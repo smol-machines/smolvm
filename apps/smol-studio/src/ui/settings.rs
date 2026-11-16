@@ -101,6 +101,26 @@ impl Studio {
         }
         window.show(ctx, |ui| {
             ui.set_width(510.0);
+            ui.add_enabled_ui(!checking && !picking, |ui| {
+                design::segmented(
+                    ui,
+                    &mut self.account_settings,
+                    &[(false, "Runtime"), (true, "Account")],
+                );
+            });
+            ui.add_space(16.0);
+            if self.account_settings {
+                egui::ScrollArea::vertical()
+                    .id_salt("settings-account")
+                    .max_height((ctx.content_rect().height() - 240.0).clamp(160.0, 400.0))
+                    .show(ui, |ui| self.cloud.account_ui(ui));
+                ui.add_space(16.0);
+                ui.separator();
+                if ui.button("Done").clicked() || self.cloud.modal_open() {
+                    close = true;
+                }
+                return;
+            }
             ui.add_space(8.0);
             ui.label(design::heading("Local runtime", 18.0));
             ui.label(

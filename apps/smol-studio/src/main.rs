@@ -1,5 +1,6 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
+mod app_access_ui;
 mod appearance;
 mod cloud_ui;
 mod command_progress_ui;

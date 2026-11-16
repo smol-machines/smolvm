@@ -1,4 +1,6 @@
+mod machines;
 mod settings;
+use machines::Location;
 
 use eframe::egui::{self, Color32, Margin, RichText, Vec2};
 use smol_studio::{
@@ -29,8 +31,7 @@ enum Tab {
 
 #[derive(Clone, Copy, PartialEq)]
 enum Workspace {
-    Local,
-    Cloud,
+    Machines,
     Containers,
 }
 
@@ -49,6 +50,10 @@ pub struct Studio {
     usage: smol_studio::usage::Usage,
     machines: Vec<Machine>,
     selected: Option<String>,
+    selected_cloud: bool,
+    selected_row_position: Option<usize>,
+    location: Location,
+    account_settings: bool,
     filter: Filter,
     query: String,
     tab: Tab,
@@ -96,7 +101,7 @@ impl Studio {
             desktop_menu: crate::desktop_menu::DesktopMenu::new(&cc.egui_ctx),
             switcher: crate::navigation_ui::Switcher::default(),
             cloud: crate::cloud_ui::CloudView::new(&cc.egui_ctx),
-            workspace: Workspace::Local,
+            workspace: Workspace::Machines,
             terminals: crate::terminal_ui::Terminals::default(),
             docker: crate::docker_ui::DockerView::new(&cc.egui_ctx),
             runtime,
@@ -105,6 +110,10 @@ impl Studio {
             usage,
             machines: Vec::new(),
             selected: None,
+            selected_cloud: false,
+            selected_row_position: None,
+            location: Location::All,
+            account_settings: false,
             filter: Filter::All,
             query: String::new(),
             tab: Tab::Overview,
@@ -222,6 +231,8 @@ impl Studio {
                     if let Operation::Create(m) = done.operation {
                         self.create = None;
                         self.selected = Some(m.name);
+                        self.selected_cloud = false;
+                        self.location = Location::All;
                         self.tab = Tab::Overview;
                         self.logs.reset();
                         self.query.clear();
@@ -336,8 +347,11 @@ impl Studio {
     fn navigate(&mut self, destination: crate::navigation_ui::Destination) {
         use crate::navigation_ui::Destination;
         match destination {
-            Destination::Machines => self.workspace = Workspace::Local,
-            Destination::Cloud => self.workspace = Workspace::Cloud,
+            Destination::Machines => self.workspace = Workspace::Machines,
+            Destination::Account => {
+                self.open_settings();
+                self.account_settings = true;
+            }
             Destination::Settings => self.open_settings(),
             Destination::Docker(kind) if !self.docker.navigating() => {
                 if self.workspace != Workspace::Containers || self.docker.destination() != kind {
@@ -397,13 +411,13 @@ impl Studio {
                 design::nav_group(ui, "Workspace");
                 if design::nav(
                     ui,
-                    self.workspace == Workspace::Local,
+                    self.workspace == Workspace::Machines,
                     Icon::Machine,
                     "Machines",
                 )
                 .clicked()
                 {
-                    self.workspace = Workspace::Local;
+                    self.workspace = Workspace::Machines;
                 }
                 ui.add_enabled_ui(!self.docker.navigating(), |ui| {
                     for (destination, icon, label) in [
@@ -432,19 +446,6 @@ impl Studio {
                         }
                     }
                 });
-                ui.add_space(12.0);
-                ui.separator();
-                ui.add_space(6.0);
-                if design::nav(
-                    ui,
-                    self.workspace == Workspace::Cloud,
-                    Icon::Cloud,
-                    "Smol Cloud",
-                )
-                .clicked()
-                {
-                    self.workspace = Workspace::Cloud;
-                }
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(4.0);
                     if design::nav(ui, self.settings, Icon::Settings, "Settings").clicked() {
@@ -453,131 +454,6 @@ impl Studio {
                     ui.add_space(8.0);
                     ui.separator();
                 });
-            });
-    }
-
-    fn header(&mut self, ui: &mut egui::Ui) {
-        ui.horizontal(|ui| {
-            ui.vertical(|ui| {
-                design::section_title(
-                    ui,
-                    "Machines",
-                    &if !self.inventory_valid {
-                        if self.inventory.busy() {
-                            "Connecting to Smol…".into()
-                        } else {
-                            "Connection unavailable".into()
-                        }
-                    } else {
-                        format!(
-                            "{} {} · {} running",
-                            self.machines.len(),
-                            if self.machines.len() == 1 {
-                                "machine"
-                            } else {
-                                "machines"
-                            },
-                            self.machines
-                                .iter()
-                                .filter(|m| m.state == "running")
-                                .count()
-                        )
-                    },
-                );
-            });
-            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                if ui
-                    .add_enabled(self.local_ready(), design::primary(ui, "+  New machine"))
-                    .clicked()
-                {
-                    self.create = Some(crate::new_machine_ui::Editor::default());
-                }
-                if ui
-                    .add_enabled(
-                        self.pending.is_none() && !self.inventory.busy(),
-                        egui::Button::new(if self.inventory.busy() {
-                            "Refreshing…"
-                        } else {
-                            "Refresh"
-                        }),
-                    )
-                    .clicked()
-                {
-                    self.refresh_inventory();
-                }
-            });
-        });
-        if let Some(error) = self.error.clone() {
-            ui.add_space(12.0);
-            design::error_notice(ui, "Smol couldn’t complete this request.", &error);
-        }
-    }
-
-    fn machine_list(&mut self, ui: &mut egui::Ui) {
-        let query = self.query.to_lowercase();
-        let visible: Vec<usize> = self
-            .machines
-            .iter()
-            .enumerate()
-            .filter(|(_, m)| {
-                (self.filter == Filter::All
-                    || (self.filter == Filter::Running && m.state == "running")
-                    || (self.filter == Filter::Stopped
-                        && matches!(m.state.as_str(), "stopped" | "created")))
-                    && (m.name.to_lowercase().contains(&query)
-                        || m.image_label().to_lowercase().contains(&query))
-            })
-            .map(|(i, _)| i)
-            .collect();
-        let awaiting_created_machine = self.inventory.busy()
-            && self
-                .selected
-                .as_ref()
-                .is_some_and(|name| !self.machines.iter().any(|m| &m.name == name));
-        if !awaiting_created_machine
-            && !visible
-                .iter()
-                .any(|&i| self.selected.as_ref() == Some(&self.machines[i].name))
-        {
-            self.selected = visible.first().map(|&i| self.machines[i].name.clone());
-            self.tab = Tab::Overview;
-            self.logs.reset();
-        }
-        if visible.is_empty() {
-            ui.add_space(40.0);
-            ui.vertical_centered(|ui| {
-                if !self.inventory_valid {
-                    ui.heading("Connect to Smol");
-                    ui.label("Choose your Smol CLI in Settings, then refresh.");
-                    if ui.button("Open settings").clicked() {
-                        self.open_settings();
-                    }
-                } else if self.machines.is_empty() {
-                    ui.label(RichText::new("No machines yet").color(design::palette(ui).muted));
-                } else {
-                    ui.label(
-                        RichText::new("No results")
-                            .size(12.0)
-                            .color(design::palette(ui).muted),
-                    );
-                }
-            });
-            return;
-        }
-        egui::ScrollArea::vertical()
-            .id_salt("machine_inventory")
-            .show_rows(ui, 60.0, visible.len(), |ui, range| {
-                for index in range {
-                    let m = &self.machines[visible[index]];
-                    let selected = self.selected.as_ref() == Some(&m.name);
-                    if design::machine_row(ui, selected, &m.name, m.image_label(), &m.state)
-                        .clicked()
-                    {
-                        self.selected = Some(m.name.clone());
-                        self.tab = Tab::Overview;
-                        self.logs.reset();
-                    }
-                }
             });
     }
 
@@ -658,7 +534,7 @@ impl Studio {
                         ui,
                         Icon::Machine,
                         &m.name,
-                        m.image_label(),
+                        &format!("Local · {}", m.image_label()),
                         &m.state,
                         None,
                     );
@@ -830,6 +706,25 @@ impl Studio {
     }
 
     fn machine_overview(&mut self, ui: &mut egui::Ui, m: &Machine, enabled: bool) {
+        let endpoints: Vec<_> = m
+            .port_mappings
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .map(smol_studio::app_access::Endpoint::machine)
+            .collect();
+        crate::app_access_ui::show(
+            ui,
+            "This computer",
+            m.state == "running",
+            &endpoints,
+            if m.ports == 0 {
+                "Publish a port in machine settings to open your app here."
+            } else {
+                "The runtime did not report this machine's published addresses."
+            },
+        );
+        ui.add_space(16.0);
         ui.horizontal(|ui| {
             ui.label(design::heading("Resources", 14.0));
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -904,62 +799,6 @@ impl Studio {
                     None => "Not reported",
                 },
             );
-            ui.separator();
-            ui.label(
-                RichText::new("Published ports")
-                    .size(12.0)
-                    .color(design::palette(ui).muted),
-            );
-            match &m.port_mappings {
-                Some(ports) if !ports.is_empty() => {
-                    for port in ports {
-                        let address = format!("127.0.0.1:{}", port.host);
-                        ui.add_space(6.0);
-                        ui.horizontal(|ui| {
-                            ui.with_layout(
-                                egui::Layout::right_to_left(egui::Align::Center),
-                                |ui| {
-                                    if ui.small_button("Copy address").clicked() {
-                                        ui.ctx().copy_text(address.clone());
-                                    }
-                                    ui.with_layout(
-                                        egui::Layout::left_to_right(egui::Align::Center),
-                                        |ui| {
-                                            ui.add(
-                                                egui::Label::new(
-                                                    RichText::new(&address).monospace().size(12.0),
-                                                )
-                                                .truncate(),
-                                            )
-                                            .on_hover_text(&address);
-                                        },
-                                    );
-                                },
-                            );
-                        });
-                        ui.label(
-                            RichText::new(format!(
-                                "{} → guest port {}",
-                                port.protocol.to_uppercase(),
-                                port.guest
-                            ))
-                            .size(11.5)
-                            .color(design::palette(ui).muted),
-                        );
-                    }
-                }
-                _ => {
-                    ui.label(
-                        RichText::new(if m.ports == 0 {
-                            "No ports published".into()
-                        } else {
-                            format!("{} ports · details not reported", m.ports)
-                        })
-                        .size(12.0)
-                        .color(design::palette(ui).muted),
-                    );
-                }
-            }
             ui.add_space(8.0);
             ui.separator();
             ui.label(
@@ -1155,7 +994,8 @@ impl eframe::App for Studio {
         }
         self.receive_inventory();
         self.logs.set_visible(
-            self.workspace == Workspace::Local
+            self.workspace == Workspace::Machines
+                && !self.selected_cloud
                 && self.tab == Tab::Logs
                 && self.inventory_valid
                 && ctx.input(|i| i.viewport().minimized != Some(true)),
@@ -1196,7 +1036,8 @@ impl eframe::App for Studio {
             pid: m.pid,
         });
         let usage_active = active
-            && self.workspace == Workspace::Local
+            && self.workspace == Workspace::Machines
+            && !self.selected_cloud
             && self.tab == Tab::Usage
             && machine.is_some_and(|m| m.state == "running")
             && self.local_ready()
@@ -1207,11 +1048,13 @@ impl eframe::App for Studio {
             ctx.request_repaint_after(after);
         }
 
-        self.cloud
-            .logic(ctx, active && (self.workspace == Workspace::Cloud));
+        self.cloud.logic(
+            ctx,
+            active && (self.workspace == Workspace::Machines || self.settings),
+        );
         if self.schedule.due(
             Instant::now(),
-            active && (self.workspace == Workspace::Local),
+            active && (self.workspace == Workspace::Machines),
             self.pending.is_some()
                 || self.inventory.busy()
                 || self.files.modal_open()
@@ -1223,7 +1066,7 @@ impl eframe::App for Studio {
         ) {
             self.refresh_inventory();
         }
-        if active && self.workspace == Workspace::Local {
+        if active && self.workspace == Workspace::Machines {
             ctx.request_repaint_after(REFRESH_INTERVAL);
         }
     }
@@ -1275,16 +1118,15 @@ impl eframe::App for Studio {
                         }
                     } else {
                         match self.workspace {
-                            Workspace::Cloud => "Smol Cloud".to_string(),
                             Workspace::Containers => self.docker.status().to_owned(),
-                            Workspace::Local => self
+                            Workspace::Machines => self
                                 .pending
                                 .as_ref()
                                 .map(Operation::label)
                                 .unwrap_or_else(|| self.activity.clone()),
                         }
                     };
-                    if self.workspace == Workspace::Local && self.pending.is_some() {
+                    if self.workspace == Workspace::Machines && self.pending.is_some() {
                         ui.spinner();
                     }
                     ui.label(
@@ -1318,10 +1160,9 @@ impl eframe::App for Studio {
             });
         self.sidebar(ui);
         match self.workspace {
-            Workspace::Cloud => self.cloud.ui(ui),
             Workspace::Containers => self.docker.ui(ui, &self.runtime, frame),
-            Workspace::Local => {
-                egui::Panel::top("local-heading")
+            Workspace::Machines => {
+                egui::Panel::top("machines-heading")
                     .resizable(false)
                     .frame(
                         egui::Frame::new()
@@ -1329,7 +1170,7 @@ impl eframe::App for Studio {
                             .inner_margin(Margin::symmetric(22, 14)),
                     )
                     .show(ui, |ui| self.header(ui));
-                egui::Panel::left("local-list")
+                egui::Panel::left("machines-list")
                     .resizable(true)
                     .default_size(248.0)
                     .min_size(224.0)
@@ -1344,11 +1185,11 @@ impl eframe::App for Studio {
                         ui.add_space(8.0);
                         design::segmented(
                             ui,
-                            &mut self.filter,
+                            &mut self.location,
                             &[
-                                (Filter::All, "All"),
-                                (Filter::Running, "Running"),
-                                (Filter::Stopped, "Stopped"),
+                                (Location::All, "All"),
+                                (Location::Local, "Local"),
+                                (Location::Cloud, "Cloud"),
                             ],
                         );
                         ui.add_space(12.0);
@@ -1361,9 +1202,11 @@ impl eframe::App for Studio {
                             .inner_margin(24),
                     )
                     .show(ui, |ui| {
-                        if self.selected.is_some() {
+                        if self.selected_cloud && self.cloud.selected().is_some() {
+                            self.cloud.details(ui);
+                        } else if self.selected.is_some() && !self.selected_cloud {
                             self.details(ui, frame);
-                        } else if !self.machines.is_empty() {
+                        } else if !self.machines.is_empty() || !self.cloud.inventory().is_empty() {
                             ui.add_space(100.0);
                             ui.vertical_centered(|ui| {
                                 design::empty_state(
@@ -1376,6 +1219,7 @@ impl eframe::App for Studio {
                                 if ui.button("Clear filters").clicked() {
                                     self.query.clear();
                                     self.filter = Filter::All;
+                                    self.location = Location::All;
                                 }
                             });
                         } else {
@@ -1403,6 +1247,7 @@ impl eframe::App for Studio {
             }
         }
         self.dialogs(&ctx, frame);
+        self.cloud.dialogs(&ctx);
         crate::search_ui::finish(
             &ctx,
             !self.modal_open() && !self.terminals.focused(&ctx) && !egui::Popup::is_any_open(&ctx),

@@ -1349,90 +1349,142 @@ impl DockerView {
             }
             return;
         }
-        egui::ScrollArea::vertical().id_salt(("container-inspector-scroll", &details.id, self.container_tab)).auto_shrink([false, false]).show(ui, |ui| {
-            match self.container_tab {
-                ContainerTab::Logs | ContainerTab::Files => {},
+        egui::ScrollArea::vertical()
+            .id_salt((
+                "container-inspector-scroll",
+                &details.id,
+                self.container_tab,
+            ))
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.container_tab {
+                ContainerTab::Logs | ContainerTab::Files => {}
                 ContainerTab::Mounts => {
-                    ui.label(design::heading("Shared folders & volumes", 14.0)); ui.add_space(8.0);
-                    if details.mounts.is_empty() { ui.label(RichText::new("No folders or volumes are mounted in this container.").size(12.0).color(design::palette(ui).muted)); }
+                    ui.label(design::heading("Shared folders & volumes", 14.0));
+                    ui.add_space(8.0);
+                    if details.mounts.is_empty() {
+                        ui.label(
+                            RichText::new("No folders or volumes are mounted in this container.")
+                                .size(12.0)
+                                .color(design::palette(ui).muted),
+                        );
+                    }
                     for (index, mount) in details.mounts.iter().enumerate() {
                         ui.push_id(index, |ui| {
                             design::card(ui.ctx()).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if ui.small_button("Copy path").clicked() { ui.ctx().copy_text(mount.target.clone()); }
-                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                            ui.add(egui::Label::new(RichText::new(&mount.target).monospace().size(13.0)).truncate()).on_hover_text(&mount.target);
-                                        });
-                                    });
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui.small_button("Copy path").clicked() {
+                                                ui.ctx().copy_text(mount.target.clone());
+                                            }
+                                            ui.with_layout(
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(
+                                                            RichText::new(&mount.target)
+                                                                .monospace()
+                                                                .size(13.0),
+                                                        )
+                                                        .truncate(),
+                                                    )
+                                                    .on_hover_text(&mount.target);
+                                                },
+                                            );
+                                        },
+                                    );
                                 });
-                                ui.label(RichText::new(format!("{} · {}", mount.kind, if mount.writable { "Read & write" } else { "Read only" })).size(11.5).color(design::palette(ui).muted));
+                                ui.label(
+                                    RichText::new(format!(
+                                        "{} · {}",
+                                        mount.kind,
+                                        if mount.writable {
+                                            "Read & write"
+                                        } else {
+                                            "Read only"
+                                        }
+                                    ))
+                                    .size(11.5)
+                                    .color(design::palette(ui).muted),
+                                );
                                 ui.add_space(8.0);
-                                ui.add(egui::Label::new(RichText::new(&mount.source).size(12.0).color(design::palette(ui).muted)).wrap()).on_hover_text(&mount.source);
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&mount.source)
+                                            .size(12.0)
+                                            .color(design::palette(ui).muted),
+                                    )
+                                    .wrap(),
+                                )
+                                .on_hover_text(&mount.source);
                             });
                             ui.add_space(8.0);
                         });
                     }
                 }
                 ContainerTab::Overview => {
-        if let Some((id, warning)) = &self.run_warning
-            && id == &details.id
-        {
-            design::error_notice(ui, "Container created; startup needs attention.", warning);
-            if ui.small_button("Dismiss notice").clicked() {
-                self.run_warning = None;
-            }
-            ui.add_space(12.0);
-        }
+                    if let Some((id, warning)) = &self.run_warning
+                        && id == &details.id
+                    {
+                        design::error_notice(
+                            ui,
+                            "Container created; startup needs attention.",
+                            warning,
+                        );
+                        if ui.small_button("Dismiss notice").clicked() {
+                            self.run_warning = None;
+                        }
+                        ui.add_space(12.0);
+                    }
                     self.container_diagnostics(ui, runtime, &details, enabled);
-                    design::card(ui.ctx()).show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0));
-                        ui.add_space(8.0);
-                        if details.ports.is_empty() {
-                            ui.label(RichText::new("No host ports configured").size(12.0).color(design::palette(ui).muted));
-                        }
-                        for (index, port) in details.ports.iter().enumerate() {
-                            ui.push_id(index, |ui| {
-                                if index > 0 { ui.separator(); }
-                                let binding = format!("{}:{} → {}", port.host_ip, if port.host_port.is_empty() { "automatic" } else { &port.host_port }, port.container);
-                                ui.horizontal(|ui| {
-                                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                        if let Some(url) = port.browser_url() {
-                                            if ui.small_button("Copy URL").clicked() { ui.ctx().copy_text(url.clone()); }
-                                            ui.add_enabled_ui(details.state == "running", |ui| {
-                                                ui.hyperlink_to("Open", url).on_hover_text("Open this TCP port using HTTP; the service must speak HTTP.");
-                                            }).response.on_disabled_hover_text("Start the container to use its published ports.");
-                                        } else if ui.small_button("Copy binding").clicked() { ui.ctx().copy_text(binding.clone()); }
-                                        ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
-                                            ui.add(egui::Label::new(RichText::new(&binding).monospace().size(12.0)).truncate()).on_hover_text(&binding);
-                                        });
-                                    });
-                                });
-                            });
-                        }
-                    });
+                    let endpoints: Vec<_> = details
+                        .ports
+                        .iter()
+                        .map(smol_studio::app_access::Endpoint::container)
+                        .collect();
+                    crate::app_access_ui::show(
+                        ui,
+                        "This computer",
+                        details.state == "running",
+                        &endpoints,
+                        "Publish a host port when creating the container to open your app here.",
+                    );
                     ui.add_space(16.0);
                     self.container_usage_ui(ui, &details);
                     if let Some(project) = &details.project {
-                        ui.add_space(20.0); ui.label(design::heading("Compose project", 14.0));
+                        ui.add_space(20.0);
+                        ui.label(design::heading("Compose project", 14.0));
                         if ui.link(project).clicked() && enabled {
-                            self.compose = true; self.compose_import = false; self.project_selected = Some(project.clone()); self.submit(runtime, Action::Projects);
+                            self.compose = true;
+                            self.compose_import = false;
+                            self.project_selected = Some(project.clone());
+                            self.submit(runtime, Action::Projects);
                         }
-                        if let Some(service) = &details.service { ui.label(RichText::new(format!("Service: {service}")).size(12.0).color(design::palette(ui).muted)); }
+                        if let Some(service) = &details.service {
+                            ui.label(
+                                RichText::new(format!("Service: {service}"))
+                                    .size(12.0)
+                                    .color(design::palette(ui).muted),
+                            );
+                        }
                     }
                     ui.add_space(20.0);
                     design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.collapsing("Command & diagnostics", |ui| {
                             design::property(ui, "Restarts", &details.restarts.to_string());
-                            for arg in &details.command { ui.add(egui::Label::new(RichText::new(arg).monospace().size(11.0)).wrap()); }
+                            for arg in &details.command {
+                                ui.add(
+                                    egui::Label::new(RichText::new(arg).monospace().size(11.0))
+                                        .wrap(),
+                                );
+                            }
                         });
                     });
                 }
-            }
-        });
+            });
     }
     pub fn ui(&mut self, ui: &mut egui::Ui, runtime: &Runtime, frame: &eframe::Frame) {
         let ctx = ui.ctx().clone();

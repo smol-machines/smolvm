@@ -1,3 +1,4 @@
+pub mod app_access;
 pub mod cloud;
 pub mod inventory;
 pub mod machine_settings;

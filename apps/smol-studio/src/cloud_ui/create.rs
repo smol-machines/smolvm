@@ -84,6 +84,38 @@ impl CloudView {
                             ui.add_space(8.0);
                             ui.checkbox(&mut draft.network, "Allow outbound network access");
                         });
+                        ui.add_space(16.0);
+                        ui.label(design::heading("App ports", 14.0));
+                        ui.label(
+                            RichText::new("Publish the ports your app listens on.")
+                                .size(12.0)
+                                .color(design::palette(ui).muted),
+                        );
+                        let mut remove = None;
+                        for (index, port) in draft.ports.iter_mut().enumerate() {
+                            ui.push_id(("cloud-port", index), |ui| {
+                                ui.horizontal(|ui| {
+                                    ui.label("Guest port");
+                                    ui.add(egui::DragValue::new(&mut port.guest).range(1..=65535));
+                                    port.host = port.guest;
+                                    if ui.button("Remove").clicked() {
+                                        remove = Some(index);
+                                    }
+                                });
+                            });
+                        }
+                        if let Some(index) = remove {
+                            draft.ports.remove(index);
+                        }
+                        if ui
+                            .add_enabled(draft.ports.len() < 32, egui::Button::new("Add port"))
+                            .clicked()
+                        {
+                            draft.ports.push(smol_studio::model::PublishedPort {
+                                host: 8080,
+                                guest: 8080,
+                            });
+                        }
                     });
                     if let Some(error) = &self.create_error {
                         ui.add_space(12.0);
@@ -93,13 +125,7 @@ impl CloudView {
                         }
                     }
                 });
-            let valid = draft.validate().and_then(|_| {
-                if draft.image.trim().is_empty() || draft.image.trim().starts_with(['/', '.']) {
-                    Err("Use a registry image reference for cloud machines.".into())
-                } else {
-                    smol_studio::storage::validate_reference(draft.image.trim())
-                }
-            });
+            let valid = validate(&draft);
             if let Err(error) = &valid
                 && !draft.name.is_empty()
             {
@@ -154,6 +180,14 @@ impl CloudView {
                         cidrs: vec![],
                         hosts: vec![],
                     }),
+                    ports: draft
+                        .ports
+                        .iter()
+                        .map(|p| smol_cloud::types::Port {
+                            port: p.guest,
+                            host_port: None,
+                        })
+                        .collect(),
                     ..Default::default()
                 }),
             });
@@ -161,5 +195,59 @@ impl CloudView {
         if busy || submit || (open && !cancel && !ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.create = Some(draft);
         }
+    }
+}
+
+fn validate(draft: &NewMachine) -> Result<(), String> {
+    draft.validate()?;
+    if draft.image.trim().is_empty() || draft.image.trim().starts_with(['/', '.']) {
+        return Err("Use a registry image reference for cloud machines.".into());
+    }
+    smol_studio::storage::validate_reference(draft.image.trim())?;
+    let mut ports = std::collections::BTreeSet::new();
+    for port in &draft.ports {
+        if !ports.insert(port.guest) {
+            return Err(format!(
+                "Guest port {} is listed more than once.",
+                port.guest
+            ));
+        }
+    }
+    if ports.len() > 32 {
+        return Err("Publish at most 32 app ports.".into());
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cloud_ports_reject_duplicate_guest_bindings_before_creation() {
+        use smol_studio::model::PublishedPort;
+        let mut draft = NewMachine {
+            name: "app".into(),
+            image: "alpine:3.22".into(),
+            ..Default::default()
+        };
+        draft.ports = vec![
+            PublishedPort {
+                host: 8080,
+                guest: 80,
+            },
+            PublishedPort {
+                host: 8081,
+                guest: 80,
+            },
+        ];
+        assert!(
+            validate(&draft)
+                .unwrap_err()
+                .contains("listed more than once")
+        );
+        draft.ports[1].guest = 443;
+        assert!(validate(&draft).is_ok());
+        draft.ports[1].guest = 0;
+        assert!(validate(&draft).is_err());
     }
 }

@@ -6,7 +6,7 @@ use smol_studio::docker::Kind;
 pub enum Destination {
     Machines,
     Docker(Option<Kind>),
-    Cloud,
+    Account,
     Settings,
 }
 
@@ -18,7 +18,7 @@ impl Destination {
         Self::Docker(Some(Kind::Images)),
         Self::Docker(Some(Kind::Volumes)),
         Self::Docker(Some(Kind::Networks)),
-        Self::Cloud,
+        Self::Account,
         Self::Settings,
     ];
 
@@ -30,7 +30,7 @@ impl Destination {
             Self::Docker(Some(Kind::Images)) => ("Images", Icon::Image, Key::Num4),
             Self::Docker(Some(Kind::Volumes)) => ("Volumes", Icon::Volume, Key::Num5),
             Self::Docker(Some(Kind::Networks)) => ("Networks", Icon::Network, Key::Num6),
-            Self::Cloud => ("Smol Cloud", Icon::Cloud, Key::Num7),
+            Self::Account => ("Account", Icon::Cloud, Key::Num7),
             Self::Settings => ("Settings", Icon::Settings, Key::Comma),
         }
     }

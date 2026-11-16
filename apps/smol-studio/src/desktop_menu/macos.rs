@@ -249,7 +249,7 @@ impl DesktopMenu {
             ("Images", "4", Key::Num4),
             ("Volumes", "5", Key::Num5),
             ("Networks", "6", Key::Num6),
-            ("Smol Cloud", "7", Key::Num7),
+            ("Account", "7", Key::Num7),
         ] {
             let entry = add(&view, title, key, Command::Key(code, false));
             if matches!(code, Key::Num1 | Key::Num7) {
