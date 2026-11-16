@@ -170,7 +170,7 @@ printf action-complete
 }
 
 impl Inventory {
-    pub fn new(wake: impl Fn() + Send + 'static) -> Self {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
         Self {
             worker: Worker::new(wake),
             epoch: 0,

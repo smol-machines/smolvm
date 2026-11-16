@@ -68,6 +68,9 @@ pub struct Studio {
     runtime_path: String,
     command: String,
     output: Option<(String, String)>,
+    console_machine: Option<String>,
+    console_revision: u64,
+    console_snapshot: Option<smol_studio::command_progress::Snapshot>,
 }
 
 impl Studio {
@@ -116,6 +119,9 @@ impl Studio {
             runtime_path,
             command: String::new(),
             output: None,
+            console_machine: None,
+            console_revision: 0,
+            console_snapshot: None,
         };
         app.cloud.restore();
         app.refresh_inventory();
@@ -127,10 +133,18 @@ impl Studio {
             return;
         }
         self.close_notice = false;
+        // Capture the previous report before queuing: the worker can begin or
+        // finish the next command immediately after submit succeeds.
+        let previous_revision = self.worker.console.snapshot_after(0).map(|s| s.revision);
         match self.worker.submit(self.runtime.clone(), op.clone()) {
             Ok(()) => {
                 if op.is_mutation() {
                     self.inventory.invalidate();
+                }
+                if let Operation::Exec { name, .. } = &op {
+                    self.console_machine = Some(name.clone());
+                    self.console_revision = previous_revision.unwrap_or(0);
+                    self.console_snapshot = None;
                 }
                 self.pending = Some(op);
             }
@@ -219,6 +233,10 @@ impl Studio {
                             editor.error = Some(e.clone());
                             shown_in_editor = true;
                         }
+                    }
+                    if let Operation::Exec { name, .. } = &done.operation {
+                        self.output = Some((name.clone(), format!("Command error: {e}")));
+                        shown_in_editor = true;
                     }
                     self.refresh_error = false;
                     self.error = if shown_in_editor { None } else { Some(e) };
@@ -684,13 +702,20 @@ impl Studio {
                         });
                     });
                     ui.add_space(6.0);
-                    ui.add(
-                        egui::TextEdit::multiline(&mut self.command)
-                            .desired_rows(2)
-                            .desired_width(f32::INFINITY)
-                            .font(egui::TextStyle::Monospace)
-                            .hint_text("uname -a"),
-                    );
+                    egui::ScrollArea::vertical()
+                        .id_salt(("console-command", &m.name))
+                        .max_height(96.0)
+                        .min_scrolled_height(40.0)
+                        .auto_shrink([false, true])
+                        .show(ui, |ui| {
+                            ui.add(
+                                egui::TextEdit::multiline(&mut self.command)
+                                    .desired_rows(2)
+                                    .desired_width(f32::INFINITY)
+                                    .font(egui::TextStyle::Monospace)
+                                    .hint_text("uname -a"),
+                            );
+                        });
                     ui.label(
                         RichText::new(if m.state == "running" {
                             "Shell command · 60 second limit"
@@ -702,38 +727,65 @@ impl Studio {
                     );
                 });
                 ui.add_space(16.0);
-                let output = self.output.as_ref().filter(|(name, _)| name == &m.name);
+                let snapshot = self
+                    .console_snapshot
+                    .as_ref()
+                    .filter(|_| self.console_machine.as_deref() == Some(&m.name));
+                let finished = self.output.as_ref().filter(|(name, _)| name == &m.name);
+                let text = finished
+                    .map(|(_, text)| text.as_str())
+                    .or_else(|| snapshot.map(|s| s.text.as_str()));
                 ui.horizontal(|ui| {
                     ui.label(design::heading("Output", 14.0));
+                    if let Some(snapshot) = snapshot {
+                        use smol_studio::command_progress::Status;
+                        let (label, color) = match snapshot.status {
+                            Status::Running => ("Running", MUTED),
+                            Status::Succeeded => ("Completed", GREEN),
+                            Status::Failed => ("Failed", design::RED),
+                        };
+                        ui.label(RichText::new(label).size(11.5).color(color));
+                    }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if let Some((_, text)) = output
+                        if let Some(text) = text.filter(|t| !t.is_empty())
                             && ui.small_button("Copy output").clicked()
                         {
-                            ui.ctx().copy_text(text.clone());
+                            ui.ctx().copy_text(text.to_owned());
                         }
                     });
                 });
+                if snapshot.is_some_and(|s| s.discarded) {
+                    ui.label(
+                        RichText::new("Recent output · older output discarded")
+                            .size(11.0)
+                            .color(MUTED),
+                    );
+                }
                 ui.add_space(8.0);
-                if let Some((_, text)) = output {
+                if let Some(text) = text.filter(|t| !t.is_empty()) {
+                    let lines: Vec<_> = text.lines().collect();
+                    let row_height =
+                        ui.fonts_mut(|fonts| fonts.row_height(&egui::FontId::monospace(11.5)));
                     egui::ScrollArea::both()
-                        .id_salt(("console", &m.name))
+                        .id_salt(("console", &m.name, snapshot.map(|s| s.id)))
                         .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            if text.is_empty() {
-                                ui.label(
-                                    RichText::new("Command completed without output.").color(MUTED),
-                                );
-                            } else {
+                        .stick_to_bottom(true)
+                        .show_rows(ui, row_height, lines.len(), |ui, range| {
+                            for index in range {
                                 ui.add(
-                                    egui::Label::new(RichText::new(text).monospace())
-                                        .selectable(true),
+                                    egui::Label::new(
+                                        RichText::new(lines[index]).monospace().size(11.5),
+                                    )
+                                    .wrap_mode(egui::TextWrapMode::Extend)
+                                    .selectable(true),
                                 );
                             }
                         });
                 } else {
-                    ui.label(RichText::new(if matches!(&self.pending, Some(Operation::Exec { name, .. }) if name == &m.name) { "Running command…" } else { "Command output will appear here." }).size(12.0).color(MUTED));
+                    ui.label(RichText::new(if matches!(&self.pending, Some(Operation::Exec { name, .. }) if name == &m.name) { "Waiting for command output…" } else { "Command output will appear here." }).size(12.0).color(MUTED));
                 }
             }
+
             Tab::Overview => {
                 egui::ScrollArea::vertical()
                     .id_salt(("machine-detail", &m.name, self.tab))
@@ -1125,6 +1177,9 @@ impl Studio {
                         self.inventory_valid = false;
                         self.machines.clear();
                         self.selected = None;
+                        self.output = None;
+                        self.console_machine = None;
+                        self.console_snapshot = None;
                         self.logs.reset();
                         self.error = None;
                         self.activity = "Connecting to Smol…".into();
@@ -1160,6 +1215,10 @@ impl eframe::App for Studio {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
+        if let Some(snapshot) = self.worker.console.snapshot_after(self.console_revision) {
+            self.console_revision = snapshot.revision;
+            self.console_snapshot = Some(snapshot);
+        }
         self.receive_inventory();
         self.logs.set_visible(
             self.workspace == Workspace::Local

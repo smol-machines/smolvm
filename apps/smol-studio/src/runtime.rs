@@ -128,6 +128,7 @@ impl Runtime {
                     "--local".into(),
                     "--name".into(),
                     name.into(),
+                    "--stream".into(),
                     "--timeout".into(),
                     "60".into(),
                     "--".into(),
@@ -239,6 +240,15 @@ impl Runtime {
     }
 
     fn execute(&self, op: &Operation, shutdown: &AtomicBool) -> Result<Payload, String> {
+        self.execute_reporting(op, shutdown, None)
+    }
+
+    fn execute_reporting(
+        &self,
+        op: &Operation,
+        shutdown: &AtomicBool,
+        progress: Option<&crate::command_progress::Progress>,
+    ) -> Result<Payload, String> {
         if let Operation::UpdateSettings { original, .. } = op {
             let Payload::Settings(current) =
                 self.execute(&Operation::ReadSettings(original.name.clone()), shutdown)?
@@ -249,7 +259,6 @@ impl Runtime {
                 return Err("This machine changed since you opened its settings. Reload before applying changes.".into());
             }
         }
-        let mut command = self.command(op)?;
         let limit = match op {
             Operation::Refresh | Operation::ReadSettings(_) | Operation::ListFiles { .. } => {
                 INVENTORY_LIMIT
@@ -263,20 +272,34 @@ impl Runtime {
             Duration::from_secs(15)
         };
         if let Operation::Exec { name, .. } = op {
-            let output = capture_process(&mut command, Duration::from_secs(75), limit, shutdown)?;
+            let fallback = crate::command_progress::Progress::new(|| {});
+            let report = progress.unwrap_or(&fallback);
+            report.begin(format!("Command in {name}"));
+            let result = self.command(op).and_then(|command| {
+                report.capture_exit(command, Duration::from_secs(75), shutdown)
+            });
+            report.finish(matches!(result, Ok(0)));
+            let snapshot = report
+                .snapshot_after(0)
+                .expect("command report initialized");
+            let outcome = match result {
+                Ok(code) => format!("Exit status: {code}"),
+                Err(error) => format!("Command error: {error}"),
+            };
             return Ok(Payload::Output {
                 name: name.clone(),
                 text: format!(
-                    "{}{}\nExit status: {}",
-                    String::from_utf8_lossy(&output.stdout),
-                    String::from_utf8_lossy(&output.stderr),
-                    output
-                        .code
-                        .map(|c| c.to_string())
-                        .unwrap_or_else(|| "interrupted".into())
+                    "{}{}\n{outcome}",
+                    if snapshot.discarded {
+                        "Recent output only; older output was discarded.\n\n"
+                    } else {
+                        ""
+                    },
+                    snapshot.text
                 ),
             });
         }
+        let mut command = self.command(op)?;
         let output = capture(&mut command, timeout, limit, shutdown)?;
         match op {
             Operation::Refresh => parse_machines(&output).map(Payload::Machines),
@@ -497,12 +520,17 @@ pub struct Completion {
 pub struct Worker {
     requests: Option<mpsc::SyncSender<(Runtime, Operation)>>,
     pub responses: mpsc::Receiver<Completion>,
+    pub console: crate::command_progress::Progress,
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 
 impl Worker {
-    pub fn new(wake: impl Fn() + Send + 'static) -> Self {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        let wake = Arc::new(wake);
+        let report_wake = wake.clone();
+        let console = crate::command_progress::Progress::new(move || report_wake());
+        let report = console.clone();
         let (requests, incoming) = mpsc::sync_channel::<(Runtime, Operation)>(1);
         let (outgoing, responses) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -513,7 +541,7 @@ impl Worker {
                     break;
                 }
                 let started = Instant::now();
-                let result = runtime.execute(&operation, &stop);
+                let result = runtime.execute_reporting(&operation, &stop, Some(&report));
                 if outgoing
                     .send(Completion {
                         operation,
@@ -530,6 +558,7 @@ impl Worker {
         Self {
             requests: Some(requests),
             responses,
+            console,
             shutdown,
             thread: Some(thread),
         }
@@ -1027,6 +1056,7 @@ mod tests {
             .unwrap();
         assert_eq!(args.last().unwrap(), script);
         assert!(args.windows(2).any(|w| w == ["--timeout", "60"]));
+        assert!(args.iter().any(|arg| arg == "--stream"));
     }
     #[test]
     #[cfg(unix)]
@@ -1045,6 +1075,65 @@ mod tests {
         assert_eq!(result.code, Some(7));
         assert!(!result.success);
     }
+    #[cfg(unix)]
+    #[test]
+    fn console_worker_streams_before_exit_and_retains_a_bounded_failure_tail() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let cli = dir.path().join("cli");
+        std::fs::write(&cli, "#!/bin/sh\ncd -- \"$(dirname -- \"$0\")\" || exit 2\nprintf 'early stdout\\n'\nprintf 'early stderr\\n' >&2\nwhile test ! -f release; do sleep .01; done\ni=0; while test $i -lt 9000; do printf 'verbose diagnostic abcdefghijklmnopqrstuvwxyz\\n' >&2; i=$((i+1)); done\nprintf 'last diagnostic\\n' >&2\nprintf completed > completed\nexit 7\n").unwrap();
+        std::fs::set_permissions(&cli, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let worker = Worker::new(|| {});
+        worker
+            .submit(
+                Runtime {
+                    executable: cli,
+                    state_dir: None,
+                },
+                Operation::Exec {
+                    name: "fixture".into(),
+                    command: "ignored by fixture".into(),
+                },
+            )
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if worker
+                .console
+                .snapshot_after(0)
+                .is_some_and(|s| s.text.contains("early stdout") && s.text.contains("early stderr"))
+            {
+                break;
+            }
+            assert!(Instant::now() < deadline, "output was buffered until exit");
+            thread::sleep(Duration::from_millis(10));
+        }
+        assert!(worker.responses.try_recv().is_err());
+        std::fs::write(dir.path().join("release"), "").unwrap();
+        let done = worker
+            .responses
+            .recv_timeout(Duration::from_secs(5))
+            .unwrap();
+        let Payload::Output { name, text } = done.result.unwrap() else {
+            panic!("console output")
+        };
+        assert_eq!(name, "fixture");
+        assert!(
+            text.contains("older output was discarded")
+                && text.contains("last diagnostic")
+                && text.contains("Exit status: 7")
+        );
+        assert!(text.len() < 257 * 1024);
+        assert_eq!(
+            std::fs::read_to_string(dir.path().join("completed")).unwrap(),
+            "completed"
+        );
+        assert_eq!(
+            worker.console.snapshot_after(0).unwrap().status,
+            crate::command_progress::Status::Failed
+        );
+    }
+
     #[test]
     #[ignore = "boots an isolated local VM through the Smol CLI"]
     fn live_public_smol_cli_lifecycle() {

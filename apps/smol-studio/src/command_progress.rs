@@ -82,6 +82,29 @@ impl Progress {
         timeout: Duration,
         shutdown: &AtomicBool,
     ) -> Result<(), String> {
+        let code = self.capture_exit(command, timeout, shutdown)?;
+        if code == 0 {
+            return Ok(());
+        }
+        let state = self.state.lock().unwrap();
+        let tail: String = state
+            .text
+            .chars()
+            .rev()
+            .take(4096)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .collect();
+        Err(format!("Command exited with code {code}.\n{}", tail.trim()))
+    }
+
+    pub(crate) fn capture_exit(
+        &self,
+        command: Command,
+        timeout: Duration,
+        shutdown: &AtomicBool,
+    ) -> Result<i32, String> {
         // This reader belongs to the command, not to the visible output panel.
         // Hiding the panel never interrupts a build or image pull.
         let stream = LogStream::spawn(command, || {})?;
@@ -95,36 +118,19 @@ impl Progress {
                 state.discarded = snapshot.discarded;
                 state.revision = state.revision.wrapping_add(1);
                 let status = snapshot.status;
-                let failure = match &status {
-                    LogStatus::Finished(code) if *code != 0 => {
-                        let tail: String = state
-                            .text
-                            .chars()
-                            .rev()
-                            .take(4096)
-                            .collect::<Vec<_>>()
-                            .into_iter()
-                            .rev()
-                            .collect();
-                        Some(format!("Command exited with code {code}.\n{}", tail.trim()))
-                    }
-                    LogStatus::Failed(error) => Some(error.clone()),
-                    _ => None,
-                };
                 drop(state);
                 (self.wake)();
-                if let Some(error) = failure {
-                    return Err(error);
-                }
-                if matches!(status, LogStatus::Finished(0)) {
-                    return Ok(());
+                match status {
+                    LogStatus::Finished(code) => return Ok(code),
+                    LogStatus::Failed(error) => return Err(error),
+                    LogStatus::Following => {}
                 }
             }
             if shutdown.load(Ordering::Relaxed) {
-                return Err("Studio closed; the command was interrupted. Check project state before retrying.".into());
+                return Err("Studio closed; the command was interrupted. Check machine or project state before retrying.".into());
             }
             if started.elapsed() >= timeout {
-                return Err("The command timed out and may have partially completed. Refresh project state before retrying.".into());
+                return Err("The command timed out and may have partially completed. Refresh machine or project state before retrying.".into());
             }
             thread::sleep(Duration::from_millis(50));
         }
@@ -199,12 +205,16 @@ mod tests {
         assert!(p.snapshot_after(0).unwrap().text.contains("failure detail"));
         let error = p
             .capture(
-                shell("echo $$ > pid; exec sleep 30", dir.path()),
+                shell(
+                    "echo $$ > pid; printf 'before timeout\\n'; exec sleep 30",
+                    dir.path(),
+                ),
                 Duration::from_millis(200),
                 &AtomicBool::new(false),
             )
             .unwrap_err();
         assert!(error.contains("timed out"));
+        assert!(p.snapshot_after(0).unwrap().text.contains("before timeout"));
         let pid: i32 = std::fs::read_to_string(dir.path().join("pid"))
             .unwrap()
             .trim()
