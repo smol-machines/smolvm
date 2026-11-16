@@ -15,6 +15,8 @@ pub struct Source {
     pub env_files: Vec<PathBuf>,
     #[serde(default)]
     pub profiles: Vec<String>,
+    #[serde(default)]
+    pub project_dir: Option<PathBuf>,
 }
 impl Source {
     pub fn single(file: PathBuf) -> Self {
@@ -55,6 +57,13 @@ impl Source {
         {
             return Err("Use up to 32 profile names containing letters, numbers, dots, underscores or hyphens; use * for all profiles.".into());
         }
+        if self
+            .project_dir
+            .as_ref()
+            .is_some_and(|p| !p.is_absolute() || p.to_str().is_none())
+        {
+            return Err("Project directory must be an absolute, UTF-8 path.".into());
+        }
         if let Some(name) = &self.name {
             validate_name(name)?;
         }
@@ -65,6 +74,18 @@ impl Source {
         let mut args = vec!["--context".into(), "smol".into(), "compose".into()];
         if let Some(name) = &self.name {
             args.extend(["--project-name".into(), name.clone()]);
+        }
+        if let Some(directory) = &self.project_dir {
+            if !directory.is_dir() {
+                return Err(format!(
+                    "Project directory is unavailable: {}",
+                    directory.display()
+                ));
+            }
+            args.extend([
+                "--project-directory".into(),
+                directory.to_str().unwrap().to_owned(),
+            ]);
         }
         for file in &self.files {
             if !file.is_file() {
@@ -177,7 +198,17 @@ pub(crate) fn attach_sources(projects: &mut Vec<Project>, sources: BTreeMap<Stri
     projects.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
-pub const LIST_FORMAT: &str = r#"{"id":{{json .ID}},"name":{{json .Names}},"image":{{json .Image}},"state":{{json .State}},"project":{{json (.Label "com.docker.compose.project")}},"service":{{json (.Label "com.docker.compose.service")}},"one_off":{{json (.Label "com.docker.compose.oneoff")}}}"#;
+pub const LIST_FORMAT: &str = r#"{"id":{{json .ID}},"name":{{json .Names}},"image":{{json .Image}},"state":{{json .State}},"project":{{json (.Label "com.docker.compose.project")}},"service":{{json (.Label "com.docker.compose.service")}},"one_off":{{json (.Label "com.docker.compose.oneoff")}},"config_files":{{json (.Label "com.docker.compose.project.config_files")}},"working_dir":{{json (.Label "com.docker.compose.project.working_dir")}},"environment_file":{{json (.Label "com.docker.compose.project.environment_file")}}}"#;
+
+#[derive(Clone, Debug, Default, PartialEq, Deserialize)]
+pub struct RecordedSource {
+    #[serde(default)]
+    pub config_files: String,
+    #[serde(default)]
+    pub working_dir: String,
+    #[serde(default)]
+    pub environment_file: String,
+}
 
 #[derive(Clone, Debug, Deserialize)]
 pub struct Container {
@@ -188,6 +219,8 @@ pub struct Container {
     pub project: String,
     pub service: String,
     one_off: String,
+    #[serde(flatten)]
+    pub recorded: RecordedSource,
 }
 impl Container {
     pub fn is_job(&self) -> bool {
@@ -208,6 +241,40 @@ pub struct Project {
     pub source: Option<Source>,
 }
 impl Project {
+    pub fn recorded_source(&self) -> Result<&RecordedSource, String> {
+        let has_services = self.containers.iter().any(|c| !c.is_job());
+        let mut records = self
+            .containers
+            .iter()
+            .filter(|c| !has_services || !c.is_job())
+            .map(|c| &c.recorded);
+        let first = records
+            .next()
+            .ok_or("This project no longer has containers.")?;
+        if first.config_files.is_empty() {
+            return Err("Compose did not record file locations for this project. Choose the files manually.".into());
+        }
+        if records.any(|r| r != first) {
+            return Err("The service containers record different project settings. Choose the files manually.".into());
+        }
+        Ok(first)
+    }
+    pub fn discover_source(&self) -> Result<Source, String> {
+        let record = self.recorded_source()?;
+        let source = Source {
+            files: recorded_paths(&record.config_files)?,
+            env_files: if record.environment_file.is_empty() {
+                Vec::new()
+            } else {
+                recorded_paths(&record.environment_file)?
+            },
+            name: Some(self.name.clone()),
+            project_dir: Some(PathBuf::from(&record.working_dir)),
+            profiles: Vec::new(),
+        };
+        source.args()?;
+        Ok(source)
+    }
     pub fn running(&self) -> usize {
         self.containers
             .iter()
@@ -247,6 +314,49 @@ impl Project {
                 .push(container);
         }
         services
+    }
+}
+
+// Compose joins absolute paths with commas without escaping filenames. Resolve
+// only a unique partition into existing files, on the action worker, never UI.
+fn recorded_paths(label: &str) -> Result<Vec<PathBuf>, String> {
+    let parts: Vec<_> = label.split(',').collect();
+    if label.len() > 16384 || parts.len() > 64 {
+        return Err(
+            "Recorded file locations exceed the import limit. Choose the files manually.".into(),
+        );
+    }
+    let mut solutions: Vec<Vec<Vec<PathBuf>>> = vec![Vec::new(); parts.len() + 1];
+    solutions[parts.len()].push(Vec::new());
+    for start in (0..parts.len()).rev() {
+        for end in start + 1..=parts.len() {
+            if solutions[end].is_empty() {
+                continue;
+            }
+            let path = PathBuf::from(parts[start..end].join(","));
+            if !path.is_absolute() || !path.is_file() {
+                continue;
+            }
+            for suffix in solutions[end].clone() {
+                if suffix.len() >= 32 {
+                    continue;
+                }
+                let mut candidate = vec![path.clone()];
+                candidate.extend(suffix);
+                solutions[start].push(candidate);
+                if solutions[start].len() == 2 {
+                    break;
+                }
+            }
+            if solutions[start].len() == 2 {
+                break;
+            }
+        }
+    }
+    match solutions[0].len() {
+        1 => Ok(solutions[0].remove(0)),
+        0 => Err("The recorded files are unavailable on this computer. Choose their current locations manually.".into()),
+        _ => Err("Commas make the recorded file locations ambiguous. Choose the files manually.".into()),
     }
 }
 
@@ -370,6 +480,7 @@ mod tests {
             name: Some("shop".into()),
             env_files: vec![first.clone(), last.clone()],
             profiles: vec!["debug".into(), "metrics.dev".into()],
+            project_dir: None,
         };
         let args = source.args().unwrap();
         assert_eq!(
@@ -412,6 +523,76 @@ mod tests {
                 .unwrap_err()
                 .contains("Environment file is missing")
         );
+    }
+
+    #[test]
+    fn discovery_preserves_commas_order_directory_and_requires_consistent_service_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().join("base, with spaces.yaml");
+        let overlay = dir.path().join("override.yaml");
+        let env = dir.path().join("local, dev.env");
+        for p in [&base, &overlay, &env] {
+            std::fs::write(p, "fixture").unwrap();
+        }
+        let row = |id: &str, job: &str, files: &str| {
+            json!({"id":id,"name":"service","image":"alpine","state":"running","project":"shop","service":"web","one_off":job,"config_files":files,"working_dir":dir.path(),"environment_file":env}).to_string()
+        };
+        let files = format!("{},{}", base.display(), overlay.display());
+        let input = [
+            row("aa", "False", &files),
+            row("bb", "False", &files),
+            row("cc", "True", "/other/job.yaml"),
+        ]
+        .join("\n");
+        let project = parse(input.as_bytes()).unwrap().remove(0);
+        let source = project.discover_source().unwrap();
+        assert_eq!(source.files, vec![base, overlay.clone()]);
+        assert_eq!(source.env_files, vec![env.clone()]);
+        assert_eq!(source.project_dir.as_deref(), Some(dir.path()));
+        assert_eq!(source.name.as_deref(), Some("shop"));
+        assert!(source.profiles.is_empty());
+        assert!(project.source.is_none());
+        assert!(
+            source
+                .args()
+                .unwrap()
+                .windows(2)
+                .any(|a| a == ["--project-directory", dir.path().to_str().unwrap()])
+        );
+        let conflict = [
+            row("aa", "False", &files),
+            row("bb", "False", "/other/project.yaml"),
+        ]
+        .join("\n");
+        assert!(
+            parse(conflict.as_bytes()).unwrap()[0]
+                .discover_source()
+                .unwrap_err()
+                .contains("different")
+        );
+        std::fs::remove_file(overlay).unwrap();
+        assert!(
+            project
+                .discover_source()
+                .unwrap_err()
+                .contains("unavailable")
+        );
+        assert!(recorded_paths("relative.yaml").is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ambiguous_recorded_paths_are_not_guessed() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first");
+        let second = dir.path().join("second");
+        std::fs::write(&first, "").unwrap();
+        std::fs::write(&second, "").unwrap();
+        let label = format!("{},{}", first.display(), second.display());
+        let combined = PathBuf::from(&label);
+        std::fs::create_dir_all(combined.parent().unwrap()).unwrap();
+        std::fs::write(&combined, "").unwrap();
+        assert!(recorded_paths(&label).unwrap_err().contains("ambiguous"));
     }
 
     #[test]

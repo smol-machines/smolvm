@@ -12,12 +12,17 @@ impl DockerView {
             ui.add_space(12.0);
             ui.label(design::heading(if self.compose_name.is_some() { "Project settings" } else { "Open a Compose project" }, 20.0));
             if let Some(name) = &self.compose_name { ui.add(egui::Label::new(RichText::new(name).color(MUTED)).wrap()); }
+            if self.compose_discovered { ui.add_space(8.0); hint(ui, "Detected from Compose containers. Review profiles and environment before applying: the original profile choices and shell variables are not recorded."); }
             ui.add_space(16.0);
             ui.add_enabled_ui(enabled, |ui| {
                 design::card().show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(design::heading("Compose files", 14.0));
                     hint(ui, "Applied in order. Later files override the base configuration.");
+                    ui.add_space(10.0);
+                    hint(ui, "Project directory");
+                    ui.add(egui::TextEdit::singleline(&mut self.compose_project_dir).desired_width(f32::INFINITY).hint_text("Default: directory of the first Compose file").margin(egui::Margin::symmetric(10, 9)));
+                    hint(ui, "Resolves relative paths and the default .env file.");
                     ui.add_space(12.0);
                     if paths(ui, &mut self.compose_files, false) { self.file_error = None; }
                     ui.add_space(12.0);

@@ -60,6 +60,7 @@ pub enum Action {
     PullImage(String),
     CreateVolume(String),
     Projects,
+    DiscoverProject(String),
     Project {
         name: String,
         action: ProjectAction,
@@ -97,6 +98,7 @@ impl Action {
                 | Self::Stats(_)
                 | Self::StorageInspect { .. }
                 | Self::Projects
+                | Self::DiscoverProject(_)
                 | Self::Project {
                     action: ProjectAction::Logs,
                     ..
@@ -108,6 +110,7 @@ pub enum Output {
     Connection(crate::docker_connection::Connection),
     Rows(Kind, Vec<Value>),
     Projects(Vec<crate::compose::Project>, Option<String>),
+    DiscoveredSource(crate::compose::Source),
     ComposeApplied {
         name: String,
         warning: Option<String>,
@@ -251,6 +254,16 @@ fn execute_with_progress(
     shutdown: &AtomicBool,
     progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
+    if let Action::DiscoverProject(name) = action {
+        let Output::Projects(projects, _) = execute(runtime, &Action::Projects, shutdown)? else {
+            unreachable!()
+        };
+        let project = projects
+            .iter()
+            .find(|p| &p.name == name)
+            .ok_or("This project no longer exists. Refresh the project list.")?;
+        return Ok(Output::DiscoveredSource(project.discover_source()?));
+    }
     if let Action::StorageRemove { kind, id, created } = action {
         let Output::Storage(details) = execute(
             runtime,
@@ -434,8 +447,10 @@ fn compose_command(source: &crate::compose::Source) -> Result<Command, String> {
     let mut command = docker_command();
     command.args(source.args()?);
     command.current_dir(
-        source.files[0]
-            .parent()
+        source
+            .project_dir
+            .as_deref()
+            .or_else(|| source.files[0].parent())
             .ok_or("Compose file has no parent directory.")?,
     );
     // The Studio form defines the files and identity; unrelated shell control
@@ -1024,11 +1039,14 @@ mod tests {
         std::fs::write(&env_base, "STUDIO_TEST_VALUE=first\n").unwrap();
         std::fs::write(&env_override, "STUDIO_TEST_VALUE=last\n").unwrap();
         std::fs::write(&overlay, "name: studio-sources-owned\nservices:\n  web:\n    profiles: [debug]\n    environment:\n      SOURCE_VALUE: ${STUDIO_TEST_VALUE:?missing fixture value}\n").unwrap();
+        let workdir = root.join("project working directory");
+        std::fs::create_dir_all(&workdir).unwrap();
         let source = Source {
             files: vec![base.clone(), overlay.clone()],
             name: None,
             env_files: vec![env_base.clone(), env_override.clone()],
             profiles: vec!["debug".into()],
+            project_dir: Some(workdir.clone()),
         };
         let mut default = source.clone();
         default.profiles.clear();
@@ -1036,6 +1054,34 @@ mod tests {
         config.args(["config", "--services"]);
         assert!(
             capture(&mut config, Duration::from_secs(30), 4096, &shutdown)
+                .unwrap()
+                .is_empty()
+        );
+        // Create through Compose itself: Studio has not saved any source yet.
+        let mut cli = compose_command(&source).unwrap();
+        cli.args(["up", "--detach"]);
+        capture(
+            &mut cli,
+            Duration::from_secs(600),
+            4 * 1024 * 1024,
+            &shutdown,
+        )
+        .unwrap();
+        let Output::DiscoveredSource(discovered) = execute(
+            &runtime,
+            &Action::DiscoverProject("studio-sources-owned".into()),
+            &shutdown,
+        )
+        .unwrap() else {
+            panic!("Expected detected configuration")
+        };
+        assert_eq!(discovered.files, source.files);
+        assert_eq!(discovered.env_files, source.env_files);
+        assert_eq!(discovered.project_dir, source.project_dir);
+        assert!(discovered.profiles.is_empty());
+        assert_eq!(discovered.name.as_deref(), Some("studio-sources-owned"));
+        assert!(
+            load_sources(&source_store(&runtime).unwrap())
                 .unwrap()
                 .is_empty()
         );
