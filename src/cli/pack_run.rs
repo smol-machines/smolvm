@@ -729,10 +729,6 @@ impl PackRunCmd {
         // that already has threads, and a registry pull leaves this one with
         // Security.framework's (#1819). Windows has no fork.
         //
-        // Watched from the parent, which owns the run (#1192); `_boot-vm`
-        // watches its own mounts.
-        #[cfg(target_os = "linux")]
-        let watched_mounts = watched_packed_mounts(&packed_mounts);
         // The CLI as the forked VM child will see its parent (#1193).
         #[cfg(target_os = "linux")]
         let cli_pid = std::process::id() as smolvm::process::Pid;
@@ -783,6 +779,13 @@ impl PackRunCmd {
                 // steal keystrokes or corrupt terminal state.
                 detach_vm_child_stdio();
 
+                // Finish the initial snapshot and watch registration before the
+                // guest can read files; the child owns watches until its VM exits.
+                let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged_after_fork(
+                    config.vsock_socket.to_path_buf(),
+                    watched_packed_mounts(config.mounts),
+                );
+
                 if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
                     let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
                     let _ = std::fs::write(&config.console_log, &msg);
@@ -792,9 +795,6 @@ impl PackRunCmd {
             })
             .map_err(|e| Error::agent("fork VM process", e.to_string()))?
         };
-        #[cfg(target_os = "linux")]
-        let _fsnotify_watcher =
-            smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
 
         #[cfg(not(target_os = "linux"))]
         let child_pid = {
@@ -1946,10 +1946,8 @@ fn run_from_cache(
     let console_log_path = runtime_dir.path().join("console.log");
     let vsock_path_clone = vsock_path.clone();
     // As in a packed `run`: Linux forks, macOS and Windows boot in `_boot-vm`
-    // (#1819), the parent watches mounts (#1192) and the VM ends with the CLI
-    // (#1193).
-    #[cfg(target_os = "linux")]
-    let watched_mounts = watched_packed_mounts(&packed_mounts);
+    // (#1819); the child establishes its mount watches before guest launch
+    // and the VM ends with the CLI (#1193).
     #[cfg(target_os = "linux")]
     let cli_pid = std::process::id() as smolvm::process::Pid;
     #[cfg(target_os = "linux")]
@@ -1988,6 +1986,13 @@ fn run_from_cache(
         // steal keystrokes or corrupt terminal state.
         detach_vm_child_stdio();
 
+        // Finish the initial snapshot and watch registration before the
+        // guest can read files; the child owns watches until its VM exits.
+        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged_after_fork(
+            config.vsock_socket.to_path_buf(),
+            watched_packed_mounts(config.mounts),
+        );
+
         if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
             let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
             let _ = std::fs::write(&config.console_log, &msg);
@@ -1995,9 +2000,6 @@ fn run_from_cache(
         smolvm::process::exit_child(1);
     })
     .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
-    #[cfg(target_os = "linux")]
-    let _fsnotify_watcher =
-        smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
 
     // Re-spawn this executable as `_boot-vm <config>`, mirroring the non-packed
     // launcher and the `--sidecar` path. BootConfig carries the same packed

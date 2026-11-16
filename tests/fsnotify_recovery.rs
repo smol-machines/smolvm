@@ -94,6 +94,55 @@ fn watcher(root: &Path, source: &Path, after_fork: bool) -> FsNotifyWatcher {
 }
 
 #[test]
+fn an_immediate_edit_is_replayed_when_the_guest_has_not_booted_yet() {
+    immediate_edit(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn polling_replays_an_immediate_edit_to_a_cold_guest() {
+    immediate_edit(true);
+}
+
+fn immediate_edit(after_fork: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    for index in 0..10_000 {
+        std::fs::write(source.join(format!("file-{index}")), b"before").unwrap();
+    }
+    // Choose the end of the OS directory order: an asynchronous initial scan
+    // used to absorb this edit into its baseline and never tell the guest.
+    let target = std::fs::read_dir(&source)
+        .unwrap()
+        .last()
+        .unwrap()
+        .unwrap()
+        .path();
+    let started = Instant::now();
+    let watcher = watcher(root.path(), &source, after_fork);
+    assert!(started.elapsed() < Duration::from_secs(10));
+    std::fs::write(&target, b"after").unwrap();
+    // Startup must finish without an agent socket or an acknowledgement.
+    let listener = UnixListener::bind(root.path().join("agent.sock")).unwrap();
+    let mut peer = accept(&listener);
+    let expected = format!(
+        "/run/smolvm/virtiofs/smolvm0/{}",
+        target.file_name().unwrap().to_str().unwrap()
+    );
+    loop {
+        let events = request(&mut peer);
+        peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+            .unwrap();
+        if events.iter().any(|event| event.path == expected) {
+            break;
+        }
+        assert!(started.elapsed() < Duration::from_secs(15));
+    }
+    drop(watcher);
+}
+
+#[test]
 fn distinct_changes_survive_a_lost_agent_connection() {
     distinct_changes(false);
 }
@@ -262,7 +311,12 @@ fn overflow_recovery(after_fork: bool) {
     let mut peer = accept(&listener);
     wait_for_notifications(&mut peer, &source, "smolvm0");
     std::fs::write(source.join("held"), b"pending").unwrap();
-    assert!(!request(&mut peer).is_empty()); // Hold the acknowledgement during the burst.
+    // Hold the acknowledgement during the burst.
+    assert!(!request(&mut peer).is_empty());
+    // The unavailable guest cannot accept reconnects while the burst is being
+    // written. Otherwise this mock queues connections that have already timed
+    // out by accept(), and BSD rejects setting options on those dead sockets.
+    drop(listener);
     for index in 0..20_000 {
         std::fs::write(source.join(format!("create-{index}")), b"new").unwrap();
     }
@@ -271,6 +325,8 @@ fn overflow_recovery(after_fork: bool) {
         std::fs::write(source.join(format!("modify-{index}")), b"after").unwrap();
     }
     drop(peer);
+    std::fs::remove_file(root.path().join("agent.sock")).unwrap();
+    let listener = UnixListener::bind(root.path().join("agent.sock")).unwrap();
     let mut peer = accept(&listener);
     let deadline = Instant::now() + Duration::from_secs(30);
     let mut created = HashSet::new();
