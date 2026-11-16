@@ -3,6 +3,7 @@ mod image_archive;
 mod image_tag;
 mod project_form;
 mod resources;
+mod run_container;
 
 use crate::design::{self, MUTED, SURFACE};
 use eframe::egui::{self, Color32, RichText};
@@ -45,6 +46,8 @@ pub struct DockerView {
     new_resource: Option<Kind>,
     tag_image: Option<image_tag::Form>,
     archive_image: Option<image_archive::Form>,
+    run_container: Option<run_container::Form>,
+    run_warning: Option<(String, String)>,
     resource_input: String,
     resource_error: Option<String>,
     pending: Option<Action>,
@@ -163,6 +166,8 @@ impl DockerView {
             new_resource: None,
             tag_image: None,
             archive_image: None,
+            run_container: None,
+            run_warning: None,
             resource_input: String::new(),
             resource_error: None,
             pending: None,
@@ -238,6 +243,7 @@ impl DockerView {
 
     pub fn modal_open(&self) -> bool {
         self.connection_open
+            || self.run_container.is_some()
             || self.tag_image.is_some()
             || self.archive_image.as_ref().is_some_and(|f| !f.transferring)
             || self.confirm.is_some()
@@ -325,6 +331,25 @@ impl DockerView {
         while let Ok(done) = self.worker.events.try_recv() {
             self.pending = None;
             match done.result {
+                Ok(Output::RunImages(images)) => {
+                    if let Some(form) = &mut self.run_container {
+                        if !images.iter().any(|i| i.id == form.draft.image) {
+                            form.draft.image =
+                                images.first().map(|i| i.id.clone()).unwrap_or_default();
+                        }
+                        form.images = images;
+                        form.loaded = true;
+                        form.error = None;
+                    }
+                }
+                Ok(Output::ContainerCreated(created)) => {
+                    self.run_container = None;
+                    self.compose = false;
+                    self.open_resource_container(runtime, &created.id);
+                    self.activity = "Container created.".into();
+                    self.run_warning = created.warning.map(|warning| (created.id, warning));
+                }
+
                 Ok(Output::Connection(connection)) => {
                     let ready = connection.state == smol_studio::docker_connection::State::Ready;
                     self.activity = connection.title().into();
@@ -493,6 +518,15 @@ impl DockerView {
                     }
                 }
                 Ok(Output::Completed) => {
+                    if let Action::Start(id) | Action::Delete(id) = &done.action
+                        && self
+                            .run_warning
+                            .as_ref()
+                            .is_some_and(|(target, _)| target == id)
+                    {
+                        self.run_warning = None;
+                    }
+
                     if let Action::TransferImageArchive(plan) = &done.action {
                         self.archive_image = None;
                         self.activity = format!(
@@ -564,6 +598,15 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if matches!(done.action, Action::RunImages | Action::RunContainer(_)) {
+                        if let Some(form) = &mut self.run_container {
+                            form.reveal_error = true;
+                            form.error = Some(e);
+                        }
+                        self.activity = "Container needs attention.".into();
+                        continue;
+                    }
+
                     if matches!(
                         done.action,
                         Action::ReviewImageArchive(_) | Action::TransferImageArchive(_)
@@ -1109,6 +1152,15 @@ impl DockerView {
                     }
                 }
                 ContainerTab::Overview => {
+        if let Some((id, warning)) = &self.run_warning
+            && id == &details.id
+        {
+            design::error_notice(ui, "Container created; startup needs attention.", warning);
+            if ui.small_button("Dismiss notice").clicked() {
+                self.run_warning = None;
+            }
+            ui.add_space(12.0);
+        }
                     ui.horizontal_wrapped(|ui| {
                         if details.state == "running" {
                             if ui.add_enabled(enabled, design::primary("Open terminal")).clicked() {
@@ -1133,26 +1185,28 @@ impl DockerView {
                     if details.oom_killed { ui.add_space(8.0); design::notice(ui, "Stopped after running out of memory."); }
                     if !details.error.is_empty() { ui.add_space(8.0); design::notice(ui, &details.error); }
                     ui.add_space(16.0);
-                    if details.health.is_some() || details.state != "running" {
+                    if details.health.is_some() || (matches!(details.state.as_str(), "exited" | "dead") && details.exit_code.is_some()) {
                         design::card().show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             if let Some(health) = &details.health { design::property(ui, "Health", health); }
-                            if details.state != "running" && let Some(code) = details.exit_code { design::property(ui, "Exit code", &code.to_string()); }
+                            if matches!(details.state.as_str(), "exited" | "dead") && let Some(code) = details.exit_code { design::property(ui, "Exit code", &code.to_string()); }
                         }); ui.add_space(16.0);
                     }
-                    ui.label(design::heading("Published ports", 14.0)); ui.add_space(8.0);
-                    if details.ports.is_empty() { ui.label(RichText::new("No ports published to this computer.").size(12.0).color(MUTED)); }
+                    ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0)); ui.add_space(8.0);
+                    if details.ports.is_empty() { ui.label(RichText::new(if details.state == "running" { "No ports published to this computer." } else { "No host ports configured." }).size(12.0).color(MUTED)); }
                     else { design::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for (index, port) in details.ports.iter().enumerate() {
                             ui.push_id(index, |ui| {
                                 if index > 0 { ui.separator(); }
-                                let binding = format!("{}:{} → {}", port.host_ip, port.host_port, port.container);
+                                let binding = format!("{}:{} → {}", port.host_ip, if port.host_port.is_empty() { "automatic" } else { &port.host_port }, port.container);
                                 ui.horizontal(|ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                                         if let Some(url) = port.browser_url() {
                                             if ui.small_button("Copy URL").clicked() { ui.ctx().copy_text(url.clone()); }
-                                            ui.hyperlink_to("Open", url).on_hover_text("Open this TCP port using HTTP; the service must speak HTTP.");
+                                            ui.add_enabled_ui(details.state == "running", |ui| {
+                                                ui.hyperlink_to("Open", url).on_hover_text("Open this TCP port using HTTP; the service must speak HTTP.");
+                                            }).response.on_disabled_hover_text("Start the container to use its published ports.");
                                         } else if ui.small_button("Copy binding").clicked() { ui.ctx().copy_text(binding.clone()); }
                                         ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                                             ui.add(egui::Label::new(RichText::new(&binding).monospace().size(12.0)).truncate()).on_hover_text(&binding);
@@ -1234,6 +1288,7 @@ impl DockerView {
             self.refresh(runtime);
         }
         if self.confirm.is_some()
+            || self.run_container.is_some()
             || self.tag_image.is_some()
             || self.archive_image.as_ref().is_some_and(|f| !f.transferring)
         {
@@ -1260,6 +1315,18 @@ impl DockerView {
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if !self.compose
+                            && self.kind == Kind::Containers
+                            && !cfg!(windows)
+                            && ui
+                                .add_enabled(
+                                    self.pending.is_none() && self.connected(),
+                                    design::primary("+  Run container"),
+                                )
+                                .clicked()
+                        {
+                            self.open_run_container(runtime, None);
+                        }
                         if self.compose && !cfg!(windows) {
                             if ui
                                 .add_enabled(
@@ -1466,13 +1533,15 @@ impl DockerView {
                 ui.add_space(70.0);
                 ui.vertical_centered(|ui| {
                     ui.heading(if !query.is_empty() && self.valid {"No matching resources"}else if self.valid && self.kind == Kind::Containers {"Run your first container"}else if self.valid {"Nothing here yet"}else if self.pending.is_some() {"Loading containers…"}else{"Couldn’t load containers"});
-                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Use your Docker CLI, or open Compose to start a project."}else{"Check the connection details above, then refresh to try again."}).color(MUTED));
+                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Run a local image, or open Projects to start a Compose application."}else{"Check the connection details above, then refresh to try again."}).color(MUTED));
                     ui.add_space(16.0);
+                    if self.valid && self.kind == Kind::Containers && query.is_empty() && ui.add_enabled(self.pending.is_none(),design::primary("Run container…")).clicked(){self.open_run_container(runtime,None);}
                     if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary("Refresh")).clicked(){self.refresh(runtime);}
                 });
             }
 
         });
+        self.run_container_dialog(&ctx, runtime, frame);
         self.connection_dialog(&ctx, runtime);
         self.resource_dialog(&ctx, runtime);
         self.image_tag_dialog(&ctx, runtime);

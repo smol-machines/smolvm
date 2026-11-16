@@ -211,7 +211,7 @@ impl DockerView {
             );
         }
     }
-    fn open_resource_container(&mut self, runtime: &Runtime, id: &str) {
+    pub(super) fn open_resource_container(&mut self, runtime: &Runtime, id: &str) {
         self.kind = Kind::Containers;
         self.selected = Some(id.to_owned());
         self.details = None;
@@ -323,7 +323,10 @@ impl DockerView {
             match self.resource_tab {
                 Tab::Overview => {
             ui.horizontal_wrapped(|ui| {
-                if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary("Tag image…")).clicked() {
+                if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary("Run…")).clicked() {
+                    self.open_run_container(runtime,Some(smol_studio::container_run::Image {id:details.id.clone(),label:title.clone()}));
+                }
+                if details.kind == Kind::Images && ui.add_enabled(enabled, egui::Button::new("Tag image…")).clicked() {
                     self.tag_image = Some(super::image_tag::Form { source_id: details.id.clone(), source_label: title.clone(), reference: String::new(), plan: None, error: None, focus_reference: true });
                 }
                 if details.kind == Kind::Images && ui.add_enabled(enabled, egui::Button::new("Export…")).clicked() {

@@ -65,7 +65,14 @@ impl ContainerDetails {
             return Err("Docker returned an invalid container ID.".into());
         }
         let mut ports = vec![];
-        if let Some(bindings) = v["NetworkSettings"]["Ports"].as_object() {
+        let port_bindings = if v["State"]["Status"].as_str() == Some("running") {
+            &v["NetworkSettings"]["Ports"]
+        } else if v["HostConfig"]["PortBindings"].is_object() {
+            &v["HostConfig"]["PortBindings"]
+        } else {
+            &v["NetworkSettings"]["Ports"]
+        };
+        if let Some(bindings) = port_bindings.as_object() {
             for (container, bindings) in bindings {
                 if let Some(bindings) = bindings.as_array() {
                     for binding in bindings {
@@ -158,5 +165,17 @@ mod tests {
         assert_eq!(d.ports.len(), 1);
         assert_eq!(d.command, vec!["sh", "-c", "exit 7"]);
         assert!(!format!("{d:?}").contains("secret"));
+    }
+    #[test]
+    fn stopped_ports_use_configuration_and_running_ports_use_actual_bindings() {
+        let mut v = serde_json::json!({"Id":"abcdef","State":{"Status":"exited"},"HostConfig":{"PortBindings":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"8080"}]}},"NetworkSettings":{"Ports":{"80/tcp":[{"HostIp":"127.0.0.1","HostPort":"49152"}]}}});
+        let parse = |v: &serde_json::Value| {
+            ContainerDetails::parse(&serde_json::to_vec(v).unwrap()).unwrap()
+        };
+        assert_eq!(parse(&v).ports[0].host_port, "8080");
+        v["State"]["Status"] = "running".into();
+        assert_eq!(parse(&v).ports[0].host_port, "49152");
+        v["NetworkSettings"]["Ports"] = serde_json::json!({});
+        assert!(parse(&v).ports.is_empty());
     }
 }

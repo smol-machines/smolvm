@@ -39,6 +39,8 @@ pub enum ProjectAction {
 pub enum Action {
     Status,
     Configure,
+    RunImages,
+    RunContainer(crate::container_run::Draft),
     List(Kind),
     Start(String),
     Stop(String),
@@ -102,6 +104,7 @@ impl Action {
         !matches!(
             self,
             Self::Status
+                | Self::RunImages
                 | Self::List(_)
                 | Self::Logs(_)
                 | Self::Inspect(_)
@@ -117,6 +120,8 @@ impl Action {
 }
 pub enum Output {
     Connection(crate::docker_connection::Connection),
+    RunImages(Vec<crate::container_run::Image>),
+    ContainerCreated(crate::container_run::Created),
     Rows(Kind, Vec<Value>),
     Projects(Vec<crate::compose::Project>, Option<String>),
     DiscoveredSource(crate::compose::Source),
@@ -265,6 +270,12 @@ fn execute_with_progress(
     shutdown: &AtomicBool,
     progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
+    if matches!(action, Action::RunImages) {
+        return crate::container_run::images(shutdown).map(Output::RunImages);
+    }
+    if let Action::RunContainer(draft) = action {
+        return crate::container_run::run(draft, shutdown).map(Output::ContainerCreated);
+    }
     if let Action::ReviewImageArchive(request) = action {
         return crate::image_archive::review(request, shutdown).map(Output::ImageArchivePlan);
     }
