@@ -145,6 +145,10 @@ fn main() {
         "Quit must not bypass the operation guard"
     );
     let edit = bar.itemAtIndex(1).unwrap().submenu().unwrap();
+    let find_index = edit.numberOfItems() - 1;
+    let find = edit.itemAtIndex(find_index).unwrap();
+    assert_eq!(find.title().to_string(), "Find…");
+    assert_eq!(find.keyEquivalent().to_string(), "f");
     let view = bar.itemAtIndex(2).unwrap().submenu().unwrap();
     let window = bar.itemAtIndex(3).unwrap().submenu().unwrap();
     assert_eq!(view.title().to_string(), "View");
@@ -153,11 +157,13 @@ fn main() {
     menu.update(false, false, false);
     app_menu.update(); // AppKit's automatic validation must not re-enable guarded items.
     assert!(!settings.isEnabled());
+    assert!(!find.isEnabled());
     assert!(!quit.isEnabled());
     assert!(!view.itemAtIndex(0).unwrap().isEnabled());
     assert!(!window.itemAtIndex(0).unwrap().isEnabled());
     let mut raw = egui::RawInput::default();
     app_menu.performActionForItemAtIndex(1);
+    edit.performActionForItemAtIndex(find_index);
     assert!(!menu.input(&mut raw));
     assert!(
         raw.events.is_empty(),
@@ -194,6 +200,14 @@ fn main() {
     output.textures_delta.clear();
 
     let mut raw = egui::RawInput::default();
+    assert!(find.isEnabled());
+    edit.performActionForItemAtIndex(find_index);
+    assert!(!menu.input(&mut raw));
+    assert!(matches!(raw.events.as_slice(), [
+        Event::Key { key: Key::F, pressed: true, modifiers, .. },
+        Event::Key { key: Key::F, pressed: false, .. },
+    ] if modifiers.mac_cmd && modifiers.command));
+    raw.events.clear();
     edit.performActionForItemAtIndex(4); // Copy, with no native editor responder.
     assert!(!menu.input(&mut raw));
     assert!(matches!(raw.events.as_slice(), [Event::Copy]));

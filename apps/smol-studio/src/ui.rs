@@ -1219,6 +1219,7 @@ impl eframe::App for Studio {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        crate::search_ui::begin(&ctx);
         if !self.modal_open()
             && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
             && !self.docker.terminal_focused(&ctx)
@@ -1328,7 +1329,7 @@ impl eframe::App for Studio {
                             .inner_margin(12),
                     )
                     .show(ui, |ui| {
-                        design::search(ui, &mut self.query, "Search machines…");
+                        design::workspace_search(ui, &mut self.query, "Search machines…");
                         ui.add_space(8.0);
                         design::segmented(
                             ui,
@@ -1391,6 +1392,13 @@ impl eframe::App for Studio {
             }
         }
         self.dialogs(&ctx, frame);
+        crate::search_ui::finish(
+            &ctx,
+            !self.modal_open()
+                && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
+                && !self.docker.terminal_focused(&ctx)
+                && !egui::Popup::is_any_open(&ctx),
+        );
         self.desktop_menu.update(
             !self.modal_open()
                 && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))

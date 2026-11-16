@@ -737,7 +737,20 @@ pub fn resource_heading(ui: &mut egui::Ui, kind: Icon, title: &str, subtitle: &s
     });
 }
 
-pub fn search(ui: &mut egui::Ui, value: &mut String, hint: &str) {
+pub fn search(ui: &mut egui::Ui, value: &mut String, hint: &str) -> egui::Response {
+    search_field(ui, value, hint, crate::search_ui::Scope::Content)
+}
+
+pub fn workspace_search(ui: &mut egui::Ui, value: &mut String, hint: &str) -> egui::Response {
+    search_field(ui, value, hint, crate::search_ui::Scope::Workspace)
+}
+
+fn search_field(
+    ui: &mut egui::Ui,
+    value: &mut String,
+    hint: &str,
+    scope: crate::search_ui::Scope,
+) -> egui::Response {
     let response = ui.add(
         egui::TextEdit::singleline(value)
             .hint_text(hint)
@@ -756,9 +769,8 @@ pub fn search(ui: &mut egui::Ui, value: &mut String, hint: &str) {
         [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
         Stroke::new(1.2, palette(ui).muted),
     );
-    if ui.is_enabled() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
-        response.request_focus();
-    }
+    crate::search_ui::register(ui, &response, scope, value.chars().count());
+    response
 }
 
 pub fn empty_state(ui: &mut egui::Ui, kind: Icon, title: &str, message: &str) {

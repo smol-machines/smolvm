@@ -101,7 +101,7 @@ impl DockerView {
                     .inner_margin(12),
             )
             .show(ui, |ui| {
-                design::search(
+                design::workspace_search(
                     ui,
                     &mut self.query,
                     &format!("Search {}…", self.kind.label().to_lowercase()),

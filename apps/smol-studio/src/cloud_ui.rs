@@ -429,7 +429,7 @@ impl CloudView {
                     .inner_margin(12),
             )
             .show(ui, |ui| {
-                design::search(ui, &mut self.query, "Search cloud machines…");
+                design::workspace_search(ui, &mut self.query, "Search cloud machines…");
                 ui.add_space(14.0);
                 let query = self.query.to_lowercase();
                 let rows: Vec<_> = self

@@ -105,10 +105,16 @@ impl ProgressView {
                 ui.add_space(8.0);
                 let mut jump_to_latest = false;
                 ui.horizontal(|ui| {
-                    ui.add(
+                    let search = ui.add(
                         egui::TextEdit::singleline(&mut self.filter)
                             .desired_width(180.0)
                             .hint_text("Filter output…"),
+                    );
+                    crate::search_ui::register(
+                        ui,
+                        &search,
+                        crate::search_ui::Scope::Output,
+                        self.filter.chars().count(),
                     );
                     if !self.filter.is_empty() && ui.small_button("Clear").clicked() {
                         self.filter.clear();

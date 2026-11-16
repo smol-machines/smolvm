@@ -232,9 +232,12 @@ impl DesktopMenu {
         add(&edit, "Copy", "c", Command::Copy);
         add(&edit, "Paste", "v", Command::Paste);
         add(&edit, "Select All", "a", Command::Key(Key::A, false));
+        edit.addItem(&NSMenuItem::separatorItem(mtm));
+        let find = add(&edit, "Find…", "f", Command::Key(Key::F, false));
         let view = submenu(mtm, &bar, "View");
         let mut navigation = vec![
             settings,
+            find,
             add(&view, "Go to…", "k", Command::Key(Key::K, false)),
         ];
         view.addItem(&NSMenuItem::separatorItem(mtm));

@@ -922,7 +922,7 @@ impl DockerView {
                     .inner_margin(12),
             )
             .show(ui, |ui| {
-                design::search(ui, &mut self.project_query, "Search projects…");
+                design::workspace_search(ui, &mut self.project_query, "Search projects…");
                 ui.add_space(12.0);
                 design::eyebrow(ui, &format!("PROJECTS  /  {}", self.projects.len()));
                 ui.add_space(8.0);
@@ -1648,7 +1648,7 @@ impl DockerView {
                         .inner_margin(12),
                 )
                 .show(ui, |ui| {
-                    design::search(ui, &mut self.query, "Search containers…");
+                    design::workspace_search(ui, &mut self.query, "Search containers…");
                     ui.add_space(12.0);
                     design::eyebrow(ui, &format!("CONTAINERS  /  {}", self.rows.len()));
                     ui.add_space(8.0);
