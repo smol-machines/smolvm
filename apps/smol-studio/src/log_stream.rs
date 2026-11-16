@@ -1,4 +1,4 @@
-//! Bounded Docker output readers owned by visible desktop views.
+//! Bounded local-machine and Docker output readers owned by visible desktop views.
 use std::{
     collections::VecDeque,
     io::Read,
@@ -83,6 +83,16 @@ pub struct LogStream {
 }
 
 impl LogStream {
+    pub fn machine(
+        runtime: &crate::runtime::Runtime,
+        name: &str,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        let mut command = runtime.command(&crate::model::Operation::Logs(name.to_owned()))?;
+        command.arg("--follow");
+        Self::spawn(command, wake)
+    }
+
     pub fn container(id: &str, wake: impl Fn() + Send + Sync + 'static) -> Result<Self, String> {
         crate::docker::validate_container_id(id)?;
         let mut command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
@@ -126,7 +136,7 @@ impl LogStream {
         }
         let mut child = command
             .spawn()
-            .map_err(|e| format!("Cannot start Docker reader: {e}"))?;
+            .map_err(|e| format!("Cannot start log reader: {e}"))?;
         let stdout = child.stdout.take().expect("piped log stdout");
         let stderr = child.stderr.take().expect("piped log stderr");
         let state = Arc::new(Mutex::new(State::new()));
@@ -226,7 +236,7 @@ fn read_pipe(
                 Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
                     let mut state = state.lock().unwrap();
-                    state.status = Status::Failed(format!("Cannot read container logs: {error}"));
+                    state.status = Status::Failed(format!("Cannot read log output: {error}"));
                     state.revision = state.revision.wrapping_add(1);
                     drop(state);
                     wake();
@@ -287,7 +297,7 @@ fn cancel(child: &mut Child) {
 impl Drop for LogStream {
     fn drop(&mut self) {
         // Kill synchronously, reap on the monitor: leaving the view does not
-        // block on pipe readers or leave a Docker CLI alive on application exit.
+        // block on pipe readers or leave a log CLI alive on application exit.
         cancel(&mut self.child.lock().unwrap());
         if let Some(stop) = self.stop.take() {
             let _ = stop.send(());
@@ -381,6 +391,48 @@ mod tests {
                 }
             }
             assert!(Instant::now() < deadline, "log process did not complete");
+            thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn machine_reader_uses_selected_cli_state_and_literal_name() {
+        use std::os::unix::fs::PermissionsExt;
+        let directory = tempfile::tempdir().unwrap();
+        let executable = directory.path().join("chosen smol");
+        std::fs::write(
+            &executable,
+            "#!/bin/sh\nprintf '[%s]\\n' \"$@\" \"$SMOLVM_DATA_DIR\" \"$NO_COLOR\" \"$RUST_LOG\"\n",
+        )
+        .unwrap();
+        std::fs::set_permissions(&executable, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let state_dir = directory.path().join("chosen state");
+        let runtime = crate::runtime::Runtime {
+            executable,
+            state_dir: Some(state_dir.clone()),
+        };
+        let stream = LogStream::machine(&runtime, "literal; echo unsafe", || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut revision = 0;
+        loop {
+            if let Some(snapshot) = stream.snapshot_after(revision) {
+                revision = snapshot.revision;
+                if snapshot.status == Status::Finished(0) {
+                    assert_eq!(
+                        snapshot.text,
+                        format!(
+                            "[_engine]\n[machine]\n[logs]\n[--name]\n[literal; echo unsafe]\n[--tail]\n[200]\n[--follow]\n[{}]\n[1]\n[error]\n",
+                            state_dir.display()
+                        )
+                    );
+                    break;
+                }
+            }
+            assert!(
+                Instant::now() < deadline,
+                "machine log reader did not complete"
+            );
             thread::sleep(Duration::from_millis(10));
         }
     }

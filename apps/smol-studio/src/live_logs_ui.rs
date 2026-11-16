@@ -39,6 +39,47 @@ impl LiveLogs {
         }
     }
     pub fn show(&mut self, ui: &mut egui::Ui, id: &str, enabled: bool) {
+        let ctx = ui.ctx().clone();
+        self.show_reader(
+            ui,
+            &format!("container:{id}"),
+            enabled,
+            "Waiting for container output…",
+            || {
+                LogStream::container(id, move || {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33))
+                })
+            },
+        );
+    }
+    pub fn show_machine(
+        &mut self,
+        ui: &mut egui::Ui,
+        runtime: &smol_studio::runtime::Runtime,
+        name: &str,
+        enabled: bool,
+    ) {
+        let ctx = ui.ctx().clone();
+        self.show_reader(
+            ui,
+            &format!("machine:{name}"),
+            enabled,
+            "Waiting for workload output…",
+            || {
+                LogStream::machine(runtime, name, move || {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33))
+                })
+            },
+        );
+    }
+    fn show_reader(
+        &mut self,
+        ui: &mut egui::Ui,
+        id: &str,
+        enabled: bool,
+        empty_hint: &str,
+        start: impl FnOnce() -> Result<LogStream, String>,
+    ) {
         if self.id != id {
             let visible = self.visible;
             self.reset();
@@ -46,10 +87,7 @@ impl LiveLogs {
             self.id = id.to_owned();
         }
         if self.visible && enabled && !self.paused && self.stream.is_none() {
-            let ctx = ui.ctx().clone();
-            match LogStream::container(id, move || {
-                ctx.request_repaint_after(std::time::Duration::from_millis(33))
-            }) {
+            match start() {
                 Ok(stream) => {
                     self.stream = Some(stream);
                     self.revision = 0;
@@ -108,13 +146,18 @@ impl LiveLogs {
         if let Status::Failed(error) = &self.status {
             design::error_notice(ui, "Logs could not be followed.", error);
         }
+        ui.label(
+            RichText::new("Recent output · starts with the last 200 lines")
+                .size(11.0)
+                .color(MUTED),
+        );
         ui.add_space(8.0);
         design::search(ui, &mut self.filter, "Filter log lines…");
         ui.add_space(12.0);
         if self.text.is_empty() {
             ui.label(
                 RichText::new(if self.status == Status::Following && !self.paused {
-                    "Waiting for container output…"
+                    empty_hint
                 } else {
                     "No output received."
                 })
@@ -156,7 +199,7 @@ impl LiveLogs {
                 ui.set_width(ui.available_width());
                 ui.spacing_mut().interact_size.y = 18.0;
                 egui::ScrollArea::both()
-                    .id_salt(("container-live-log-lines", id))
+                    .id_salt(("live-log-lines", id))
                     .auto_shrink([false, true])
                     .stick_to_bottom(true)
                     .max_height((ui.clip_rect().bottom() - ui.cursor().top() - 16.0).max(100.0))

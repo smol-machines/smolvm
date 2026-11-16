@@ -45,7 +45,7 @@ pub struct Studio {
     filter: Filter,
     query: String,
     tab: Tab,
-    logs: Option<(String, String)>,
+    logs: crate::live_logs_ui::LiveLogs,
     files: crate::files_ui::FilesView,
     pending: Option<Operation>,
     schedule: RefreshSchedule,
@@ -86,7 +86,7 @@ impl Studio {
             filter: Filter::All,
             query: String::new(),
             tab: Tab::Overview,
-            logs: None,
+            logs: crate::live_logs_ui::LiveLogs::default(),
             files: crate::files_ui::FilesView::default(),
             pending: None,
             schedule: RefreshSchedule::default(),
@@ -163,16 +163,15 @@ impl Studio {
                         .any(|m| Some(&m.name) == self.selected.as_ref())
                     {
                         self.selected = self.machines.first().map(|m| m.name.clone());
-                        self.logs = None;
+                        self.logs.reset();
                         self.tab = Tab::Overview;
                     }
                     if self.activity == "Connecting to Smol…" {
                         self.activity = "Ready".into();
                     }
                 }
-                Ok(Payload::Logs { name, text }) => {
-                    self.logs = Some((name, text));
-                }
+                // The visible Logs tab owns its reader independently of the operation worker.
+                Ok(Payload::Logs { .. }) => {}
                 Ok(Payload::Output { name, text }) => {
                     self.output = Some((name, text));
                 }
@@ -199,7 +198,7 @@ impl Studio {
                         self.create = None;
                         self.selected = Some(m.name);
                         self.tab = Tab::Overview;
-                        self.logs = None;
+                        self.logs.reset();
                         self.query.clear();
                         self.filter = Filter::All;
                     }
@@ -440,7 +439,7 @@ impl Studio {
         {
             self.selected = visible.first().map(|&i| self.machines[i].name.clone());
             self.tab = Tab::Overview;
-            self.logs = None;
+            self.logs.reset();
         }
         if visible.is_empty() {
             ui.add_space(40.0);
@@ -470,7 +469,7 @@ impl Studio {
                     {
                         self.selected = Some(m.name.clone());
                         self.tab = Tab::Overview;
-                        self.logs = None;
+                        self.logs.reset();
                     }
                 }
             });
@@ -589,9 +588,7 @@ impl Studio {
             ] {
                 if design::tab(ui, self.tab == tab, label).clicked() {
                     self.tab = tab;
-                    if tab == Tab::Logs && enabled {
-                        self.submit(Operation::Logs(m.name.clone()));
-                    }
+                    self.logs.set_visible(tab == Tab::Logs);
                 }
             }
         });
@@ -726,40 +723,7 @@ impl Studio {
             }
 
             Tab::Logs => {
-                ui.horizontal(|ui| {
-                    ui.label(RichText::new("Last 200 lines").small().color(MUTED));
-                    if ui
-                        .add_enabled(enabled, egui::Button::new("Reload logs"))
-                        .clicked()
-                    {
-                        self.submit(Operation::Logs(m.name.clone()));
-                    }
-                });
-                ui.add_space(10.0);
-                let log = self
-                    .logs
-                    .as_ref()
-                    .filter(|(name, _)| name == &m.name)
-                    .map(|(_, text)| text.as_str());
-                match log {
-                    None => {
-                        ui.label("Load this machine’s workload output with Reload logs.");
-                    }
-                    Some("") => {
-                        ui.label("No workload output yet.");
-                    }
-                    Some(text) => {
-                        egui::ScrollArea::both()
-                            .id_salt(("logs", &m.name))
-                            .max_height(ui.available_height())
-                            .show(ui, |ui| {
-                                ui.add(
-                                    egui::Label::new(RichText::new(text).monospace().size(12.0))
-                                        .selectable(true),
-                                );
-                            });
-                    }
-                }
+                self.logs.show_machine(ui, &self.runtime, &m.name, enabled);
             }
         }
     }
@@ -945,7 +909,7 @@ impl Studio {
                         self.inventory_valid = false;
                         self.machines.clear();
                         self.selected = None;
-                        self.logs = None;
+                        self.logs.reset();
                         self.error = None;
                         self.activity = "Connecting to Smol…".into();
                         self.settings = false;
@@ -977,6 +941,12 @@ impl eframe::App for Studio {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
+        self.logs.set_visible(
+            self.workspace == Workspace::Local
+                && self.tab == Tab::Logs
+                && self.inventory_valid
+                && ctx.input(|i| i.viewport().minimized != Some(true)),
+        );
         self.docker.logic(&self.runtime);
         let docker_visible = self.workspace == Workspace::Containers
             && ctx.input(|i| i.viewport().minimized != Some(true));

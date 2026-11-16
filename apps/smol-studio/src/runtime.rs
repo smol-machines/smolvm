@@ -204,17 +204,7 @@ impl Runtime {
         Ok(args)
     }
 
-    fn execute(&self, op: &Operation, shutdown: &AtomicBool) -> Result<Payload, String> {
-        if let Operation::UpdateSettings { original, .. } = op {
-            let Payload::Settings(current) =
-                self.execute(&Operation::ReadSettings(original.name.clone()), shutdown)?
-            else {
-                return Err("Cannot recheck the machine's current settings.".into());
-            };
-            if current.as_ref() != original.as_ref() {
-                return Err("This machine changed since you opened its settings. Reload before applying changes.".into());
-            }
-        }
+    pub(crate) fn command(&self, op: &Operation) -> Result<Command, String> {
         #[cfg(windows)]
         if self
             .executable
@@ -245,6 +235,21 @@ impl Runtime {
             use std::os::windows::process::CommandExt;
             command.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
         }
+        Ok(command)
+    }
+
+    fn execute(&self, op: &Operation, shutdown: &AtomicBool) -> Result<Payload, String> {
+        if let Operation::UpdateSettings { original, .. } = op {
+            let Payload::Settings(current) =
+                self.execute(&Operation::ReadSettings(original.name.clone()), shutdown)?
+            else {
+                return Err("Cannot recheck the machine's current settings.".into());
+            };
+            if current.as_ref() != original.as_ref() {
+                return Err("This machine changed since you opened its settings. Reload before applying changes.".into());
+            }
+        }
+        let mut command = self.command(op)?;
         let limit = match op {
             Operation::Refresh | Operation::ReadSettings(_) | Operation::ListFiles { .. } => {
                 INVENTORY_LIMIT
