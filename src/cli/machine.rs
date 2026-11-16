@@ -362,9 +362,36 @@ fn try_spawn_detached_cleanup(vm_name: &str, pid: i32, start_time: Option<u64>) 
     result.is_ok()
 }
 
+/// Prepare the managed Kubernetes image feed using the selected engine's state.
+#[derive(Args, Debug)]
+pub struct ImageFeedCmd {
+    #[arg(long)]
+    machine: Option<String>,
+    #[arg(long, hide = true)]
+    root: Option<std::path::PathBuf>,
+}
+
+impl ImageFeedCmd {
+    fn run(self) -> smolvm::Result<()> {
+        let root = match self.root {
+            Some(root) => root,
+            None => smolvm::image_feed::default_root()?,
+        };
+        let feed = smolvm::image_feed::prepare(&root, self.machine.as_deref())?;
+        println!(
+            "{}",
+            serde_json::to_string(&feed).map_err(std::io::Error::other)?
+        );
+        Ok(())
+    }
+}
+
 /// Manage machines
 #[derive(Subcommand, Debug)]
 pub enum MachineCmd {
+    /// Prepare local images for managed Kubernetes
+    #[command(hide = true)]
+    ImageFeed(ImageFeedCmd),
     /// Run a container image in an ephemeral machine
     Run(RunCmd),
 
@@ -481,11 +508,12 @@ impl MachineCmd {
         // over successive runs. Other commands sweep everything.
         if matches!(self, MachineCmd::Run(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
-        } else {
+        } else if !matches!(self, MachineCmd::ImageFeed(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
 
         match self {
+            MachineCmd::ImageFeed(cmd) => cmd.run(),
             MachineCmd::Run(cmd) => cmd.run(),
             MachineCmd::Exec(cmd) => cmd.run(),
             MachineCmd::Create(cmd) => cmd.run(),

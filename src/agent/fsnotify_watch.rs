@@ -19,9 +19,10 @@
 //! inode, a watcher inside the container wakes up exactly as if the change had
 //! happened locally.
 //!
-//! The watcher is best-effort and self-contained: if the kernel lacks the patch,
-//! or the connection drops when the VM exits, propagation simply stops — the
-//! mount still serves reads. Dropping [`FsNotifyWatcher`] stops the thread.
+//! The watcher is best-effort and follows the VM lifetime: pending changes are
+//! bounded and coalesced, and a dropped agent connection is retried. A kernel
+//! without the injection hook still serves mount reads. Dropping
+//! [`FsNotifyWatcher`] stops the thread.
 
 use crate::agent::AgentClient;
 use crate::data::storage::HostMount;
@@ -35,6 +36,9 @@ use std::sync::Arc;
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
+
+mod queue;
+use queue::EventQueue;
 
 /// Whether host directories are watched at all. Setting SMOL_NO_HOT_RELOAD
 /// disables it (e.g. very large trees, or privacy preference); the launcher
@@ -58,7 +62,8 @@ const COALESCE_WINDOW: Duration = Duration::from_millis(25);
 /// a failed launch can tear down immediately instead of joining a sleeping
 /// exponential-backoff thread.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const CONNECT_RETRY_LIMIT: usize = 200;
+const MAX_BATCH_EVENTS: usize = 256;
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A single watched mount: host source directory → guest virtiofs staging base.
 struct WatchTarget {
@@ -132,10 +137,15 @@ impl FsNotifyWatcher {
         // (that is exactly the read-only-source hot-reload case).
         let targets: Vec<WatchTarget> = mounts
             .into_iter()
-            .filter(|(source, _)| source.is_dir())
-            .map(|(host_source, tag)| WatchTarget {
-                host_source,
-                guest_base: format!("{GUEST_VIRTIOFS_ROOT}/{tag}"),
+            .filter_map(|(source, tag)| {
+                // FSEvents reports resolved paths (e.g. /private/var for
+                // /var). Match the same directory even if the caller used an
+                // alias; virtiofs holds that directory for the mount lifetime.
+                let host_source = source.canonicalize().ok()?;
+                host_source.is_dir().then_some(WatchTarget {
+                    host_source,
+                    guest_base: format!("{GUEST_VIRTIOFS_ROOT}/{tag}"),
+                })
             })
             .collect();
         if targets.is_empty() {
@@ -170,13 +180,9 @@ impl Drop for FsNotifyWatcher {
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
 fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>, poll: bool) {
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
-
-    // The receiver is dropped only when this thread exits, so a send error
-    // just means we're shutting down.
-    let handler = move |res| {
-        let _ = tx.send(res);
-    };
+    let rx = Arc::new(EventQueue::new(stop.clone()));
+    let tx = rx.clone();
+    let handler = move |res| tx.push(res);
     let watcher: notify::Result<Box<dyn Watcher + Send>> = if poll {
         notify::PollWatcher::new(
             handler,
@@ -193,6 +199,16 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
             return;
         }
     };
+
+    // Set stop before dropping the OS watcher, including on unwinding: its
+    // callback may be waiting for queue capacity and its destructor joins it.
+    struct StopOnExit(Arc<AtomicBool>);
+    impl Drop for StopOnExit {
+        fn drop(&mut self) {
+            self.0.store(true, Ordering::SeqCst);
+        }
+    }
+    let _stop_on_exit = StopOnExit(stop.clone());
 
     for t in &targets {
         if let Err(e) = watcher.watch(&t.host_source, RecursiveMode::Recursive) {
@@ -229,6 +245,9 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         // Coalesce the rest of the burst (a save fans out into several events).
         let deadline = Instant::now() + COALESCE_WINDOW;
         while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
+            if batch.len() >= MAX_BATCH_EVENTS {
+                break;
+            }
             match rx.recv_timeout(remaining) {
                 Ok(Ok(ev)) => collect_events(&ev, &targets, &mut announced, &mut batch),
                 Ok(Err(_)) => {}
@@ -241,31 +260,52 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         }
         dedup(&mut batch);
 
-        if let Err(e) = client.fsnotify(batch) {
-            // The VM has almost certainly gone away (the command exited). Stop
-            // quietly rather than spinning on a dead socket.
-            debug!(error = %e, "fsnotify inject failed; stopping watcher");
-            break;
+        for chunk in batch.chunks(MAX_BATCH_EVENTS) {
+            if !deliver(&mut client, chunk, &socket_path, &stop) {
+                return;
+            }
         }
     }
 }
 
 fn connect_to_agent(socket_path: &Path, stop: &AtomicBool) -> Option<AgentClient> {
     let mut last_error = None;
-    for _ in 0..CONNECT_RETRY_LIMIT {
-        if stop.load(Ordering::SeqCst) {
-            return None;
-        }
-        match AgentClient::connect(socket_path) {
+    // A cold boot can spend more than ten seconds preparing disks before the
+    // guest accepts connections. The VM process owns this watcher: only its
+    // shutdown signal, not an arbitrary startup deadline, ends the watch.
+    while !stop.load(Ordering::SeqCst) {
+        match AgentClient::connect_for_sampling(socket_path, CONNECT_TIMEOUT) {
             Ok(client) => return Some(client),
             Err(error) => last_error = Some(error),
         }
         std::thread::sleep(CONNECT_RETRY_INTERVAL);
     }
     if let Some(error) = last_error {
-        debug!(%error, "fsnotify watcher could not connect to agent; disabled");
+        debug!(%error, "fsnotify watcher stopped before the agent became available");
     }
     None
+}
+
+fn deliver(
+    client: &mut AgentClient,
+    batch: &[FsNotifyEvent],
+    socket_path: &Path,
+    stop: &AtomicBool,
+) -> bool {
+    while !stop.load(Ordering::SeqCst) {
+        match client.fsnotify(batch.to_vec()) {
+            Ok(()) => return true,
+            Err(error) => {
+                debug!(%error, "fsnotify connection lost; reconnecting before replaying events");
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                let Some(next) = connect_to_agent(socket_path, stop) else {
+                    return false;
+                };
+                *client = next;
+            }
+        }
+    }
+    false
 }
 
 /// Maximum depth to inspect for recent file modifications when a directory event fires.
@@ -507,12 +547,15 @@ fn matching_target<'a>(path: &Path, targets: &'a [WatchTarget]) -> Option<&'a Wa
 
 /// Join a guest base path with a host-relative path, normalizing separators.
 fn join_guest(base: &str, rel: &Path) -> String {
-    let rel = rel.to_string_lossy();
-    if rel.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}/{rel}")
+    // Host separators differ on Windows; guest paths always use '/'. Keep a
+    // literal backslash in a Unix filename instead of replacing it globally.
+    let mut path = String::with_capacity(base.len() + rel.as_os_str().len() + 1);
+    path.push_str(base);
+    for part in rel.components() {
+        path.push('/');
+        path.push_str(&part.as_os_str().to_string_lossy());
     }
+    path
 }
 
 /// Map a notify [`EventKind`] to the closest `FS_*` mask.
@@ -556,6 +599,123 @@ fn dedup(batch: &mut Vec<FsNotifyEvent>) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_agent_can_become_ready_after_the_old_ten_second_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let socket = socket.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || connect_to_agent(&socket, &stop))
+        };
+        std::thread::sleep(Duration::from_millis(10_500));
+        let waiting = !worker.is_finished();
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let connected = worker.join().unwrap();
+        assert!(waiting, "watcher abandoned a VM that was still booting");
+        assert!(connected.is_some());
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_connection_replays_the_pending_events() {
+        use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut client = AgentClient::connect(&socket).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer); // A connection accepted before the guest was ready went away.
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                struct Stop(Arc<AtomicBool>);
+                impl Drop for Stop {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _stop = Stop(stop);
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut peer = loop {
+                    if let Ok((peer, _)) = listener.accept() {
+                        break peer;
+                    }
+                    assert!(Instant::now() < deadline, "watcher did not reconnect");
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                // BSD accepts inherit O_NONBLOCK from the listener.
+                peer.set_nonblocking(false).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut header = [0; 4];
+                peer.read_exact(&mut header).unwrap();
+                let mut frame = vec![0; u32::from_be_bytes(header) as usize];
+                peer.read_exact(&mut frame).unwrap();
+                let request: Envelope<AgentRequest> = serde_json::from_slice(&frame).unwrap();
+                let AgentRequest::FsNotify { events } = request.body else {
+                    panic!("expected fsnotify")
+                };
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].path, "/run/smolvm/virtiofs/smolvm0/first.tar");
+                peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                    .unwrap();
+            })
+        };
+        assert!(deliver(
+            &mut client,
+            &[FsNotifyEvent {
+                path: "/run/smolvm/virtiofs/smolvm0/first.tar".into(),
+                mask: fsnotify_mask::FS_CREATE,
+            }],
+            &socket,
+            &stop
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_agent_that_never_reads_has_a_bounded_notification_write() {
+        let (stream, peer) = crate::platform::uds::UdsStream::pair().unwrap();
+        stream.as_socket().set_send_buffer_size(4096).unwrap();
+        peer.as_socket().set_recv_buffer_size(4096).unwrap();
+        stream.set_write_timeout(Some(CONNECT_TIMEOUT)).unwrap();
+        let mut client = AgentClient::from_stream(stream);
+        let started = Instant::now();
+        let error = client
+            .fsnotify(vec![
+                FsNotifyEvent {
+                    path: format!("/run/smolvm/virtiofs/smolvm0/{}", "x".repeat(4000)),
+                    mask: fsnotify_mask::FS_MODIFY,
+                };
+                MAX_BATCH_EVENTS
+            ])
+            .unwrap_err();
+        assert!(error.to_string().contains("write progress"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn shutting_down_the_vm_cancels_waiting_for_its_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("absent.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let stop = stop.clone();
+            std::thread::spawn(move || connect_to_agent(&socket, &stop))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        assert!(worker.join().unwrap().is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
     fn target() -> WatchTarget {
         WatchTarget {
             host_source: PathBuf::from("/host/project"),
@@ -566,7 +726,10 @@ mod tests {
     #[test]
     fn join_guest_maps_relative_paths() {
         assert_eq!(
-            join_guest("/run/smolvm/virtiofs/smolvm0", Path::new("src/app.js")),
+            join_guest(
+                "/run/smolvm/virtiofs/smolvm0",
+                &Path::new("src").join("app.js")
+            ),
             "/run/smolvm/virtiofs/smolvm0/src/app.js"
         );
         assert_eq!(
