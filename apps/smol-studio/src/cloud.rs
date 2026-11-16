@@ -132,6 +132,11 @@ pub enum Event {
         id: String,
         text: String,
     },
+    LogError {
+        tenant: Option<String>,
+        id: String,
+        error: String,
+    },
     Completed,
     Error(String),
 }
@@ -404,6 +409,16 @@ impl Backend {
         tenant: Option<&str>,
         value: Option<&Value>,
     ) -> Result<Vec<u8>> {
+        self.request_with_status_error(method, path, tenant, value, status_error)
+    }
+    fn request_with_status_error(
+        &mut self,
+        method: Method,
+        path: &str,
+        tenant: Option<&str>,
+        value: Option<&Value>,
+        explain_status: fn(u16) -> String,
+    ) -> Result<Vec<u8>> {
         if let Some(id) = tenant {
             segment(id)?;
         }
@@ -429,11 +444,11 @@ impl Backend {
                 continue;
             }
             if !(200..300).contains(&status) {
-                return Err(status_error(status));
+                return Err(explain_status(status));
             }
             return Ok(bytes);
         }
-        Err(status_error(401))
+        Err(explain_status(401))
     }
     fn snapshot(&mut self, tenant: Option<String>) -> Result<Event> {
         let identity: Identity =
@@ -592,12 +607,30 @@ impl Backend {
                         Some(json!({"command":["/bin/sh","-lc",command],"timeoutSeconds":60})),
                     ),
                 };
-                let bytes = self.request(
+                let response = self.request_with_status_error(
                     method,
                     &format!("{base}{suffix}"),
                     tenant.as_deref(),
                     value.as_ref(),
-                )?;
+                    if matches!(action, MachineAction::Logs) {
+                        |status| {
+                            if status == 404 {
+                                "Console logs are not available for this machine.".into()
+                            } else {
+                                status_error(status)
+                            }
+                        }
+                    } else {
+                        status_error
+                    },
+                );
+                let bytes = match response {
+                    Ok(bytes) => bytes,
+                    Err(error) if matches!(action, MachineAction::Logs) => {
+                        return Ok(Event::LogError { tenant, id, error });
+                    }
+                    Err(error) => return Err(error),
+                };
                 match action {
                     MachineAction::Logs => Ok(Event::Output {
                         kind: OutputKind::Logs,
@@ -815,6 +848,54 @@ mod tests {
             expires_at: now() + 3600,
         });
         backend
+    }
+    #[test]
+    fn failed_log_reads_keep_their_machine_scope_and_can_be_retried() {
+        let (url, requests, join) = server(vec![
+            (503, "unavailable".into()),
+            (404, "no logs".into()),
+            (200, "data: {\"message\":\"recovered output\"}\n\n".into()),
+        ]);
+        let mut b = backend(&url);
+        let action = Action::Machine {
+            tenant: Some("t-team".into()),
+            id: "m-id".into(),
+            action: MachineAction::Logs,
+        };
+        match b.act(action.clone()).unwrap() {
+            Event::LogError { tenant, id, error } => {
+                assert_eq!(tenant.as_deref(), Some("t-team"));
+                assert_eq!(id, "m-id");
+                assert!(!error.is_empty());
+            }
+            _ => panic!("Expected a machine-scoped log failure"),
+        }
+        match b.act(action.clone()).unwrap() {
+            Event::LogError { error, .. } => {
+                assert_eq!(error, "Console logs are not available for this machine.");
+            }
+            _ => panic!("Expected a log-specific missing-output error"),
+        }
+        match b.act(action).unwrap() {
+            Event::Output {
+                kind: OutputKind::Logs,
+                tenant,
+                id,
+                text,
+            } => {
+                assert_eq!(tenant.as_deref(), Some("t-team"));
+                assert_eq!(id, "m-id");
+                assert_eq!(text, "recovered output\n");
+            }
+            _ => panic!("Expected successful log retry"),
+        }
+        join.join().unwrap();
+        let requests: Vec<_> = requests.try_iter().collect();
+        assert_eq!(requests.len(), 3);
+        for request in requests {
+            assert!(request.starts_with("GET /v1/machines/m-id/logs?tail=200&follow=false "));
+            assert!(request.to_lowercase().contains("smol-tenant: t-team\r\n"));
+        }
     }
     #[test]
     fn every_machine_action_carries_account_and_stable_id() {

@@ -9,7 +9,7 @@ use smol_studio::{
 };
 use std::time::{Duration, Instant};
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 enum Tab {
     #[default]
     Overview,
@@ -31,7 +31,10 @@ pub struct CloudView {
     focus_selected: bool,
     query: String,
     output: String,
-    logs: Option<String>,
+    logs: Option<(String, Instant)>,
+    log_filter: String,
+    log_error: Option<String>,
+    loading_logs: bool,
     tab: Tab,
     create_error: Option<String>,
     creating: bool,
@@ -57,6 +60,9 @@ impl CloudView {
             query: String::new(),
             output: String::new(),
             logs: None,
+            log_filter: String::new(),
+            log_error: None,
+            loading_logs: false,
             tab: Tab::Overview,
             create_error: None,
             creating: false,
@@ -92,10 +98,21 @@ impl CloudView {
         }
         let mutation = action.mutates();
         let creating = matches!(action, Action::Create { .. });
+        let loading_logs = matches!(
+            action,
+            Action::Machine {
+                action: MachineAction::Logs,
+                ..
+            }
+        );
         match self.worker.submit(action) {
             Ok(()) => {
                 self.pending = true;
                 self.creating = creating;
+                self.loading_logs = loading_logs;
+                if loading_logs {
+                    self.log_error = None;
+                }
                 self.mutation = mutation;
                 self.error = None;
             }
@@ -119,6 +136,7 @@ impl CloudView {
             let mutated = self.mutation;
             let creating = std::mem::take(&mut self.creating);
             self.pending = false;
+            self.loading_logs = false;
             self.mutation = false;
             match event {
                 Event::SignedOut => {
@@ -173,8 +191,16 @@ impl CloudView {
                     if tenant == self.tenant && Some(&id) == self.selected.as_ref() {
                         match kind {
                             OutputKind::Command => self.output = text,
-                            OutputKind::Logs => self.logs = Some(text),
+                            OutputKind::Logs => {
+                                self.logs = Some((text, Instant::now()));
+                                self.log_error = None;
+                            }
                         }
+                    }
+                }
+                Event::LogError { tenant, id, error } => {
+                    if tenant == self.tenant && Some(&id) == self.selected.as_ref() {
+                        self.log_error = Some(error);
                     }
                 }
                 Event::Completed => {
@@ -490,62 +516,72 @@ impl CloudView {
         egui::CentralPanel::default()
             .frame(egui::Frame::new().fill(SURFACE).inner_margin(24))
             .show(ui, |ui| {
-                egui::ScrollArea::vertical()
-                    .id_salt("cloud-detail")
-                    .show(ui, |ui| {
-                        let Some(machine) = self
-                            .snapshot
-                            .machines
-                            .iter()
-                            .find(|m| Some(&m.id) == self.selected.as_ref())
-                            .cloned()
-                        else {
-                            ui.add_space(100.0);
-                            ui.vertical_centered(|ui| {
-                                ui.heading(if self.query.is_empty() {
-                                    "Your cloud workspace"
-                                } else {
-                                    "No matching machines"
-                                });
-                                ui.label(
-                                    RichText::new(
-                                        if self.query.is_empty() { "Select a machine to see its resources and activity." } else { "Try another name or clear your search." },
-                                    )
-                                    .color(MUTED),
-                                );
-                                if !self.query.is_empty() && ui.button("Clear search").clicked() {
-                                    self.query.clear();
-                                }
-                            });
-                            return;
-                        };
-                        ui.add(
-                            egui::Label::new(design::heading(machine.display_name(), 24.0))
-                                .truncate(),
-                        )
-                        .on_hover_text(machine.display_name());
-                        if let Some(source) = &machine.source {
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(
-                                        source.reference.as_deref().unwrap_or(&source.source_type),
-                                    )
-                                    .small()
-                                    .color(MUTED),
-                                )
-                                .truncate(),
-                            );
-                        }
-                        ui.add_space(12.0);
-                        design::badge(
-                            ui,
-                            if machine.is_started() && !machine.is_ready() {
-                                "starting"
-                            } else {
-                                &machine.state
-                            },
+                let Some(machine) = self
+                    .snapshot
+                    .machines
+                    .iter()
+                    .find(|m| Some(&m.id) == self.selected.as_ref())
+                    .cloned()
+                else {
+                    ui.add_space(100.0);
+                    ui.vertical_centered(|ui| {
+                        ui.heading(if self.query.is_empty() {
+                            "Your cloud workspace"
+                        } else {
+                            "No matching machines"
+                        });
+                        ui.label(
+                            RichText::new(
+                                if self.query.is_empty() { "Select a machine to see its resources and activity." } else { "Try another name or clear your search." },
+                            )
+                            .color(MUTED),
                         );
-                        ui.add_space(18.0);
+                        if !self.query.is_empty() && ui.button("Clear search").clicked() {
+                            self.query.clear();
+                        }
+                    });
+                    return;
+                };
+                ui.add(
+                    egui::Label::new(design::heading(machine.display_name(), 24.0))
+                        .truncate(),
+                )
+                .on_hover_text(machine.display_name());
+                ui.horizontal(|ui| {
+                    design::badge(ui, if machine.is_started() && !machine.is_ready() { "starting" } else { &machine.state });
+                    if let Some(source) = &machine.source {
+                        let label = source.reference.as_deref().unwrap_or(&source.source_type);
+                        ui.add(egui::Label::new(RichText::new(label).small().color(MUTED)).truncate()).on_hover_text(label);
+                    }
+                });
+                ui.add_space(12.0);
+                ui.horizontal(|ui| {
+                    for (tab, label) in [
+                        (Tab::Overview, "Overview"),
+                        (Tab::Console, "Console"),
+                        (Tab::Logs, "Logs"),
+                    ] {
+                        if design::tab(ui, self.tab == tab, label).clicked() {
+                            self.tab = tab;
+                            if tab == Tab::Logs
+                                && self.logs.is_none()
+                                && self.valid
+                                && !self.pending
+                                && identity.allows("machine:read")
+                            {
+                                self.machine(machine.id.clone(), MachineAction::Logs);
+                            }
+                        }
+                    }
+                });
+                ui.separator();
+                ui.add_space(16.0);
+                if self.tab == Tab::Logs {
+                    self.logs_ui(ui, &machine.id, identity.allows("machine:read"));
+                    return;
+                }
+                egui::ScrollArea::vertical().id_salt(("cloud-detail", &self.tenant, &machine.id, self.tab)).auto_shrink([false, false]).show(ui, |ui| {
+                    if self.tab == Tab::Overview {
                         ui.add_enabled_ui(self.valid && !self.pending, |ui| {
                             ui.horizontal_wrapped(|ui| {
                                 if machine.is_ready() && ui
@@ -612,215 +648,257 @@ impl CloudView {
                                 });
                             });
                         });
+
                         ui.add_space(20.0);
-                        ui.horizontal(|ui| {
-                            for (tab, label) in [
-                                (Tab::Overview, "Overview"),
-                                (Tab::Console, "Console"),
-                                (Tab::Logs, "Logs"),
-                            ] {
-                                if design::tab(ui, self.tab == tab, label).clicked() {
-                                    self.tab = tab;
-                                    if tab == Tab::Logs
-                                        && self.logs.is_none()
-                                        && self.valid
-                                        && !self.pending
-                                        && identity.allows("machine:read")
-                                    {
-                                        self.machine(machine.id.clone(), MachineAction::Logs);
-                                    }
-                                }
-                            }
-                        });
-                        ui.separator();
-                        ui.add_space(16.0);
-                        if self.tab == Tab::Overview {
-                            if let Some(resources) = &machine.resources {
-                                ui.label(design::heading("Configuration", 14.0));
-                                ui.add_space(10.0);
-                                design::card().show(ui, |ui| {
-                                    ui.set_width(ui.available_width());
-                                    ui.columns(2, |columns| {
-                                        design::metric(
-                                            &mut columns[0],
-                                            "CPU limit",
-                                            &resources
-                                                .cpus
-                                                .map(|n| n.to_string())
-                                                .unwrap_or_else(|| "—".into()),
-                                            "cores",
-                                        );
-                                        design::metric(
-                                            &mut columns[1],
-                                            "Memory limit",
-                                            &resources
-                                                .memory_mb
-                                                .map(|n| n.to_string())
-                                                .unwrap_or_else(|| "—".into()),
-                                            "MB",
-                                        );
-                                    });
-                                    if let Some(disk) = resources.disk_gb {
-                                        ui.label(
-                                            RichText::new(format!("Disk limit: {disk} GB"))
-                                                .small()
-                                                .color(MUTED),
-                                        );
-                                    }
-                                });
-                                ui.add_space(24.0);
-                            }
+                        if let Some(resources) = &machine.resources {
+                            ui.label(design::heading("Configuration", 14.0));
+                            ui.add_space(10.0);
                             design::card().show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                design::property(ui, "Account", self.account_label());
-                                ui.add_space(8.0);
-                                ui.horizontal(|ui| {
-                                    design::eyebrow(ui, "MACHINE ID");
-                                    if ui.small_button("Copy").clicked() {
-                                        ctx.copy_text(machine.id.clone());
-                                    }
+                                ui.columns(2, |columns| {
+                                    design::metric(
+                                        &mut columns[0],
+                                        "CPU limit",
+                                        &resources
+                                            .cpus
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "—".into()),
+                                        "cores",
+                                    );
+                                    design::metric(
+                                        &mut columns[1],
+                                        "Memory limit",
+                                        &resources
+                                            .memory_mb
+                                            .map(|n| n.to_string())
+                                            .unwrap_or_else(|| "—".into()),
+                                        "MB",
+                                    );
                                 });
-                                ui.add(
-                                    egui::Label::new(
-                                        RichText::new(&machine.id).monospace().size(12.0),
-                                    )
-                                    .wrap()
-                                    .selectable(true),
-                                );
-                            });
-                        } else if self.tab == Tab::Console {
-                            if !machine.is_ready() {
-                                ui.label(RichText::new("Start this machine and wait for it to be ready to run commands.").size(12.0).color(MUTED));
-                                ui.add_space(12.0);
-                            }
-                            design::eyebrow(ui, "CONSOLE");
-                            ui.add_space(8.0);
-                            ui.label(
-                                RichText::new("Run a command · 60 second limit")
-                                    .small()
-                                    .color(MUTED),
-                            );
-                            ui.add(
-                                egui::TextEdit::multiline(&mut self.command)
-                                    .desired_rows(2)
-                                    .desired_width(f32::INFINITY)
-                                    .font(egui::TextStyle::Monospace)
-                                    .hint_text("uname -a"),
-                            );
-                            if ui
-                                .add_enabled(
-                                    self.valid
-                                        && !self.pending
-                                        && machine.is_ready()
-                                        && identity.allows("machine:exec")
-                                        && !self.command.trim().is_empty(),
-                                    design::primary("Run command"),
-                                )
-                                .clicked()
-                            {
-                                self.output.clear();
-                                self.machine(
-                                    machine.id.clone(),
-                                    MachineAction::Exec(self.command.clone()),
-                                );
-                            }
-                            if !self.output.is_empty() {
-                                ui.add_space(16.0);
-                                ui.horizontal(|ui| {
-                                    design::eyebrow(ui, "OUTPUT");
-                                    if ui.small_button("Copy").clicked() {
-                                        ctx.copy_text(self.output.clone());
-                                    }
-                                });
-                                egui::ScrollArea::both()
-                                    .id_salt("cloud-output")
-                                    .max_height(300.0)
-                                    .show(ui, |ui| {
-                                        ui.add(
-                                            egui::Label::new(
-                                                RichText::new(&self.output).monospace().size(12.0),
-                                            )
-                                            .selectable(true),
-                                        );
-                                    });
-                            }
-                        } else {
-                            ui.horizontal(|ui| {
-                                ui.label(
-                                    RichText::new("Machine console · snapshot")
-                                        .size(12.0)
-                                        .color(MUTED),
-                                );
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
-                                            .add_enabled(
-                                                self.valid
-                                                    && !self.pending
-                                                    && identity.allows("machine:read"),
-                                                egui::Button::new("Reload logs"),
-                                            )
-                                            .clicked()
-                                        {
-                                            self.machine(machine.id.clone(), MachineAction::Logs);
-                                        }
-                                        if let Some(logs) = &self.logs
-                                            && ui
-                                                .add_enabled(
-                                                    !logs.is_empty(),
-                                                    egui::Button::new("Copy"),
-                                                )
-                                                .clicked()
-                                        {
-                                            ctx.copy_text(logs.clone());
-                                        }
-                                    },
-                                );
-                            });
-                            ui.add_space(12.0);
-                            match &self.logs {
-                                Some(text) if text.is_empty() => {
+                                if let Some(disk) = resources.disk_gb {
                                     ui.label(
-                                        RichText::new("This machine has not written any output.")
+                                        RichText::new(format!("Disk limit: {disk} GB"))
+                                            .small()
                                             .color(MUTED),
                                     );
                                 }
-                                Some(text) => {
-                                    design::card().show(ui, |ui| {
-                                        ui.set_width(ui.available_width());
-                                        let lines: Vec<_> = text.lines().collect();
-                                        ui.spacing_mut().interact_size.y = 18.0;
-                                        egui::ScrollArea::both()
-                                            .id_salt(("cloud-logs", &machine.id))
-                                            .auto_shrink([false, true])
-                                            .max_height((ui.clip_rect().bottom() - ui.cursor().top() - 16.0).max(100.0))
-                                            .show_rows(ui, 18.0, lines.len(), |ui, range| {
-                                                for index in range {
-                                                    ui.add(egui::Label::new(RichText::new(lines[index]).monospace().size(12.0)).wrap_mode(egui::TextWrapMode::Extend).selectable(true));
-                                                }
-                                            });
-                                    });
-                                }
-                                None => {
-                                    ui.label(
-                                        RichText::new(if self.pending {
-                                            "Loading logs…"
-                                        } else {
-                                            "Reload to read this machine’s recent output."
-                                        })
-                                        .color(MUTED),
-                                    );
-                                }
-                            }
+                            });
+                            ui.add_space(24.0);
                         }
-                    });
+                        design::card().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            design::property(ui, "Account", self.account_label());
+                            ui.add_space(8.0);
+                            ui.horizontal(|ui| {
+                                design::eyebrow(ui, "MACHINE ID");
+                                if ui.small_button("Copy").clicked() {
+                                    ctx.copy_text(machine.id.clone());
+                                }
+                            });
+                            ui.add(
+                                egui::Label::new(
+                                    RichText::new(&machine.id).monospace().size(12.0),
+                                )
+                                .wrap()
+                                .selectable(true),
+                            );
+                        });
+                    } else if self.tab == Tab::Console {
+                        if !machine.is_ready() {
+                            ui.label(RichText::new("Start this machine and wait for it to be ready to run commands.").size(12.0).color(MUTED));
+                            ui.add_space(12.0);
+                        }
+                        design::eyebrow(ui, "CONSOLE");
+                        ui.add_space(8.0);
+                        ui.label(
+                            RichText::new("Run a command · 60 second limit")
+                                .small()
+                                .color(MUTED),
+                        );
+                        ui.add(
+                            egui::TextEdit::multiline(&mut self.command)
+                                .desired_rows(2)
+                                .desired_width(f32::INFINITY)
+                                .font(egui::TextStyle::Monospace)
+                                .hint_text("uname -a"),
+                        );
+                        if ui
+                            .add_enabled(
+                                self.valid
+                                    && !self.pending
+                                    && machine.is_ready()
+                                    && identity.allows("machine:exec")
+                                    && !self.command.trim().is_empty(),
+                                design::primary("Run command"),
+                            )
+                            .clicked()
+                        {
+                            self.output.clear();
+                            self.machine(
+                                machine.id.clone(),
+                                MachineAction::Exec(self.command.clone()),
+                            );
+                        }
+                        if !self.output.is_empty() {
+                            ui.add_space(16.0);
+                            ui.horizontal(|ui| {
+                                design::eyebrow(ui, "OUTPUT");
+                                if ui.small_button("Copy").clicked() {
+                                    ctx.copy_text(self.output.clone());
+                                }
+                            });
+                            egui::ScrollArea::both()
+                                .id_salt("cloud-output")
+                                .max_height(300.0)
+                                .show(ui, |ui| {
+                                    ui.add(
+                                        egui::Label::new(
+                                            RichText::new(&self.output).monospace().size(12.0),
+                                        )
+                                        .selectable(true),
+                                    );
+                                });
+                        }
+                    }
+                });
             });
         self.dialogs(&ctx);
+    }
+    fn logs_ui(&mut self, ui: &mut egui::Ui, id: &str, allowed: bool) {
+        let enabled = self.valid && !self.pending && allowed;
+        ui.horizontal(|ui| {
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui
+                    .add_enabled(enabled, egui::Button::new("Reload logs"))
+                    .clicked()
+                {
+                    self.machine(id.to_owned(), MachineAction::Logs);
+                }
+                if ui
+                    .add_enabled(
+                        self.logs.as_ref().is_some_and(|(text, _)| !text.is_empty()),
+                        egui::Button::new("Copy all"),
+                    )
+                    .clicked()
+                    && let Some((text, _)) = &self.logs
+                {
+                    ui.ctx().copy_text(text.clone());
+                }
+                ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new(if self.loading_logs {
+                            "Fetching logs…"
+                        } else {
+                            "Console snapshot"
+                        })
+                        .small()
+                        .color(MUTED),
+                    );
+                });
+            });
+        });
+        if let Some((_, fetched)) = &self.logs {
+            let seconds = fetched.elapsed().as_secs();
+            let age = match seconds {
+                0..5 => "just now".into(),
+                5..60 => format!("{seconds}s ago"),
+                60..3600 => format!("{}m ago", seconds / 60),
+                _ => format!("{}h ago", seconds / 3600),
+            };
+            ui.label(RichText::new(format!("Fetched {age} · last 200 lines requested")).small().color(MUTED))
+                .on_hover_text("Time this snapshot was received. Timestamps inside the output come from the cloud service.");
+        } else {
+            ui.label(
+                RichText::new("Recent console output · last 200 lines requested")
+                    .small()
+                    .color(MUTED),
+            );
+        }
+        if let Some(error) = &self.log_error {
+            ui.add_space(8.0);
+            design::error_notice(
+                ui,
+                if self.logs.is_some() {
+                    "Could not refresh logs. Showing the previous snapshot."
+                } else {
+                    "Could not load logs."
+                },
+                error,
+            );
+        }
+        ui.add_space(8.0);
+        design::search(ui, &mut self.log_filter, "Filter log lines…");
+        ui.add_space(12.0);
+        let Some((text, _)) = &self.logs else {
+            if self.log_error.is_none() {
+                ui.label(
+                    RichText::new(if self.loading_logs {
+                        "Waiting for console output…"
+                    } else {
+                        "Reload to read this machine’s recent output."
+                    })
+                    .color(MUTED),
+                );
+            }
+            return;
+        };
+        if text.is_empty() {
+            ui.label(RichText::new("No console output was returned.").color(MUTED));
+            return;
+        }
+        let query = self.log_filter.to_lowercase();
+        let total = text.lines().count();
+        let lines: Vec<_> = text
+            .lines()
+            .enumerate()
+            .filter(|(_, line)| query.is_empty() || line.to_lowercase().contains(&query))
+            .collect();
+        if lines.is_empty() {
+            ui.label(RichText::new("No log lines match this filter.").color(MUTED));
+            return;
+        }
+        ui.label(
+            RichText::new(if query.is_empty() {
+                format!("{total} lines")
+            } else {
+                format!("{} of {total} lines", lines.len())
+            })
+            .small()
+            .color(MUTED),
+        );
+        design::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.spacing_mut().interact_size.y = 18.0;
+            egui::ScrollArea::both()
+                .id_salt(("cloud-logs", &self.tenant, id))
+                .auto_shrink([false, true])
+                .max_height((ui.clip_rect().bottom() - ui.cursor().top() - 16.0).max(60.0))
+                .show_rows(ui, 18.0, lines.len(), |ui, range| {
+                    for index in range {
+                        let (number, line) = lines[index];
+                        ui.horizontal(|ui| {
+                            ui.label(
+                                RichText::new(format!("{:>4}", number + 1))
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(MUTED),
+                            );
+                            ui.add(
+                                egui::Label::new(RichText::new(line).monospace().size(12.0))
+                                    .wrap_mode(egui::TextWrapMode::Extend)
+                                    .selectable(true),
+                            );
+                        });
+                    }
+                });
+        });
     }
     fn clear_machine_output(&mut self) {
         self.output.clear();
         self.logs = None;
+        self.log_filter.clear();
+        self.log_error = None;
+        self.loading_logs = false;
         self.tab = Tab::Overview;
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
