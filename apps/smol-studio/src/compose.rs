@@ -7,16 +7,21 @@ use std::{
 };
 
 /// Only file locations and the resolved identity are saved, never expanded config or secrets.
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Default, Serialize, Deserialize)]
 pub struct Source {
     pub files: Vec<PathBuf>,
     pub name: Option<String>,
+    #[serde(default)]
+    pub env_files: Vec<PathBuf>,
+    #[serde(default)]
+    pub profiles: Vec<String>,
 }
 impl Source {
     pub fn single(file: PathBuf) -> Self {
         Self {
             files: vec![file],
             name: None,
+            ..Self::default()
         }
     }
     pub fn validate(&self) -> Result<(), String> {
@@ -29,6 +34,26 @@ impl Source {
             .any(|p| !p.is_absolute() || p.to_str().is_none())
         {
             return Err("Compose files must have absolute, UTF-8 paths.".into());
+        }
+        if self.env_files.len() > 32
+            || self
+                .env_files
+                .iter()
+                .any(|p| !p.is_absolute() || p.to_str().is_none())
+        {
+            return Err("Choose up to 32 environment files with absolute, UTF-8 paths.".into());
+        }
+        if self.profiles.len() > 32
+            || self.profiles.iter().any(|p| {
+                p != "*"
+                    && (p.is_empty()
+                        || !p.as_bytes()[0].is_ascii_alphanumeric()
+                        || !p
+                            .bytes()
+                            .all(|c| c.is_ascii_alphanumeric() || b"_.-".contains(&c)))
+            })
+        {
+            return Err("Use up to 32 profile names containing letters, numbers, dots, underscores or hyphens; use * for all profiles.".into());
         }
         if let Some(name) = &self.name {
             validate_name(name)?;
@@ -49,6 +74,18 @@ impl Source {
                 ));
             }
             args.extend(["--file".into(), file.to_str().unwrap().to_owned()]);
+        }
+        for file in &self.env_files {
+            if !file.is_file() {
+                return Err(format!(
+                    "Environment file is missing or unreadable: {}",
+                    file.display()
+                ));
+            }
+            args.extend(["--env-file".into(), file.to_str().unwrap().to_owned()]);
+        }
+        for profile in &self.profiles {
+            args.extend(["--profile".into(), profile.clone()]);
         }
         Ok(args)
     }
@@ -266,6 +303,7 @@ mod tests {
         let source = Source {
             files: vec![first.clone(), second.clone()],
             name: Some("shop-dev".into()),
+            ..Source::default()
         };
         assert_eq!(
             source.args().unwrap(),
@@ -304,6 +342,7 @@ mod tests {
         let source = Source {
             files: vec![dir.path().join("compose.yaml")],
             name: Some("shop".into()),
+            ..Source::default()
         };
         assert!(save_source(&store, "shop", Some(source)).is_err());
         assert_eq!(
@@ -315,6 +354,64 @@ mod tests {
         }
         assert_eq!(resolved_name(br#"{"name":"shop","services":{"web":{"environment":{"PASSWORD":"never retained"}}}}"#).unwrap(), "shop");
         assert!(resolved_name(br#"{"services":{}}"#).is_err());
+    }
+
+    #[test]
+    fn environment_order_profiles_and_legacy_bookmarks_are_preserved() {
+        let dir = tempfile::tempdir().unwrap();
+        let compose = dir.path().join("compose.yaml");
+        let first = dir.path().join("base env");
+        let last = dir.path().join("override.env");
+        for path in [&compose, &first, &last] {
+            std::fs::write(path, "PRIVATE_VALUE=not stored").unwrap();
+        }
+        let source = Source {
+            files: vec![compose.clone()],
+            name: Some("shop".into()),
+            env_files: vec![first.clone(), last.clone()],
+            profiles: vec!["debug".into(), "metrics.dev".into()],
+        };
+        let args = source.args().unwrap();
+        assert_eq!(
+            &args[7..],
+            &[
+                "--env-file",
+                first.to_str().unwrap(),
+                "--env-file",
+                last.to_str().unwrap(),
+                "--profile",
+                "debug",
+                "--profile",
+                "metrics.dev"
+            ]
+        );
+        let store = dir.path().join("saved.json");
+        save_source(&store, "shop", Some(source.clone())).unwrap();
+        assert_eq!(load_sources(&store).unwrap()["shop"], source);
+        assert!(
+            !std::fs::read_to_string(&store)
+                .unwrap()
+                .contains("PRIVATE_VALUE")
+        );
+        let legacy: Source =
+            serde_json::from_value(json!({"files":[compose],"name":"shop"})).unwrap();
+        assert!(legacy.env_files.is_empty() && legacy.profiles.is_empty());
+        for profile in ["--bad", "a,b", "has space", "", "bad/dir"] {
+            let mut invalid = source.clone();
+            invalid.profiles = vec![profile.into()];
+            assert!(invalid.validate().is_err());
+        }
+        let mut all = source.clone();
+        all.profiles = vec!["*".into()];
+        assert!(all.validate().is_ok());
+        std::fs::remove_file(&last).unwrap();
+        assert!(load_sources(&store).is_ok());
+        assert!(
+            source
+                .args()
+                .unwrap_err()
+                .contains("Environment file is missing")
+        );
     }
 
     #[test]

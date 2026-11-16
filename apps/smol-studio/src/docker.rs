@@ -419,6 +419,7 @@ fn compose_command(source: &crate::compose::Source) -> Result<Command, String> {
     ] {
         command.env_remove(key);
     }
+    command.env("COMPOSE_PROFILES", source.profiles.join(","));
     Ok(command)
 }
 
@@ -976,10 +977,26 @@ mod tests {
         let overlay = root.join("override.yaml");
         std::fs::write(&base, format!("name: studio-sources-base\nservices:\n  web:\n    image: {image}\n    command: [sleep, '300']\n    environment:\n      SOURCE_VALUE: base\n")).unwrap();
         std::fs::write(&overlay, "name: studio-sources-owned\nservices:\n  web:\n    environment:\n      SOURCE_VALUE: override\n").unwrap();
+        let env_base = root.join("base environment.env");
+        let env_override = root.join("override environment.env");
+        std::fs::write(&env_base, "STUDIO_TEST_VALUE=first\n").unwrap();
+        std::fs::write(&env_override, "STUDIO_TEST_VALUE=last\n").unwrap();
+        std::fs::write(&overlay, "name: studio-sources-owned\nservices:\n  web:\n    profiles: [debug]\n    environment:\n      SOURCE_VALUE: ${STUDIO_TEST_VALUE:?missing fixture value}\n").unwrap();
         let source = Source {
             files: vec![base.clone(), overlay.clone()],
             name: None,
+            env_files: vec![env_base.clone(), env_override.clone()],
+            profiles: vec!["debug".into()],
         };
+        let mut default = source.clone();
+        default.profiles.clear();
+        let mut config = compose_command(&default).unwrap();
+        config.args(["config", "--services"]);
+        assert!(
+            capture(&mut config, Duration::from_secs(30), 4096, &shutdown)
+                .unwrap()
+                .is_empty()
+        );
         match execute(
             &runtime,
             &Action::Compose {
@@ -1001,6 +1018,8 @@ mod tests {
             .remove("studio-sources-owned")
             .unwrap();
         assert_eq!(stored.files, source.files);
+        assert_eq!(stored.env_files, source.env_files);
+        assert_eq!(stored.profiles, source.profiles);
         assert_eq!(stored.name.as_deref(), Some("studio-sources-owned"));
         let Output::Projects(projects, None) =
             execute(&runtime, &Action::Projects, &shutdown).unwrap()
@@ -1026,7 +1045,7 @@ mod tests {
             &capture(&mut inspect, Duration::from_secs(20), 4096, &shutdown).unwrap(),
         )
         .unwrap();
-        assert!(env.iter().any(|v| v == "SOURCE_VALUE=override"));
+        assert!(env.iter().any(|v| v == "SOURCE_VALUE=last"));
         // A name edit in the source must not redirect a saved project's actions.
         std::fs::write(&overlay, "name: studio-sources-unexpected\nservices:\n  web:\n    environment:\n      SOURCE_VALUE: changed\n").unwrap();
         execute(

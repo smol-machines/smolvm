@@ -85,6 +85,20 @@ impl FilePicker {
         ctx.request_repaint();
     }
 
+    pub fn open_environment(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
+        if self.is_open() {
+            return;
+        }
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Choose Compose environment files");
+        if let Some(parent) = Path::new(current).parent().filter(|p| p.is_absolute()) {
+            dialog = dialog.set_directory(parent);
+        }
+        self.pending = Some(Box::pin(dialog.pick_files()));
+        ctx.request_repaint();
+    }
+
     /// Outer None means pending; inner None means the dialog closed without a file.
     pub fn poll(&mut self, ctx: &egui::Context) -> Option<Selection> {
         let future = self.pending.as_mut()?;

@@ -1,4 +1,5 @@
 mod connection;
+mod project_form;
 mod resources;
 
 use crate::design::{self, MUTED, SURFACE};
@@ -14,6 +15,7 @@ enum PickMode {
     New,
     Replace,
     Append,
+    Environment,
 }
 
 #[derive(Clone, Copy, Default, PartialEq)]
@@ -46,6 +48,8 @@ pub struct DockerView {
     activity: String,
     compose_files: Vec<String>,
     compose_name: Option<String>,
+    compose_env_files: Vec<String>,
+    compose_profiles: String,
     pick_mode: PickMode,
     file_picker: crate::file_picker::FilePicker,
     file_error: Option<String>,
@@ -86,9 +90,19 @@ impl DockerView {
         match self.pick_mode {
             PickMode::New => {
                 self.compose_name = None;
+                self.compose_env_files.clear();
+                self.compose_profiles.clear();
                 self.compose_files = files;
             }
             PickMode::Replace => self.compose_files = files,
+            PickMode::Environment => {
+                self.compose_env_files.retain(|p| !p.is_empty());
+                for file in files {
+                    if !self.compose_env_files.contains(&file) {
+                        self.compose_env_files.push(file);
+                    }
+                }
+            }
             PickMode::Append => {
                 self.compose_files.retain(|p| !p.is_empty());
                 for file in files {
@@ -105,6 +119,14 @@ impl DockerView {
         smol_studio::compose::Source {
             files: self.compose_files.iter().map(Into::into).collect(),
             name: self.compose_name.clone(),
+            env_files: self.compose_env_files.iter().map(Into::into).collect(),
+            profiles: self
+                .compose_profiles
+                .split(',')
+                .map(str::trim)
+                .filter(|p| !p.is_empty())
+                .map(str::to_owned)
+                .collect(),
         }
     }
 
@@ -132,6 +154,8 @@ impl DockerView {
             activity: "Docker context: smol".into(),
             compose_files: vec![String::new()],
             compose_name: None,
+            compose_env_files: Vec::new(),
+            compose_profiles: String::new(),
             pick_mode: PickMode::New,
             file_picker: crate::file_picker::FilePicker::default(),
             file_error: None,
@@ -719,9 +743,14 @@ impl DockerView {
                 design::eyebrow(ui, "COMPOSE FILES");
                 if let Some(source) = &project.source {
                     for file in &source.files { ui.add(egui::Label::new(RichText::new(file.display().to_string()).small().color(MUTED)).truncate()).on_hover_text(file.display().to_string()); }
+                    ui.add_space(8.0);
+                    ui.add(egui::Label::new(RichText::new(format!("Profiles: {}", if source.profiles.is_empty() { "Default services".into() } else { source.profiles.join(", ") })).small().color(MUTED)).wrap());
+                    ui.label(RichText::new(if source.env_files.is_empty() { "Environment: project default".into() } else { format!("Environment: {} selected", count(source.env_files.len(), "file")) }).small().color(MUTED));
                     if ui.add_enabled(enabled, egui::Button::new("Review / apply changes…")).clicked() {
                         self.compose_files = source.files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                         self.compose_name = Some(project.name.clone());
+                        self.compose_env_files = source.env_files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
+                        self.compose_profiles = source.profiles.join(", ");
                         self.compose_import = true;
                         self.file_error = None;
                     }
@@ -729,6 +758,8 @@ impl DockerView {
                     ui.label(RichText::new("Link the files to update this project from Studio.").small().color(MUTED));
                     if ui.add_enabled(enabled, egui::Button::new("Link Compose files…")).clicked() {
                         self.compose_files = vec![String::new()];
+                        self.compose_env_files.clear();
+                        self.compose_profiles.clear();
                         self.compose_name = Some(project.name.clone());
                         self.compose_import = true;
                         self.file_error = None;
@@ -1150,59 +1181,7 @@ impl DockerView {
                 return;
             }
             if self.compose {
-                egui::ScrollArea::vertical().id_salt("compose-form").show(ui,|ui| {
-                    ui.add_space(12.0);
-                    ui.label(design::heading(if self.compose_name.is_some() { "Update project" } else { "Open a Compose project" }, 20.0));
-                    if let Some(name) = &self.compose_name { ui.label(RichText::new(format!("Project: {name}")).color(MUTED)); }
-                    ui.label(RichText::new("Files are applied in order. Later files override the base configuration.").color(MUTED));
-                    ui.add_space(20.0);
-                    design::card().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        let mut move_file = None;
-                        let mut remove = None;
-                        let length = self.compose_files.len();
-                        for (index, file) in self.compose_files.iter_mut().enumerate() {
-                            if index > 0 { ui.add_space(10.0); }
-                            let role = if index == 0 { "Base file".to_owned() } else { format!("Override {index}") };
-                            let filename = std::path::Path::new(file.as_str()).file_name().and_then(|s| s.to_str()).unwrap_or("");
-                            ui.add(egui::Label::new(RichText::new(if filename.is_empty() { role } else { format!("{role} · {filename}") }).small().color(MUTED)).truncate());
-                            ui.horizontal(|ui| {
-                                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                                    if ui.add_enabled(length > 1, egui::Button::new("×")).on_hover_text("Remove file from this configuration").clicked() { remove = Some(index); }
-                                    if ui.add_enabled(index + 1 < length, egui::Button::new("↓")).on_hover_text("Apply later").clicked() { move_file = Some((index,index+1)); }
-                                    if ui.add_enabled(index > 0, egui::Button::new("↑")).on_hover_text("Apply earlier").clicked() { move_file = Some((index,index-1)); }
-                                    if ui.add(egui::TextEdit::singleline(file).hint_text("Choose a file or paste its full path").desired_width(ui.available_width()).margin(egui::Margin::symmetric(10,9))).changed() { self.file_error = None; }
-                                });
-                            });
-                        }
-                        if let Some(index) = remove { self.compose_files.remove(index); }
-                        if let Some((from,to)) = move_file { self.compose_files.swap(from,to); }
-                        ui.add_space(12.0);
-                        ui.horizontal(|ui| {
-                            for (label, mode) in [("Choose files…", PickMode::Replace), ("Add files…", PickMode::Append)] {
-                                if ui.add_enabled(self.pending.is_none(), egui::Button::new(label)).clicked() {
-                                    self.pick_mode = mode;
-                                    self.file_picker.open_compose(frame, self.compose_files.first().map(String::as_str).unwrap_or(""), &ctx);
-                                }
-                            }
-                        });
-                        if let Some(error) = &self.file_error { design::notice(ui, error); }
-                        ui.add_space(16.0);
-                        let source = self.compose_source();
-                        let validation = source.validate();
-                        if self.compose_files.iter().any(|p| !p.is_empty()) && let Err(error) = &validation {
-                            ui.label(RichText::new(error).small().color(design::RED));
-                        }
-                        ui.add_enabled_ui(self.pending.is_none() && self.file_error.is_none() && validation.is_ok(), |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                if ui.add(design::primary("Apply project…")).clicked() { self.confirm = Some(Action::Compose { source: source.clone(), up: true }); }
-                                if ui.button("Remove containers…").clicked() { self.confirm = Some(Action::Compose { source, up: false }); }
-                            });
-                        });
-                    });
-                    ui.add_space(16.0);
-                    ui.label(RichText::new("Named volumes are retained when you remove a project.").small().color(MUTED));
-                });
+                self.project_form(ui, frame);
                 return;
             }
             if matches!(self.kind, Kind::Images | Kind::Volumes | Kind::Networks) {
@@ -1255,9 +1234,18 @@ impl DockerView {
                     Action::Compose { source, up } => {
                         ui.label(format!("{} {}?", if *up { "Apply" } else { "Remove containers for" }, source.name.as_deref().unwrap_or("this project")));
                         ui.add_space(8.0);
-                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| { for file in &source.files { ui.add(egui::Label::new(file.display().to_string()).wrap()); } });
+                        egui::ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+                            ui.label(RichText::new("Compose files").strong());
+                            for file in &source.files { ui.add(egui::Label::new(file.display().to_string()).wrap()); }
+                            if !source.env_files.is_empty() {
+                                ui.add_space(8.0); ui.label(RichText::new("Environment files (in order)").strong());
+                                for file in &source.env_files { ui.add(egui::Label::new(file.display().to_string()).wrap()); }
+                            }
+                            ui.add_space(8.0);
+                            ui.label(format!("Profiles: {}", if source.profiles.is_empty() { "Default services".into() } else { source.profiles.join(", ") }));
+                        });
                         ui.add_space(8.0);
-                        ui.label(if *up { "This can build or pull images and start services. Studio will remember these files." } else { "Project containers and networks are removed. Named volumes and saved file locations are retained." });
+                        ui.label(if *up { "This can build or pull images and start services. Studio will remember these files and profiles." } else { "Default services and selected profiles are removed. Named volumes and saved settings are retained." });
                     }
                     Action::ForgetProject(name) => { ui.label(format!("Forget {name} in Studio? Its Compose files and named volumes are retained.")); }
                     _=>{}
