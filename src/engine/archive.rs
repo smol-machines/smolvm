@@ -2,8 +2,8 @@
 //!
 //! A running container's files are reached through its agent. A container
 //! that is not running gets its machine booted for the copy and stopped
-//! again, except an upload before the first start, which is kept on the
-//! host and unpacked as the container starts.
+//! again. A stopped container gets its configured mount namespace without
+//! executing its command, so uploads are visible immediately.
 
 use std::sync::Arc;
 
@@ -41,10 +41,11 @@ fn path_param(q: &std::collections::HashMap<String, String>) -> ApiResult<String
 pub(super) struct FilesMachine {
     pub(super) socket: std::path::PathBuf,
     temporary: Option<Temporary>,
+    operation: Option<tokio::sync::OwnedMutexGuard<()>>,
+    session: Option<FilesSession>,
+    shares: Option<(Arc<Engine>, super::containers::ContainerRecord)>,
 }
 
-/// A machine booted only to reach the container's files, with the locks
-/// that keep its container from starting meanwhile.
 struct Temporary {
     engine: Arc<Engine>,
     machine: String,
@@ -52,101 +53,195 @@ struct Temporary {
     _op: tokio::sync::OwnedMutexGuard<()>,
 }
 
+struct FilesSession {
+    overlay_id: String,
+    id: String,
+    reader: super::runtime::AgentReader,
+    writer: super::runtime::AgentWriter,
+}
+
+async fn end_session(mut session: FilesSession) {
+    let request = AgentRequest::ContainerEndFiles {
+        overlay_id: session.overlay_id,
+        id: session.id,
+    };
+    match tokio::time::timeout(std::time::Duration::from_secs(5), async {
+        session.writer.send(&request).await?;
+        session.reader.recv().await
+    })
+    .await
+    {
+        Ok(Ok(AgentResponse::Ok { .. })) => {}
+        reply => tracing::warn!(
+            ?reply,
+            "could not release the container inspection namespace"
+        ),
+    }
+}
+
+async fn finish_files(
+    session: Option<FilesSession>,
+    temporary: Option<Temporary>,
+    shares: Option<(Arc<Engine>, super::containers::ContainerRecord)>,
+    _operation: Option<tokio::sync::OwnedMutexGuard<()>>,
+) {
+    if let Some(session) = session {
+        end_session(session).await;
+    }
+    if let Some((engine, record)) = shares {
+        super::containers::release_guest_shares(&engine, &record).await;
+    }
+    if let Some(t) = temporary {
+        super::containers::stop_machine(&t.engine, &t.machine, Some(std::time::Duration::ZERO))
+            .await;
+    }
+}
+
 impl FilesMachine {
     pub(super) async fn finish(mut self) {
-        if let Some(t) = self.temporary.take() {
-            super::containers::stop_machine(&t.engine, &t.machine, Some(std::time::Duration::ZERO))
-                .await;
-        }
+        finish_files(
+            self.session.take(),
+            self.temporary.take(),
+            self.shares.take(),
+            self.operation.take(),
+        )
+        .await;
     }
 }
 
 impl Drop for FilesMachine {
     fn drop(&mut self) {
-        // An error path that never reached `finish` still stops the machine.
-        if let Some(t) = self.temporary.take() {
-            tokio::spawn(async move {
-                super::containers::stop_machine(
-                    &t.engine,
-                    &t.machine,
-                    Some(std::time::Duration::ZERO),
-                )
-                .await;
-            });
+        if self.session.is_some() || self.temporary.is_some() || self.shares.is_some() {
+            tokio::spawn(finish_files(
+                self.session.take(),
+                self.temporary.take(),
+                self.shares.take(),
+                self.operation.take(),
+            ));
         }
     }
+}
+
+async fn begin_session(
+    engine: &Engine,
+    record: &super::containers::ContainerRecord,
+    socket: &std::path::Path,
+) -> ApiResult<FilesSession> {
+    let request =
+        AgentRequest::ContainerBeginFiles(Box::new(super::containers::start_spec(engine, record)));
+    let (mut reader, mut writer) = super::runtime::connect(socket)
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    let reply = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+        writer.send(&request).await?;
+        reader.recv().await
+    })
+    .await
+    .map_err(|_| ApiError::internal("container filesystem preparation timed out"))?
+    .map_err(|e| {
+        ApiError::internal(format!(
+            "prepare container files: {e}; ensure the guest agent supports ContainerBeginFiles"
+        ))
+    })?;
+    match reply {
+        AgentResponse::Ok { data: Some(data) } => {
+            let id = data["id"]
+                .as_str()
+                .filter(|id| {
+                    !id.is_empty()
+                        && id.len() <= 200
+                        && id
+                            .bytes()
+                            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'-' | b'_'))
+                })
+                .ok_or_else(|| {
+                    ApiError::internal("the guest returned an invalid inspection identity")
+                })?;
+            Ok(FilesSession {
+                overlay_id: super::containers::overlay_id(record),
+                id: id.into(),
+                reader,
+                writer,
+            })
+        }
+        AgentResponse::Error { message, .. } => Err(ApiError::internal(format!(
+            "prepare container files: {message}"
+        ))),
+        _ => Err(ApiError::internal(
+            "the guest returned no inspection identity",
+        )),
+    }
+}
+
+// Migrate archives queued by older engines. New uploads are applied immediately.
+async fn unpack_pending(engine: &Engine, c: &Container, socket: &std::path::Path) -> ApiResult<()> {
+    let record = c.record();
+    for (file, destination) in &record.pending_archives {
+        let bytes = tokio::fs::read(file)
+            .await
+            .map_err(|e| ApiError::internal(format!("read staged archive: {e}")))?;
+        unpack(socket, &record, &bytes, destination).await?;
+        c.update(engine, |r| {
+            r.pending_archives
+                .retain(|p| p != &(file.clone(), destination.clone()))
+        });
+        let _ = tokio::fs::remove_file(file).await;
+    }
+    Ok(())
+}
+
+/// Apply legacy queued uploads in the configured namespace before first start.
+/// The caller already holds the container lifecycle lock.
+pub(super) async fn apply_pending(
+    engine: &Engine,
+    c: &Container,
+    socket: &std::path::Path,
+) -> ApiResult<()> {
+    if c.record().pending_archives.is_empty() {
+        return Ok(());
+    }
+    let session = begin_session(engine, &c.record(), socket).await?;
+    let result = unpack_pending(engine, c, socket).await;
+    end_session(session).await;
+    result
 }
 
 pub(super) async fn files_machine(
     engine: &Arc<Engine>,
     c: &Arc<Container>,
 ) -> ApiResult<FilesMachine> {
-    let machine = open_files_machine(engine, c).await?;
-    let record = c.record();
-    if record.state.started_at == super::util::ZERO_TIME {
-        // No ContainerStart has marked this as a Docker filesystem yet.
-        // Do this before even a HEAD/list request can prepare the overlay
-        // with machine semantics and discard the image's /tmp contents.
-        let request = AgentRequest::ContainerPrepareFiles {
-            image: record.pull_ref.clone(),
-            overlay_id: super::containers::overlay_id(&record),
-            image_source: record.image_source(),
-        };
-        let reply = tokio::time::timeout(
-            std::time::Duration::from_secs(30),
-            super::runtime::request(&machine.socket, &request),
-        )
-        .await;
-        let prepared = match reply {
-            Ok(Ok(AgentResponse::Ok { .. })) => Ok(()),
-            Ok(Ok(AgentResponse::Error { message, .. })) => Err(message),
-            Ok(Ok(_)) => Err("the guest returned an unexpected preparation response".into()),
-            Ok(Err(e)) => Err(format!(
-                "{e}; ensure the guest agent supports ContainerPrepareFiles"
-            )),
-            Err(_) => Err("filesystem preparation timed out".into()),
-        };
-        if let Err(message) = prepared {
-            machine.finish().await;
-            return Err(ApiError::internal(format!(
-                "prepare container files: {message}"
-            )));
-        }
+    let mut machine = open_files_machine(engine, c).await?;
+    if !c.is_running() {
+        machine.session = Some(begin_session(engine, &c.record(), &machine.socket).await?);
     }
+    unpack_pending(engine, c, &machine.socket).await?;
     Ok(machine)
 }
 
 async fn open_files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<FilesMachine> {
-    if let Some(socket) = c.socket() {
-        return Ok(FilesMachine {
-            socket,
-            temporary: None,
-        });
-    }
     let guard = c.op_lock().await;
     if let Some(socket) = c.socket() {
         return Ok(FilesMachine {
             socket,
             temporary: None,
+            operation: Some(guard),
+            session: None,
+            shares: None,
         });
     }
     // A container that shares another's network has its files in that
     // container's machine, which only that container boots.
-    if let Some(host) = c.record().network_host().map(str::to_string) {
-        let socket = engine
-            .find_container(&host)
-            .and_then(|h| h.socket())
-            .ok_or_else(|| {
-                ApiError::conflict(format!(
-                    "the files of {} are in the machine of container {host}, which is not running",
-                    c.name()
-                ))
-            })?;
-        drop(guard);
-        return Ok(FilesMachine {
-            socket,
+    let record = c.record();
+    if let Some(host) = record.network_host().map(str::to_string) {
+        let mut machine = FilesMachine {
+            socket: std::path::PathBuf::new(),
             temporary: None,
-        });
+            operation: Some(guard),
+            session: None,
+            shares: Some((engine.clone(), record.clone())),
+        };
+        machine.socket = super::containers::guest_machine(engine, &record, &host).await?;
+        return Ok(machine);
     }
     // A machine still shutting down after its command exited must be down
     // before it boots again.
@@ -171,6 +266,9 @@ async fn open_files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResu
     .map_err(|e| ApiError::internal(format!("boot the container's machine: {e}")))?;
     Ok(FilesMachine {
         socket,
+        operation: None,
+        session: None,
+        shares: None,
         temporary: Some(Temporary {
             engine: engine.clone(),
             machine: record.machine,
@@ -419,19 +517,6 @@ pub(crate) async fn put_archive(
         .await
         .map_err(|e| ApiError::bad_request(format!("read archive: {e}")))?;
     let record = c.record();
-    // Before the first start the overlay may not exist yet: keep the archive
-    // and unpack it as the container starts.
-    if !c.is_running() && record.state.status == "created" {
-        let dir = engine.store.container_dir(&record.id).join("archives");
-        std::fs::create_dir_all(&dir).map_err(|e| ApiError::internal(e.to_string()))?;
-        let file = dir.join(format!("{}.tar", super::util::new_id()));
-        std::fs::write(&file, &bytes).map_err(|e| ApiError::internal(e.to_string()))?;
-        c.update(&engine, |r| {
-            r.pending_archives
-                .push((file.to_string_lossy().into_owned(), path.clone()))
-        });
-        return Ok(StatusCode::OK.into_response());
-    }
     let machine = files_machine(&engine, &c).await?;
     let unpacked = unpack(&machine.socket, &record, &bytes, &path).await;
     machine.finish().await;

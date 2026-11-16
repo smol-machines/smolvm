@@ -53,6 +53,150 @@ pub fn handle_prepare_files(
     }
 }
 
+/// The control connection owns the inspection namespace. Losing the host
+/// releases it even when this container shares another container's VM.
+pub(crate) struct FilesSession {
+    pub overlay_id: String,
+    pub id: String,
+}
+
+impl FilesSession {
+    pub(crate) fn begin(spec: ContainerStartSpec) -> Result<Self, AgentResponse> {
+        let overlay_id = spec.overlay_id.clone();
+        match handle_begin_files(spec) {
+            AgentResponse::Ok { data: Some(data) } => Ok(Self {
+                overlay_id,
+                id: data["id"].as_str().expect("inspection identity").to_owned(),
+            }),
+            error => Err(error),
+        }
+    }
+
+    pub(crate) fn finish(&self) -> AgentResponse {
+        handle_end_files(&self.overlay_id, &self.id)
+    }
+}
+
+impl Drop for FilesSession {
+    fn drop(&mut self) {
+        let _ = self.finish();
+    }
+}
+
+/// Create only the OCI namespace setup; the workload command is never started.
+#[cfg(target_os = "linux")]
+pub fn handle_begin_files(mut spec: ContainerStartSpec) -> AgentResponse {
+    let prepared = handle_prepare_files(&spec.image, &spec.overlay_id, spec.image_source.as_ref());
+    if matches!(prepared, AgentResponse::Error { .. }) {
+        return prepared;
+    }
+    if crate::resolve_main_container(Some(&spec.overlay_id)).is_some() {
+        return AgentResponse::error("container is already running", error_codes::INVALID_REQUEST);
+    }
+    let marker = crate::paths::files_container_id_path(&format!("persistent-{}", spec.overlay_id));
+    if let Ok(old) = std::fs::read_to_string(&marker) {
+        if crate::crun_created_container_pid(old.trim()).is_some() {
+            return AgentResponse::error(
+                "container files are already in use",
+                error_codes::INVALID_REQUEST,
+            );
+        }
+        let result = handle_end_files(&spec.overlay_id, old.trim());
+        if matches!(result, AgentResponse::Error { .. }) {
+            return result;
+        }
+    }
+    // A create-only process has no dependency on tools in the image. It waits
+    // in crun before exec; even an image with no valid command is inspectable.
+    spec.command = vec!["/proc/self/exe".into()];
+    spec.user = None;
+    spec.workdir = Some("/".into());
+    spec.tty = false;
+    spec.open_stdin = false;
+    let result = (|| -> Result<String, String> {
+        let (bundle, id, _) = prepare_bundle(&spec, true).map_err(|e| e.to_string())?;
+        let created = crate::crun::CrunCommand::create(&bundle, &id)
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !created.status.success() || crate::crun_created_container_pid(&id).is_none() {
+            let error = crate::crun::create_failure_reason(&id, &created);
+            let _ = crate::crun::CrunCommand::delete(&id, true).output();
+            return Err(error);
+        }
+        let mut temporary = vec!["/dev".to_owned(), "/dev/shm".to_owned()];
+        temporary.extend(spec.mounts.iter().filter_map(|mount| match mount {
+            smolvm_protocol::ContainerMount::Tmpfs { target, .. } => Some(target.clone()),
+            _ => None,
+        }));
+        temporary.sort();
+        temporary.dedup();
+        let pid = crate::crun_created_container_pid(&id).ok_or("inspection process exited")?;
+        if let Err(error) = crate::nsfile::protect_inspection_tmpfs(pid, &temporary) {
+            let _ = crate::crun::CrunCommand::delete(&id, true).output();
+            return Err(error);
+        }
+        if let Err(e) = std::fs::write(&marker, &id) {
+            let _ = crate::crun::CrunCommand::delete(&id, true).output();
+            return Err(e.to_string());
+        }
+        Ok(id)
+    })();
+    match result {
+        Ok(id) => AgentResponse::Ok {
+            data: Some(serde_json::json!({"id":id})),
+        },
+        Err(message) => AgentResponse::error(message, error_codes::INTERNAL_ERROR),
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub fn handle_end_files(overlay_id: &str, id: &str) -> AgentResponse {
+    if smolvm_protocol::workload_target::validate_overlay_id(overlay_id).is_err()
+        || !crate::valid_crun_container_id(id)
+    {
+        return AgentResponse::error("invalid inspection identity", error_codes::INVALID_REQUEST);
+    }
+    let marker = crate::paths::files_container_id_path(&format!("persistent-{overlay_id}"));
+    match std::fs::read_to_string(&marker) {
+        Ok(recorded) if recorded.trim() == id => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return AgentResponse::Ok { data: None }
+        }
+        _ => {
+            return AgentResponse::error(
+                "inspection identity changed",
+                error_codes::INVALID_REQUEST,
+            )
+        }
+    }
+    let alive = crate::crun_created_container_pid(id).is_some();
+    let removed = crate::crun::CrunCommand::delete(id, true).output();
+    if alive && !removed.as_ref().is_ok_and(|r| r.status.success()) {
+        return AgentResponse::error(
+            "could not release inspection namespace",
+            error_codes::INTERNAL_ERROR,
+        );
+    }
+    let _ = std::fs::remove_file(marker);
+    AgentResponse::Ok { data: None }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handle_begin_files(_spec: ContainerStartSpec) -> AgentResponse {
+    AgentResponse::error(
+        "container inspection is not supported on this platform",
+        error_codes::INTERNAL_ERROR,
+    )
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handle_end_files(_overlay_id: &str, _id: &str) -> AgentResponse {
+    AgentResponse::error(
+        "container inspection is not supported on this platform",
+        error_codes::INTERNAL_ERROR,
+    )
+}
+
 #[cfg(not(target_os = "linux"))]
 pub fn handle_prepare_files(
     _image: &str,
@@ -125,7 +269,10 @@ struct Started {
 
 /// Everything up to the running command: overlay, mounts, bundle, spawn.
 #[cfg(target_os = "linux")]
-fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Error>> {
+fn prepare_bundle(
+    spec: &ContainerStartSpec,
+    inspecting: bool,
+) -> Result<(std::path::PathBuf, String, String), Box<dyn std::error::Error>> {
     use smolvm_protocol::ContainerMount;
     use std::path::Path;
 
@@ -154,9 +301,11 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
 
     // A previous run of this container that the host lost track of (it was
     // killed with the VM still up) would otherwise hold the overlay.
-    if let Some(old) = crate::resolve_main_container(Some(&spec.overlay_id)) {
-        let _ = crate::crun::CrunCommand::kill(&old, "SIGKILL").status();
-        let _ = crate::crun::CrunCommand::delete(&old, true).output();
+    if !inspecting {
+        if let Some(old) = crate::resolve_main_container(Some(&spec.overlay_id)) {
+            let _ = crate::crun::CrunCommand::kill(&old, "SIGKILL").status();
+            let _ = crate::crun::CrunCommand::delete(&old, true).output();
+        }
     }
 
     // Whole-directory shares go through the regular volume path; files and
@@ -235,7 +384,9 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
         .find(|(k, _)| k == "PATH")
         .map(|(_, v)| v.clone())
         .unwrap_or_else(|| "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into());
-    check_executable(rootfs, &spec.command[0], spec.workdir.as_deref(), &path)?;
+    if !inspecting {
+        check_executable(rootfs, &spec.command[0], spec.workdir.as_deref(), &path)?;
+    }
     let launch = crate::ResolvedLaunch {
         command: spec.command.clone(),
         env,
@@ -243,6 +394,9 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
         user: spec.user.clone(),
     };
     let mut oci = crate::build_oci_spec(rootfs, &launch, &volumes, spec.tty, false, false)?;
+    // Inspection has its own bundle directory, outside the normal bundle's
+    // relative rootfs link. Both paths must name the same mounted overlay.
+    oci.root.path = rootfs.to_string_lossy().into_owned();
     oci.root.readonly = spec.read_only_rootfs;
     // VM convenience mounts are not Docker defaults: /tmp and /run belong to
     // the image's writable layer. Explicit caller mounts are applied below.
@@ -301,11 +455,17 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
     let bundle = rootfs
         .parent()
         .ok_or("invalid rootfs path: no parent")?
-        .join("bundle");
+        .join(if inspecting { "files-bundle" } else { "bundle" });
     std::fs::create_dir_all(&bundle)?;
     oci.write_to(&bundle)
         .map_err(|e| format!("failed to write OCI spec: {e}"))?;
     let container_id = crate::oci::generate_container_id();
+    Ok((bundle, container_id, workload_id))
+}
+
+#[cfg(target_os = "linux")]
+fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Error>> {
+    let (bundle, container_id, workload_id) = prepare_bundle(spec, false)?;
     tracing::info!(id = %spec.id, container_id = %container_id, command = ?spec.command, tty = spec.tty, "starting container");
     let (mut child, pty) = crate::spawn_crun_run(&bundle, &container_id, spec.tty, false)?;
     // Only a running container becomes the overlay's main container: a `Run`
@@ -611,12 +771,17 @@ pub fn handle_container_archive(
                 .map_err(|e| e.to_string())
             })
             .and_then(|prepared| {
-                unpack_archive(
-                    std::path::Path::new(&prepared.rootfs_path),
-                    archive,
-                    destination,
-                )
-                .map_err(|e| e.to_string())
+                let root = std::path::Path::new(&prepared.rootfs_path);
+                let namespace =
+                    crate::nsfile::GuestNs::on_overlay(&format!("persistent-{overlay_id}"), root);
+                let result = match namespace {
+                    crate::nsfile::GuestNs::Container(ns) => ns.unpack(archive, destination),
+                    crate::nsfile::GuestNs::Root(_) => {
+                        unpack_archive(root, archive, destination).map_err(|e| e.to_string())
+                    }
+                };
+                let _ = std::fs::remove_file(archive);
+                result
             });
         match result {
             Ok(()) => AgentResponse::Ok { data: None },

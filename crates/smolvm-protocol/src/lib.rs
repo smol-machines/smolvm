@@ -1197,6 +1197,19 @@ pub enum AgentRequest {
         image_source: Option<ContainerImageSource>,
     },
 
+    /// Create the configured mount namespace for file access without starting
+    /// the container command. Replies with an inspection ID. The connection
+    /// owns the namespace until its matching ContainerEndFiles or disconnect.
+    /// Temporary mounts are read-only until the workload is started.
+    ContainerBeginFiles(Box<ContainerStartSpec>),
+    /// Release exactly the inspection namespace returned by ContainerBeginFiles.
+    ContainerEndFiles {
+        /// Persistent overlay ID.
+        overlay_id: String,
+        /// Inspection container ID returned by the guest.
+        id: String,
+    },
+
     /// Send a signal to the init process of the container `ContainerStart`
     /// started on `overlay_id`.
     ContainerSignal {
@@ -1491,6 +1504,12 @@ impl AgentRequest {
             ),
             AgentRequest::ContainerPrepareFiles { overlay_id, .. } => {
                 format!("ContainerPrepareFiles {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerBeginFiles(spec) => {
+                format!("ContainerBeginFiles {{ overlay: {} }}", spec.overlay_id)
+            }
+            AgentRequest::ContainerEndFiles { overlay_id, .. } => {
+                format!("ContainerEndFiles {{ overlay: {overlay_id} }}")
             }
             AgentRequest::ContainerSignal {
                 overlay_id,

@@ -2377,6 +2377,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut files_session: Option<container::FilesSession> = None;
 
     loop {
         // Read length header
@@ -2437,6 +2438,23 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                     continue;
                 }
             };
+
+        if let Some(session) = files_session.take() {
+            let response = match request {
+                AgentRequest::ContainerEndFiles { overlay_id, id }
+                    if overlay_id == session.overlay_id && id == session.id =>
+                {
+                    session.finish()
+                }
+                _ => AgentResponse::error(
+                    "inspection connection requires its matching end request",
+                    error_codes::INVALID_REQUEST,
+                ),
+            };
+            drop(session);
+            send_response(stream, &response)?;
+            return Ok(());
+        }
 
         // Work around serde flatten + internally-tagged enum limitation:
         // fields with #[serde(default)] can be silently dropped during
@@ -2584,6 +2602,20 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         } = request
         {
             handle_streaming_export_layer(stream, image_digest, layer_index)?;
+            continue;
+        }
+
+        if let AgentRequest::ContainerBeginFiles(spec) = request {
+            let response = match container::FilesSession::begin(*spec) {
+                Ok(session) => {
+                    let response =
+                        AgentResponse::ok_with_data(serde_json::json!({"id": session.id}));
+                    files_session = Some(session);
+                    response
+                }
+                Err(error) => error,
+            };
+            send_response(stream, &response)?;
             continue;
         }
 
@@ -3128,6 +3160,13 @@ fn handle_request(
             overlay_id,
             image_source,
         } => container::handle_prepare_files(&image, &overlay_id, image_source.as_ref()),
+        AgentRequest::ContainerBeginFiles(_) => AgentResponse::error(
+            "inspection requires a held connection",
+            error_codes::INVALID_REQUEST,
+        ),
+        AgentRequest::ContainerEndFiles { overlay_id, id } => {
+            container::handle_end_files(&overlay_id, &id)
+        }
 
         AgentRequest::ContainerSignal {
             overlay_id,
@@ -4149,6 +4188,33 @@ fn handle_streaming_archive_directory(
             return Ok(());
         }
     };
+    if let nsfile::GuestNs::Container(namespace) = root.namespace() {
+        let mut archive = match namespace.archive(path) {
+            Ok(archive) => archive,
+            Err(message) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+        send_data_chunks_body(
+            stream,
+            &mut archive,
+            smolvm_protocol::LAYER_CHUNK_SIZE,
+            "failed to read container archive",
+            error_codes::FILE_IO_FAILED,
+        )?;
+        let response = match archive.finish() {
+            Ok(()) => AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+            Err(message) => AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+        };
+        return send_response(stream, &response);
+    }
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a
