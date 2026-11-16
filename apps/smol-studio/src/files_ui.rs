@@ -486,7 +486,7 @@ impl FilesView {
                             }
                         });
                         ui.add_space(12.0);
-                        ui.label(RichText::new(if self.container { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::MUTED));
+                        ui.label(RichText::new(if self.container && transfer.upload { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else if self.container { "An existing file at the destination will be replaced." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::MUTED));
                     });
                 ui.add_space((ui.available_height() - 48.0).max(12.0));
                 ui.separator();
