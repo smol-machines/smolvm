@@ -48,6 +48,88 @@ pub struct FromVmExportOptions {
     pub dns: Option<std::net::Ipv4Addr>,
 }
 
+/// Container image archive format produced by `machine export`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, clap::ValueEnum)]
+pub enum ExportArchiveFormat {
+    /// OCI image layout tar (`oci-layout`, `index.json`, `blobs/sha256/...`).
+    #[default]
+    Oci,
+    /// Docker `docker save` tar (`manifest.json`, `blobs/sha256/...`).
+    Docker,
+}
+
+/// Minimal image config fields preserved from a machine's base image (and
+/// never from the machine's own `VmRecord`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct BaseImageMetadata {
+    /// Target CPU architecture from the base image config (`amd64`, `arm64`, ...).
+    pub architecture: String,
+    /// Target operating system from the base image config (`linux`).
+    pub os: String,
+    /// Environment variables (`KEY=VALUE`) declared by the base image.
+    pub env: Vec<String>,
+    /// Default user declared by the base image.
+    pub user: Option<String>,
+    /// Default working directory declared by the base image.
+    pub workdir: Option<String>,
+}
+
+impl BaseImageMetadata {
+    /// Extract the preserved base-image metadata from [`smolvm_protocol::ImageInfo`].
+    pub fn from_image_info(info: &smolvm_protocol::ImageInfo) -> Self {
+        Self {
+            architecture: info.architecture.clone(),
+            os: info.os.clone(),
+            env: info.env.clone(),
+            user: info.user.clone().filter(|s| !s.is_empty()),
+            workdir: info.workdir.clone().filter(|s| !s.is_empty()),
+        }
+    }
+
+    /// Parse the preserved base-image metadata from raw OCI image config JSON.
+    pub fn from_oci_config_json(bytes: &[u8]) -> Option<Self> {
+        let json: serde_json::Value = serde_json::from_slice(bytes).ok()?;
+        let architecture = json["architecture"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        let os = json["os"].as_str().unwrap_or_default().to_string();
+        let cfg = &json["config"];
+        let env = cfg["Env"]
+            .as_array()
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
+            .unwrap_or_default();
+        let user = cfg["User"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        let workdir = cfg["WorkingDir"]
+            .as_str()
+            .filter(|s| !s.is_empty())
+            .map(String::from);
+        Some(Self {
+            architecture,
+            os,
+            env,
+            user,
+            workdir,
+        })
+    }
+}
+
+fn effective_export_image(vm: &VmRecord, rebase_from_image: bool) -> Option<String> {
+    if rebase_from_image {
+        if let Some(ref origin) = vm.image_origin {
+            return Some(origin.clone());
+        }
+    }
+    vm.image.clone()
+}
+
 /// The resolver a from-VM export helper should pull the base image with.
 ///
 /// `pack create --dns` wins; otherwise the machine's own resolver is inherited,
@@ -178,20 +260,22 @@ pub fn collect_from_vm_assets(
             )?;
         }
         Some(ImageExportSource::LocalArchiveOrDir) => {
-            let image = vm.image.as_deref().unwrap();
-            export_flattened_from_local_image(
+            let image = effective_export_image(vm, opts.rebase_from_image).unwrap();
+            let meta = export_flattened_from_local_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                image,
+                &image,
                 opts.include_workspace,
             )?;
+            image_env = meta.env;
+            image_user = meta.user;
         }
         Some(ImageExportSource::StorageOrRegistry {
             rebase_from_registry,
         }) => {
-            let image = vm.image.as_deref().unwrap();
+            let image = effective_export_image(vm, opts.rebase_from_image).unwrap();
             let mut effective_opts = opts.clone();
             effective_opts.rebase_from_image = rebase_from_registry;
             if opts.rebase_from_image && !rebase_from_registry {
@@ -205,7 +289,7 @@ pub fn collect_from_vm_assets(
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                image,
+                &image,
                 &effective_opts,
             )?;
         }
@@ -1046,6 +1130,25 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<(Vec<String>, Option<String>)> {
+    let (_export_vm, mut client, lowers, meta) =
+        prepare_registry_export(vm_name, vm_dir, image, opts)?;
+
+    flatten_and_export(
+        collector,
+        &mut client,
+        overlay_owner,
+        &lowers,
+        opts.include_workspace,
+    )?;
+    Ok((meta.env, meta.user))
+}
+
+fn prepare_registry_export(
+    vm_name: &str,
+    vm_dir: &Path,
+    image: &str,
+    opts: &FromVmExportOptions,
+) -> crate::Result<(ExportVm, AgentClient, Vec<String>, BaseImageMetadata)> {
     let rebase_from_registry =
         opts.rebase_from_image && !crate::data::image_source::is_local_ref(image);
     if opts.rebase_from_image && !rebase_from_registry {
@@ -1082,15 +1185,8 @@ fn export_flattened_from_registry_image(
             format!("/storage/layers/{}", id)
         })
         .collect();
-
-    flatten_and_export(
-        collector,
-        &mut client,
-        overlay_owner,
-        &lowers,
-        opts.include_workspace,
-    )?;
-    Ok((image_info.env, image_info.user))
+    let meta = BaseImageMetadata::from_image_info(&image_info);
+    Ok((export_vm, client, lowers, meta))
 }
 
 fn cached_export_image(
@@ -1413,7 +1509,25 @@ fn export_flattened_from_local_image(
     vm_dir: &Path,
     image: &str,
     include_workspace: bool,
-) -> crate::Result<()> {
+) -> crate::Result<BaseImageMetadata> {
+    let (_export_vm, mut client, lowers, meta) =
+        prepare_local_image_export(vm_name, vm_dir, image)?;
+
+    flatten_and_export(
+        collector,
+        &mut client,
+        overlay_owner,
+        &lowers,
+        include_workspace,
+    )?;
+    Ok(meta)
+}
+
+fn prepare_local_image_export(
+    vm_name: &str,
+    vm_dir: &Path,
+    image: &str,
+) -> crate::Result<(ExportVm, AgentClient, Vec<String>, BaseImageMetadata)> {
     let host_dir = crate::data::image_source::packed_layers_dir_for_ref(image);
     let is_dir_source = image.starts_with("local-dir:");
 
@@ -1437,8 +1551,11 @@ fn export_flattened_from_local_image(
     }
 
     // No network: this helper stages layers already on the host, so it never
-    // resolves a name and needs no resolver.
-    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false, None)?;
+    // resolves a name and needs no resolver. Archive sources read their
+    // flattened rootfs straight from the source machine's storage disk and do
+    // not need the host archive cache mounted via virtiofs.
+    let packed_mount = if is_dir_source { host_dir } else { None };
+    let export_vm = ExportVm::start(vm_name, vm_dir, packed_mount, false, None)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -1452,7 +1569,7 @@ fn export_flattened_from_local_image(
     // The copy is confined to that case deliberately: it is a second full-size
     // copy of the image on a disk whose size was guessed from the source, and
     // taking it for an archive too is what runs a large export out of space.
-    let lower = if is_dir_source {
+    let (lower, meta) = if is_dir_source {
         println!("Staging the machine's base layer for flatten...");
         let dst = "/storage/stage/0".to_string();
         let stage_cmd = format!(
@@ -1475,18 +1592,14 @@ fn export_flattened_from_local_image(
                 ),
             ));
         }
-        dst
+        (dst, BaseImageMetadata::default())
     } else {
-        locate_flattened_archive_rootfs(&mut client, vm_name)?
+        let rootfs = locate_flattened_archive_rootfs(&mut client, vm_name)?;
+        let meta = read_flattened_archive_metadata(&mut client, &rootfs);
+        (rootfs, meta)
     };
 
-    flatten_and_export(
-        collector,
-        &mut client,
-        overlay_owner,
-        &[lower],
-        include_workspace,
-    )
+    Ok((export_vm, client, vec![lower], meta))
 }
 
 /// The flattened rootfs of a local *archive* image on the source machine's
@@ -1538,6 +1651,34 @@ fn locate_flattened_archive_rootfs(
     }
 }
 
+/// Read the recovered base image `config.json` sitting beside `0000_rootfs` on
+/// the source machine's storage disk.
+fn read_flattened_archive_metadata(
+    client: &mut AgentClient,
+    rootfs_dir: &str,
+) -> BaseImageMetadata {
+    let Some(parent) = Path::new(rootfs_dir).parent() else {
+        return BaseImageMetadata::default();
+    };
+    let config_path = parent.join("config.json");
+    let Ok((exit_code, stdout, _)) = client.vm_exec(
+        vec![
+            "cat".to_string(),
+            config_path.to_string_lossy().into_owned(),
+        ],
+        vec![],
+        None,
+        None,
+        None,
+    ) else {
+        return BaseImageMetadata::default();
+    };
+    if exit_code != 0 {
+        return BaseImageMetadata::default();
+    }
+    BaseImageMetadata::from_oci_config_json(&stdout).unwrap_or_default()
+}
+
 fn export_flattened_from_artifact_sourced(
     collector: &mut AssetCollector,
     vm_name: &str,
@@ -1547,6 +1688,23 @@ fn export_flattened_from_artifact_sourced(
     source_smolmachine: Option<&str>,
     include_workspace: bool,
 ) -> crate::Result<()> {
+    let (_export_vm, mut client, lowers, _meta) =
+        prepare_artifact_sourced_export(vm_name, vm_dir, source_smolmachine)?;
+
+    flatten_and_export(
+        collector,
+        &mut client,
+        overlay_owner,
+        &lowers,
+        include_workspace,
+    )
+}
+
+fn prepare_artifact_sourced_export(
+    vm_name: &str,
+    vm_dir: &Path,
+    source_smolmachine: Option<&str>,
+) -> crate::Result<(ExportVm, AgentClient, Vec<String>, BaseImageMetadata)> {
     let cache_dir = machine_layers_cache_dir(vm_name);
     let pack_content_dir = read_shared_pack_pointer(&cache_dir).unwrap_or(cache_dir.clone());
     let mut layer_ids = ordered_cached_layer_ids(&pack_content_dir);
@@ -1624,13 +1782,7 @@ fn export_flattened_from_artifact_sourced(
         lowers.push(dst);
     }
 
-    flatten_and_export(
-        collector,
-        &mut client,
-        overlay_owner,
-        &lowers,
-        include_workspace,
-    )
+    Ok((export_vm, client, lowers, BaseImageMetadata::default()))
 }
 
 /// The cached layers of an imported pack, bottom -> top, as paths relative to
@@ -1716,42 +1868,66 @@ fn flatten_and_export(
     lowers: &[String],
     include_workspace: bool,
 ) -> crate::Result<()> {
+    let tmp_file = collector
+        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+        .with_file_name("flat-export.tmp");
+    let (layer_hex, total) =
+        flatten_machine_rootfs_to_file(client, overlay_owner, lowers, None, &tmp_file)?;
+    let digest = format!("sha256:{layer_hex}");
+    let layer_file = collector.layer_staging_path(&digest);
+    std::fs::rename(&tmp_file, &layer_file)
+        .map_err(|e| Error::agent("write flattened layer", e.to_string()))?;
+    collector
+        .register_layer(&digest)
+        .map_err(|e| Error::agent("register flattened layer", e.to_string()))?;
+    println!("  Flattened layer: {} bytes", total);
+    if include_workspace {
+        export_workspace_seed(collector, client)?;
+    }
+    Ok(())
+}
+
+/// Merge `lowers` (bottom -> top), the machine's persistent overlay, and an
+/// optional top-level directory (`workspace_stage`) into `tmp_file`, returning
+/// `(sha256_hex, size_bytes)` of the resulting uncompressed layer tar.
+fn flatten_machine_rootfs_to_file(
+    client: &mut AgentClient,
+    overlay_owner: &str,
+    lowers: &[String],
+    workspace_stage: Option<String>,
+    tmp_file: &Path,
+) -> crate::Result<(String, u64)> {
     if lowers.is_empty() {
         return Err(Error::agent("flatten layers", "no layers to flatten"));
     }
-    // Topmost first, which is the order the agent stacks them in: the machine's
-    // own writes outrank every image layer, then the image layers from top down.
-    // `lowers` arrives bottom-up as the image lists them, so it has to be
-    // reversed — leaving it as-is makes the base layer win every conflict.
-    // The agent drops the overlay if the machine never wrote to it, so it needs
-    // no probe from here.
+    // Topmost first, which is the order the agent stacks them in: optional
+    // staged /workspace on top, then the machine's own writes outranking every
+    // image layer, then the image layers from top down. `lowers` arrives
+    // bottom-up as the image lists them, so it has to be reversed: leaving it
+    // as-is makes the base layer win every conflict. The agent drops the
+    // overlay if the machine never wrote to it, so it needs no probe from here.
     let upper = format!("/mnt/source-storage/overlays/persistent-{overlay_owner}/upper");
-    let mut stack: Vec<String> = vec![upper];
+    let mut stack: Vec<String> = Vec::new();
+    if let Some(ws) = workspace_stage {
+        stack.push(ws);
+    }
+    stack.push(upper);
     stack.extend(lowers.iter().rev().cloned());
 
     println!(
         "Flattening {} layer(s) + container overlay...",
         lowers.len()
     );
-    // Driven agent-side rather than through `mount(8)` over VmExec: `mount(8)`
-    // rejects a `lowerdir=` value past ~255 bytes, which any image with four or
-    // more layers exceeds. The merged tree streams straight to the host — never
-    // staged as an archive in the guest, never buffered whole in memory — and is
-    // content-addressed on the way past. Stage in the layers dir so the final
-    // rename is atomic on the same filesystem.
-    let tmp_file = collector
-        .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
-        .with_file_name("flat-export.tmp");
     let total = client
         .flatten_layers_to_path(
             &stack,
-            &tmp_file,
+            tmp_file,
             crate::agent::pack_export_max_total(),
             |_| {},
         )
         .map_err(|e| Error::agent("export flattened layer", e.to_string()))?;
     if total == 0 {
-        let _ = std::fs::remove_file(&tmp_file);
+        let _ = std::fs::remove_file(tmp_file);
         return Err(Error::agent(
             "export flattened layer",
             "flattened layer tar is empty",
@@ -1761,7 +1937,7 @@ fn flatten_and_export(
     let mut hasher = Sha256::new();
     {
         use std::io::Read;
-        let mut f = std::fs::File::open(&tmp_file)
+        let mut f = std::fs::File::open(tmp_file)
             .map_err(|e| Error::agent("read flattened layer", e.to_string()))?;
         let mut buf = vec![0u8; 4 * 1024 * 1024];
         loop {
@@ -1774,18 +1950,389 @@ fn flatten_and_export(
             hasher.update(&buf[..n]);
         }
     }
-    let digest = format!("sha256:{}", hex::encode(hasher.finalize()));
-    let layer_file = collector.layer_staging_path(&digest);
-    std::fs::rename(&tmp_file, &layer_file)
-        .map_err(|e| Error::agent("write flattened layer", e.to_string()))?;
-    collector
-        .register_layer(&digest)
-        .map_err(|e| Error::agent("register flattened layer", e.to_string()))?;
-    println!("  Flattened layer: {} bytes", total);
-    if include_workspace {
-        export_workspace_seed(collector, client)?;
+    let layer_hex = hex::encode(hasher.finalize());
+    Ok((layer_hex, total))
+}
+
+/// Stage non-empty `/mnt/source-storage/workspace` into
+/// `/storage/stage-workspace/workspace` inside the export helper VM so a single
+/// overlay flatten merges it into `/workspace` in the exported rootfs layer.
+fn stage_workspace_for_archive(client: &mut AgentClient) -> crate::Result<Option<String>> {
+    const GUEST_WORKSPACE: &str = "/mnt/source-storage/workspace";
+    const STAGE_ROOT: &str = "/storage/stage-workspace";
+    let (_, stdout, _) = client
+        .vm_exec(
+            vec![
+                "sh".into(),
+                "-c".into(),
+                format!(
+                    "find {GUEST_WORKSPACE} -mindepth 1 ! -name .smolvm-workspace-seeded -print -quit 2>/dev/null"
+                ),
+            ],
+            vec![],
+            None,
+            None,
+            None,
+        )
+        .map_err(|e| Error::agent("inspect workspace", e.to_string()))?;
+    if String::from_utf8_lossy(&stdout).trim().is_empty() {
+        return Ok(None);
     }
-    Ok(())
+    println!("Capturing /workspace into image rootfs...");
+    let cmd = format!(
+        "rm -rf '{STAGE_ROOT}' && mkdir -p '{STAGE_ROOT}/workspace' && \
+         (cd '{GUEST_WORKSPACE}' && tar --exclude=./.smolvm-workspace-seeded -cf - .) | \
+         (cd '{STAGE_ROOT}/workspace' && tar -xf -)"
+    );
+    let (exit_code, _, stderr) = client.vm_exec(
+        vec!["sh".into(), "-c".into(), cmd],
+        vec![],
+        None,
+        None,
+        None,
+    )?;
+    if exit_code != 0 {
+        return Err(Error::agent(
+            "stage workspace",
+            format!(
+                "staging /workspace failed (exit {}): {}",
+                exit_code,
+                String::from_utf8_lossy(&stderr)
+            ),
+        ));
+    }
+    Ok(Some(STAGE_ROOT.to_string()))
+}
+
+/// Export a stopped machine's filesystem as a standard OCI or `docker save`
+/// image archive, without any of the machine's `VmRecord` env, secret refs,
+/// entrypoint, cmd, user, workdir, mounts, or network configuration.
+///
+/// Only the base image's `Env`, `User`, and `WorkingDir` (plus `architecture`
+/// and `os`) are preserved in the exported image config.
+pub fn export_machine_to_archive(
+    vm_name: &str,
+    vm: &VmRecord,
+    output: &Path,
+    format: ExportArchiveFormat,
+    opts: &FromVmExportOptions,
+) -> crate::Result<u64> {
+    let state = vm.actual_state();
+    if matches!(
+        state,
+        crate::config::RecordState::Running
+            | crate::config::RecordState::Pausing
+            | crate::config::RecordState::Unreachable
+            | crate::config::RecordState::Frozen
+    ) {
+        return Err(Error::agent(
+            "export machine",
+            format!(
+                "machine '{vm_name}' is {state}. Stop it first with: smolvm machine stop --name {vm_name}"
+            ),
+        ));
+    }
+
+    let is_image_based = vm.image.is_some();
+    if !is_image_based {
+        return Err(Error::agent(
+            "export machine",
+            format!(
+                "machine '{vm_name}' is a bare VM (created without --image) and has no container \
+                 image rootfs to export as an image archive; use `smolvm pack create --from-vm {vm_name}` \
+                 to package a bare VM"
+            ),
+        ));
+    }
+
+    let overlay_owner = export_overlay_owner(vm_name, vm);
+    let vm_dir = vm_data_dir(vm_name);
+    let is_artifact_sourced = vm.source_smolmachine.is_some() && !vm.packed_image_on_storage;
+
+    let (export_vm, mut client, lowers, base_meta) =
+        if is_artifact_sourced && !opts.rebase_from_image {
+            prepare_artifact_sourced_export(vm_name, &vm_dir, vm.source_smolmachine.as_deref())?
+        } else {
+            let image = effective_export_image(vm, opts.rebase_from_image).unwrap();
+            if crate::data::image_source::is_local_ref(&image) {
+                if opts.rebase_from_image {
+                    return Err(Error::agent(
+                        "export machine",
+                        format!(
+                            "machine '{vm_name}' was created from a local image ({image}) with no \
+                             registry origin, so --rebase cannot re-pull it from a registry"
+                        ),
+                    ));
+                }
+                prepare_local_image_export(vm_name, &vm_dir, &image)?
+            } else {
+                prepare_registry_export(vm_name, &vm_dir, &image, opts)?
+            }
+        };
+
+    let workspace_stage = if opts.include_workspace {
+        stage_workspace_for_archive(&mut client)?
+    } else {
+        None
+    };
+
+    let staging_parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(staging_parent)
+        .map_err(|e| Error::agent("create output directory", e.to_string()))?;
+    let layer_tmp_dir = tempfile::Builder::new()
+        .prefix(".smolvm-export-layer-")
+        .tempdir_in(staging_parent)
+        .or_else(|_| {
+            tempfile::Builder::new()
+                .prefix(".smolvm-export-layer-")
+                .tempdir()
+        })
+        .map_err(|e| Error::agent("create export temp directory", e.to_string()))?;
+    let layer_tmp = layer_tmp_dir.path().join("layer.tar");
+
+    let (layer_hex, layer_bytes) = flatten_machine_rootfs_to_file(
+        &mut client,
+        &overlay_owner,
+        &lowers,
+        workspace_stage,
+        &layer_tmp,
+    )?;
+    println!("  Flattened layer: {} bytes", layer_bytes);
+
+    // Stop the export helper VM as soon as the flattened layer is on disk.
+    drop(client);
+    drop(export_vm);
+
+    write_exported_image_archive(output, &layer_tmp, &layer_hex, &base_meta, format)
+}
+
+fn default_oci_arch() -> &'static str {
+    match std::env::consts::ARCH {
+        "aarch64" => "arm64",
+        "x86_64" => "amd64",
+        other => other,
+    }
+}
+
+fn effective_oci_arch(arch: &str) -> &str {
+    let trimmed = arch.trim();
+    if trimmed.is_empty() || trimmed == "unknown" {
+        default_oci_arch()
+    } else {
+        trimmed
+    }
+}
+
+fn effective_oci_os(os: &str) -> &str {
+    let trimmed = os.trim();
+    if trimmed.is_empty() {
+        "linux"
+    } else {
+        trimmed
+    }
+}
+
+/// Build the minimal OCI image config JSON for an exported machine archive.
+///
+/// Preserves only the base image's `Env`, `User`, and `WorkingDir` (plus
+/// `architecture` and `os`); excludes any `VmRecord` env, secret refs,
+/// entrypoint, cmd, user, workdir, labels, volumes, or network settings.
+pub fn build_minimal_image_config(meta: &BaseImageMetadata, layer_hex: &str) -> Vec<u8> {
+    let arch = effective_oci_arch(&meta.architecture);
+    let os = effective_oci_os(&meta.os);
+    let mut container_cfg = serde_json::Map::new();
+    if !meta.env.is_empty() {
+        container_cfg.insert("Env".to_string(), serde_json::json!(meta.env));
+    }
+    if let Some(ref user) = meta.user {
+        if !user.is_empty() {
+            container_cfg.insert("User".to_string(), serde_json::json!(user));
+        }
+    }
+    if let Some(ref workdir) = meta.workdir {
+        if !workdir.is_empty() {
+            container_cfg.insert("WorkingDir".to_string(), serde_json::json!(workdir));
+        }
+    }
+    let config_json = serde_json::json!({
+        "architecture": arch,
+        "os": os,
+        "config": serde_json::Value::Object(container_cfg),
+        "rootfs": {
+            "type": "layers",
+            "diff_ids": [format!("sha256:{layer_hex}")],
+        },
+    });
+    serde_json::to_vec(&config_json).expect("minimal image config is valid JSON")
+}
+
+/// Write a single-layer OCI layout or `docker save` tar archive to `output`.
+pub fn write_exported_image_archive(
+    output: &Path,
+    layer_tar: &Path,
+    layer_hex: &str,
+    meta: &BaseImageMetadata,
+    format: ExportArchiveFormat,
+) -> crate::Result<u64> {
+    let parent = output
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    std::fs::create_dir_all(parent)
+        .map_err(|e| Error::agent("create output directory", e.to_string()))?;
+
+    let config_bytes = build_minimal_image_config(meta, layer_hex);
+    let config_hex = hex::encode(Sha256::digest(&config_bytes));
+    let layer_size = std::fs::metadata(layer_tar)
+        .map_err(|e| Error::agent("stat flattened layer", e.to_string()))?
+        .len();
+
+    let tmp_out = tempfile::Builder::new()
+        .prefix(".smolvm-export-")
+        .suffix(".tar.tmp")
+        .tempfile_in(parent)
+        .map_err(|e| Error::agent("create output temp file", e.to_string()))?;
+
+    let append_bytes = |builder: &mut tar::Builder<std::io::BufWriter<std::fs::File>>,
+                        name: &str,
+                        bytes: &[u8]|
+     -> crate::Result<()> {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(bytes.len() as u64);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, bytes)
+            .map_err(|e| Error::agent("write archive entry", e.to_string()))
+    };
+
+    let append_file = |builder: &mut tar::Builder<std::io::BufWriter<std::fs::File>>,
+                       name: &str,
+                       path: &Path,
+                       size: u64|
+     -> crate::Result<()> {
+        let mut file = std::fs::File::open(path)
+            .map_err(|e| Error::agent("open layer blob", e.to_string()))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_mtime(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, name, &mut file)
+            .map_err(|e| Error::agent("write layer blob", e.to_string()))
+    };
+
+    {
+        let file = tmp_out
+            .as_file()
+            .try_clone()
+            .map_err(|e| Error::agent("clone output file handle", e.to_string()))?;
+        let mut builder = tar::Builder::new(std::io::BufWriter::new(file));
+
+        match format {
+            ExportArchiveFormat::Oci => {
+                let oci_layout = br#"{"imageLayoutVersion":"1.0.0"}"#;
+                append_bytes(&mut builder, "oci-layout", oci_layout)?;
+
+                let manifest_json = serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                    "config": {
+                        "mediaType": "application/vnd.oci.image.config.v1+json",
+                        "digest": format!("sha256:{config_hex}"),
+                        "size": config_bytes.len(),
+                    },
+                    "layers": [{
+                        "mediaType": "application/vnd.oci.image.layer.v1.tar",
+                        "digest": format!("sha256:{layer_hex}"),
+                        "size": layer_size,
+                    }],
+                });
+                let manifest_bytes = serde_json::to_vec(&manifest_json)
+                    .map_err(|e| Error::agent("serialize OCI manifest", e.to_string()))?;
+                let manifest_hex = hex::encode(Sha256::digest(&manifest_bytes));
+
+                let index_json = serde_json::json!({
+                    "schemaVersion": 2,
+                    "mediaType": "application/vnd.oci.image.index.v1+json",
+                    "manifests": [{
+                        "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                        "digest": format!("sha256:{manifest_hex}"),
+                        "size": manifest_bytes.len(),
+                        "platform": {
+                            "architecture": effective_oci_arch(&meta.architecture),
+                            "os": effective_oci_os(&meta.os),
+                        },
+                    }],
+                });
+                let index_bytes = serde_json::to_vec(&index_json)
+                    .map_err(|e| Error::agent("serialize OCI index", e.to_string()))?;
+
+                append_bytes(&mut builder, "index.json", &index_bytes)?;
+                append_bytes(
+                    &mut builder,
+                    &format!("blobs/sha256/{manifest_hex}"),
+                    &manifest_bytes,
+                )?;
+                append_bytes(
+                    &mut builder,
+                    &format!("blobs/sha256/{config_hex}"),
+                    &config_bytes,
+                )?;
+                if layer_hex != config_hex && layer_hex != manifest_hex {
+                    append_file(
+                        &mut builder,
+                        &format!("blobs/sha256/{layer_hex}"),
+                        layer_tar,
+                        layer_size,
+                    )?;
+                }
+            }
+            ExportArchiveFormat::Docker => {
+                let manifest_json = serde_json::json!([{
+                    "Config": format!("blobs/sha256/{config_hex}"),
+                    "RepoTags": serde_json::Value::Null,
+                    "Layers": [format!("blobs/sha256/{layer_hex}")],
+                }]);
+                let manifest_bytes = serde_json::to_vec(&manifest_json)
+                    .map_err(|e| Error::agent("serialize docker manifest", e.to_string()))?;
+
+                append_bytes(&mut builder, "manifest.json", &manifest_bytes)?;
+                append_bytes(
+                    &mut builder,
+                    &format!("blobs/sha256/{config_hex}"),
+                    &config_bytes,
+                )?;
+                if layer_hex != config_hex {
+                    append_file(
+                        &mut builder,
+                        &format!("blobs/sha256/{layer_hex}"),
+                        layer_tar,
+                        layer_size,
+                    )?;
+                }
+            }
+        }
+
+        let mut writer = builder
+            .into_inner()
+            .map_err(|e| Error::agent("finish archive", e.to_string()))?;
+        std::io::Write::flush(&mut writer)
+            .map_err(|e| Error::agent("flush archive", e.to_string()))?;
+    }
+
+    tmp_out
+        .persist(output)
+        .map_err(|e| Error::agent("write output archive", e.error.to_string()))?;
+    let archive_bytes = std::fs::metadata(output)
+        .map_err(|e| Error::agent("stat output archive", e.to_string()))?
+        .len();
+    Ok(archive_bytes)
 }
 
 /// Capture the source machine's `/workspace` as the pack's workspace seed.
@@ -2370,5 +2917,151 @@ mod export_helper_sizing_tests {
             return;
         }
         assert_eq!(export_helper_storage_gib(50, 0), helper_storage_for(50, 0));
+    }
+}
+
+#[cfg(test)]
+mod export_archive_tests {
+    use super::*;
+    use crate::config::VmRecord;
+
+    #[test]
+    fn minimal_image_config_keeps_only_base_image_env_user_and_workdir() {
+        let raw_base = serde_json::json!({
+            "architecture": "arm64",
+            "os": "linux",
+            "config": {
+                "Env": ["PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"],
+                "User": "1000:1000",
+                "WorkingDir": "/app",
+                "Entrypoint": ["/bin/entrypoint.sh"],
+                "Cmd": ["serve"],
+                "Labels": {"org.example.secret": "should-not-copy"},
+                "Volumes": {"/data": {}},
+                "ExposedPorts": {"8080/tcp": {}},
+            }
+        });
+        let meta = BaseImageMetadata::from_oci_config_json(&serde_json::to_vec(&raw_base).unwrap())
+            .unwrap();
+        assert_eq!(meta.architecture, "arm64");
+        assert_eq!(meta.os, "linux");
+        assert_eq!(
+            meta.env,
+            vec![
+                "PATH=/usr/local/bin:/usr/bin:/bin".to_string(),
+                "LANG=C.UTF-8".to_string()
+            ]
+        );
+        assert_eq!(meta.user.as_deref(), Some("1000:1000"));
+        assert_eq!(meta.workdir.as_deref(), Some("/app"));
+
+        let layer_hex = "a".repeat(64);
+        let config_bytes = build_minimal_image_config(&meta, &layer_hex);
+        let parsed: serde_json::Value = serde_json::from_slice(&config_bytes).unwrap();
+        assert_eq!(parsed["architecture"], "arm64");
+        assert_eq!(parsed["os"], "linux");
+        assert_eq!(
+            parsed["rootfs"]["diff_ids"],
+            serde_json::json!([format!("sha256:{layer_hex}")])
+        );
+        let cfg = parsed["config"].as_object().unwrap();
+        assert_eq!(
+            cfg.get("Env").unwrap(),
+            &serde_json::json!(["PATH=/usr/local/bin:/usr/bin:/bin", "LANG=C.UTF-8"])
+        );
+        assert_eq!(cfg.get("User").unwrap(), "1000:1000");
+        assert_eq!(cfg.get("WorkingDir").unwrap(), "/app");
+        assert!(!cfg.contains_key("Entrypoint"));
+        assert!(!cfg.contains_key("Cmd"));
+        assert!(!cfg.contains_key("Labels"));
+        assert!(!cfg.contains_key("Volumes"));
+        assert!(!cfg.contains_key("ExposedPorts"));
+    }
+
+    #[test]
+    fn write_exported_image_archive_produces_readable_oci_and_docker_archives() {
+        let dir = tempfile::tempdir().unwrap();
+        let layer_path = dir.path().join("layer.tar");
+        {
+            let file = std::fs::File::create(&layer_path).unwrap();
+            let mut tar = tar::Builder::new(file);
+            let payload = b"hello from exported rootfs\n";
+            let mut header = tar::Header::new_gnu();
+            header.set_size(payload.len() as u64);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "etc/greeting", &payload[..])
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        let layer_bytes = std::fs::read(&layer_path).unwrap();
+        let layer_hex = hex::encode(Sha256::digest(&layer_bytes));
+        let meta = BaseImageMetadata {
+            architecture: "arm64".to_string(),
+            os: "linux".to_string(),
+            env: vec!["PATH=/usr/bin:/bin".to_string()],
+            user: Some("nobody".to_string()),
+            workdir: Some("/work".to_string()),
+        };
+
+        for (format, filename) in [
+            (ExportArchiveFormat::Oci, "out-oci.tar"),
+            (ExportArchiveFormat::Docker, "out-docker.tar"),
+        ] {
+            let archive_path = dir.path().join(filename);
+            let written =
+                write_exported_image_archive(&archive_path, &layer_path, &layer_hex, &meta, format)
+                    .unwrap();
+            assert!(written > 0);
+
+            let unpack_dir = dir.path().join(format!("unpacked-{filename}"));
+            std::fs::create_dir_all(&unpack_dir).unwrap();
+            crate::engine::image_ops::unpack(&archive_path, &unpack_dir).unwrap();
+            if format == ExportArchiveFormat::Oci {
+                assert!(unpack_dir.join("oci-layout").is_file());
+                assert!(unpack_dir.join("index.json").is_file());
+                assert!(!unpack_dir.join("manifest.json").exists());
+            } else {
+                assert!(unpack_dir.join("manifest.json").is_file());
+            }
+
+            let images = crate::engine::image_ops::read_images(&unpack_dir).unwrap();
+            assert_eq!(images.len(), 1);
+            assert_eq!(images[0].layers.len(), 1);
+            assert_eq!(std::fs::read(&images[0].layers[0]).unwrap(), layer_bytes);
+            let recovered = BaseImageMetadata::from_oci_config_json(&images[0].config).unwrap();
+            assert_eq!(recovered, meta);
+        }
+    }
+
+    #[test]
+    fn export_machine_refuses_bare_vm_and_local_rebase_without_origin() {
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("export.tar");
+        let bare = VmRecord::new("bare".to_string(), 2, 1024, vec![], vec![], false);
+        let err = export_machine_to_archive(
+            "bare",
+            &bare,
+            &out,
+            ExportArchiveFormat::Oci,
+            &FromVmExportOptions::default(),
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("bare VM"), "{err}");
+
+        let mut local_vm = bare;
+        local_vm.image = Some("local:0123456789abcdef".to_string());
+        let err = export_machine_to_archive(
+            "local-vm",
+            &local_vm,
+            &out,
+            ExportArchiveFormat::Oci,
+            &FromVmExportOptions {
+                rebase_from_image: true,
+                ..Default::default()
+            },
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("no registry origin"), "{err}");
     }
 }
