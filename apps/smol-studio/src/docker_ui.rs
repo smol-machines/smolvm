@@ -2,6 +2,7 @@ mod connection;
 mod image_archive;
 mod image_tag;
 mod project_form;
+mod rename_container;
 mod resources;
 mod run_container;
 
@@ -47,6 +48,7 @@ pub struct DockerView {
     tag_image: Option<image_tag::Form>,
     archive_image: Option<image_archive::Form>,
     run_container: Option<run_container::Form>,
+    rename_container: Option<rename_container::Form>,
     run_warning: Option<(String, String)>,
     resource_input: String,
     resource_error: Option<String>,
@@ -167,6 +169,7 @@ impl DockerView {
             tag_image: None,
             archive_image: None,
             run_container: None,
+            rename_container: None,
             run_warning: None,
             resource_input: String::new(),
             resource_error: None,
@@ -244,6 +247,7 @@ impl DockerView {
     pub fn modal_open(&self) -> bool {
         self.connection_open
             || self.run_container.is_some()
+            || self.rename_container.is_some()
             || self.tag_image.is_some()
             || self.archive_image.as_ref().is_some_and(|f| !f.transferring)
             || self.confirm.is_some()
@@ -271,6 +275,8 @@ impl DockerView {
                 }
                 | Action::Stop(_),
             ) => "Stopping containers…",
+            Some(Action::Restart(_)) => "Restarting container…",
+            Some(Action::Rename { .. }) => "Renaming container…",
             Some(Action::Logs(_)) => "Loading logs…",
             Some(Action::ReviewImageTag { .. }) => "Checking image tag…",
             Some(Action::TagImage(_)) => "Tagging image…",
@@ -467,6 +473,11 @@ impl DockerView {
                     }
                 }
                 Ok(Output::Details(details)) => {
+                    if let Some(form) = &mut self.rename_container
+                        && form.id == details.id
+                    {
+                        form.original = details.name.clone();
+                    }
                     if self.selected.as_deref() == Some(&details.id) {
                         self.details = Some(*details);
                         self.stats = None;
@@ -518,7 +529,13 @@ impl DockerView {
                     }
                 }
                 Ok(Output::Completed) => {
-                    if let Action::Start(id) | Action::Delete(id) = &done.action
+                    if let Action::Rename { id, .. } = &done.action {
+                        self.rename_container = None;
+                        self.selected = Some(id.clone());
+                        self.query.clear();
+                    }
+                    if let Action::Start(id) | Action::Restart(id) | Action::Delete(id) =
+                        &done.action
                         && self
                             .run_warning
                             .as_ref()
@@ -583,6 +600,8 @@ impl DockerView {
                         }
                         | Action::Stop(_) => "Containers stopped.",
                         Action::Delete(_) => "Container removed.",
+                        Action::Restart(_) => "Container restarted.",
+                        Action::Rename { .. } => "Container renamed.",
                         Action::Configure => "Docker setup finished. Checking connection…",
                         Action::ForgetProject(_) => {
                             "Project forgotten; files and volumes retained."
@@ -598,6 +617,16 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if let Action::Rename { id, .. } = &done.action {
+                        if let Some(form) = &mut self.rename_container
+                            && &form.id == id
+                        {
+                            form.error = Some(e);
+                        }
+                        self.activity = "Container rename needs attention.".into();
+                        self.refresh(runtime);
+                        continue;
+                    }
                     if matches!(done.action, Action::RunImages | Action::RunContainer(_)) {
                         if let Some(form) = &mut self.run_container {
                             form.reveal_error = true;
@@ -1119,6 +1148,16 @@ impl DockerView {
             }
             ui.add_enabled_ui(enabled, |ui| {
                 ui.menu_button("More", |ui| {
+                    if ui.button("Rename…").clicked() {
+                        self.rename_container =
+                            Some(rename_container::Form::new(&details.id, &details.name));
+                        ui.close();
+                    }
+                    if details.state == "running" && ui.button("Restart…").clicked() {
+                        self.confirm = Some(Action::Restart(details.id.clone()));
+                        ui.close();
+                    }
+                    ui.separator();
                     if ui.button("Copy container ID").clicked() {
                         ui.ctx().copy_text(details.id.clone());
                         ui.close();
@@ -1338,6 +1377,7 @@ impl DockerView {
         }
         if self.confirm.is_some()
             || self.run_container.is_some()
+            || self.rename_container.is_some()
             || self.tag_image.is_some()
             || self.archive_image.as_ref().is_some_and(|f| !f.transferring)
         {
@@ -1610,6 +1650,7 @@ impl DockerView {
             }
 
         });
+        self.rename_container_dialog(&ctx, runtime);
         self.run_container_dialog(&ctx, runtime, frame);
         self.connection_dialog(&ctx, runtime);
         self.resource_dialog(&ctx, runtime);
@@ -1624,6 +1665,7 @@ impl DockerView {
             let mut open = true;
             let title = match &action {
                 Action::Delete(_) => "Remove container?",
+                Action::Restart(_) => "Restart container?",
                 Action::StorageRemove {
                     kind: Kind::Volumes,
                     ..
@@ -1636,6 +1678,12 @@ impl DockerView {
             };
             egui::Window::new(title).id(egui::Id::unique("docker-confirm")).anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).default_width(440.0).open(&mut open).collapsible(false).resizable(false).show(&ctx,|ui| {
                 match &action {
+                    Action::Restart(id) => {
+                        let name = self.rows.iter().find(|row| text(row, "ID") == *id).map(|row| text(row, "Names")).unwrap_or_else(|| id.clone());
+                        ui.add(egui::Label::new(format!("Restart {name}?")).wrap());
+                        ui.add_space(8.0);
+                        ui.label("Running processes will stop and the container’s command will start again. The writable filesystem and configuration are retained; temporary mounts are cleared.");
+                    }
                     Action::Delete(id)=>{ui.label(format!("Remove stopped container {id} and its writable filesystem?"));}
                     Action::StorageRemove { kind, id, .. } => {
                         ui.label(if *kind == Kind::Volumes { format!("Permanently delete volume “{id}” and all of its data?") } else { format!("Remove image {id} and its local tags from Smol?") });
@@ -1670,6 +1718,7 @@ impl DockerView {
                         Action::StorageRemove { kind: Kind::Images, .. } => ("Remove image", true),
                         Action::StorageRemove { .. } => ("Delete volume", true),
                         Action::Delete(_) => ("Remove container", true),
+                        Action::Restart(_) => ("Restart container", false),
                         Action::Compose { up: false, .. } => ("Remove containers", true),
                         Action::Compose { up: true, .. } => ("Apply project", false),
                         Action::ForgetProject(_) => ("Forget project", false),

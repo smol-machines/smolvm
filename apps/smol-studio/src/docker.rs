@@ -44,6 +44,11 @@ pub enum Action {
     List(Kind),
     Start(String),
     Stop(String),
+    Restart(String),
+    Rename {
+        id: String,
+        name: String,
+    },
     Delete(String),
     Logs(String),
     Inspect(String),
@@ -152,6 +157,12 @@ pub fn validate_container_id(id: &str) -> Result<(), String> {
         Ok(())
     }
 }
+pub fn validate_container_name(name: &str) -> Result<(), String> {
+    crate::storage::validate_volume(name).map_err(|_| {
+        "Use letters, numbers, dots, underscores or dashes; start with a letter or number.".into()
+    })
+}
+
 fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     let mut args = vec!["--context".into(), "smol".into()];
     match action {
@@ -219,7 +230,18 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
             args.extend(prefix.iter().map(|s| s.to_string()));
             args.extend(["--format".into(), "{{json .}}".into()]);
         }
+        Action::Rename { id, name } => {
+            validate_container_id(id)?;
+            validate_container_name(name)?;
+            args.extend([
+                "container".into(),
+                "rename".into(),
+                id.clone(),
+                name.clone(),
+            ]);
+        }
         Action::Start(id)
+        | Action::Restart(id)
         | Action::Stop(id)
         | Action::Delete(id)
         | Action::Logs(id)
@@ -228,6 +250,7 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
             validate_container_id(id)?;
             let command = match action {
                 Action::Start(_) => "start",
+                Action::Restart(_) => "restart",
                 Action::Stop(_) => "stop",
                 Action::Delete(_) => "rm",
                 Action::Logs(_) => "logs",
@@ -877,6 +900,11 @@ mod tests {
         for action in [
             Action::Start("ab12".into()),
             Action::Stop("ab12".into()),
+            Action::Restart("ab12".into()),
+            Action::Rename {
+                id: "ab12".into(),
+                name: "new-name".into(),
+            },
             Action::Delete("ab12".into()),
             Action::List(Kind::Containers),
             Action::Inspect("ab12".into()),
@@ -889,6 +917,182 @@ mod tests {
             assert!(!args.iter().any(|a| a == "--force" || a == "-f"));
         }
         assert!(docker_args(&Action::Delete("--force".into())).is_err());
+    }
+
+    #[test]
+    #[ignore = "creates explicitly owned containers in an isolated smol context"]
+    fn live_rename_and_restart_preserve_identity_and_files() {
+        let image = std::env::var("SMOL_STUDIO_LIFECYCLE_IMAGE").expect("owned local image");
+        let name = std::env::var("SMOL_STUDIO_LIFECYCLE_NAME").expect("unique fixture name");
+        let shutdown = AtomicBool::new(false);
+        let runtime = Runtime::discover();
+        let command = |args: &[&str]| -> Result<String, String> {
+            capture(
+                docker_command().args(["--context", "smol"]).args(args),
+                Duration::from_secs(120),
+                65536,
+                &shutdown,
+            )
+            .map(|bytes| String::from_utf8(bytes).unwrap().trim().to_owned())
+        };
+        let mut owned = Vec::<String>::new();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let conflict = format!("{name}-taken");
+            let renamed = format!("{name}-renamed");
+            let other = command(&["create", "--name", &conflict, &image, "true"]).unwrap();
+            owned.push(other.clone());
+            let id = command(&["run", "--detach", "--name", &name, "--stop-timeout", "1", &image, "sh", "-c", "n=$(cat /tmp/studio-start-count 2>/dev/null || echo 0); echo $((n+1)) > /tmp/studio-start-count; exec sleep 600"]).unwrap();
+            owned.push(id.clone());
+            for _ in 0..30 {
+                if command(&["exec", &id, "cat", "/tmp/studio-start-count"]).as_deref() == Ok("1") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(
+                command(&["exec", &id, "cat", "/tmp/studio-start-count"]).unwrap(),
+                "1"
+            );
+            command(&[
+                "exec",
+                &id,
+                "sh",
+                "-c",
+                "printf preserved > /tmp/studio-lifecycle-marker",
+            ])
+            .unwrap();
+            let before = command(&["inspect", "--format", "{{.State.StartedAt}}", &id]).unwrap();
+            execute(
+                &runtime,
+                &Action::Rename {
+                    id: id.clone(),
+                    name: renamed.clone(),
+                },
+                &shutdown,
+            )
+            .unwrap();
+            assert_eq!(
+                command(&["inspect", "--format", "{{.Name}}", &id]).unwrap(),
+                format!("/{renamed}")
+            );
+            assert_eq!(
+                command(&["inspect", "--format", "{{.State.StartedAt}}", &id]).unwrap(),
+                before
+            );
+            assert!(
+                execute(
+                    &runtime,
+                    &Action::Rename {
+                        id: id.clone(),
+                        name: conflict.clone()
+                    },
+                    &shutdown
+                )
+                .is_err()
+            );
+            assert_eq!(
+                command(&["inspect", "--format", "{{.Name}}", &id]).unwrap(),
+                format!("/{renamed}")
+            );
+            assert_eq!(
+                command(&["inspect", "--format", "{{.Id}}", &conflict]).unwrap(),
+                other
+            );
+            execute(&runtime, &Action::Restart(id.clone()), &shutdown).unwrap();
+            for _ in 0..30 {
+                if command(&["exec", &id, "cat", "/tmp/studio-start-count"]).as_deref() == Ok("2") {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert_eq!(
+                command(&["exec", &id, "cat", "/tmp/studio-start-count"]).unwrap(),
+                "2"
+            );
+            assert_eq!(
+                command(&["exec", &id, "cat", "/tmp/studio-lifecycle-marker"]).unwrap(),
+                "preserved"
+            );
+            assert_eq!(
+                command(&["inspect", "--format", "{{.Id}} {{.State.Status}}", &renamed]).unwrap(),
+                format!("{id} running")
+            );
+            execute(&runtime, &Action::Stop(id.clone()), &shutdown).unwrap();
+            let copied = tempfile::tempdir().unwrap();
+            let target = copied.path().join("marker");
+            command(&[
+                "cp",
+                &format!("{id}:/tmp/studio-lifecycle-marker"),
+                target.to_str().unwrap(),
+            ])
+            .unwrap();
+            assert_eq!(std::fs::read_to_string(&target).unwrap(), "preserved");
+            execute(&runtime, &Action::Start(id.clone()), &shutdown).unwrap();
+            assert_eq!(
+                command(&["exec", &id, "cat", "/tmp/studio-start-count"]).unwrap(),
+                "3"
+            );
+            assert_eq!(
+                command(&["inspect", "--format", "{{.State.Status}}", &other]).unwrap(),
+                "created"
+            );
+        }));
+        for id in owned {
+            command(&["rm", "--force", &id]).expect("remove owned lifecycle fixture");
+        }
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
+    }
+
+    #[test]
+    fn rename_rejects_option_injection_and_preserves_target_identity() {
+        for name in [
+            "",
+            "--help",
+            "/other",
+            "has space",
+            "a;command",
+            "line\nbreak",
+        ] {
+            assert!(
+                docker_args(&Action::Rename {
+                    id: "ab12".into(),
+                    name: name.into()
+                })
+                .is_err()
+            );
+        }
+        assert!(
+            docker_args(&Action::Rename {
+                id: "--help".into(),
+                name: "valid".into()
+            })
+            .is_err()
+        );
+        assert_eq!(
+            docker_args(&Action::Rename {
+                id: "ab12".into(),
+                name: "api.v2_test-1".into()
+            })
+            .unwrap(),
+            [
+                "--context",
+                "smol",
+                "container",
+                "rename",
+                "ab12",
+                "api.v2_test-1"
+            ]
+        );
+        assert!(
+            Action::Rename {
+                id: "ab12".into(),
+                name: "api".into()
+            }
+            .mutates()
+        );
+        assert!(Action::Restart("ab12".into()).mutates());
     }
 
     #[test]
