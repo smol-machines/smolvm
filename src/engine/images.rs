@@ -361,6 +361,8 @@ impl Images {
         };
         store.save_object("images", merged.id.trim_start_matches("sha256:"), &merged)?;
         records.insert(merged.id.clone(), merged);
+        drop(records);
+        crate::image_feed::changed(store.root())?;
         Ok(())
     }
 
@@ -369,6 +371,7 @@ impl Images {
         self.records
             .write()
             .insert(record.id.clone(), record.clone());
+        crate::image_feed::changed(store.root())?;
         Ok(())
     }
 
@@ -441,6 +444,7 @@ impl Images {
             .remove_object("images", image.id.trim_start_matches("sha256:"))
             .map_err(ApiError::from)?;
         self.records.write().remove(&image.id);
+        crate::image_feed::changed(store.root())?;
         Ok(out)
     }
 

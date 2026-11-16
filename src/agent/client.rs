@@ -1613,12 +1613,16 @@ impl AgentClient {
     /// Replay host-originated filesystem changes into the guest as fsnotify
     /// events so inotify-based watchers on `-v` mounts fire. Used by the host
     /// [`FsNotifyWatcher`](super::FsNotifyWatcher); a stale connection surfaces as
-    /// an error the watcher treats as "VM gone, stop".
+    /// an error the watcher can recover from by reconnecting and replaying.
     pub fn fsnotify(&mut self, events: Vec<FsNotifyEvent>) -> Result<()> {
         if events.is_empty() {
             return Ok(());
         }
-        match self.request(&AgentRequest::FsNotify { events })? {
+        // A watcher must be able to stop even if the agent accepts the socket
+        // but never reads or answers. It can reconnect and replay this batch.
+        let timeout = Duration::from_secs(1);
+        let _timeout = self.set_extended_read_timeout(timeout)?;
+        match self.request_with_write_idle_timeout(&AgentRequest::FsNotify { events }, timeout)? {
             AgentResponse::Ok { .. } => Ok(()),
             AgentResponse::Error { message, code } => {
                 Err(agent_error("fsnotify", message, code.as_deref()))
