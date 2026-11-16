@@ -3,8 +3,8 @@ name: CI
 on:
   push:
     branches: [main]
+  # Stacked PRs need the same platform checks as PRs targeting main.
   pull_request:
-    branches: [main, "engine-*"]
   workflow_call:
 
 env:
