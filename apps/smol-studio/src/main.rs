@@ -1,6 +1,7 @@
 #![cfg_attr(target_os = "windows", windows_subsystem = "windows")]
 
 mod cloud_ui;
+mod command_progress_ui;
 mod design;
 mod desktop_menu;
 mod docker_ui;

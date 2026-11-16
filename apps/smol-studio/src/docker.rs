@@ -71,6 +71,21 @@ pub enum Action {
     ForgetProject(String),
 }
 impl Action {
+    pub fn progress_title(&self) -> Option<String> {
+        match self {
+            Self::Compose { source, up } => Some(format!(
+                "{} {}",
+                if *up {
+                    "Apply"
+                } else {
+                    "Remove containers for"
+                },
+                source.name.as_deref().unwrap_or("Compose project")
+            )),
+            Self::PullImage(reference) => Some(format!("Pull {reference}")),
+            _ => None,
+        }
+    }
     pub fn mutates(&self) -> bool {
         !matches!(
             self,
@@ -224,6 +239,18 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
     Ok(args)
 }
 fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<Output, String> {
+    let progress = crate::command_progress::Progress::new(|| {});
+    if let Some(title) = action.progress_title() {
+        progress.begin(title);
+    }
+    execute_with_progress(runtime, action, shutdown, &progress)
+}
+fn execute_with_progress(
+    runtime: &Runtime,
+    action: &Action,
+    shutdown: &AtomicBool,
+    progress: &crate::command_progress::Progress,
+) -> Result<Output, String> {
     if let Action::StorageRemove { kind, id, created } = action {
         let Output::Storage(details) = execute(
             runtime,
@@ -249,7 +276,7 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
         return project_action(runtime, name, action, shutdown);
     }
     if let Action::Compose { source, up } = action {
-        return apply_compose(runtime, source, *up, shutdown);
+        return apply_compose(runtime, source, *up, shutdown, progress);
     }
     if let Action::ForgetProject(name) = action {
         crate::compose::save_source(&crate::compose::source_store(runtime)?, name, None)?;
@@ -305,6 +332,10 @@ fn execute(runtime: &Runtime, action: &Action, shutdown: &AtomicBool) -> Result<
             String::from_utf8_lossy(&output.stdout),
             String::from_utf8_lossy(&output.stderr)
         )));
+    }
+    if matches!(action, Action::PullImage(_)) {
+        progress.capture(command, Duration::from_secs(600), shutdown)?;
+        return Ok(Output::Completed);
     }
     let bytes = capture(
         &mut command,
@@ -428,6 +459,7 @@ fn apply_compose(
     source: &crate::compose::Source,
     up: bool,
     shutdown: &AtomicBool,
+    progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
     let mut source = source.clone();
     if source.name.is_none() {
@@ -444,17 +476,13 @@ fn apply_compose(
     }
     let name = source.name.clone().unwrap();
     let mut command = compose_command(&source)?;
+    command.args(["--ansi", "never", "--progress", "plain"]);
     if up {
         command.args(["up", "--detach"]);
     } else {
         command.arg("down");
     }
-    capture(
-        &mut command,
-        Duration::from_secs(600),
-        4 * 1024 * 1024,
-        shutdown,
-    )?;
+    progress.capture(command, Duration::from_secs(600), shutdown)?;
     let warning = crate::compose::source_store(runtime)
         .and_then(|path| crate::compose::save_source(&path, &name, Some(source)))
         .err()
@@ -596,11 +624,16 @@ fn docker_command() -> Command {
 pub struct DockerWorker {
     sender: Option<mpsc::SyncSender<(Runtime, Action)>>,
     pub events: mpsc::Receiver<Completion>,
+    pub progress: crate::command_progress::Progress,
     shutdown: Arc<AtomicBool>,
     thread: Option<thread::JoinHandle<()>>,
 }
 impl DockerWorker {
-    pub fn new(wake: impl Fn() + Send + 'static) -> Self {
+    pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
+        let wake = Arc::new(wake);
+        let notify = wake.clone();
+        let progress = crate::command_progress::Progress::new(move || notify());
+        let report = progress.clone();
         let (sender, requests) = mpsc::sync_channel::<(Runtime, Action)>(1);
         let (responses, events) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
@@ -610,7 +643,15 @@ impl DockerWorker {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
-                let result = execute(&runtime, &action, &stop);
+                let title = action.progress_title();
+                let tracked = title.is_some();
+                if let Some(title) = title {
+                    report.begin(title);
+                }
+                let result = execute_with_progress(&runtime, &action, &stop, &report);
+                if tracked {
+                    report.finish(result.is_ok());
+                }
                 if responses.send(Completion { action, result }).is_err() {
                     break;
                 }
@@ -620,6 +661,7 @@ impl DockerWorker {
         Self {
             sender: Some(sender),
             events,
+            progress,
             shutdown,
             thread: Some(thread),
         }

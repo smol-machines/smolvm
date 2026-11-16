@@ -28,6 +28,7 @@ enum ContainerTab {
 
 pub struct DockerView {
     worker: DockerWorker,
+    progress: crate::command_progress_ui::ProgressView,
     connection: Option<smol_studio::docker_connection::Connection>,
     connection_open: bool,
     connection_error: Option<String>,
@@ -134,6 +135,7 @@ impl DockerView {
         let ctx = ctx.clone();
         Self {
             worker: DockerWorker::new(move || ctx.request_repaint()),
+            progress: crate::command_progress_ui::ProgressView::default(),
             connection: None,
             connection_open: false,
             connection_error: None,
@@ -214,7 +216,7 @@ impl DockerView {
     pub fn modal_open(&self) -> bool {
         self.connection_open
             || self.confirm.is_some()
-            || self.new_resource.is_some()
+            || (self.new_resource.is_some() && !matches!(self.pending, Some(Action::PullImage(_))))
             || self.file_picker.is_open()
     }
     pub fn mutating(&self) -> bool {
@@ -256,6 +258,19 @@ impl DockerView {
     fn submit(&mut self, runtime: &Runtime, action: Action) {
         if self.pending.is_some() {
             return;
+        }
+        if action.progress_title().is_some() {
+            self.text.clear();
+        }
+        if matches!(
+            action,
+            Action::Logs(_)
+                | Action::Project {
+                    action: ProjectAction::Logs,
+                    ..
+                }
+        ) {
+            self.progress.dismiss_finished();
         }
         match self.worker.submit(runtime.clone(), action.clone()) {
             Ok(()) => {
@@ -510,6 +525,9 @@ impl DockerView {
         }
     }
     fn resource_dialog(&mut self, ctx: &egui::Context, runtime: &Runtime) {
+        if matches!(self.pending, Some(Action::PullImage(_))) {
+            return;
+        }
         let Some(kind) = self.new_resource else {
             return;
         };
@@ -1067,6 +1085,7 @@ impl DockerView {
                     );
                 }
             });
+        self.progress.panel(ui, &self.worker.progress);
         if !self.text.is_empty() {
             egui::Panel::bottom("docker-output")
                 .resizable(true)
