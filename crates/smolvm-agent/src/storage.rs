@@ -4269,7 +4269,12 @@ fn verify_layers(lowerdirs: &[String]) -> Result<()> {
     Ok(())
 }
 
+// File APIs may reopen an overlay without its original ContainerStart request.
+// Keep its filesystem lifetime with the overlay, outside the writable layer.
+const CONTAINER_FILESYSTEM_MARKER: &str = "container-filesystem";
+
 struct OverlaySetup {
+    keep_tmp: bool,
     overlay_root: PathBuf,
     upper_path: PathBuf,
     work_path: PathBuf,
@@ -4282,12 +4287,19 @@ impl OverlaySetup {
     fn new(workload_id: &str) -> Result<Self> {
         let overlay_root = overlay_root_for_workload(workload_id)?;
         Ok(Self {
+            keep_tmp: overlay_root.join(CONTAINER_FILESYSTEM_MARKER).is_file(),
             upper_path: overlay_root.join("upper"),
             work_path: overlay_root.join("work"),
             merged_path: overlay_root.join("merged"),
             overlay_root,
             workload_id: workload_id.to_string(),
         })
+    }
+
+    fn prepare_tmp(&self) {
+        if !self.keep_tmp {
+            let _ = reset_workload_tmp(&self.overlay_root, &self.upper_path);
+        }
     }
 
     /// Prepare overlay directories, cleaning up any previous state.
@@ -4313,7 +4325,7 @@ impl OverlaySetup {
 
     /// Set up the upper layer with DNS resolution and /dev directory.
     fn setup_upper_layer(&self, lowerdirs: &[String]) -> Result<()> {
-        let _ = reset_workload_tmp(&self.overlay_root, &self.upper_path);
+        self.prepare_tmp();
         // Set up DNS resolution BEFORE mounting. Image-backed workloads read
         // `/etc/resolv.conf` from the overlay upper layer, so this file must
         // match the active networking mode rather than always hardcoding
@@ -4539,7 +4551,7 @@ impl OverlaySetup {
             // A boot starts with an empty /tmp, as it did on the tmpfs; a fork
             // clone keeps the golden's, like the rest of its state.
             if !restored_fork {
-                let _ = reset_workload_tmp(&self.overlay_root, &self.upper_path);
+                self.prepare_tmp();
             }
             refresh_overlay_resolver(&self.upper_path)?;
 
@@ -5426,6 +5438,33 @@ pub fn prepare_for_run_persistent_from<F>(
     image: &str,
     overlay_id: &str,
     source: LayerSource<'_>,
+    progress: F,
+) -> Result<PreparedOverlayRootfs>
+where
+    F: FnMut(&str, u64),
+{
+    prepare_persistent_from(image, overlay_id, source, false, progress)
+}
+
+/// Docker containers keep their entire writable layer between starts, including
+/// /tmp. Machine workloads continue to receive a fresh temporary directory.
+pub fn prepare_for_container_from<F>(
+    image: &str,
+    overlay_id: &str,
+    source: LayerSource<'_>,
+    progress: F,
+) -> Result<PreparedOverlayRootfs>
+where
+    F: FnMut(&str, u64),
+{
+    prepare_persistent_from(image, overlay_id, source, true, progress)
+}
+
+fn prepare_persistent_from<F>(
+    image: &str,
+    overlay_id: &str,
+    source: LayerSource<'_>,
+    keep_tmp: bool,
     mut progress: F,
 ) -> Result<PreparedOverlayRootfs>
 where
@@ -5438,8 +5477,12 @@ where
     // stands; its layers were resolved when it was mounted. A container
     // started in a machine booted for another image (its exec sessions name
     // an image this machine's store does not hold) depends on that.
-    let setup = OverlaySetup::new(&workload_id)?;
+    let mut setup = OverlaySetup::new(&workload_id)?;
+    setup.keep_tmp |= keep_tmp;
     if is_mountpoint(&setup.merged_path) && mounted_overlay_is_healthy(&setup.merged_path) {
+        if setup.keep_tmp {
+            std::fs::write(setup.overlay_root.join(CONTAINER_FILESYSTEM_MARKER), b"")?;
+        }
         let overlay = setup.execute_or_remount(Vec::new())?;
         return Ok(PreparedOverlayRootfs {
             workload_id,
@@ -5464,12 +5507,17 @@ where
     };
 
     progress("preparing persistent overlay", 0);
-    let setup = OverlaySetup::new(&workload_id)?;
+    let mut setup = OverlaySetup::new(&workload_id)?;
+    setup.keep_tmp |= keep_tmp;
     let overlay_root = setup.overlay_root.clone();
+    let keep_tmp = setup.keep_tmp;
     if image_store {
         check_overlay_image(&overlay_root, &workload_id, image)?;
     }
     let overlay = setup.execute_or_remount(lowerdirs)?;
+    if keep_tmp {
+        std::fs::write(overlay_root.join(CONTAINER_FILESYSTEM_MARKER), b"")?;
+    }
     if image_store {
         record_overlay_image(&overlay_root, image)?;
     }
@@ -6937,6 +6985,34 @@ mod tests {
             .map(|(tag, _, _)| tag.as_str())
             .collect();
         assert_eq!(tags, ["data", "node", "npm", "cache"]);
+    }
+
+    #[test]
+    fn container_overlay_preserves_temporary_files_and_image_contents() {
+        let root = tempfile::tempdir().unwrap();
+        let upper = root.path().join("upper");
+        std::fs::create_dir_all(upper.join("tmp")).unwrap();
+        std::fs::write(upper.join("tmp/sentinel"), b"preserve me").unwrap();
+        let setup = OverlaySetup {
+            keep_tmp: true,
+            overlay_root: root.path().to_owned(),
+            upper_path: upper.clone(),
+            work_path: root.path().join("work"),
+            merged_path: root.path().join("merged"),
+            workload_id: "container-test".into(),
+        };
+        setup.prepare_tmp();
+        assert_eq!(
+            std::fs::read(upper.join("tmp/sentinel")).unwrap(),
+            b"preserve me"
+        );
+        std::fs::remove_dir_all(upper.join("tmp")).unwrap();
+        setup.prepare_tmp();
+        assert!(
+            !upper.join("tmp").exists(),
+            "an opaque upper /tmp would hide image files"
+        );
+        assert!(!root.path().join(crate::oci::TMP_KEEP_TMPFS_MARKER).exists());
     }
 
     /// A boot gives the workload an empty, sticky, world-writable /tmp in the
@@ -8499,6 +8575,7 @@ mod tests {
     fn setup_upper_layer_defaults_hosts_only_when_image_lacks_it() {
         let tmp = tempfile::tempdir().unwrap();
         let builder = |name: &str| OverlaySetup {
+            keep_tmp: false,
             workload_id: format!("hosts-test-{name}"),
             overlay_root: tmp.path().join(name),
             upper_path: tmp.path().join(name).join("upper"),
