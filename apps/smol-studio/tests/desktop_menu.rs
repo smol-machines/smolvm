@@ -8,9 +8,24 @@ mod native_editor {
     use objc2::rc::Retained;
     use objc2::runtime::AnyObject;
     use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send};
-    use objc2_app_kit::NSResponder;
-    use objc2_foundation::MainThreadMarker;
+    use objc2_app_kit::{NSApplicationDelegate, NSResponder};
+    use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol};
     use std::cell::Cell;
+
+    define_class!(
+        // SAFETY: Test delegate uses NSObject's layout and stays on the main thread.
+        #[unsafe(super = NSObject)]
+        #[thread_kind = MainThreadOnly]
+        pub struct ApplicationDelegate;
+        unsafe impl NSObjectProtocol for ApplicationDelegate {}
+        unsafe impl NSApplicationDelegate for ApplicationDelegate {}
+    );
+    impl ApplicationDelegate {
+        pub fn new(mtm: MainThreadMarker) -> Retained<Self> {
+            // SAFETY: NSObject's designated initializer.
+            unsafe { msg_send![Self::alloc(mtm), init] }
+        }
+    }
 
     define_class!(
         // SAFETY: NSResponder has no extra subclass invariants; actions stay on the main thread.
@@ -41,12 +56,24 @@ fn main() {}
 #[cfg(target_os = "macos")]
 fn main() {
     use eframe::egui::{self, Event, Key};
-    use objc2::sel;
-    use objc2_app_kit::{NSApplication, NSMenu, NSMenuItem};
+    use objc2::runtime::ProtocolObject;
+    use objc2::{msg_send, sel};
+    use objc2_app_kit::{NSApplication, NSApplicationTerminateReply, NSMenu, NSMenuItem};
     use objc2_foundation::{MainThreadMarker, ns_string};
 
+    if std::env::args().nth(1).as_deref() == Some("--winit-quit-probe") {
+        winit_quit_probe(
+            std::env::args()
+                .nth(2)
+                .expect("isolated probe directory")
+                .into(),
+        );
+        return;
+    }
     let mtm = MainThreadMarker::new().expect("test runs on the main thread");
     let app = NSApplication::sharedApplication(mtm);
+    let delegate = native_editor::ApplicationDelegate::new(mtm);
+    app.setDelegate(Some(ProtocolObject::from_ref(&*delegate)));
     // The same app-menu shape winit supplies before Studio is constructed.
     let bar = NSMenu::new(mtm);
     let app_menu = NSMenu::new(mtm);
@@ -69,6 +96,41 @@ fn main() {
     app.setMainMenu(Some(&bar));
     let ctx = egui::Context::default();
     let menu = desktop_menu::DesktopMenu::new(&ctx);
+    if let Some(mode) = std::env::args().nth(1).filter(|mode| {
+        matches!(
+            mode.as_str(),
+            "--native-quit-idle" | "--native-quit-blocked"
+        )
+    }) {
+        let allowed = mode == "--native-quit-idle";
+        assert!(allowed || mode == "--native-quit-blocked");
+        menu.update(allowed, allowed, allowed);
+        // SAFETY: The guard installs this exact typed application delegate method.
+        let reply: NSApplicationTerminateReply =
+            unsafe { msg_send![&*delegate, applicationShouldTerminate: &*app] };
+        assert_eq!(
+            reply,
+            if allowed {
+                NSApplicationTerminateReply::TerminateNow
+            } else {
+                NSApplicationTerminateReply::TerminateCancel
+            }
+        );
+        if allowed {
+            use std::io::Write;
+            println!("Native idle quit starting");
+            std::io::stdout().flush().unwrap();
+        }
+        app.terminate(None);
+        assert!(!allowed, "idle native termination must exit");
+        assert!(
+            menu.input(&mut egui::RawInput::default()),
+            "blocked native termination must wake Studio with feedback"
+        );
+        println!("Native quit was cancelled; process and menu remain usable");
+        return;
+    }
+
     assert_eq!(bar.numberOfItems(), 4);
     assert_eq!(
         app_menu.itemAtIndex(0).unwrap().title().to_string(),
@@ -170,5 +232,71 @@ fn main() {
     );
     app_menu.performActionForItemAtIndex(app_menu.numberOfItems() - 1);
     assert!(menu.input(&mut raw), "Quit must enter the same close guard");
-    println!("Native menu validation, navigation/edit events and guarded Close/Quit passed");
+    for (mode, marker) in [
+        ("--native-quit-blocked", "Native quit was cancelled"),
+        ("--native-quit-idle", "Native idle quit starting"),
+    ] {
+        let output = std::process::Command::new(std::env::current_exe().unwrap())
+            .arg(mode)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(
+            String::from_utf8_lossy(&output.stdout).contains(marker),
+            "{mode}: {}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+    }
+    println!(
+        "Native menu validation, navigation/edit events, guarded Close/Quit and native terminate veto/idle exit passed"
+    );
+}
+
+// Opt-in live probe for AppleEvent quit requests against the actual winit delegate.
+// The controlling test owns the directory and removes `hold` when work is done.
+#[cfg(target_os = "macos")]
+fn winit_quit_probe(root: std::path::PathBuf) {
+    struct Probe {
+        menu: desktop_menu::DesktopMenu,
+        root: std::path::PathBuf,
+    }
+    impl eframe::App for Probe {
+        fn raw_input_hook(
+            &mut self,
+            _ctx: &eframe::egui::Context,
+            raw: &mut eframe::egui::RawInput,
+        ) {
+            if self.menu.input(raw) {
+                std::fs::write(self.root.join("attempted"), "blocked native quit received")
+                    .unwrap();
+            }
+        }
+        fn ui(&mut self, ui: &mut eframe::egui::Ui, _frame: &mut eframe::Frame) {
+            let held = self.root.join("hold").exists();
+            self.menu.update(true, true, !held);
+            std::fs::write(self.root.join("state"), if held { "busy" } else { "idle" }).unwrap();
+            ui.label(if held {
+                "Operation active"
+            } else {
+                "Ready to quit"
+            });
+            ui.ctx()
+                .request_repaint_after(std::time::Duration::from_millis(50));
+        }
+    }
+    eframe::run_native(
+        "Smol Studio quit probe",
+        eframe::NativeOptions::default(),
+        Box::new(move |cc| {
+            Ok(Box::new(Probe {
+                menu: desktop_menu::DesktopMenu::new(&cc.egui_ctx),
+                root,
+            }))
+        }),
+    )
+    .unwrap();
 }

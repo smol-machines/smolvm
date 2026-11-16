@@ -1,12 +1,104 @@
 use eframe::egui::{self, Event, Key, Modifiers};
 use objc2::rc::Retained;
-use objc2::runtime::Sel;
-use objc2::{DefinedClass, MainThreadOnly, define_class, msg_send, sel};
+use objc2::runtime::{AnyClass, AnyObject, Imp, Sel};
+use objc2::{DefinedClass, Encode, MainThreadOnly, define_class, msg_send, sel};
 use objc2_app_kit::{
-    NSApplication, NSEventModifierFlags, NSMenu, NSMenuItem, NSPasteboard, NSPasteboardTypeString,
+    NSApplication, NSApplicationTerminateReply, NSEventModifierFlags, NSMenu, NSMenuItem,
+    NSPasteboard, NSPasteboardTypeString,
 };
 use objc2_foundation::{MainThreadMarker, NSObject, NSObjectProtocol, NSString};
 use std::sync::mpsc::{self, Receiver, SyncSender};
+use std::{
+    cell::{Cell, RefCell},
+    ffi::CString,
+    rc::{Rc, Weak},
+};
+
+struct QuitGuard {
+    allowed: Cell<bool>,
+    attempted: Cell<bool>,
+    ctx: egui::Context,
+}
+thread_local! {
+    static QUIT_GUARD: RefCell<Option<Weak<QuitGuard>>> = const { RefCell::new(None) };
+}
+
+// AppKit calls this for native terminate: requests, including Dock/AppleEvent
+// quits. Winit 0.30's delegate has no implementation, so those requests otherwise
+// bypass egui's CloseRequested guard. Keep Winit's delegate and all its ivars.
+unsafe extern "C-unwind" fn should_terminate(
+    _delegate: &AnyObject,
+    _selector: Sel,
+    _app: &NSApplication,
+) -> NSApplicationTerminateReply {
+    QUIT_GUARD
+        .try_with(|slot| {
+            let Ok(slot) = slot.try_borrow() else {
+                return NSApplicationTerminateReply::TerminateCancel;
+            };
+            let Some(guard) = slot.as_ref().and_then(Weak::upgrade) else {
+                return NSApplicationTerminateReply::TerminateNow;
+            };
+            if guard.allowed.get() {
+                NSApplicationTerminateReply::TerminateNow
+            } else {
+                guard.attempted.set(true);
+                guard.ctx.request_repaint();
+                NSApplicationTerminateReply::TerminateCancel
+            }
+        })
+        .unwrap_or(NSApplicationTerminateReply::TerminateCancel)
+}
+
+fn install_quit_guard(app: &NSApplication, ctx: &egui::Context) -> Rc<QuitGuard> {
+    let delegate = app
+        .delegate()
+        .expect("winit installs its application delegate before Studio");
+    let object: &AnyObject = (*delegate).as_ref();
+    let class = object.class();
+    let selector = sel!(applicationShouldTerminate:);
+    // SAFETY: Objective-C erases IMP signatures. The encoding below describes
+    // exactly this callback: NSUInteger return, receiver, selector, NSApplication.
+    let implementation: Imp = unsafe {
+        std::mem::transmute(
+            should_terminate
+                as unsafe extern "C-unwind" fn(
+                    &AnyObject,
+                    Sel,
+                    &NSApplication,
+                ) -> NSApplicationTerminateReply,
+        )
+    };
+    if let Some(method) = class.instance_method(selector) {
+        assert!(
+            std::ptr::fn_addr_eq(method.implementation(), implementation),
+            "application delegate already handles termination; preserve its policy before installing Studio's guard"
+        );
+    } else {
+        let encoding =
+            CString::new(format!("{}@:@", NSApplicationTerminateReply::ENCODING)).unwrap();
+        // SAFETY: Add only an absent method to the actual application delegate
+        // class on the main thread; no method replacement, layout or isa change.
+        assert!(
+            unsafe {
+                objc2::ffi::class_addMethod(
+                    class as *const AnyClass as *mut AnyClass,
+                    selector,
+                    implementation,
+                    encoding.as_ptr(),
+                )
+            }
+            .as_bool()
+        );
+    }
+    let guard = Rc::new(QuitGuard {
+        allowed: Cell::new(false),
+        attempted: Cell::new(false),
+        ctx: ctx.clone(),
+    });
+    QUIT_GUARD.with(|slot| *slot.borrow_mut() = Some(Rc::downgrade(&guard)));
+    guard
+}
 
 #[derive(Clone, Copy)]
 enum Command {
@@ -66,6 +158,7 @@ define_class!(
 pub struct DesktopMenu {
     // NSMenuItem.target is weak, so retain the receiver as long as Studio is alive.
     _target: Retained<StudioMenuTarget>,
+    quit_guard: Rc<QuitGuard>,
     receiver: Receiver<Command>,
     navigation: Vec<Retained<NSMenuItem>>,
     docker: Vec<Retained<NSMenuItem>>,
@@ -102,6 +195,7 @@ impl DesktopMenu {
     pub fn new(ctx: &egui::Context) -> Self {
         let mtm = MainThreadMarker::new().expect("Studio initializes its menu on the main thread");
         let app = NSApplication::sharedApplication(mtm);
+        let quit_guard = install_quit_guard(&app, ctx);
         let bar = app
             .mainMenu()
             .expect("winit initializes the application menu before Studio");
@@ -198,6 +292,7 @@ impl DesktopMenu {
         // Standard app commands retain AppKit validation; custom entries use Studio guards.
         Self {
             _target: target,
+            quit_guard,
             receiver,
             navigation,
             docker,
@@ -206,7 +301,7 @@ impl DesktopMenu {
     }
 
     pub fn input(&self, raw: &mut egui::RawInput) -> bool {
-        let mut close = false;
+        let mut close = self.quit_guard.attempted.replace(false);
         for command in self.receiver.try_iter() {
             let event = match command {
                 Command::Key(key, shift) => Event::Key {
@@ -252,6 +347,7 @@ impl DesktopMenu {
     }
 
     pub fn update(&self, navigation: bool, docker: bool, close: bool) {
+        self.quit_guard.allowed.set(close);
         for entry in &self.navigation {
             entry.setEnabled(navigation);
         }

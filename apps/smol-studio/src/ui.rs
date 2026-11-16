@@ -58,6 +58,7 @@ pub struct Studio {
     error: Option<String>,
     refresh_error: bool,
     activity: String,
+    close_notice: bool,
     create: Option<crate::new_machine_ui::Editor>,
     editing: Option<crate::machine_settings_ui::Editor>,
     settings_request: Option<String>,
@@ -105,6 +106,7 @@ impl Studio {
             error: None,
             refresh_error: false,
             activity: "Connecting to Smol…".into(),
+            close_notice: false,
             create: None,
             editing: None,
             settings_request: None,
@@ -124,6 +126,7 @@ impl Studio {
         if self.pending.is_some() {
             return;
         }
+        self.close_notice = false;
         match self.worker.submit(self.runtime.clone(), op.clone()) {
             Ok(()) => {
                 if op.is_mutation() {
@@ -1142,13 +1145,16 @@ impl Studio {
 
 impl eframe::App for Studio {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
-        if self.desktop_menu.input(raw)
-            && !self.pending.as_ref().is_some_and(Operation::is_mutation)
-            && !self.cloud.mutating()
-            && !self.docker.mutating()
-            && !self.modal_open()
-        {
-            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        if self.desktop_menu.input(raw) {
+            if self.pending.as_ref().is_some_and(Operation::is_mutation)
+                || self.cloud.mutating()
+                || self.docker.mutating()
+                || self.modal_open()
+            {
+                self.close_notice = true;
+            } else {
+                ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+            }
         }
     }
 
@@ -1177,9 +1183,7 @@ impl eframe::App for Studio {
                 || self.docker.mutating())
         {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
-            self.error = Some(
-                "A machine operation is still running. Close Studio after it completes.".into(),
-            );
+            self.close_notice = true;
         }
         let active = ctx
             .input(|i| i.viewport().focused == Some(true) && i.viewport().minimized != Some(true));
@@ -1258,14 +1262,27 @@ impl eframe::App for Studio {
             .show(ui, |ui| {
                 ui.spacing_mut().interact_size.y = 18.0;
                 ui.horizontal(|ui| {
-                    let label = match self.workspace {
-                        Workspace::Cloud => "Smol Cloud".to_string(),
-                        Workspace::Containers => self.docker.status().to_owned(),
-                        Workspace::Local => self
-                            .pending
-                            .as_ref()
-                            .map(Operation::label)
-                            .unwrap_or_else(|| self.activity.clone()),
+                    let label = if self.close_notice {
+                        if self.pending.as_ref().is_some_and(Operation::is_mutation)
+                            || self.cloud.mutating()
+                            || self.docker.mutating()
+                        {
+                            "Quit cancelled: an operation is still running.".to_owned()
+                        } else if self.modal_open() {
+                            "Quit cancelled: close the open dialog first.".to_owned()
+                        } else {
+                            "You can now close Studio.".to_owned()
+                        }
+                    } else {
+                        match self.workspace {
+                            Workspace::Cloud => "Smol Cloud".to_string(),
+                            Workspace::Containers => self.docker.status().to_owned(),
+                            Workspace::Local => self
+                                .pending
+                                .as_ref()
+                                .map(Operation::label)
+                                .unwrap_or_else(|| self.activity.clone()),
+                        }
                     };
                     if self.workspace == Workspace::Local && self.pending.is_some() {
                         ui.spinner();
