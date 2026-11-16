@@ -38,8 +38,8 @@ fn path_param(q: &std::collections::HashMap<String, String>) -> ApiResult<String
 /// otherwise one booted for this copy, which [`FilesMachine::finish`] stops
 /// again. A booted one holds the container's lifecycle lock, so a start
 /// waits for the copy instead of racing the stop.
-struct FilesMachine {
-    socket: std::path::PathBuf,
+pub(super) struct FilesMachine {
+    pub(super) socket: std::path::PathBuf,
     temporary: Option<Temporary>,
 }
 
@@ -53,7 +53,7 @@ struct Temporary {
 }
 
 impl FilesMachine {
-    async fn finish(mut self) {
+    pub(super) async fn finish(mut self) {
         if let Some(t) = self.temporary.take() {
             super::containers::stop_machine(&t.engine, &t.machine, Some(std::time::Duration::ZERO))
                 .await;
@@ -77,7 +77,46 @@ impl Drop for FilesMachine {
     }
 }
 
-async fn files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<FilesMachine> {
+pub(super) async fn files_machine(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+) -> ApiResult<FilesMachine> {
+    let machine = open_files_machine(engine, c).await?;
+    let record = c.record();
+    if record.state.started_at == super::util::ZERO_TIME {
+        // No ContainerStart has marked this as a Docker filesystem yet.
+        // Do this before even a HEAD/list request can prepare the overlay
+        // with machine semantics and discard the image's /tmp contents.
+        let request = AgentRequest::ContainerPrepareFiles {
+            image: record.pull_ref.clone(),
+            overlay_id: super::containers::overlay_id(&record),
+            image_source: record.image_source(),
+        };
+        let reply = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            super::runtime::request(&machine.socket, &request),
+        )
+        .await;
+        let prepared = match reply {
+            Ok(Ok(AgentResponse::Ok { .. })) => Ok(()),
+            Ok(Ok(AgentResponse::Error { message, .. })) => Err(message),
+            Ok(Ok(_)) => Err("the guest returned an unexpected preparation response".into()),
+            Ok(Err(e)) => Err(format!(
+                "{e}; ensure the guest agent supports ContainerPrepareFiles"
+            )),
+            Err(_) => Err("filesystem preparation timed out".into()),
+        };
+        if let Err(message) = prepared {
+            machine.finish().await;
+            return Err(ApiError::internal(format!(
+                "prepare container files: {message}"
+            )));
+        }
+    }
+    Ok(machine)
+}
+
+async fn open_files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<FilesMachine> {
     if let Some(socket) = c.socket() {
         return Ok(FilesMachine {
             socket,
@@ -141,7 +180,7 @@ async fn files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<Fi
     })
 }
 
-fn target(c: &Container) -> WorkloadTarget {
+pub(super) fn target(c: &Container) -> WorkloadTarget {
     let record = c.record();
     WorkloadTarget::Container {
         image: record.pull_ref.clone(),

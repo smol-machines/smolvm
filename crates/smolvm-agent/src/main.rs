@@ -3123,6 +3123,12 @@ fn handle_request(
             error_codes::INVALID_REQUEST,
         ),
 
+        AgentRequest::ContainerPrepareFiles {
+            image,
+            overlay_id,
+            image_source,
+        } => container::handle_prepare_files(&image, &overlay_id, image_source.as_ref()),
+
         AgentRequest::ContainerSignal {
             overlay_id,
             signal,

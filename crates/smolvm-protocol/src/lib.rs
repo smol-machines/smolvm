@@ -1185,6 +1185,18 @@ pub enum AgentRequest {
     /// closing the connection kills the container.
     ContainerStart(Box<ContainerStartSpec>),
 
+    /// Prepare a Docker container's persistent filesystem for inspection
+    /// before its first start, without running its command or clearing /tmp.
+    ContainerPrepareFiles {
+        /// Image the container filesystem is built from.
+        image: String,
+        /// Persistent overlay ID.
+        overlay_id: String,
+        /// Explicit layer source, as for ContainerStart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_source: Option<ContainerImageSource>,
+    },
+
     /// Send a signal to the init process of the container `ContainerStart`
     /// started on `overlay_id`.
     ContainerSignal {
@@ -1477,6 +1489,9 @@ impl AgentRequest {
                 spec.tty,
                 spec.mounts.len()
             ),
+            AgentRequest::ContainerPrepareFiles { overlay_id, .. } => {
+                format!("ContainerPrepareFiles {{ overlay: {overlay_id} }}")
+            }
             AgentRequest::ContainerSignal {
                 overlay_id,
                 signal,

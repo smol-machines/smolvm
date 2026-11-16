@@ -21,6 +21,50 @@ use smolvm_protocol::{error_codes, AgentResponse, ContainerStartSpec};
 #[cfg(target_os = "linux")]
 const CONTAINER_FILES_DIR: &str = "/run/smolvm/containers";
 
+/// File inspection before the first start must use Docker's filesystem
+/// lifetime too. Preparing a machine overlay here would clear image /tmp.
+#[cfg(target_os = "linux")]
+pub fn handle_prepare_files(
+    image: &str,
+    overlay_id: &str,
+    image_source: Option<&smolvm_protocol::ContainerImageSource>,
+) -> AgentResponse {
+    if let Err(reason) = (smolvm_protocol::WorkloadTarget::Container {
+        image: image.to_string(),
+        overlay_id: overlay_id.to_string(),
+    })
+    .validate()
+    {
+        return AgentResponse::error(reason, error_codes::INVALID_REQUEST);
+    }
+    crate::ensure_storage_mounted();
+    let source = match layer_source(image_source) {
+        Ok(source) => source,
+        Err(message) => return AgentResponse::error(message, error_codes::OVERLAY_FAILED),
+    };
+    match crate::storage::prepare_for_container_from(
+        image,
+        overlay_id,
+        source.as_layer_source(),
+        |_, _| {},
+    ) {
+        Ok(_) => AgentResponse::Ok { data: None },
+        Err(e) => crate::io_target::storage_error_response(e, error_codes::OVERLAY_FAILED),
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn handle_prepare_files(
+    _image: &str,
+    _overlay_id: &str,
+    _image_source: Option<&smolvm_protocol::ContainerImageSource>,
+) -> AgentResponse {
+    AgentResponse::error(
+        "container files are not supported on this platform",
+        error_codes::INTERNAL_ERROR,
+    )
+}
+
 /// Run a container's command as its init and stream its I/O until it exits.
 #[cfg(target_os = "linux")]
 pub fn handle_container_start(
@@ -939,6 +983,21 @@ pub fn handle_set_primary_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn file_preparation_rejects_invalid_targets_before_accessing_storage() {
+        for (image, overlay) in [
+            ("", "valid"),
+            ("alpine", "../outside"),
+            ("alpine", "a/b"),
+            ("alpine", "nul\0"),
+        ] {
+            assert!(
+                matches!(handle_prepare_files(image, overlay, None), AgentResponse::Error { code: Some(code), .. } if code == error_codes::INVALID_REQUEST)
+            );
+        }
+    }
 
     #[test]
     fn hosts_file_names_the_container_and_lists_extra_hosts() {
