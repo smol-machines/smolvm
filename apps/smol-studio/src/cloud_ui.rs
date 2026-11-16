@@ -1,3 +1,4 @@
+mod account;
 mod create;
 
 use crate::design::{self, ACCENT, MUTED, SURFACE};
@@ -38,6 +39,8 @@ pub struct CloudView {
     tab: Tab,
     create_error: Option<String>,
     creating: bool,
+    account_open: bool,
+    account_tab: account::Tab,
     command: String,
     create: Option<NewMachine>,
     delete: Option<(String, String)>,
@@ -66,6 +69,8 @@ impl CloudView {
             tab: Tab::Overview,
             create_error: None,
             creating: false,
+            account_open: false,
+            account_tab: account::Tab::Overview,
             command: String::new(),
             create: None,
             delete: None,
@@ -87,7 +92,7 @@ impl CloudView {
         }
     }
     pub fn modal_open(&self) -> bool {
-        self.create.is_some() || self.delete.is_some()
+        self.create.is_some() || self.delete.is_some() || self.account_open
     }
     pub fn mutating(&self) -> bool {
         self.mutation
@@ -140,6 +145,7 @@ impl CloudView {
             self.mutation = false;
             match event {
                 Event::SignedOut => {
+                    self.account_open = false;
                     self.snapshot = Snapshot::default();
                     self.tenant = None;
                     self.selected = None;
@@ -228,6 +234,7 @@ impl CloudView {
             && self.device.is_none()
             && self.create.is_none()
             && self.delete.is_none()
+            && !self.account_open
             && self.last.elapsed() >= Duration::from_secs(30)
         {
             self.refresh();
@@ -238,7 +245,7 @@ impl CloudView {
     }
     pub fn ui(&mut self, ui: &mut egui::Ui) {
         let ctx = ui.ctx().clone();
-        if self.create.is_some() || self.delete.is_some() {
+        if self.create.is_some() || self.delete.is_some() || self.account_open {
             ui.disable();
         }
         egui::Panel::top("cloud-heading")
@@ -294,7 +301,7 @@ impl CloudView {
         if self.snapshot.identity.is_none() || self.device.is_some() {
             egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(32)).show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
-                    ui.add_space(48.0);
+                    ui.add_space((ctx.content_rect().height() - 640.0).clamp(12.0, 32.0));
                     ui.vertical_centered(|ui| {
                         ui.set_max_width(480.0);
                         let (r,_) = ui.allocate_exact_size(egui::Vec2::splat(64.0),egui::Sense::hover());
@@ -312,10 +319,15 @@ impl CloudView {
                             ui.label(RichText::new(format!("Code expires in {} seconds",expires.saturating_duration_since(Instant::now()).as_secs())).small().color(MUTED));
                             if ui.button("Cancel").clicked() { self.send(Action::CancelLogin); }
                         } else {
-                            ui.label(design::heading("Connect to Smol Cloud",28.0));
+                            ui.label(design::heading(if self.pending { "Connecting to Smol Cloud" } else { "Connect to Smol Cloud" },28.0));
                             ui.add_space(8.0);
                             ui.label(RichText::new("Connect your Smol account to manage cloud machines\nand switch between your personal and team workspaces.").color(MUTED));
                             ui.add_space(28.0);
+                            if self.pending {
+                                ui.spinner();
+                                ui.label(RichText::new("Checking your sign-in…").color(MUTED));
+                                ui.add_space(12.0);
+                            }
                             ui.add_enabled_ui(!self.pending, |ui| {
                                 if ui.add_sized([240.0,40.0],design::primary("Sign in with Smol")).clicked() { self.tenant=None; self.send(Action::Login); }
                                 ui.add_space(8.0);
@@ -347,8 +359,9 @@ impl CloudView {
                     ui.add_enabled_ui(!self.pending, |ui| {
                         let mut next = self.tenant.clone();
                         egui::ComboBox::from_id_salt("cloud-account")
-                            .width(220.0)
+                            .width((ui.available_width() - 260.0).clamp(140.0, 260.0))
                             .selected_text(self.account_label())
+                            .truncate()
                             .show_ui(ui, |ui| {
                                 ui.selectable_value(&mut next, None, "Personal account");
                                 for membership in &self.snapshot.memberships {
@@ -378,50 +391,16 @@ impl CloudView {
                         {
                             self.send(Action::Logout);
                         }
-                        ui.menu_button("Account & usage", |ui| {
-                            ui.set_max_width(360.0);
-                            ui.label(
-                                RichText::new(format!(
-                                    "{} · {}",
-                                    identity.tenant_id.as_deref().unwrap_or("Not provisioned"),
-                                    identity
-                                        .tenant_status
-                                        .as_deref()
-                                        .unwrap_or("Unknown status")
-                                ))
-                                .small()
-                                .color(MUTED),
-                            );
-                            if let Some(namespace) = &identity.registry_namespace {
-                                ui.label(format!(
-                                    "Registry: registry.smolmachines.com/{namespace}"
-                                ));
-                            }
-                            if let Some(account) = &self.snapshot.account {
-                                ui.horizontal_wrapped(|ui| {
-                                    if let Some(plan) = account["plan"]["name"].as_str() {
-                                        ui.label(format!("{plan} plan"));
-                                    }
-                                    if let Some(cost) =
-                                        account["periodCost"]["totalMicros"].as_u64()
-                                    {
-                                        ui.label(format!(
-                                            "Period gross usage: ${:.2}",
-                                            cost as f64 / 1_000_000.0
-                                        ));
-                                    }
-                                    if let Some(max) = account["effectiveMaxMachines"].as_u64() {
-                                        ui.label(format!("{max} machine limit"));
-                                    }
-                                    if let Some(max) = account["effectiveMaxCpus"].as_u64() {
-                                        ui.label(format!("{max} CPU limit"));
-                                    }
-                                    if let Some(max) = account["effectiveMaxMemoryMb"].as_u64() {
-                                        ui.label(format!("{max} MB memory limit"));
-                                    }
-                                });
-                            }
-                        });
+                        if ui
+                            .add_enabled(
+                                !self.pending && self.valid,
+                                egui::Button::new("Account & usage"),
+                            )
+                            .clicked()
+                        {
+                            self.account_open = true;
+                            self.account_tab = account::Tab::Overview;
+                        }
                     });
                 });
                 for warning in &self.snapshot.warnings {
@@ -902,6 +881,7 @@ impl CloudView {
         self.tab = Tab::Overview;
     }
     fn dialogs(&mut self, ctx: &egui::Context) {
+        self.account_dialog(ctx);
         self.create_dialog(ctx);
         if let Some((id, name)) = self.delete.clone() {
             let mut open = true;
