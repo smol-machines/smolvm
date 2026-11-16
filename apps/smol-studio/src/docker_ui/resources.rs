@@ -202,6 +202,7 @@ impl DockerView {
             return;
         }
         self.storage_selected = id.clone();
+        self.volume_folder_error = None;
         self.storage = None;
         self.network = None;
         self.resource_tab = Tab::Overview;
@@ -309,6 +310,10 @@ impl DockerView {
         let Some(details) = self.storage.clone() else {
             return;
         };
+        let local_volume = self
+            .connection
+            .as_ref()
+            .is_some_and(smol_studio::volume_files::is_local);
         let title = if details.kind == Kind::Images {
             field(&details, "Tags")
                 .lines()
@@ -333,6 +338,10 @@ impl DockerView {
             match self.resource_tab {
                 Tab::Overview => {
             ui.horizontal_wrapped(|ui| {
+                if details.kind == Kind::Volumes && ui.add_enabled(enabled && local_volume, design::primary(ui, smol_studio::volume_files::open_label())).on_disabled_hover_text("Opening a folder requires a local Smol connection.").clicked() {
+                    self.volume_folder_error = None;
+                    self.submit(runtime, Action::OpenVolumeFolder { name: details.id.clone(), created: details.created.clone() });
+                }
                 if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary(ui, "Run…")).clicked() {
                     self.open_run_container(runtime,Some(smol_studio::container_run::Image {id:details.id.clone(),label:title.clone()}));
                 }
@@ -353,6 +362,22 @@ impl DockerView {
                 });
             });
                     ui.add_space(16.0);
+                    if details.kind == Kind::Volumes {
+                        if let Some(error) = &self.volume_folder_error {
+                            let summary = error.lines().next().unwrap_or("The volume folder could not be opened.");
+                            design::error_notice(ui, summary, error);
+                            ui.add_space(12.0);
+                        }
+                        ui.label(design::heading("Files", 14.0)); ui.add_space(8.0);
+                        design::card(ui.ctx()).show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            metadata(ui, "Volume folder", &field(&details, "Storage path"), true);
+                        });
+                        ui.add_space(8.0);
+                        ui.label(RichText::new(if local_volume { "Browse these files with your file manager. Changes here affect the volume directly." } else { "This folder is on the engine’s host. Connect to a local Smol engine to open it here." }).size(12.0).color(design::palette(ui).muted));
+                        ui.add_space(20.0);
+                        ui.label(design::heading("Details", 14.0)); ui.add_space(8.0);
+                    }
                     design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for label in if details.kind == Kind::Images { ["Platform", "Image size", "Created"] } else { ["Driver", "Scope", "Created"] } {
@@ -374,14 +399,6 @@ impl DockerView {
                         });
                         ui.add_space(20.0);
                         design::card(ui.ctx()).show(ui, |ui| { ui.set_width(ui.available_width()); metadata(ui, "Image ID", &details.id, true); });
-                    } else {
-                        ui.label(design::heading("Storage", 14.0)); ui.add_space(8.0);
-                        design::card(ui.ctx()).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            metadata(ui, "Engine storage path", &field(&details, "Storage path"), true);
-                        });
-                        ui.add_space(8.0);
-                        ui.label(RichText::new("Data persists when containers stop or are removed.").size(12.0).color(design::palette(ui).muted));
                     }
                 }
                 Tab::Containers => {

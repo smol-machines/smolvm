@@ -65,6 +65,10 @@ pub enum Action {
         id: String,
         created: String,
     },
+    OpenVolumeFolder {
+        name: String,
+        created: String,
+    },
     ReviewImageTag {
         id: String,
         reference: String,
@@ -121,6 +125,7 @@ impl Action {
                 | Self::NetworkInspect(_)
                 | Self::Stats(_)
                 | Self::StorageInspect { .. }
+                | Self::OpenVolumeFolder { .. }
                 | Self::Projects
                 | Self::DiscoverProject(_)
                 | Self::ReviewImageTag { .. }
@@ -129,6 +134,7 @@ impl Action {
     }
 }
 pub enum Output {
+    VolumeFolderOpened(std::path::PathBuf),
     Files {
         id: String,
         listing: crate::files::Listing,
@@ -310,6 +316,9 @@ fn execute_with_progress(
     shutdown: &AtomicBool,
     progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
+    if let Action::OpenVolumeFolder { name, created } = action {
+        return crate::volume_files::open(name, created, shutdown).map(Output::VolumeFolderOpened);
+    }
     if let Action::Files(request) = action {
         return crate::container_files::execute(request, shutdown);
     }

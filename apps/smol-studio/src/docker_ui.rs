@@ -45,6 +45,7 @@ pub struct DockerView {
     rows: Vec<Value>,
     storage_selected: Option<String>,
     storage: Option<smol_studio::storage::Details>,
+    volume_folder_error: Option<String>,
     network: Option<smol_studio::network::Details>,
     resource_tab: resources::Tab,
     new_resource: Option<Kind>,
@@ -168,6 +169,7 @@ impl DockerView {
             rows: vec![],
             storage_selected: None,
             storage: None,
+            volume_folder_error: None,
             network: None,
             resource_tab: resources::Tab::Overview,
             new_resource: None,
@@ -305,6 +307,7 @@ impl DockerView {
             }
             Some(Action::CreateVolume(_)) => "Creating volume…",
             Some(Action::StorageRemove { .. }) => "Removing resource…",
+            Some(Action::OpenVolumeFolder { .. }) => "Opening volume folder…",
             Some(_) => "Working…",
             None if self.events.disconnected() => "Automatic updates interrupted · reconnecting…",
             None => &self.activity,
@@ -351,6 +354,11 @@ impl DockerView {
         while let Ok(done) = self.worker.events.try_recv() {
             self.pending = None;
             match done.result {
+                Ok(Output::VolumeFolderOpened(path)) => {
+                    self.volume_folder_error = None;
+                    self.error = None;
+                    self.activity = format!("Opened {}", path.display());
+                }
                 Ok(Output::Files { id, listing }) => {
                     self.files.receive(&id, listing);
                 }
@@ -637,6 +645,17 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if let Action::OpenVolumeFolder { name, created } = &done.action {
+                        if self.storage.as_ref().is_some_and(|details| {
+                            details.kind == Kind::Volumes
+                                && details.id == *name
+                                && details.created == *created
+                        }) {
+                            self.volume_folder_error = Some(e);
+                        }
+                        self.activity = "Volume folder could not be opened.".into();
+                        continue;
+                    }
                     if let Action::Files(request) = &done.action {
                         if done.cancelled && request.mutates() {
                             let upload = matches!(

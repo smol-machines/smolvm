@@ -15,6 +15,7 @@ pub mod compose;
 pub mod container_details;
 mod container_files;
 pub mod storage;
+pub mod volume_files;
 
 pub mod files;
 
