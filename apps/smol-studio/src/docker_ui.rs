@@ -359,7 +359,7 @@ impl DockerView {
                     self.activity = if upload {
                         "File uploaded."
                     } else {
-                        "File saved."
+                        "Saved to your computer."
                     }
                     .into();
                 }

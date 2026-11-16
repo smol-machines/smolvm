@@ -552,7 +552,12 @@ impl FilesView {
                     .max_height(body_height)
                     .show(ui, |ui| {
                         if let Some(error) = &self.error {
-                            design::error_notice(ui, "Transfer failed. Your paths are kept below.", error);
+                            let summary = if error.len() < 240 && !error.contains('\n') {
+                                error.as_str()
+                            } else {
+                                "Transfer failed. Your paths are kept below."
+                            };
+                            design::error_notice(ui, summary, error);
                             ui.add_space(12.0);
                         }
                         design::card(ui.ctx()).show(ui, |ui| {
