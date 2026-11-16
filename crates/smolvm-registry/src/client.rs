@@ -1016,7 +1016,22 @@ impl RegistryClient {
         reference: &str,
         platform: &OciPlatform,
     ) -> Result<Vec<u8>> {
+        Ok(self
+            .get_manifest_resolved_with_reference_digest(repo, reference, platform)
+            .await?
+            .0)
+    }
+
+    /// Resolve a platform manifest and retain the original registry document's
+    /// digest (the index for a multi-platform reference), from the same fetch.
+    pub async fn get_manifest_resolved_with_reference_digest(
+        &self,
+        repo: &str,
+        reference: &str,
+        platform: &OciPlatform,
+    ) -> Result<(Vec<u8>, String)> {
         let (doc_bytes, content_type) = self.get_manifest_raw(repo, reference).await?;
+        let reference_digest = format!("sha256:{}", hex::encode(Sha256::digest(&doc_bytes)));
 
         let is_index = content_type.contains(INDEX_MEDIA_TYPE)
             || serde_json::from_slice::<serde_json::Value>(&doc_bytes)
@@ -1027,7 +1042,7 @@ impl RegistryClient {
                 })
                 .unwrap_or(false);
         if !is_index {
-            return Ok(doc_bytes);
+            return Ok((doc_bytes, reference_digest));
         }
 
         let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
@@ -1061,7 +1076,10 @@ impl RegistryClient {
                 ))
             })?;
         tracing::info!(platform = %want, digest = %entry.digest, "selected index entry");
-        Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
+        Ok((
+            self.get_manifest_raw(repo, &entry.digest).await?.0,
+            reference_digest,
+        ))
     }
 
     /// List the repositories in this registry via the OCI catalog endpoint
@@ -2580,6 +2598,72 @@ mod http_tests {
         let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
         assert_eq!(manifest["schemaVersion"], 2);
         assert!(manifest["config"]["digest"].is_string());
+    }
+
+    #[tokio::test]
+    async fn resolution_retains_the_original_document_digest() {
+        let manifest = br#"{"schemaVersion":2,"config":{},"layers":[]}"#.to_vec();
+        let child_digest = format!("sha256:{}", hex::encode(Sha256::digest(&manifest)));
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": INDEX_MEDIA_TYPE,
+            "manifests": [{
+                "mediaType": MANIFEST_MEDIA_TYPE,
+                "digest": child_digest,
+                "size": manifest.len(),
+                "platform": {"os": "linux", "architecture": "arm64"}
+            }]
+        }))
+        .unwrap();
+        let index_digest = format!("sha256:{}", hex::encode(Sha256::digest(&index)));
+        for by_digest in [false, true] {
+            for multi_platform in [false, true] {
+                let server = MockServer::start().await;
+                let (body, digest, media_type) = if multi_platform {
+                    (&index, &index_digest, INDEX_MEDIA_TYPE)
+                } else {
+                    (&manifest, &child_digest, MANIFEST_MEDIA_TYPE)
+                };
+                let reference = if by_digest { digest.as_str() } else { "latest" };
+                Mock::given(method("GET"))
+                    .and(path(format!("/v2/app/manifests/{reference}")))
+                    .respond_with(
+                        ResponseTemplate::new(200)
+                            .insert_header("content-type", media_type)
+                            .set_body_bytes(body.clone()),
+                    )
+                    .expect(1)
+                    .mount(&server)
+                    .await;
+                if multi_platform {
+                    Mock::given(method("GET"))
+                        .and(path(format!("/v2/app/manifests/{child_digest}")))
+                        .respond_with(
+                            ResponseTemplate::new(200)
+                                .insert_header("content-type", MANIFEST_MEDIA_TYPE)
+                                .set_body_bytes(manifest.clone()),
+                        )
+                        .expect(1)
+                        .mount(&server)
+                        .await;
+                }
+                let (bytes, original_digest) = RegistryClient::new(server.uri())
+                    .get_manifest_resolved_with_reference_digest(
+                        "app",
+                        reference,
+                        &OciPlatform::parse("linux/arm64"),
+                    )
+                    .await
+                    .unwrap();
+                assert_eq!(bytes, manifest);
+                assert_eq!(&original_digest, digest);
+                // No second lookup of the mutable tag (or a HEAD request).
+                assert_eq!(
+                    server.received_requests().await.unwrap().len(),
+                    if multi_platform { 2 } else { 1 }
+                );
+            }
+        }
     }
 
     #[tokio::test]

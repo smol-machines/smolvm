@@ -122,6 +122,8 @@ pub async fn authorized_image_config(reference: &str, auth: &PullAuth) -> Result
 /// An image's identity and full config, as a container engine reports it.
 #[derive(Debug, Clone)]
 pub struct ImageMetadata {
+    /// Digest of the original registry manifest or multi-platform index.
+    pub reference_digest: String,
     /// Digest of the resolved single-platform manifest.
     pub manifest_digest: String,
     /// Digest of the config blob: the image id.
@@ -141,7 +143,8 @@ pub async fn authorized_image_metadata(
     auth: &PullAuth,
     oci_platform: Option<&str>,
 ) -> Result<ImageMetadata> {
-    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform).await?;
+    let (client, repo, manifest_bytes, reference_digest) =
+        resolve_manifest_with_reference_digest(reference, auth, oci_platform).await?;
     let manifest_digest = manifest_digest(&manifest_bytes);
     let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
         .map_err(|e| Error::agent("parse image manifest", e.to_string()))?;
@@ -166,6 +169,7 @@ pub async fn authorized_image_metadata(
     let config = serde_json::from_slice(&config_bytes)
         .map_err(|e| Error::agent("parse image config", e.to_string()))?;
     Ok(ImageMetadata {
+        reference_digest,
         manifest_digest,
         config_digest,
         config,
@@ -221,6 +225,16 @@ async fn resolve_manifest(
     auth: &PullAuth,
     oci_platform: Option<&str>,
 ) -> Result<(RegistryClient, String, Vec<u8>)> {
+    let (client, repo, bytes, _) =
+        resolve_manifest_with_reference_digest(reference, auth, oci_platform).await?;
+    Ok((client, repo, bytes))
+}
+
+async fn resolve_manifest_with_reference_digest(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<(RegistryClient, String, Vec<u8>, String)> {
     let reference = &without_pinned_tag(reference);
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
@@ -240,12 +254,17 @@ async fn resolve_manifest(
     let host = crate::registry::extract_registry(reference);
     let client = registry_client(&host, &config, auth);
     let repo = repo_for(&host, &parsed);
-    let platform = oci_platform.map(smolvm_registry::OciPlatform::parse);
-    let manifest_bytes = match &platform {
-        Some(p) => client.get_manifest_resolved_platform(&repo, &want, p).await,
-        None => client.get_manifest_resolved(&repo, &want).await,
-    }
-    .map_err(|e| Error::agent("image-auth", e.to_string()))?;
+    let platform = oci_platform
+        .map(smolvm_registry::OciPlatform::parse)
+        .unwrap_or_else(|| smolvm_registry::OciPlatform {
+            os: "linux".into(),
+            architecture: smolvm_registry::OciPlatform::current().architecture,
+            variant: None,
+        });
+    let (manifest_bytes, reference_digest) = client
+        .get_manifest_resolved_with_reference_digest(&repo, &want, &platform)
+        .await
+        .map_err(|e| Error::agent("image-auth", e.to_string()))?;
     // A manifest is a JSON object. Anything else is not from a registry, and
     // must not be hashed into a digest or trusted as one.
     if !matches!(
@@ -257,7 +276,7 @@ async fn resolve_manifest(
             format!("{host} did not return an image manifest for {reference}"),
         ));
     }
-    Ok((client, repo, manifest_bytes))
+    Ok((client, repo, manifest_bytes, reference_digest))
 }
 
 /// A registry image the host fetched: the `local:` reference it boots from and
@@ -851,6 +870,77 @@ mod tests {
         assert_eq!(repo_for("ghcr.io", &ns), "org/tool");
         // A bare name on a non-Docker-Hub host is not `library/`-prefixed.
         assert_eq!(repo_for("ghcr.io", &bare), "alpine");
+    }
+
+    #[tokio::test]
+    async fn metadata_retains_index_identity_and_platform_config() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let server = MockServer::start().await;
+        let config = br#"{"architecture":"arm64","os":"linux","config":{"Cmd":["true"]}}"#.to_vec();
+        let config_digest = manifest_digest(&config);
+        let manifest = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "config": {"digest": config_digest, "size": config.len()},
+            "layers": [{"size": 123}]
+        }))
+        .unwrap();
+        let child_digest = manifest_digest(&manifest);
+        let index = serde_json::to_vec(&serde_json::json!({
+            "schemaVersion": 2,
+            "mediaType": "application/vnd.oci.image.index.v1+json",
+            "manifests": [{
+                "mediaType": "application/vnd.oci.image.manifest.v1+json",
+                "digest": child_digest,
+                "size": manifest.len(),
+                "platform": {"os": "linux", "architecture": "arm64"}
+            }]
+        }))
+        .unwrap();
+        let index_digest = manifest_digest(&index);
+        for (endpoint, body, media_type) in [
+            (
+                format!("manifests/{index_digest}"),
+                index,
+                "application/vnd.oci.image.index.v1+json",
+            ),
+            (
+                format!("manifests/{child_digest}"),
+                manifest,
+                "application/vnd.oci.image.manifest.v1+json",
+            ),
+            (
+                format!("blobs/{config_digest}"),
+                config,
+                "application/vnd.oci.image.config.v1+json",
+            ),
+        ] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/app/{endpoint}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", media_type)
+                        .set_body_bytes(body),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
+        let host = server.uri().strip_prefix("http://").unwrap().to_string();
+        let meta = authorized_image_metadata(
+            &format!("{host}/app@{index_digest}"),
+            &PullAuth::Anonymous,
+            Some("linux/arm64"),
+        )
+        .await
+        .unwrap();
+        assert_eq!(meta.reference_digest, index_digest);
+        assert_eq!(meta.manifest_digest, child_digest);
+        assert_eq!(meta.config_digest, config_digest);
+        assert_eq!(meta.config["config"]["Cmd"][0], "true");
+        assert_eq!(meta.compressed_size, 123);
+        assert_eq!(server.received_requests().await.unwrap().len(), 3);
     }
 
     /// THE security property: authorization is the registry's decision, made with
