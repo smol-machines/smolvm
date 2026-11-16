@@ -65,6 +65,9 @@ pub(crate) fn unpack(archive: &Path, dir: &Path) -> std::io::Result<()> {
 /// The images of an unpacked archive: `manifest.json` (`docker save`) or,
 /// without one, `index.json` (an OCI image layout).
 pub(crate) fn read_images(dir: &Path) -> Result<Vec<ArchiveImage>, String> {
+    let root = dir
+        .canonicalize()
+        .map_err(|e| format!("resolve the image archive directory: {e}"))?;
     let inside = |name: &str| -> Result<PathBuf, String> {
         let rel = Path::new(name.trim_start_matches('/'));
         if rel
@@ -73,9 +76,33 @@ pub(crate) fn read_images(dir: &Path) -> Result<Vec<ArchiveImage>, String> {
         {
             return Err(format!("archive names a path outside itself: {name}"));
         }
-        Ok(dir.join(rel))
+        // Lexical checks alone do not contain archive-created symlinks. Resolve
+        // every metadata/blob reference, including links in parent directories,
+        // and retain the resolved path for subsequent reads and archive writes.
+        let path = root
+            .join(rel)
+            .canonicalize()
+            .map_err(|e| format!("resolve archive entry {name}: {e}"))?;
+        if !path.starts_with(&root) {
+            return Err(format!(
+                "archive entry resolves outside its directory: {name}"
+            ));
+        }
+        if !path.is_file() {
+            return Err(format!("archive entry is not a regular file: {name}"));
+        }
+        Ok(path)
     };
-    if let Ok(bytes) = std::fs::read(dir.join("manifest.json")) {
+    // A present but invalid manifest must fail, rather than silently falling
+    // back to an OCI index (which could hide an unsafe or broken link).
+    let docker_manifest = match std::fs::symlink_metadata(root.join("manifest.json")) {
+        Ok(_) => true,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => false,
+        Err(e) => return Err(format!("read manifest.json metadata: {e}")),
+    };
+    if docker_manifest {
+        let bytes = std::fs::read(inside("manifest.json")?)
+            .map_err(|e| format!("read manifest.json: {e}"))?;
         let entries: Vec<serde_json::Value> =
             serde_json::from_slice(&bytes).map_err(|e| format!("manifest.json: {e}"))?;
         let mut out = Vec::new();
@@ -106,7 +133,7 @@ pub(crate) fn read_images(dir: &Path) -> Result<Vec<ArchiveImage>, String> {
         return Ok(out);
     }
     let index: serde_json::Value = serde_json::from_slice(
-        &std::fs::read(dir.join("index.json"))
+        &std::fs::read(inside("index.json")?)
             .map_err(|_| "neither manifest.json nor index.json in the archive".to_string())?,
     )
     .map_err(|e| format!("index.json: {e}"))?;
@@ -1277,5 +1304,175 @@ mod tests {
         )
         .unwrap();
         assert!(read_images(dir.path()).is_err());
+    }
+
+    fn docker_fixture(root: &Path) -> Vec<PathBuf> {
+        std::fs::create_dir_all(root.join("content")).unwrap();
+        std::fs::write(root.join("content/config.json"), b"{}").unwrap();
+        std::fs::write(root.join("content/layer.tar"), b"layer bytes").unwrap();
+        std::fs::write(
+            root.join("manifest.json"),
+            br#"[{"Config":"content/config.json","Layers":["content/layer.tar"],"RepoTags":["app:1"]}]"#,
+        )
+        .unwrap();
+        [
+            "manifest.json",
+            "content/config.json",
+            "content/layer.tar",
+            "content",
+        ]
+        .into_iter()
+        .map(PathBuf::from)
+        .collect()
+    }
+
+    #[cfg(unix)]
+    fn oci_fixture(root: &Path) -> Vec<PathBuf> {
+        std::fs::create_dir_all(root.join("blobs/sha256")).unwrap();
+        let mut members = Vec::new();
+        let mut blob = |bytes: &[u8]| {
+            let hash = hex::encode(Sha256::digest(bytes));
+            let member = PathBuf::from(format!("blobs/sha256/{hash}"));
+            std::fs::write(root.join(&member), bytes).unwrap();
+            members.push(member);
+            serde_json::json!({"digest": format!("sha256:{hash}")})
+        };
+        let config = blob(b"{}");
+        let layer = blob(b"layer bytes");
+        let manifest = blob(
+            &serde_json::to_vec(&serde_json::json!({
+                "config": config, "layers": [layer]
+            }))
+            .unwrap(),
+        );
+        let nested = blob(
+            &serde_json::to_vec(&serde_json::json!({
+                "manifests": [manifest]
+            }))
+            .unwrap(),
+        );
+        std::fs::write(
+            root.join("index.json"),
+            serde_json::to_vec(&serde_json::json!({
+                "manifests": [nested]
+            }))
+            .unwrap(),
+        )
+        .unwrap();
+        members.extend([PathBuf::from("index.json"), PathBuf::from("blobs/sha256")]);
+        members
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn docker_and_oci_reject_external_file_and_directory_links() {
+        for fixture in [docker_fixture, oci_fixture] {
+            let initial = tempfile::tempdir().unwrap();
+            let members = fixture(initial.path());
+            assert_eq!(read_images(initial.path()).unwrap().len(), 1);
+            for member in members {
+                for absolute in [false, true] {
+                    let dir = tempfile::tempdir().unwrap();
+                    let root = dir.path().join("archive");
+                    fixture(&root);
+                    // A sibling with the same prefix also must fail containment.
+                    let outside = dir.path().join("archive-outside");
+                    std::fs::rename(root.join(&member), &outside).unwrap();
+                    let target = if absolute {
+                        outside
+                    } else {
+                        let mut target = PathBuf::new();
+                        for _ in 0..member.components().count() {
+                            target.push("..");
+                        }
+                        target.join("archive-outside")
+                    };
+                    std::os::unix::fs::symlink(target, root.join(&member)).unwrap();
+                    let error = read_images(&root).unwrap_err();
+                    assert!(error.contains("resolves outside"), "{member:?}: {error}");
+                }
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn internal_links_and_linked_archive_roots_remain_readable() {
+        for fixture in [docker_fixture, oci_fixture] {
+            for hardlink in [false, true] {
+                let dir = tempfile::tempdir().unwrap();
+                let root = dir.path().join("archive");
+                let members = fixture(&root);
+                for (i, member) in members.into_iter().enumerate() {
+                    let source = root.join(&member);
+                    if source.is_dir() {
+                        continue;
+                    }
+                    let target = source.with_file_name(format!("original-{i}"));
+                    std::fs::rename(&source, &target).unwrap();
+                    if hardlink {
+                        std::fs::hard_link(&target, &source).unwrap();
+                    } else {
+                        std::os::unix::fs::symlink(target.file_name().unwrap(), &source).unwrap();
+                    }
+                }
+                let alias = dir.path().join("alias");
+                std::os::unix::fs::symlink(&root, &alias).unwrap();
+                let images = read_images(&alias).unwrap();
+                assert_eq!(images.len(), 1);
+                assert_eq!(images[0].config, b"{}");
+                assert_eq!(std::fs::read(&images[0].layers[0]).unwrap(), b"layer bytes");
+                assert!(!images[0].layers[0].is_symlink());
+            }
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn unpacked_tar_cannot_reference_external_config() {
+        let dir = tempfile::tempdir().unwrap();
+        let outside = dir.path().join("owned-config.json");
+        std::fs::write(&outside, b"{}").unwrap();
+        let archive = dir.path().join("input.tar");
+        let mut tar = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o644);
+        tar.append_link(&mut link, "config.json", &outside).unwrap();
+        let manifest = br#"[{"Config":"config.json","Layers":[]}]"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o644);
+        header.set_size(manifest.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "manifest.json", &manifest[..])
+            .unwrap();
+        tar.finish().unwrap();
+        drop(tar);
+        let root = dir.path().join("unpacked");
+        unpack(&archive, &root).unwrap();
+        assert!(read_images(&root).unwrap_err().contains("resolves outside"));
+    }
+
+    #[test]
+    fn archive_members_must_be_regular_files() {
+        let dir = tempfile::tempdir().unwrap();
+        docker_fixture(dir.path());
+        std::fs::remove_file(dir.path().join("content/layer.tar")).unwrap();
+        std::fs::create_dir(dir.path().join("content/layer.tar")).unwrap();
+        assert!(read_images(dir.path())
+            .unwrap_err()
+            .contains("not a regular file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn broken_docker_manifest_does_not_fall_back_to_oci() {
+        let dir = tempfile::tempdir().unwrap();
+        oci_fixture(dir.path());
+        std::os::unix::fs::symlink("missing", dir.path().join("manifest.json")).unwrap();
+        assert!(read_images(dir.path())
+            .unwrap_err()
+            .contains("manifest.json"));
     }
 }
