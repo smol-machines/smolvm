@@ -91,7 +91,7 @@ impl DockerView {
             .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+            .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
             .show(ui, |ui| {
                 design::search(
                     ui,

@@ -372,13 +372,7 @@ impl Studio {
                     egui::Modifiers::COMMAND,
                     egui::Key::K,
                 ));
-                if ui
-                    .add_sized(
-                        [ui.available_width(), 28.0],
-                        egui::Button::new(format!("Go to…     {shortcut}")),
-                    )
-                    .clicked()
-                {
+                if design::switcher_button(ui, &shortcut).clicked() {
                     self.switcher.open();
                 }
                 ui.add_space(12.0);
@@ -421,7 +415,8 @@ impl Studio {
                     }
                 });
                 ui.add_space(12.0);
-                design::nav_group(ui, "Cloud");
+                ui.separator();
+                ui.add_space(6.0);
                 if design::nav(
                     ui,
                     self.workspace == Workspace::Cloud,
@@ -831,30 +826,48 @@ impl Studio {
         ui.add_space(8.0);
         design::card().show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.columns(2, |columns| {
-                design::metric(
-                    &mut columns[0],
+            let memory = design::memory(m.memory_mib);
+            let (memory_value, memory_unit) = memory.split_once(' ').unwrap_or((&memory, ""));
+            let cpu = m.cpus.to_string();
+            let storage = m
+                .storage_gb
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "—".into());
+            let overlay = m
+                .overlay_gb
+                .map(|v| v.to_string())
+                .unwrap_or_else(|| "—".into());
+            let metrics = [
+                (
                     "CPU limit",
-                    &m.cpus.to_string(),
+                    cpu.as_str(),
                     if m.cpus == 1 { "core" } else { "cores" },
-                );
-                let memory = design::memory(m.memory_mib);
-                let (value, unit) = memory.split_once(' ').unwrap_or((&memory, ""));
-                design::metric(&mut columns[1], "Memory limit", value, unit);
-            });
-            ui.add_space(8.0);
-            ui.separator();
-            for (label, size) in [
-                ("Storage disk", m.storage_gb),
-                ("Overlay disk", m.overlay_gb),
-            ] {
-                design::property(
-                    ui,
-                    label,
-                    &size
-                        .map(|v| format!("{v} GiB capacity"))
-                        .unwrap_or_else(|| "Not reported".into()),
-                );
+                ),
+                ("Memory limit", memory_value, memory_unit),
+                (
+                    "Storage disk",
+                    storage.as_str(),
+                    if m.storage_gb.is_some() { "GiB" } else { "" },
+                ),
+                (
+                    "Overlay disk",
+                    overlay.as_str(),
+                    if m.overlay_gb.is_some() { "GiB" } else { "" },
+                ),
+            ];
+            let column_count = if ui.available_width() >= 420.0 { 4 } else { 2 };
+            for (index, row) in metrics.chunks(column_count).enumerate() {
+                if index > 0 {
+                    ui.add_space(12.0);
+                }
+                ui.columns(column_count, |columns| {
+                    for (column, (label, value, unit)) in columns.iter_mut().zip(row) {
+                        design::metric(column, label, value, unit);
+                        if *value == "—" {
+                            column.label(RichText::new("Not reported").size(11.0).color(MUTED));
+                        }
+                    }
+                });
             }
         });
         ui.add_space(16.0);
@@ -1268,7 +1281,7 @@ impl eframe::App for Studio {
                     .default_size(248.0)
                     .min_size(224.0)
                     .max_size(380.0)
-                    .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+                    .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
                     .show(ui, |ui| {
                         design::search(ui, &mut self.query, "Search machines…");
                         ui.add_space(8.0);
@@ -1285,7 +1298,7 @@ impl eframe::App for Studio {
                         self.machine_list(ui);
                     });
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(SURFACE).inner_margin(24))
+                    .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24))
                     .show(ui, |ui| {
                         if self.selected.is_some() {
                             self.details(ui, frame);

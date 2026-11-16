@@ -829,7 +829,7 @@ impl DockerView {
             .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+            .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
             .show(ui, |ui| {
                 design::search(ui, &mut self.project_query, "Search projects…");
                 ui.add_space(12.0);
@@ -1086,6 +1086,58 @@ impl DockerView {
         );
     }
 
+    fn container_actions(
+        &mut self,
+        ui: &mut egui::Ui,
+        runtime: &Runtime,
+        details: &smol_studio::container_details::ContainerDetails,
+        enabled: bool,
+    ) {
+        ui.horizontal_wrapped(|ui| {
+            if details.state == "running" {
+                if ui
+                    .add_enabled(enabled, design::primary("Open terminal"))
+                    .clicked()
+                {
+                    match crate::terminal_ui::TerminalWindow::for_container(
+                        ui.ctx(),
+                        &details.id,
+                        &details.name,
+                    ) {
+                        Ok(t) => self.terminal = Some(t),
+                        Err(e) => self.error = Some(e),
+                    }
+                }
+                if ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() {
+                    self.submit(runtime, Action::Stop(details.id.clone()));
+                }
+            } else if ui
+                .add_enabled(enabled, design::primary("Start container"))
+                .clicked()
+            {
+                self.submit(runtime, Action::Start(details.id.clone()));
+            }
+            ui.add_enabled_ui(enabled, |ui| {
+                ui.menu_button("More", |ui| {
+                    if ui.button("Copy container ID").clicked() {
+                        ui.ctx().copy_text(details.id.clone());
+                        ui.close();
+                    }
+                    if details.state != "running" {
+                        ui.separator();
+                        if ui
+                            .button(RichText::new("Remove container…").color(design::RED))
+                            .clicked()
+                        {
+                            self.confirm = Some(Action::Delete(details.id.clone()));
+                            ui.close();
+                        }
+                    }
+                });
+            });
+        });
+    }
+
     fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         let Some(details) = self.details.clone() else {
             ui.add_space(20.0);
@@ -1097,15 +1149,34 @@ impl DockerView {
             return;
         };
         let enabled = self.valid && self.pending.is_none();
-        ui.add(egui::Label::new(design::heading(&details.name, 23.0)).truncate())
-            .on_hover_text(&details.name);
+        let wide = ui.available_width() >= 640.0;
         ui.horizontal(|ui| {
-            design::badge(ui, &details.state);
-            ui.add(
-                egui::Label::new(RichText::new(&details.image).size(12.0).color(MUTED)).truncate(),
-            )
-            .on_hover_text(&details.image);
+            let title_width = (ui.available_width() - if wide { 260.0 } else { 0.0 }).max(120.0);
+            ui.allocate_ui_with_layout(
+                egui::vec2(title_width, 56.0),
+                egui::Layout::top_down(egui::Align::LEFT),
+                |ui| {
+                    ui.set_min_width(title_width);
+                    ui.add(egui::Label::new(design::heading(&details.name, 23.0)).truncate())
+                        .on_hover_text(&details.name);
+                    ui.horizontal(|ui| {
+                        design::badge(ui, &details.state);
+                        ui.add(
+                            egui::Label::new(RichText::new(&details.image).size(12.0).color(MUTED))
+                                .truncate(),
+                        )
+                        .on_hover_text(&details.image);
+                    });
+                },
+            );
+            if wide {
+                self.container_actions(ui, runtime, &details, enabled);
+            }
         });
+        if !wide {
+            ui.add_space(10.0);
+            self.container_actions(ui, runtime, &details, enabled);
+        }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
             for (tab, label) in [
@@ -1161,30 +1232,8 @@ impl DockerView {
             }
             ui.add_space(12.0);
         }
-                    ui.horizontal_wrapped(|ui| {
-                        if details.state == "running" {
-                            if ui.add_enabled(enabled, design::primary("Open terminal")).clicked() {
-                                match crate::terminal_ui::TerminalWindow::for_container(ui.ctx(), &details.id, &details.name) {
-                                    Ok(t) => self.terminal = Some(t), Err(e) => self.error = Some(e),
-                                }
-                            }
-                            if ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() { self.submit(runtime, Action::Stop(details.id.clone())); }
-                        } else if ui.add_enabled(enabled, design::primary("Start container")).clicked() {
-                            self.submit(runtime, Action::Start(details.id.clone()));
-                        }
-                        ui.add_enabled_ui(enabled, |ui| {
-                            ui.menu_button("More", |ui| {
-                                if ui.button("Copy container ID").clicked() { ui.ctx().copy_text(details.id.clone()); ui.close(); }
-                                if details.state != "running" {
-                                    ui.separator();
-                                    if ui.button(RichText::new("Remove container…").color(design::RED)).clicked() { self.confirm = Some(Action::Delete(details.id.clone())); ui.close(); }
-                                }
-                            });
-                        });
-                    });
                     if details.oom_killed { ui.add_space(8.0); design::notice(ui, "Stopped after running out of memory."); }
                     if !details.error.is_empty() { ui.add_space(8.0); design::notice(ui, &details.error); }
-                    ui.add_space(16.0);
                     if details.health.is_some() || (matches!(details.state.as_str(), "exited" | "dead") && details.exit_code.is_some()) {
                         design::card().show(ui, |ui| {
                             ui.set_width(ui.available_width());
@@ -1311,7 +1360,27 @@ impl DockerView {
                             } else {
                                 self.kind.label()
                             },
-                            "Docker and Compose, powered by Smol.",
+                            &if self.compose && self.projects_valid {
+                                count(self.projects.len(), "project")
+                            } else if !self.compose && self.valid {
+                                match self.kind {
+                                    Kind::Containers => format!(
+                                        "{} · {} running",
+                                        count(self.rows.len(), "container"),
+                                        self.rows
+                                            .iter()
+                                            .filter(|row| text(row, "State") == "running")
+                                            .count()
+                                    ),
+                                    Kind::Images => count(self.rows.len(), "image"),
+                                    Kind::Volumes => count(self.rows.len(), "volume"),
+                                    Kind::Networks => count(self.rows.len(), "network"),
+                                }
+                            } else if self.pending.is_some() {
+                                "Connecting to Smol…".into()
+                            } else {
+                                "Check your connection to Smol".into()
+                            },
                         );
                     });
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1446,7 +1515,7 @@ impl DockerView {
                 .default_size(248.0)
                 .min_size(224.0)
                 .max_size(380.0)
-                .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(12))
+                .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
                 .show(ui, |ui| {
                     design::search(ui, &mut self.query, "Search containers…");
                     ui.add_space(12.0);
@@ -1505,7 +1574,7 @@ impl DockerView {
                         });
                 });
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(24)).show(ui,|ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
             if !self.connected() && !cfg!(windows) {
                 self.connection_content(ui, runtime);

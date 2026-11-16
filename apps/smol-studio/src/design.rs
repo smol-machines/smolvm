@@ -3,10 +3,10 @@ use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
 pub const INK: Color32 = Color32::from_rgb(17, 17, 17);
 pub const MUTED: Color32 = Color32::from_rgb(104, 106, 111);
-pub const SIDEBAR: Color32 = Color32::from_rgb(243, 243, 245);
+pub const SIDEBAR: Color32 = Color32::from_rgb(245, 245, 246);
 pub const ACCENT: Color32 = Color32::from_rgb(17, 17, 17);
 pub const LINE: Color32 = Color32::from_rgb(226, 226, 227);
-pub const SURFACE: Color32 = Color32::from_rgb(248, 248, 250);
+pub const SURFACE: Color32 = Color32::from_rgb(249, 249, 250);
 pub const SELECTED: Color32 = Color32::from_rgb(230, 231, 234);
 pub const GREEN: Color32 = Color32::from_rgb(44, 122, 63);
 pub const RED: Color32 = Color32::from_rgb(179, 38, 30);
@@ -165,14 +165,18 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
 
 pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::Response {
     let response = ui.add_sized(
-        [ui.available_width(), 36.0],
+        [ui.available_width(), 34.0],
         egui::Button::selectable(selected, "")
             .fill(if selected {
-                SELECTED
+                Color32::WHITE
             } else {
                 Color32::TRANSPARENT
             })
-            .stroke(Stroke::NONE)
+            .stroke(if selected {
+                Stroke::new(1.0, LINE)
+            } else {
+                Stroke::NONE
+            })
             .corner_radius(6),
     );
     response.widget_info(|| {
@@ -196,6 +200,35 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
         label,
         FontId::proportional(13.0),
         if selected { ACCENT } else { INK },
+    );
+    response
+}
+
+/// Separate label and shortcut anchors keep the command switcher aligned on every OS.
+pub fn switcher_button(ui: &mut egui::Ui, shortcut: &str) -> egui::Response {
+    let response = ui.add_sized(
+        [ui.available_width(), 30.0],
+        egui::Button::new("")
+            .fill(Color32::TRANSPARENT)
+            .stroke(Stroke::new(1.0, LINE)),
+    );
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Go to workspace")
+    });
+    let rect = response.rect;
+    ui.painter().text(
+        rect.left_center() + egui::vec2(10.0, 0.0),
+        egui::Align2::LEFT_CENTER,
+        "Go to…",
+        FontId::proportional(12.0),
+        MUTED,
+    );
+    ui.painter().text(
+        rect.right_center() - egui::vec2(10.0, 0.0),
+        egui::Align2::RIGHT_CENTER,
+        shortcut,
+        FontId::proportional(11.0),
+        MUTED,
     );
     response
 }
@@ -307,7 +340,7 @@ pub fn metric(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
     ui.vertical(|ui| {
         ui.label(RichText::new(label).size(12.0).color(MUTED));
         ui.add_space(4.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             ui.label(heading(value, 26.0));
             ui.label(RichText::new(unit).size(12.0).color(MUTED));
         });
@@ -397,11 +430,7 @@ pub fn resource_row(
     let response = ui.add_sized(
         [ui.available_width(), 60.0],
         egui::Button::selectable(selected, "")
-            .fill(if selected {
-                SELECTED
-            } else {
-                Color32::TRANSPARENT
-            })
+            .fill(if selected { INK } else { Color32::TRANSPARENT })
             .stroke(Stroke::NONE)
             .corner_radius(6),
     );
@@ -414,29 +443,76 @@ pub fn resource_row(
         )
     });
     row_feedback(ui, &response, selected);
+    if selected && response.has_focus() {
+        ui.painter().rect_stroke(
+            response.rect.shrink(2.0),
+            4,
+            Stroke::new(1.0, Color32::WHITE),
+            egui::StrokeKind::Inside,
+        );
+    }
     let r = response.rect;
     let icon_rect =
         egui::Rect::from_center_size(egui::pos2(r.left() + 25.0, r.center().y), Vec2::splat(30.0));
     ui.painter().rect_filled(
         icon_rect,
         8,
-        if selected { Color32::WHITE } else { SURFACE },
+        if selected {
+            Color32::from_rgb(48, 48, 50)
+        } else {
+            Color32::WHITE
+        },
     );
     icon(
         ui.painter(),
         icon_rect.shrink(6.0),
         kind,
-        if selected { ACCENT } else { MUTED },
+        if selected { Color32::WHITE } else { MUTED },
     );
     let left = r.left() + 49.0;
     let painter = ui.painter_at(egui::Rect::from_min_max(
         egui::pos2(left, r.top()),
         egui::pos2(r.right() - 22.0, r.bottom()),
     ));
-    for (text, y, size, color) in [(name, 12.0, 13.0, INK), (subtitle, 33.0, 11.5, MUTED)] {
+    let subtitle = if state.is_empty() {
+        subtitle.to_owned()
+    } else {
+        let mut chars = state.chars();
+        let label = chars
+            .next()
+            .map(|c| c.to_uppercase().collect::<String>() + chars.as_str())
+            .unwrap_or_default();
+        if subtitle.is_empty() {
+            label
+        } else {
+            format!("{label} · {subtitle}")
+        }
+    };
+    for (text, y, size, color) in [
+        (
+            name,
+            12.0,
+            13.0,
+            if selected { Color32::WHITE } else { INK },
+        ),
+        (
+            subtitle.as_str(),
+            33.0,
+            11.5,
+            if selected {
+                Color32::from_rgb(196, 197, 201)
+            } else {
+                MUTED
+            },
+        ),
+    ] {
         let mut job = egui::text::LayoutJob::simple_singleline(
             text.to_owned(),
-            FontId::proportional(size),
+            if text == name {
+                FontId::new(size, egui::FontFamily::Name("studio-heading".into()))
+            } else {
+                FontId::proportional(size)
+            },
             color,
         );
         job.wrap.max_width = (r.width() - 74.0).max(1.0);
@@ -449,7 +525,15 @@ pub fn resource_row(
         ui.painter().circle_filled(
             egui::pos2(r.right() - 13.0, r.center().y),
             3.0,
-            state_color(state),
+            if selected && matches!(state, "running" | "started" | "ready") {
+                Color32::from_rgb(113, 209, 137)
+            } else if selected && state_color(state) == RED {
+                Color32::from_rgb(255, 141, 134)
+            } else if selected && matches!(state_color(state), MUTED | ACCENT) {
+                Color32::from_rgb(169, 171, 177)
+            } else {
+                state_color(state)
+            },
         );
     }
     response.on_hover_text(format!("{name}\n{subtitle}\n{state}"))
@@ -528,7 +612,7 @@ pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
 pub fn notice(ui: &mut egui::Ui, message: &str) {
     egui::Frame::new()
         .fill(Color32::from_rgb(255, 243, 242))
-        .corner_radius(0)
+        .corner_radius(8)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -539,7 +623,7 @@ pub fn notice(ui: &mut egui::Ui, message: &str) {
 pub fn error_notice(ui: &mut egui::Ui, title: &str, detail: &str) {
     egui::Frame::new()
         .fill(Color32::from_rgb(255, 243, 242))
-        .corner_radius(0)
+        .corner_radius(8)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
@@ -634,7 +718,7 @@ pub fn theme(ctx: &egui::Context) {
         style.visuals.widgets.inactive.corner_radius = 5.into();
         style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(243, 243, 243);
         style.visuals.widgets.hovered.bg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(136, 136, 136));
+            Stroke::new(1.0, Color32::from_rgb(188, 188, 192));
         style.visuals.widgets.hovered.corner_radius = 5.into();
         style.visuals.widgets.active.weak_bg_fill = SELECTED;
         style.visuals.widgets.active.corner_radius = 5.into();
