@@ -236,3 +236,68 @@ fn busy_mount_registration(after_fork: bool) {
         assert!(shutdown.elapsed() < Duration::from_secs(3));
     });
 }
+
+#[test]
+fn a_disconnected_guest_recovers_a_large_burst_including_removed_names() {
+    overflow_recovery(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn polling_recovers_a_large_burst_including_removed_names() {
+    overflow_recovery(true);
+}
+
+fn overflow_recovery(after_fork: bool) {
+    use smolvm_protocol::fsnotify_mask;
+    let root = tempfile::tempdir().unwrap();
+    let source = root.path().join("source");
+    std::fs::create_dir(&source).unwrap();
+    for index in 0..512 {
+        std::fs::write(source.join(format!("remove-{index}")), b"before").unwrap();
+        std::fs::write(source.join(format!("modify-{index}")), b"before").unwrap();
+    }
+    let listener = UnixListener::bind(root.path().join("agent.sock")).unwrap();
+    let watcher = watcher(root.path(), &source, after_fork);
+    let mut peer = accept(&listener);
+    wait_for_notifications(&mut peer, &source, "smolvm0");
+    std::fs::write(source.join("held"), b"pending").unwrap();
+    assert!(!request(&mut peer).is_empty()); // Hold the acknowledgement during the burst.
+    for index in 0..20_000 {
+        std::fs::write(source.join(format!("create-{index}")), b"new").unwrap();
+    }
+    for index in 0..512 {
+        std::fs::remove_file(source.join(format!("remove-{index}"))).unwrap();
+        std::fs::write(source.join(format!("modify-{index}")), b"after").unwrap();
+    }
+    drop(peer);
+    let mut peer = accept(&listener);
+    let deadline = Instant::now() + Duration::from_secs(30);
+    let mut created = HashSet::new();
+    let mut modified = HashSet::new();
+    let mut removed = HashSet::new();
+    while created.len() < 20_000 || modified.len() < 512 || removed.len() < 512 {
+        for event in request(&mut peer) {
+            let name = event.path.rsplit('/').next().unwrap();
+            if name.starts_with("create-") && event.mask & fsnotify_mask::FS_CREATE != 0 {
+                created.insert(name.to_owned());
+            } else if name.starts_with("modify-") && event.mask & fsnotify_mask::FS_MODIFY != 0 {
+                modified.insert(name.to_owned());
+            } else if name.starts_with("remove-") && event.mask & fsnotify_mask::FS_DELETE != 0 {
+                removed.insert(name.to_owned());
+            }
+        }
+        peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+            .unwrap();
+        assert!(
+            Instant::now() < deadline,
+            "incomplete recovery: {} creates, {} modifies, {} removals",
+            created.len(),
+            modified.len(),
+            removed.len()
+        );
+    }
+    let shutdown = Instant::now();
+    drop(watcher);
+    assert!(shutdown.elapsed() < Duration::from_secs(3));
+}

@@ -1,167 +1,161 @@
-//! Bounded pending host changes, including while the guest cannot accept them.
+//! Bounded, nonblocking dirty paths; overflow requests state reconciliation.
 use notify::Event;
 use parking_lot::{Condvar, Mutex};
-use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{mpsc::RecvTimeoutError, Arc};
-use std::time::{Duration, Instant};
-
+use std::{
+    collections::BTreeSet,
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc,
+    },
+    time::{Duration, Instant},
+};
 const CAPACITY: usize = 256;
-const STOP_CHECK: Duration = Duration::from_millis(50);
-
+#[derive(Default)]
+struct Pending {
+    paths: BTreeSet<PathBuf>,
+    all: bool,
+}
 pub(super) struct EventQueue {
-    pending: Mutex<VecDeque<notify::Result<Event>>>,
+    pending: Mutex<Pending>,
     changed: Condvar,
     stop: Arc<AtomicBool>,
 }
-
+#[derive(Debug)]
+pub(super) enum Work {
+    Paths(Vec<PathBuf>),
+    All,
+}
 impl EventQueue {
-    pub(super) fn new(stop: Arc<AtomicBool>) -> Self {
+    pub fn new(stop: Arc<AtomicBool>) -> Self {
         Self {
-            pending: Mutex::new(VecDeque::new()),
+            pending: Mutex::new(Pending::default()),
             changed: Condvar::new(),
             stop,
         }
     }
-
-    pub(super) fn push(&self, event: notify::Result<Event>) {
+    pub fn push(&self, event: notify::Result<Event>) {
+        if self.stop.load(Ordering::SeqCst) {
+            return;
+        }
         let mut pending = self.pending.lock();
-        while !self.stop.load(Ordering::SeqCst) {
-            if let Ok(new) = &event {
-                // Delivery reads the current host metadata, not an event's old
-                // timestamp. Repeated changes of the same kind and path need
-                // one announcement; keep create/remove/rename kinds distinct.
-                if pending.iter().any(|queued| {
-                    queued.as_ref().is_ok_and(|old| {
-                        old.kind == new.kind
-                            && old.paths == new.paths
-                            && old.need_rescan() == new.need_rescan()
-                    })
-                }) {
+        if pending.all {
+            return;
+        }
+        match event {
+            Ok(event) if !event.need_rescan() => {
+                if matches!(event.kind, notify::EventKind::Access(_)) {
                     return;
                 }
+                for path in event.paths {
+                    if pending.paths.iter().any(|p| path.starts_with(p)) {
+                        continue;
+                    }
+                    pending.paths.retain(|p| !p.starts_with(&path));
+                    if pending.paths.len() == CAPACITY {
+                        pending.paths.clear();
+                        pending.all = true;
+                        break;
+                    }
+                    pending.paths.insert(path);
+                }
             }
-            if pending.len() < CAPACITY {
-                pending.push_back(event);
-                self.changed.notify_all();
-                return;
+            _ => {
+                pending.paths.clear();
+                pending.all = true;
             }
-            // Backpressure distinct changes instead of allocating indefinitely
-            // or silently discarding them. Never block watcher teardown: the
-            // OS callback also observes the VM owner's stop flag.
-            self.changed.wait_for(&mut pending, STOP_CHECK);
         }
+        self.changed.notify_one();
     }
-
-    pub(super) fn recv_timeout(
-        &self,
-        timeout: Duration,
-    ) -> Result<notify::Result<Event>, RecvTimeoutError> {
+    pub fn retry_all(&self) {
+        let mut pending = self.pending.lock();
+        pending.paths.clear();
+        pending.all = true;
+        self.changed.notify_one();
+    }
+    pub fn take(&self, timeout: Duration) -> Option<Work> {
         let deadline = Instant::now() + timeout;
         let mut pending = self.pending.lock();
+        let mut burst_deadline = None;
         loop {
             if self.stop.load(Ordering::SeqCst) {
-                return Err(RecvTimeoutError::Disconnected);
+                return None;
             }
-            if let Some(event) = pending.pop_front() {
-                self.changed.notify_all();
-                return Ok(event);
+            if pending.all {
+                pending.all = false;
+                return Some(Work::All);
             }
-            let Some(remaining) = deadline.checked_duration_since(Instant::now()) else {
-                return Err(RecvTimeoutError::Timeout);
-            };
-            self.changed.wait_for(&mut pending, remaining);
+            if !pending.paths.is_empty() {
+                let burst = *burst_deadline.get_or_insert_with(|| {
+                    (Instant::now() + Duration::from_millis(25)).min(deadline)
+                });
+                if let Some(remaining) = burst.checked_duration_since(Instant::now()) {
+                    self.changed.wait_for(&mut pending, remaining);
+                    continue;
+                }
+                return Some(Work::Paths(
+                    std::mem::take(&mut pending.paths).into_iter().collect(),
+                ));
+            }
+            let remaining = deadline.checked_duration_since(Instant::now())?;
+            self.changed
+                .wait_for(&mut pending, remaining.min(Duration::from_millis(50)));
         }
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use notify::event::{CreateKind, ModifyKind, RemoveKind};
-    use std::path::PathBuf;
-
-    fn change(path: impl Into<PathBuf>) -> notify::Result<Event> {
-        Ok(Event::new(notify::EventKind::Modify(ModifyKind::Any)).add_path(path.into()))
+    fn write(p: impl Into<PathBuf>) -> notify::Result<Event> {
+        Ok(Event::new(notify::EventKind::Any).add_path(p.into()))
     }
-
     #[test]
-    fn repeated_edits_do_not_grow_a_disconnected_guests_backlog() {
-        let queue = EventQueue::new(Arc::new(AtomicBool::new(false)));
-        for _ in 0..100_000 {
-            queue.push(change("/project/app.rs"));
-        }
-        assert_eq!(queue.pending.lock().len(), 1);
-        let event = queue.recv_timeout(Duration::ZERO).unwrap().unwrap();
-        assert_eq!(event.paths, vec![PathBuf::from("/project/app.rs")]);
+    fn a_disconnected_consumer_never_blocks_the_native_callback() {
+        let q = Arc::new(EventQueue::new(Arc::new(AtomicBool::new(false))));
+        let producer = q.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            for i in 0..100000 {
+                producer.push(write(format!("/source/file-{i}")));
+            }
+            tx.send(()).unwrap();
+        });
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("callback waited for guest delivery");
+        worker.join().unwrap();
+        assert!(q.pending.lock().paths.len() <= CAPACITY);
+        assert!(matches!(q.take(Duration::ZERO), Some(Work::All)));
+        assert!(q.take(Duration::ZERO).is_none());
     }
-
     #[test]
-    fn different_kinds_and_names_are_preserved() {
-        let queue = EventQueue::new(Arc::new(AtomicBool::new(false)));
-        let kinds = [
-            notify::EventKind::Create(CreateKind::File),
-            notify::EventKind::Modify(ModifyKind::Any),
-            notify::EventKind::Remove(RemoveKind::File),
-        ];
-        for kind in kinds {
-            queue.push(Ok(Event::new(kind).add_path("/project/app.rs".into())));
-        }
-        queue.push(change("/project/other.rs"));
-        for kind in kinds {
-            assert_eq!(
-                queue.recv_timeout(Duration::ZERO).unwrap().unwrap().kind,
-                kind
-            );
-        }
-        assert_eq!(queue.pending.lock().len(), 1);
+    fn changes_during_recovery_and_failed_delivery_remain_pending() {
+        let q = EventQueue::new(Arc::new(AtomicBool::new(false)));
+        q.retry_all();
+        assert!(matches!(q.take(Duration::ZERO), Some(Work::All)));
+        q.push(write("/source/after-scan-start"));
+        assert!(
+            matches!(q.take(Duration::ZERO),Some(Work::Paths(p)) if p==[PathBuf::from("/source/after-scan-start")])
+        );
+        q.retry_all();
+        q.push(write("/source/while-disconnected"));
+        assert!(matches!(q.take(Duration::ZERO), Some(Work::All)));
     }
-
     #[test]
-    fn a_full_queue_preserves_distinct_changes_when_delivery_resumes() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let queue = Arc::new(EventQueue::new(stop));
-        for index in 0..CAPACITY {
-            queue.push(change(format!("/project/{index}")));
-        }
-        let producer = {
-            let queue = queue.clone();
-            std::thread::spawn(move || {
-                for index in CAPACITY..CAPACITY * 4 {
-                    queue.push(change(format!("/project/{index}")));
-                }
-            })
-        };
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!producer.is_finished());
-        assert_eq!(queue.pending.lock().len(), CAPACITY);
-        for index in 0..CAPACITY * 4 {
-            let event = queue.recv_timeout(Duration::from_secs(2)).unwrap().unwrap();
-            assert_eq!(
-                event.paths,
-                vec![PathBuf::from(format!("/project/{index}"))]
-            );
-            assert!(queue.pending.lock().len() <= CAPACITY);
-        }
-        producer.join().unwrap();
+    fn native_overflow_is_not_mistaken_for_an_empty_event() {
+        let q = EventQueue::new(Arc::new(AtomicBool::new(false)));
+        q.push(Ok(
+            Event::new(notify::EventKind::Other).set_flag(notify::event::Flag::Rescan)
+        ));
+        assert!(matches!(q.take(Duration::ZERO), Some(Work::All)));
     }
-
     #[test]
-    fn shutdown_releases_a_callback_waiting_on_a_full_queue() {
-        let stop = Arc::new(AtomicBool::new(false));
-        let queue = Arc::new(EventQueue::new(stop.clone()));
-        for index in 0..CAPACITY {
-            queue.push(change(format!("/project/{index}")));
-        }
-        let producer = {
-            let queue = queue.clone();
-            std::thread::spawn(move || queue.push(change("/project/last")))
-        };
-        std::thread::sleep(Duration::from_millis(100));
-        assert!(!producer.is_finished());
-        let start = Instant::now();
-        stop.store(true, Ordering::SeqCst);
-        producer.join().unwrap();
-        assert!(start.elapsed() < Duration::from_secs(1));
+    fn parents_coalesce_descendants_but_not_similarly_named_siblings() {
+        let q = EventQueue::new(Arc::new(AtomicBool::new(false)));
+        q.push(write("/source/a/child"));
+        q.push(write("/source/a-sibling"));
+        q.push(write("/source/a"));
+        assert!(
+            matches!(q.take(Duration::ZERO),Some(Work::Paths(p)) if p==[PathBuf::from("/source/a"),PathBuf::from("/source/a-sibling")])
+        );
     }
 }
