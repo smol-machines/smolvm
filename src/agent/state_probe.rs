@@ -160,6 +160,7 @@ pub(crate) fn recover_unreachable_machine_in_db(
     record: &VmRecord,
     db: &SmolvmDb,
 ) -> crate::Result<()> {
+    let mut held_pid = None;
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
@@ -172,11 +173,21 @@ pub(crate) fn recover_unreachable_machine_in_db(
                 ));
             }
             crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(&record.name), pid);
-            crate::process::stop_vm_process(
+            if let crate::process::VmStop::Held(held) = crate::process::stop_vm_process_bounded(
                 pid,
                 crate::process::VM_SIGTERM_TIMEOUT,
                 crate::process::VM_SIGKILL_TIMEOUT,
-            )?;
+            )? {
+                // Nothing can make the process exit, and it runs no more
+                // code. Finish the teardown and keep its PID in the record,
+                // so a later start is refused while it still holds the disks.
+                tracing::warn!(
+                    "machine '{}' is stopped, but {}",
+                    record.name,
+                    held.explain()
+                );
+                held_pid = Some(pid);
+            }
         }
     }
 
@@ -192,8 +203,10 @@ pub(crate) fn recover_unreachable_machine_in_db(
     // in-memory config load; the update is targeted to the one record.
     db.update_vm(&record.name, |r| {
         r.state = RecordState::Stopped;
-        r.pid = None;
-        r.pid_start_time = None;
+        if held_pid.is_none() {
+            r.pid = None;
+            r.pid_start_time = None;
+        }
     })?;
     Ok(())
 }

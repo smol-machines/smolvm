@@ -2613,10 +2613,17 @@ pub fn stop_vm_named_with_timeout(
         ));
     }
 
+    // A process the kernel is holding after SIGKILL stays in the record, so
+    // a later start is refused while it still has the machine's disks open.
+    let held = record
+        .pid
+        .is_some_and(|pid| smolvm::process::held_after_kill(pid).is_some());
     config.update_vm(name, |r| {
         r.state = RecordState::Stopped;
-        r.pid = None;
-        r.pid_start_time = None;
+        if !held {
+            r.pid = None;
+            r.pid_start_time = None;
+        }
     });
 
     println!("Stopped machine: {}", name);
@@ -2966,7 +2973,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 // The machine is being deleted, so its workload has nothing
                 // to save: kill it at once rather than wait out its timeout.
                 manager.stop_with_timeout(std::time::Duration::ZERO)?;
-                if record.pid.is_some_and(smolvm::process::is_alive) {
+                if record.pid.is_some_and(smolvm::process::can_still_run) {
                     return Err(smolvm::Error::agent(
                         "delete machine",
                         format!("machine '{name}' process is still alive after stop"),
@@ -2987,6 +2994,29 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             }
             _ => {}
         }
+    }
+
+    // A process the kernel is holding after SIGKILL cannot be made to exit,
+    // by this or any later delete. Removing the machine around it leaves that
+    // process behind with the machine's files open, so it needs --force; a
+    // delete without it stops here and says why.
+    if let Some(held) = record.pid.and_then(smolvm::process::held_after_kill) {
+        if !force {
+            db.update_vm(name, |r| r.state = RecordState::Stopped)?;
+            return Err(smolvm::Error::agent(
+                "delete machine",
+                format!(
+                    "machine '{name}' is stopped, but {}; pass --force to delete the \
+                     machine and leave that process behind",
+                    held.explain()
+                ),
+            ));
+        }
+        eprintln!(
+            "Deleting machine '{name}' and leaving PID {} behind: {}.",
+            held.pid,
+            held.explain()
+        );
     }
 
     // If the machine was created from a .smolmachine, detach its case-sensitive

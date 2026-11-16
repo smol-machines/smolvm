@@ -51,8 +51,7 @@ use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
-    is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
-    VM_SIGTERM_TIMEOUT,
+    is_alive, is_our_process_strict, process_start_time, VM_SIGKILL_TIMEOUT, VM_SIGTERM_TIMEOUT,
 };
 use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
@@ -2690,7 +2689,15 @@ fn shutdown_machine_process(
                 Duration::ZERO
             };
             crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(name), pid);
-            let _ = stop_vm_process(pid, sigterm, VM_SIGKILL_TIMEOUT);
+            if let Ok(crate::process::VmStop::Held(held)) =
+                crate::process::stop_vm_process_bounded(pid, sigterm, VM_SIGKILL_TIMEOUT)
+            {
+                // The kernel will not let the process exit and it runs no
+                // more code. Report the machine stopped instead of failing
+                // every later stop and delete until the host reboots.
+                tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+                return true;
+            }
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }

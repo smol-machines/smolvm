@@ -1024,8 +1024,15 @@ pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
 pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
     db.update_vm(name, |record| {
         record.state = RecordState::Stopped;
-        record.pid = None;
-        record.pid_start_time = None;
+        // A process the kernel is holding after SIGKILL stays in the record,
+        // so a later start is refused while it still has the disks open.
+        let held = record
+            .pid
+            .is_some_and(|pid| crate::process::held_after_kill(pid).is_some());
+        if !held {
+            record.pid = None;
+            record.pid_start_time = None;
+        }
     })?
     .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())

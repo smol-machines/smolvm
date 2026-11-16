@@ -3901,6 +3901,176 @@ pub const VM_SIGTERM_TIMEOUT: Duration = Duration::from_secs(3);
 /// down VM resources. This timeout must be long enough for that cleanup.
 pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A process that is still present after SIGKILL was delivered to it.
+///
+/// SIGKILL cannot be blocked or handled, so the only way to outlive it is a
+/// thread that is inside a kernel call the kernel will not interrupt (for
+/// example an `open()` of a device whose driver is not responding). Such a
+/// thread keeps the process entry, its open files and its listening ports
+/// until the call returns or the host reboots; no signal changes that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldProcess {
+    /// The process (thread group) id.
+    pub pid: Pid,
+    /// The threads that have not exited, with their scheduler state letter
+    /// from `/proc` (`D` is uninterruptible sleep).
+    pub blocked_threads: Vec<(Pid, char)>,
+}
+
+impl HeldProcess {
+    /// One sentence for the user: which PID was left behind and why.
+    pub fn explain(&self) -> String {
+        let threads = match self.blocked_threads.as_slice() {
+            [] => "a thread of it is".to_string(),
+            [(tid, state)] => format!("its thread {tid} (state {state}) is"),
+            many => format!(
+                "its threads {} are",
+                many.iter()
+                    .map(|(tid, state)| format!("{tid} (state {state})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        format!(
+            "process {} is still present after SIGKILL: {threads} blocked inside the \
+             kernel and cannot be killed. The kernel is holding it; it goes away when \
+             that kernel call returns or when the host is rebooted",
+            self.pid
+        )
+    }
+}
+
+/// How [`stop_vm_process_bounded`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmStop {
+    /// The process exited with this code.
+    Exited(i32),
+    /// SIGKILL was delivered and the kernel has not let the process go.
+    Held(HeldProcess),
+}
+
+/// The process operations a VM stop needs. A trait so a test can stand in a
+/// process that survives SIGKILL, which cannot be produced on demand.
+pub(crate) trait ProcessControl {
+    fn is_alive(&self, pid: Pid) -> bool;
+    fn try_wait(&self, pid: Pid) -> Option<i32>;
+    fn terminate(&self, pid: Pid) -> bool;
+    fn kill(&self, pid: Pid) -> bool;
+    fn poll_for_exit(&self, pid: Pid, timeout: Duration) -> Option<i32>;
+    fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess>;
+}
+
+/// The host's real processes.
+pub(crate) struct HostProcesses;
+
+impl ProcessControl for HostProcesses {
+    fn is_alive(&self, pid: Pid) -> bool {
+        is_alive(pid)
+    }
+    fn try_wait(&self, pid: Pid) -> Option<i32> {
+        try_wait(pid)
+    }
+    fn terminate(&self, pid: Pid) -> bool {
+        terminate(pid)
+    }
+    fn kill(&self, pid: Pid) -> bool {
+        kill(pid)
+    }
+    fn poll_for_exit(&self, pid: Pid, timeout: Duration) -> Option<i32> {
+        poll_for_exit(pid, timeout)
+    }
+    fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess> {
+        held_after_kill(pid)
+    }
+}
+
+/// Whether `pid` has been killed and is still present: SIGKILL is pending on
+/// one of its threads, or its main thread has exited while others remain.
+///
+/// Right after a kill this is briefly true for any process, so callers ask
+/// only once the wait for SIGKILL to take effect has run out, or to explain
+/// a process they already found alive.
+#[cfg(target_os = "linux")]
+pub fn held_after_kill(pid: Pid) -> Option<HeldProcess> {
+    if pid <= 0 || !is_alive(pid) {
+        return None;
+    }
+    let leader_stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let leader_exited = matches!(linux_stat_state(&leader_stat), Some('Z' | 'X' | 'x'));
+    let mut kill_pending = false;
+    let mut blocked_threads = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<Pid>().ok())
+        else {
+            continue;
+        };
+        let Some(state) = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .as_deref()
+            .and_then(linux_stat_state)
+        else {
+            continue;
+        };
+        if matches!(state, 'Z' | 'X' | 'x') {
+            continue;
+        }
+        blocked_threads.push((tid, state));
+        if std::fs::read_to_string(entry.path().join("status"))
+            .is_ok_and(|status| linux_status_sigkill_pending(&status))
+        {
+            kill_pending = true;
+        }
+    }
+    blocked_threads.sort_unstable();
+    ((leader_exited && !blocked_threads.is_empty()) || kill_pending).then_some(HeldProcess {
+        pid,
+        blocked_threads,
+    })
+}
+
+/// Only Linux exposes what is needed to tell a held process from a slow exit.
+#[cfg(not(target_os = "linux"))]
+pub fn held_after_kill(_pid: Pid) -> Option<HeldProcess> {
+    None
+}
+
+/// The scheduler state letter from a `/proc/<pid>/stat` line.
+#[cfg(target_os = "linux")]
+fn linux_stat_state(stat: &str) -> Option<char> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_ascii_whitespace().next()?.chars().next()
+}
+
+/// Whether a `/proc/<pid>/task/<tid>/status` text shows SIGKILL pending on
+/// the thread (`SigPnd`) or on its process (`ShdPnd`).
+#[cfg(target_os = "linux")]
+fn linux_status_sigkill_pending(status: &str) -> bool {
+    const SIGKILL_BIT: u64 = 1 << (libc::SIGKILL - 1);
+    status.lines().any(|line| {
+        line.strip_prefix("SigPnd:")
+            .or_else(|| line.strip_prefix("ShdPnd:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & SIGKILL_BIT != 0)
+    })
+}
+
+/// Whether `pid` can still run guest or VMM code: it is alive and has not
+/// been left behind by a SIGKILL the kernel has yet to finish.
+///
+/// Use after a stop instead of [`is_alive`] where the question is "may its
+/// files be removed and its record marked stopped". A held process executes
+/// nothing more: every thread that could still run has exited, and a blocked
+/// thread dies as soon as its kernel call returns.
+pub fn can_still_run(pid: Pid) -> bool {
+    is_alive(pid) && held_after_kill(pid).is_none()
+}
+
 /// Stop a VM process with Hypervisor-aware timeouts.
 ///
 /// Two-phase shutdown:
@@ -3909,25 +4079,68 @@ pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Callers must verify process identity BEFORE calling this function.
 ///
-/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive.
+/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive. A
+/// process the kernel is holding after SIGKILL is an `Err` whose text says
+/// so; callers that can finish their work without the exit use
+/// [`stop_vm_process_bounded`].
 pub fn stop_vm_process(
     pid: Pid,
     sigterm_timeout: Duration,
     sigkill_timeout: Duration,
 ) -> Result<i32> {
-    if !is_alive(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    match stop_vm_process_bounded(pid, sigterm_timeout, sigkill_timeout)? {
+        VmStop::Exited(code) => Ok(code),
+        VmStop::Held(held) => Err(Error::agent("stop vm process", held.explain())),
+    }
+}
+
+/// [`stop_vm_process`], reporting a process the kernel is holding after
+/// SIGKILL as [`VmStop::Held`] instead of an error.
+///
+/// Either way the call returns within the two timeouts. A held process runs
+/// no more code, so a stop or delete can complete around it: the caller
+/// marks the machine stopped, tells the user which PID was left behind, and
+/// does not wait for an exit that may only come with a reboot.
+pub fn stop_vm_process_bounded(
+    pid: Pid,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<VmStop> {
+    stop_vm_process_with(&HostProcesses, pid, sigterm_timeout, sigkill_timeout)
+}
+
+pub(crate) fn stop_vm_process_with(
+    processes: &dyn ProcessControl,
+    pid: Pid,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<VmStop> {
+    if !processes.is_alive(pid) {
+        return Ok(VmStop::Exited(
+            processes.try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE),
+        ));
+    }
+    // Already killed, by an earlier stop or by its own exit: another signal
+    // changes nothing. Give the exit the SIGKILL wait to finish, since a
+    // process that is exiting normally looks the same for a moment.
+    if processes.held_after_kill(pid).is_some() {
+        if let Some(code) = processes.poll_for_exit(pid, sigkill_timeout) {
+            return Ok(VmStop::Exited(code));
+        }
+        if let Some(held) = processes.held_after_kill(pid) {
+            return Ok(VmStop::Held(held));
+        }
     }
 
     // Phase 1: SIGTERM + poll
-    if !terminate(pid) {
+    if !processes.terminate(pid) {
         // A failed signal is not evidence of exit: EPERM leaves the VMM alive.
         // Only return success when the child has exited or the PID is gone.
-        if let Some(code) = try_wait(pid) {
-            return Ok(code);
+        if let Some(code) = processes.try_wait(pid) {
+            return Ok(VmStop::Exited(code));
         }
-        if !is_alive(pid) {
-            return Ok(UNKNOWN_EXIT_CODE);
+        if !processes.is_alive(pid) {
+            return Ok(VmStop::Exited(UNKNOWN_EXIT_CODE));
         }
         return Err(Error::agent(
             "stop vm process",
@@ -3935,16 +4148,22 @@ pub fn stop_vm_process(
         ));
     }
 
-    if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
-        return Ok(code);
+    if let Some(code) = processes.poll_for_exit(pid, sigterm_timeout) {
+        return Ok(VmStop::Exited(code));
     }
 
     // Phase 2: SIGKILL + poll
     tracing::debug!(pid, "SIGTERM timeout, sending SIGKILL");
-    kill(pid);
+    processes.kill(pid);
 
-    if let Some(code) = poll_for_exit(pid, sigkill_timeout) {
-        return Ok(code);
+    if let Some(code) = processes.poll_for_exit(pid, sigkill_timeout) {
+        return Ok(VmStop::Exited(code));
+    }
+
+    // SIGKILL was delivered and the wait for it ran out. What is left is
+    // inside the kernel; more waiting or more signals do not help.
+    if let Some(held) = processes.held_after_kill(pid) {
+        return Ok(VmStop::Held(held));
     }
 
     Err(Error::agent(
@@ -6358,5 +6577,142 @@ mod nofile_limit_tests {
             assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &above), 0);
         }
         assert_eq!(raise_nofile_limit(), Some(cap));
+    }
+}
+
+#[cfg(test)]
+mod held_process_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// A process that ignores SIGTERM and, when `survives_kill` is set, is
+    /// still present after SIGKILL the way a thread blocked in the kernel
+    /// keeps it.
+    struct FakeProcess {
+        survives_kill: bool,
+        killed: Cell<bool>,
+        signals: RefCell<Vec<&'static str>>,
+        waited: RefCell<Vec<Duration>>,
+    }
+
+    impl FakeProcess {
+        fn new(survives_kill: bool) -> Self {
+            Self {
+                survives_kill,
+                killed: Cell::new(false),
+                signals: RefCell::new(Vec::new()),
+                waited: RefCell::new(Vec::new()),
+            }
+        }
+        fn gone(&self) -> bool {
+            self.killed.get() && !self.survives_kill
+        }
+    }
+
+    impl ProcessControl for FakeProcess {
+        fn is_alive(&self, _pid: Pid) -> bool {
+            !self.gone()
+        }
+        fn try_wait(&self, _pid: Pid) -> Option<i32> {
+            self.gone().then_some(137)
+        }
+        fn terminate(&self, _pid: Pid) -> bool {
+            self.signals.borrow_mut().push("TERM");
+            true
+        }
+        fn kill(&self, _pid: Pid) -> bool {
+            self.signals.borrow_mut().push("KILL");
+            self.killed.set(true);
+            true
+        }
+        fn poll_for_exit(&self, _pid: Pid, timeout: Duration) -> Option<i32> {
+            self.waited.borrow_mut().push(timeout);
+            self.gone().then_some(137)
+        }
+        fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess> {
+            (self.killed.get() && self.survives_kill).then(|| HeldProcess {
+                pid,
+                blocked_threads: vec![(pid + 7, 'D')],
+            })
+        }
+    }
+
+    const TERM_WAIT: Duration = Duration::from_millis(20);
+    const KILL_WAIT: Duration = Duration::from_millis(30);
+
+    #[test]
+    fn process_that_survives_sigkill_is_reported_held_within_the_two_waits() {
+        let process = FakeProcess::new(true);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert_eq!(
+            outcome,
+            VmStop::Held(HeldProcess {
+                pid: 4242,
+                blocked_threads: vec![(4249, 'D')],
+            })
+        );
+        // One SIGTERM, one SIGKILL, and no wait beyond the two given.
+        assert_eq!(*process.signals.borrow(), ["TERM", "KILL"]);
+        assert_eq!(*process.waited.borrow(), [TERM_WAIT, KILL_WAIT]);
+    }
+
+    #[test]
+    fn process_that_dies_on_sigkill_is_reported_exited() {
+        let process = FakeProcess::new(false);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert_eq!(outcome, VmStop::Exited(137));
+    }
+
+    #[test]
+    fn stopping_an_already_held_process_sends_no_further_signal() {
+        let process = FakeProcess::new(true);
+        process.killed.set(true);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert!(matches!(outcome, VmStop::Held(_)));
+        assert!(process.signals.borrow().is_empty());
+        assert_eq!(*process.waited.borrow(), [KILL_WAIT]);
+    }
+
+    #[test]
+    fn explanation_names_the_pid_the_thread_and_the_reboot() {
+        let text = HeldProcess {
+            pid: 2768452,
+            blocked_threads: vec![(2768460, 'D')],
+        }
+        .explain();
+        assert_eq!(
+            text,
+            "process 2768452 is still present after SIGKILL: its thread 2768460 (state D) \
+             is blocked inside the kernel and cannot be killed. The kernel is holding it; \
+             it goes away when that kernel call returns or when the host is rebooted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigkill_pending_is_read_from_the_thread_and_process_masks() {
+        let thread = "Name:\tgpu worker\nSigPnd:\t0000000000000100\nShdPnd:\t0000000000000000\n";
+        let process = "SigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n";
+        let term_only = "SigPnd:\t0000000000004000\nShdPnd:\t0000000000004000\n";
+        assert!(linux_status_sigkill_pending(thread));
+        assert!(linux_status_sigkill_pending(process));
+        assert!(!linux_status_sigkill_pending(term_only));
+        assert!(!linux_status_sigkill_pending(""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_letter_is_read_past_a_name_with_spaces_and_parentheses() {
+        assert_eq!(linux_stat_state("2768460 (gpu worker) D 1 2 3"), Some('D'));
+        assert_eq!(linux_stat_state("7 (a) b) Z 1"), Some('Z'));
+        assert_eq!(linux_stat_state("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_process_is_not_held() {
+        let me = std::process::id() as Pid;
+        assert_eq!(held_after_kill(me), None);
+        assert!(can_still_run(me));
     }
 }
