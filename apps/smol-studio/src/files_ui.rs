@@ -187,11 +187,11 @@ impl FilesView {
             ui.horizontal(|ui| {
                 let back = self.history.back().map(|(i, p)| (i, p.to_owned()));
                 let forward = self.history.forward().map(|(i, p)| (i, p.to_owned()));
-                for (label, hint, target) in [("←", "Back", back), ("→", "Forward", forward)] {
-                    if ui
-                        .add_enabled(target.is_some(), egui::Button::new(label))
-                        .on_hover_text(hint)
-                        .clicked()
+                for (icon, hint, target) in [
+                    (design::ToolbarIcon::Back, "Back", back),
+                    (design::ToolbarIcon::Forward, "Forward", forward),
+                ] {
+                    if design::icon_button(ui, icon, hint, target.is_some()).clicked()
                         && let Some((index, path)) = target
                     {
                         self.path = path;
@@ -200,10 +200,13 @@ impl FilesView {
                         self.history_target = Some(index);
                     }
                 }
-                if ui
-                    .add_enabled(self.path != "/", egui::Button::new("↑"))
-                    .on_hover_text("Parent folder")
-                    .clicked()
+                if design::icon_button(
+                    ui,
+                    design::ToolbarIcon::Up,
+                    "Parent folder",
+                    self.path != "/",
+                )
+                .clicked()
                 {
                     self.path = files::parent(&self.path);
                     self.filter.clear();
@@ -211,7 +214,8 @@ impl FilesView {
                 }
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.path)
-                        .desired_width((ui.available_width() - 140.0).max(60.0))
+                        .desired_width((ui.available_width() - 94.0).max(60.0))
+                        .margin(egui::Margin::symmetric(10, 7))
                         .hint_text(if self.container { "/" } else { "/workspace" }),
                 );
                 if ui.button("Go").clicked()
@@ -219,20 +223,30 @@ impl FilesView {
                 {
                     action = self.request();
                 }
-                if ui.button("Refresh").clicked() {
+                if design::icon_button(ui, design::ToolbarIcon::Refresh, "Refresh folder", true)
+                    .clicked()
+                {
                     action = self.request();
                 }
             });
-            ui.add_space(8.0);
-            design::search(ui, &mut self.filter, "Filter files…");
-            ui.add_space(8.0);
+            ui.add_space(6.0);
             ui.horizontal(|ui| {
-                ui.checkbox(&mut self.hidden, "Hidden files");
+                let search_width = (ui.available_width() - 160.0).max(100.0);
+                ui.allocate_ui_with_layout(
+                    egui::vec2(search_width, 34.0),
+                    egui::Layout::left_to_right(egui::Align::Center),
+                    |ui| {
+                        design::search(ui, &mut self.filter, "Filter files…");
+                    },
+                );
+                ui.menu_button("View", |ui| {
+                    ui.checkbox(&mut self.hidden, "Show hidden files");
+                });
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
                         .add_enabled(
                             self.listing.is_some() && self.error.is_none(),
-                            design::primary("Upload file…"),
+                            design::primary("Upload…"),
                         )
                         .clicked()
                     {
@@ -311,10 +325,8 @@ impl FilesView {
             let mut navigate = None;
             egui::ScrollArea::vertical()
                 .id_salt(("guest-file-list", &self.machine, &listing.path))
-                .max_height(
-                    (ui.clip_rect().bottom() - ui.cursor().top() - 12.0).clamp(100.0, 380.0),
-                )
-                .show_rows(ui, 38.0, entries.len(), |ui, rows| {
+                .max_height((ui.clip_rect().bottom() - ui.cursor().top() - 12.0).max(100.0))
+                .show_rows(ui, 32.0, entries.len(), |ui, rows| {
                     for row in rows {
                         let entry = entries[row];
                         ui.push_id(&entry.name, |ui| {
@@ -331,13 +343,29 @@ impl FilesView {
                                             }
                                         })
                                         .collect::<String>();
-                                    let (icon, _) = ui.allocate_exact_size(
-                                        egui::vec2(20.0, 20.0),
-                                        egui::Sense::hover(),
+                                    let response = ui.add_sized(
+                                        [(ui.available_width() - 160.0).max(80.0), 32.0],
+                                        egui::Button::new("").frame(false),
                                     );
+                                    response.widget_info(|| {
+                                        egui::WidgetInfo::labeled(
+                                            egui::Role::Button,
+                                            ui.is_enabled(),
+                                            &display,
+                                        )
+                                    });
+                                    let rect = response.rect;
+                                    let color = if ui.is_enabled() {
+                                        design::INK
+                                    } else {
+                                        design::MUTED
+                                    };
                                     design::icon(
                                         ui.painter(),
-                                        icon,
+                                        egui::Rect::from_center_size(
+                                            egui::pos2(rect.left() + 12.0, rect.center().y),
+                                            egui::Vec2::splat(18.0),
+                                        ),
                                         if entry.kind == "dir" {
                                             design::Icon::Project
                                         } else {
@@ -345,13 +373,20 @@ impl FilesView {
                                         },
                                         design::MUTED,
                                     );
-                                    let response = ui.add_sized(
-                                        [(ui.available_width() - 155.0).max(100.0), 32.0],
-                                        egui::Button::new("")
-                                            .left_text(display)
-                                            .frame(false)
-                                            .truncate(),
+                                    let mut job = egui::text::LayoutJob::simple_singleline(
+                                        display,
+                                        egui::FontId::proportional(13.0),
+                                        color,
                                     );
+                                    job.wrap.max_width = (rect.width() - 36.0).max(1.0);
+                                    job.wrap.max_rows = 1;
+                                    job.wrap.break_anywhere = true;
+                                    let galley = ui.fonts_mut(|f| f.layout_job(job));
+                                    let position = egui::pos2(
+                                        rect.left() + 30.0,
+                                        rect.center().y - galley.size().y / 2.0,
+                                    );
+                                    ui.painter_at(rect).galley(position, galley, color);
                                     if response.on_hover_text(&entry.name).clicked()
                                         && entry.kind == "dir"
                                     {

@@ -163,6 +163,79 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
     }
 }
 
+#[derive(Clone, Copy)]
+pub enum ToolbarIcon {
+    Back,
+    Forward,
+    Up,
+    Refresh,
+}
+
+pub fn icon_button(
+    ui: &mut egui::Ui,
+    kind: ToolbarIcon,
+    label: &str,
+    enabled: bool,
+) -> egui::Response {
+    let response = ui.add_enabled(enabled, egui::Button::new("").min_size(Vec2::splat(30.0)));
+    response.widget_info(|| {
+        egui::WidgetInfo::labeled(egui::Role::Button, enabled && ui.is_enabled(), label)
+    });
+    let color = if enabled && ui.is_enabled() {
+        MUTED
+    } else {
+        LINE
+    };
+    let center = response.rect.center();
+    let stroke = Stroke::new(1.4, color);
+    let point = |x, y| center + egui::vec2(x, y);
+    match kind {
+        ToolbarIcon::Refresh => {
+            let points = (0..=20)
+                .map(|i| {
+                    let angle = 0.4 + i as f32 / 20.0 * 5.2;
+                    point(angle.cos() * 5.5, angle.sin() * 5.5)
+                })
+                .collect();
+            ui.painter().add(egui::Shape::line(points, stroke));
+            ui.painter().add(egui::Shape::line(
+                vec![point(1.0, -4.0), point(5.0, -3.0), point(5.0, -7.0)],
+                stroke,
+            ));
+        }
+        _ => {
+            let transform = |x: f32, y: f32| match kind {
+                ToolbarIcon::Forward => point(-x, y),
+                ToolbarIcon::Up => point(y, x),
+                _ => point(x, y),
+            };
+            ui.painter()
+                .line_segment([transform(-5.0, 0.0), transform(5.0, 0.0)], stroke);
+            ui.painter().add(egui::Shape::line(
+                vec![
+                    transform(-1.0, -4.0),
+                    transform(-5.0, 0.0),
+                    transform(-1.0, 4.0),
+                ],
+                stroke,
+            ));
+        }
+    }
+    response.on_hover_text(label)
+}
+
+/// Keep untagged image identities recognizable without letting a digest dominate a heading.
+fn image_label(image: &str) -> String {
+    if let Some(digest) = image.strip_prefix("sha256:")
+        && digest.len() == 64
+        && digest.bytes().all(|b| b.is_ascii_hexdigit())
+    {
+        format!("Image {}", &digest[..12])
+    } else {
+        image.to_owned()
+    }
+}
+
 pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::Response {
     let response = ui.add_sized(
         [ui.available_width(), 34.0],
@@ -537,8 +610,11 @@ pub fn workload_heading(
                 if let Some(health) = health {
                     badge(ui, health);
                 }
-                ui.add(egui::Label::new(RichText::new(image).size(12.0).color(MUTED)).truncate())
-                    .on_hover_text(image);
+                ui.add(
+                    egui::Label::new(RichText::new(image_label(image)).size(12.0).color(MUTED))
+                        .truncate(),
+                )
+                .on_hover_text(image);
             });
         });
     });
