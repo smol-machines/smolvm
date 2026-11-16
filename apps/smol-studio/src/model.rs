@@ -7,6 +7,16 @@ pub struct Machine {
     pub cpus: u16,
     pub memory_mib: u64,
     #[serde(default)]
+    pub storage_gb: Option<u64>,
+    #[serde(default)]
+    pub overlay_gb: Option<u64>,
+    #[serde(default)]
+    pub network: Option<bool>,
+    #[serde(default)]
+    pub shared_folders: Option<Vec<MachineFolder>>,
+    #[serde(default)]
+    pub port_mappings: Option<Vec<MachinePort>>,
+    #[serde(default)]
     pub image: Option<String>,
     #[serde(default)]
     pub pid: Option<u32>,
@@ -18,6 +28,22 @@ pub struct Machine {
     pub parent_machine: Option<String>,
     #[serde(default)]
     pub state_reason: Option<String>,
+}
+
+// Read-only inventory keeps unknown modes/protocols visible instead of rejecting
+// a newer CLI's entire list; the settings editor validates editable values.
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct MachineFolder {
+    pub host: String,
+    pub guest: String,
+    pub mode: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq)]
+pub struct MachinePort {
+    pub host: u16,
+    pub guest: u16,
+    pub protocol: String,
 }
 
 impl Machine {
@@ -209,6 +235,17 @@ mod tests {
         assert_eq!(rows[0].image_label(), "Bare Linux machine");
         assert!(rows[0].can_stop());
         assert!(!rows[0].can_delete());
+        assert_eq!(rows[0].network, None);
+        assert_eq!(rows[0].storage_gb, None);
+        assert_eq!(rows[0].shared_folders, None);
+        let detailed = parse_machines(br#"[{"name":"dev","state":"stopped","cpus":2,"memory_mib":4096,"network":false,"storage_gb":3,"overlay_gb":4,"shared_folders":[{"host":"/project files","guest":"/src","mode":"future-mode"}],"port_mappings":[{"host":8080,"guest":80,"protocol":"tcp"},{"host":8080,"guest":53,"protocol":"udp"}]}]"#).unwrap().remove(0);
+        assert_eq!(detailed.storage_gb, Some(3));
+        assert_eq!(detailed.overlay_gb, Some(4));
+        assert_eq!(detailed.network, Some(false));
+        assert_eq!(detailed.shared_folders.unwrap()[0].mode, "future-mode");
+        let ports = detailed.port_mappings.unwrap();
+        assert_eq!((ports[0].host, ports[0].guest), (8080, 80));
+        assert_eq!(ports[1].protocol, "udp");
     }
 
     #[test]

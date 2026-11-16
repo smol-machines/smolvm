@@ -16,7 +16,7 @@ enum Filter {
     Stopped,
 }
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Hash)]
 enum Tab {
     Overview,
     Usage,
@@ -629,7 +629,7 @@ impl Studio {
             design::notice(ui, reason);
         }
         ui.add_space(16.0);
-        ui.horizontal(|ui| {
+        ui.horizontal_wrapped(|ui| {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
                 (Tab::Usage, "Usage"),
@@ -646,111 +646,287 @@ impl Studio {
         ui.separator();
         ui.add_space(16.0);
         match self.tab {
-            Tab::Usage => crate::usage_ui::show(ui, &self.usage, &m),
+            Tab::Usage => {
+                egui::ScrollArea::vertical()
+                    .id_salt(("machine-detail", &m.name, self.tab))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| crate::usage_ui::show(ui, &self.usage, &m));
+            }
             Tab::Files => {
                 if let Some(action) = self.files.show(ui, frame, &m, enabled) {
                     self.submit(action);
                 }
             }
             Tab::Console => {
-                ui.label("Run a shell command (60 second limit)");
-                ui.add(
-                    egui::TextEdit::multiline(&mut self.command)
-                        .desired_rows(2)
-                        .desired_width(f32::INFINITY)
-                        .hint_text("uname -a"),
-                );
-                ui.horizontal(|ui| {
-                    if ui
-                        .add_enabled(
-                            enabled && m.state == "running" && !self.command.trim().is_empty(),
-                            egui::Button::new("Run"),
-                        )
-                        .clicked()
-                    {
-                        self.output = None;
-                        self.submit(Operation::Exec {
-                            name: m.name.clone(),
-                            command: self.command.clone(),
+                design::card().show(ui, |ui| {
+                    ui.set_width(ui.available_width());
+                    ui.horizontal(|ui| {
+                        ui.label(design::heading("Run a command", 14.0));
+                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                            if ui
+                                .add_enabled(
+                                    enabled
+                                        && m.state == "running"
+                                        && !self.command.trim().is_empty(),
+                                    design::primary("Run"),
+                                )
+                                .clicked()
+                            {
+                                self.output = None;
+                                self.submit(Operation::Exec {
+                                    name: m.name.clone(),
+                                    command: self.command.clone(),
+                                });
+                            }
                         });
-                    }
+                    });
+                    ui.add_space(6.0);
+                    ui.add(
+                        egui::TextEdit::multiline(&mut self.command)
+                            .desired_rows(2)
+                            .desired_width(f32::INFINITY)
+                            .font(egui::TextStyle::Monospace)
+                            .hint_text("uname -a"),
+                    );
+                    ui.label(
+                        RichText::new(if m.state == "running" {
+                            "Shell command · 60 second limit"
+                        } else {
+                            "Start this machine to run commands."
+                        })
+                        .size(11.5)
+                        .color(MUTED),
+                    );
                 });
-                if let Some((_, text)) = self.output.as_ref().filter(|(name, _)| name == &m.name) {
-                    if ui.button("Copy output").clicked() {
-                        ui.ctx().copy_text(text.clone());
-                    }
-                    egui::ScrollArea::both()
-                        .id_salt(("console", &m.name))
-                        .show(ui, |ui| {
-                            ui.add(
-                                egui::Label::new(RichText::new(text).monospace()).selectable(true),
-                            );
-                        });
-                }
-            }
-            Tab::Overview => {
+                ui.add_space(16.0);
+                let output = self.output.as_ref().filter(|(name, _)| name == &m.name);
                 ui.horizontal(|ui| {
-                    ui.label(design::heading("Configuration", 14.0));
+                    ui.label(design::heading("Output", 14.0));
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(enabled && matches!(m.state.as_str(), "created" | "stopped"), egui::Button::new("Edit…"))
-                            .on_disabled_hover_text("Stop this machine to change resources, shared folders and published ports.").clicked() {
-                            self.settings_request = Some(m.name.clone());
-                            self.submit(Operation::ReadSettings(m.name.clone()));
+                        if let Some((_, text)) = output
+                            && ui.small_button("Copy output").clicked()
+                        {
+                            ui.ctx().copy_text(text.clone());
                         }
                     });
                 });
-                ui.add_space(10.0);
-                design::card().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    ui.columns(2, |columns| {
-                        design::metric(
-                            &mut columns[0],
-                            "CPU limit",
-                            &m.cpus.to_string(),
-                            if m.cpus == 1 { "core" } else { "cores" },
-                        );
-                        let memory = design::memory(m.memory_mib);
-                        let (value, unit) = memory.split_once(' ').unwrap_or((&memory, ""));
-                        design::metric(&mut columns[1], "Memory limit", value, unit);
-                    });
-                });
-                ui.add_space(20.0);
-                ui.label(design::heading("Connections", 14.0));
                 ui.add_space(8.0);
-                design::card().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    design::property(
-                        ui,
-                        "Shared folders",
-                        &if m.mounts == 0 {
-                            "None".into()
-                        } else {
-                            m.mounts.to_string()
-                        },
-                    );
-                    ui.separator();
-                    design::property(
-                        ui,
-                        "Published ports",
-                        &if m.ports == 0 {
-                            "None".into()
-                        } else {
-                            m.ports.to_string()
-                        },
-                    );
-                    if let Some(parent) = &m.parent_machine {
-                        ui.separator();
-                        design::property(ui, "Branched from", parent);
+                if let Some((_, text)) = output {
+                    egui::ScrollArea::both()
+                        .id_salt(("console", &m.name))
+                        .auto_shrink([false, false])
+                        .show(ui, |ui| {
+                            if text.is_empty() {
+                                ui.label(
+                                    RichText::new("Command completed without output.").color(MUTED),
+                                );
+                            } else {
+                                ui.add(
+                                    egui::Label::new(RichText::new(text).monospace())
+                                        .selectable(true),
+                                );
+                            }
+                        });
+                } else {
+                    ui.label(RichText::new(if matches!(&self.pending, Some(Operation::Exec { name, .. }) if name == &m.name) { "Running command…" } else { "Command output will appear here." }).size(12.0).color(MUTED));
+                }
+            }
+            Tab::Overview => {
+                egui::ScrollArea::vertical()
+                    .id_salt(("machine-detail", &m.name, self.tab))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| self.machine_overview(ui, &m, enabled));
+            }
+
+            Tab::Logs => {
+                self.logs.show_machine(ui, &self.runtime, &m.name, enabled);
+            }
+        }
+    }
+
+    fn machine_overview(&mut self, ui: &mut egui::Ui, m: &Machine, enabled: bool) {
+        ui.horizontal(|ui| {
+            ui.label(design::heading("Resources", 14.0));
+            ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                if ui.add_enabled(enabled && matches!(m.state.as_str(), "created" | "stopped"), egui::Button::new("Edit settings…"))
+                    .on_disabled_hover_text("Stop this machine to change resources, shared folders and published ports.").clicked() {
+                    self.settings_request = Some(m.name.clone());
+                    self.submit(Operation::ReadSettings(m.name.clone()));
+                }
+            });
+        });
+        ui.add_space(8.0);
+        design::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.columns(2, |columns| {
+                design::metric(
+                    &mut columns[0],
+                    "CPU limit",
+                    &m.cpus.to_string(),
+                    if m.cpus == 1 { "core" } else { "cores" },
+                );
+                let memory = design::memory(m.memory_mib);
+                let (value, unit) = memory.split_once(' ').unwrap_or((&memory, ""));
+                design::metric(&mut columns[1], "Memory limit", value, unit);
+            });
+            ui.add_space(8.0);
+            ui.separator();
+            for (label, size) in [
+                ("Storage disk", m.storage_gb),
+                ("Overlay disk", m.overlay_gb),
+            ] {
+                design::property(
+                    ui,
+                    label,
+                    &size
+                        .map(|v| format!("{v} GiB capacity"))
+                        .unwrap_or_else(|| "Not reported".into()),
+                );
+            }
+        });
+        ui.add_space(16.0);
+        ui.label(design::heading("Connections", 14.0));
+        ui.add_space(8.0);
+        design::card().show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            design::property(
+                ui,
+                "Outbound network",
+                match m.network {
+                    Some(true) => "Enabled",
+                    Some(false) => "Disabled",
+                    None => "Not reported",
+                },
+            );
+            ui.separator();
+            ui.label(RichText::new("Published ports").size(12.0).color(MUTED));
+            match &m.port_mappings {
+                Some(ports) if !ports.is_empty() => {
+                    for port in ports {
+                        let address = format!("127.0.0.1:{}", port.host);
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.with_layout(
+                                egui::Layout::right_to_left(egui::Align::Center),
+                                |ui| {
+                                    if ui.small_button("Copy address").clicked() {
+                                        ui.ctx().copy_text(address.clone());
+                                    }
+                                    ui.with_layout(
+                                        egui::Layout::left_to_right(egui::Align::Center),
+                                        |ui| {
+                                            ui.add(
+                                                egui::Label::new(
+                                                    RichText::new(&address).monospace().size(12.0),
+                                                )
+                                                .truncate(),
+                                            )
+                                            .on_hover_text(&address);
+                                        },
+                                    );
+                                },
+                            );
+                        });
+                        ui.label(
+                            RichText::new(format!(
+                                "{} → guest port {}",
+                                port.protocol.to_uppercase(),
+                                port.guest
+                            ))
+                            .size(11.5)
+                            .color(MUTED),
+                        );
                     }
-                });
-                ui.add_space(20.0);
-                ui.collapsing("Command line & process", |ui| {
-                    if let Some(pid) = m.pid {
-                        design::property(ui, "Process ID", &pid.to_string());
+                }
+                _ => {
+                    ui.label(
+                        RichText::new(if m.ports == 0 {
+                            "No ports published".into()
+                        } else {
+                            format!("{} ports · details not reported", m.ports)
+                        })
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
+            }
+            ui.add_space(8.0);
+            ui.separator();
+            ui.label(RichText::new("Shared folders").size(12.0).color(MUTED));
+            match &m.shared_folders {
+                Some(folders) if !folders.is_empty() => {
+                    for folder in folders {
+                        ui.add_space(8.0);
+                        for (label, path) in [("Guest", &folder.guest), ("Host", &folder.host)] {
+                            ui.horizontal(|ui| {
+                                ui.with_layout(
+                                    egui::Layout::right_to_left(egui::Align::Center),
+                                    |ui| {
+                                        if ui
+                                            .small_button(format!("Copy {}", label.to_lowercase()))
+                                            .clicked()
+                                        {
+                                            ui.ctx().copy_text(path.clone());
+                                        }
+                                        ui.with_layout(
+                                            egui::Layout::left_to_right(egui::Align::Center),
+                                            |ui| {
+                                                ui.label(
+                                                    RichText::new(label).size(11.0).color(MUTED),
+                                                );
+                                                ui.add(
+                                                    egui::Label::new(
+                                                        RichText::new(path).monospace().size(12.0),
+                                                    )
+                                                    .truncate(),
+                                                )
+                                                .on_hover_text(path);
+                                            },
+                                        );
+                                    },
+                                );
+                            });
+                        }
+                        ui.label(
+                            RichText::new(match folder.mode.as_str() {
+                                "ro" => "Read only",
+                                "rw" => "Read and write",
+                                "staged" => "Staged copy",
+                                mode => mode,
+                            })
+                            .size(11.5)
+                            .color(MUTED),
+                        );
                     }
-                    let command =
-                        format!("smol machine exec --local --name {} -it -- /bin/sh", m.name);
-                    ui.horizontal(|ui| {
+                }
+                _ => {
+                    ui.label(
+                        RichText::new(if m.mounts == 0 {
+                            "No shared folders".into()
+                        } else {
+                            format!("{} folders · details not reported", m.mounts)
+                        })
+                        .size(12.0)
+                        .color(MUTED),
+                    );
+                }
+            }
+        });
+        ui.add_space(16.0);
+        ui.collapsing("Command line & process", |ui| {
+            if let Some(parent) = &m.parent_machine {
+                design::property(ui, "Branched from", parent);
+            }
+            if let Some(pid) = m.pid {
+                design::property(ui, "Process ID", &pid.to_string());
+            }
+            let command = format!("smol machine exec --local --name {} -it -- /bin/sh", m.name);
+            ui.horizontal(|ui| {
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.small_button("Copy").clicked() {
+                        ui.ctx().copy_text(command.clone());
+                    }
+                    ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
                                 RichText::new(&command).monospace().size(11.0).color(MUTED),
@@ -758,17 +934,10 @@ impl Studio {
                             .truncate(),
                         )
                         .on_hover_text(&command);
-                        if ui.small_button("Copy").clicked() {
-                            ui.ctx().copy_text(command.clone());
-                        }
                     });
                 });
-            }
-
-            Tab::Logs => {
-                self.logs.show_machine(ui, &self.runtime, &m.name, enabled);
-            }
-        }
+            });
+        });
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
@@ -1160,9 +1329,7 @@ impl eframe::App for Studio {
                     .frame(egui::Frame::new().fill(SURFACE).inner_margin(24))
                     .show(ui, |ui| {
                         if self.selected.is_some() {
-                            egui::ScrollArea::vertical()
-                                .id_salt("machine-detail")
-                                .show(ui, |ui| self.details(ui, frame));
+                            self.details(ui, frame);
                         } else if !self.machines.is_empty() {
                             ui.add_space(100.0);
                             ui.vertical_centered(|ui| {
