@@ -7,12 +7,15 @@ use smol_studio::{
 use std::path::PathBuf;
 
 struct Transfer {
+    folder: bool,
+    folder_name: String,
     name: String,
     guest: String,
     local: PathBuf,
     upload: bool,
 }
 struct Pick {
+    folder: bool,
     name: String,
     guest: String,
     upload: bool,
@@ -126,8 +129,8 @@ impl FilesView {
             );
             return None;
         }
-        self.show_contents(ui, frame, enabled)
-            .map(Request::machine_operation)
+        let request = self.show_contents(ui, frame, enabled);
+        self.machine_operation(request)
     }
 
     fn select_target(&mut self, id: &str, name: &str, container: bool, initial: &str) {
@@ -251,6 +254,7 @@ impl FilesView {
                         .clicked()
                     {
                         self.picking = Some(Pick {
+                            folder: false,
                             name: self.machine.clone(),
                             guest: self.requested.clone(),
                             upload: true,
@@ -399,9 +403,12 @@ impl FilesView {
                                     ui.with_layout(
                                         egui::Layout::right_to_left(egui::Align::Center),
                                         |ui| {
-                                            if entry.kind == "file" {
+                                            if entry.kind == "file"
+                                                || (entry.kind == "dir" && self.container)
+                                            {
                                                 if ui.small_button("Save…").clicked() {
                                                     self.picking = Some(Pick {
+                                                        folder: entry.kind == "dir",
                                                         name: self.machine.clone(),
                                                         guest: files::join(
                                                             &listing.path,
@@ -409,16 +416,25 @@ impl FilesView {
                                                         ),
                                                         upload: false,
                                                     });
-                                                    self.picker.open_file(
-                                                        frame,
-                                                        Some(&entry.name),
-                                                        ui.ctx(),
-                                                    );
+                                                    if entry.kind == "dir" {
+                                                        self.picker
+                                                            .folder_destination(frame, ui.ctx());
+                                                    } else {
+                                                        self.picker.open_file(
+                                                            frame,
+                                                            Some(&entry.name),
+                                                            ui.ctx(),
+                                                        );
+                                                    }
                                                 }
                                                 ui.label(
-                                                    RichText::new(byte_size(entry.size))
-                                                        .small()
-                                                        .color(design::palette(ui).muted),
+                                                    RichText::new(if entry.kind == "dir" {
+                                                        "Folder".into()
+                                                    } else {
+                                                        byte_size(entry.size)
+                                                    })
+                                                    .small()
+                                                    .color(design::palette(ui).muted),
                                                 );
                                             } else {
                                                 ui.label(
@@ -452,8 +468,18 @@ impl FilesView {
         action
     }
     pub fn dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Operation> {
-        self.transfer_dialog(ctx, busy)
-            .map(Request::machine_operation)
+        let request = self.transfer_dialog(ctx, busy);
+        self.machine_operation(request)
+    }
+
+    fn machine_operation(&mut self, request: Option<Request>) -> Option<Operation> {
+        match request?.machine_operation() {
+            Ok(operation) => Some(operation),
+            Err(error) => {
+                self.error = Some(error);
+                None
+            }
+        }
     }
 
     pub fn transfer_dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Request> {
@@ -471,7 +497,19 @@ impl FilesView {
             } else {
                 pick.guest
             };
+            let folder_name = if pick.folder {
+                guest
+                    .trim_end_matches('/')
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or("folder")
+                    .to_owned()
+            } else {
+                String::new()
+            };
             self.transfer = Some(Transfer {
+                folder: pick.folder,
+                folder_name,
                 name: pick.name,
                 guest,
                 local,
@@ -483,18 +521,27 @@ impl FilesView {
         let mut open = true;
         let mut cancel = false;
         let mut action = None;
-        egui::Window::new(if transfer.upload { "Upload file" } else { "Save file" })
+        let title = if transfer.folder {
+            "Save folder"
+        } else if transfer.upload {
+            "Upload file"
+        } else {
+            "Save file"
+        };
+        egui::Window::new(title)
             .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
             .collapsible(false)
             .resizable(false)
             .fixed_size(egui::vec2(
                 500.0,
-                (ctx.content_rect().height() - 120.0).clamp(360.0, 460.0),
+                (ctx.content_rect().height() - 120.0).clamp(360.0, if transfer.folder { 500.0 } else { 460.0 }),
             ))
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(RichText::new(if transfer.upload {
                     if self.container { "Copy a file from your computer into this container." } else { "Copy a file from your computer into this machine." }
+                } else if transfer.folder {
+                    "Save this container folder and its contents to your computer."
                 } else {
                     "Save a copy of this file to your computer."
                 }).size(12.0).color(design::palette(ui).muted));
@@ -512,6 +559,14 @@ impl FilesView {
                             ui.set_width(ui.available_width());
                             ui.label(RichText::new("On your computer").size(11.5).color(design::palette(ui).muted));
                             ui.add(egui::Label::new(transfer.local.display().to_string()).wrap().selectable(true));
+                            if transfer.folder {
+                                ui.add_space(8.0);
+                                ui.label(RichText::new("New folder name").small().color(design::palette(ui).muted));
+                                ui.add_enabled(!busy, egui::TextEdit::singleline(&mut transfer.folder_name).desired_width(f32::INFINITY));
+                                if let Err(error) = files::validate_folder_name(&transfer.folder_name) {
+                                    ui.label(RichText::new(error).small().color(design::palette(ui).red));
+                                }
+                            }
                         });
                         ui.add_space(12.0);
                         design::card(ui.ctx()).show(ui, |ui| {
@@ -525,7 +580,7 @@ impl FilesView {
                             }
                         });
                         ui.add_space(12.0);
-                        ui.label(RichText::new(if self.container && transfer.upload { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else if self.container { "An existing file at the destination will be replaced." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::palette(ui).muted));
+                        ui.label(RichText::new(if transfer.folder { "Creates a new folder after copying. Existing items stay untouched. Symbolic links remain links." } else if self.container && transfer.upload { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else if self.container { "An existing file at the destination will be replaced." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::palette(ui).muted));
                     });
                 ui.add_space((ui.available_height() - 48.0).max(12.0));
                 ui.separator();
@@ -533,11 +588,18 @@ impl FilesView {
                 ui.horizontal(|ui| {
                     if busy { ui.spinner(); ui.label("Transferring…"); }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok(), design::primary(ui, if transfer.upload { "Upload file" } else { "Save file" })).clicked() {
+                        if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok() && (!transfer.folder || files::validate_folder_name(&transfer.folder_name).is_ok()), design::primary(ui, title)).clicked() {
                             self.error = None;
-                            action = Some(Request::Transfer {
-                                target: transfer.name.clone(), guest: transfer.guest.clone(),
-                                local: transfer.local.clone(), upload: transfer.upload,
+                            action = Some(if transfer.folder {
+                                Request::SaveFolder {
+                                    target: transfer.name.clone(), guest: transfer.guest.clone(),
+                                    local: transfer.local.join(&transfer.folder_name),
+                                }
+                            } else {
+                                Request::Transfer {
+                                    target: transfer.name.clone(), guest: transfer.guest.clone(),
+                                    local: transfer.local.clone(), upload: transfer.upload,
+                                }
                             });
                         }
                         if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() { cancel = true; }

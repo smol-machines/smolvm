@@ -13,19 +13,26 @@ pub enum Request {
         local: std::path::PathBuf,
         upload: bool,
     },
+    SaveFolder {
+        target: String,
+        guest: String,
+        local: std::path::PathBuf,
+    },
 }
 
 impl Request {
     pub fn target(&self) -> &str {
         match self {
-            Self::List { target, .. } | Self::Transfer { target, .. } => target,
+            Self::List { target, .. }
+            | Self::Transfer { target, .. }
+            | Self::SaveFolder { target, .. } => target,
         }
     }
     pub fn mutates(&self) -> bool {
-        matches!(self, Self::Transfer { .. })
+        !matches!(self, Self::List { .. })
     }
-    pub fn machine_operation(self) -> crate::model::Operation {
-        match self {
+    pub fn machine_operation(self) -> Result<crate::model::Operation, String> {
+        Ok(match self {
             Self::List { target, path } => {
                 crate::model::Operation::ListFiles { name: target, path }
             }
@@ -40,7 +47,10 @@ impl Request {
                 local,
                 upload,
             },
-        }
+            Self::SaveFolder { .. } => {
+                return Err("Saving whole folders is currently available for containers.".into());
+            }
+        })
     }
 }
 
@@ -103,6 +113,18 @@ pub fn validate_path(path: &str) -> Result<(), String> {
     Ok(())
 }
 
+pub fn validate_folder_name(name: &str) -> Result<(), String> {
+    use std::path::Component;
+    let mut components = std::path::Path::new(name).components();
+    if name.contains('\0')
+        || !matches!(components.next(), Some(Component::Normal(value)) if value == name)
+        || components.next().is_some()
+    {
+        return Err("Enter a folder name without a path, such as project-copy.".into());
+    }
+    Ok(())
+}
+
 pub fn join(parent: &str, name: &str) -> String {
     format!("{}/{name}", parent.trim_end_matches('/'))
 }
@@ -142,6 +164,24 @@ impl Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn folder_names_cannot_escape_the_selected_destination() {
+        for name in [
+            "",
+            ".",
+            "..",
+            "/tmp/other",
+            "../other",
+            "a/b",
+            "a/",
+            "nul\0",
+        ] {
+            assert!(validate_folder_name(name).is_err(), "{name:?}");
+        }
+        for name in ["project-copy", "雪 ; $(false)", "café"] {
+            assert!(validate_folder_name(name).is_ok(), "{name:?}");
+        }
+    }
     #[test]
     fn folder_history_preserves_forward_on_refresh_and_branches_on_new_visit() {
         let mut history = History::default();

@@ -76,6 +76,19 @@ impl FilePicker {
         ctx.request_repaint();
     }
 
+    pub fn folder_destination(&mut self, frame: &eframe::Frame, ctx: &egui::Context) {
+        if self.is_open() {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Choose where to save the folder");
+        self.pending = Some(Box::pin(async move {
+            dialog.pick_folder().await.map(|folder| vec![folder])
+        }));
+        ctx.request_repaint();
+    }
+
     pub fn open_executable(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
         if self.is_open() {
             return;

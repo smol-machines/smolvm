@@ -11,6 +11,8 @@ use std::{
     time::Duration,
 };
 
+mod folder_download;
+
 fn socket(shutdown: &AtomicBool) -> Result<PathBuf, String> {
     let connection = crate::docker_connection::check(shutdown);
     if connection.state != crate::docker_connection::State::Ready {
@@ -45,6 +47,15 @@ pub(crate) fn execute(request: &Request, shutdown: &AtomicBool) -> Result<Output
     }
     let socket = socket(shutdown)?;
     match request {
+        Request::SaveFolder { guest, local, .. } => {
+            crate::files::validate_path(guest)?;
+            folder_download::download(&format!("{id}:{guest}"), local, shutdown)?;
+            Ok(Output::FileTransferred {
+                id: id.into(),
+                local: local.clone(),
+                upload: false,
+            })
+        }
         Request::List { path, .. } => {
             crate::files::validate_path(path)?;
             let mut command = Command::new(find_tool(if cfg!(windows) {
@@ -143,6 +154,189 @@ pub(crate) fn execute(request: &Request, shutdown: &AtomicBool) -> Result<Output
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_for_shared_folder(id: &str, name: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let result = execute(
+                &Request::List {
+                    target: id.into(),
+                    path: "/app".into(),
+                },
+                &AtomicBool::new(false),
+            );
+            if matches!(result, Ok(Output::Files { listing, .. }) if listing.entries.iter().any(|e| e.name == name))
+            {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "host-created fixture folder did not become visible in the guest"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    #[test]
+    #[ignore = "requires an isolated Smol container with SMOL_STUDIO_FILES_SHARED mounted at /app"]
+    #[cfg(unix)]
+    fn live_container_folder_preserves_tree_links_modes_and_state() {
+        use std::os::unix::fs::{PermissionsExt, symlink};
+        let id = std::env::var("SMOL_STUDIO_FILES_CONTAINER").unwrap();
+        let shared = PathBuf::from(std::env::var("SMOL_STUDIO_FILES_SHARED").unwrap());
+        let source = tempfile::Builder::new()
+            .prefix("folder 雪 ; ")
+            .tempdir_in(shared)
+            .unwrap();
+        let name = source.path().file_name().unwrap().to_str().unwrap();
+        let guest = format!("/app/{name}");
+        std::fs::create_dir(source.path().join("empty")).unwrap();
+        std::fs::create_dir(source.path().join("nested")).unwrap();
+        std::fs::write(source.path().join("nested/雪\n.txt"), b"bytes\0\xff").unwrap();
+        std::fs::write(source.path().join(".hidden"), b"hidden").unwrap();
+        let mut sparse = std::fs::File::create(source.path().join("sparse.bin")).unwrap();
+        use std::io::{Seek, Write};
+        sparse.set_len(32768).unwrap();
+        sparse.seek(std::io::SeekFrom::Start(8192)).unwrap();
+        sparse.write_all(b"abc").unwrap();
+        drop(sparse);
+        std::fs::write(source.path().join("run"), b"#!/bin/sh\n").unwrap();
+        std::fs::set_permissions(
+            source.path().join("run"),
+            std::fs::Permissions::from_mode(0o751),
+        )
+        .unwrap();
+        symlink("nested/雪\n.txt", source.path().join("relative-link")).unwrap();
+        symlink("/outside/missing", source.path().join("absolute-link")).unwrap();
+        wait_for_shared_folder(&id, name);
+        let stop = AtomicBool::new(false);
+        let inspect = || {
+            let mut command = crate::docker::docker_command();
+            command.args([
+                "--context",
+                "smol",
+                "inspect",
+                "--format",
+                "{{json .State}}",
+                &id,
+            ]);
+            capture(&mut command, Duration::from_secs(30), 1024 * 1024, &stop).unwrap()
+        };
+        let before = inspect();
+        let local = tempfile::tempdir().unwrap();
+        let output = local.path().join("renamed copy 雪");
+        let save = |guest: &str, path: &Path| {
+            execute(
+                &Request::SaveFolder {
+                    target: id.clone(),
+                    guest: guest.into(),
+                    local: path.into(),
+                },
+                &stop,
+            )
+        };
+        save(&guest, &output).unwrap();
+        assert_eq!(
+            output.metadata().unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let mut expected_sparse = vec![0; 32768];
+        expected_sparse[8192..8195].copy_from_slice(b"abc");
+        assert_eq!(
+            std::fs::read(output.join("sparse.bin")).unwrap(),
+            expected_sparse
+        );
+        assert_eq!(
+            std::fs::read(output.join("nested/雪\n.txt")).unwrap(),
+            b"bytes\0\xff"
+        );
+        assert_eq!(std::fs::read(output.join(".hidden")).unwrap(), b"hidden");
+        assert!(output.join("empty").is_dir());
+        assert_eq!(
+            std::fs::read_link(output.join("relative-link")).unwrap(),
+            Path::new("nested/雪\n.txt")
+        );
+        assert_eq!(
+            std::fs::read_link(output.join("absolute-link")).unwrap(),
+            Path::new("/outside/missing")
+        );
+        assert_eq!(
+            output.join("run").metadata().unwrap().permissions().mode() & 0o777,
+            0o751
+        );
+        assert!(
+            save(&guest, &output)
+                .err()
+                .unwrap()
+                .contains("already exists")
+        );
+        let failed = local.path().join("failed");
+        assert!(save(&format!("{guest}/missing"), &failed).is_err());
+        assert!(save(&format!("{guest}/run"), &failed).is_err());
+        assert!(save(&format!("{guest}/relative-link"), &failed).is_err());
+        assert!(!failed.exists());
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            1,
+            "staging leaked"
+        );
+        assert_eq!(inspect(), before, "folder copy changed lifecycle state");
+    }
+
+    #[test]
+    #[ignore = "requires isolated container, writable /app bind, and 512 MiB free space"]
+    fn live_container_folder_cancel_removes_partial_download() {
+        use std::sync::atomic::Ordering;
+        let id = std::env::var("SMOL_STUDIO_FILES_CONTAINER").unwrap();
+        let shared = PathBuf::from(std::env::var("SMOL_STUDIO_FILES_SHARED").unwrap());
+        let source = tempfile::tempdir_in(shared).unwrap();
+        let size = 512 * 1024 * 1024;
+        std::fs::File::create(source.path().join("large.bin"))
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        wait_for_shared_folder(&id, source.path().file_name().unwrap().to_str().unwrap());
+        let remote = format!(
+            "{id}:/app/{}",
+            source.path().file_name().unwrap().to_str().unwrap()
+        );
+        let local = tempfile::tempdir().unwrap();
+        let destination = local.path().join("copy");
+        let stop = AtomicBool::new(false);
+        std::thread::scope(|scope| {
+            let copying = scope.spawn(|| folder_download::download(&remote, &destination, &stop));
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            let partial = loop {
+                let partial = std::fs::read_dir(local.path())
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| {
+                        entry
+                            .path()
+                            .join("folder/large.bin")
+                            .metadata()
+                            .is_ok_and(|m| m.len() > 0)
+                    });
+                if partial || copying.is_finished() || std::time::Instant::now() > deadline {
+                    break partial;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            };
+            stop.store(true, Ordering::Release);
+            let result = copying.join().unwrap();
+            assert!(
+                partial,
+                "fixture did not observe a staged in-progress copy: {result:?}"
+            );
+            assert!(result.is_err());
+        });
+        assert!(!destination.exists());
+        assert_eq!(
+            std::fs::read_dir(local.path()).unwrap().count(),
+            0,
+            "partial folder leaked"
+        );
+    }
 
     #[test]
     #[ignore = "requires an isolated Smol engine, owned read-only container and writable /app"]

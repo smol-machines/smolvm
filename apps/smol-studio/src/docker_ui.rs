@@ -286,6 +286,9 @@ impl DockerView {
             Some(Action::Files(smol_studio::files::Request::List { .. })) => {
                 "Reading container folder…"
             }
+            Some(Action::Files(smol_studio::files::Request::SaveFolder { .. })) => {
+                "Saving container folder…"
+            }
             Some(Action::Files(_)) => "Transferring file…",
             Some(Action::Rename { .. }) => "Renaming container…",
             Some(Action::Logs(_)) => "Loading logs…",
