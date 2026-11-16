@@ -61,6 +61,8 @@ pub enum Action {
         reference: String,
     },
     TagImage(crate::image_tag::Plan),
+    ReviewImageArchive(crate::image_archive::Request),
+    TransferImageArchive(crate::image_archive::Plan),
     PullImage(String),
     CreateVolume(String),
     Projects,
@@ -88,6 +90,11 @@ impl Action {
                 source.name.as_deref().unwrap_or("Compose project")
             )),
             Self::PullImage(reference) => Some(format!("Pull {reference}")),
+            Self::TransferImageArchive(plan) => Some(format!(
+                "{} {}",
+                if plan.importing() { "Import" } else { "Export" },
+                plan.path.file_name().unwrap_or_default().to_string_lossy()
+            )),
             _ => None,
         }
     }
@@ -104,6 +111,7 @@ impl Action {
                 | Self::Projects
                 | Self::DiscoverProject(_)
                 | Self::ReviewImageTag { .. }
+                | Self::ReviewImageArchive(_)
         )
     }
 }
@@ -117,6 +125,7 @@ pub enum Output {
         warning: Option<String>,
     },
     ImageTagPlan(crate::image_tag::Plan),
+    ImageArchivePlan(crate::image_archive::Plan),
     Storage(crate::storage::Details),
     Network(crate::network::Details),
     Text(String),
@@ -256,6 +265,13 @@ fn execute_with_progress(
     shutdown: &AtomicBool,
     progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
+    if let Action::ReviewImageArchive(request) = action {
+        return crate::image_archive::review(request, shutdown).map(Output::ImageArchivePlan);
+    }
+    if let Action::TransferImageArchive(plan) = action {
+        crate::image_archive::apply(plan, progress, shutdown)?;
+        return Ok(Output::Completed);
+    }
     if let Action::ReviewImageTag { id, reference } = action {
         return crate::image_tag::review(id, reference, shutdown).map(Output::ImageTagPlan);
     }

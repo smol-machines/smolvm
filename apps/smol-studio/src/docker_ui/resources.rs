@@ -326,6 +326,9 @@ impl DockerView {
                 if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary("Tag image…")).clicked() {
                     self.tag_image = Some(super::image_tag::Form { source_id: details.id.clone(), source_label: title.clone(), reference: String::new(), plan: None, error: None, focus_reference: true });
                 }
+                if details.kind == Kind::Images && ui.add_enabled(enabled, egui::Button::new("Export…")).clicked() {
+                    self.archive_image = Some(super::image_archive::Form::export(details.id.clone(), title.clone()));
+                }
                 if ui.button(if details.kind == Kind::Images { "Copy image ID" } else { "Copy volume name" }).clicked() { ui.ctx().copy_text(details.id.clone()); }
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.menu_button("More", |ui| {

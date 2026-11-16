@@ -53,6 +53,29 @@ impl FilePicker {
         ctx.request_repaint();
     }
 
+    pub fn open_archive(&mut self, frame: &eframe::Frame, save: bool, ctx: &egui::Context) {
+        if self.is_open() {
+            return;
+        }
+        let dialog = rfd::AsyncFileDialog::new().set_parent(frame);
+        self.pending = Some(Box::pin(async move {
+            if save {
+                dialog
+                    .set_title("Export container image")
+                    .set_file_name("image.tar")
+                    .save_file()
+                    .await
+            } else {
+                dialog
+                    .set_title("Import container images")
+                    .pick_file()
+                    .await
+            }
+            .map(|file| vec![file])
+        }));
+        ctx.request_repaint();
+    }
+
     pub fn open_executable(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
         if self.is_open() {
             return;

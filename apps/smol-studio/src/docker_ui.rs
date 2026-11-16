@@ -1,4 +1,5 @@
 mod connection;
+mod image_archive;
 mod image_tag;
 mod project_form;
 mod resources;
@@ -43,6 +44,7 @@ pub struct DockerView {
     resource_tab: resources::Tab,
     new_resource: Option<Kind>,
     tag_image: Option<image_tag::Form>,
+    archive_image: Option<image_archive::Form>,
     resource_input: String,
     resource_error: Option<String>,
     pending: Option<Action>,
@@ -160,6 +162,7 @@ impl DockerView {
             resource_tab: resources::Tab::Overview,
             new_resource: None,
             tag_image: None,
+            archive_image: None,
             resource_input: String::new(),
             resource_error: None,
             pending: None,
@@ -236,6 +239,7 @@ impl DockerView {
     pub fn modal_open(&self) -> bool {
         self.connection_open
             || self.tag_image.is_some()
+            || self.archive_image.as_ref().is_some_and(|f| !f.transferring)
             || self.confirm.is_some()
             || (self.new_resource.is_some() && !matches!(self.pending, Some(Action::PullImage(_))))
             || self.file_picker.is_open()
@@ -265,6 +269,14 @@ impl DockerView {
             Some(Action::ReviewImageTag { .. }) => "Checking image tag…",
             Some(Action::TagImage(_)) => "Tagging image…",
             Some(Action::PullImage(_)) => "Pulling image…",
+            Some(Action::ReviewImageArchive(_)) => "Reviewing image archive…",
+            Some(Action::TransferImageArchive(plan)) => {
+                if plan.importing() {
+                    "Importing images…"
+                } else {
+                    "Exporting image…"
+                }
+            }
             Some(Action::CreateVolume(_)) => "Creating volume…",
             Some(Action::StorageRemove { .. }) => "Removing resource…",
             Some(_) => "Working…",
@@ -322,6 +334,14 @@ impl DockerView {
                     }
                     if std::mem::take(&mut self.refresh_after_check) && ready {
                         self.refresh(runtime);
+                    }
+                }
+                Ok(Output::ImageArchivePlan(plan)) => {
+                    if let Some(form) = &mut self.archive_image {
+                        form.path = plan.path.to_string_lossy().into_owned();
+                        form.plan = Some(plan);
+                        form.error = None;
+                        form.reveal_review = true;
                     }
                 }
                 Ok(Output::ImageTagPlan(plan)) => {
@@ -473,6 +493,22 @@ impl DockerView {
                     }
                 }
                 Ok(Output::Completed) => {
+                    if let Action::TransferImageArchive(plan) = &done.action {
+                        self.archive_image = None;
+                        self.activity = format!(
+                            "{} {}",
+                            if plan.importing() {
+                                "Imported"
+                            } else {
+                                "Exported to"
+                            },
+                            plan.path.display()
+                        );
+                        self.valid = false;
+                        self.storage = None;
+                        self.refresh(runtime);
+                        continue;
+                    }
                     if let Action::TagImage(plan) = &done.action {
                         self.tag_image = None;
                         self.storage_selected = Some(plan.source_id.clone());
@@ -528,6 +564,23 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if matches!(
+                        done.action,
+                        Action::ReviewImageArchive(_) | Action::TransferImageArchive(_)
+                    ) {
+                        if let Some(form) = &mut self.archive_image {
+                            form.error = Some(e);
+                            form.plan = None;
+                            form.transferring = false;
+                            form.reveal_error = true;
+                        }
+                        self.activity = "Image transfer needs review.".into();
+                        if done.action.mutates() {
+                            self.valid = false;
+                            self.refresh(runtime);
+                        }
+                        continue;
+                    }
                     if matches!(
                         done.action,
                         Action::ReviewImageTag { .. } | Action::TagImage(_)
@@ -1180,7 +1233,10 @@ impl DockerView {
             self.opened = true;
             self.refresh(runtime);
         }
-        if self.confirm.is_some() || self.tag_image.is_some() {
+        if self.confirm.is_some()
+            || self.tag_image.is_some()
+            || self.archive_image.as_ref().is_some_and(|f| !f.transferring)
+        {
             ui.disable();
         }
         egui::Panel::top("docker-heading")
@@ -1235,6 +1291,18 @@ impl DockerView {
                             self.resource_input.clear();
                             self.resource_error = None;
                             self.new_resource = Some(self.kind);
+                        }
+                        if !self.compose
+                            && self.kind == Kind::Images
+                            && !cfg!(windows)
+                            && ui
+                                .add_enabled(
+                                    self.pending.is_none() && self.connected(),
+                                    egui::Button::new("Import…"),
+                                )
+                                .clicked()
+                        {
+                            self.archive_image = Some(image_archive::Form::import());
                         }
                         if ui
                             .add_enabled(self.pending.is_none(), egui::Button::new("Refresh"))
@@ -1408,6 +1476,7 @@ impl DockerView {
         self.connection_dialog(&ctx, runtime);
         self.resource_dialog(&ctx, runtime);
         self.image_tag_dialog(&ctx, runtime);
+        self.image_archive_dialog(&ctx, runtime, frame);
         if let Some(action) = self.confirm.clone() {
             let mut open = true;
             let title = match &action {

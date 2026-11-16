@@ -346,7 +346,9 @@ impl Studio {
             || self.delete.is_some()
             || self.settings
             || self.cloud.modal_open()
-            || self.docker.modal_open()
+            // A background Docker operation can finish with a retry dialog.
+            // Its hidden form must not disable another workspace.
+            || (self.workspace == Workspace::Containers && self.docker.modal_open())
     }
 
     fn sidebar(&mut self, ui: &mut egui::Ui) {

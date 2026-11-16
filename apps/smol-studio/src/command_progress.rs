@@ -1,7 +1,7 @@
 //! A bounded live transcript for a command owned by the action worker.
 use crate::log_stream::{LogStream, Status as LogStatus};
 use std::{
-    process::Command,
+    process::{Command, Stdio},
     sync::{
         Arc, Mutex,
         atomic::{AtomicBool, Ordering},
@@ -82,7 +82,38 @@ impl Progress {
         timeout: Duration,
         shutdown: &AtomicBool,
     ) -> Result<(), String> {
-        let code = self.capture_exit(command, timeout, shutdown)?;
+        self.capture_with_input(command, Stdio::null(), timeout, shutdown)
+    }
+
+    pub(crate) fn capture_with_input(
+        &self,
+        command: Command,
+        input: Stdio,
+        timeout: Duration,
+        shutdown: &AtomicBool,
+    ) -> Result<(), String> {
+        self.capture_with_io(command, input, None, timeout, shutdown)
+    }
+
+    pub(crate) fn capture_to_file(
+        &self,
+        command: Command,
+        output: std::fs::File,
+        timeout: Duration,
+        shutdown: &AtomicBool,
+    ) -> Result<(), String> {
+        self.capture_with_io(command, Stdio::null(), Some(output), timeout, shutdown)
+    }
+
+    fn capture_with_io(
+        &self,
+        command: Command,
+        input: Stdio,
+        output: Option<std::fs::File>,
+        timeout: Duration,
+        shutdown: &AtomicBool,
+    ) -> Result<(), String> {
+        let code = self.capture_exit_with_io(command, input, output, timeout, shutdown)?;
         if code == 0 {
             return Ok(());
         }
@@ -105,9 +136,20 @@ impl Progress {
         timeout: Duration,
         shutdown: &AtomicBool,
     ) -> Result<i32, String> {
+        self.capture_exit_with_io(command, Stdio::null(), None, timeout, shutdown)
+    }
+
+    fn capture_exit_with_io(
+        &self,
+        command: Command,
+        input: Stdio,
+        output: Option<std::fs::File>,
+        timeout: Duration,
+        shutdown: &AtomicBool,
+    ) -> Result<i32, String> {
         // This reader belongs to the command, not to the visible output panel.
         // Hiding the panel never interrupts a build or image pull.
-        let stream = LogStream::spawn(command, || {})?;
+        let stream = LogStream::spawn_with_io(command, input, output, || {})?;
         let started = Instant::now();
         let mut revision = 0;
         loop {

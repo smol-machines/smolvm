@@ -125,12 +125,29 @@ impl LogStream {
     }
 
     pub(crate) fn spawn(
+        command: Command,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_with_input(command, Stdio::null(), wake)
+    }
+
+    pub(crate) fn spawn_with_input(
+        command: Command,
+        input: Stdio,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn_with_io(command, input, None, wake)
+    }
+
+    pub(crate) fn spawn_with_io(
         mut command: Command,
+        input: Stdio,
+        output: Option<std::fs::File>,
         wake: impl Fn() + Send + Sync + 'static,
     ) -> Result<Self, String> {
         command
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
+            .stdin(input)
+            .stdout(output.map(Stdio::from).unwrap_or_else(Stdio::piped))
             .stderr(Stdio::piped());
         #[cfg(unix)]
         {
@@ -145,11 +162,11 @@ impl LogStream {
         let mut child = command
             .spawn()
             .map_err(|e| format!("Cannot start log reader: {e}"))?;
-        let stdout = child.stdout.take().expect("piped log stdout");
+        let stdout = child.stdout.take();
         let stderr = child.stderr.take().expect("piped log stderr");
         let state = Arc::new(Mutex::new(State::new()));
         let wake: Arc<dyn Fn() + Send + Sync> = Arc::new(wake);
-        let out = read_pipe(stdout, state.clone(), wake.clone());
+        let out = stdout.map(|stdout| read_pipe(stdout, state.clone(), wake.clone()));
         let err = read_pipe(stderr, state.clone(), wake.clone());
         let child = Arc::new(Mutex::new(child));
         let monitor = child.clone();
@@ -174,7 +191,9 @@ impl LogStream {
             };
             // Drain both streams before marking completion, including the last
             // bytes written just before a normal process exit.
-            let _ = out.join();
+            if let Some(out) = out {
+                let _ = out.join();
+            }
             let _ = err.join();
             let mut state = view.lock().unwrap();
             if !matches!(state.status, Status::Failed(_)) {
