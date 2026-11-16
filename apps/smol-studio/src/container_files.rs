@@ -186,6 +186,7 @@ mod tests {
         let shared = PathBuf::from(std::env::var("SMOL_STUDIO_FILES_SHARED").unwrap());
         let source = tempfile::Builder::new()
             .prefix("folder 雪 ; ")
+            .permissions(std::fs::Permissions::from_mode(0o700))
             .tempdir_in(shared)
             .unwrap();
         let name = source.path().file_name().unwrap().to_str().unwrap();

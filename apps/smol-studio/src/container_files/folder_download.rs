@@ -15,9 +15,15 @@ pub(super) fn download(remote: &str, local: &Path, shutdown: &AtomicBool) -> Res
         Err(e) => return Err(format!("Cannot access {}: {e}", local.display())),
     }
     let parent = local.parent().ok_or("Choose a destination folder.")?;
+    let mut staging = tempfile::Builder::new();
+    staging.prefix(".smol-download-");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        staging.permissions(std::fs::Permissions::from_mode(0o700));
+    }
     let stage = Stage(
-        tempfile::Builder::new()
-            .prefix(".smol-download-")
+        staging
             .tempdir_in(parent)
             .map_err(|e| format!("Cannot save in {}: {e}", parent.display()))?,
     );
