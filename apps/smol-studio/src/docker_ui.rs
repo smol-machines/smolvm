@@ -88,7 +88,7 @@ pub struct DockerView {
     container_tab: ContainerTab,
     live_logs: crate::live_logs_ui::LiveLogs,
     files: crate::files_ui::FilesView,
-    terminal: Option<crate::terminal_ui::TerminalWindow>,
+    terminal_request: Option<(String, String)>,
 }
 impl DockerView {
     fn select_compose_files(&mut self, paths: &[std::path::PathBuf]) {
@@ -212,7 +212,7 @@ impl DockerView {
             container_tab: ContainerTab::Overview,
             live_logs: crate::live_logs_ui::LiveLogs::default(),
             files: crate::files_ui::FilesView::default(),
-            terminal: None,
+            terminal_request: None,
         }
     }
     pub fn destination(&self) -> Option<Kind> {
@@ -794,15 +794,8 @@ impl DockerView {
             ctx.request_repaint_after(delay);
         }
     }
-    pub fn terminal_focused(&self, ctx: &egui::Context) -> bool {
-        self.terminal.as_ref().is_some_and(|t| t.focused(ctx))
-    }
-    pub fn terminal_ui(&mut self, ctx: &egui::Context) {
-        if let Some(terminal) = &mut self.terminal
-            && !terminal.ui(ctx)
-        {
-            self.terminal = None;
-        }
+    pub fn take_terminal_request(&mut self) -> Option<(String, String)> {
+        self.terminal_request.take()
     }
     fn resource_dialog(&mut self, ctx: &egui::Context, runtime: &Runtime) {
         if matches!(self.pending, Some(Action::PullImage(_))) {
@@ -1224,14 +1217,7 @@ impl DockerView {
                     .add_enabled(enabled, design::primary(ui, "Open terminal"))
                     .clicked()
                 {
-                    match crate::terminal_ui::TerminalWindow::for_container(
-                        ui.ctx(),
-                        &details.id,
-                        &details.name,
-                    ) {
-                        Ok(t) => self.terminal = Some(t),
-                        Err(e) => self.error = Some(e),
-                    }
+                    self.terminal_request = Some((details.id.clone(), details.name.clone()));
                 }
             } else if details.state == "paused" {
                 if ui

@@ -41,7 +41,7 @@ pub struct Studio {
     switcher: crate::navigation_ui::Switcher,
     cloud: crate::cloud_ui::CloudView,
     workspace: Workspace,
-    terminal: Option<crate::terminal_ui::TerminalWindow>,
+    terminals: crate::terminal_ui::Terminals,
     docker: crate::docker_ui::DockerView,
     runtime: Runtime,
     worker: Worker,
@@ -97,7 +97,7 @@ impl Studio {
             switcher: crate::navigation_ui::Switcher::default(),
             cloud: crate::cloud_ui::CloudView::new(&cc.egui_ctx),
             workspace: Workspace::Local,
-            terminal: None,
+            terminals: crate::terminal_ui::Terminals::default(),
             docker: crate::docker_ui::DockerView::new(&cc.egui_ctx),
             runtime,
             worker,
@@ -601,12 +601,11 @@ impl Studio {
                 && ui
                     .add_enabled(enabled, design::primary(ui, "Open terminal"))
                     .clicked()
+                && let Err(error) =
+                    self.terminals
+                        .open_machine(ui.ctx(), self.runtime.clone(), m.name.clone())
             {
-                self.terminal = Some(crate::terminal_ui::TerminalWindow::new(
-                    ui.ctx(),
-                    self.runtime.clone(),
-                    m.name.clone(),
-                ));
+                self.terminals.show_error(error);
             }
             if m.can_stop() && ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() {
                 self.submit(Operation::Stop(m.name.clone()));
@@ -1233,8 +1232,7 @@ impl eframe::App for Studio {
         let ctx = ui.ctx().clone();
         crate::search_ui::begin(&ctx);
         if !self.modal_open()
-            && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
-            && !self.docker.terminal_focused(&ctx)
+            && !self.terminals.focused(&ctx)
             && !egui::Popup::is_any_open(&ctx)
             && let Some(destination) = self.switcher.shortcuts(&ctx)
         {
@@ -1244,12 +1242,12 @@ impl eframe::App for Studio {
         if let Some(destination) = self.switcher.show(&ctx, self.docker.navigating()) {
             self.navigate(destination);
         }
-        self.docker.terminal_ui(&ctx);
-        if let Some(terminal) = &mut self.terminal
-            && !terminal.ui(&ctx)
+        if let Some((id, name)) = self.docker.take_terminal_request()
+            && let Err(error) = self.terminals.open_container(&ctx, id, name)
         {
-            self.terminal = None;
+            self.terminals.show_error(error);
         }
+        self.terminals.ui(&ctx, !self.modal_open() && !switching);
         if self.modal_open() || switching {
             ui.disable();
         }
@@ -1263,6 +1261,7 @@ impl eframe::App for Studio {
             .show(ui, |ui| {
                 ui.spacing_mut().interact_size.y = 18.0;
                 ui.horizontal(|ui| {
+                    self.terminals.status_button(ui);
                     let label = if self.close_notice {
                         if self.pending.as_ref().is_some_and(Operation::is_mutation)
                             || self.cloud.mutating()
@@ -1406,15 +1405,10 @@ impl eframe::App for Studio {
         self.dialogs(&ctx, frame);
         crate::search_ui::finish(
             &ctx,
-            !self.modal_open()
-                && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
-                && !self.docker.terminal_focused(&ctx)
-                && !egui::Popup::is_any_open(&ctx),
+            !self.modal_open() && !self.terminals.focused(&ctx) && !egui::Popup::is_any_open(&ctx),
         );
         self.desktop_menu.update(
-            !self.modal_open()
-                && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
-                && !self.docker.terminal_focused(&ctx),
+            !self.modal_open() && !self.terminals.focused(&ctx),
             !self.docker.navigating(),
             !self.modal_open()
                 && !self.pending.as_ref().is_some_and(Operation::is_mutation)
