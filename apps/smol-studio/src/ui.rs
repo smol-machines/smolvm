@@ -229,6 +229,14 @@ impl Studio {
                     }
                 }
                 Err(e) => {
+                    if done.cancelled
+                        && let Operation::TransferFile { name, upload, .. } = &done.operation
+                    {
+                        self.files.transfer_stopped(name, *upload);
+                        self.error = None;
+                        self.activity = "Transfer stopped.".into();
+                        continue;
+                    }
                     let mut shown_in_editor = false;
                     if matches!(done.operation, Operation::Create(_))
                         && let Some(editor) = &mut self.create
@@ -1053,7 +1061,11 @@ impl Studio {
     }
 
     fn dialogs(&mut self, ctx: &egui::Context, frame: &eframe::Frame) {
-        if let Some(action) = self.files.dialog(ctx, self.pending.is_some()) {
+        let interruption = self.worker.transfer_cancellation();
+        if let Some(action) =
+            self.files
+                .dialog(ctx, self.pending.is_some(), interruption.as_deref())
+        {
             self.submit(action);
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape))

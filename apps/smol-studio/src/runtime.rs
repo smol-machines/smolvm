@@ -5,7 +5,7 @@ use std::{
     path::PathBuf,
     process::{Command, Stdio},
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -16,6 +16,8 @@ use std::{
 const INVENTORY_LIMIT: u64 = 4 * 1024 * 1024;
 const LOG_LIMIT: u64 = 256 * 1024;
 const ERROR_LIMIT: u64 = 64 * 1024;
+
+mod file_download;
 
 #[derive(Clone, Debug, PartialEq)]
 pub struct Runtime {
@@ -271,6 +273,16 @@ impl Runtime {
         } else {
             Duration::from_secs(15)
         };
+        if let Operation::TransferFile {
+            name,
+            guest,
+            local,
+            upload: false,
+        } = op
+        {
+            file_download::download(self, name, guest, local, shutdown)?;
+            return Ok(Payload::Completed);
+        }
         if let Operation::Exec { name, .. } = op {
             let fallback = crate::command_progress::Progress::new(|| {});
             let report = progress.unwrap_or(&fallback);
@@ -515,14 +527,26 @@ pub struct Completion {
     pub operation: Operation,
     pub elapsed: Duration,
     pub result: Result<Payload, String>,
+    pub cancelled: bool,
 }
 
 pub struct Worker {
-    requests: Option<mpsc::SyncSender<(Runtime, Operation)>>,
+    requests: Option<mpsc::SyncSender<Work>>,
     pub responses: mpsc::Receiver<Completion>,
     pub console: crate::command_progress::Progress,
     shutdown: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<Cancellation>>>,
     thread: Option<thread::JoinHandle<()>>,
+}
+
+struct Work {
+    runtime: Runtime,
+    operation: Operation,
+    interrupted: Arc<AtomicBool>,
+}
+struct Cancellation {
+    interrupted: Arc<AtomicBool>,
+    transfer: bool,
 }
 
 impl Worker {
@@ -531,22 +555,36 @@ impl Worker {
         let report_wake = wake.clone();
         let console = crate::command_progress::Progress::new(move || report_wake());
         let report = console.clone();
-        let (requests, incoming) = mpsc::sync_channel::<(Runtime, Operation)>(1);
+        let (requests, incoming) = mpsc::sync_channel::<Work>(1);
         let (outgoing, responses) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
+        let active = Arc::new(Mutex::new(None));
+        let current = active.clone();
         let thread = thread::spawn(move || {
-            while let Ok((runtime, operation)) = incoming.recv() {
+            while let Ok(Work {
+                runtime,
+                operation,
+                interrupted,
+            }) = incoming.recv()
+            {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
                 let started = Instant::now();
-                let result = runtime.execute_reporting(&operation, &stop, Some(&report));
+                let result = if interrupted.load(Ordering::Acquire) {
+                    Err("Transfer stopped before it started.".into())
+                } else {
+                    runtime.execute_reporting(&operation, &interrupted, Some(&report))
+                };
+                let cancelled = result.is_err() && interrupted.load(Ordering::Acquire);
+                *current.lock().unwrap() = None;
                 if outgoing
                     .send(Completion {
                         operation,
                         elapsed: started.elapsed(),
                         result,
+                        cancelled,
                     })
                     .is_err()
                 {
@@ -560,22 +598,50 @@ impl Worker {
             responses,
             console,
             shutdown,
+            active,
             thread: Some(thread),
         }
     }
 
     pub fn submit(&self, runtime: Runtime, operation: Operation) -> Result<(), String> {
+        let mut active = self.active.lock().unwrap();
+        if active.is_some() {
+            return Err("The runtime is busy. Wait for the current operation.".into());
+        }
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let transfer = matches!(operation, Operation::TransferFile { .. });
         self.requests
             .as_ref()
             .ok_or("Runtime worker is closed")?
-            .try_send((runtime, operation))
-            .map_err(|_| "The runtime is busy. Wait for the current operation.".into())
+            .try_send(Work {
+                runtime,
+                operation,
+                interrupted: interrupted.clone(),
+            })
+            .map_err(|_| "The runtime is busy. Wait for the current operation.".to_string())?;
+        *active = Some(Cancellation {
+            interrupted,
+            transfer,
+        });
+        Ok(())
+    }
+
+    pub fn transfer_cancellation(&self) -> Option<Arc<AtomicBool>> {
+        self.active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|active| active.transfer)
+            .map(|active| active.interrupted.clone())
     }
 }
 
 impl Drop for Worker {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(active) = self.active.lock().unwrap().as_ref() {
+            active.interrupted.store(true, Ordering::Release);
+        }
         self.requests.take();
         if let Some(thread) = self.thread.take() {
             let _ = thread.join();

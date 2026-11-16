@@ -484,8 +484,13 @@ impl FilesView {
         }
         action
     }
-    pub fn dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Operation> {
-        let request = self.transfer_dialog(ctx, busy, None);
+    pub fn dialog(
+        &mut self,
+        ctx: &egui::Context,
+        busy: bool,
+        interruption: Option<&AtomicBool>,
+    ) -> Option<Operation> {
+        let request = self.transfer_dialog(ctx, busy, interruption);
         self.machine_operation(request)
     }
 
