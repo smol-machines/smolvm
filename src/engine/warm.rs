@@ -572,7 +572,11 @@ mod tests {
         assert!(lock_within(&path, Duration::from_millis(50)).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(held);
-        assert!(lock_within(&path, Duration::ZERO).is_some());
+        // Parallel tests spawn processes: a fork can retain this descriptor
+        // until exec closes it, even though our own descriptor was dropped.
+        // Keep the held-lock assertions nonblocking, but allow that transient
+        // inherited reference to close before proving the lock is reusable.
+        assert!(lock_within(&path, Duration::from_secs(1)).is_some());
     }
 
     #[test]
