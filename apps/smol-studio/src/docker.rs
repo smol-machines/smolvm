@@ -45,6 +45,7 @@ pub enum Action {
     Start(String),
     Stop(String),
     Restart(String),
+    Resume(String),
     Rename {
         id: String,
         name: String,
@@ -242,6 +243,7 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
         }
         Action::Start(id)
         | Action::Restart(id)
+        | Action::Resume(id)
         | Action::Stop(id)
         | Action::Delete(id)
         | Action::Logs(id)
@@ -251,6 +253,7 @@ fn docker_args(action: &Action) -> Result<Vec<String>, String> {
             let command = match action {
                 Action::Start(_) => "start",
                 Action::Restart(_) => "restart",
+                Action::Resume(_) => "unpause",
                 Action::Stop(_) => "stop",
                 Action::Delete(_) => "rm",
                 Action::Logs(_) => "logs",
@@ -901,6 +904,7 @@ mod tests {
             Action::Start("ab12".into()),
             Action::Stop("ab12".into()),
             Action::Restart("ab12".into()),
+            Action::Resume("ab12".into()),
             Action::Rename {
                 id: "ab12".into(),
                 name: "new-name".into(),
@@ -917,6 +921,102 @@ mod tests {
             assert!(!args.iter().any(|a| a == "--force" || a == "-f"));
         }
         assert!(docker_args(&Action::Delete("--force".into())).is_err());
+    }
+
+    #[test]
+    #[ignore = "creates an explicitly owned counter container in an isolated smol context"]
+    fn live_resume_continues_work_without_restarting_and_paused_stop_exits() {
+        let image = std::env::var("SMOL_STUDIO_LIFECYCLE_IMAGE").expect("owned local image");
+        let name = std::env::var("SMOL_STUDIO_LIFECYCLE_NAME").expect("unique fixture name");
+        let shutdown = AtomicBool::new(false);
+        let runtime = Runtime::discover();
+        let command = |args: &[&str]| -> Result<String, String> {
+            capture(
+                docker_command().args(["--context", "smol"]).args(args),
+                Duration::from_secs(30),
+                65536,
+                &shutdown,
+            )
+            .map(|bytes| String::from_utf8(bytes).unwrap().trim().to_owned())
+        };
+        let id = command(&[
+            "run",
+            "--detach",
+            "--name",
+            &name,
+            "--stop-timeout",
+            "1",
+            &image,
+            "sh",
+            "-c",
+            "n=0; while :; do n=$((n+1)); echo $n; sleep 0.1; done",
+        ])
+        .unwrap();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let started = command(&["inspect", "--format", "{{.State.StartedAt}}", &id]).unwrap();
+            let count = || {
+                command(&["logs", "--tail", "1", &id])
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap()
+            };
+            for _ in 0..50 {
+                if command(&["logs", "--tail", "1", &id])
+                    .unwrap()
+                    .parse::<u64>()
+                    .unwrap_or(0)
+                    >= 3
+                {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(count() >= 3);
+            command(&["pause", &id]).unwrap();
+            assert_eq!(
+                command(&["inspect", "--format", "{{.State.Status}}", &id]).unwrap(),
+                "paused"
+            );
+            std::thread::sleep(Duration::from_millis(300));
+            let paused = count();
+            std::thread::sleep(Duration::from_secs(1));
+            assert_eq!(count(), paused, "work must actually pause");
+            execute(&runtime, &Action::Resume(id.clone()), &shutdown).unwrap();
+            for _ in 0..50 {
+                if count() > paused {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }
+            assert!(
+                count() > paused,
+                "resume must continue the original process"
+            );
+            assert_eq!(
+                command(&[
+                    "inspect",
+                    "--format",
+                    "{{.Id}} {{.State.Status}} {{.State.StartedAt}}",
+                    &id
+                ])
+                .unwrap(),
+                format!("{id} running {started}")
+            );
+            assert!(
+                execute(&runtime, &Action::Resume(id.clone()), &shutdown).is_err(),
+                "already running must report the engine conflict"
+            );
+            command(&["pause", &id]).unwrap();
+            execute(&runtime, &Action::Stop(id.clone()), &shutdown).unwrap();
+            assert_eq!(
+                command(&["inspect", "--format", "{{.State.Status}}", &id]).unwrap(),
+                "exited"
+            );
+        }));
+        command(&["rm", "--force", &id]).expect("remove owned counter fixture");
+        if let Err(error) = result {
+            std::panic::resume_unwind(error);
+        }
     }
 
     #[test]

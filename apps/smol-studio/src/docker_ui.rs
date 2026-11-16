@@ -278,6 +278,7 @@ impl DockerView {
                 | Action::Stop(_),
             ) => "Stopping containers…",
             Some(Action::Restart(_)) => "Restarting container…",
+            Some(Action::Resume(_)) => "Resuming container…",
             Some(Action::Rename { .. }) => "Renaming container…",
             Some(Action::Logs(_)) => "Loading logs…",
             Some(Action::ReviewImageTag { .. }) => "Checking image tag…",
@@ -597,6 +598,7 @@ impl DockerView {
                         | Action::Stop(_) => "Containers stopped.",
                         Action::Delete(_) => "Container removed.",
                         Action::Restart(_) => "Container restarted.",
+                        Action::Resume(_) => "Container resumed.",
                         Action::Rename { .. } => "Container renamed.",
                         Action::Configure => "Docker setup finished. Checking connection…",
                         Action::ForgetProject(_) => {
@@ -1164,18 +1166,26 @@ impl DockerView {
                         Err(e) => self.error = Some(e),
                     }
                 }
-                if ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() {
-                    self.submit(runtime, Action::Stop(details.id.clone()));
+            } else if details.state == "paused" {
+                if ui
+                    .add_enabled(enabled, design::primary("Resume container"))
+                    .clicked()
+                {
+                    self.submit(runtime, Action::Resume(details.id.clone()));
                 }
-            } else if ui
-                .add_enabled(enabled, design::primary("Start container"))
-                .clicked()
+            } else if details.can_start()
+                && ui
+                    .add_enabled(enabled, design::primary("Start container"))
+                    .clicked()
             {
                 self.submit(runtime, Action::Start(details.id.clone()));
             }
+            if details.can_stop() && ui.add_enabled(enabled, egui::Button::new("Stop")).clicked() {
+                self.submit(runtime, Action::Stop(details.id.clone()));
+            }
             ui.add_enabled_ui(enabled, |ui| {
                 ui.menu_button("More", |ui| {
-                    if ui.button("Rename…").clicked() {
+                    if details.can_rename() && ui.button("Rename…").clicked() {
                         self.rename_container =
                             Some(rename_container::Form::new(&details.id, &details.name));
                         ui.close();
@@ -1184,12 +1194,14 @@ impl DockerView {
                         self.confirm = Some(Action::Restart(details.id.clone()));
                         ui.close();
                     }
-                    ui.separator();
+                    if details.can_rename() {
+                        ui.separator();
+                    }
                     if ui.button("Copy container ID").clicked() {
                         ui.ctx().copy_text(details.id.clone());
                         ui.close();
                     }
-                    if details.state != "running" {
+                    if details.can_remove() {
                         ui.separator();
                         if ui
                             .button(RichText::new("Remove container…").color(design::RED))
@@ -1217,7 +1229,7 @@ impl DockerView {
         let enabled = self.valid && self.pending.is_none();
         let wide = ui.available_width() >= 640.0;
         ui.horizontal(|ui| {
-            let title_width = (ui.available_width() - if wide { 260.0 } else { 0.0 }).max(120.0);
+            let title_width = (ui.available_width() - if wide { 300.0 } else { 0.0 }).max(120.0);
             ui.allocate_ui_with_layout(
                 egui::vec2(title_width, 56.0),
                 egui::Layout::top_down(egui::Align::LEFT),
@@ -1247,6 +1259,10 @@ impl DockerView {
         if !wide {
             ui.add_space(10.0);
             self.container_actions(ui, runtime, &details, enabled);
+        }
+        if let Some(notice) = details.state_notice() {
+            ui.add_space(10.0);
+            ui.add(egui::Label::new(RichText::new(notice).size(12.0).color(MUTED)).wrap());
         }
         ui.add_space(12.0);
         ui.horizontal(|ui| {

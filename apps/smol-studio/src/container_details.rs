@@ -79,6 +79,35 @@ fn text(value: &Value) -> String {
     value.as_str().unwrap_or_default().to_owned()
 }
 impl ContainerDetails {
+    pub fn can_start(&self) -> bool {
+        matches!(self.state.as_str(), "created" | "exited")
+    }
+
+    pub fn can_stop(&self) -> bool {
+        matches!(self.state.as_str(), "running" | "paused" | "restarting")
+    }
+
+    pub fn can_remove(&self) -> bool {
+        matches!(self.state.as_str(), "created" | "exited" | "dead")
+    }
+
+    pub fn can_rename(&self) -> bool {
+        self.can_start() || self.can_stop() || self.state == "dead"
+    }
+
+    pub fn state_notice(&self) -> Option<&'static str> {
+        match self.state.as_str() {
+            "running" | "created" | "exited" => None,
+            "paused" => Some("Resume this container to continue its work and open a terminal."),
+            "restarting" => {
+                Some("Waiting for this container to restart. Stop it to end the restart cycle.")
+            }
+            "removing" => Some("This container is being removed."),
+            "dead" => Some("This container cannot be started. Review its logs before removing it."),
+            _ => Some("Container state is unavailable. Refresh to check its status."),
+        }
+    }
+
     pub fn exit_summary(&self) -> Option<ExitSummary> {
         if !matches!(self.state.as_str(), "exited" | "dead") {
             return None;
@@ -193,6 +222,32 @@ impl ContainerDetails {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn paused_and_transitional_containers_do_not_offer_start_or_remove() {
+        for (state, start, stop, remove, rename) in [
+            ("created", true, false, true, true),
+            ("exited", true, false, true, true),
+            ("running", false, true, false, true),
+            ("paused", false, true, false, true),
+            ("restarting", false, true, false, true),
+            ("removing", false, false, false, false),
+            ("dead", false, false, true, true),
+            ("", false, false, false, false),
+            ("future-state", false, false, false, false),
+        ] {
+            let d = ContainerDetails::parse(
+                &serde_json::to_vec(&serde_json::json!({"Id":"abcdef", "State":{"Status":state}}))
+                    .unwrap(),
+            )
+            .unwrap();
+            assert_eq!(
+                (d.can_start(), d.can_stop(), d.can_remove(), d.can_rename()),
+                (start, stop, remove, rename),
+                "{state}"
+            );
+        }
+    }
+
     #[test]
     #[ignore = "requires an explicitly owned health-check container in an isolated smol context"]
     fn live_health_projection_reports_the_current_check() {

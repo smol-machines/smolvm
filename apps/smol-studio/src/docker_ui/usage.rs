@@ -7,9 +7,13 @@ impl DockerView {
     ) {
         if details.state != "running" {
             ui.label(
-                RichText::new("Start this container to measure resource usage.")
-                    .size(12.0)
-                    .color(MUTED),
+                RichText::new(match details.state.as_str() {
+                    "paused" => "Resume this container to measure resource usage.",
+                    "created" | "exited" => "Start this container to measure resource usage.",
+                    _ => "Resource usage is available while this container is running.",
+                })
+                .size(12.0)
+                .color(MUTED),
             );
             return;
         }
