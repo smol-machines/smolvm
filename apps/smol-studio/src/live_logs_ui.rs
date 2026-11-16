@@ -45,8 +45,30 @@ impl LiveLogs {
             &format!("container:{id}"),
             enabled,
             "Waiting for container output…",
+            "Recent output · starts with the last 200 lines",
             || {
                 LogStream::container(id, move || {
+                    ctx.request_repaint_after(std::time::Duration::from_millis(33))
+                })
+            },
+        );
+    }
+    pub fn show_project(
+        &mut self,
+        ui: &mut egui::Ui,
+        name: &str,
+        service: Option<&str>,
+        enabled: bool,
+    ) {
+        let ctx = ui.ctx().clone();
+        self.show_reader(
+            ui,
+            &format!("project:{name}:{service:?}"),
+            enabled,
+            "Waiting for service output…",
+            "Recent output · starts with the last 200 lines per container",
+            || {
+                LogStream::project(name, service, move || {
                     ctx.request_repaint_after(std::time::Duration::from_millis(33))
                 })
             },
@@ -65,6 +87,7 @@ impl LiveLogs {
             &format!("machine:{name}"),
             enabled,
             "Waiting for workload output…",
+            "Recent output · starts with the last 200 lines",
             || {
                 LogStream::machine(runtime, name, move || {
                     ctx.request_repaint_after(std::time::Duration::from_millis(33))
@@ -78,6 +101,7 @@ impl LiveLogs {
         id: &str,
         enabled: bool,
         empty_hint: &str,
+        history_hint: &str,
         start: impl FnOnce() -> Result<LogStream, String>,
     ) {
         if self.id != id {
@@ -146,11 +170,7 @@ impl LiveLogs {
         if let Status::Failed(error) = &self.status {
             design::error_notice(ui, "Logs could not be followed.", error);
         }
-        ui.label(
-            RichText::new("Recent output · starts with the last 200 lines")
-                .size(11.0)
-                .color(MUTED),
-        );
+        ui.label(RichText::new(history_hint).size(11.0).color(MUTED));
         ui.add_space(8.0);
         design::search(ui, &mut self.filter, "Filter log lines…");
         ui.add_space(12.0);

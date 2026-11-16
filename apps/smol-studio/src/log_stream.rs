@@ -116,6 +116,14 @@ impl LogStream {
         Self::spawn(command, wake)
     }
 
+    pub fn project(
+        name: &str,
+        service: Option<&str>,
+        wake: impl Fn() + Send + Sync + 'static,
+    ) -> Result<Self, String> {
+        Self::spawn(project_command(name, service)?, wake)
+    }
+
     pub(crate) fn spawn(
         mut command: Command,
         wake: impl Fn() + Send + Sync + 'static,
@@ -209,6 +217,44 @@ impl LogStream {
             text: String::from_utf8_lossy(state.bytes.make_contiguous()).into_owned(),
         })
     }
+}
+
+fn project_command(name: &str, service: Option<&str>) -> Result<Command, String> {
+    crate::compose::validate_name(name)?;
+    let mut command = crate::docker::docker_command();
+    command.args([
+        "--context",
+        "smol",
+        "compose",
+        "--project-name",
+        name,
+        "--ansi",
+        "never",
+        "logs",
+        "--follow",
+        "--tail",
+        "200",
+        "--no-color",
+    ]);
+    // An explicit project name and no files selects current containers by label;
+    // reading logs must not depend on local config or inherited Compose settings.
+    for key in [
+        "COMPOSE_FILE",
+        "COMPOSE_PROJECT_NAME",
+        "COMPOSE_PROFILES",
+        "COMPOSE_ENV_FILES",
+        "COMPOSE_DISABLE_ENV_FILE",
+        "COMPOSE_PATH_SEPARATOR",
+    ] {
+        command.env_remove(key);
+    }
+    if let Some(service) = service {
+        if service.is_empty() || service.chars().any(char::is_control) {
+            return Err("Invalid Compose service name.".into());
+        }
+        command.args(["--", service]);
+    }
+    Ok(command)
 }
 
 fn read_pipe(
@@ -310,6 +356,51 @@ mod tests {
     use super::*;
     #[cfg(unix)]
     use std::time::Instant;
+
+    #[test]
+    fn project_reader_pins_identity_without_loading_files_or_inheriting_overrides() {
+        let command = project_command("studio-shop", Some("--literal-service")).unwrap();
+        let args: Vec<_> = command.get_args().map(|a| a.to_str().unwrap()).collect();
+        assert_eq!(
+            args,
+            [
+                "--context",
+                "smol",
+                "compose",
+                "--project-name",
+                "studio-shop",
+                "--ansi",
+                "never",
+                "logs",
+                "--follow",
+                "--tail",
+                "200",
+                "--no-color",
+                "--",
+                "--literal-service"
+            ]
+        );
+        for key in [
+            "DOCKER_HOST",
+            "DOCKER_CONTEXT",
+            "COMPOSE_FILE",
+            "COMPOSE_PROJECT_NAME",
+            "COMPOSE_PROFILES",
+            "COMPOSE_ENV_FILES",
+            "COMPOSE_DISABLE_ENV_FILE",
+            "COMPOSE_PATH_SEPARATOR",
+        ] {
+            assert!(
+                command
+                    .get_envs()
+                    .any(|(name, value)| name == key && value.is_none()),
+                "{key} must not override the selected project"
+            );
+        }
+        assert!(project_command("--invalid", None).is_err());
+        assert!(project_command("studio-shop", Some("")).is_err());
+        assert!(project_command("studio-shop", Some("web\nworker")).is_err());
+    }
 
     #[test]
     fn retention_is_bounded_for_lines_and_unterminated_output() {

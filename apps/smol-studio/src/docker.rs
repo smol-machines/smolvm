@@ -34,7 +34,6 @@ impl Kind {
 pub enum ProjectAction {
     Start,
     Stop,
-    Logs,
 }
 #[derive(Clone, Debug)]
 pub enum Action {
@@ -99,10 +98,6 @@ impl Action {
                 | Self::StorageInspect { .. }
                 | Self::Projects
                 | Self::DiscoverProject(_)
-                | Self::Project {
-                    action: ProjectAction::Logs,
-                    ..
-                }
         )
     }
 }
@@ -525,69 +520,13 @@ fn project_action(
         .into_iter()
         .find(|p| p.name == name)
         .ok_or("This Compose project no longer has containers. Refresh the project list.")?;
-    let deadline = Instant::now()
-        + Duration::from_secs(if matches!(action, ProjectAction::Logs) {
-            20
-        } else {
-            600
-        });
-    if matches!(action, ProjectAction::Logs) {
-        let mut text = String::new();
-        for container in &project.containers {
-            if text.len() >= 192 * 1024 || Instant::now() >= deadline {
-                text.push_str(
-                    "\nMore project logs are available from the individual containers.\n",
-                );
-                break;
-            }
-            text.push_str(&format!(
-                "\n── {} / {} ──\n",
-                container.service, container.name
-            ));
-            let mut command = docker_command();
-            command.args(docker_args(&Action::Logs(container.id.clone()))?);
-            match crate::runtime::capture_process(
-                &mut command,
-                deadline.saturating_duration_since(Instant::now()),
-                32 * 1024,
-                shutdown,
-            ) {
-                Ok(output) => {
-                    text.push_str(&String::from_utf8_lossy(&output.stdout));
-                    text.push_str(&String::from_utf8_lossy(&output.stderr));
-                    if !output.success {
-                        text.push_str("\nCould not load all logs for this container.\n");
-                    }
-                }
-                Err(error) => {
-                    text.push_str(&error);
-                    text.push('\n');
-                }
-            }
-            if shutdown.load(Ordering::Relaxed) {
-                return Err("Project logs cancelled.".into());
-            }
-            if text.len() > 256 * 1024 {
-                let mut end = 256 * 1024 - 100;
-                while !text.is_char_boundary(end) {
-                    end -= 1;
-                }
-                text.truncate(end);
-                text.push_str(
-                    "\nProject output truncated. Open individual containers for more logs.\n",
-                );
-                break;
-            }
-        }
-        return Ok(Output::Text(text));
-    }
+    let deadline = Instant::now() + Duration::from_secs(600);
     let ids: Vec<_> = project
         .containers
         .iter()
         .filter(|c| match action {
             ProjectAction::Start => c.can_start(),
             ProjectAction::Stop => c.can_stop(),
-            ProjectAction::Logs => false,
         })
         .map(|c| c.id.as_str())
         .collect();
@@ -618,7 +557,7 @@ fn project_action(
     Ok(Output::Completed)
 }
 
-fn docker_command() -> Command {
+pub(crate) fn docker_command() -> Command {
     let mut command = Command::new(crate::runtime::find_tool(if cfg!(windows) {
         "docker.exe"
     } else {
@@ -974,12 +913,25 @@ mod tests {
             started.iter().find(|p| p.name == other).unwrap().running(),
             other_running
         );
+        let stream = crate::log_stream::LogStream::project(&name, None, || {}).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(15);
+        loop {
+            if let Some(snapshot) = stream.snapshot_after(0)
+                && snapshot.text.contains("studio-web-ready")
+            {
+                assert!(!snapshot.text.contains("migration-done"));
+                break;
+            }
+            assert!(Instant::now() < deadline, "Project logs did not arrive");
+            thread::sleep(Duration::from_millis(20));
+        }
+        drop(stream);
+        let job = project.containers.iter().find(|c| c.is_job()).unwrap();
         let Output::Text(logs) =
-            execute(&runtime, &action(ProjectAction::Logs), &shutdown).unwrap()
+            execute(&runtime, &Action::Logs(job.id.clone()), &shutdown).unwrap()
         else {
-            panic!("Expected project logs");
+            panic!("Expected job logs")
         };
-        assert!(logs.contains("studio-web-ready"), "{logs}");
         assert!(logs.contains("migration-done"), "{logs}");
         assert!(
             execute(

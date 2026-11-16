@@ -1,4 +1,4 @@
-//! Project inventory comes from structured Docker labels, never comma-split label strings.
+//! Project inventory uses individually encoded labels; recorded paths require disambiguation.
 use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, HashSet},

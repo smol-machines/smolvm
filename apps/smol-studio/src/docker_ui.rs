@@ -59,6 +59,9 @@ pub struct DockerView {
     projects: Vec<smol_studio::compose::Project>,
     project_selected: Option<String>,
     project_query: String,
+    project_logs_open: bool,
+    project_service: Option<String>,
+    project_logs: crate::live_logs_ui::LiveLogs,
     projects_valid: bool,
     compose_import: bool,
     confirm: Option<Action>,
@@ -172,6 +175,9 @@ impl DockerView {
             projects: vec![],
             project_selected: None,
             project_query: String::new(),
+            project_logs_open: false,
+            project_service: None,
+            project_logs: crate::live_logs_ui::LiveLogs::default(),
             projects_valid: false,
             compose_import: false,
             confirm: None,
@@ -204,6 +210,9 @@ impl DockerView {
             self.kind = kind;
         }
         self.query.clear();
+        self.project_logs_open = false;
+        self.project_service = None;
+        self.project_logs.reset();
         self.storage = None;
         self.network = None;
         self.resource_tab = resources::Tab::Overview;
@@ -248,13 +257,7 @@ impl DockerView {
                 }
                 | Action::Stop(_),
             ) => "Stopping containers…",
-            Some(
-                Action::Project {
-                    action: ProjectAction::Logs,
-                    ..
-                }
-                | Action::Logs(_),
-            ) => "Loading logs…",
+            Some(Action::Logs(_)) => "Loading logs…",
             Some(Action::PullImage(_)) => "Pulling image…",
             Some(Action::CreateVolume(_)) => "Creating volume…",
             Some(Action::StorageRemove { .. }) => "Removing resource…",
@@ -270,14 +273,7 @@ impl DockerView {
         if action.progress_title().is_some() {
             self.text.clear();
         }
-        if matches!(
-            action,
-            Action::Logs(_)
-                | Action::Project {
-                    action: ProjectAction::Logs,
-                    ..
-                }
-        ) {
+        if matches!(action, Action::Logs(_)) {
             self.progress.dismiss_finished();
         }
         match self.worker.submit(runtime.clone(), action.clone()) {
@@ -342,11 +338,17 @@ impl DockerView {
                     }
                     self.projects = projects;
                     self.projects_valid = true;
+                    let previous = self.project_selected.clone();
                     self.project_selected = self
                         .project_selected
                         .take()
                         .filter(|name| self.projects.iter().any(|p| &p.name == name))
                         .or_else(|| self.projects.first().map(|p| p.name.clone()));
+                    if self.project_selected != previous {
+                        self.project_logs_open = false;
+                        self.project_service = None;
+                        self.project_logs.reset();
+                    }
                 }
                 Ok(Output::Rows(kind, rows)) => {
                     if self.kind == kind {
@@ -746,6 +748,11 @@ impl DockerView {
                             )
                             .clicked()
                             {
+                                if self.project_selected.as_deref() != Some(&project.name) {
+                                    self.project_logs_open = false;
+                                    self.project_service = None;
+                                    self.project_logs.reset();
+                                }
                                 self.project_selected = Some(project.name.clone());
                                 self.compose_import = false;
                                 self.text.clear();
@@ -764,11 +771,79 @@ impl DockerView {
             return;
         };
         let enabled = self.projects_valid && self.pending.is_none();
+        ui.add(egui::Label::new(design::heading(&project.name, 22.0)).truncate())
+            .on_hover_text(&project.name);
+        ui.label(
+            RichText::new(format!(
+                "{} · {} · {} running",
+                count(project.services().len(), "service"),
+                count(project.containers.len(), "container"),
+                project.running()
+            ))
+            .small()
+            .color(MUTED),
+        );
+        ui.add_space(12.0);
+        ui.horizontal(|ui| {
+            for (logs, label) in [(false, "Overview"), (true, "Service logs")] {
+                if design::tab(ui, self.project_logs_open == logs, label).clicked() {
+                    self.project_logs_open = logs;
+                    self.project_logs.set_visible(logs);
+                    if logs {
+                        self.progress.dismiss_finished();
+                    }
+                }
+            }
+        });
+        ui.separator();
+        ui.add_space(16.0);
+        if self.project_logs_open {
+            let services: std::collections::BTreeSet<_> = project
+                .containers
+                .iter()
+                .filter(|c| !c.is_job())
+                .map(|c| c.service.as_str())
+                .collect();
+            if services.is_empty() {
+                ui.label(RichText::new("No service containers. Open one-off job logs from their container entries in Overview.").color(MUTED));
+                return;
+            }
+            if self
+                .project_service
+                .as_deref()
+                .is_some_and(|s| !services.contains(s))
+            {
+                self.project_service = None;
+            }
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("Service").small().color(MUTED))
+                    .on_hover_text(
+                        "One-off job logs are available from their container entries in Overview.",
+                    );
+                egui::ComboBox::from_id_salt("project-log-service")
+                    .selected_text(self.project_service.as_deref().unwrap_or("All services"))
+                    .show_ui(ui, |ui| {
+                        ui.selectable_value(&mut self.project_service, None, "All services");
+                        for service in &services {
+                            ui.selectable_value(
+                                &mut self.project_service,
+                                Some((*service).to_owned()),
+                                *service,
+                            );
+                        }
+                    });
+            });
+            ui.add_space(10.0);
+            self.project_logs.show_project(
+                ui,
+                &project.name,
+                self.project_service.as_deref(),
+                enabled,
+            );
+            return;
+        }
         egui::ScrollArea::vertical().id_salt("compose-project-detail").auto_shrink([false, false]).show(ui, |ui| {
-            ui.add(egui::Label::new(design::heading(&project.name, 22.0)).truncate()).on_hover_text(&project.name);
-            ui.label(RichText::new(format!("{} · {} · {} running", count(project.services().len(), "service"), count(project.containers.len(), "container"), project.running())).small().color(MUTED));
-            ui.add_space(12.0);
-            design::badge(ui, project.state());
+            ui.horizontal(|ui| { design::badge(ui, project.state()); });
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 if let Some(source) = &project.source {
@@ -782,11 +857,8 @@ impl DockerView {
                 if ui.add_enabled(enabled && project.containers.iter().any(|c| c.can_stop()), egui::Button::new("Stop containers")).clicked() {
                     self.submit(runtime, Action::Project { name: project.name.clone(), action: ProjectAction::Stop });
                 }
-                if ui.add_enabled(enabled, egui::Button::new("Project logs")).clicked() {
-                    self.submit(runtime, Action::Project { name: project.name.clone(), action: ProjectAction::Logs });
-                }
             });
-            ui.add_space(12.0);
+            ui.add_space(16.0);
             design::card().show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 design::eyebrow(ui, "COMPOSE FILES");
@@ -861,6 +933,18 @@ impl DockerView {
         });
     }
     pub fn logs_visibility(&mut self, workspace_visible: bool) {
+        self.project_logs.set_visible(
+            workspace_visible
+                && self.connected()
+                && self.compose
+                && !self.compose_import
+                && self.project_logs_open
+                && self.project_selected.is_some()
+                && self.projects.iter().any(|p| {
+                    Some(&p.name) == self.project_selected.as_ref()
+                        && p.containers.iter().any(|c| !c.is_job())
+                }),
+        );
         self.live_logs.set_visible(
             workspace_visible
                 && self.connected()
