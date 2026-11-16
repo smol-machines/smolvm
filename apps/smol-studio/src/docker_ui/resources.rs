@@ -1,6 +1,6 @@
 use super::*;
 
-#[derive(Clone, Copy, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Hash)]
 pub(super) enum Tab {
     #[default]
     Overview,
@@ -53,6 +53,27 @@ fn metadata(ui: &mut egui::Ui, label: &str, value: &str, copy: bool) {
             .wrap()
             .selectable(true),
         );
+    });
+}
+fn image_reference(ui: &mut egui::Ui, reference: &str) {
+    ui.horizontal(|ui| {
+        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+            if reference != "Untagged"
+                && ui
+                    .small_button("Copy")
+                    .on_hover_text("Copy image reference")
+                    .clicked()
+            {
+                ui.ctx().copy_text(reference.to_owned());
+            }
+            ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
+                ui.add(
+                    egui::Label::new(RichText::new(reference).size(12.5))
+                        .wrap()
+                        .selectable(true),
+                );
+            });
+        });
     });
 }
 fn bool_label(value: Option<bool>) -> &'static str {
@@ -127,7 +148,7 @@ impl DockerView {
                 }
                 ui.add_enabled_ui(self.pending.is_none(), |ui| {
                     egui::ScrollArea::vertical()
-                        .id_salt("storage-list-scroll")
+                        .id_salt(("storage-list-scroll", self.kind.label()))
                         .show_rows(ui, 60.0, rows.len(), |ui, range| {
                             for row in &rows[range] {
                                 let id = text(row, key(self.kind));
@@ -204,46 +225,103 @@ impl DockerView {
     }
     pub(super) fn resource_details(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
         if self.storage.is_none() && self.network.is_none() {
-            ui.add_space(64.0);
+            ui.add_space((ui.available_height() * 0.16).min(64.0));
             ui.vertical_centered(|ui| {
                 if self.pending.is_some() {
                     ui.spinner();
+                    ui.label(RichText::new("Loading resources…").color(MUTED));
+                    return;
                 }
-                ui.label(design::heading(
-                    if self.pending.is_some() {
-                        "Loading details…"
-                    } else if !self.query.is_empty() {
-                        "No matching resources"
-                    } else {
-                        "Select a resource"
-                    },
-                    20.0,
-                ));
-                ui.add_space(8.0);
-                ui.label(
-                    RichText::new(if !self.query.is_empty() {
-                        "Try another name, tag, or ID."
-                    } else {
-                        "Choose an item to see its configuration and containers."
-                    })
-                    .color(MUTED),
-                );
-                if !self.query.is_empty() && ui.button("Clear search").clicked() {
+                let empty = self.valid && self.rows.is_empty();
+                let unavailable = !self.valid || self.storage_selected.is_some();
+                let filtered = !unavailable && !self.query.is_empty();
+                let (title, message) = if unavailable {
+                    (
+                        "Resources unavailable",
+                        "Refresh to try loading this workspace again.",
+                    )
+                } else if filtered {
+                    ("No matching resources", "Try another name, tag, or ID.")
+                } else if empty {
+                    match self.kind {
+                        Kind::Images => (
+                            "Pull your first image",
+                            "Images provide the filesystem and tools for your containers.",
+                        ),
+                        Kind::Volumes => (
+                            "Keep your data in a volume",
+                            "Volumes keep container data across stops and removals.",
+                        ),
+                        _ => (
+                            "No networks yet",
+                            "Networks created by Docker or Compose appear here.",
+                        ),
+                    }
+                } else {
+                    (
+                        "Select a resource",
+                        "Choose an item to see its configuration and containers.",
+                    )
+                };
+                design::empty_state(ui, icon(self.kind), title, message);
+                ui.add_space(16.0);
+                if filtered && ui.button("Clear search").clicked() {
                     self.query.clear();
+                }
+                if unavailable && ui.button("Refresh").clicked() {
+                    self.refresh(runtime);
+                }
+                if empty
+                    && !filtered
+                    && matches!(self.kind, Kind::Images | Kind::Volumes)
+                    && ui
+                        .add(design::primary(if self.kind == Kind::Images {
+                            "Pull image…"
+                        } else {
+                            "Create volume…"
+                        }))
+                        .clicked()
+                {
+                    self.resource_input.clear();
+                    self.resource_error = None;
+                    self.new_resource = Some(self.kind);
                 }
             });
             return;
         }
         let enabled = self.pending.is_none() && self.valid;
-        egui::ScrollArea::vertical().id_salt(("resource-details", self.storage_selected.clone())).auto_shrink([false, false]).show(ui, |ui| {
-            if self.kind == Kind::Networks {
-                if let Some(details) = self.network.clone() { self.network_details(ui, runtime, &details, enabled); }
-                return;
+        if self.kind == Kind::Networks {
+            if let Some(details) = self.network.clone() {
+                self.network_details(ui, runtime, &details, enabled);
             }
-            let Some(details) = self.storage.clone() else { return; };
-            let title = if details.kind == Kind::Images { field(&details, "Tags").lines().next().unwrap_or("Untagged image").to_owned() } else { details.id.clone() };
-            design::resource_heading(ui, icon(details.kind), &title, if details.kind == Kind::Images { "Container image" } else { "Persistent volume" });
-            ui.add_space(16.0);
+            return;
+        }
+        let Some(details) = self.storage.clone() else {
+            return;
+        };
+        let title = if details.kind == Kind::Images {
+            field(&details, "Tags")
+                .lines()
+                .next()
+                .unwrap_or("Untagged image")
+                .to_owned()
+        } else {
+            details.id.clone()
+        };
+        design::resource_heading(
+            ui,
+            icon(details.kind),
+            &title,
+            if details.kind == Kind::Images {
+                "Container image"
+            } else {
+                "Persistent volume"
+            },
+        );
+        self.resource_tabs(ui, details.users.len());
+        egui::ScrollArea::vertical().id_salt(("resource-details", self.kind.label(), &details.id, self.resource_tab)).auto_shrink([false, false]).show(ui, |ui| {
+            match self.resource_tab {
+                Tab::Overview => {
             ui.horizontal_wrapped(|ui| {
                 if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary("Tag image…")).clicked() {
                     self.tag_image = Some(super::image_tag::Form { source_id: details.id.clone(), source_label: title.clone(), reference: String::new(), plan: None, error: None, focus_reference: true });
@@ -258,19 +336,7 @@ impl DockerView {
                     });
                 });
             });
-            self.resource_tabs(ui, details.users.len());
-            match self.resource_tab {
-                Tab::Containers => {
-                    ui.label(RichText::new("Containers that reference this resource, including stopped containers.").size(12.0).color(MUTED));
-                    ui.add_space(12.0);
-                    if details.users.is_empty() { Self::empty_connections(ui); }
-                    for user in &details.users {
-                        ui.add_enabled_ui(enabled, |ui| {
-                            if design::resource_row(ui, false, &user.name, &user.state, &user.state, design::Icon::Containers).clicked() { self.open_resource_container(runtime, &user.id); }
-                        });
-                    }
-                }
-                Tab::Overview => {
+                    ui.add_space(16.0);
                     design::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for label in if details.kind == Kind::Images { ["Platform", "Image size", "Created"] } else { ["Driver", "Scope", "Created"] } {
@@ -285,8 +351,9 @@ impl DockerView {
                         ui.label(design::heading("Tags", 14.0)); ui.add_space(8.0);
                         design::card().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            for tag in field(&details, "Tags").lines() {
-                                ui.push_id(tag, |ui| { metadata(ui, "Image reference", tag, tag != "Untagged"); });
+                            for (index, tag) in field(&details, "Tags").lines().enumerate() {
+                                if index > 0 { ui.separator(); }
+                                ui.push_id(tag, |ui| { image_reference(ui, tag); });
                             }
                         });
                         ui.add_space(20.0);
@@ -299,6 +366,16 @@ impl DockerView {
                         });
                         ui.add_space(8.0);
                         ui.label(RichText::new("Data persists when containers stop or are removed.").size(12.0).color(MUTED));
+                    }
+                }
+                Tab::Containers => {
+                    ui.label(RichText::new("Containers that reference this resource, including stopped containers.").size(12.0).color(MUTED));
+                    ui.add_space(12.0);
+                    if details.users.is_empty() { Self::empty_connections(ui); }
+                    for user in &details.users {
+                        ui.add_enabled_ui(enabled, |ui| {
+                            if design::resource_row(ui, false, &user.name, &user.state, &user.state, design::Icon::Containers).clicked() { self.open_resource_container(runtime, &user.id); }
+                        });
                     }
                 }
             }
@@ -338,70 +415,73 @@ impl DockerView {
             &details.name,
             "Container network",
         );
-        ui.add_space(16.0);
-        if ui.button("Copy network name").clicked() {
-            ui.ctx().copy_text(details.name.clone());
-        }
         self.resource_tabs(ui, details.endpoints.len());
-        match self.resource_tab {
-            Tab::Overview => {
-                design::card().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    design::property(ui, "Driver", &details.driver);
-                    design::property(ui, "Scope", &details.scope);
-                    design::property(ui, "Internal network", bool_label(details.internal));
-                    design::property(ui, "IPv6 enabled", bool_label(details.ipv6));
-                });
-                ui.add_space(20.0);
-                ui.label(design::heading("Subnets & gateways", 14.0));
-                ui.add_space(8.0);
-                if details.subnets.is_empty() {
+        egui::ScrollArea::vertical()
+            .id_salt(("network-details", &details.id, self.resource_tab))
+            .auto_shrink([false, false])
+            .show(ui, |ui| match self.resource_tab {
+                Tab::Overview => {
+                    if ui.button("Copy network name").clicked() {
+                        ui.ctx().copy_text(details.name.clone());
+                    }
+                    ui.add_space(16.0);
+                    design::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        design::property(ui, "Driver", &details.driver);
+                        design::property(ui, "Scope", &details.scope);
+                        design::property(ui, "Internal network", bool_label(details.internal));
+                        design::property(ui, "IPv6 enabled", bool_label(details.ipv6));
+                    });
+                    ui.add_space(20.0);
+                    ui.label(design::heading("Subnets & gateways", 14.0));
+                    ui.add_space(8.0);
+                    if details.subnets.is_empty() {
+                        ui.label(
+                            RichText::new("No IP address pools reported for this network.")
+                                .size(12.0)
+                                .color(MUTED),
+                        );
+                    }
+                    for (index, subnet) in details.subnets.iter().enumerate() {
+                        ui.push_id(index, |ui| {
+                            design::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                metadata(ui, "Subnet", &subnet.subnet, true);
+                                ui.add_space(10.0);
+                                metadata(ui, "Gateway", &subnet.gateway, true);
+                                if !subnet.range.is_empty() {
+                                    ui.add_space(10.0);
+                                    metadata(ui, "Address range", &subnet.range, true);
+                                }
+                            });
+                        });
+                        ui.add_space(8.0);
+                    }
+                    ui.add_space(12.0);
+                    design::card().show(ui, |ui| {
+                        ui.set_width(ui.available_width());
+                        metadata(ui, "Network ID", &details.id, true);
+                    });
+                }
+                Tab::Containers => {
                     ui.label(
-                        RichText::new("No IP address pools reported for this network.")
+                        RichText::new("Attached endpoints reported by this network.")
                             .size(12.0)
                             .color(MUTED),
                     );
-                }
-                for (index, subnet) in details.subnets.iter().enumerate() {
-                    ui.push_id(index, |ui| {
-                        design::card().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            metadata(ui, "Subnet", &subnet.subnet, true);
-                            ui.add_space(10.0);
-                            metadata(ui, "Gateway", &subnet.gateway, true);
-                            if !subnet.range.is_empty() {
-                                ui.add_space(10.0);
-                                metadata(ui, "Address range", &subnet.range, true);
-                            }
-                        });
-                    });
-                    ui.add_space(8.0);
-                }
-                ui.add_space(12.0);
-                design::card().show(ui, |ui| {
-                    ui.set_width(ui.available_width());
-                    metadata(ui, "Network ID", &details.id, true);
-                });
-            }
-            Tab::Containers => {
-                ui.label(
-                    RichText::new("Attached endpoints reported by this network.")
-                        .size(12.0)
-                        .color(MUTED),
-                );
-                ui.add_space(12.0);
-                if details.endpoints.is_empty() {
-                    Self::empty_connections(ui);
-                }
-                for endpoint in &details.endpoints {
-                    ui.push_id(&endpoint.id, |ui| {
-                        design::card().show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            ui.horizontal(|ui| {
-                                ui.with_layout(
-                                    egui::Layout::right_to_left(egui::Align::Center),
-                                    |ui| {
-                                        if ui
+                    ui.add_space(12.0);
+                    if details.endpoints.is_empty() {
+                        Self::empty_connections(ui);
+                    }
+                    for endpoint in &details.endpoints {
+                        ui.push_id(&endpoint.id, |ui| {
+                            design::card().show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.horizontal(|ui| {
+                                    ui.with_layout(
+                                        egui::Layout::right_to_left(egui::Align::Center),
+                                        |ui| {
+                                            if ui
                                             .add_enabled(
                                                 enabled
                                                     && smol_studio::docker::validate_container_id(
@@ -414,33 +494,33 @@ impl DockerView {
                                         {
                                             self.open_resource_container(runtime, &endpoint.id);
                                         }
-                                        ui.with_layout(
-                                            egui::Layout::left_to_right(egui::Align::Center),
-                                            |ui| {
-                                                ui.add(
-                                                    egui::Label::new(design::heading(
-                                                        &endpoint.name,
-                                                        14.0,
-                                                    ))
-                                                    .truncate(),
-                                                )
-                                                .on_hover_text(&endpoint.name);
-                                            },
-                                        );
-                                    },
-                                );
-                            });
-                            ui.add_space(8.0);
-                            metadata(ui, "IPv4 address", &endpoint.ipv4, true);
-                            if !endpoint.ipv6.is_empty() {
+                                            ui.with_layout(
+                                                egui::Layout::left_to_right(egui::Align::Center),
+                                                |ui| {
+                                                    ui.add(
+                                                        egui::Label::new(design::heading(
+                                                            &endpoint.name,
+                                                            14.0,
+                                                        ))
+                                                        .truncate(),
+                                                    )
+                                                    .on_hover_text(&endpoint.name);
+                                                },
+                                            );
+                                        },
+                                    );
+                                });
                                 ui.add_space(8.0);
-                                metadata(ui, "IPv6 address", &endpoint.ipv6, true);
-                            }
+                                metadata(ui, "IPv4 address", &endpoint.ipv4, true);
+                                if !endpoint.ipv6.is_empty() {
+                                    ui.add_space(8.0);
+                                    metadata(ui, "IPv6 address", &endpoint.ipv6, true);
+                                }
+                            });
                         });
-                    });
-                    ui.add_space(8.0);
+                        ui.add_space(8.0);
+                    }
                 }
-            }
-        }
+            });
     }
 }
