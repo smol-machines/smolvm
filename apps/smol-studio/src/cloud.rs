@@ -105,6 +105,12 @@ impl Action {
         )
     }
 }
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum OutputKind {
+    Logs,
+    Command,
+}
+
 pub enum Event {
     SignedOut,
     Device {
@@ -116,13 +122,64 @@ pub enum Event {
         tenant: Option<String>,
         snapshot: Box<Snapshot>,
     },
+    Created {
+        tenant: Option<String>,
+        id: String,
+    },
     Output {
+        kind: OutputKind,
         tenant: Option<String>,
         id: String,
         text: String,
     },
     Completed,
     Error(String),
+}
+
+/// Cloud console snapshots use SSE frames containing tracing records, as in the CLI.
+/// Preserve unrecognized payloads instead of hiding diagnostics.
+fn console_logs(bytes: &[u8]) -> String {
+    let text = String::from_utf8_lossy(bytes);
+    if !text.lines().any(|line| line.starts_with("data:")) {
+        return text.into_owned();
+    }
+    let mut output = String::new();
+    let mut data = Vec::new();
+    let flush = |data: &mut Vec<&str>, output: &mut String| {
+        if data.is_empty() {
+            return;
+        }
+        let payload = data.join("\n");
+        data.clear();
+        if let Ok(value) = serde_json::from_str::<Value>(&payload)
+            && let Some(message) = value["message"]
+                .as_str()
+                .or_else(|| value["fields"]["message"].as_str())
+        {
+            if let Some(timestamp) = value["timestamp"].as_str() {
+                output.push_str(timestamp);
+                output.push(' ');
+            }
+            if let Some(level) = value["level"].as_str() {
+                output.push('[');
+                output.push_str(level);
+                output.push_str("] ");
+            }
+            output.push_str(message);
+        } else {
+            output.push_str(&payload);
+        }
+        output.push('\n');
+    };
+    for line in text.lines() {
+        if line.is_empty() {
+            flush(&mut data, &mut output);
+        } else if let Some(value) = line.strip_prefix("data:") {
+            data.push(value.strip_prefix(' ').unwrap_or(value));
+        }
+    }
+    flush(&mut data, &mut output);
+    output
 }
 
 /// Only the OAuth session is stored here; CLI sessions remain owned by the CLI,
@@ -505,7 +562,7 @@ impl Backend {
             }
             Action::Refresh { tenant } => self.snapshot(tenant),
             Action::Create { tenant, request } => {
-                self.request(
+                let bytes = self.request(
                     Method::POST,
                     "/v1/machines",
                     tenant.as_deref(),
@@ -514,7 +571,12 @@ impl Backend {
                             .map_err(|_| "Invalid machine settings.".to_string())?,
                     ),
                 )?;
-                Ok(Event::Completed)
+                let machine: Machine = decode(&bytes)?;
+                segment(&machine.id)?;
+                Ok(Event::Created {
+                    tenant,
+                    id: machine.id,
+                })
             }
             Action::Machine { tenant, id, action } => {
                 let base = format!("/v1/machines/{}", segment(&id)?);
@@ -523,7 +585,7 @@ impl Backend {
                     MachineAction::Stop => (Method::POST, "/stop", None),
                     MachineAction::Resume => (Method::POST, "/resume", None),
                     MachineAction::Delete => (Method::DELETE, "", None),
-                    MachineAction::Logs => (Method::GET, "/logs?tail=200", None),
+                    MachineAction::Logs => (Method::GET, "/logs?tail=200&follow=false", None),
                     MachineAction::Exec(command) => (
                         Method::POST,
                         "/exec",
@@ -538,13 +600,15 @@ impl Backend {
                 )?;
                 match action {
                     MachineAction::Logs => Ok(Event::Output {
+                        kind: OutputKind::Logs,
                         tenant,
                         id,
-                        text: String::from_utf8_lossy(&bytes).into_owned(),
+                        text: console_logs(&bytes),
                     }),
                     MachineAction::Exec(_) => {
                         let output: smol_cloud::types::CommandOutput = decode(&bytes)?;
                         Ok(Event::Output {
+                            kind: OutputKind::Command,
                             tenant,
                             id,
                             text: format!(
@@ -762,12 +826,20 @@ mod tests {
             action: MachineAction::Stop,
         })
         .unwrap();
-        b.act(Action::Machine {
-            tenant: Some("t-team".into()),
-            id: "m-id".into(),
-            action: MachineAction::Logs,
-        })
-        .unwrap();
+        let logs = b
+            .act(Action::Machine {
+                tenant: Some("t-team".into()),
+                id: "m-id".into(),
+                action: MachineAction::Logs,
+            })
+            .unwrap();
+        assert!(matches!(
+            logs,
+            Event::Output {
+                kind: OutputKind::Logs,
+                ..
+            }
+        ));
         join.join().unwrap();
         let first = requests.recv().unwrap().to_lowercase();
         assert!(first.starts_with("post /v1/machines/m-id/stop "));
@@ -778,6 +850,48 @@ mod tests {
                 .unwrap()
                 .to_lowercase()
                 .contains("smol-tenant: t-team\r\n")
+        );
+    }
+    #[test]
+    fn create_retries_keep_account_and_return_created_identity() {
+        let (url, requests, join) = server(vec![
+            (400, "invalid resources".into()),
+            (
+                201,
+                json!({"id":"m-new", "name":"draft", "state":"created"}).to_string(),
+            ),
+        ]);
+        let mut b = backend(&url);
+        let action = Action::Create {
+            tenant: Some("t-team".into()),
+            request: Box::new(CreateMachine {
+                name: Some("draft".into()),
+                ..Default::default()
+            }),
+        };
+        assert!(b.act(action.clone()).is_err());
+        match b.act(action).unwrap() {
+            Event::Created { tenant, id } => {
+                assert_eq!(tenant.as_deref(), Some("t-team"));
+                assert_eq!(id, "m-new");
+            }
+            _ => panic!("expected created identity"),
+        }
+        join.join().unwrap();
+        for _ in 0..2 {
+            let request = requests.recv().unwrap();
+            assert!(request.starts_with("POST /v1/machines "));
+            assert!(request.to_lowercase().contains("smol-tenant: t-team\r\n"));
+            assert!(request.contains("\"name\":\"draft\""));
+        }
+    }
+    #[test]
+    fn console_snapshots_unwrap_sse_without_losing_unknown_payloads() {
+        assert_eq!(console_logs(b"plain\n\noutput\n"), "plain\n\noutput\n");
+        let input = b": heartbeat\r\n\r\ndata: {\"timestamp\":\"time\",\"level\":\"WARN\",\"fields\":{\"message\":\"ready\"}}\r\n\r\ndata: first\ndata: second\n\ndata: {not-json}\n";
+        assert_eq!(
+            console_logs(input),
+            "time [WARN] ready\nfirst\nsecond\n{not-json}\n"
         );
     }
     #[test]
