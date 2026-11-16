@@ -33,6 +33,9 @@ pub const HISTORY_FORMAT_VERSION: u32 = 5;
 pub const DELTA_FORMAT_VERSION: u32 = 6;
 /// libkrun VM/vCPU/device-state compatibility identifier.
 pub const RUNTIME_ABI: &str = "libkrun-portable-snapshot-v1";
+/// Tagged ARM KVM state requires a reader that understands `SMVCKVM1`.
+/// Older engines reject this identifier before creating a machine.
+const KVM_ARM_RUNTIME_ABI: &str = "libkrun-portable-snapshot-arm-kvm-v1";
 /// Device topology supported by the initial portable checkpoint profile.
 pub const DEVICE_PROFILE: &str = "smolvm-basic-v1";
 /// The basic profile plus one read-only virtio-fs device serving a pack's image
@@ -2629,7 +2632,8 @@ fn capture_with_completion(
     let credential_ca = checkpoint_credential_ca(name, vm, &snapshot_dir)?;
     manifest.checkpoint = Some(PortableCheckpointManifest {
         version: FORMAT_VERSION,
-        runtime_abi: RUNTIME_ABI.to_string(),
+        runtime_abi: captured_runtime_abi(&host_platform, &snapshot_dir.join("checkpoint.bin"))?
+            .to_string(),
         host_platform,
         cpu_contract: checkpoint_cpu_contract()?,
         cpus: vm.cpus,
@@ -3328,6 +3332,44 @@ fn host_counter_hz() -> Option<u64> {
 const HVF_STATE_TAG: &[u8; 8] = b"SMVCHVF1";
 const KVM_ARM_STATE_TAG: &[u8; 8] = b"SMVCKVM1";
 
+fn state_tag(state: &Path) -> Result<Vec<u8>> {
+    let mut tag = Vec::with_capacity(8);
+    std::fs::File::open(state)
+        .and_then(|file| file.take(8).read_to_end(&mut tag))
+        .map_err(|error| Error::agent("read checkpoint state tag", error.to_string()))?;
+    Ok(tag)
+}
+
+/// Select the reader contract from the captured bytes, including when an
+/// older, still-running VM writes a legacy checkpoint after an engine update.
+fn captured_runtime_abi(host_platform: &str, state: &Path) -> Result<&'static str> {
+    if state_tag(state)? == KVM_ARM_STATE_TAG {
+        if host_platform != "linux/arm64" {
+            return Err(Error::agent(
+                "capture checkpoint",
+                "tagged ARM KVM state requires a linux/arm64 source",
+            ));
+        }
+        Ok(KVM_ARM_RUNTIME_ABI)
+    } else {
+        Ok(RUNTIME_ABI)
+    }
+}
+
+fn validate_runtime_abi(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    match checkpoint.runtime_abi.as_str() {
+        RUNTIME_ABI => Ok(()),
+        KVM_ARM_RUNTIME_ABI if checkpoint.host_platform == "linux/arm64" => Ok(()),
+        _ => Err(Error::agent(
+            "restore checkpoint",
+            format!(
+                "checkpoint requires runtime ABI '{}' for '{}'; this runtime supports '{}' and '{}' (linux/arm64 source only)",
+                checkpoint.runtime_abi, checkpoint.host_platform, RUNTIME_ABI, KVM_ARM_RUNTIME_ABI
+            ),
+        )),
+    }
+}
+
 fn foreign_state_tag(source: &str, host: &str) -> Option<&'static [u8; 8]> {
     match (source, host) {
         ("darwin/arm64", "linux/arm64") => Some(HVF_STATE_TAG),
@@ -3340,17 +3382,22 @@ fn foreign_state_tag(source: &str, host: &str) -> Option<&'static [u8; 8]> {
 /// translation. A Mac machine started by an older libkrun writes untagged
 /// state, which this host's runtime would misread as its own format.
 fn validate_state_origin(checkpoint: &PortableCheckpointManifest, state: &Path) -> Result<()> {
+    validate_runtime_abi(checkpoint)?;
+    let tag = state_tag(state)?;
+    if (tag == KVM_ARM_STATE_TAG) != (checkpoint.runtime_abi == KVM_ARM_RUNTIME_ABI) {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "the checkpoint's VM state does not match its runtime ABI; capture it again with a newer smolvm",
+        ));
+    }
     let host_platform = crate::platform::Platform::current()
         .host_oci_platform()
         .to_string();
     if checkpoint.host_platform == host_platform {
         return Ok(());
     }
-    let mut tag = [0u8; 8];
-    let tagged = std::fs::File::open(state)
-        .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut tag))
-        .is_ok()
-        && foreign_state_tag(&checkpoint.host_platform, &host_platform) == Some(&tag);
+    let tagged = foreign_state_tag(&checkpoint.host_platform, &host_platform)
+        .is_some_and(|expected| tag == expected);
     if tagged {
         return Ok(());
     }
@@ -5514,15 +5561,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             ),
         ));
     }
-    if checkpoint.runtime_abi != RUNTIME_ABI {
-        return Err(Error::agent(
-            "restore checkpoint",
-            format!(
-                "checkpoint requires runtime ABI '{}', this runtime provides '{}'",
-                checkpoint.runtime_abi, RUNTIME_ABI
-            ),
-        ));
-    }
+    validate_runtime_abi(checkpoint)?;
     let host_platform = crate::platform::Platform::current()
         .host_oci_platform()
         .to_string();
@@ -6992,7 +7031,7 @@ mod tests {
         let state = dir.path().join("checkpoint.bin");
         let mut checkpoint = minimal_checkpoint_manifest();
 
-        // This host's own state is never inspected.
+        // Untagged legacy state remains valid on its original platform.
         std::fs::write(&state, b"untagged").unwrap();
         validate_state_origin(&checkpoint, &state).unwrap();
 
@@ -7018,6 +7057,55 @@ mod tests {
         );
         assert_eq!(foreign_state_tag("other/arch", "darwin/arm64"), None);
         assert_eq!(foreign_state_tag("linux/amd64", "darwin/arm64"), None);
+    }
+
+    #[test]
+    fn tagged_arm_kvm_capture_requires_a_distinct_reader_abi() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("checkpoint.bin");
+        for bytes in [b"legacy".as_slice(), HVF_STATE_TAG.as_slice()] {
+            std::fs::write(&state, bytes).unwrap();
+            for platform in ["linux/arm64", "darwin/arm64", "linux/amd64"] {
+                assert_eq!(captured_runtime_abi(platform, &state).unwrap(), RUNTIME_ABI);
+            }
+        }
+        std::fs::write(&state, [KVM_ARM_STATE_TAG.as_slice(), b"state"].concat()).unwrap();
+        let abi = captured_runtime_abi("linux/arm64", &state).unwrap();
+        assert_eq!(abi, KVM_ARM_RUNTIME_ABI);
+        assert_ne!(abi, RUNTIME_ABI, "released readers must reject this ABI");
+        assert!(captured_runtime_abi("darwin/arm64", &state).is_err());
+        assert!(captured_runtime_abi("linux/amd64", &state).is_err());
+        std::fs::remove_file(&state).unwrap();
+        assert!(captured_runtime_abi("linux/arm64", &state).is_err());
+    }
+
+    #[test]
+    fn tagged_arm_kvm_abi_requires_matching_source_and_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let state = dir.path().join("checkpoint.bin");
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.host_platform = "linux/arm64".into();
+        checkpoint.runtime_abi = KVM_ARM_RUNTIME_ABI.into();
+        validate_runtime_abi(&checkpoint).unwrap();
+        for bytes in [b"legacy".as_slice(), HVF_STATE_TAG.as_slice(), b"SMVCKVM"] {
+            std::fs::write(&state, bytes).unwrap();
+            let error = validate_state_origin(&checkpoint, &state).unwrap_err();
+            assert!(error.to_string().contains("does not match its runtime ABI"));
+        }
+        std::fs::write(&state, KVM_ARM_STATE_TAG).unwrap();
+        #[cfg(target_arch = "aarch64")]
+        validate_state_origin(&checkpoint, &state).unwrap();
+        checkpoint.runtime_abi = RUNTIME_ABI.into();
+        let error = validate_state_origin(&checkpoint, &state).unwrap_err();
+        assert!(error.to_string().contains("does not match its runtime ABI"));
+        checkpoint.runtime_abi = KVM_ARM_RUNTIME_ABI.into();
+        for platform in ["darwin/arm64", "linux/amd64", "other/arch"] {
+            checkpoint.host_platform = platform.into();
+            assert!(validate_runtime_abi(&checkpoint).is_err());
+        }
+        checkpoint.runtime_abi = "libkrun-portable-snapshot-arm-kvm-v999".into();
+        checkpoint.host_platform = "linux/arm64".into();
+        assert!(validate_runtime_abi(&checkpoint).is_err());
     }
 
     #[test]
