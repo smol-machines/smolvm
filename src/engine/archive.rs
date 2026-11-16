@@ -502,27 +502,63 @@ fn prefix_archive<R: std::io::Read, W: std::io::Write>(
         top.set_mode(0o755);
         top.set_size(0);
         top.set_mtime(now_secs());
-        out.append_data(&mut top, format!("{prefix}/"), std::io::empty())?;
+        let mut top_written = false;
         let mut archive = tar::Archive::new(source);
         for entry in archive.entries()? {
             let mut entry = entry?;
             let path = entry.path()?.to_string_lossy().into_owned();
             let path = path.trim_start_matches("./");
-            if path.is_empty() || path == "." {
+            let root = path.is_empty() || path == ".";
+            if root && entry.header().entry_type().is_dir() {
+                top = entry.header().clone();
+                top.set_size(0);
+                out.append_data(&mut top, format!("{prefix}/"), std::io::empty())?;
+                top_written = true;
+                continue;
+            }
+            if !top_written {
+                out.append_data(&mut top, format!("{prefix}/"), std::io::empty())?;
+                top_written = true;
+            }
+            if root {
                 continue;
             }
             let mut header = entry.header().clone();
+            if header.entry_type().is_gnu_sparse() {
+                // Entry reads expand GNU sparse data to its logical byte stream;
+                // retaining the packed size/map would corrupt the rewritten tar.
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_size(entry.size());
+            }
             let full = format!("{prefix}/{path}");
             match header.entry_type() {
                 tar::EntryType::Symlink | tar::EntryType::Link => {
-                    let link = entry
+                    let mut link = entry
                         .link_name()?
                         .map(|l| l.to_string_lossy().into_owned())
                         .unwrap_or_default();
+                    if header.entry_type().is_hard_link() {
+                        let relative = std::path::Path::new(&link);
+                        if relative.components().any(|c| {
+                            !matches!(
+                                c,
+                                std::path::Component::Normal(_) | std::path::Component::CurDir
+                            )
+                        }) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "hard link escapes directory archive",
+                            ));
+                        }
+                        link = format!("{prefix}/{}", link.trim_start_matches("./"));
+                    }
                     out.append_link(&mut header, &full, link)?;
                 }
                 _ => out.append_data(&mut header, &full, &mut entry)?,
             }
+        }
+        if !top_written {
+            out.append_data(&mut top, format!("{prefix}/"), std::io::empty())?;
         }
         // A tar footer is not the end of the transport: the guest can still fail
         // while finishing its helper. Consume that final result before success.
@@ -843,6 +879,96 @@ mod tests {
             names.push(e.unwrap().path().unwrap().to_string_lossy().into_owned());
         }
         assert_eq!(names, ["etc/", "etc/a.txt"]);
+    }
+
+    #[test]
+    fn rewriting_directory_archive_preserves_root_mode_and_link_targets() {
+        let mut input = tar::Builder::new(Vec::new());
+        let mut root = tar::Header::new_gnu();
+        root.set_mode(0o700);
+        root.set_size(0);
+        root.set_entry_type(tar::EntryType::Directory);
+        input.append_data(&mut root, ".", std::io::empty()).unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_mode(0o640);
+        file.set_size(3);
+        input.append_data(&mut file, "./data", &b"abc"[..]).unwrap();
+        for (kind, name, target) in [
+            (tar::EntryType::Link, "hard", "./data"),
+            (tar::EntryType::Symlink, "symbolic", "data"),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_size(0);
+            header.set_mode(0o777);
+            input.append_link(&mut header, name, target).unwrap();
+        }
+        let input = input.into_inner().unwrap();
+        let output = prefix_archive(&input[..], Vec::new(), "private").unwrap();
+        let mut archive = tar::Archive::new(&output[..]);
+        let mut entries = archive.entries().unwrap();
+        let root = entries.next().unwrap().unwrap();
+        assert_eq!(root.header().mode().unwrap(), 0o700);
+        assert_eq!(
+            root.path().unwrap().as_ref(),
+            std::path::Path::new("private/")
+        );
+        entries.next().unwrap().unwrap();
+        assert_eq!(
+            entries
+                .next()
+                .unwrap()
+                .unwrap()
+                .link_name()
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            std::path::Path::new("private/data")
+        );
+        assert_eq!(
+            entries
+                .next()
+                .unwrap()
+                .unwrap()
+                .link_name()
+                .unwrap()
+                .unwrap()
+                .as_ref(),
+            std::path::Path::new("data")
+        );
+        assert!(entries.next().is_none());
+    }
+
+    #[test]
+    fn rewriting_sparse_archive_uses_logical_size_and_regular_header() {
+        let mut input = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(3);
+        header.set_mode(0o600);
+        let sparse = header.as_gnu_mut().unwrap();
+        sparse.set_real_size(32768);
+        sparse.sparse[0].set_offset(8192);
+        sparse.sparse[0].set_length(3);
+        sparse.sparse[1].set_offset(32768);
+        sparse.sparse[1].set_length(0);
+        input
+            .append_data(&mut header, "sparse", &b"abc"[..])
+            .unwrap();
+        let input = input.into_inner().unwrap();
+        let output = prefix_archive(&input[..], Vec::new(), "app").unwrap();
+        let mut archive = tar::Archive::new(&output[..]);
+        let mut entries = archive.entries().unwrap();
+        entries.next().unwrap().unwrap();
+        let mut file = entries.next().unwrap().unwrap();
+        assert!(file.header().entry_type().is_file());
+        assert_eq!(file.header().size().unwrap(), 32768);
+        let mut actual = Vec::new();
+        file.read_to_end(&mut actual).unwrap();
+        let mut expected = vec![0; 32768];
+        expected[8192..8195].copy_from_slice(b"abc");
+        assert_eq!(actual, expected);
+        assert!(entries.next().is_none());
     }
     #[test]
     fn changed_file_size_never_finishes_a_successful_archive() {
