@@ -7,6 +7,7 @@ mod file_picker;
 mod files_ui;
 mod live_logs_ui;
 mod machine_settings_ui;
+mod navigation_ui;
 mod new_machine_ui;
 mod terminal_ui;
 mod ui;

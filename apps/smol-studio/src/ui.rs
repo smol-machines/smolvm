@@ -32,6 +32,7 @@ enum Workspace {
 
 pub struct Studio {
     brand: egui::TextureHandle,
+    switcher: crate::navigation_ui::Switcher,
     cloud: crate::cloud_ui::CloudView,
     workspace: Workspace,
     terminal: Option<crate::terminal_ui::TerminalWindow>,
@@ -71,6 +72,7 @@ impl Studio {
         let runtime_path = runtime.executable.to_string_lossy().into_owned();
         let mut app = Self {
             brand: design::brand_texture(&cc.egui_ctx),
+            switcher: crate::navigation_ui::Switcher::default(),
             cloud: crate::cloud_ui::CloudView::new(&cc.egui_ctx),
             workspace: Workspace::Local,
             terminal: None,
@@ -237,6 +239,32 @@ impl Studio {
         }
     }
 
+    fn navigate(&mut self, destination: crate::navigation_ui::Destination) {
+        use crate::navigation_ui::Destination;
+        match destination {
+            Destination::Machines => self.workspace = Workspace::Local,
+            Destination::Cloud => self.workspace = Workspace::Cloud,
+            Destination::Settings => self.settings = true,
+            Destination::Docker(kind) if !self.docker.navigating() => {
+                if self.workspace != Workspace::Containers || self.docker.destination() != kind {
+                    self.workspace = Workspace::Containers;
+                    self.docker.navigate(&self.runtime, kind);
+                }
+            }
+            Destination::Docker(_) => {}
+        }
+    }
+
+    fn modal_open(&self) -> bool {
+        self.files.modal_open()
+            || self.create.is_some()
+            || self.editing.is_some()
+            || self.delete.is_some()
+            || self.settings
+            || self.cloud.modal_open()
+            || self.docker.modal_open()
+    }
+
     fn sidebar(&mut self, ui: &mut egui::Ui) {
         use smol_studio::docker::Kind;
         egui::Panel::left("navigation")
@@ -253,7 +281,21 @@ impl Studio {
                         ui.label(RichText::new("by smol machines").size(10.0).color(MUTED));
                     });
                 });
-                ui.add_space(22.0);
+                ui.add_space(12.0);
+                let shortcut = ui.ctx().format_shortcut(&egui::KeyboardShortcut::new(
+                    egui::Modifiers::COMMAND,
+                    egui::Key::K,
+                ));
+                if ui
+                    .add_sized(
+                        [ui.available_width(), 28.0],
+                        egui::Button::new(format!("Go to…     {shortcut}")),
+                    )
+                    .clicked()
+                {
+                    self.switcher.open();
+                }
+                ui.add_space(12.0);
                 design::nav_group(ui, "Workspace");
                 if design::nav(
                     ui,
@@ -277,7 +319,7 @@ impl Studio {
                             self.docker.navigate(&self.runtime, destination);
                         }
                     }
-                    ui.add_space(18.0);
+                    ui.add_space(12.0);
                     design::nav_group(ui, "Resources");
                     for (kind, icon, label) in [
                         (Kind::Images, Icon::Image, "Images"),
@@ -292,7 +334,7 @@ impl Studio {
                         }
                     }
                 });
-                ui.add_space(18.0);
+                ui.add_space(12.0);
                 design::nav_group(ui, "Cloud");
                 if design::nav(
                     ui,
@@ -926,8 +968,12 @@ impl eframe::App for Studio {
         let docker_visible = self.workspace == Workspace::Containers
             && ctx.input(|i| i.viewport().minimized != Some(true));
         self.docker.logs_visibility(docker_visible);
-        self.docker
-            .watch(ctx, &self.runtime, docker_visible, self.settings);
+        self.docker.watch(
+            ctx,
+            &self.runtime,
+            docker_visible,
+            self.settings || self.switcher.open,
+        );
         if ctx.input(|i| i.viewport().close_requested())
             && (self.pending.as_ref().is_some_and(Operation::is_mutation)
                 || self.cloud.mutating()
@@ -948,6 +994,7 @@ impl eframe::App for Studio {
             self.pending.is_some()
                 || self.files.modal_open()
                 || self.settings
+                || self.switcher.open
                 || self.create.is_some()
                 || self.editing.is_some()
                 || self.delete.is_some(),
@@ -961,20 +1008,25 @@ impl eframe::App for Studio {
 
     fn ui(&mut self, ui: &mut egui::Ui, frame: &mut eframe::Frame) {
         let ctx = ui.ctx().clone();
+        if !self.modal_open()
+            && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
+            && !self.docker.terminal_focused(&ctx)
+            && !egui::Popup::is_any_open(&ctx)
+            && let Some(destination) = self.switcher.shortcuts(&ctx)
+        {
+            self.navigate(destination);
+        }
+        let switching = self.switcher.open;
+        if let Some(destination) = self.switcher.show(&ctx, self.docker.navigating()) {
+            self.navigate(destination);
+        }
         self.docker.terminal_ui(&ctx);
         if let Some(terminal) = &mut self.terminal
             && !terminal.ui(&ctx)
         {
             self.terminal = None;
         }
-        if self.files.modal_open()
-            || self.create.is_some()
-            || self.editing.is_some()
-            || self.delete.is_some()
-            || self.settings
-            || self.cloud.modal_open()
-            || self.docker.modal_open()
-        {
+        if self.modal_open() || switching {
             ui.disable();
         }
         egui::Panel::bottom("status")

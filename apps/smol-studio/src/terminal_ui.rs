@@ -6,6 +6,7 @@ pub struct TerminalWindow {
     name: String,
     size: (u16, u16),
     error: Option<String>,
+    focus_id: Option<egui::Id>,
 }
 impl TerminalWindow {
     pub fn new(ctx: &egui::Context, runtime: Runtime, name: String) -> Self {
@@ -17,6 +18,7 @@ impl TerminalWindow {
             name,
             size: (24, 80),
             error: None,
+            focus_id: None,
         }
     }
     pub fn for_container(ctx: &egui::Context, id: &str, name: &str) -> Result<Self, String> {
@@ -28,7 +30,12 @@ impl TerminalWindow {
             name: format!("{name} · container"),
             size: (24, 80),
             error: None,
+            focus_id: None,
         })
+    }
+    pub fn focused(&self, ctx: &egui::Context) -> bool {
+        self.focus_id
+            .is_some_and(|id| ctx.memory(|m| m.has_focus(id)))
     }
     pub fn ui(&mut self, ctx: &egui::Context) -> bool {
         let mut open = true;
@@ -68,6 +75,7 @@ impl TerminalWindow {
                     egui::vec2(cols as f32 * cell.x, rows as f32 * cell.y),
                     egui::Sense::click(),
                 );
+                self.focus_id = Some(response.id);
                 if response.clicked() {
                     response.request_focus();
                 }

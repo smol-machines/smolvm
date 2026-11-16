@@ -434,6 +434,9 @@ impl DockerView {
             ctx.request_repaint_after(delay);
         }
     }
+    pub fn terminal_focused(&self, ctx: &egui::Context) -> bool {
+        self.terminal.as_ref().is_some_and(|t| t.focused(ctx))
+    }
     pub fn terminal_ui(&mut self, ctx: &egui::Context) {
         if let Some(terminal) = &mut self.terminal
             && !terminal.ui(ctx)
