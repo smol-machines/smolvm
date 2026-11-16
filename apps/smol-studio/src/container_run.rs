@@ -238,8 +238,10 @@ mod tests {
     #[test]
     fn preserves_argument_boundaries_and_keeps_values_out_of_arguments() {
         let temp = tempfile::tempdir().unwrap();
-        let host = temp.path().join("a,\"b folder");
+        let host = temp.path().join("a,b folder");
         std::fs::create_dir(&host).unwrap();
+        // Quotes are valid CSV input but not Windows directory names.
+        assert_eq!(csv("source=a,\"b"), "\"source=a,\"\"b\"");
         let mut d = draft();
         d.command = vec![
             "printf".into(),
