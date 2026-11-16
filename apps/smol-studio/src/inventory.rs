@@ -141,6 +141,37 @@ printf action-complete
     }
 
     #[test]
+    fn verified_connection_rejects_a_late_failure_from_the_previous_source() {
+        let (dir, runtime) = fixture();
+        let mut inventory = Inventory::new(|| {});
+        std::fs::write(dir.path().join("hold"), "").unwrap();
+        std::fs::write(dir.path().join("failure"), "").unwrap();
+        inventory.start(&runtime).unwrap();
+        until(|| dir.path().join("started").exists());
+        inventory.accept_snapshot();
+        assert!(inventory.current());
+        assert!(!inventory.requested);
+        std::fs::remove_file(dir.path().join("hold")).unwrap();
+        until(|| {
+            assert!(inventory.poll().is_none());
+            inventory.pending.is_none()
+        });
+        assert!(
+            inventory.current(),
+            "old-source failure must not disconnect the new CLI"
+        );
+        assert!(
+            !inventory.busy(),
+            "verified snapshot needs no duplicate read"
+        );
+        std::fs::remove_file(dir.path().join("failure")).unwrap();
+        snapshot(dir.path(), "current-source");
+        inventory.request();
+        inventory.start(&runtime).unwrap();
+        assert_eq!(result(&mut inventory).unwrap()[0].name, "current-source");
+    }
+
+    #[test]
     fn obsolete_connection_failure_is_discarded_but_current_failure_is_reported() {
         let (dir, runtime) = fixture();
         let mut inventory = Inventory::new(|| {});
@@ -199,6 +230,14 @@ impl Inventory {
     pub fn invalidate(&mut self) {
         self.epoch = self.epoch.wrapping_add(1);
         self.requested = true;
+    }
+
+    /// A separately verified connection replaces the inventory source; any
+    /// in-flight read from the previous source must not overwrite it.
+    pub fn accept_snapshot(&mut self) {
+        self.epoch = self.epoch.wrapping_add(1);
+        self.observed = Some(self.epoch);
+        self.requested = false;
     }
 
     /// The caller defers starting reads during actions and ordinary dialogs.

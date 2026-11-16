@@ -1,3 +1,5 @@
+mod settings;
+
 use eframe::egui::{self, Color32, Margin, RichText, Vec2};
 use smol_studio::{
     inventory::Inventory,
@@ -65,6 +67,10 @@ pub struct Studio {
     delete: Option<String>,
     settings: bool,
     settings_error: Option<String>,
+    settings_feedback: Option<String>,
+    settings_scroll_error: bool,
+    settings_candidate: Option<Runtime>,
+    settings_picker: crate::file_picker::FilePicker,
     runtime_path: String,
     command: String,
     output: Option<(String, String)>,
@@ -116,6 +122,10 @@ impl Studio {
             delete: None,
             settings: false,
             settings_error: None,
+            settings_feedback: None,
+            settings_scroll_error: false,
+            settings_candidate: None,
+            settings_picker: crate::file_picker::FilePicker::default(),
             runtime_path,
             command: String::new(),
             output: None,
@@ -163,6 +173,12 @@ impl Studio {
     fn receive(&mut self) {
         while let Ok(done) = self.worker.responses.try_recv() {
             self.pending = None;
+            if matches!(done.operation, Operation::Refresh)
+                && let Some(candidate) = self.settings_candidate.take()
+            {
+                self.finish_settings_check(candidate, done.result);
+                continue;
+            }
             match done.result {
                 Ok(Payload::Files { name, listing }) => {
                     self.files.receive(&name, listing);
@@ -312,7 +328,7 @@ impl Studio {
         match destination {
             Destination::Machines => self.workspace = Workspace::Local,
             Destination::Cloud => self.workspace = Workspace::Cloud,
-            Destination::Settings => self.settings = true,
+            Destination::Settings => self.open_settings(),
             Destination::Docker(kind) if !self.docker.navigating() => {
                 if self.workspace != Workspace::Containers || self.docker.destination() != kind {
                     self.workspace = Workspace::Containers;
@@ -417,7 +433,7 @@ impl Studio {
                 ui.with_layout(egui::Layout::bottom_up(egui::Align::LEFT), |ui| {
                     ui.add_space(4.0);
                     if design::nav(ui, self.settings, Icon::Settings, "Settings").clicked() {
-                        self.settings = true;
+                        self.open_settings();
                     }
                     ui.add_space(8.0);
                     ui.separator();
@@ -519,7 +535,7 @@ impl Studio {
                     ui.heading("Connect to Smol");
                     ui.label("Choose your Smol CLI in Settings, then refresh.");
                     if ui.button("Open settings").clicked() {
-                        self.settings = true;
+                        self.open_settings();
                     }
                 } else if self.machines.is_empty() {
                     ui.label(RichText::new("No machines yet").color(MUTED));
@@ -1001,6 +1017,8 @@ impl Studio {
         }
         if ctx.input(|i| i.key_pressed(egui::Key::Escape))
             && !self.files.modal_open()
+            && !self.settings_picker.is_open()
+            && self.settings_candidate.is_none()
             && !self.editing.as_ref().is_some_and(|e| e.picking())
             && !self.create.as_ref().is_some_and(|e| e.picking())
             && !self.pending.as_ref().is_some_and(Operation::is_mutation)
@@ -1057,144 +1075,7 @@ impl Studio {
                 self.delete = None;
             }
         }
-        if self.settings {
-            let mut open = true;
-            let mut close = false;
-            let mut connect = false;
-            egui::Window::new("Settings")
-                .anchor(egui::Align2::CENTER_CENTER, Vec2::ZERO)
-                .collapsible(false)
-                .resizable(false)
-                .default_width(510.0)
-                .max_height((ctx.content_rect().height() - 80.0).max(300.0))
-                .open(&mut open)
-                .show(ctx, |ui| {
-                    egui::ScrollArea::vertical()
-                        .id_salt("studio-settings")
-                        .max_height((ctx.content_rect().height() - 220.0).max(200.0))
-                        .show(ui, |ui| {
-                            ui.label(design::heading("Local runtime", 16.0));
-                            ui.label(
-                                RichText::new(
-                                    "Studio connects to your machines through the Smol CLI.",
-                                )
-                                .size(12.0)
-                                .color(MUTED),
-                            );
-                            ui.add_space(12.0);
-                            design::card().show(ui, |ui| {
-                                ui.set_width(ui.available_width());
-                                design::property(
-                                    ui,
-                                    "Connection",
-                                    if self.inventory_valid {
-                                        "Connected"
-                                    } else {
-                                        "Unavailable"
-                                    },
-                                );
-                                if self.inventory_valid {
-                                    ui.separator();
-                                    design::property(
-                                        ui,
-                                        "Local machines",
-                                        &self.machines.len().to_string(),
-                                    );
-                                }
-                                ui.separator();
-                                design::property(ui, "When Studio closes", "Machines keep running");
-                            });
-                            ui.add_space(16.0);
-                            ui.label(design::heading("CLI location", 14.0));
-                            ui.label(
-                                RichText::new(
-                                    "Use the included CLI, or choose your own installation.",
-                                )
-                                .size(12.0)
-                                .color(MUTED),
-                            );
-                            ui.add(
-                                egui::TextEdit::singleline(&mut self.runtime_path)
-                                    .desired_width(f32::INFINITY)
-                                    .hint_text("Path to smol"),
-                            );
-                            ui.horizontal(|ui| {
-                                if ui.button("Use detected CLI").clicked() {
-                                    self.runtime_path = Runtime::discover()
-                                        .executable
-                                        .to_string_lossy()
-                                        .into_owned();
-                                    self.settings_error = None;
-                                }
-                                if ui.button("Copy path").clicked() {
-                                    ctx.copy_text(self.runtime_path.clone());
-                                }
-                            });
-                            if let Some(path) = &self.runtime.state_dir {
-                                ui.add_space(8.0);
-                                ui.label(
-                                    RichText::new(format!("State directory: {}", path.display()))
-                                        .small()
-                                        .color(MUTED),
-                                );
-                            }
-                            if let Some(error) = &self.settings_error {
-                                ui.add_space(12.0);
-                                design::error_notice(ui, "Settings could not be saved.", error);
-                            } else if !self.inventory_valid
-                                && let Some(error) = &self.error
-                            {
-                                ui.add_space(12.0);
-                                design::error_notice(
-                                    ui,
-                                    "Could not connect to the selected CLI.",
-                                    error,
-                                );
-                            }
-                        });
-                    ui.add_space(12.0);
-                    ui.separator();
-                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        connect = ui
-                            .add_enabled(
-                                self.pending.is_none() && !self.runtime_path.trim().is_empty(),
-                                design::primary("Save & connect"),
-                            )
-                            .clicked();
-                        close = ui.button("Done").clicked();
-                    });
-                });
-            if connect {
-                let result = (|| -> Result<(), String> {
-                    let mut preferences = smol_studio::preferences::Preferences::load()?;
-                    preferences.smol_cli = Some(self.runtime_path.trim().into());
-                    preferences.save()
-                })();
-                match result {
-                    Ok(()) => {
-                        self.runtime.executable = self.runtime_path.trim().into();
-                        self.inventory.invalidate();
-                        self.inventory_valid = false;
-                        self.machines.clear();
-                        self.selected = None;
-                        self.output = None;
-                        self.console_machine = None;
-                        self.console_snapshot = None;
-                        self.logs.reset();
-                        self.error = None;
-                        self.activity = "Connecting to Smol…".into();
-                        self.settings = false;
-                        self.settings_error = None;
-                        self.refresh_inventory();
-                    }
-                    Err(error) => self.settings_error = Some(error),
-                }
-            }
-            if !open || close {
-                self.settings = false;
-                self.settings_error = None;
-            }
-        }
+        self.settings_dialog(ctx, frame);
     }
 }
 

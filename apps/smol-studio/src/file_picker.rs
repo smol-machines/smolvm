@@ -53,6 +53,22 @@ impl FilePicker {
         ctx.request_repaint();
     }
 
+    pub fn open_executable(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
+        if self.is_open() {
+            return;
+        }
+        let mut dialog = rfd::AsyncFileDialog::new()
+            .set_parent(frame)
+            .set_title("Choose the Smol CLI");
+        if let Some(parent) = Path::new(current).parent().filter(|p| p.is_absolute()) {
+            dialog = dialog.set_directory(parent);
+        }
+        self.pending = Some(Box::pin(async move {
+            dialog.pick_file().await.map(|file| vec![file])
+        }));
+        ctx.request_repaint();
+    }
+
     pub fn open_folder(&mut self, frame: &eframe::Frame, current: &str, ctx: &egui::Context) {
         if self.is_open() {
             return;
