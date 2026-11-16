@@ -56,6 +56,11 @@ pub enum Action {
         id: String,
         created: String,
     },
+    ReviewImageTag {
+        id: String,
+        reference: String,
+    },
+    TagImage(crate::image_tag::Plan),
     PullImage(String),
     CreateVolume(String),
     Projects,
@@ -98,6 +103,7 @@ impl Action {
                 | Self::StorageInspect { .. }
                 | Self::Projects
                 | Self::DiscoverProject(_)
+                | Self::ReviewImageTag { .. }
         )
     }
 }
@@ -110,6 +116,7 @@ pub enum Output {
         name: String,
         warning: Option<String>,
     },
+    ImageTagPlan(crate::image_tag::Plan),
     Storage(crate::storage::Details),
     Network(crate::network::Details),
     Text(String),
@@ -249,6 +256,13 @@ fn execute_with_progress(
     shutdown: &AtomicBool,
     progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
+    if let Action::ReviewImageTag { id, reference } = action {
+        return crate::image_tag::review(id, reference, shutdown).map(Output::ImageTagPlan);
+    }
+    if let Action::TagImage(plan) = action {
+        crate::image_tag::apply(plan, shutdown)?;
+        return Ok(Output::Completed);
+    }
     if let Action::DiscoverProject(name) = action {
         let Output::Projects(projects, _) = execute(runtime, &Action::Projects, shutdown)? else {
             unreachable!()

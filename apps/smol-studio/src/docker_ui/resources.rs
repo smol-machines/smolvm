@@ -87,6 +87,10 @@ impl DockerView {
                         ["Name", "Repository", "Tag", "ID", "Driver"]
                             .iter()
                             .any(|key| text(row, key).to_lowercase().contains(&query))
+                            || (self.kind == Kind::Images
+                                && format!("{}:{}", text(row, "Repository"), text(row, "Tag"))
+                                    .to_lowercase()
+                                    .contains(&query))
                     })
                     .filter(|row| seen.insert(text(row, key(self.kind))))
                     .cloned()
@@ -241,6 +245,9 @@ impl DockerView {
             design::resource_heading(ui, icon(details.kind), &title, if details.kind == Kind::Images { "Container image" } else { "Persistent volume" });
             ui.add_space(16.0);
             ui.horizontal_wrapped(|ui| {
+                if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary("Tag image…")).clicked() {
+                    self.tag_image = Some(super::image_tag::Form { source_id: details.id.clone(), source_label: title.clone(), reference: String::new(), plan: None, error: None, focus_reference: true });
+                }
                 if ui.button(if details.kind == Kind::Images { "Copy image ID" } else { "Copy volume name" }).clicked() { ui.ctx().copy_text(details.id.clone()); }
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.menu_button("More", |ui| {

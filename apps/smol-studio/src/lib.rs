@@ -26,3 +26,5 @@ pub mod event_watch;
 pub mod docker_connection;
 
 pub mod command_progress;
+
+pub mod image_tag;

@@ -1,4 +1,5 @@
 mod connection;
+mod image_tag;
 mod project_form;
 mod resources;
 
@@ -41,6 +42,7 @@ pub struct DockerView {
     network: Option<smol_studio::network::Details>,
     resource_tab: resources::Tab,
     new_resource: Option<Kind>,
+    tag_image: Option<image_tag::Form>,
     resource_input: String,
     resource_error: Option<String>,
     pending: Option<Action>,
@@ -157,6 +159,7 @@ impl DockerView {
             network: None,
             resource_tab: resources::Tab::Overview,
             new_resource: None,
+            tag_image: None,
             resource_input: String::new(),
             resource_error: None,
             pending: None,
@@ -232,6 +235,7 @@ impl DockerView {
 
     pub fn modal_open(&self) -> bool {
         self.connection_open
+            || self.tag_image.is_some()
             || self.confirm.is_some()
             || (self.new_resource.is_some() && !matches!(self.pending, Some(Action::PullImage(_))))
             || self.file_picker.is_open()
@@ -258,6 +262,8 @@ impl DockerView {
                 | Action::Stop(_),
             ) => "Stopping containers…",
             Some(Action::Logs(_)) => "Loading logs…",
+            Some(Action::ReviewImageTag { .. }) => "Checking image tag…",
+            Some(Action::TagImage(_)) => "Tagging image…",
             Some(Action::PullImage(_)) => "Pulling image…",
             Some(Action::CreateVolume(_)) => "Creating volume…",
             Some(Action::StorageRemove { .. }) => "Removing resource…",
@@ -316,6 +322,14 @@ impl DockerView {
                     }
                     if std::mem::take(&mut self.refresh_after_check) && ready {
                         self.refresh(runtime);
+                    }
+                }
+                Ok(Output::ImageTagPlan(plan)) => {
+                    if let Some(form) = &mut self.tag_image
+                        && form.source_id == plan.source_id
+                    {
+                        form.plan = Some(plan);
+                        form.error = None;
                     }
                 }
                 Ok(Output::Network(details)) => {
@@ -459,6 +473,12 @@ impl DockerView {
                     }
                 }
                 Ok(Output::Completed) => {
+                    if let Action::TagImage(plan) = &done.action {
+                        self.tag_image = None;
+                        self.storage_selected = Some(plan.source_id.clone());
+                        self.query.clear();
+                        self.resource_tab = resources::Tab::Overview;
+                    }
                     if matches!(done.action, Action::PullImage(_) | Action::CreateVolume(_)) {
                         self.new_resource = None;
                         self.resource_error = None;
@@ -471,6 +491,7 @@ impl DockerView {
                         self.connection = None;
                     }
                     self.activity = match done.action {
+                        Action::TagImage(_) => "Image tag updated.",
                         Action::PullImage(_) => "Image pulled.",
                         Action::CreateVolume(_) => "Volume created.",
                         Action::StorageRemove {
@@ -507,6 +528,21 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if matches!(
+                        done.action,
+                        Action::ReviewImageTag { .. } | Action::TagImage(_)
+                    ) {
+                        if let Some(form) = &mut self.tag_image {
+                            form.error = Some(e);
+                            form.plan = None;
+                        }
+                        self.activity = "Image tag needs review.".into();
+                        if done.action.mutates() {
+                            self.valid = false;
+                            self.refresh(runtime);
+                        }
+                        continue;
+                    }
                     if matches!(done.action, Action::Configure) {
                         self.connection_error = Some(e.clone());
                     }
@@ -1137,13 +1173,14 @@ impl DockerView {
             self.connection_open = false;
             if self.pending.is_none() {
                 self.new_resource = None;
+                self.tag_image = None;
             }
         }
         if !self.opened && !cfg!(windows) {
             self.opened = true;
             self.refresh(runtime);
         }
-        if self.confirm.is_some() {
+        if self.confirm.is_some() || self.tag_image.is_some() {
             ui.disable();
         }
         egui::Panel::top("docker-heading")
@@ -1370,6 +1407,7 @@ impl DockerView {
         });
         self.connection_dialog(&ctx, runtime);
         self.resource_dialog(&ctx, runtime);
+        self.image_tag_dialog(&ctx, runtime);
         if let Some(action) = self.confirm.clone() {
             let mut open = true;
             let title = match &action {
