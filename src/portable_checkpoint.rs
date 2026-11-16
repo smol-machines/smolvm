@@ -3123,6 +3123,9 @@ fn parse_macos_features(sysctl_output: &str) -> Vec<String> {
         let Some((key, value)) = line.split_once(':') else {
             continue;
         };
+        if key.trim() == "hw.optional.floatingpoint" && value.trim() == "1" {
+            out.push("FEAT_FP".to_string());
+        }
         let Some(name) = key.trim().strip_prefix("hw.optional.arm.") else {
             continue;
         };
@@ -3323,6 +3326,15 @@ fn host_counter_hz() -> Option<u64> {
 /// libkrun's tag on VM state written by its macOS backend, which other
 /// backends translate rather than parse (see libkrun's `VmCheckpoint`).
 const HVF_STATE_TAG: &[u8; 8] = b"SMVCHVF1";
+const KVM_ARM_STATE_TAG: &[u8; 8] = b"SMVCKVM1";
+
+fn foreign_state_tag(source: &str, host: &str) -> Option<&'static [u8; 8]> {
+    match (source, host) {
+        ("darwin/arm64", "linux/arm64") => Some(HVF_STATE_TAG),
+        ("linux/arm64", "darwin/arm64") => Some(KVM_ARM_STATE_TAG),
+        _ => None,
+    }
+}
 
 /// Refuse VM state from another platform that its runtime did not tag for
 /// translation. A Mac machine started by an older libkrun writes untagged
@@ -3338,7 +3350,7 @@ fn validate_state_origin(checkpoint: &PortableCheckpointManifest, state: &Path) 
     let tagged = std::fs::File::open(state)
         .and_then(|mut file| std::io::Read::read_exact(&mut file, &mut tag))
         .is_ok()
-        && &tag == HVF_STATE_TAG;
+        && foreign_state_tag(&checkpoint.host_platform, &host_platform) == Some(&tag);
     if tagged {
         return Ok(());
     }
@@ -3349,10 +3361,11 @@ fn validate_state_origin(checkpoint: &PortableCheckpointManifest, state: &Path) 
 }
 
 /// Whether a checkpoint captured on `source` may be restored on `host`. An
-/// arm64 Mac checkpoint restores on arm64 Linux: libkrun recreates the Mac's
-/// virtual board under KVM and the CPU and clock checks below cover the rest.
+/// arm64 Mac checkpoint restores on arm64 Linux, and a checkpoint retaining
+/// that Mac board can return: libkrun validates and recreates the saved board,
+/// while CPU, clock and state-origin checks cover the rest.
 fn host_platform_compatible(source: &str, host: &str) -> bool {
-    source == host || (source == "darwin/arm64" && host == "linux/arm64")
+    source == host || foreign_state_tag(source, host).is_some()
 }
 
 /// Refuse a restore whose guest would keep time at the wrong rate.
@@ -3475,12 +3488,51 @@ fn validate_aarch64_features(_required: &[String]) -> Result<()> {
 #[cfg(any(target_arch = "aarch64", test))]
 #[allow(dead_code)]
 fn missing_features(required: &[String], available: &[String]) -> Vec<String> {
-    let have: std::collections::HashSet<&str> = available.iter().map(String::as_str).collect();
+    let have: std::collections::HashSet<String> = available
+        .iter()
+        .flat_map(|name| arm_feature_components(name))
+        .collect();
     required
         .iter()
-        .filter(|name| !have.contains(name.as_str()))
+        .filter(|name| {
+            arm_feature_components(name)
+                .iter()
+                .any(|part| !have.contains(part))
+        })
         .cloned()
         .collect()
+}
+
+/// Compare existing checkpoint spellings without changing their on-disk
+/// contract. Linux uses HWCAP names; Apple's sysctls use architecture names.
+/// See Linux's arch/arm64/elf_hwcaps documentation for the ID-register fields.
+#[cfg(any(target_arch = "aarch64", test))]
+#[allow(dead_code)]
+fn arm_feature_components(name: &str) -> Vec<String> {
+    let upper = name.to_ascii_uppercase();
+    let parts: &[&str] = match upper.as_str() {
+        "ADVSIMD" => &["FEAT_ASIMD"],
+        "FEAT_ATOMICS" => &["FEAT_LSE"],
+        "FEAT_ASIMDDP" => &["FEAT_DOTPROD"],
+        "FEAT_ASIMDFHM" => &["FEAT_FHM"],
+        "FEAT_ASIMDRDM" => &["FEAT_RDM"],
+        "FEAT_ILRCPC" => &["FEAT_LRCPC2"],
+        "FEAT_USCAT" => &["FEAT_LSE2"],
+        "FEAT_DCPOP" => &["FEAT_DPB"],
+        "FEAT_DCPODP" => &["FEAT_DPB2"],
+        "FEAT_SHA2" => &["FEAT_SHA256"],
+        "FEAT_FRINT" => &["FEAT_FRINTTS"],
+        // FP16 covers scalar and SIMD half-precision arithmetic; requiring
+        // both avoids accepting a host that reports only one Linux HWCAP.
+        "FEAT_FP16" => &["FEAT_FPHP", "FEAT_ASIMDHP"],
+        // These describe the retained Linux guest kernel: ID-register
+        // emulation at EL0 and generic-timer event-stream configuration,
+        // respectively, rather than optional host CPU instructions. The
+        // timer register state and counter-rate contract are checked separately.
+        "FEAT_CPUID" | "FEAT_EVTSTRM" => &[],
+        _ => return vec![upper],
+    };
+    parts.iter().map(|part| (*part).to_string()).collect()
 }
 
 fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
@@ -3495,20 +3547,8 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             ));
         }
         CheckpointCpuContract::Aarch64FeaturesV1 { features } => {
-            // A Mac contract names the Mac's own features, spelled the macOS
-            // way and including ones its hypervisor hides from guests. On
-            // Linux, check the features the guest itself reported instead.
-            #[cfg(target_os = "linux")]
-            if checkpoint.host_platform.starts_with("darwin/") {
-                let guest = checkpoint.guest_cpu_features.as_ref().ok_or_else(|| {
-                    Error::agent(
-                        "restore checkpoint",
-                        "the checkpoint does not record its guest's CPU features; capture it again with a newer smolvm",
-                    )
-                })?;
-                return validate_aarch64_features(guest);
-            }
-            return validate_aarch64_features(features);
+            let host = crate::platform::Platform::current().host_oci_platform();
+            return validate_aarch64_features(checkpoint_arm_features(checkpoint, features, host)?);
         }
         CheckpointCpuContract::LinuxKvmIntelPortableV1 => {
             let current_vendor = cpu_vendor()?.ok_or_else(|| {
@@ -3534,6 +3574,25 @@ fn validate_cpu_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     // required architectural feature fails closed with it named, even though
     // host model/stepping differences are accepted here.
     Ok(())
+}
+
+fn checkpoint_arm_features<'a>(
+    checkpoint: &'a PortableCheckpointManifest,
+    host_features: &'a [String],
+    host: &str,
+) -> Result<&'a [String]> {
+    // Host features can include capabilities the hypervisor hides, or features
+    // absent from a guest that booted elsewhere. In both cross-platform
+    // directions require the actual guest's recorded instruction set.
+    if checkpoint.host_platform == host {
+        return Ok(host_features);
+    }
+    checkpoint.guest_cpu_features.as_deref().ok_or_else(|| {
+        Error::agent(
+            "restore checkpoint",
+            "the checkpoint does not record its guest's CPU features; capture it again with a newer smolvm",
+        )
+    })
 }
 
 /// Whether a machine mounts image layers from the host over the packed-layers
@@ -6944,16 +7003,54 @@ mod tests {
         let mut tagged = HVF_STATE_TAG.to_vec();
         tagged.extend_from_slice(b"rest of the state");
         std::fs::write(&state, tagged).unwrap();
-        validate_state_origin(&checkpoint, &state).unwrap();
+        assert!(validate_state_origin(&checkpoint, &state).is_err());
     }
 
     #[test]
-    fn only_mac_to_linux_crosses_platforms() {
+    fn arm64_cross_platform_state_requires_the_source_backend_tag() {
+        assert_eq!(
+            foreign_state_tag("darwin/arm64", "linux/arm64"),
+            Some(HVF_STATE_TAG)
+        );
+        assert_eq!(
+            foreign_state_tag("linux/arm64", "darwin/arm64"),
+            Some(KVM_ARM_STATE_TAG)
+        );
+        assert_eq!(foreign_state_tag("other/arch", "darwin/arm64"), None);
+        assert_eq!(foreign_state_tag("linux/amd64", "darwin/arm64"), None);
+    }
+
+    #[test]
+    fn only_arm64_mac_and_linux_cross_platforms() {
         assert!(host_platform_compatible("darwin/arm64", "darwin/arm64"));
         assert!(host_platform_compatible("darwin/arm64", "linux/arm64"));
-        assert!(!host_platform_compatible("linux/arm64", "darwin/arm64"));
+        assert!(host_platform_compatible("linux/arm64", "darwin/arm64"));
         assert!(!host_platform_compatible("darwin/arm64", "linux/amd64"));
         assert!(!host_platform_compatible("linux/amd64", "linux/arm64"));
+    }
+
+    #[test]
+    fn cross_platform_arm_restore_requires_recorded_guest_features() {
+        let mut checkpoint = minimal_checkpoint_manifest();
+        let host_features = vec!["FEAT_SVE".into(), "FEAT_AES".into()];
+        let guest_features = vec!["FEAT_AES".into()];
+        for (source, host) in [
+            ("darwin/arm64", "linux/arm64"),
+            ("linux/arm64", "darwin/arm64"),
+        ] {
+            checkpoint.host_platform = source.into();
+            checkpoint.guest_cpu_features = None;
+            assert!(checkpoint_arm_features(&checkpoint, &host_features, host).is_err());
+            checkpoint.guest_cpu_features = Some(guest_features.clone());
+            assert_eq!(
+                checkpoint_arm_features(&checkpoint, &host_features, host).unwrap(),
+                guest_features
+            );
+            assert_eq!(
+                checkpoint_arm_features(&checkpoint, &host_features, source).unwrap(),
+                host_features
+            );
+        }
     }
 
     #[cfg(target_os = "linux")]
@@ -9843,7 +9940,77 @@ mod aarch64_feature_contract_tests {
                    hw.optional.floatingpoint: 1\n\
                    hw.memsize: 38654705664\n";
         let got = parse_macos_features(out);
-        assert_eq!(got, vec!["FEAT_BF16".to_string(), "FEAT_I8MM".to_string()]);
+        assert_eq!(
+            got,
+            vec![
+                "FEAT_BF16".to_string(),
+                "FEAT_I8MM".to_string(),
+                "FEAT_FP".to_string()
+            ]
+        );
+    }
+
+    #[test]
+    fn linux_guest_features_match_mac_names_without_accepting_missing_instructions() {
+        let linux = v(&[
+            "FEAT_FP",
+            "FEAT_ASIMD",
+            "FEAT_ATOMICS",
+            "FEAT_ASIMDDP",
+            "FEAT_ASIMDFHM",
+            "FEAT_ASIMDRDM",
+            "FEAT_FPHP",
+            "FEAT_ASIMDHP",
+            "FEAT_ILRCPC",
+            "FEAT_USCAT",
+            "FEAT_DCPOP",
+            "FEAT_DCPODP",
+            "FEAT_SHA2",
+            "FEAT_FLAGM",
+            "FEAT_FLAGM2",
+            "FEAT_FRINT",
+            "FEAT_CPUID",
+            "FEAT_EVTSTRM",
+        ]);
+        let mac = v(&[
+            "FEAT_FP",
+            "AdvSIMD",
+            "FEAT_LSE",
+            "FEAT_DotProd",
+            "FEAT_FHM",
+            "FEAT_RDM",
+            "FEAT_FP16",
+            "FEAT_LRCPC2",
+            "FEAT_LSE2",
+            "FEAT_DPB",
+            "FEAT_DPB2",
+            "FEAT_SHA256",
+            "FEAT_FlagM",
+            "FEAT_FlagM2",
+            "FEAT_FRINTTS",
+        ]);
+        assert!(missing_features(&linux, &mac).is_empty());
+        assert!(missing_features(&mac, &linux).is_empty());
+        let no_lse: Vec<_> = mac
+            .iter()
+            .filter(|name| name.as_str() != "FEAT_LSE")
+            .cloned()
+            .collect();
+        assert_eq!(missing_features(&linux, &no_lse), v(&["FEAT_ATOMICS"]));
+        let mut future = linux;
+        future.extend(v(&["FEAT_BF16", "FEAT_I8MM", "FEAT_FUTURE_UNKNOWN"]));
+        assert_eq!(
+            missing_features(&future, &mac),
+            v(&["FEAT_BF16", "FEAT_I8MM", "FEAT_FUTURE_UNKNOWN"])
+        );
+        assert_eq!(
+            missing_features(&v(&["FEAT_FP16"]), &v(&["FEAT_FPHP"])),
+            v(&["FEAT_FP16"])
+        );
+        assert_eq!(
+            missing_features(&v(&["FEAT_FP16"]), &v(&["FEAT_ASIMDHP"])),
+            v(&["FEAT_FP16"])
+        );
     }
 
     #[test]
