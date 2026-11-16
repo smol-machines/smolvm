@@ -3889,6 +3889,39 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
 // Resize
 // ============================================================================
 
+/// A fresh machine has no disk until launch. A missing disk on an existing
+/// machine, or a broken symlink to either disk format, is still an error.
+fn disk_resize_is_physical(
+    path: &std::path::Path,
+    can_be_unallocated: bool,
+) -> smolvm::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound && can_be_unallocated {
+                // resolve_disk_image follows links when choosing a format. Do
+                // not mistake a dangling qcow2 link for a not-yet-created raw disk.
+                match std::fs::symlink_metadata(path.with_extension("qcow2")) {
+                    Err(alternate) if alternate.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(false);
+                    }
+                    Err(alternate) => {
+                        return Err(smolvm::Error::storage(
+                            "inspect resize disk",
+                            alternate.to_string(),
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+            }
+            Err(smolvm::Error::storage(
+                "inspect resize disk",
+                format!("{}: {error}", path.display()),
+            ))
+        }
+    }
+}
+
 /// Resize a microVM's disk resources.
 ///
 /// The VM must be stopped before resizing. Only expansion is supported
@@ -3897,7 +3930,8 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
 /// the caller is responsible for persisting the new sizes.
 ///
 /// Returns a list of human-readable change descriptions for display.
-/// Validates no-shrink and performs the physical I/O.
+/// Validates no-shrink and performs the physical I/O. Unallocated disks of a
+/// newly created machine take their updated sizes from the record at first boot.
 pub fn expand_disks(
     name: &str,
     record: &smolvm::config::VmRecord,
@@ -3955,13 +3989,35 @@ pub fn expand_disks(
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
 
+    let fresh = record.state == RecordState::Created
+        && record.engine_build.is_none()
+        && record.golden.is_none()
+        && record.checkpoint_head.is_none();
+    // Preflight both targets before growing either disk. In particular, a
+    // missing overlay on a stopped machine must not leave its storage grown.
+    let storage_physical = if new_storage_gb.is_some_and(|size| size > current_storage_gb) {
+        disk_resize_is_physical(
+            manager.storage_path(),
+            fresh && !record.packed_image_on_storage,
+        )?
+    } else {
+        false
+    };
+    let overlay_physical = if new_overlay_gb.is_some_and(|size| size > current_overlay_gb) {
+        disk_resize_is_physical(manager.overlay_path(), fresh)?
+    } else {
+        false
+    };
+
     let mut changes = Vec::new();
 
     if let Some(storage_gb) = new_storage_gb {
         if storage_gb > current_storage_gb {
             let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            if storage_physical {
+                expand_disk::<Storage>(storage_path, storage_gb)
+                    .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            }
             changes.push(format!(
                 "  storage: {} GiB → {} GiB",
                 current_storage_gb, storage_gb
@@ -3972,8 +4028,10 @@ pub fn expand_disks(
     if let Some(overlay_gb) = new_overlay_gb {
         if overlay_gb > current_overlay_gb {
             let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            if overlay_physical {
+                expand_disk::<Overlay>(overlay_path, overlay_gb)
+                    .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            }
             changes.push(format!(
                 "  overlay: {} GiB → {} GiB",
                 current_overlay_gb, overlay_gb
