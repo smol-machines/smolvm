@@ -32,6 +32,7 @@ enum Workspace {
 
 pub struct Studio {
     brand: egui::TextureHandle,
+    desktop_menu: crate::desktop_menu::DesktopMenu,
     switcher: crate::navigation_ui::Switcher,
     cloud: crate::cloud_ui::CloudView,
     workspace: Workspace,
@@ -72,6 +73,7 @@ impl Studio {
         let runtime_path = runtime.executable.to_string_lossy().into_owned();
         let mut app = Self {
             brand: design::brand_texture(&cc.egui_ctx),
+            desktop_menu: crate::desktop_menu::DesktopMenu::new(&cc.egui_ctx),
             switcher: crate::navigation_ui::Switcher::default(),
             cloud: crate::cloud_ui::CloudView::new(&cc.egui_ctx),
             workspace: Workspace::Local,
@@ -962,6 +964,17 @@ impl Studio {
 }
 
 impl eframe::App for Studio {
+    fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        if self.desktop_menu.input(raw)
+            && !self.pending.as_ref().is_some_and(Operation::is_mutation)
+            && !self.cloud.mutating()
+            && !self.docker.mutating()
+            && !self.modal_open()
+        {
+            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+        }
+    }
+
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
         self.docker.logic(&self.runtime);
@@ -1153,5 +1166,15 @@ impl eframe::App for Studio {
             }
         }
         self.dialogs(&ctx, frame);
+        self.desktop_menu.update(
+            !self.modal_open()
+                && !self.terminal.as_ref().is_some_and(|t| t.focused(&ctx))
+                && !self.docker.terminal_focused(&ctx),
+            !self.docker.navigating(),
+            !self.modal_open()
+                && !self.pending.as_ref().is_some_and(Operation::is_mutation)
+                && !self.cloud.mutating()
+                && !self.docker.mutating(),
+        );
     }
 }

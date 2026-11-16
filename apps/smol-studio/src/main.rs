@@ -2,6 +2,7 @@
 
 mod cloud_ui;
 mod design;
+mod desktop_menu;
 mod docker_ui;
 mod file_picker;
 mod files_ui;

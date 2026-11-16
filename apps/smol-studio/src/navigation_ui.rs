@@ -68,11 +68,10 @@ impl Switcher {
                 self.open();
             }
         }
-        if !self.open {
-            for destination in Destination::ALL {
-                if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, destination.details().2)) {
-                    return Some(destination);
-                }
+        for destination in Destination::ALL {
+            if ctx.input_mut(|i| i.consume_key(Modifiers::COMMAND, destination.details().2)) {
+                self.open = false;
+                return Some(destination);
             }
         }
         None

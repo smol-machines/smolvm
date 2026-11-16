@@ -30,3 +30,12 @@ libc = "0.2"
 lto = "thin"
 codegen-units = 1
 strip = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["std", "NSObject", "NSString"] }
+objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std", "NSApplication", "NSEvent", "NSMenu", "NSMenuItem", "NSPasteboard", "NSResponder", "NSWindow"] }
+
+[[test]]
+name = "desktop_menu"
+harness = false
