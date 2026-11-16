@@ -1573,7 +1573,9 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
 pub fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
     let _ = std::fs::remove_file(path);
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
-    sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;
+    let address = krun_socket::SocketPath::new(path).ok()?;
+    sock.bind(&socket2::SockAddr::unix(address.path()).ok()?)
+        .ok()?;
     sock.listen(16).ok()?;
     sock.set_nonblocking(true).ok()?;
     Some(sock)

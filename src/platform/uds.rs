@@ -27,7 +27,8 @@ pub struct UdsStream {
 impl UdsStream {
     /// Connect to the AF_UNIX socket at `path`.
     pub fn connect(path: impl AsRef<Path>) -> io::Result<Self> {
-        let addr = SockAddr::unix(path.as_ref())?;
+        let address = krun_socket::SocketPath::new(path)?;
+        let addr = SockAddr::unix(address.path())?;
         let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         sock.connect(&addr)?;
         Ok(Self { inner: sock })
@@ -35,7 +36,8 @@ impl UdsStream {
 
     /// Connect with a deadline, including a full listener backlog.
     pub fn connect_timeout(path: impl AsRef<Path>, timeout: Duration) -> io::Result<Self> {
-        let addr = SockAddr::unix(path.as_ref())?;
+        let address = krun_socket::SocketPath::new(path)?;
+        let addr = SockAddr::unix(address.path())?;
         let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         sock.connect_timeout(&addr, timeout)?;
         Ok(Self { inner: sock })
@@ -172,7 +174,8 @@ impl UdsListener {
     /// The caller is responsible for removing any stale socket file first
     /// (matching `UnixListener::bind` semantics, which also fail on EADDRINUSE).
     pub fn bind(path: impl AsRef<Path>) -> io::Result<Self> {
-        let addr = SockAddr::unix(path.as_ref())?;
+        let address = krun_socket::SocketPath::new(path)?;
+        let addr = SockAddr::unix(address.path())?;
         let sock = Socket::new(Domain::UNIX, Type::STREAM, None)?;
         sock.bind(&addr)?;
         sock.listen(128)?;
@@ -201,5 +204,42 @@ impl Iterator for Incoming<'_> {
 
     fn next(&mut self) -> Option<Self::Item> {
         Some(self.listener.accept())
+    }
+}
+
+#[cfg(all(test, unix))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn long_paths_support_agent_requests_and_control_timeouts() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("workspace".repeat(16));
+        std::fs::create_dir(&parent).unwrap();
+        let path = parent.join("control.sock");
+        let listener = UdsListener::bind(&path).unwrap();
+        // The listener's temporary alias is already gone. A later command
+        // still finds the actual socket at its original filesystem path.
+        let mut client = UdsStream::connect_timeout(&path, Duration::from_secs(1)).unwrap();
+        let mut server = listener.accept().unwrap();
+        client
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        server
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        client.write_all(b"STATUS\n").unwrap();
+        let mut request = [0; 7];
+        server.read_exact(&mut request).unwrap();
+        assert_eq!(&request, b"STATUS\n");
+        server.write_all(b"OK\n").unwrap();
+        let mut reply = [0; 3];
+        client.read_exact(&mut reply).unwrap();
+        assert_eq!(&reply, b"OK\n");
+        assert!(path.exists());
+        assert_eq!(
+            UdsListener::bind(&path).unwrap_err().kind(),
+            io::ErrorKind::AddrInUse
+        );
     }
 }

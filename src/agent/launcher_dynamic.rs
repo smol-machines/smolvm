@@ -1280,14 +1280,21 @@ pub(crate) fn truncate_console_log(path: &Path) {
     }
 }
 
-/// Longest Unix socket path the host accepts: `sockaddr_un.sun_path` holds 104
-/// bytes on macOS and 108 elsewhere, including the terminating NUL.
-const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+/// Windows AF_UNIX paths must fit the 108-byte address including its NUL.
+#[cfg(not(unix))]
+const MAX_UNIX_SOCKET_PATH: usize = 107;
 
-/// libkrun binds the sockets it listens on inside `krun_start_enter` and
-/// reports a path that does not fit only as a bare EINVAL, which reads like a
-/// bad disk. Check the length before handing a socket to libkrun so the error
-/// names the path and the way out.
+/// Check addressability before libkrun starts: Unix hosts resolve deep paths
+/// through a private alias, while Windows requires the original path to fit.
+/// Report the actual path problem instead of libkrun's generic startup EINVAL.
+#[cfg(unix)]
+pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
+    krun_socket::SocketPath::new(path)
+        .map(|_| ())
+        .map_err(|error| format!("cannot address Unix socket {}: {error}", path.display()))
+}
+
+#[cfg(not(unix))]
 pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
     let len = path.as_os_str().len();
     if len <= MAX_UNIX_SOCKET_PATH {
@@ -1344,6 +1351,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(unix))]
     fn socket_path_over_the_host_limit_is_named() {
         let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 1)));
         assert!(check_socket_path_len(&fits).is_ok());

@@ -68,6 +68,7 @@ libloading = "0.8"
 # bridges. std has no UnixStream on Windows, but socket2 (Domain::UNIX) works
 # on Windows 10 1809+. See src/platform/uds.rs.
 socket2 = "0.6"
+krun-socket = { git = "https://github.com/smol-machines/libkrun", rev = "b94a8aabaa6b87cf32225a3f796cf46866895434" }
 dirs = "5"
 sha1 = "0.10"
 sha2 = "0.10"

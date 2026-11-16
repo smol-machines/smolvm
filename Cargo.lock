@@ -1844,6 +1844,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "krun-socket"
+version = "0.1.0"
+source = "git+https://github.com/smol-machines/libkrun?rev=b94a8aabaa6b87cf32225a3f796cf46866895434#b94a8aabaa6b87cf32225a3f796cf46866895434"
+dependencies = [
+ "tempfile",
+]
+
+[[package]]
 name = "landlock"
 version = "0.4.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -3330,6 +3338,7 @@ dependencies = [
  "hyper-util",
  "imago",
  "ipnet",
+ "krun-socket",
  "landlock",
  "libc",
  "libloading",

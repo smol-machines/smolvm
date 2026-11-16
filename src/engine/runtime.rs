@@ -24,7 +24,8 @@ pub(crate) struct AgentWriter(OwnedWriteHalf, Arc<AtomicBool>);
 
 /// Open a connection to the agent listening on `socket`.
 pub(crate) async fn connect(socket: &Path) -> std::io::Result<(AgentReader, AgentWriter)> {
-    let stream = UnixStream::connect(socket).await?;
+    let address = krun_socket::SocketPath::new(socket)?;
+    let stream = UnixStream::connect(address.path()).await?;
     let (r, w) = stream.into_split();
     let binary = Arc::new(AtomicBool::new(false));
     Ok((AgentReader(r, binary.clone()), AgentWriter(w, binary)))
