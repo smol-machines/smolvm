@@ -179,10 +179,72 @@ impl Drop for FsNotifyWatcher {
 /// How often the polling watcher (forked children on macOS) rescans.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
+struct StopOnExit(Option<Arc<AtomicBool>>);
+impl Drop for StopOnExit {
+    fn drop(&mut self) {
+        if let Some(stop) = &self.0 {
+            stop.store(true, Ordering::SeqCst);
+        }
+    }
+}
+
 fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>, poll: bool) {
+    run_with_registration(socket_path, targets, stop, move |queue, targets, stop| {
+        register_watches(queue, targets, stop, poll)
+    });
+}
+
+/// A callback can block on the bounded queue while the OS backend is also
+/// servicing a synchronous watch-registration request. Drain events alongside
+/// registration so a busy first mount cannot prevent registering the rest.
+fn run_with_registration<R: Send>(
+    socket_path: PathBuf,
+    targets: Vec<WatchTarget>,
+    stop: Arc<AtomicBool>,
+    register: impl FnOnce(Arc<EventQueue>, &[WatchTarget], &Arc<AtomicBool>) -> Option<R> + Send,
+) {
     let rx = Arc::new(EventQueue::new(stop.clone()));
-    let tx = rx.clone();
-    let handler = move |res| tx.push(res);
+
+    std::thread::scope(|scope| {
+        let registration = std::thread::Builder::new()
+            .name("fsnotify-register".into())
+            .spawn_scoped(scope, || {
+                // Failed or panicked setup must also release the delivery
+                // worker, including while it waits for a cold guest.
+                let mut failed = StopOnExit(Some(stop.clone()));
+                let watcher = register(rx.clone(), &targets, &stop);
+                if watcher.is_some() {
+                    failed.0.take();
+                }
+                watcher
+            });
+        let registration = match registration {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!(%error, "failed to start host watch registration");
+                return;
+            }
+        };
+        // Declared after the handle: on return or unwinding, unblock callbacks
+        // before joining setup or destroying its returned OS watcher. The
+        // registration thread exits after setup; its result owns the watcher
+        // for the rest of this VM's lifetime.
+        let _stop_on_exit = StopOnExit(Some(stop.clone()));
+        run_delivery(&socket_path, &targets, &stop, &rx);
+        drop(_stop_on_exit);
+        if registration.join().is_err() {
+            warn!("host watch registration panicked");
+        }
+    });
+}
+
+fn register_watches(
+    queue: Arc<EventQueue>,
+    targets: &[WatchTarget],
+    stop: &Arc<AtomicBool>,
+    poll: bool,
+) -> Option<Box<dyn Watcher + Send>> {
+    let handler = move |res| queue.push(res);
     let watcher: notify::Result<Box<dyn Watcher + Send>> = if poll {
         notify::PollWatcher::new(
             handler,
@@ -196,36 +258,36 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         Ok(w) => w,
         Err(e) => {
             warn!(error = %e, "failed to create host fs watcher; hot-reload propagation disabled");
-            return;
+            return None;
         }
     };
+    // If a backend panics in watch(), release its callback before unwinding
+    // destroys the OS watcher and joins the callback thread.
+    let mut failed = StopOnExit(Some(stop.clone()));
 
-    // Set stop before dropping the OS watcher, including on unwinding: its
-    // callback may be waiting for queue capacity and its destructor joins it.
-    struct StopOnExit(Arc<AtomicBool>);
-    impl Drop for StopOnExit {
-        fn drop(&mut self) {
-            self.0.store(true, Ordering::SeqCst);
+    for t in targets {
+        if stop.load(Ordering::SeqCst) {
+            break;
         }
-    }
-    let _stop_on_exit = StopOnExit(stop.clone());
-
-    for t in &targets {
         if let Err(e) = watcher.watch(&t.host_source, RecursiveMode::Recursive) {
             warn!(path = %t.host_source.display(), error = %e, "failed to watch mount source");
         }
     }
+    failed.0.take();
+    Some(watcher)
+}
 
+fn run_delivery(socket_path: &Path, targets: &[WatchTarget], stop: &AtomicBool, rx: &EventQueue) {
     // A dedicated connection so injected events never interleave with the
     // command's own request/response stream on the primary connection.
-    let mut client = match connect_to_agent(&socket_path, &stop) {
+    let mut client = match connect_to_agent(socket_path, stop) {
         Some(client) => client,
         None => return,
     };
 
     info!(
         mounts = targets.len(),
-        "host→guest fsnotify propagation active (hot-reload)"
+        "host→guest fsnotify delivery connected (hot-reload)"
     );
     let mut announced = Announced::default();
 
@@ -240,7 +302,7 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
 
         let mut batch = Vec::new();
         announced.prune();
-        collect_events(&first, &targets, &mut announced, &mut batch);
+        collect_events(&first, targets, &mut announced, &mut batch);
 
         // Coalesce the rest of the burst (a save fans out into several events).
         let deadline = Instant::now() + COALESCE_WINDOW;
@@ -249,7 +311,7 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
                 break;
             }
             match rx.recv_timeout(remaining) {
-                Ok(Ok(ev)) => collect_events(&ev, &targets, &mut announced, &mut batch),
+                Ok(Ok(ev)) => collect_events(&ev, targets, &mut announced, &mut batch),
                 Ok(Err(_)) => {}
                 Err(_) => break,
             }
@@ -261,7 +323,7 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         dedup(&mut batch);
 
         for chunk in batch.chunks(MAX_BATCH_EVENTS) {
-            if !deliver(&mut client, chunk, &socket_path, &stop) {
+            if !deliver(&mut client, chunk, socket_path, stop) {
                 return;
             }
         }
@@ -598,6 +660,120 @@ fn dedup(batch: &mut Vec<FsNotifyEvent>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn registration_can_fill_the_queue_before_finishing_without_blocking_delivery() {
+        use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        struct OwnedWatch(Arc<AtomicBool>);
+        impl Drop for OwnedWatch {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("agent.sock");
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        for index in 0..512 {
+            std::fs::write(source.join(format!("file-{index}")), b"changed").unwrap();
+        }
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stopped = stop.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = released.clone();
+        let (registered, complete) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            run_with_registration(
+                socket,
+                vec![WatchTarget {
+                    host_source: source,
+                    guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+                }],
+                stopped,
+                move |queue, targets, _| {
+                    // Models a backend's callback filling the queue before
+                    // watch() can finish registering another mount.
+                    for index in 0..512 {
+                        queue.push(Ok(Event::new(EventKind::Any)
+                            .add_path(targets[0].host_source.join(format!("file-{index}")))));
+                    }
+                    registered.send(()).unwrap();
+                    Some(OwnedWatch(owned))
+                },
+            );
+        });
+        // Own shutdown even if a socket assertion panics.
+        let watcher = FsNotifyWatcher {
+            stop,
+            handle: Some(handle),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut peer = loop {
+            if let Ok((peer, _)) = listener.accept() {
+                break peer;
+            }
+            assert!(Instant::now() < deadline, "registration blocked delivery");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < 512 {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).unwrap();
+            let size = u32::from_be_bytes(header) as usize;
+            assert!(size < 1024 * 1024);
+            let mut frame = vec![0; size];
+            peer.read_exact(&mut frame).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&frame).unwrap();
+            let AgentRequest::FsNotify { events } = request.body else {
+                panic!("unexpected request");
+            };
+            assert!(events.len() <= MAX_BATCH_EVENTS);
+            seen.extend(events.into_iter().map(|event| event.path));
+            peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                .unwrap();
+        }
+        complete.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!released.load(Ordering::SeqCst));
+        for index in 0..512 {
+            assert!(seen.contains(&format!("/run/smolvm/virtiofs/smolvm0/file-{index}")));
+        }
+        drop(watcher);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_registration_stops_delivery_waiting_for_an_absent_guest() {
+        for panic in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("absent.sock");
+            let stop = Arc::new(AtomicBool::new(false));
+            let stopped = stop.clone();
+            let (finished, done) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                run_with_registration(socket, vec![], stopped, move |_, _, _| {
+                    assert!(!panic, "injected backend setup panic");
+                    None::<()>
+                });
+                finished.send(()).unwrap();
+            });
+            let watcher = FsNotifyWatcher {
+                stop,
+                handle: Some(handle),
+            };
+            let result = done.recv_timeout(Duration::from_secs(2));
+            drop(watcher);
+            result.expect("failed setup left delivery running");
+        }
+    }
 
     #[cfg(unix)]
     #[test]

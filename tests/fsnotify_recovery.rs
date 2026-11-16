@@ -45,6 +45,38 @@ fn request(peer: &mut UnixStream) -> Vec<FsNotifyEvent> {
     events
 }
 
+fn wait_for_notifications(peer: &mut UnixStream, source: &Path, tag: &str) {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    let done = AtomicBool::new(false);
+    let deadline = Instant::now() + Duration::from_secs(4);
+    let expected = format!("/run/smolvm/virtiofs/{tag}/watch-ready");
+    // An agent connection can precede registration of a later mount. Observe
+    // actual delivery instead of treating socket acceptance as watch readiness.
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            let mut revision = 0;
+            while !done.load(Ordering::SeqCst) && Instant::now() < deadline {
+                std::fs::write(source.join("watch-ready"), revision.to_string()).unwrap();
+                revision += 1;
+                std::thread::sleep(Duration::from_millis(25));
+            }
+        });
+        loop {
+            let events = request(peer);
+            peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                .unwrap();
+            if events.iter().any(|event| event.path == expected) {
+                done.store(true, Ordering::SeqCst);
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "mount notifications never became ready"
+            );
+        }
+    });
+}
+
 fn watcher(root: &Path, source: &Path, after_fork: bool) -> FsNotifyWatcher {
     if std::env::var_os("RUST_LOG").is_some() {
         let _ = tracing_subscriber::fmt()
@@ -78,8 +110,8 @@ fn distinct_changes(after_fork: bool) {
     std::fs::create_dir(&source).unwrap();
     let listener = UnixListener::bind(root.path().join("agent.sock")).unwrap();
     let watcher = watcher(root.path(), &source, after_fork);
-    // Connecting happens after the host watch is registered.
     let mut peer = accept(&listener);
+    wait_for_notifications(&mut peer, &source, "smolvm0");
     std::fs::write(source.join("first"), b"pending").unwrap();
     assert!(!request(&mut peer).is_empty()); // Deliberately do not acknowledge.
     for index in 0..512 {
@@ -124,6 +156,7 @@ fn unanswered_shutdown(after_fork: bool) {
     let listener = UnixListener::bind(root.path().join("agent.sock")).unwrap();
     let watcher = watcher(root.path(), &source, after_fork);
     let mut peer = accept(&listener);
+    wait_for_notifications(&mut peer, &source, "smolvm0");
     std::fs::write(source.join("first"), b"pending").unwrap();
     assert!(!request(&mut peer).is_empty());
     let stop = Instant::now();
@@ -156,4 +189,50 @@ fn full_queue_shutdown(after_fork: bool) {
     let stop = Instant::now();
     drop(watcher);
     assert!(stop.elapsed() < Duration::from_secs(3));
+}
+
+#[test]
+fn a_busy_first_mount_does_not_prevent_later_mounts_from_registering() {
+    busy_mount_registration(false);
+}
+
+#[cfg(target_os = "macos")]
+#[test]
+fn polling_registers_later_mounts_while_the_first_mount_changes() {
+    busy_mount_registration(true);
+}
+
+fn busy_mount_registration(after_fork: bool) {
+    let root = tempfile::tempdir().unwrap();
+    let sources: Vec<_> = (0..16)
+        .map(|index| {
+            let source = root.path().join(format!("mount-{index}"));
+            std::fs::create_dir(&source).unwrap();
+            source
+        })
+        .collect();
+    let listener = UnixListener::bind(root.path().join("agent.sock")).unwrap();
+    std::thread::scope(|scope| {
+        scope.spawn(|| {
+            for index in 0..2048 {
+                std::fs::write(sources[0].join(format!("file-{index}")), b"changed").unwrap();
+            }
+        });
+        let mounts = sources
+            .iter()
+            .enumerate()
+            .map(|(index, path)| (path.clone(), format!("smolvm{index}")));
+        let watcher = if after_fork {
+            FsNotifyWatcher::start_tagged_after_fork(root.path().join("agent.sock"), mounts)
+        } else {
+            FsNotifyWatcher::start_tagged(root.path().join("agent.sock"), mounts)
+        }
+        .unwrap();
+        let mut peer = accept(&listener);
+        wait_for_notifications(&mut peer, &sources[15], "smolvm15");
+        wait_for_notifications(&mut peer, &sources[0], "smolvm0");
+        let shutdown = Instant::now();
+        drop(watcher);
+        assert!(shutdown.elapsed() < Duration::from_secs(3));
+    });
 }
