@@ -1,7 +1,7 @@
 use crate::{design, file_picker::FilePicker};
 use eframe::egui::{self, RichText};
 use smol_studio::{
-    files::{self, Listing},
+    files::{self, Listing, Request},
     model::{Machine, Operation},
 };
 use std::path::PathBuf;
@@ -20,6 +20,9 @@ struct Pick {
 
 pub struct FilesView {
     machine: String,
+    display_name: String,
+    container: bool,
+    generation: String,
     path: String,
     requested: String,
     listing: Option<Listing>,
@@ -38,6 +41,9 @@ impl Default for FilesView {
     fn default() -> Self {
         Self {
             machine: String::new(),
+            display_name: String::new(),
+            container: false,
+            generation: String::new(),
             path: "/workspace".into(),
             requested: String::new(),
             listing: None,
@@ -83,7 +89,7 @@ impl FilesView {
             self.attempted = false;
         }
     }
-    fn request(&mut self) -> Option<Operation> {
+    fn request(&mut self) -> Option<Request> {
         self.attempted = true;
         self.history_target = None;
         if self.path != self.requested {
@@ -97,8 +103,8 @@ impl FilesView {
         }
         self.requested = self.path.clone();
         self.error = None;
-        Some(Operation::ListFiles {
-            name: self.machine.clone(),
+        Some(Request::List {
+            target: self.machine.clone(),
             path: self.path.clone(),
         })
     }
@@ -109,12 +115,7 @@ impl FilesView {
         machine: &Machine,
         enabled: bool,
     ) -> Option<Operation> {
-        if self.machine != machine.name {
-            *self = Self {
-                machine: machine.name.clone(),
-                ..Self::default()
-            };
-        }
+        self.select_target(&machine.name, &machine.name, false, "/workspace");
         if machine.state != "running" {
             ui.add_space(24.0);
             design::empty_state(
@@ -125,6 +126,59 @@ impl FilesView {
             );
             return None;
         }
+        self.show_contents(ui, frame, enabled)
+            .map(Request::machine_operation)
+    }
+
+    fn select_target(&mut self, id: &str, name: &str, container: bool, initial: &str) {
+        if self.machine != id || self.container != container {
+            *self = Self {
+                machine: id.into(),
+                path: initial.into(),
+                container,
+                ..Self::default()
+            };
+        }
+        self.display_name = name.into();
+    }
+
+    pub fn show_container(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        details: &smol_studio::container_details::ContainerDetails,
+        enabled: bool,
+    ) -> Option<Request> {
+        self.select_target(&details.id, &details.name, true, "/");
+        let generation = format!("{}:{}", details.state, details.started_at);
+        if self.generation != generation {
+            self.generation = generation;
+            self.listing = None;
+            self.attempted = false;
+            self.error = None;
+            self.notice = None;
+        }
+        if !matches!(
+            details.state.as_str(),
+            "created" | "running" | "paused" | "exited"
+        ) {
+            design::empty_state(
+                ui,
+                design::Icon::Project,
+                "Files are unavailable",
+                "Wait for the container to finish changing state, then refresh.",
+            );
+            return None;
+        }
+        self.show_contents(ui, frame, enabled)
+    }
+
+    fn show_contents(
+        &mut self,
+        ui: &mut egui::Ui,
+        frame: &eframe::Frame,
+        enabled: bool,
+    ) -> Option<Request> {
         let mut action = None;
         if enabled && !self.attempted {
             action = self.request();
@@ -158,7 +212,7 @@ impl FilesView {
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.path)
                         .desired_width((ui.available_width() - 140.0).max(60.0))
-                        .hint_text("/workspace"),
+                        .hint_text(if self.container { "/" } else { "/workspace" }),
                 );
                 if ui.button("Go").clicked()
                     || (response.lost_focus() && ui.input(|i| i.key_pressed(egui::Key::Enter)))
@@ -183,7 +237,7 @@ impl FilesView {
                         .clicked()
                     {
                         self.picking = Some(Pick {
-                            name: machine.name.clone(),
+                            name: self.machine.clone(),
                             guest: self.requested.clone(),
                             upload: true,
                         });
@@ -309,7 +363,7 @@ impl FilesView {
                                             if entry.kind == "file" {
                                                 if ui.small_button("Save…").clicked() {
                                                     self.picking = Some(Pick {
-                                                        name: machine.name.clone(),
+                                                        name: self.machine.clone(),
                                                         guest: files::join(
                                                             &listing.path,
                                                             &entry.name,
@@ -359,6 +413,11 @@ impl FilesView {
         action
     }
     pub fn dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Operation> {
+        self.transfer_dialog(ctx, busy)
+            .map(Request::machine_operation)
+    }
+
+    pub fn transfer_dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Request> {
         if let Some(selection) = self.picker.poll(ctx)
             && let (Some(pick), Some(files)) = (self.picking.take(), selection)
             && let Some(file) = files.first()
@@ -396,9 +455,9 @@ impl FilesView {
             .open(&mut open)
             .show(ctx, |ui| {
                 ui.label(RichText::new(if transfer.upload {
-                    "Copy a file from your computer into this machine."
+                    if self.container { "Copy a file from your computer into this container." } else { "Copy a file from your computer into this machine." }
                 } else {
-                    "Save a copy of a machine file to your computer."
+                    "Save a copy of this file to your computer."
                 }).size(12.0).color(design::MUTED));
                 ui.add_space(12.0);
                 let body_height = (ui.available_height() - 60.0).max(180.0);
@@ -418,7 +477,7 @@ impl FilesView {
                         ui.add_space(12.0);
                         design::card().show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new(format!("In {}", transfer.name)).size(11.5).color(design::MUTED));
+                            ui.label(RichText::new(format!("In {}", self.display_name)).size(11.5).color(design::MUTED));
                             ui.add_enabled_ui(!busy, |ui| {
                                 ui.add(egui::TextEdit::singleline(&mut transfer.guest).desired_width(f32::INFINITY));
                             });
@@ -427,7 +486,7 @@ impl FilesView {
                             }
                         });
                         ui.add_space(12.0);
-                        ui.label(RichText::new("An existing file at the destination will be replaced. Files up to 4 GiB are supported.").size(11.5).color(design::MUTED));
+                        ui.label(RichText::new(if self.container { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::MUTED));
                     });
                 ui.add_space((ui.available_height() - 48.0).max(12.0));
                 ui.separator();
@@ -437,8 +496,8 @@ impl FilesView {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok(), design::primary(if transfer.upload { "Upload file" } else { "Save file" })).clicked() {
                             self.error = None;
-                            action = Some(Operation::TransferFile {
-                                name: transfer.name.clone(), guest: transfer.guest.clone(),
+                            action = Some(Request::Transfer {
+                                target: transfer.name.clone(), guest: transfer.guest.clone(),
                                 local: transfer.local.clone(), upload: transfer.upload,
                             });
                         }

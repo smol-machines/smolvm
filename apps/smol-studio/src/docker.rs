@@ -55,6 +55,7 @@ pub enum Action {
     Inspect(String),
     NetworkInspect(String),
     Stats(String),
+    Files(crate::files::Request),
     StorageInspect {
         kind: Kind,
         id: String,
@@ -107,6 +108,9 @@ impl Action {
         }
     }
     pub fn mutates(&self) -> bool {
+        if let Self::Files(request) = self {
+            return request.mutates();
+        }
         !matches!(
             self,
             Self::Status
@@ -125,6 +129,15 @@ impl Action {
     }
 }
 pub enum Output {
+    Files {
+        id: String,
+        listing: crate::files::Listing,
+    },
+    FileTransferred {
+        id: String,
+        local: std::path::PathBuf,
+        upload: bool,
+    },
     Connection(crate::docker_connection::Connection),
     RunImages(Vec<crate::container_run::Image>),
     ContainerCreated(crate::container_run::Created),
@@ -296,6 +309,9 @@ fn execute_with_progress(
     shutdown: &AtomicBool,
     progress: &crate::command_progress::Progress,
 ) -> Result<Output, String> {
+    if let Action::Files(request) = action {
+        return crate::container_files::execute(request, shutdown);
+    }
     if matches!(action, Action::RunImages) {
         return crate::container_run::images(shutdown).map(Output::RunImages);
     }

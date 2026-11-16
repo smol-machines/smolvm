@@ -29,6 +29,7 @@ enum ContainerTab {
     #[default]
     Overview,
     Logs,
+    Files,
     Mounts,
 }
 
@@ -85,6 +86,7 @@ pub struct DockerView {
     usage: smol_studio::container_usage::Usage,
     container_tab: ContainerTab,
     live_logs: crate::live_logs_ui::LiveLogs,
+    files: crate::files_ui::FilesView,
     terminal: Option<crate::terminal_ui::TerminalWindow>,
 }
 impl DockerView {
@@ -207,6 +209,7 @@ impl DockerView {
             usage: smol_studio::container_usage::Usage::new(move || repaint.request_repaint()),
             container_tab: ContainerTab::Overview,
             live_logs: crate::live_logs_ui::LiveLogs::default(),
+            files: crate::files_ui::FilesView::default(),
             terminal: None,
         }
     }
@@ -255,6 +258,7 @@ impl DockerView {
             || self.confirm.is_some()
             || (self.new_resource.is_some() && !matches!(self.pending, Some(Action::PullImage(_))))
             || self.file_picker.is_open()
+            || self.files.modal_open()
     }
     pub fn mutating(&self) -> bool {
         self.pending.as_ref().is_some_and(Action::mutates)
@@ -279,6 +283,10 @@ impl DockerView {
             ) => "Stopping containers…",
             Some(Action::Restart(_)) => "Restarting container…",
             Some(Action::Resume(_)) => "Resuming container…",
+            Some(Action::Files(smol_studio::files::Request::List { .. })) => {
+                "Reading container folder…"
+            }
+            Some(Action::Files(_)) => "Transferring file…",
             Some(Action::Rename { .. }) => "Renaming container…",
             Some(Action::Logs(_)) => "Loading logs…",
             Some(Action::ReviewImageTag { .. }) => "Checking image tag…",
@@ -340,6 +348,18 @@ impl DockerView {
         while let Ok(done) = self.worker.events.try_recv() {
             self.pending = None;
             match done.result {
+                Ok(Output::Files { id, listing }) => {
+                    self.files.receive(&id, listing);
+                }
+                Ok(Output::FileTransferred { id, local, upload }) => {
+                    self.files.transferred(&id, upload, &local);
+                    self.activity = if upload {
+                        "File uploaded."
+                    } else {
+                        "File saved."
+                    }
+                    .into();
+                }
                 Ok(Output::RunImages(images)) => {
                     if let Some(form) = &mut self.run_container {
                         if !images.iter().any(|i| i.id == form.draft.image) {
@@ -614,6 +634,11 @@ impl DockerView {
                     self.refresh(runtime);
                 }
                 Err(e) => {
+                    if let Action::Files(request) = &done.action {
+                        self.files.failed(request.target(), e);
+                        self.activity = "Container files need attention.".into();
+                        continue;
+                    }
                     if let Action::Rename { id, .. } = &done.action {
                         if let Some(form) = &mut self.rename_container
                             && &form.id == id
@@ -1216,7 +1241,7 @@ impl DockerView {
         });
     }
 
-    fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+    fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime, frame: &eframe::Frame) {
         ui.spacing_mut().item_spacing.y = 4.0;
         let Some(details) = self.details.clone() else {
             ui.add_space(20.0);
@@ -1266,6 +1291,7 @@ impl DockerView {
             for (tab, label) in [
                 (ContainerTab::Overview, "Overview"),
                 (ContainerTab::Logs, "Logs"),
+                (ContainerTab::Files, "Files"),
                 (ContainerTab::Mounts, "Mounts"),
             ] {
                 if design::tab(ui, self.container_tab == tab, label).clicked() {
@@ -1280,9 +1306,15 @@ impl DockerView {
             self.live_logs.show(ui, &details.id, enabled);
             return;
         }
+        if self.container_tab == ContainerTab::Files {
+            if let Some(request) = self.files.show_container(ui, frame, &details, enabled) {
+                self.submit(runtime, Action::Files(request));
+            }
+            return;
+        }
         egui::ScrollArea::vertical().id_salt(("container-inspector-scroll", &details.id, self.container_tab)).auto_shrink([false, false]).show(ui, |ui| {
             match self.container_tab {
-                ContainerTab::Logs => {},
+                ContainerTab::Logs | ContainerTab::Files => {},
                 ContainerTab::Mounts => {
                     ui.label(design::heading("Shared folders & volumes", 14.0)); ui.add_space(8.0);
                     if details.mounts.is_empty() { ui.label(RichText::new("No folders or volumes are mounted in this container.").size(12.0).color(MUTED)); }
@@ -1660,7 +1692,7 @@ impl DockerView {
                 return;
             }
             if self.kind == Kind::Containers && self.selected.is_some() {
-                self.inspector(ui, runtime);
+                self.inspector(ui, runtime, frame);
                 return;
             }
             let query=self.query.to_lowercase();
@@ -1678,6 +1710,9 @@ impl DockerView {
 
         });
         self.rename_container_dialog(&ctx, runtime);
+        if let Some(request) = self.files.transfer_dialog(&ctx, self.pending.is_some()) {
+            self.submit(runtime, Action::Files(request));
+        }
         self.run_container_dialog(&ctx, runtime, frame);
         self.connection_dialog(&ctx, runtime);
         self.resource_dialog(&ctx, runtime);

@@ -35,7 +35,7 @@ impl FilePicker {
                 let name = name.to_owned();
                 Box::pin(async move {
                     dialog
-                        .set_title("Save file from machine")
+                        .set_title("Save file")
                         .set_file_name(name)
                         .save_file()
                         .await

@@ -1,6 +1,49 @@
 use serde::Deserialize;
 use std::collections::HashSet;
 
+#[derive(Clone, Debug)]
+pub enum Request {
+    List {
+        target: String,
+        path: String,
+    },
+    Transfer {
+        target: String,
+        guest: String,
+        local: std::path::PathBuf,
+        upload: bool,
+    },
+}
+
+impl Request {
+    pub fn target(&self) -> &str {
+        match self {
+            Self::List { target, .. } | Self::Transfer { target, .. } => target,
+        }
+    }
+    pub fn mutates(&self) -> bool {
+        matches!(self, Self::Transfer { .. })
+    }
+    pub fn machine_operation(self) -> crate::model::Operation {
+        match self {
+            Self::List { target, path } => {
+                crate::model::Operation::ListFiles { name: target, path }
+            }
+            Self::Transfer {
+                target,
+                guest,
+                local,
+                upload,
+            } => crate::model::Operation::TransferFile {
+                name: target,
+                guest,
+                local,
+                upload,
+            },
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Entry {
     pub name: String,
