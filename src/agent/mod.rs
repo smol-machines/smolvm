@@ -455,7 +455,7 @@ mod guest_network_env_tests {
 
 #[cfg(test)]
 mod gpu_device_tests {
-    use super::{gpu_device, virgl_flags_for, GpuDevice};
+    use super::{gpu_device, GpuDevice};
 
     #[test]
     fn display_without_gpu_gets_the_software_display() {
@@ -482,6 +482,7 @@ mod gpu_device_tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn software_display_passes_no_renderer_flags_on_linux() {
+        use super::virgl_flags_for;
         assert_eq!(virgl_flags_for(GpuDevice::SoftwareDisplay), 0);
         assert_ne!(virgl_flags_for(GpuDevice::Accelerated), 0);
     }

@@ -258,7 +258,7 @@ mod linux {
 
     /// `DRM_IOCTL_VERSION`: `_IOWR('d', 0x00, struct drm_version)`. The
     /// renderer issues it right after the open, so the probe does too.
-    const DRM_IOCTL_VERSION: libc::c_ulong = 0xC040_6400;
+    const DRM_IOCTL_VERSION: libc::Ioctl = 0xC040_6400_u32 as libc::Ioctl;
 
     /// Record index the probe process writes once every node is done.
     const DONE: u32 = u32::MAX;
