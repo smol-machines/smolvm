@@ -549,7 +549,7 @@ impl DockerView {
                         }
                         | Action::Stop(_) => "Containers stopped.",
                         Action::Delete(_) => "Container removed.",
-                        Action::Configure => "Docker connected to Smol.",
+                        Action::Configure => "Docker setup finished. Checking connection…",
                         Action::ForgetProject(_) => {
                             "Project forgotten; files and volumes retained."
                         }
@@ -1477,10 +1477,14 @@ impl DockerView {
         self.resource_dialog(&ctx, runtime);
         self.image_tag_dialog(&ctx, runtime);
         self.image_archive_dialog(&ctx, runtime, frame);
-        if let Some(action) = self.confirm.clone() {
+        self.connection_setup_dialog(&ctx, runtime);
+        if let Some(action) = self
+            .confirm
+            .clone()
+            .filter(|a| !matches!(a, Action::Configure))
+        {
             let mut open = true;
             let title = match &action {
-                Action::Configure => "Connect Docker to Smol?",
                 Action::Delete(_) => "Remove container?",
                 Action::StorageRemove {
                     kind: Kind::Volumes,
@@ -1494,7 +1498,6 @@ impl DockerView {
             };
             egui::Window::new(title).id(egui::Id::unique("docker-confirm")).anchor(egui::Align2::CENTER_CENTER,egui::Vec2::ZERO).default_width(440.0).open(&mut open).collapsible(false).resizable(false).show(&ctx,|ui| {
                 match &action {
-                    Action::Configure=>{ui.label("Register Smol’s on-demand Docker socket and select the smol context for your tools.");ui.add_space(8.0);ui.label("This changes your default Docker context and configures Buildx and Testcontainers.");}
                     Action::Delete(id)=>{ui.label(format!("Remove stopped container {id} and its writable filesystem?"));}
                     Action::StorageRemove { kind, id, .. } => {
                         ui.label(if *kind == Kind::Volumes { format!("Permanently delete volume “{id}” and all of its data?") } else { format!("Remove image {id} and its local tags from Smol?") });
