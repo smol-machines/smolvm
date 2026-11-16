@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Filters {
     map: HashMap<String, Vec<String>>,
+    name_patterns: std::sync::OnceLock<Vec<Option<regex::Regex>>>,
 }
 
 impl Filters {
@@ -39,7 +40,10 @@ impl Filters {
                 _ => {}
             }
         }
-        Ok(Self { map })
+        Ok(Self {
+            map,
+            name_patterns: Default::default(),
+        })
     }
 
     /// Values given for `key` (empty when the key is absent).
@@ -61,12 +65,71 @@ impl Filters {
         }
     }
 
+    /// Docker matches name expressions against both `/name` and `name`.
+    /// Cache compiled patterns for this request, not for every container, and
+    /// ignore invalid expressions as Docker does (literal equality still wins).
+    pub(crate) fn container_name_matches(&self, name: &str) -> bool {
+        let values = self.get("name");
+        if values.is_empty() {
+            return true;
+        }
+        let name = name.strip_prefix('/').unwrap_or(name);
+        let full_name = format!("/{name}");
+        if values
+            .iter()
+            .any(|value| value == name || value == &full_name)
+        {
+            return true;
+        }
+        self.name_patterns
+            .get_or_init(|| {
+                values
+                    .iter()
+                    .map(|value| regex::Regex::new(&unquote_pattern(value)).ok())
+                    .collect()
+            })
+            .iter()
+            .flatten()
+            .any(|pattern| pattern.is_match(name) || pattern.is_match(&full_name))
+    }
+
     /// Every `label` filter (`key` or `key=value`, or `key!=value` for the
     /// negative form) holds for `labels`. Unlike other keys, all label
     /// filters must hold.
     pub(crate) fn labels_match(&self, key: &str, labels: &BTreeMap<String, String>) -> bool {
         self.get(key).iter().all(|f| label_matches(f, labels))
     }
+}
+
+// Go/RE2 accepts \Q...\E literals, including an unterminated quote to EOF.
+// Preserve ordinary escapes so an escaped backslash before Q does not quote.
+fn unquote_pattern(mut pattern: &str) -> String {
+    let mut out = String::new();
+    while let Some(index) = pattern.find('\\') {
+        out.push_str(&pattern[..index]);
+        pattern = &pattern[index..];
+        if let Some(quoted) = pattern.strip_prefix(r"\Q") {
+            match quoted.split_once(r"\E") {
+                Some((literal, rest)) => {
+                    out.push_str(&regex::escape(literal));
+                    pattern = rest;
+                }
+                None => {
+                    out.push_str(&regex::escape(quoted));
+                    return out;
+                }
+            }
+        } else {
+            let mut chars = pattern.chars();
+            out.push(chars.next().unwrap());
+            if let Some(next) = chars.next() {
+                out.push(next);
+            }
+            pattern = chars.as_str();
+        }
+    }
+    out.push_str(pattern);
+    out
 }
 
 /// One label filter against a label set.
@@ -90,6 +153,67 @@ mod tests {
         assert_eq!(f.get("label"), ["a=b"]);
         assert_eq!(f.get("status"), ["running"]);
         assert!(f.any("name", |_| false));
+    }
+
+    fn names(patterns: &[&str]) -> Filters {
+        Filters::parse(Some(&serde_json::json!({"name": patterns}).to_string())).unwrap()
+    }
+
+    #[test]
+    fn container_name_anchors_work_with_and_without_the_leading_slash() {
+        for pattern in ["api", "/api", "^api$", "^/api$", "^/?api$"] {
+            assert!(names(&[pattern]).container_name_matches("api"), "{pattern}");
+        }
+        for pattern in ["^api$", "^/api$", "^/?api$"] {
+            for other in ["api-2", "myapi", "api.other"] {
+                assert!(
+                    !names(&[pattern]).container_name_matches(other),
+                    "{pattern}: {other}"
+                );
+            }
+        }
+        assert!(names(&["^/api"]).container_name_matches("api-2"));
+        assert!(names(&["api$"]).container_name_matches("myapi"));
+        assert!(!names(&["^//api$"]).container_name_matches("api"));
+    }
+
+    #[test]
+    fn container_name_patterns_support_groups_classes_and_escaped_literals() {
+        let filter = names(&[r"^/?(api|web)-[0-9]+$"]);
+        for name in ["api-1", "web-20"] {
+            assert!(filter.container_name_matches(name));
+        }
+        for name in ["api", "api-x", "worker-1", "myweb-1"] {
+            assert!(!filter.container_name_matches(name));
+        }
+        assert!(names(&[r"^/v1\.2$"]).container_name_matches("v1.2"));
+        assert!(!names(&[r"^/v1\.2$"]).container_name_matches("v1x2"));
+        assert!(names(&[r"(?i)^/API$"]).container_name_matches("api"));
+    }
+
+    #[test]
+    fn go_quoted_literals_preserve_escapes_and_anchor_positions() {
+        assert!(names(&[r"^\Q/api.v1\E$"]).container_name_matches("api.v1"));
+        assert!(!names(&[r"^\Q/api.v1\E$"]).container_name_matches("apixv1"));
+        assert!(names(&[r"^\Q/api.v1"]).container_name_matches("api.v1"));
+        assert_eq!(unquote_pattern(r"\\Qliteral"), r"\\Qliteral");
+        assert!(names(&[r"\Q/api.v1\E(-[0-9]+)?$"]).container_name_matches("api.v1-2"));
+    }
+
+    #[test]
+    fn invalid_name_patterns_do_not_hide_valid_alternatives_or_literal_matches() {
+        assert!(!names(&["["]).container_name_matches("api"));
+        assert!(names(&["[", "^/api$"]).container_name_matches("api"));
+        assert!(names(&["[", "^/api$"]).container_name_matches("["));
+        assert!(Filters::default().container_name_matches("anything"));
+        assert!(names(&[]).container_name_matches("anything"));
+        assert!(names(&[""]).container_name_matches("anything"));
+        let modern = Filters::parse(Some(
+            r#"{"name":{"^/api$":true,"[":true,"^/other$":false}}"#,
+        ))
+        .unwrap();
+        assert!(modern.container_name_matches("api"));
+        assert!(!modern.container_name_matches("other"));
     }
 
     #[test]
