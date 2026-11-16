@@ -108,7 +108,6 @@ impl Action {
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub enum OutputKind {
     Logs,
-    Command,
 }
 
 pub enum Event {
@@ -131,6 +130,11 @@ pub enum Event {
         tenant: Option<String>,
         id: String,
         text: String,
+    },
+    CommandFinished {
+        tenant: Option<String>,
+        id: String,
+        result: Result<smol_cloud::types::CommandOutput>,
     },
     LogError {
         tenant: Option<String>,
@@ -624,6 +628,13 @@ impl Backend {
                         status_error
                     },
                 );
+                if matches!(action, MachineAction::Exec(_)) {
+                    return Ok(Event::CommandFinished {
+                        tenant,
+                        id,
+                        result: response.and_then(|bytes| decode(&bytes)),
+                    });
+                }
                 let bytes = match response {
                     Ok(bytes) => bytes,
                     Err(error) if matches!(action, MachineAction::Logs) => {
@@ -638,23 +649,6 @@ impl Backend {
                         id,
                         text: console_logs(&bytes),
                     }),
-                    MachineAction::Exec(_) => {
-                        let output: smol_cloud::types::CommandOutput = decode(&bytes)?;
-                        Ok(Event::Output {
-                            kind: OutputKind::Command,
-                            tenant,
-                            id,
-                            text: format!(
-                                "{}{}\nExit status: {}",
-                                String::from_utf8_lossy(&output.stdout_bytes()),
-                                String::from_utf8_lossy(&output.stderr_bytes()),
-                                output
-                                    .exit_code
-                                    .map(|c| c.to_string())
-                                    .unwrap_or_else(|| "unknown".into())
-                            ),
-                        })
-                    }
                     _ => Ok(Event::Completed),
                 }
             }
@@ -848,6 +842,59 @@ mod tests {
             expires_at: now() + 3600,
         });
         backend
+    }
+    #[test]
+    fn command_failures_are_scoped_and_retry_keeps_exit_status_separate() {
+        let (url, requests, join) = server(vec![
+            (503, "private server diagnostics".into()),
+            (200, "malformed result".into()),
+            (
+                200,
+                json!({"stdout":"hello\n", "stderr":"problem\n", "exitCode":7}).to_string(),
+            ),
+        ]);
+        let mut backend = backend(&url);
+        let action = Action::Machine {
+            tenant: Some("t-team".into()),
+            id: "m-owned".into(),
+            action: MachineAction::Exec("printf hello; exit 7".into()),
+        };
+        for _ in 0..2 {
+            match backend.act(action.clone()).unwrap() {
+                Event::CommandFinished {
+                    tenant,
+                    id,
+                    result: Err(error),
+                } => {
+                    assert_eq!(tenant.as_deref(), Some("t-team"));
+                    assert_eq!(id, "m-owned");
+                    assert!(!error.contains("private server diagnostics"));
+                }
+                _ => panic!("command errors must remain scoped to the selected machine"),
+            }
+        }
+        match backend.act(action).unwrap() {
+            Event::CommandFinished {
+                result: Ok(output), ..
+            } => {
+                assert_eq!(output.exit_code, Some(7));
+                assert_eq!(output.stdout_bytes(), b"hello\n");
+                assert_eq!(output.stderr_bytes(), b"problem\n");
+            }
+            _ => panic!("expected a completed nonzero command, not an account failure"),
+        }
+        join.join().unwrap();
+        let requests: Vec<_> = requests.try_iter().collect();
+        assert_eq!(
+            requests.len(),
+            3,
+            "a failed command is never automatically replayed"
+        );
+        for request in requests {
+            assert!(request.starts_with("POST /v1/machines/m-owned/exec "));
+            assert!(request.to_lowercase().contains("smol-tenant: t-team"));
+            assert!(request.contains("\"timeoutSeconds\":60"));
+        }
     }
     #[test]
     fn failed_log_reads_keep_their_machine_scope_and_can_be_retried() {
@@ -1156,9 +1203,11 @@ mod tests {
                 id: machine.id.clone(),
                 action: MachineAction::Exec("printf studio-cloud-ok; uname -s".into()),
             })? {
-                Event::Output { text, .. }
-                    if text.contains("studio-cloud-okLinux") && text.contains("Exit status: 0") => {
-                }
+                Event::CommandFinished {
+                    result: Ok(output), ..
+                } if String::from_utf8_lossy(&output.stdout_bytes())
+                    .contains("studio-cloud-okLinux")
+                    && output.exit_code == Some(0) => {}
                 _ => return Err("Cloud command returned unexpected output".into()),
             }
             b.act(Action::Machine {

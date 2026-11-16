@@ -1,4 +1,5 @@
 mod account;
+mod console;
 mod create;
 
 use crate::design;
@@ -31,7 +32,7 @@ pub struct CloudView {
     selected: Option<String>,
     focus_selected: bool,
     query: String,
-    output: String,
+    console: console::Console,
     logs: Option<(String, Instant)>,
     log_filter: String,
     log_error: Option<String>,
@@ -41,7 +42,6 @@ pub struct CloudView {
     creating: bool,
     account_open: bool,
     account_tab: account::Tab,
-    command: String,
     create: Option<NewMachine>,
     delete: Option<(String, String)>,
 }
@@ -61,7 +61,7 @@ impl CloudView {
             selected: None,
             focus_selected: false,
             query: String::new(),
-            output: String::new(),
+            console: console::Console::default(),
             logs: None,
             log_filter: String::new(),
             log_error: None,
@@ -71,7 +71,6 @@ impl CloudView {
             creating: false,
             account_open: false,
             account_tab: account::Tab::Overview,
-            command: String::new(),
             create: None,
             delete: None,
         }
@@ -101,6 +100,13 @@ impl CloudView {
         if self.pending {
             return;
         }
+        let command = matches!(
+            action,
+            Action::Machine {
+                action: MachineAction::Exec(_),
+                ..
+            }
+        );
         let mutation = action.mutates();
         let creating = matches!(action, Action::Create { .. });
         let loading_logs = matches!(
@@ -112,6 +118,9 @@ impl CloudView {
         );
         match self.worker.submit(action) {
             Ok(()) => {
+                if command {
+                    self.console.begin();
+                }
                 self.pending = true;
                 self.creating = creating;
                 self.loading_logs = loading_logs;
@@ -196,12 +205,16 @@ impl CloudView {
                 } => {
                     if tenant == self.tenant && Some(&id) == self.selected.as_ref() {
                         match kind {
-                            OutputKind::Command => self.output = text,
                             OutputKind::Logs => {
                                 self.logs = Some((text, Instant::now()));
                                 self.log_error = None;
                             }
                         }
+                    }
+                }
+                Event::CommandFinished { tenant, id, result } => {
+                    if tenant == self.tenant && Some(&id) == self.selected.as_ref() {
+                        self.console.finish(result);
                     }
                 }
                 Event::LogError { tenant, id, error } => {
@@ -503,7 +516,11 @@ impl CloudView {
                 });
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(design::palette(ui).base).inner_margin(24))
+            .frame(
+                egui::Frame::new()
+                    .fill(design::palette(ui).base)
+                    .inner_margin(24),
+            )
             .show(ui, |ui| {
                 let Some(machine) = self
                     .snapshot
@@ -520,9 +537,11 @@ impl CloudView {
                             "No matching machines"
                         });
                         ui.label(
-                            RichText::new(
-                                if self.query.is_empty() { "Select a machine to see its resources and activity." } else { "Try another name or clear your search." },
-                            )
+                            RichText::new(if self.query.is_empty() {
+                                "Select a machine to see its resources and activity."
+                            } else {
+                                "Try another name or clear your search."
+                            })
                             .color(design::palette(ui).muted),
                         );
                         if !self.query.is_empty() && ui.button("Clear search").clicked() {
@@ -531,16 +550,28 @@ impl CloudView {
                     });
                     return;
                 };
-                ui.add(
-                    egui::Label::new(design::heading(machine.display_name(), 24.0))
-                        .truncate(),
-                )
-                .on_hover_text(machine.display_name());
+                ui.add(egui::Label::new(design::heading(machine.display_name(), 24.0)).truncate())
+                    .on_hover_text(machine.display_name());
                 ui.horizontal(|ui| {
-                    design::badge(ui, if machine.is_started() && !machine.is_ready() { "starting" } else { &machine.state });
+                    design::badge(
+                        ui,
+                        if machine.is_started() && !machine.is_ready() {
+                            "starting"
+                        } else {
+                            &machine.state
+                        },
+                    );
                     if let Some(source) = &machine.source {
                         let label = source.reference.as_deref().unwrap_or(&source.source_type);
-                        ui.add(egui::Label::new(RichText::new(label).small().color(design::palette(ui).muted)).truncate()).on_hover_text(label);
+                        ui.add(
+                            egui::Label::new(
+                                RichText::new(label)
+                                    .small()
+                                    .color(design::palette(ui).muted),
+                            )
+                            .truncate(),
+                        )
+                        .on_hover_text(label);
                     }
                 });
                 ui.add_space(12.0);
@@ -569,187 +600,148 @@ impl CloudView {
                     self.logs_ui(ui, &machine.id, identity.allows("machine:read"));
                     return;
                 }
-                egui::ScrollArea::vertical().id_salt(("cloud-detail", &self.tenant, &machine.id, self.tab)).auto_shrink([false, false]).show(ui, |ui| {
-                    if self.tab == Tab::Overview {
-                        ui.add_enabled_ui(self.valid && !self.pending, |ui| {
-                            ui.horizontal_wrapped(|ui| {
-                                if machine.is_ready() && ui
-                                    .add_enabled(
-                                        identity.allows("machine:exec"),
-                                        design::primary(ui, "Console"),
-                                    )
-                                    .clicked()
-                                {
-                                    self.tab = Tab::Console;
-                                }
-                                if matches!(machine.state.as_str(), "created" | "stopped" | "error")
-                                    && ui
+                if self.tab == Tab::Console {
+                    if let Some(command) = self.console.show(
+                        ui,
+                        self.valid && !self.pending,
+                        machine.is_ready(),
+                        identity.allows("machine:exec"),
+                    ) {
+                        self.machine(machine.id.clone(), MachineAction::Exec(command));
+                    }
+                    return;
+                }
+                egui::ScrollArea::vertical()
+                    .id_salt(("cloud-detail", &self.tenant, &machine.id, self.tab))
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        if self.tab == Tab::Overview {
+                            ui.add_enabled_ui(self.valid && !self.pending, |ui| {
+                                ui.horizontal_wrapped(|ui| {
+                                    if machine.is_ready()
+                                        && ui
+                                            .add_enabled(
+                                                identity.allows("machine:exec"),
+                                                design::primary(ui, "Console"),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.tab = Tab::Console;
+                                    }
+                                    if matches!(
+                                        machine.state.as_str(),
+                                        "created" | "stopped" | "error"
+                                    ) && ui
                                         .add_enabled(
                                             identity.allows("machine:create"),
                                             design::primary(ui, "Start machine"),
                                         )
                                         .clicked()
-                                {
-                                    self.machine(machine.id.clone(), MachineAction::Start);
-                                }
-                                if machine.is_started()
-                                    && ui
-                                        .add_enabled(
-                                            identity.allows("machine:create"),
-                                            egui::Button::new("Stop"),
-                                        )
-                                        .clicked()
-                                {
-                                    self.machine(machine.id.clone(), MachineAction::Stop);
-                                }
-                                if machine.state == "paused"
-                                    && ui
-                                        .add_enabled(
-                                            identity.allows("machine:create"),
-                                            design::primary(ui, "Resume machine"),
-                                        )
-                                        .clicked()
-                                {
-                                    self.machine(machine.id.clone(), MachineAction::Resume);
-                                }
-                                ui.menu_button("More", |ui| {
-                                    if ui.button("Copy machine ID").clicked() {
-                                        ctx.copy_text(machine.id.clone());
-                                        ui.close();
+                                    {
+                                        self.machine(machine.id.clone(), MachineAction::Start);
                                     }
-                                    if !machine.is_started()
+                                    if machine.is_started()
                                         && ui
                                             .add_enabled(
-                                                identity.allows("machine:delete"),
-                                                egui::Button::new(
-                                                    RichText::new("Delete machine…")
-                                                        .color(design::palette(ui).red),
-                                                ),
+                                                identity.allows("machine:create"),
+                                                egui::Button::new("Stop"),
                                             )
                                             .clicked()
                                     {
-                                        self.delete = Some((
-                                            machine.id.clone(),
-                                            machine.display_name().into(),
-                                        ));
-                                        ui.close();
+                                        self.machine(machine.id.clone(), MachineAction::Stop);
+                                    }
+                                    if machine.state == "paused"
+                                        && ui
+                                            .add_enabled(
+                                                identity.allows("machine:create"),
+                                                design::primary(ui, "Resume machine"),
+                                            )
+                                            .clicked()
+                                    {
+                                        self.machine(machine.id.clone(), MachineAction::Resume);
+                                    }
+                                    ui.menu_button("More", |ui| {
+                                        if ui.button("Copy machine ID").clicked() {
+                                            ctx.copy_text(machine.id.clone());
+                                            ui.close();
+                                        }
+                                        if !machine.is_started()
+                                            && ui
+                                                .add_enabled(
+                                                    identity.allows("machine:delete"),
+                                                    egui::Button::new(
+                                                        RichText::new("Delete machine…")
+                                                            .color(design::palette(ui).red),
+                                                    ),
+                                                )
+                                                .clicked()
+                                        {
+                                            self.delete = Some((
+                                                machine.id.clone(),
+                                                machine.display_name().into(),
+                                            ));
+                                            ui.close();
+                                        }
+                                    });
+                                });
+                            });
+
+                            ui.add_space(20.0);
+                            if let Some(resources) = &machine.resources {
+                                ui.label(design::heading("Configuration", 14.0));
+                                ui.add_space(10.0);
+                                design::card(ui.ctx()).show(ui, |ui| {
+                                    ui.set_width(ui.available_width());
+                                    ui.columns(2, |columns| {
+                                        design::metric(
+                                            &mut columns[0],
+                                            "CPU limit",
+                                            &resources
+                                                .cpus
+                                                .map(|n| n.to_string())
+                                                .unwrap_or_else(|| "—".into()),
+                                            "cores",
+                                        );
+                                        design::metric(
+                                            &mut columns[1],
+                                            "Memory limit",
+                                            &resources
+                                                .memory_mb
+                                                .map(|n| n.to_string())
+                                                .unwrap_or_else(|| "—".into()),
+                                            "MB",
+                                        );
+                                    });
+                                    if let Some(disk) = resources.disk_gb {
+                                        ui.label(
+                                            RichText::new(format!("Disk limit: {disk} GB"))
+                                                .small()
+                                                .color(design::palette(ui).muted),
+                                        );
                                     }
                                 });
-                            });
-                        });
-
-                        ui.add_space(20.0);
-                        if let Some(resources) = &machine.resources {
-                            ui.label(design::heading("Configuration", 14.0));
-                            ui.add_space(10.0);
+                                ui.add_space(24.0);
+                            }
                             design::card(ui.ctx()).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
-                                ui.columns(2, |columns| {
-                                    design::metric(
-                                        &mut columns[0],
-                                        "CPU limit",
-                                        &resources
-                                            .cpus
-                                            .map(|n| n.to_string())
-                                            .unwrap_or_else(|| "—".into()),
-                                        "cores",
-                                    );
-                                    design::metric(
-                                        &mut columns[1],
-                                        "Memory limit",
-                                        &resources
-                                            .memory_mb
-                                            .map(|n| n.to_string())
-                                            .unwrap_or_else(|| "—".into()),
-                                        "MB",
-                                    );
+                                design::property(ui, "Account", self.account_label());
+                                ui.add_space(8.0);
+                                ui.horizontal(|ui| {
+                                    design::eyebrow(ui, "MACHINE ID");
+                                    if ui.small_button("Copy").clicked() {
+                                        ctx.copy_text(machine.id.clone());
+                                    }
                                 });
-                                if let Some(disk) = resources.disk_gb {
-                                    ui.label(
-                                        RichText::new(format!("Disk limit: {disk} GB"))
-                                            .small()
-                                            .color(design::palette(ui).muted),
-                                    );
-                                }
+                                ui.add(
+                                    egui::Label::new(
+                                        RichText::new(&machine.id).monospace().size(12.0),
+                                    )
+                                    .wrap()
+                                    .selectable(true),
+                                );
                             });
-                            ui.add_space(24.0);
                         }
-                        design::card(ui.ctx()).show(ui, |ui| {
-                            ui.set_width(ui.available_width());
-                            design::property(ui, "Account", self.account_label());
-                            ui.add_space(8.0);
-                            ui.horizontal(|ui| {
-                                design::eyebrow(ui, "MACHINE ID");
-                                if ui.small_button("Copy").clicked() {
-                                    ctx.copy_text(machine.id.clone());
-                                }
-                            });
-                            ui.add(
-                                egui::Label::new(
-                                    RichText::new(&machine.id).monospace().size(12.0),
-                                )
-                                .wrap()
-                                .selectable(true),
-                            );
-                        });
-                    } else if self.tab == Tab::Console {
-                        if !machine.is_ready() {
-                            ui.label(RichText::new("Start this machine and wait for it to be ready to run commands.").size(12.0).color(design::palette(ui).muted));
-                            ui.add_space(12.0);
-                        }
-                        design::eyebrow(ui, "CONSOLE");
-                        ui.add_space(8.0);
-                        ui.label(
-                            RichText::new("Run a command · 60 second limit")
-                                .small()
-                                .color(design::palette(ui).muted),
-                        );
-                        ui.add(
-                            egui::TextEdit::multiline(&mut self.command)
-                                .desired_rows(2)
-                                .desired_width(f32::INFINITY)
-                                .font(egui::TextStyle::Monospace)
-                                .hint_text("uname -a"),
-                        );
-                        if ui
-                            .add_enabled(
-                                self.valid
-                                    && !self.pending
-                                    && machine.is_ready()
-                                    && identity.allows("machine:exec")
-                                    && !self.command.trim().is_empty(),
-                                design::primary(ui, "Run command"),
-                            )
-                            .clicked()
-                        {
-                            self.output.clear();
-                            self.machine(
-                                machine.id.clone(),
-                                MachineAction::Exec(self.command.clone()),
-                            );
-                        }
-                        if !self.output.is_empty() {
-                            ui.add_space(16.0);
-                            ui.horizontal(|ui| {
-                                design::eyebrow(ui, "OUTPUT");
-                                if ui.small_button("Copy").clicked() {
-                                    ctx.copy_text(self.output.clone());
-                                }
-                            });
-                            egui::ScrollArea::both()
-                                .id_salt("cloud-output")
-                                .max_height(300.0)
-                                .show(ui, |ui| {
-                                    ui.add(
-                                        egui::Label::new(
-                                            RichText::new(&self.output).monospace().size(12.0),
-                                        )
-                                        .selectable(true),
-                                    );
-                                });
-                        }
-                    }
-                });
+                    });
             });
         self.dialogs(&ctx);
     }
@@ -887,7 +879,7 @@ impl CloudView {
         });
     }
     fn clear_machine_output(&mut self) {
-        self.output.clear();
+        self.console = console::Console::default();
         self.logs = None;
         self.log_filter.clear();
         self.log_error = None;
