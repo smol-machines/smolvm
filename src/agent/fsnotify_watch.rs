@@ -32,7 +32,6 @@ use notify::{RecursiveMode, Watcher};
 use smolvm_protocol::{fsnotify_mask, FsNotifyEvent};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
-#[cfg(test)]
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -86,7 +85,7 @@ impl FsNotifyWatcher {
     /// index `i` maps to virtiofs tag `smolvm{i}`.
     ///
     /// Returns `None` (non-fatal) when there is nothing to watch or the watcher
-    /// thread can't be spawned — the mount still works, only live change
+    /// thread or watch initialization fails — the mount still works, only live change
     /// notifications are unavailable.
     pub fn start(socket_path: PathBuf, mounts: &[HostMount]) -> Option<Self> {
         Self::start_tagged(
@@ -155,15 +154,23 @@ impl FsNotifyWatcher {
 
         let stop = Arc::new(AtomicBool::new(false));
         let stop_thread = stop.clone();
+        let (initialized, ready) = mpsc::sync_channel(1);
         let handle = std::thread::Builder::new()
             .name("fsnotify-watch".into())
-            .spawn(move || run_watch(socket_path, targets, stop_thread, poll))
+            .spawn(move || run_watch(socket_path, targets, stop_thread, poll, initialized))
             .ok()?;
 
-        Some(Self {
+        let watcher = Self {
             stop,
             handle: Some(handle),
-        })
+        };
+        // Establish the baseline and OS watches before the guest can read or
+        // watch these files. An asynchronous baseline can silently absorb an
+        // edit made just after boot, leaving the guest's cached content stale.
+        // Registration never waits for guest delivery: callbacks only mark
+        // bounded dirty paths, so a cold guest cannot deadlock initialization.
+        ready.recv().ok()?;
+        Some(watcher)
     }
 }
 
@@ -189,9 +196,19 @@ impl Drop for StopOnExit {
     }
 }
 
-fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>, poll: bool) {
+fn run_watch(
+    socket_path: PathBuf,
+    targets: Vec<WatchTarget>,
+    stop: Arc<AtomicBool>,
+    poll: bool,
+    initialized: mpsc::SyncSender<()>,
+) {
     run_with_registration(socket_path, targets, stop, move |queue, targets, stop| {
-        register_watches(queue, targets, stop, poll)
+        let watcher = register_watches(queue, targets, stop, poll);
+        if watcher.is_some() {
+            let _ = initialized.send(());
+        }
+        watcher
     });
 }
 
@@ -212,7 +229,7 @@ fn run_with_registration<R: Send>(
     };
     // Prime before installing OS watches, then reconcile once registration is
     // complete to cover changes between the baseline and watch installation.
-    // This runs only on the watcher worker, never the VM launch thread.
+    // The worker signals readiness after registration, before guest launch.
     let roots = watched_roots(&targets);
     if let Err(error) = snapshot.reconcile(&roots, &stop, |_| true) {
         if stop.load(Ordering::SeqCst) {
