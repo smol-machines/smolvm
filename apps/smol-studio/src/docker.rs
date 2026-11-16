@@ -5,7 +5,7 @@ use serde_json::Value;
 use std::{
     process::Command,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
         mpsc,
     },
@@ -163,6 +163,7 @@ pub enum Output {
 pub struct Completion {
     pub action: Action,
     pub result: Result<Output, String>,
+    pub cancelled: bool,
 }
 pub fn validate_container_id(id: &str) -> Result<(), String> {
     if id.is_empty() || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
@@ -659,11 +660,21 @@ pub(crate) fn docker_command() -> Command {
     command
 }
 pub struct DockerWorker {
-    sender: Option<mpsc::SyncSender<(Runtime, Action)>>,
+    sender: Option<mpsc::SyncSender<Work>>,
     pub events: mpsc::Receiver<Completion>,
     pub progress: crate::command_progress::Progress,
     shutdown: Arc<AtomicBool>,
+    active: Arc<Mutex<Option<Cancellation>>>,
     thread: Option<thread::JoinHandle<()>>,
+}
+struct Work {
+    runtime: Runtime,
+    action: Action,
+    interrupted: Arc<AtomicBool>,
+}
+struct Cancellation {
+    interrupted: Arc<AtomicBool>,
+    transfer: bool,
 }
 impl DockerWorker {
     pub fn new(wake: impl Fn() + Send + Sync + 'static) -> Self {
@@ -671,12 +682,19 @@ impl DockerWorker {
         let notify = wake.clone();
         let progress = crate::command_progress::Progress::new(move || notify());
         let report = progress.clone();
-        let (sender, requests) = mpsc::sync_channel::<(Runtime, Action)>(1);
+        let (sender, requests) = mpsc::sync_channel::<Work>(1);
         let (responses, events) = mpsc::channel();
         let shutdown = Arc::new(AtomicBool::new(false));
         let stop = shutdown.clone();
+        let active = Arc::new(Mutex::new(None));
+        let current = active.clone();
         let thread = thread::spawn(move || {
-            while let Ok((runtime, action)) = requests.recv() {
+            while let Ok(Work {
+                runtime,
+                action,
+                interrupted,
+            }) = requests.recv()
+            {
                 if stop.load(Ordering::Relaxed) {
                     break;
                 }
@@ -685,11 +703,25 @@ impl DockerWorker {
                 if let Some(title) = title {
                     report.begin(title);
                 }
-                let result = execute_with_progress(&runtime, &action, &stop, &report);
+                let result = if interrupted.load(Ordering::Acquire) {
+                    Err("Transfer stopped before it started.".into())
+                } else {
+                    execute_with_progress(&runtime, &action, &interrupted, &report)
+                };
+                // A completion that won the race with Stop is still a success.
+                let cancelled = result.is_err() && interrupted.load(Ordering::Acquire);
                 if tracked {
                     report.finish(result.is_ok());
                 }
-                if responses.send(Completion { action, result }).is_err() {
+                *current.lock().unwrap() = None;
+                if responses
+                    .send(Completion {
+                        action,
+                        result,
+                        cancelled,
+                    })
+                    .is_err()
+                {
                     break;
                 }
                 wake();
@@ -700,20 +732,50 @@ impl DockerWorker {
             events,
             progress,
             shutdown,
+            active,
             thread: Some(thread),
         }
     }
     pub fn submit(&self, runtime: Runtime, action: Action) -> Result<(), String> {
+        let mut active = self.active.lock().unwrap();
+        if active.is_some() {
+            return Err("Container worker is busy.".into());
+        }
+        let interrupted = Arc::new(AtomicBool::new(false));
+        let transfer = matches!(&action, Action::Files(request) if request.mutates());
         self.sender
             .as_ref()
             .ok_or("Container worker closed")?
-            .try_send((runtime, action))
-            .map_err(|_| "Container worker is busy.".into())
+            .try_send(Work {
+                runtime,
+                action,
+                interrupted: interrupted.clone(),
+            })
+            .map_err(|_| "Container worker is busy.".to_string())?;
+        *active = Some(Cancellation {
+            interrupted,
+            transfer,
+        });
+        Ok(())
+    }
+
+    /// This signal belongs only to the submitted transfer, even if retained
+    /// after it finishes. Stopping it never closes or cancels the next job.
+    pub fn transfer_cancellation(&self) -> Option<Arc<AtomicBool>> {
+        self.active
+            .lock()
+            .unwrap()
+            .as_ref()
+            .filter(|active| active.transfer)
+            .map(|active| active.interrupted.clone())
     }
 }
 impl Drop for DockerWorker {
     fn drop(&mut self) {
         self.shutdown.store(true, Ordering::Relaxed);
+        if let Some(active) = self.active.lock().unwrap().as_ref() {
+            active.interrupted.store(true, Ordering::Release);
+        }
         self.sender.take();
         if let Some(t) = self.thread.take() {
             let _ = t.join();

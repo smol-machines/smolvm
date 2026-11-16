@@ -138,6 +138,9 @@ pub(crate) fn execute(request: &Request, shutdown: &AtomicBool) -> Result<Output
                     shutdown,
                 )?;
                 regular_file(temporary.path())?;
+                if shutdown.load(std::sync::atomic::Ordering::Acquire) {
+                    return Err("File download stopped.".into());
+                }
                 temporary
                     .persist(local)
                     .map_err(|e| format!("Cannot replace {}: {}", local.display(), e.error))?;
@@ -337,6 +340,248 @@ mod tests {
             0,
             "partial folder leaked"
         );
+    }
+
+    #[test]
+    #[ignore = "requires isolated Smol container, writable /app bind, and 512 MiB free space"]
+    fn live_container_transfer_stop_is_scoped_and_reusable() {
+        use crate::docker::{Action, DockerWorker};
+        use crate::runtime::Runtime;
+        use std::sync::atomic::Ordering;
+        let id = std::env::var("SMOL_STUDIO_FILES_CONTAINER").unwrap();
+        let shared = PathBuf::from(std::env::var("SMOL_STUDIO_FILES_SHARED").unwrap());
+        let source = tempfile::tempdir_in(shared).unwrap();
+        std::fs::File::create(source.path().join("large.bin"))
+            .unwrap()
+            .set_len(512 * 1024 * 1024)
+            .unwrap();
+        std::fs::write(source.path().join("small.txt"), b"retry succeeded").unwrap();
+        let name = source.path().file_name().unwrap().to_str().unwrap();
+        wait_for_shared_folder(&id, name);
+        let guest = format!("/app/{name}");
+        let local = tempfile::tempdir().unwrap();
+        let destination = local.path().join("download");
+        let worker = DockerWorker::new(|| {});
+        let runtime = Runtime::discover();
+        for folder in [true, false] {
+            let request = if folder {
+                Request::SaveFolder {
+                    target: id.clone(),
+                    guest: guest.clone(),
+                    local: destination.clone(),
+                }
+            } else {
+                std::fs::write(&destination, b"existing destination").unwrap();
+                Request::Transfer {
+                    target: id.clone(),
+                    guest: format!("{guest}/large.bin"),
+                    local: destination.clone(),
+                    upload: false,
+                }
+            };
+            worker
+                .submit(runtime.clone(), Action::Files(request))
+                .unwrap();
+            let signal = worker
+                .transfer_cancellation()
+                .expect("transfer can be stopped");
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                let partial = std::fs::read_dir(local.path())
+                    .unwrap()
+                    .flatten()
+                    .any(|entry| {
+                        let path = entry.path();
+                        if path == destination {
+                            return false;
+                        }
+                        let payload = if folder {
+                            path.join("folder/large.bin")
+                        } else {
+                            path
+                        };
+                        payload.metadata().is_ok_and(|m| m.len() > 0)
+                    });
+                if partial {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "copy did not start streaming"
+                );
+                assert!(
+                    worker.events.try_recv().is_err(),
+                    "copy finished before it could be stopped"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            assert!(
+                worker.submit(runtime.clone(), Action::Status).is_err(),
+                "another job displaced the active transfer"
+            );
+            let stopped = std::time::Instant::now();
+            signal.store(true, Ordering::Release);
+            let done = worker.events.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(done.cancelled && done.result.is_err());
+            assert!(stopped.elapsed() < Duration::from_secs(5));
+            assert!(worker.transfer_cancellation().is_none());
+            if folder {
+                assert!(!destination.exists());
+            } else {
+                assert_eq!(
+                    std::fs::read(&destination).unwrap(),
+                    b"existing destination"
+                );
+            }
+            assert_eq!(
+                std::fs::read_dir(local.path()).unwrap().count(),
+                usize::from(!folder)
+            );
+            // Keep signalling the old transfer while the same worker saves a new one.
+            worker
+                .submit(
+                    runtime.clone(),
+                    Action::Files(Request::Transfer {
+                        target: id.clone(),
+                        guest: format!("{guest}/small.txt"),
+                        local: destination.clone(),
+                        upload: false,
+                    }),
+                )
+                .unwrap();
+            signal.store(true, Ordering::Release);
+            let done = worker.events.recv_timeout(Duration::from_secs(30)).unwrap();
+            assert!(!done.cancelled);
+            assert!(matches!(done.result, Ok(Output::FileTransferred { .. })));
+            assert_eq!(std::fs::read(&destination).unwrap(), b"retry succeeded");
+            std::fs::remove_file(&destination).unwrap();
+        }
+        worker
+            .submit(
+                runtime.clone(),
+                Action::Files(Request::List {
+                    target: id.clone(),
+                    path: guest.clone(),
+                }),
+            )
+            .unwrap();
+        assert!(
+            worker.transfer_cancellation().is_none(),
+            "browsing is not an upload or download"
+        );
+        assert!(
+            worker
+                .events
+                .recv_timeout(Duration::from_secs(30))
+                .unwrap()
+                .result
+                .is_ok()
+        );
+        // A stop immediately after submission must not be reset when execution begins.
+        worker
+            .submit(
+                runtime,
+                Action::Files(Request::SaveFolder {
+                    target: id,
+                    guest,
+                    local: destination.clone(),
+                }),
+            )
+            .unwrap();
+        worker
+            .transfer_cancellation()
+            .unwrap()
+            .store(true, Ordering::Release);
+        let done = worker.events.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(done.cancelled && done.result.is_err());
+        assert!(!destination.exists());
+        assert_eq!(std::fs::read_dir(local.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    #[ignore = "requires isolated Smol container, writable /app bind, upload cache and 512 MiB free space"]
+    fn live_container_upload_stop_and_worker_close_release_resources() {
+        use crate::docker::{Action, DockerWorker};
+        use crate::runtime::Runtime;
+        use std::sync::atomic::Ordering;
+        let id = std::env::var("SMOL_STUDIO_FILES_CONTAINER").unwrap();
+        let shared = PathBuf::from(std::env::var("SMOL_STUDIO_FILES_SHARED").unwrap());
+        let cache = PathBuf::from(std::env::var("SMOL_STUDIO_UPLOAD_CACHE").unwrap());
+        let remote = tempfile::tempdir_in(shared).unwrap();
+        let name = remote.path().file_name().unwrap().to_str().unwrap();
+        let target = remote.path().join("received.bin");
+        std::fs::write(&target, b"original destination").unwrap();
+        wait_for_shared_folder(&id, name);
+        let local = tempfile::tempdir().unwrap();
+        let source = local.path().join("large.bin");
+        let size = 512 * 1024 * 1024;
+        std::fs::File::create(&source)
+            .unwrap()
+            .set_len(size)
+            .unwrap();
+        let runtime = Runtime::discover();
+        let uploads = || {
+            std::fs::read_dir(&cache)
+                .unwrap()
+                .flatten()
+                .map(|entry| entry.path().join("upload.tar"))
+                .filter(|p| p.exists())
+                .collect::<Vec<_>>()
+        };
+        assert!(
+            uploads().is_empty(),
+            "fixture cache has another active upload"
+        );
+        for close in [false, true] {
+            let worker = DockerWorker::new(|| {});
+            worker
+                .submit(
+                    runtime.clone(),
+                    Action::Files(Request::Transfer {
+                        target: id.clone(),
+                        guest: format!("/app/{name}/received.bin"),
+                        local: source.clone(),
+                        upload: true,
+                    }),
+                )
+                .unwrap();
+            let signal = worker.transfer_cancellation().unwrap();
+            let deadline = std::time::Instant::now() + Duration::from_secs(30);
+            loop {
+                if uploads()
+                    .iter()
+                    .any(|p| p.metadata().is_ok_and(|m| m.len() > 0 && m.len() < size))
+                {
+                    break;
+                }
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "upload did not start streaming"
+                );
+                assert!(
+                    worker.events.try_recv().is_err(),
+                    "upload finished before cancellation"
+                );
+                std::thread::sleep(Duration::from_millis(2));
+            }
+            let stopped = std::time::Instant::now();
+            if close {
+                drop(worker);
+            } else {
+                signal.store(true, Ordering::Release);
+                let done = worker.events.recv_timeout(Duration::from_secs(5)).unwrap();
+                assert!(done.cancelled && done.result.is_err());
+            }
+            assert!(stopped.elapsed() < Duration::from_secs(5));
+            while !uploads().is_empty() {
+                assert!(
+                    stopped.elapsed() < Duration::from_secs(5),
+                    "server upload staging leaked"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            assert_eq!(std::fs::read(&target).unwrap(), b"original destination");
+        }
     }
 
     #[test]

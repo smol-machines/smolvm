@@ -638,8 +638,17 @@ impl DockerView {
                 }
                 Err(e) => {
                     if let Action::Files(request) = &done.action {
-                        self.files.failed(request.target(), e);
-                        self.activity = "Container files need attention.".into();
+                        if done.cancelled && request.mutates() {
+                            let upload = matches!(
+                                request,
+                                smol_studio::files::Request::Transfer { upload: true, .. }
+                            );
+                            self.files.transfer_stopped(request.target(), upload);
+                            self.activity = "Transfer stopped.".into();
+                        } else {
+                            self.files.failed(request.target(), e);
+                            self.activity = "Container files need attention.".into();
+                        }
                         continue;
                     }
                     if let Action::Rename { id, .. } = &done.action {
@@ -1744,7 +1753,11 @@ impl DockerView {
 
         });
         self.rename_container_dialog(&ctx, runtime);
-        if let Some(request) = self.files.transfer_dialog(&ctx, self.pending.is_some()) {
+        let interruption = self.worker.transfer_cancellation();
+        if let Some(request) =
+            self.files
+                .transfer_dialog(&ctx, self.pending.is_some(), interruption.as_deref())
+        {
             self.submit(runtime, Action::Files(request));
         }
         self.run_container_dialog(&ctx, runtime, frame);

@@ -5,6 +5,7 @@ use smol_studio::{
     model::{Machine, Operation},
 };
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 struct Transfer {
     folder: bool,
@@ -39,6 +40,7 @@ pub struct FilesView {
     picker: FilePicker,
     picking: Option<Pick>,
     transfer: Option<Transfer>,
+    transfer_note: Option<String>,
 }
 impl Default for FilesView {
     fn default() -> Self {
@@ -60,6 +62,7 @@ impl Default for FilesView {
             picker: FilePicker::default(),
             picking: None,
             transfer: None,
+            transfer_note: None,
         }
     }
 }
@@ -77,18 +80,32 @@ impl FilesView {
     }
     pub fn failed(&mut self, name: &str, error: String) {
         if self.machine == name {
+            self.transfer_note = None;
             self.history_target = None;
             self.error = Some(error);
         }
     }
     pub fn transferred(&mut self, name: &str, upload: bool, local: &std::path::Path) {
         self.transfer = None;
+        self.transfer_note = None;
         if self.machine == name {
             self.notice = Some(if upload {
                 "File uploaded.".into()
             } else {
                 format!("Saved to {}", local.display())
             });
+            self.attempted = false;
+        }
+    }
+    pub fn transfer_stopped(&mut self, name: &str, upload: bool) {
+        if self.machine == name {
+            self.error = None;
+            self.notice = None;
+            self.transfer_note = Some(if upload {
+                "Upload stopped. Some files may already have been written; refresh the destination before retrying."
+            } else {
+                "Download stopped. The partial copy was removed and your destination was left unchanged."
+            }.into());
             self.attempted = false;
         }
     }
@@ -468,7 +485,7 @@ impl FilesView {
         action
     }
     pub fn dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Operation> {
-        let request = self.transfer_dialog(ctx, busy);
+        let request = self.transfer_dialog(ctx, busy, None);
         self.machine_operation(request)
     }
 
@@ -482,7 +499,12 @@ impl FilesView {
         }
     }
 
-    pub fn transfer_dialog(&mut self, ctx: &egui::Context, busy: bool) -> Option<Request> {
+    pub fn transfer_dialog(
+        &mut self,
+        ctx: &egui::Context,
+        busy: bool,
+        interruption: Option<&AtomicBool>,
+    ) -> Option<Request> {
         if let Some(selection) = self.picker.poll(ctx)
             && let (Some(pick), Some(files)) = (self.picking.take(), selection)
             && let Some(file) = files.first()
@@ -516,11 +538,13 @@ impl FilesView {
                 upload: pick.upload,
             });
             self.error = None;
+            self.transfer_note = None;
         }
         let transfer = self.transfer.as_mut()?;
         let mut open = true;
         let mut cancel = false;
         let mut action = None;
+        let stopping = interruption.is_some_and(|signal| signal.load(Ordering::Acquire));
         let title = if transfer.folder {
             "Save folder"
         } else if transfer.upload {
@@ -551,6 +575,13 @@ impl FilesView {
                     .id_salt("file-transfer-form")
                     .max_height(body_height)
                     .show(ui, |ui| {
+                        if let Some(note) = &self.transfer_note {
+                            design::card(ui.ctx()).show(ui, |ui| {
+                                ui.set_width(ui.available_width());
+                                ui.add(egui::Label::new(note).wrap());
+                            });
+                            ui.add_space(12.0);
+                        }
                         if let Some(error) = &self.error {
                             let summary = if error.len() < 240 && !error.contains('\n') {
                                 error.as_str()
@@ -591,10 +622,11 @@ impl FilesView {
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
-                    if busy { ui.spinner(); ui.label("Transferring…"); }
+                    if busy { ui.spinner(); ui.label(if stopping { "Stopping…" } else { "Transferring…" }); }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok() && (!transfer.folder || files::validate_folder_name(&transfer.folder_name).is_ok()), design::primary(ui, title)).clicked() {
+                        if !busy && ui.add_enabled(files::validate_path(&transfer.guest).is_ok() && (!transfer.folder || files::validate_folder_name(&transfer.folder_name).is_ok()), design::primary(ui, title)).clicked() {
                             self.error = None;
+                            self.transfer_note = None;
                             action = Some(if transfer.folder {
                                 Request::SaveFolder {
                                     target: transfer.name.clone(), guest: transfer.guest.clone(),
@@ -607,7 +639,11 @@ impl FilesView {
                                 }
                             });
                         }
-                        if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() { cancel = true; }
+                        if busy && let Some(signal) = interruption {
+                            if ui.add_enabled(!stopping, egui::Button::new("Stop transfer")).clicked() {
+                                signal.store(true, Ordering::Release);
+                            }
+                        } else if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() { cancel = true; }
                     });
                 });
             });
