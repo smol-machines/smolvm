@@ -1217,6 +1217,7 @@ impl DockerView {
     }
 
     fn inspector(&mut self, ui: &mut egui::Ui, runtime: &Runtime) {
+        ui.spacing_mut().item_spacing.y = 4.0;
         let Some(details) = self.details.clone() else {
             ui.add_space(20.0);
             if self.pending.is_some() {
@@ -1316,10 +1317,6 @@ impl DockerView {
             ui.add_space(12.0);
         }
                     self.container_diagnostics(ui, runtime, &details, enabled);
-                    ui.label(design::heading("Resource usage", 14.0));
-                    ui.add_space(8.0);
-                    self.container_usage_ui(ui, &details);
-                    ui.add_space(20.0);
                     design::card().show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0));
@@ -1347,6 +1344,8 @@ impl DockerView {
                             });
                         }
                     });
+                    ui.add_space(16.0);
+                    self.container_usage_ui(ui, &details);
                     if let Some(project) = &details.project {
                         ui.add_space(20.0); ui.label(design::heading("Compose project", 14.0));
                         if ui.link(project).clicked() && enabled {

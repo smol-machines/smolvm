@@ -6,7 +6,7 @@ impl DockerView {
         details: &smol_studio::container_details::ContainerDetails,
     ) {
         if details.state != "running" {
-            design::card().show(ui, |ui| {
+            design::card().inner_margin(14).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new(match details.state.as_str() {
@@ -21,66 +21,55 @@ impl DockerView {
             return;
         }
         let sample = self.usage.sample.as_ref();
-        ui.horizontal_wrapped(|ui| {
-            if self.usage.pending() && sample.is_none() {
-                ui.spinner();
-            }
-            let status = if !self.usage.active {
-                "Updates paused while this view is inactive".into()
-            } else if let Some((at, _)) = sample {
-                format!("Sampled {}s ago · updates every 5s", at.elapsed().as_secs())
-            } else if self.usage.error.is_some() {
-                "Waiting for resource measurements".into()
-            } else {
-                "Measuring CPU and memory…".into()
-            };
-            ui.label(RichText::new(status).size(11.5).color(MUTED));
-        });
-        ui.add_space(10.0);
-        let values = [
-            (
-                "Machine CPU",
-                sample.map(|(_, s)| s.cpu.as_str()).unwrap_or("—"),
-            ),
-            (
-                "Machine memory",
-                sample.map(|(_, s)| s.memory.as_str()).unwrap_or("—"),
-            ),
-        ];
-        let card = |ui: &mut egui::Ui, label: &str, value: &str| {
-            design::card().show(ui, |ui| {
-                ui.set_width(ui.available_width());
-                ui.label(RichText::new(label).size(11.5).color(MUTED));
-                ui.add_space(6.0);
-                let (value, limit) = value
-                    .split_once('/')
-                    .map_or((value, None), |(used, limit)| {
+        design::card().inner_margin(14).show(ui, |ui| {
+            ui.set_width(ui.available_width());
+            ui.horizontal(|ui| {
+                ui.label(design::heading("Machine usage", 14.0))
+                    .on_hover_text("CPU and memory are measured for the backing machine, which may also host other containers.");
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if self.usage.pending() && sample.is_none() {
+                        ui.spinner();
+                    }
+                    let status = if !self.usage.active {
+                        "Updates paused".into()
+                    } else if let Some((at, _)) = sample {
+                        format!("{}s ago", at.elapsed().as_secs())
+                    } else if self.usage.error.is_some() {
+                        "Waiting for measurements".into()
+                    } else {
+                        "Measuring…".into()
+                    };
+                    ui.label(RichText::new(status).size(11.0).color(MUTED))
+                        .on_hover_text("Updates every 5 seconds while this view is active.");
+                });
+            });
+            ui.add_space(8.0);
+            let values = [
+                ("CPU", sample.map(|(_, s)| s.cpu.as_str()).unwrap_or("—")),
+                ("Memory", sample.map(|(_, s)| s.memory.as_str()).unwrap_or("—")),
+            ];
+            ui.columns(2, |columns| {
+                for (column, (label, value)) in columns.iter_mut().zip(values) {
+                    column.spacing_mut().item_spacing.y = 2.0;
+                    column.label(RichText::new(label).size(11.5).color(MUTED));
+                    let (value, limit) = value.split_once('/').map_or((value, None), |(used, limit)| {
                         (used.trim(), Some(limit.trim()))
                     });
-                ui.add(egui::Label::new(design::heading(value, 24.0)).wrap());
-                ui.label(
-                    RichText::new(
-                        limit
-                            .map(|limit| format!("of {limit} limit"))
-                            .unwrap_or_else(|| " ".into()),
-                    )
-                    .size(11.5)
-                    .color(MUTED),
-                );
-            });
-        };
-        if ui.available_width() >= 420.0 {
-            ui.columns(2, |cols| {
-                for (col, (label, value)) in cols.iter_mut().zip(values) {
-                    card(col, label, value);
+                    let unit_at = value.find(|c: char| c.is_ascii_alphabetic() || c == '%');
+                    let (amount, unit) = unit_at.map_or((value, ""), |index| value.split_at(index));
+                    column.horizontal_wrapped(|ui| {
+                        ui.spacing_mut().item_spacing.x = 4.0;
+                        ui.label(design::heading(amount.trim(), 23.0));
+                        if !unit.is_empty() {
+                            ui.label(RichText::new(unit).size(12.0).color(MUTED));
+                        }
+                    });
+                    if let Some(limit) = limit {
+                        column.label(RichText::new(format!("of {limit} limit")).size(11.0).color(MUTED));
+                    }
                 }
             });
-        } else {
-            for (label, value) in values {
-                card(ui, label, value);
-                ui.add_space(8.0);
-            }
-        }
+        });
         if let Some(error) = &self.usage.error {
             ui.add_space(10.0);
             design::error_notice(
@@ -89,11 +78,5 @@ impl DockerView {
                 error,
             );
         }
-        ui.add_space(8.0);
-        ui.label(
-            RichText::new("Usage is measured for the backing machine.")
-                .size(11.0)
-                .color(MUTED),
-        );
     }
 }

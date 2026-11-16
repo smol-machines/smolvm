@@ -510,7 +510,7 @@ pub fn resource_row(
             state_color(state),
         );
     }
-    response.on_hover_text(format!("{name}\n{subtitle}\n{state}"))
+    response.on_hover_text(format!("{name}\n{subtitle}"))
 }
 
 /// A shared identity block keeps machine and container inspectors aligned.
