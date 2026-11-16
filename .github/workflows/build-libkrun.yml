@@ -149,7 +149,14 @@ jobs:
             python3-pyelftools curl xz-utils cpio kmod gcc-mingw-w64-x86-64
 
       - name: Build libkrunfw.dll (mingw cross)
-        run: cd libkrunfw && make OS=Windows -j"$(nproc)"
+        run: |
+          cd libkrunfw
+          # Fetch the official release archive from the kernel CDN.
+          kernel_version="$(sed -n 's/^KERNEL_VERSION = //p' Makefile)"
+          kernel_major="${kernel_version#linux-}"
+          kernel_major="${kernel_major%%.*}"
+          make OS=Windows -j"$(nproc)" \
+            KERNEL_REMOTE="https://cdn.kernel.org/pub/linux/kernel/v${kernel_major}.x/${kernel_version}.tar.xz"
 
       - uses: actions/upload-artifact@v4
         with:
