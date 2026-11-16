@@ -5,9 +5,12 @@
 //! again. A stopped container gets its configured mount namespace without
 //! executing its command, so uploads are visible immediately.
 
+use std::io::{Read as _, Write as _};
 use std::sync::Arc;
 
-use axum::body::{Body, Bytes};
+mod transfer;
+
+use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -20,7 +23,7 @@ use super::Engine;
 type Q = Query<std::collections::HashMap<String, String>>;
 
 /// Largest archive accepted in one upload.
-const MAX_UPLOAD: usize = 4 << 30;
+const MAX_UPLOAD: u64 = 4 << 30;
 
 fn path_param(q: &std::collections::HashMap<String, String>) -> ApiResult<String> {
     let path = q
@@ -177,10 +180,7 @@ async fn begin_session(
 async fn unpack_pending(engine: &Engine, c: &Container, socket: &std::path::Path) -> ApiResult<()> {
     let record = c.record();
     for (file, destination) in &record.pending_archives {
-        let bytes = tokio::fs::read(file)
-            .await
-            .map_err(|e| ApiError::internal(format!("read staged archive: {e}")))?;
-        unpack(socket, &record, &bytes, destination).await?;
+        unpack(socket, &record, std::path::Path::new(file), destination).await?;
         c.update(engine, |r| {
             r.pending_archives
                 .retain(|p| p != &(file.clone(), destination.clone()))
@@ -409,90 +409,170 @@ pub(crate) async fn get_archive(
         .send(&request)
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
-    let mut data = Vec::new();
-    loop {
-        match reader
-            .recv()
-            .await
-            .map_err(|e| ApiError::internal(e.to_string()))?
-        {
-            AgentResponse::DataChunk { data: chunk, done } => {
-                data.extend_from_slice(&chunk);
-                if done {
-                    break;
-                }
-            }
-            AgentResponse::Error { message, .. } => {
-                return Err(ApiError::internal(format!("read {path}: {message}")))
-            }
-            _ => {}
-        }
+    // Fail before HTTP headers when the guest refuses the read. Later failures
+    // remain body errors, so Docker and Studio cannot report a truncated copy as complete.
+    let first = reader
+        .recv()
+        .await
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    if let AgentResponse::Error { message, .. } = &first {
+        return Err(ApiError::internal(format!("read {path}: {message}")));
     }
-    machine.finish().await;
-    let tar = tokio::task::spawn_blocking(move || {
-        if kind == "dir" {
-            prefix_archive(&data, &name)
-        } else {
-            single_file_archive(&name, &data)
+    let (input, incoming) = transfer::channel();
+    let (output, outgoing) = transfer::channel();
+    let disconnected = output.clone();
+    tokio::spawn(async move {
+        let _writer = writer;
+        let mut first = Some(first);
+        loop {
+            let reply = if let Some(first) = first.take() {
+                Ok(first)
+            } else {
+                tokio::select! {
+                    _ = disconnected.closed() => break,
+                    _ = input.closed() => break,
+                    reply = reader.recv() => reply,
+                }
+            };
+            let (chunk, done) = match reply {
+                Ok(AgentResponse::DataChunk { data, done }) => (Ok(data.into()), done),
+                Ok(AgentResponse::Progress { .. }) => continue,
+                Ok(AgentResponse::Error { message, .. }) => {
+                    (Err(std::io::Error::other(message)), true)
+                }
+                Ok(other) => (
+                    Err(std::io::Error::other(format!(
+                        "unexpected archive response: {other:?}"
+                    ))),
+                    true,
+                ),
+                Err(error) => (Err(error), true),
+            };
+            tokio::select! {
+                _ = disconnected.closed() => break,
+                sent = input.send(chunk) => if sent.is_err() { break; },
+            }
+            if done {
+                break;
+            }
         }
-    })
-    .await
-    .map_err(|e| ApiError::internal(e.to_string()))?
-    .map_err(|e| ApiError::internal(format!("build archive: {e}")))?;
-    let mut r = Response::new(Body::from(tar));
+        drop(input);
+        drop(reader);
+        drop(_writer);
+        machine.finish().await;
+    });
+    let directory = kind == "dir";
+    tokio::task::spawn_blocking(move || {
+        let source = transfer::Reader::new(incoming);
+        let destination = transfer::Writer::new(output.clone());
+        let result = if directory {
+            prefix_archive(source, destination, &name)
+        } else {
+            single_file_archive(source, destination, &name, size)
+        }
+        .and_then(|mut writer| writer.flush());
+        if let Err(error) = result {
+            let _ = output.blocking_send(Err(error));
+        }
+    });
+    let mut r = Response::new(Body::from_stream(
+        tokio_stream::wrappers::ReceiverStream::new(outgoing),
+    ));
     r.headers_mut().insert(
         header::CONTENT_TYPE,
         HeaderValue::from_static("application/x-tar"),
     );
     r.headers_mut().insert(
         "X-Docker-Container-Path-Stat",
-        stat_header(&path, "file", size),
+        stat_header(&path, &kind, size),
     );
     Ok(r)
 }
 
 /// The entries of `tar` (a directory's contents) under `prefix/`.
-fn prefix_archive(tar_bytes: &[u8], prefix: &str) -> std::io::Result<Vec<u8>> {
-    let mut out = tar::Builder::new(Vec::new());
-    let mut top = tar::Header::new_gnu();
-    top.set_entry_type(tar::EntryType::Directory);
-    top.set_mode(0o755);
-    top.set_size(0);
-    top.set_mtime(now_secs());
-    out.append_data(&mut top, format!("{prefix}/"), std::io::empty())?;
-    let mut archive = tar::Archive::new(tar_bytes);
-    for entry in archive.entries()? {
-        let mut entry = entry?;
-        let path = entry.path()?.to_string_lossy().into_owned();
-        let path = path.trim_start_matches("./");
-        if path.is_empty() || path == "." {
-            continue;
-        }
-        let mut header = entry.header().clone();
-        let full = format!("{prefix}/{path}");
-        match header.entry_type() {
-            tar::EntryType::Symlink | tar::EntryType::Link => {
-                let link = entry
-                    .link_name()?
-                    .map(|l| l.to_string_lossy().into_owned())
-                    .unwrap_or_default();
-                out.append_link(&mut header, &full, link)?;
+fn prefix_archive<R: std::io::Read, W: std::io::Write>(
+    source: R,
+    destination: W,
+    prefix: &str,
+) -> std::io::Result<W> {
+    let mut out = tar::Builder::new(transfer::AbortWriter::new(destination));
+    let result = (|| {
+        let mut top = tar::Header::new_gnu();
+        top.set_entry_type(tar::EntryType::Directory);
+        top.set_mode(0o755);
+        top.set_size(0);
+        top.set_mtime(now_secs());
+        out.append_data(&mut top, format!("{prefix}/"), std::io::empty())?;
+        let mut archive = tar::Archive::new(source);
+        for entry in archive.entries()? {
+            let mut entry = entry?;
+            let path = entry.path()?.to_string_lossy().into_owned();
+            let path = path.trim_start_matches("./");
+            if path.is_empty() || path == "." {
+                continue;
             }
-            _ => out.append_data(&mut header, &full, &mut entry)?,
+            let mut header = entry.header().clone();
+            let full = format!("{prefix}/{path}");
+            match header.entry_type() {
+                tar::EntryType::Symlink | tar::EntryType::Link => {
+                    let link = entry
+                        .link_name()?
+                        .map(|l| l.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    out.append_link(&mut header, &full, link)?;
+                }
+                _ => out.append_data(&mut header, &full, &mut entry)?,
+            }
         }
-    }
-    out.into_inner()
+        // A tar footer is not the end of the transport: the guest can still fail
+        // while finishing its helper. Consume that final result before success.
+        std::io::copy(&mut archive.into_inner(), &mut std::io::sink())?;
+        Ok(())
+    })();
+    finish_archive(out, result)
 }
 
-fn single_file_archive(name: &str, data: &[u8]) -> std::io::Result<Vec<u8>> {
-    let mut out = tar::Builder::new(Vec::new());
-    let mut header = tar::Header::new_gnu();
-    header.set_size(data.len() as u64);
-    header.set_mode(0o644);
-    header.set_mtime(now_secs());
-    header.set_entry_type(tar::EntryType::Regular);
-    out.append_data(&mut header, name, data)?;
-    out.into_inner()
+fn single_file_archive<R: std::io::Read, W: std::io::Write>(
+    mut source: R,
+    destination: W,
+    name: &str,
+    size: u64,
+) -> std::io::Result<W> {
+    let mut out = tar::Builder::new(transfer::AbortWriter::new(destination));
+    let result = (|| {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(size);
+        header.set_mode(0o644);
+        header.set_mtime(now_secs());
+        header.set_entry_type(tar::EntryType::Regular);
+        let mut limited = source.by_ref().take(size);
+        out.append_data(&mut header, name, &mut limited)?;
+        if limited.limit() != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "file became shorter during download",
+            ));
+        }
+        if source.read(&mut [0u8])? != 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "file became longer during download",
+            ));
+        }
+        Ok(())
+    })();
+    finish_archive(out, result)
+}
+
+fn finish_archive<W: std::io::Write>(
+    mut archive: tar::Builder<transfer::AbortWriter<W>>,
+    result: std::io::Result<()>,
+) -> std::io::Result<W> {
+    if let Err(error) = result {
+        archive.get_mut().abort();
+        return Err(error);
+    }
+    archive.into_inner().map(transfer::AbortWriter::into_inner)
 }
 
 fn now_secs() -> u64 {
@@ -513,15 +593,45 @@ pub(crate) async fn put_archive(
         .find_container(&id)
         .ok_or_else(|| ApiError::no_such_container(&id))?;
     let path = path_param(&q)?;
-    let bytes: Bytes = axum::body::to_bytes(body, MAX_UPLOAD)
-        .await
-        .map_err(|e| ApiError::bad_request(format!("read archive: {e}")))?;
-    let record = c.record();
+    let staging = crate::data::image_source::archive_staging_dir()
+        .map_err(|e| ApiError::internal(format!("stage archive: {e}")))?;
+    let archive = staging.path().join("upload.tar");
+    stage_upload(body, &archive, MAX_UPLOAD).await?;
     let machine = files_machine(&engine, &c).await?;
-    let unpacked = unpack(&machine.socket, &record, &bytes, &path).await;
+    let record = c.record();
+    let unpacked = unpack(&machine.socket, &record, &archive, &path).await;
     machine.finish().await;
     unpacked?;
     Ok(StatusCode::OK.into_response())
+}
+
+/// Receive the complete bounded upload before changing any guest files.
+async fn stage_upload(body: Body, path: &std::path::Path, limit: u64) -> ApiResult<()> {
+    use tokio::io::AsyncWriteExt as _;
+    use tokio_stream::StreamExt as _;
+    let file = tokio::fs::File::create(path)
+        .await
+        .map_err(|e| ApiError::internal(format!("stage archive: {e}")))?;
+    // HTTP frames can be tiny; coalesce them before scheduling filesystem writes.
+    let mut file = tokio::io::BufWriter::with_capacity(1024 * 1024, file);
+    let mut stream = body.into_data_stream();
+    let mut total = 0u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| ApiError::bad_request(format!("read archive: {e}")))?;
+        total = total
+            .checked_add(chunk.len() as u64)
+            .filter(|total| *total <= limit)
+            .ok_or_else(|| {
+                ApiError::bad_request(format!("archive exceeds the {limit}-byte upload limit"))
+            })?;
+        file.write_all(&chunk)
+            .await
+            .map_err(|e| ApiError::internal(format!("stage archive: {e}")))?;
+    }
+    file.flush()
+        .await
+        .map_err(|e| ApiError::internal(format!("stage archive: {e}")))?;
+    Ok(())
 }
 
 /// Upload `tar` into the machine and unpack it at `destination` of the
@@ -529,7 +639,7 @@ pub(crate) async fn put_archive(
 pub(crate) async fn unpack(
     socket: &std::path::Path,
     record: &super::containers::ContainerRecord,
-    tar: &[u8],
+    tar: &std::path::Path,
     destination: &str,
 ) -> ApiResult<()> {
     let guest = format!("/storage/engine-archives/{}.tar", super::util::new_id());
@@ -553,8 +663,14 @@ pub(crate) async fn unpack(
 }
 
 /// Write `data` to `path` in the machine (not the container).
-async fn upload(socket: &std::path::Path, path: &str, data: &[u8]) -> ApiResult<()> {
+async fn upload(socket: &std::path::Path, path: &str, source: &std::path::Path) -> ApiResult<()> {
+    use tokio::io::AsyncReadExt as _;
     let err = |e: std::io::Error| ApiError::internal(format!("upload archive: {e}"));
+    let mut file = tokio::fs::File::open(source).await.map_err(err)?;
+    let size = file.metadata().await.map_err(err)?.len();
+    if size > MAX_UPLOAD {
+        return Err(ApiError::bad_request("archive exceeds the upload limit"));
+    }
     let (mut reader, mut writer) = super::runtime::connect(socket).await.map_err(err)?;
     let expect_ok = |reply: AgentResponse| match reply {
         AgentResponse::Ok { .. } => Ok(()),
@@ -569,24 +685,27 @@ async fn upload(socket: &std::path::Path, path: &str, data: &[u8]) -> ApiResult<
             mode: Some(0o600),
             uid: None,
             gid: None,
-            total_size: data.len() as u64,
+            total_size: size,
             target: Some(WorkloadTarget::Vm),
         })
         .await
         .map_err(err)?;
     expect_ok(reader.recv().await.map_err(err)?)?;
-    let chunks: Vec<&[u8]> = if data.is_empty() {
-        vec![&[][..]]
-    } else {
-        data.chunks(smolvm_protocol::FILE_WRITE_CHUNK_SIZE)
-            .collect()
-    };
-    let last = chunks.len() - 1;
-    for (i, chunk) in chunks.into_iter().enumerate() {
+    let mut remaining = size;
+    loop {
+        let mut chunk =
+            vec![0u8; remaining.min(smolvm_protocol::FILE_WRITE_CHUNK_SIZE as u64) as usize];
+        file.read_exact(&mut chunk).await.map_err(err)?;
+        remaining -= chunk.len() as u64;
+        if remaining == 0 && file.read(&mut [0u8]).await.map_err(err)? != 0 {
+            return Err(ApiError::bad_request(
+                "staged archive changed during upload",
+            ));
+        }
         writer
             .send(&AgentRequest::FileWriteChunk {
-                data: chunk.to_vec(),
-                done: i == last,
+                data: chunk,
+                done: remaining == 0,
             })
             .await
             .map_err(err)?;
@@ -595,6 +714,9 @@ async fn upload(socket: &std::path::Path, path: &str, data: &[u8]) -> ApiResult<
             reply = reader.recv().await.map_err(err)?;
         }
         expect_ok(reply)?;
+        if remaining == 0 {
+            break;
+        }
     }
     Ok(())
 }
@@ -715,11 +837,117 @@ mod tests {
         h.set_mode(0o644);
         b.append_data(&mut h, "./a.txt", &b"hi"[..]).unwrap();
         let inner = b.into_inner().unwrap();
-        let out = prefix_archive(&inner, "etc").unwrap();
+        let out = prefix_archive(&inner[..], Vec::new(), "etc").unwrap();
         let mut names = Vec::new();
         for e in tar::Archive::new(&out[..]).entries().unwrap() {
             names.push(e.unwrap().path().unwrap().to_string_lossy().into_owned());
         }
         assert_eq!(names, ["etc/", "etc/a.txt"]);
+    }
+    #[test]
+    fn changed_file_size_never_finishes_a_successful_archive() {
+        for (bytes, expected) in [(&b"short"[..], 50), (&b"too long"[..], 2)] {
+            let mut output = Vec::new();
+            assert!(single_file_archive(bytes, &mut output, "file.txt", expected).is_err());
+            assert!(
+                !output.ends_with(&[0u8; 1024]),
+                "failed copy acquired a tar footer"
+            );
+        }
+    }
+
+    struct FailsAtEnd(std::io::Cursor<Vec<u8>>);
+    impl std::io::Read for FailsAtEnd {
+        fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+            let count = self.0.read(buf)?;
+            if count == 0 && !buf.is_empty() {
+                return Err(std::io::Error::other("guest failed after tar footer"));
+            }
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn directory_transport_failure_after_tar_footer_is_not_hidden() {
+        let bytes = single_file_archive(&b"payload"[..], Vec::new(), "file", 7).unwrap();
+        let mut output = Vec::new();
+        let error = prefix_archive(FailsAtEnd(std::io::Cursor::new(bytes)), &mut output, "app")
+            .unwrap_err();
+        assert!(error.to_string().contains("guest failed"));
+        assert!(
+            !output.ends_with(&[0u8; 1024]),
+            "failure must not emit a successful footer"
+        );
+    }
+
+    #[tokio::test]
+    async fn streamed_directory_preserves_file_bytes_and_literal_names() {
+        let literal = "a ; $(false) &?#+%\n雪.txt";
+        let payload = vec![0x93; 512 * 1024 + 13];
+        let archive =
+            single_file_archive(&payload[..], Vec::new(), literal, payload.len() as u64).unwrap();
+        let (tx, rx) = transfer::channel();
+        let (out, mut downloaded) = transfer::channel();
+        let producer = tokio::spawn(async move {
+            for chunk in archive.chunks(4097) {
+                tx.send(Ok(chunk.to_vec().into())).await.unwrap();
+            }
+        });
+        let transform = tokio::task::spawn_blocking(move || {
+            prefix_archive(transfer::Reader::new(rx), transfer::Writer::new(out), "app")
+                .unwrap()
+                .flush()
+                .unwrap();
+        });
+        let mut bytes = Vec::new();
+        while let Some(chunk) = downloaded.recv().await {
+            bytes.extend_from_slice(&chunk.unwrap());
+        }
+        producer.await.unwrap();
+        transform.await.unwrap();
+        let mut tar = tar::Archive::new(&bytes[..]);
+        let mut entries = tar.entries().unwrap();
+        assert_eq!(
+            entries.next().unwrap().unwrap().path().unwrap().to_str(),
+            Some("app/")
+        );
+        let mut file = entries.next().unwrap().unwrap();
+        assert_eq!(
+            file.path().unwrap().to_str(),
+            Some(format!("app/{literal}").as_str())
+        );
+        let mut read = Vec::new();
+        file.read_to_end(&mut read).unwrap();
+        assert_eq!(read, payload);
+        assert!(entries.next().is_none());
+    }
+
+    #[tokio::test]
+    async fn upload_limit_and_transport_errors_are_rejected_while_staging() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("upload.tar");
+        let chunks = || {
+            vec![
+                Ok::<_, std::io::Error>(axum::body::Bytes::from_static(b"12345")),
+                Ok(axum::body::Bytes::from_static(b"67890")),
+            ]
+        };
+        stage_upload(Body::from_stream(tokio_stream::iter(chunks())), &path, 10)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"1234567890");
+        let error = stage_upload(Body::from_stream(tokio_stream::iter(chunks())), &path, 9)
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("upload limit"));
+        let failed = vec![
+            Ok(axum::body::Bytes::from_static(b"partial")),
+            Err(std::io::Error::other("connection interrupted")),
+        ];
+        assert!(
+            stage_upload(Body::from_stream(tokio_stream::iter(failed)), &path, 100)
+                .await
+                .is_err()
+        );
     }
 }
