@@ -1,7 +1,10 @@
 use serde::Deserialize;
+use std::collections::BTreeMap;
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
 pub struct Machine {
+    #[serde(default)]
+    pub labels: Option<BTreeMap<String, String>>,
     pub name: String,
     pub state: String,
     pub cpus: u16,
@@ -47,6 +50,20 @@ pub struct MachinePort {
 }
 
 impl Machine {
+    /// Reserved ownership labels come from the engine, not from machine names.
+    /// Keep unmarked and unfamiliar machines visible, including older CLI rows.
+    fn engine_managed(&self) -> bool {
+        let Some(labels) = &self.labels else {
+            return false;
+        };
+        let populated = |key: &str| labels.get(key).is_some_and(|value| !value.is_empty());
+        labels
+            .get("smolvm.engine/container")
+            .is_some_and(|id| id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()))
+            || populated("smolvm.engine.builder")
+            || (populated("smolvm.engine/base") && populated("smolvm.engine/base-engine"))
+    }
+
     pub fn can_start(&self) -> bool {
         matches!(self.state.as_str(), "created" | "stopped" | "failed")
     }
@@ -75,6 +92,7 @@ pub fn parse_machines(bytes: &[u8]) -> Result<Vec<Machine>, String> {
     {
         return Err("The runtime returned an empty or duplicate machine name.".into());
     }
+    machines.retain(|machine| !machine.engine_managed());
     Ok(machines)
 }
 
@@ -265,6 +283,61 @@ mod tests {
             {"name":"x","state":"stopped","cpus":2,"memory_mib":1024}
         ]);
         assert!(parse_machines(&serde_json::to_vec(&duplicates).unwrap()).is_err());
+    }
+
+    #[test]
+    fn inventory_separates_engine_ownership_without_guessing_from_names() {
+        use serde_json::json;
+        let row = |name: &str, labels: serde_json::Value| {
+            json!({
+                "name": name, "state": "running", "cpus": 2, "memory_mib": 1024, "labels": labels
+            })
+        };
+        let rows = json!([
+            row("docker-my-project", json!({})),
+            row("buildkit-my-project", json!({"team": "build"})),
+            row(
+                "renamed-container-vm",
+                json!({"smolvm.engine/container": "a".repeat(64)})
+            ),
+            row(
+                "builder",
+                json!({"smolvm.engine.builder": "/engine/buildkit"})
+            ),
+            row(
+                "warm-base",
+                json!({"smolvm.engine/base": "alpine cpus=2 mem=1024 rosetta=false", "smolvm.engine/base-engine": "/engine"})
+            ),
+            row("legacy", json!(null)),
+            row("unknown-owner", json!({"smolvm.engine/future": "x"})),
+            row(
+                "invalid-container",
+                json!({"smolvm.engine/container": "not-an-id"})
+            ),
+            row("incomplete-base", json!({"smolvm.engine/base": "image"})),
+            row("empty-builder", json!({"smolvm.engine.builder": ""}))
+        ]);
+        let machines = parse_machines(&serde_json::to_vec(&rows).unwrap()).unwrap();
+        assert_eq!(
+            machines.iter().map(|m| m.name.as_str()).collect::<Vec<_>>(),
+            [
+                "buildkit-my-project",
+                "docker-my-project",
+                "empty-builder",
+                "incomplete-base",
+                "invalid-container",
+                "legacy",
+                "unknown-owner"
+            ]
+        );
+        // Ownership filtering must not conceal a broken identity response.
+        let duplicate = row("same", json!({"smolvm.engine/container": "b".repeat(64)}));
+        assert!(
+            parse_machines(
+                &serde_json::to_vec(&json!([duplicate, row("same", json!({}))])).unwrap()
+            )
+            .is_err()
+        );
     }
 
     #[test]

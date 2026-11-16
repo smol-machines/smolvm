@@ -1135,6 +1135,36 @@ mod tests {
     }
 
     #[test]
+    #[ignore = "requires an isolated public CLI inventory with real container and user machines"]
+    fn live_public_cli_inventory_ownership() {
+        let runtime = Runtime {
+            executable: std::env::var_os("SMOL_STUDIO_TEST_CLI")
+                .expect("public CLI")
+                .into(),
+            state_dir: Some(
+                std::env::var_os("SMOL_STUDIO_INVENTORY_ROOT")
+                    .expect("isolated state")
+                    .into(),
+            ),
+        };
+        let expected: Vec<String> = serde_json::from_str(
+            &std::env::var("SMOL_STUDIO_INVENTORY_NAMES").expect("expected user machines"),
+        )
+        .unwrap();
+        let Payload::Machines(rows) = runtime
+            .execute(&Operation::Refresh, &AtomicBool::new(false))
+            .unwrap()
+        else {
+            panic!("expected inventory");
+        };
+        assert_eq!(
+            rows.iter().map(|m| m.name.clone()).collect::<Vec<_>>(),
+            expected
+        );
+        println!("Public CLI refresh preserves user machines and omits engine-owned VMs.");
+    }
+
+    #[test]
     #[ignore = "boots an isolated local VM through the Smol CLI"]
     fn live_public_smol_cli_lifecycle() {
         let executable = std::env::var_os("SMOL_STUDIO_TEST_CLI").expect("matching Smol CLI path");
