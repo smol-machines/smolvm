@@ -128,7 +128,8 @@ async fn serve_listener(config: &EngineConfig, listener: UnixListener) -> crate:
                         machine = Some(tokio::task::spawn_blocking(move || boot(&config))
                             .await.map_err(|e| crate::Error::config("BuildKit", e.to_string()))??);
                     }
-                    let mut upstream = UnixStream::connect(config.root.join("guest.sock")).await?;
+                    let address = krun_socket::SocketPath::new(config.root.join("guest.sock"))?;
+                    let mut upstream = UnixStream::connect(address.path()).await?;
                     tasks.spawn(async move {
                         if let Err(error) = tokio::io::copy_bidirectional(&mut client, &mut upstream).await {
                             tracing::debug!(%error, "BuildKit client disconnected");
