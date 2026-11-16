@@ -8,8 +8,8 @@ mod resources;
 mod run_container;
 mod usage;
 
-use crate::design::{self, MUTED, SURFACE};
-use eframe::egui::{self, Color32, RichText};
+use crate::design;
+use eframe::egui::{self, RichText};
 use serde_json::Value;
 use smol_studio::{
     docker::{Action, DockerWorker, Kind, Output, ProjectAction},
@@ -807,10 +807,10 @@ impl DockerView {
                     "Keep application data across container restarts and replacements."
                 })
                 .size(12.0)
-                .color(MUTED),
+                .color(design::palette(ui).muted),
             );
             ui.add_space(16.0);
-            design::card().show(ui, |ui| {
+            design::card(ui.ctx()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new(if pulling {
@@ -819,7 +819,7 @@ impl DockerView {
                         "Volume name"
                     })
                     .size(12.0)
-                    .color(MUTED),
+                    .color(design::palette(ui).muted),
                 );
                 ui.add_enabled_ui(!busy, |ui| {
                     if ui
@@ -847,7 +847,7 @@ impl DockerView {
             if !self.resource_input.is_empty()
                 && let Err(error) = &valid
             {
-                ui.label(RichText::new(error).small().color(design::RED));
+                ui.label(RichText::new(error).small().color(design::palette(ui).red));
             }
             if let Some(error) = &self.resource_error {
                 ui.add_space(12.0);
@@ -881,11 +881,14 @@ impl DockerView {
                     submit = ui
                         .add_enabled(
                             valid.is_ok() && !busy,
-                            design::primary(if pulling {
-                                "Pull image"
-                            } else {
-                                "Create volume"
-                            }),
+                            design::primary(
+                                ui,
+                                if pulling {
+                                    "Pull image"
+                                } else {
+                                    "Create volume"
+                                },
+                            ),
                         )
                         .clicked();
                     cancel = ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();
@@ -913,7 +916,11 @@ impl DockerView {
             .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
+            .frame(
+                egui::Frame::new()
+                    .fill(design::palette(ui).surface)
+                    .inner_margin(12),
+            )
             .show(ui, |ui| {
                 design::search(ui, &mut self.project_query, "Search projects…");
                 ui.add_space(12.0);
@@ -937,7 +944,7 @@ impl DockerView {
                             "No matching projects"
                         })
                         .small()
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 }
                 if self.pending.is_some() {
@@ -997,7 +1004,7 @@ impl DockerView {
                 project.running()
             ))
             .small()
-            .color(MUTED),
+            .color(design::palette(ui).muted),
         );
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -1021,7 +1028,7 @@ impl DockerView {
                 .map(|c| c.service.as_str())
                 .collect();
             if services.is_empty() {
-                ui.label(RichText::new("No service containers. Open one-off job logs from their container entries in Overview.").color(MUTED));
+                ui.label(RichText::new("No service containers. Open one-off job logs from their container entries in Overview.").color(design::palette(ui).muted));
                 return;
             }
             if self
@@ -1032,10 +1039,14 @@ impl DockerView {
                 self.project_service = None;
             }
             ui.horizontal(|ui| {
-                ui.label(RichText::new("Service").small().color(MUTED))
-                    .on_hover_text(
-                        "One-off job logs are available from their container entries in Overview.",
-                    );
+                ui.label(
+                    RichText::new("Service")
+                        .small()
+                        .color(design::palette(ui).muted),
+                )
+                .on_hover_text(
+                    "One-off job logs are available from their container entries in Overview.",
+                );
                 egui::ComboBox::from_id_salt("project-log-service")
                     .selected_text(self.project_service.as_deref().unwrap_or("All services"))
                     .show_ui(ui, |ui| {
@@ -1063,10 +1074,10 @@ impl DockerView {
             ui.add_space(12.0);
             ui.horizontal_wrapped(|ui| {
                 if let Some(source) = &project.source {
-                    if ui.add_enabled(enabled && (project.containers.is_empty() || project.containers.iter().any(|c| c.can_start())), design::primary("Start project…")).clicked() {
+                    if ui.add_enabled(enabled && (project.containers.is_empty() || project.containers.iter().any(|c| c.can_start())), design::primary(ui, "Start project…")).clicked() {
                         self.confirm = Some(Action::Compose { source: source.clone(), up: true });
                     }
-                } else if ui.add_enabled(enabled && project.containers.iter().any(|c| c.can_start()), design::primary("Start containers"))
+                } else if ui.add_enabled(enabled && project.containers.iter().any(|c| c.can_start()), design::primary(ui, "Start containers"))
                     .on_hover_text("Starts existing stopped service containers. Link your Compose files to apply configuration and dependency ordering.").clicked() {
                     self.submit(runtime, Action::Project { name: project.name.clone(), action: ProjectAction::Start });
                 }
@@ -1075,14 +1086,14 @@ impl DockerView {
                 }
             });
             ui.add_space(16.0);
-            design::card().show(ui, |ui| {
+            design::card(ui.ctx()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 design::eyebrow(ui, "COMPOSE FILES");
                 if let Some(source) = &project.source {
-                    for file in &source.files { ui.add(egui::Label::new(RichText::new(file.display().to_string()).small().color(MUTED)).truncate()).on_hover_text(file.display().to_string()); }
+                    for file in &source.files { ui.add(egui::Label::new(RichText::new(file.display().to_string()).small().color(design::palette(ui).muted)).truncate()).on_hover_text(file.display().to_string()); }
                     ui.add_space(8.0);
-                    ui.add(egui::Label::new(RichText::new(format!("Profiles: {}", if source.profiles.is_empty() { "Default services".into() } else { source.profiles.join(", ") })).small().color(MUTED)).wrap());
-                    ui.label(RichText::new(if source.env_files.is_empty() { "Environment: project default".into() } else { format!("Environment: {} selected", count(source.env_files.len(), "file")) }).small().color(MUTED));
+                    ui.add(egui::Label::new(RichText::new(format!("Profiles: {}", if source.profiles.is_empty() { "Default services".into() } else { source.profiles.join(", ") })).small().color(design::palette(ui).muted)).wrap());
+                    ui.label(RichText::new(if source.env_files.is_empty() { "Environment: project default".into() } else { format!("Environment: {} selected", count(source.env_files.len(), "file")) }).small().color(design::palette(ui).muted));
                     if ui.add_enabled(enabled, egui::Button::new("Review / apply changes…")).clicked() {
                         self.compose_files = source.files.iter().map(|p| p.to_string_lossy().into_owned()).collect();
                         self.compose_name = Some(project.name.clone());
@@ -1095,13 +1106,13 @@ impl DockerView {
                     }
                 } else {
                     if let Ok(recorded) = project.recorded_source() {
-                        ui.label(RichText::new("File locations recorded by Compose").small().color(MUTED));
+                        ui.label(RichText::new("File locations recorded by Compose").small().color(design::palette(ui).muted));
                         ui.add(egui::Label::new(RichText::new(&recorded.config_files).small()).truncate()).on_hover_text(&recorded.config_files);
-                        if ui.add_enabled(enabled, design::primary("Review detected files…")).clicked() {
+                        if ui.add_enabled(enabled, design::primary(ui, "Review detected files…")).clicked() {
                             self.submit(runtime, Action::DiscoverProject(project.name.clone()));
                         }
                     } else {
-                        ui.label(RichText::new("Link the files to update this project from Studio.").small().color(MUTED));
+                        ui.label(RichText::new("Link the files to update this project from Studio.").small().color(design::palette(ui).muted));
                     }
                     if ui.add_enabled(enabled, egui::Button::new("Link Compose files…")).clicked() {
                         self.compose_files = vec![String::new()];
@@ -1122,7 +1133,7 @@ impl DockerView {
                 ui.add_space(16.0);
                 ui.horizontal(|ui| {
                     ui.label(design::heading(service, 14.0));
-                    ui.label(RichText::new(count(containers.len(), "container")).small().color(MUTED));
+                    ui.label(RichText::new(count(containers.len(), "container")).small().color(design::palette(ui).muted));
                 });
                 for container in containers {
                     let subtitle = if container.is_job() { format!("{} · one-off job", container.image) } else { container.image.clone() };
@@ -1143,7 +1154,7 @@ impl DockerView {
             }
             if project.containers.iter().any(|c| c.is_job()) {
                 ui.add_space(16.0);
-                ui.label(RichText::new("Completed one-off jobs are kept stopped when you start containers.").small().color(MUTED));
+                ui.label(RichText::new("Completed one-off jobs are kept stopped when you start containers.").small().color(design::palette(ui).muted));
             }
         });
     }
@@ -1179,7 +1190,7 @@ impl DockerView {
         ui.horizontal_wrapped(|ui| {
             if details.state == "running" {
                 if ui
-                    .add_enabled(enabled, design::primary("Open terminal"))
+                    .add_enabled(enabled, design::primary(ui, "Open terminal"))
                     .clicked()
                 {
                     match crate::terminal_ui::TerminalWindow::for_container(
@@ -1193,14 +1204,14 @@ impl DockerView {
                 }
             } else if details.state == "paused" {
                 if ui
-                    .add_enabled(enabled, design::primary("Resume container"))
+                    .add_enabled(enabled, design::primary(ui, "Resume container"))
                     .clicked()
                 {
                     self.submit(runtime, Action::Resume(details.id.clone()));
                 }
             } else if details.can_start()
                 && ui
-                    .add_enabled(enabled, design::primary("Start container"))
+                    .add_enabled(enabled, design::primary(ui, "Start container"))
                     .clicked()
             {
                 self.submit(runtime, Action::Start(details.id.clone()));
@@ -1229,7 +1240,9 @@ impl DockerView {
                     if details.can_remove() {
                         ui.separator();
                         if ui
-                            .button(RichText::new("Remove container…").color(design::RED))
+                            .button(
+                                RichText::new("Remove container…").color(design::palette(ui).red),
+                            )
                             .clicked()
                         {
                             self.confirm = Some(Action::Delete(details.id.clone()));
@@ -1284,7 +1297,14 @@ impl DockerView {
         }
         if let Some(notice) = details.state_notice() {
             ui.add_space(10.0);
-            ui.add(egui::Label::new(RichText::new(notice).size(12.0).color(MUTED)).wrap());
+            ui.add(
+                egui::Label::new(
+                    RichText::new(notice)
+                        .size(12.0)
+                        .color(design::palette(ui).muted),
+                )
+                .wrap(),
+            );
         }
         ui.add_space(12.0);
         ui.horizontal(|ui| {
@@ -1317,10 +1337,10 @@ impl DockerView {
                 ContainerTab::Logs | ContainerTab::Files => {},
                 ContainerTab::Mounts => {
                     ui.label(design::heading("Shared folders & volumes", 14.0)); ui.add_space(8.0);
-                    if details.mounts.is_empty() { ui.label(RichText::new("No folders or volumes are mounted in this container.").size(12.0).color(MUTED)); }
+                    if details.mounts.is_empty() { ui.label(RichText::new("No folders or volumes are mounted in this container.").size(12.0).color(design::palette(ui).muted)); }
                     for (index, mount) in details.mounts.iter().enumerate() {
                         ui.push_id(index, |ui| {
-                            design::card().show(ui, |ui| {
+                            design::card(ui.ctx()).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -1330,9 +1350,9 @@ impl DockerView {
                                         });
                                     });
                                 });
-                                ui.label(RichText::new(format!("{} · {}", mount.kind, if mount.writable { "Read & write" } else { "Read only" })).size(11.5).color(MUTED));
+                                ui.label(RichText::new(format!("{} · {}", mount.kind, if mount.writable { "Read & write" } else { "Read only" })).size(11.5).color(design::palette(ui).muted));
                                 ui.add_space(8.0);
-                                ui.add(egui::Label::new(RichText::new(&mount.source).size(12.0).color(MUTED)).wrap()).on_hover_text(&mount.source);
+                                ui.add(egui::Label::new(RichText::new(&mount.source).size(12.0).color(design::palette(ui).muted)).wrap()).on_hover_text(&mount.source);
                             });
                             ui.add_space(8.0);
                         });
@@ -1349,12 +1369,12 @@ impl DockerView {
             ui.add_space(12.0);
         }
                     self.container_diagnostics(ui, runtime, &details, enabled);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(design::heading(if details.state == "running" { "Published ports" } else { "Configured ports" }, 14.0));
                         ui.add_space(8.0);
                         if details.ports.is_empty() {
-                            ui.label(RichText::new("No host ports configured").size(12.0).color(MUTED));
+                            ui.label(RichText::new("No host ports configured").size(12.0).color(design::palette(ui).muted));
                         }
                         for (index, port) in details.ports.iter().enumerate() {
                             ui.push_id(index, |ui| {
@@ -1383,10 +1403,10 @@ impl DockerView {
                         if ui.link(project).clicked() && enabled {
                             self.compose = true; self.compose_import = false; self.project_selected = Some(project.clone()); self.submit(runtime, Action::Projects);
                         }
-                        if let Some(service) = &details.service { ui.label(RichText::new(format!("Service: {service}")).size(12.0).color(MUTED)); }
+                        if let Some(service) = &details.service { ui.label(RichText::new(format!("Service: {service}")).size(12.0).color(design::palette(ui).muted)); }
                     }
                     ui.add_space(20.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.collapsing("Command & diagnostics", |ui| {
                             design::property(ui, "Restarts", &details.restarts.to_string());
@@ -1447,7 +1467,7 @@ impl DockerView {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
+                    .fill(design::palette(ui).base)
                     .inner_margin(egui::Margin::symmetric(22, 14)),
             )
             .show(ui, |ui| {
@@ -1490,7 +1510,7 @@ impl DockerView {
                             && ui
                                 .add_enabled(
                                     self.pending.is_none() && self.connected(),
-                                    design::primary("+  Run container"),
+                                    design::primary(ui, "+  Run container"),
                                 )
                                 .clicked()
                         {
@@ -1500,7 +1520,7 @@ impl DockerView {
                             if ui
                                 .add_enabled(
                                     self.pending.is_none() && self.connected(),
-                                    design::primary("+  Open project"),
+                                    design::primary(ui, "+  Open project"),
                                 )
                                 .clicked()
                             {
@@ -1516,11 +1536,14 @@ impl DockerView {
                             && ui
                                 .add_enabled(
                                     self.pending.is_none() && self.connected(),
-                                    design::primary(if self.kind == Kind::Images {
-                                        "+  Pull image"
-                                    } else {
-                                        "+  Create volume"
-                                    }),
+                                    design::primary(
+                                        ui,
+                                        if self.kind == Kind::Images {
+                                            "+  Pull image"
+                                        } else {
+                                            "+  Create volume"
+                                        },
+                                    ),
                                 )
                                 .clicked()
                         {
@@ -1576,7 +1599,11 @@ impl DockerView {
                 .resizable(true)
                 .default_size(210.0)
                 .min_size(100.0)
-                .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(18))
+                .frame(
+                    egui::Frame::new()
+                        .fill(design::palette(ui).base)
+                        .inner_margin(18),
+                )
                 .show(ui, |ui| {
                     ui.horizontal(|ui| {
                         design::eyebrow(ui, "OUTPUT");
@@ -1615,7 +1642,11 @@ impl DockerView {
                 .default_size(248.0)
                 .min_size(224.0)
                 .max_size(380.0)
-                .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
+                .frame(
+                    egui::Frame::new()
+                        .fill(design::palette(ui).surface)
+                        .inner_margin(12),
+                )
                 .show(ui, |ui| {
                     design::search(ui, &mut self.query, "Search containers…");
                     ui.add_space(12.0);
@@ -1641,7 +1672,7 @@ impl DockerView {
                                 "No matching containers"
                             })
                             .small()
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                         );
                     }
                     if self.pending.is_some() {
@@ -1673,7 +1704,7 @@ impl DockerView {
                         });
                 });
         }
-        egui::CentralPanel::default().frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24)).show(ui,|ui| {
+        egui::CentralPanel::default().frame(egui::Frame::new().fill(design::palette(ui).base).inner_margin(24)).show(ui,|ui| {
             if cfg!(windows){ui.label("The Docker API is available on macOS and Linux. Local and cloud machines are available on Windows.");return;}
             if !self.connected() && !cfg!(windows) {
                 self.connection_content(ui, runtime);
@@ -1701,10 +1732,10 @@ impl DockerView {
                 ui.add_space(70.0);
                 ui.vertical_centered(|ui| {
                     ui.heading(if !query.is_empty() && self.valid {"No matching resources"}else if self.valid && self.kind == Kind::Containers {"Run your first container"}else if self.valid {"Nothing here yet"}else if self.pending.is_some() {"Loading containers…"}else{"Couldn’t load containers"});
-                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Run a local image, or open Projects to start a Compose application."}else{"Check the connection details above, then refresh to try again."}).color(MUTED));
+                    ui.label(RichText::new(if !query.is_empty() && self.valid {"Try a different name or clear your search."}else if self.valid {"Run a local image, or open Projects to start a Compose application."}else{"Check the connection details above, then refresh to try again."}).color(design::palette(ui).muted));
                     ui.add_space(16.0);
-                    if self.valid && self.kind == Kind::Containers && query.is_empty() && ui.add_enabled(self.pending.is_none(),design::primary("Run container…")).clicked(){self.open_run_container(runtime,None);}
-                    if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary("Refresh")).clicked(){self.refresh(runtime);}
+                    if self.valid && self.kind == Kind::Containers && query.is_empty() && ui.add_enabled(self.pending.is_none(),design::primary(ui, "Run container…")).clicked(){self.open_run_container(runtime,None);}
+                    if !self.valid && ui.add_enabled(self.pending.is_none(),design::primary(ui, "Refresh")).clicked(){self.refresh(runtime);}
                 });
             }
 
@@ -1786,7 +1817,7 @@ impl DockerView {
                         Action::ForgetProject(_) => ("Forget project", false),
                         _ => ("Connect Docker", false),
                     };
-                    let button = design::primary(label).fill(if destructive { design::RED } else { design::ACCENT });
+                    let button = design::primary(ui, label).fill(if destructive { design::palette(ui).red } else { design::palette(ui).accent });
                     if ui.add_enabled(self.pending.is_none(),button).clicked(){self.confirm=None;self.submit(runtime,action);}
                     if ui.button("Cancel").clicked(){self.confirm=None;}
                     });

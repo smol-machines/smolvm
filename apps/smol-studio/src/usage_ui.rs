@@ -1,4 +1,4 @@
-use crate::design::{self, INK, LINE, MUTED};
+use crate::design;
 use eframe::egui::{self, RichText};
 use smol_studio::{
     model::Machine,
@@ -10,7 +10,7 @@ pub fn show(ui: &mut egui::Ui, usage: &Usage, machine: &Machine) {
     if machine.state != "running" {
         ui.label(
             RichText::new("Resource usage is available while this machine is running.")
-                .color(MUTED),
+                .color(design::palette(ui).muted),
         );
         return;
     }
@@ -32,7 +32,11 @@ pub fn show(ui: &mut egui::Ui, usage: &Usage, machine: &Machine) {
         } else {
             "Measuring CPU and memory…".to_owned()
         };
-        ui.label(RichText::new(status).size(11.5).color(MUTED));
+        ui.label(
+            RichText::new(status)
+                .size(11.5)
+                .color(design::palette(ui).muted),
+        );
     });
     if let Some(error) = &usage.error {
         ui.add_space(8.0);
@@ -44,8 +48,9 @@ pub fn show(ui: &mut egui::Ui, usage: &Usage, machine: &Machine) {
     }
     ui.add_space(12.0);
     let sample = last.map(|p| &p.sample);
+    let colors = design::palette(ui);
     ui.columns(2, |cols| {
-        design::card().show(&mut cols[0], |ui| {
+        design::card(cols[0].ctx()).show(&mut cols[0], |ui| {
             ui.set_width(ui.available_width());
             let cpu = sample.and_then(|s| s.cpu_percent);
             design::metric(
@@ -65,16 +70,20 @@ pub fn show(ui: &mut egui::Ui, usage: &Usage, machine: &Machine) {
                 s.cpu_percent
             });
             ui.add_space(8.0);
-            ui.label(RichText::new("100% = one CPU core").size(11.0).color(MUTED));
+            ui.label(
+                RichText::new("100% = one CPU core")
+                    .size(11.0)
+                    .color(colors.muted),
+            );
             if sample.is_some() && cpu.is_none() {
                 ui.label(
                     RichText::new("CPU measurement unavailable")
                         .size(11.0)
-                        .color(MUTED),
+                        .color(colors.muted),
                 );
             }
         });
-        design::card().show(&mut cols[1], |ui| {
+        design::card(cols[1].ctx()).show(&mut cols[1], |ui| {
             ui.set_width(ui.available_width());
             let memory = sample.and_then(|s| s.memory.as_ref());
             let text = memory
@@ -102,12 +111,12 @@ pub fn show(ui: &mut egui::Ui, usage: &Usage, machine: &Machine) {
                         .unwrap_or_else(|| "Memory measurement unavailable".into()),
                 )
                 .size(11.0)
-                .color(MUTED),
+                .color(colors.muted),
             );
         });
     });
     ui.add_space(12.0);
-    ui.label(RichText::new("CPU measures the machine’s host process. Memory is reported by Linux inside the machine; it is not host memory consumption.").size(11.5).color(MUTED));
+    ui.label(RichText::new("CPU measures the machine’s host process. Memory is reported by Linux inside the machine; it is not host memory consumption.").size(11.5).color(design::palette(ui).muted));
 }
 
 fn chart(
@@ -125,7 +134,7 @@ fn chart(
             format!("Range: 0–{ceiling}")
         })
         .size(10.0)
-        .color(MUTED),
+        .color(design::palette(ui).muted),
     );
     let (rect, _) =
         ui.allocate_exact_size(egui::vec2(ui.available_width(), 80.0), egui::Sense::hover());
@@ -135,7 +144,7 @@ fn chart(
         let y = plot.top() + portion * plot.height();
         painter.line_segment(
             [egui::pos2(plot.left(), y), egui::pos2(plot.right(), y)],
-            egui::Stroke::new(1.0, LINE),
+            egui::Stroke::new(1.0, design::palette(ui).line),
         );
     }
     let mut previous: Option<(Instant, egui::Pos2)> = None;
@@ -155,15 +164,26 @@ fn chart(
         if let Some((at, before)) = previous
             && point.at.saturating_duration_since(at) <= Duration::from_secs(15)
         {
-            painter.line_segment([before, position], egui::Stroke::new(1.5, INK));
+            painter.line_segment(
+                [before, position],
+                egui::Stroke::new(1.5, design::palette(ui).ink),
+            );
         }
-        painter.circle_filled(position, 1.8, INK);
+        painter.circle_filled(position, 1.8, design::palette(ui).ink);
         previous = Some((point.at, position));
     }
     ui.horizontal(|ui| {
-        ui.label(RichText::new("5m ago").size(10.0).color(MUTED));
+        ui.label(
+            RichText::new("5m ago")
+                .size(10.0)
+                .color(design::palette(ui).muted),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-            ui.label(RichText::new("Now").size(10.0).color(MUTED));
+            ui.label(
+                RichText::new("Now")
+                    .size(10.0)
+                    .color(design::palette(ui).muted),
+            );
         });
     });
 }

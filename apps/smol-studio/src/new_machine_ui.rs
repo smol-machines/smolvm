@@ -55,7 +55,7 @@ impl Editor {
                 ui.label(
                     RichText::new("Create a Linux environment on this computer.")
                         .size(12.0)
-                        .color(design::MUTED),
+                        .color(design::palette(ui).muted),
                 );
                 ui.add_space(12.0);
                 let form_height = (ui.available_height() - 82.0).max(180.0);
@@ -99,16 +99,17 @@ impl Editor {
                                 "Leave empty for bare Linux, or enter a local image path.",
                             )
                             .size(11.5)
-                            .color(design::MUTED),
+                            .color(design::palette(ui).muted),
                         );
                         ui.add_space(16.0);
                         ui.label(design::heading("Resources", 14.0));
                         ui.add_space(6.0);
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            let colors = design::palette(ui);
                             ui.columns(2, |cols| {
                                 cols[0].label(
-                                    RichText::new("CPU limit").size(12.0).color(design::MUTED),
+                                    RichText::new("CPU limit").size(12.0).color(colors.muted),
                                 );
                                 cols[0].add(
                                     egui::DragValue::new(&mut self.draft.cpus)
@@ -116,9 +117,7 @@ impl Editor {
                                         .suffix(" cores"),
                                 );
                                 cols[1].label(
-                                    RichText::new("Memory limit")
-                                        .size(12.0)
-                                        .color(design::MUTED),
+                                    RichText::new("Memory limit").size(12.0).color(colors.muted),
                                 );
                                 cols[1].add(
                                     egui::DragValue::new(&mut self.draft.memory_mib)
@@ -143,18 +142,18 @@ impl Editor {
                                     "Make a folder on your computer available inside the machine.",
                                 )
                                 .small()
-                                .color(design::MUTED),
+                                .color(design::palette(ui).muted),
                             );
                             let mut remove = None;
                             let mut pick = None;
                             for (index, folder) in self.draft.folders.iter_mut().enumerate() {
                                 ui.push_id(("folder", index), |ui| {
-                                    design::card().show(ui, |ui| {
+                                    design::card(ui.ctx()).show(ui, |ui| {
                                         ui.set_width(ui.available_width());
                                         ui.label(
                                             RichText::new("On your computer")
                                                 .small()
-                                                .color(design::MUTED),
+                                                .color(design::palette(ui).muted),
                                         );
                                         ui.horizontal(|ui| {
                                             ui.add(
@@ -171,7 +170,7 @@ impl Editor {
                                         ui.label(
                                             RichText::new("Inside the machine")
                                                 .small()
-                                                .color(design::MUTED),
+                                                .color(design::palette(ui).muted),
                                         );
                                         ui.add(
                                             egui::TextEdit::singleline(&mut folder.guest)
@@ -230,7 +229,11 @@ impl Editor {
                                         ui.add(
                                             egui::DragValue::new(&mut port.guest).range(1..=65535),
                                         );
-                                        ui.label(RichText::new("TCP").small().color(design::MUTED));
+                                        ui.label(
+                                            RichText::new("TCP")
+                                                .small()
+                                                .color(design::palette(ui).muted),
+                                        );
                                         if ui.small_button("Remove").clicked() {
                                             remove = Some(index);
                                         }
@@ -249,7 +252,7 @@ impl Editor {
                             ui.label(
                                 RichText::new("Published ports also enable networking.")
                                     .small()
-                                    .color(design::MUTED),
+                                    .color(design::palette(ui).muted),
                             );
                         });
                         ui.add_space(8.0);
@@ -258,12 +261,12 @@ impl Editor {
                             ui.label(
                                 RichText::new("A machine with this name already exists.")
                                     .small()
-                                    .color(design::RED),
+                                    .color(design::palette(ui).red),
                             );
                         } else if !self.draft.name.is_empty()
                             && let Err(e) = self.draft.validate()
                         {
-                            ui.label(RichText::new(e).small().color(design::RED));
+                            ui.label(RichText::new(e).small().color(design::palette(ui).red));
                         }
                     });
                 });
@@ -275,13 +278,13 @@ impl Editor {
                         ui.label(
                             RichText::new("Creating machine…")
                                 .small()
-                                .color(design::MUTED),
+                                .color(design::palette(ui).muted),
                         );
                     } else {
                         ui.label(
                             RichText::new("Starts when you’re ready.")
                                 .small()
-                                .color(design::MUTED),
+                                .color(design::palette(ui).muted),
                         );
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -290,7 +293,7 @@ impl Editor {
                         if ui
                             .add_enabled(
                                 enabled && inventory_valid && valid,
-                                design::primary("Create machine"),
+                                design::primary(ui, "Create machine"),
                             )
                             .clicked()
                         {

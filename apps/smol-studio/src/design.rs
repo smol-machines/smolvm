@@ -1,15 +1,71 @@
 //! Shared native UI primitives. Vector icons and bounded rows need no assets or web renderer.
 use eframe::egui::{self, Color32, FontId, RichText, Stroke, Vec2};
 
-pub const INK: Color32 = Color32::from_rgb(17, 17, 17);
-pub const MUTED: Color32 = Color32::from_rgb(104, 106, 111);
-pub const SIDEBAR: Color32 = Color32::from_rgb(243, 244, 246);
-pub const ACCENT: Color32 = Color32::from_rgb(17, 17, 17);
-pub const LINE: Color32 = Color32::from_rgb(226, 226, 227);
-pub const SURFACE: Color32 = Color32::from_rgb(249, 249, 250);
-pub const SELECTED: Color32 = Color32::from_rgb(232, 235, 239);
-pub const GREEN: Color32 = Color32::from_rgb(44, 122, 63);
-pub const RED: Color32 = Color32::from_rgb(179, 38, 30);
+/// Semantic colors shared by both native system appearances.
+#[derive(Clone, Copy)]
+pub struct Palette {
+    pub ink: Color32,
+    pub muted: Color32,
+    pub sidebar: Color32,
+    pub accent: Color32,
+    pub on_accent: Color32,
+    pub line: Color32,
+    pub surface: Color32,
+    pub base: Color32,
+    pub selected: Color32,
+    pub green: Color32,
+    pub red: Color32,
+    pub error_background: Color32,
+    pub danger_fill: Color32,
+    hover: Color32,
+    hover_line: Color32,
+}
+
+impl Palette {
+    fn for_theme(theme: egui::Theme) -> Self {
+        if theme == egui::Theme::Dark {
+            Self {
+                ink: Color32::from_rgb(236, 238, 242),
+                muted: Color32::from_rgb(163, 167, 176),
+                sidebar: Color32::from_rgb(19, 20, 23),
+                accent: Color32::from_rgb(236, 238, 242),
+                on_accent: Color32::from_rgb(24, 25, 28),
+                line: Color32::from_rgb(61, 64, 71),
+                surface: Color32::from_rgb(30, 32, 36),
+                base: Color32::from_rgb(24, 25, 28),
+                selected: Color32::from_rgb(49, 52, 59),
+                green: Color32::from_rgb(117, 202, 140),
+                red: Color32::from_rgb(255, 146, 138),
+                error_background: Color32::from_rgb(55, 30, 29),
+                danger_fill: Color32::from_rgb(179, 38, 30),
+                hover: Color32::from_rgb(40, 42, 48),
+                hover_line: Color32::from_rgb(100, 104, 114),
+            }
+        } else {
+            Self {
+                ink: Color32::from_rgb(17, 17, 17),
+                muted: Color32::from_rgb(104, 106, 111),
+                sidebar: Color32::from_rgb(243, 244, 246),
+                accent: Color32::from_rgb(17, 17, 17),
+                on_accent: Color32::WHITE,
+                line: Color32::from_rgb(226, 226, 227),
+                surface: Color32::from_rgb(249, 249, 250),
+                base: Color32::WHITE,
+                selected: Color32::from_rgb(232, 235, 239),
+                green: Color32::from_rgb(44, 122, 63),
+                red: Color32::from_rgb(179, 38, 30),
+                error_background: Color32::from_rgb(255, 243, 242),
+                danger_fill: Color32::from_rgb(179, 38, 30),
+                hover: Color32::from_rgb(243, 243, 243),
+                hover_line: Color32::from_rgb(188, 188, 192),
+            }
+        }
+    }
+}
+
+pub fn palette(ui: &egui::Ui) -> Palette {
+    Palette::for_theme(egui::Theme::from_dark_mode(ui.visuals().dark_mode))
+}
 
 #[derive(Clone, Copy)]
 pub enum Icon {
@@ -156,7 +212,11 @@ pub fn icon(painter: &egui::Painter, rect: egui::Rect, kind: Icon, color: Color3
         Icon::Settings => {
             for (y, x) in [(0.18, 0.3), (0.5, 0.7), (0.82, 0.4)] {
                 painter.line_segment([point(0.0, y), point(1.0, y)], stroke);
-                painter.circle_filled(point(x, y), 2.5, SURFACE);
+                painter.circle_filled(
+                    point(x, y),
+                    2.5,
+                    Palette::for_theme(painter.ctx().theme()).surface,
+                );
                 painter.circle_stroke(point(x, y), 2.5, stroke);
             }
         }
@@ -182,9 +242,9 @@ pub fn icon_button(
         egui::WidgetInfo::labeled(egui::Role::Button, enabled && ui.is_enabled(), label)
     });
     let color = if enabled && ui.is_enabled() {
-        MUTED
+        palette(ui).muted
     } else {
-        LINE
+        palette(ui).line
     };
     let center = response.rect.center();
     let stroke = Stroke::new(1.4, color);
@@ -241,12 +301,12 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
         [ui.available_width(), 34.0],
         egui::Button::selectable(selected, "")
             .fill(if selected {
-                Color32::WHITE
+                palette(ui).base
             } else {
                 Color32::TRANSPARENT
             })
             .stroke(if selected {
-                Stroke::new(1.0, LINE)
+                Stroke::new(1.0, palette(ui).line)
             } else {
                 Stroke::NONE
             })
@@ -256,7 +316,11 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
         egui::WidgetInfo::selected(egui::Role::Button, ui.is_enabled(), selected, label)
     });
     row_feedback(ui, &response, selected);
-    let color = if selected { ACCENT } else { MUTED };
+    let color = if selected {
+        palette(ui).accent
+    } else {
+        palette(ui).muted
+    };
     let rect = response.rect;
     icon(
         ui.painter(),
@@ -272,7 +336,11 @@ pub fn nav(ui: &mut egui::Ui, selected: bool, kind: Icon, label: &str) -> egui::
         egui::Align2::LEFT_CENTER,
         label,
         FontId::proportional(13.0),
-        if selected { ACCENT } else { INK },
+        if selected {
+            palette(ui).accent
+        } else {
+            palette(ui).ink
+        },
     );
     response
 }
@@ -283,7 +351,7 @@ pub fn switcher_button(ui: &mut egui::Ui, shortcut: &str) -> egui::Response {
         [ui.available_width(), 30.0],
         egui::Button::new("")
             .fill(Color32::TRANSPARENT)
-            .stroke(Stroke::new(1.0, LINE)),
+            .stroke(Stroke::new(1.0, palette(ui).line)),
     );
     response.widget_info(|| {
         egui::WidgetInfo::labeled(egui::Role::Button, ui.is_enabled(), "Go to workspace")
@@ -294,14 +362,14 @@ pub fn switcher_button(ui: &mut egui::Ui, shortcut: &str) -> egui::Response {
         egui::Align2::LEFT_CENTER,
         "Go to…",
         FontId::proportional(12.0),
-        MUTED,
+        palette(ui).muted,
     );
     ui.painter().text(
         rect.right_center() - egui::vec2(10.0, 0.0),
         egui::Align2::RIGHT_CENTER,
         shortcut,
         FontId::proportional(11.0),
-        MUTED,
+        palette(ui).muted,
     );
     response
 }
@@ -309,14 +377,14 @@ pub fn switcher_button(ui: &mut egui::Ui, shortcut: &str) -> egui::Response {
 pub fn nav_group(ui: &mut egui::Ui, label: &str) {
     ui.horizontal(|ui| {
         ui.add_space(10.0);
-        ui.label(heading(label, 11.0).color(MUTED));
+        ui.label(heading(label, 11.0).color(palette(ui).muted));
     });
     ui.add_space(4.0);
 }
 
-pub fn primary(label: &str) -> egui::Button<'_> {
-    egui::Button::new(RichText::new(label).color(Color32::WHITE))
-        .fill(ACCENT)
+pub fn primary<'a>(ui: &egui::Ui, label: &'a str) -> egui::Button<'a> {
+    egui::Button::new(RichText::new(label).color(palette(ui).on_accent))
+        .fill(palette(ui).accent)
         .stroke(Stroke::NONE)
         .min_size(egui::vec2(0.0, 32.0))
 }
@@ -326,7 +394,11 @@ pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
     let response = ui.add(
         egui::Button::selectable(
             selected,
-            RichText::new(label).color(if selected { INK } else { MUTED }),
+            RichText::new(label).color(if selected {
+                palette(ui).ink
+            } else {
+                palette(ui).muted
+            }),
         )
         .fill(Color32::TRANSPARENT)
         .stroke(Stroke::NONE)
@@ -339,14 +411,14 @@ pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
                 egui::pos2(r.left() + 8.0, r.bottom()),
                 egui::pos2(r.right() - 8.0, r.bottom()),
             ],
-            Stroke::new(2.0, INK),
+            Stroke::new(2.0, palette(ui).ink),
         );
     }
     if response.has_focus() {
         ui.painter().rect_stroke(
             response.rect,
             4,
-            Stroke::new(1.0, INK),
+            Stroke::new(1.0, palette(ui).ink),
             egui::StrokeKind::Inside,
         );
     }
@@ -355,29 +427,30 @@ pub fn tab(ui: &mut egui::Ui, selected: bool, label: &str) -> egui::Response {
 
 fn row_feedback(ui: &egui::Ui, response: &egui::Response, selected: bool) {
     if response.hovered() && !selected {
-        ui.painter().rect_filled(response.rect, 6, SURFACE);
+        ui.painter()
+            .rect_filled(response.rect, 6, palette(ui).surface);
     }
     if response.has_focus() {
         ui.painter().rect_stroke(
             response.rect,
             6,
-            Stroke::new(1.0, INK),
+            Stroke::new(1.0, palette(ui).ink),
             egui::StrokeKind::Inside,
         );
     }
 }
 
-pub fn state_color(state: &str) -> Color32 {
+pub fn state_color(ui: &egui::Ui, state: &str) -> Color32 {
     match state {
-        "running" | "started" | "ready" | "healthy" => GREEN,
-        "failed" | "unreachable" | "error" | "unhealthy" => RED,
-        "paused" | "frozen" | "pausing" | "starting" => ACCENT,
-        _ => MUTED,
+        "running" | "started" | "ready" | "healthy" => palette(ui).green,
+        "failed" | "unreachable" | "error" | "unhealthy" => palette(ui).red,
+        "paused" | "frozen" | "pausing" | "starting" => palette(ui).accent,
+        _ => palette(ui).muted,
     }
 }
 
 pub fn badge(ui: &mut egui::Ui, state: &str) {
-    let color = state_color(state);
+    let color = state_color(ui, state);
     egui::Frame::new()
         .fill(color.gamma_multiply(0.09))
         .corner_radius(12)
@@ -398,24 +471,30 @@ pub fn badge(ui: &mut egui::Ui, state: &str) {
 }
 
 pub fn eyebrow(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(11.0).strong().color(MUTED));
+    ui.label(
+        RichText::new(text)
+            .size(11.0)
+            .strong()
+            .color(palette(ui).muted),
+    );
 }
 
-pub fn card() -> egui::Frame {
+pub fn card(ctx: &egui::Context) -> egui::Frame {
+    let colors = Palette::for_theme(ctx.theme());
     egui::Frame::new()
-        .fill(Color32::WHITE)
-        .stroke(Stroke::new(1.0, LINE))
+        .fill(colors.base)
+        .stroke(Stroke::new(1.0, colors.line))
         .corner_radius(8)
         .inner_margin(16)
 }
 
 pub fn metric(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
     ui.vertical(|ui| {
-        ui.label(RichText::new(label).size(12.0).color(MUTED));
+        ui.label(RichText::new(label).size(12.0).color(palette(ui).muted));
         ui.add_space(4.0);
         ui.horizontal_wrapped(|ui| {
             ui.label(heading(value, 26.0));
-            ui.label(RichText::new(unit).size(12.0).color(MUTED));
+            ui.label(RichText::new(unit).size(12.0).color(palette(ui).muted));
         });
     });
 }
@@ -423,7 +502,7 @@ pub fn metric(ui: &mut egui::Ui, label: &str, value: &str, unit: &str) {
 /// Equal-width filters keep the inventory toolbar quiet and easy to scan.
 pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options: &[(T, &str)]) {
     egui::Frame::new()
-        .fill(SELECTED.gamma_multiply(0.5))
+        .fill(palette(ui).selected.gamma_multiply(0.5))
         .corner_radius(7)
         .inner_margin(3)
         .show(ui, |ui| {
@@ -439,13 +518,13 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options:
                             egui::Button::selectable(
                                 selected,
                                 RichText::new(*label).size(11.5).color(if selected {
-                                    INK
+                                    palette(ui).ink
                                 } else {
-                                    MUTED
+                                    palette(ui).muted
                                 }),
                             )
                             .fill(if selected {
-                                Color32::WHITE
+                                palette(ui).base
                             } else {
                                 Color32::TRANSPARENT
                             })
@@ -464,7 +543,7 @@ pub fn segmented<T: Copy + PartialEq>(ui: &mut egui::Ui, value: &mut T, options:
 pub fn property(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.horizontal(|ui| {
         ui.set_min_height(28.0);
-        ui.label(RichText::new(label).size(13.0).color(MUTED));
+        ui.label(RichText::new(label).size(13.0).color(palette(ui).muted));
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             ui.add(egui::Label::new(RichText::new(value).size(13.0)).truncate())
                 .on_hover_text(value);
@@ -504,7 +583,7 @@ pub fn resource_row(
         [ui.available_width(), 60.0],
         egui::Button::selectable(selected, "")
             .fill(if selected {
-                SELECTED
+                palette(ui).selected
             } else {
                 Color32::TRANSPARENT
             })
@@ -524,19 +603,23 @@ pub fn resource_row(
         ui.painter().rect_stroke(
             response.rect.shrink(2.0),
             4,
-            Stroke::new(1.0, INK),
+            Stroke::new(1.0, palette(ui).ink),
             egui::StrokeKind::Inside,
         );
     }
     let r = response.rect;
     let icon_rect =
         egui::Rect::from_center_size(egui::pos2(r.left() + 25.0, r.center().y), Vec2::splat(30.0));
-    ui.painter().rect_filled(icon_rect, 8, Color32::WHITE);
+    ui.painter().rect_filled(icon_rect, 8, palette(ui).base);
     icon(
         ui.painter(),
         icon_rect.shrink(6.0),
         kind,
-        if selected { INK } else { MUTED },
+        if selected {
+            palette(ui).ink
+        } else {
+            palette(ui).muted
+        },
     );
     let left = r.left() + 49.0;
     let painter = ui.painter_at(egui::Rect::from_min_max(
@@ -558,8 +641,8 @@ pub fn resource_row(
         }
     };
     for (text, y, size, color) in [
-        (name, 12.0, 13.0, INK),
-        (subtitle.as_str(), 33.0, 11.5, MUTED),
+        (name, 12.0, 13.0, palette(ui).ink),
+        (subtitle.as_str(), 33.0, 11.5, palette(ui).muted),
     ] {
         let mut job = egui::text::LayoutJob::simple_singleline(
             text.to_owned(),
@@ -580,7 +663,7 @@ pub fn resource_row(
         ui.painter().circle_filled(
             egui::pos2(r.right() - 13.0, r.center().y),
             3.0,
-            state_color(state),
+            state_color(ui, state),
         );
     }
     response.on_hover_text(format!("{name}\n{subtitle}"))
@@ -597,10 +680,14 @@ pub fn workload_heading(
 ) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(40.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 9, SURFACE);
-        ui.painter()
-            .rect_stroke(rect, 9, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
-        icon(ui.painter(), rect.shrink(10.0), kind, INK);
+        ui.painter().rect_filled(rect, 9, palette(ui).surface);
+        ui.painter().rect_stroke(
+            rect,
+            9,
+            Stroke::new(1.0, palette(ui).line),
+            egui::StrokeKind::Inside,
+        );
+        icon(ui.painter(), rect.shrink(10.0), kind, palette(ui).ink);
         ui.add_space(4.0);
         ui.vertical(|ui| {
             ui.add(egui::Label::new(heading(name, 21.0)).truncate())
@@ -611,8 +698,12 @@ pub fn workload_heading(
                     badge(ui, health);
                 }
                 ui.add(
-                    egui::Label::new(RichText::new(image_label(image)).size(12.0).color(MUTED))
-                        .truncate(),
+                    egui::Label::new(
+                        RichText::new(image_label(image))
+                            .size(12.0)
+                            .color(palette(ui).muted),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(image);
             });
@@ -623,17 +714,22 @@ pub fn workload_heading(
 pub fn resource_heading(ui: &mut egui::Ui, kind: Icon, title: &str, subtitle: &str) {
     ui.horizontal(|ui| {
         let (rect, _) = ui.allocate_exact_size(Vec2::splat(44.0), egui::Sense::hover());
-        ui.painter().rect_filled(rect, 10, SURFACE);
-        ui.painter()
-            .rect_stroke(rect, 10, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
-        icon(ui.painter(), rect.shrink(12.0), kind, MUTED);
+        ui.painter().rect_filled(rect, 10, palette(ui).surface);
+        ui.painter().rect_stroke(
+            rect,
+            10,
+            Stroke::new(1.0, palette(ui).line),
+            egui::StrokeKind::Inside,
+        );
+        icon(ui.painter(), rect.shrink(12.0), kind, palette(ui).muted);
         ui.add_space(4.0);
         ui.vertical(|ui| {
             ui.add(egui::Label::new(heading(title, 21.0)).truncate())
                 .on_hover_text(title);
             if !subtitle.is_empty() {
                 ui.add(
-                    egui::Label::new(RichText::new(subtitle).size(12.0).color(MUTED)).truncate(),
+                    egui::Label::new(RichText::new(subtitle).size(12.0).color(palette(ui).muted))
+                        .truncate(),
                 )
                 .on_hover_text(subtitle);
             }
@@ -655,10 +751,10 @@ pub fn search(ui: &mut egui::Ui, value: &mut String, hint: &str) {
     );
     let center = egui::pos2(response.rect.left() + 14.0, response.rect.center().y - 1.0);
     ui.painter()
-        .circle_stroke(center, 4.0, Stroke::new(1.2, MUTED));
+        .circle_stroke(center, 4.0, Stroke::new(1.2, palette(ui).muted));
     ui.painter().line_segment(
         [center + egui::vec2(3.0, 3.0), center + egui::vec2(6.0, 6.0)],
-        Stroke::new(1.2, MUTED),
+        Stroke::new(1.2, palette(ui).muted),
     );
     if ui.is_enabled() && ui.input_mut(|i| i.consume_key(egui::Modifiers::COMMAND, egui::Key::F)) {
         response.request_focus();
@@ -667,14 +763,18 @@ pub fn search(ui: &mut egui::Ui, value: &mut String, hint: &str) {
 
 pub fn empty_state(ui: &mut egui::Ui, kind: Icon, title: &str, message: &str) {
     let (rect, _) = ui.allocate_exact_size(Vec2::splat(56.0), egui::Sense::hover());
-    ui.painter().rect_filled(rect, 14, SURFACE);
-    ui.painter()
-        .rect_stroke(rect, 14, Stroke::new(1.0, LINE), egui::StrokeKind::Inside);
-    icon(ui.painter(), rect.shrink(15.0), kind, MUTED);
+    ui.painter().rect_filled(rect, 14, palette(ui).surface);
+    ui.painter().rect_stroke(
+        rect,
+        14,
+        Stroke::new(1.0, palette(ui).line),
+        egui::StrokeKind::Inside,
+    );
+    icon(ui.painter(), rect.shrink(15.0), kind, palette(ui).muted);
     ui.add_space(16.0);
     ui.label(heading(title, 20.0));
     ui.add_space(6.0);
-    ui.add(egui::Label::new(RichText::new(message).size(13.0).color(MUTED)).wrap());
+    ui.add(egui::Label::new(RichText::new(message).size(13.0).color(palette(ui).muted)).wrap());
 }
 
 pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
@@ -684,33 +784,39 @@ pub fn section_title(ui: &mut egui::Ui, title: &str, subtitle: &str) {
         |ui| {
             ui.spacing_mut().item_spacing.y = 3.0;
             ui.label(heading(title, 19.0));
-            ui.add(egui::Label::new(RichText::new(subtitle).size(11.5).color(MUTED)).truncate())
-                .on_hover_text(subtitle);
+            ui.add(
+                egui::Label::new(RichText::new(subtitle).size(11.5).color(palette(ui).muted))
+                    .truncate(),
+            )
+            .on_hover_text(subtitle);
         },
     );
 }
 
 pub fn notice(ui: &mut egui::Ui, message: &str) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(255, 243, 242))
+        .fill(palette(ui).error_background)
         .corner_radius(8)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.add(egui::Label::new(RichText::new(message).color(RED)).wrap());
+            ui.add(egui::Label::new(RichText::new(message).color(palette(ui).red)).wrap());
         });
 }
 
 pub fn error_notice(ui: &mut egui::Ui, title: &str, detail: &str) {
     egui::Frame::new()
-        .fill(Color32::from_rgb(255, 243, 242))
+        .fill(palette(ui).error_background)
         .corner_radius(8)
         .inner_margin(12)
         .show(ui, |ui| {
             ui.set_width(ui.available_width());
-            ui.label(RichText::new(title).color(RED));
+            ui.label(RichText::new(title).color(palette(ui).red));
             ui.collapsing("Details", |ui| {
-                ui.add(egui::Label::new(RichText::new(detail).size(12.0).color(MUTED)).wrap());
+                ui.add(
+                    egui::Label::new(RichText::new(detail).size(12.0).color(palette(ui).muted))
+                        .wrap(),
+                );
                 if ui.small_button("Copy error").clicked() {
                     ui.ctx().copy_text(detail.to_owned());
                 }
@@ -759,50 +865,122 @@ pub fn heading(text: &str, size: f32) -> RichText {
     RichText::new(text)
         .family(egui::FontFamily::Name("studio-heading".into()))
         .size(size)
-        .color(INK)
 }
 
 pub fn theme(ctx: &egui::Context) {
     fonts(ctx);
-    ctx.set_theme(egui::ThemePreference::Light);
-    ctx.style_mut_of(egui::Theme::Light, |style| {
-        style
-            .text_styles
-            .insert(egui::TextStyle::Body, FontId::proportional(14.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Button, FontId::proportional(13.0));
-        style
-            .text_styles
-            .insert(egui::TextStyle::Small, FontId::proportional(11.5));
-        style.text_styles.insert(
-            egui::TextStyle::Heading,
-            FontId::new(18.0, egui::FontFamily::Name("studio-heading".into())),
-        );
-        style.spacing.item_spacing = Vec2::new(8.0, 6.0);
-        style.spacing.button_padding = Vec2::new(11.0, 6.0);
-        style.spacing.interact_size.y = 30.0;
-        style.visuals.widgets.noninteractive.corner_radius = 6.into();
-        style.spacing.window_margin = egui::Margin::same(16);
-        style.visuals.override_text_color = Some(INK);
-        style.visuals.hyperlink_color = INK;
-        style.visuals.panel_fill = Color32::WHITE;
-        style.visuals.window_fill = Color32::WHITE;
-        style.visuals.widgets.open.weak_bg_fill = SURFACE;
-        style.visuals.window_corner_radius = 12.into();
-        style.visuals.window_stroke = Stroke::new(1.0, LINE);
-        style.visuals.selection.bg_fill = SELECTED;
-        style.visuals.selection.stroke = Stroke::new(1.0, ACCENT);
-        style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, LINE);
-        style.visuals.widgets.inactive.weak_bg_fill = Color32::WHITE;
-        style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, LINE);
-        style.visuals.widgets.inactive.corner_radius = 5.into();
-        style.visuals.widgets.hovered.weak_bg_fill = Color32::from_rgb(243, 243, 243);
-        style.visuals.widgets.hovered.bg_stroke =
-            Stroke::new(1.0, Color32::from_rgb(188, 188, 192));
-        style.visuals.widgets.hovered.corner_radius = 5.into();
-        style.visuals.widgets.active.weak_bg_fill = SELECTED;
-        style.visuals.widgets.active.corner_radius = 5.into();
-        style.visuals.extreme_bg_color = SURFACE;
-    });
+    ctx.set_theme(egui::ThemePreference::System);
+    ctx.options_mut(|options| options.fallback_theme = egui::Theme::Light);
+    for theme in [egui::Theme::Light, egui::Theme::Dark] {
+        let colors = Palette::for_theme(theme);
+        ctx.style_mut_of(theme, |style| {
+            style
+                .text_styles
+                .insert(egui::TextStyle::Body, FontId::proportional(14.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Button, FontId::proportional(13.0));
+            style
+                .text_styles
+                .insert(egui::TextStyle::Small, FontId::proportional(11.5));
+            style.text_styles.insert(
+                egui::TextStyle::Heading,
+                FontId::new(18.0, egui::FontFamily::Name("studio-heading".into())),
+            );
+            style.spacing.item_spacing = Vec2::new(8.0, 6.0);
+            style.spacing.button_padding = Vec2::new(11.0, 6.0);
+            style.spacing.interact_size.y = 30.0;
+            style.spacing.window_margin = egui::Margin::same(16);
+            style.visuals.override_text_color = Some(colors.ink);
+            style.visuals.hyperlink_color = colors.ink;
+            style.visuals.panel_fill = colors.base;
+            style.visuals.window_fill = colors.base;
+            style.visuals.widgets.open.weak_bg_fill = colors.surface;
+            style.visuals.window_corner_radius = 12.into();
+            style.visuals.window_stroke = Stroke::new(1.0, colors.line);
+            style.visuals.selection.bg_fill = colors.selected;
+            style.visuals.selection.stroke = Stroke::new(1.0, colors.accent);
+            style.visuals.widgets.noninteractive.corner_radius = 6.into();
+            style.visuals.widgets.noninteractive.bg_stroke = Stroke::new(1.0, colors.line);
+            style.visuals.widgets.inactive.weak_bg_fill = colors.base;
+            style.visuals.widgets.inactive.bg_stroke = Stroke::new(1.0, colors.line);
+            style.visuals.widgets.inactive.corner_radius = 5.into();
+            style.visuals.widgets.hovered.weak_bg_fill = colors.hover;
+            style.visuals.widgets.hovered.bg_stroke = Stroke::new(1.0, colors.hover_line);
+            style.visuals.widgets.hovered.corner_radius = 5.into();
+            style.visuals.widgets.active.weak_bg_fill = colors.selected;
+            style.visuals.widgets.active.corner_radius = 5.into();
+            style.visuals.extreme_bg_color = colors.surface;
+        });
+    }
+}
+
+#[cfg(test)]
+mod appearance_tests {
+    use super::*;
+
+    #[test]
+    fn native_theme_changes_update_existing_context_without_an_override() {
+        let ctx = egui::Context::default();
+        theme(&ctx);
+        for system_theme in [
+            None,
+            Some(egui::Theme::Dark),
+            Some(egui::Theme::Light),
+            None,
+        ] {
+            let mut output = ctx.run_ui(
+                egui::RawInput {
+                    system_theme,
+                    ..Default::default()
+                },
+                |root| {
+                    egui::CentralPanel::default().show(root, |ui| {
+                        let dark = system_theme == Some(egui::Theme::Dark);
+                        assert_eq!(ui.visuals().dark_mode, dark);
+                        assert_eq!(ui.visuals().panel_fill, palette(ui).base);
+                        assert_eq!(ui.visuals().override_text_color, Some(palette(ui).ink));
+                    });
+                },
+            );
+            output.textures_delta.clear();
+            assert_eq!(
+                ctx.options(|o| o.theme_preference),
+                egui::ThemePreference::System
+            );
+        }
+    }
+
+    fn luminance(color: Color32) -> f64 {
+        let linear = |value: u8| {
+            let s = f64::from(value) / 255.0;
+            if s <= 0.04045 {
+                s / 12.92
+            } else {
+                ((s + 0.055) / 1.055).powf(2.4)
+            }
+        };
+        0.2126 * linear(color.r()) + 0.7152 * linear(color.g()) + 0.0722 * linear(color.b())
+    }
+    fn contrast(a: Color32, b: Color32) -> f64 {
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+    #[test]
+    fn text_and_action_colors_remain_readable_in_both_appearances() {
+        for theme in [egui::Theme::Light, egui::Theme::Dark] {
+            let p = Palette::for_theme(theme);
+            for text in [p.ink, p.muted, p.green, p.red] {
+                for background in [p.base, p.surface, p.sidebar] {
+                    assert!(
+                        contrast(text, background) >= 4.5,
+                        "{theme:?}: {text:?} on {background:?}"
+                    );
+                }
+            }
+            assert!(contrast(p.accent, p.on_accent) >= 4.5);
+            assert!(contrast(p.red, p.error_background) >= 4.5);
+            assert!(contrast(Color32::WHITE, p.danger_fill) >= 4.5);
+        }
+    }
 }

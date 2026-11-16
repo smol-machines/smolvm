@@ -17,8 +17,13 @@ fn image_id(ui: &mut egui::Ui, id: &str) {
             }
             ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                 ui.add(
-                    egui::Label::new(RichText::new(id).monospace().size(11.0).color(MUTED))
-                        .truncate(),
+                    egui::Label::new(
+                        RichText::new(id)
+                            .monospace()
+                            .size(11.0)
+                            .color(design::palette(ui).muted),
+                    )
+                    .truncate(),
                 )
                 .on_hover_text(id);
             });
@@ -45,30 +50,30 @@ impl DockerView {
             window = window.open(&mut open);
         }
         window.show(ctx, |ui| {
-            ui.label(RichText::new("Create a local name for this image.").small().color(MUTED));
+            ui.label(RichText::new("Create a local name for this image.").small().color(design::palette(ui).muted));
             ui.add_space(12.0);
             egui::ScrollArea::vertical().id_salt("image-tag-form").max_height((ctx.content_rect().height() - 190.0).clamp(160.0, 440.0)).show(ui, |ui| {
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     design::eyebrow(ui, "SOURCE IMAGE");
                     ui.add(egui::Label::new(RichText::new(&form.source_label).strong()).wrap());
                     image_id(ui, &form.source_id);
                 });
                 ui.add_space(12.0);
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
-                    ui.label(RichText::new("New image reference").small().color(MUTED));
+                    ui.label(RichText::new("New image reference").small().color(design::palette(ui).muted));
                     let response = ui.add_enabled(!busy, egui::TextEdit::singleline(&mut form.reference).desired_width(f32::INFINITY).hint_text("my-app:dev"));
                     if form.focus_reference && !busy { response.request_focus(); form.focus_reference = false; }
                     if response.changed() {
                         form.plan = None;
                         form.error = None;
                     }
-                    ui.label(RichText::new("Repository and tag, including a registry if needed.").small().color(MUTED));
+                    ui.label(RichText::new("Repository and tag, including a registry if needed.").small().color(design::palette(ui).muted));
                 });
                 if let Some(plan) = &form.plan {
                     ui.add_space(12.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         design::eyebrow(ui, "REVIEW");
                         ui.add(egui::Label::new(RichText::new(&plan.reference).monospace()).wrap());
@@ -84,7 +89,7 @@ impl DockerView {
                     });
                 }
                 if !form.reference.is_empty() && let Err(error) = smol_studio::image_tag::reference(form.reference.trim()) {
-                    ui.add_space(8.0); ui.label(RichText::new(error).small().color(design::RED));
+                    ui.add_space(8.0); ui.label(RichText::new(error).small().color(design::palette(ui).red));
                 }
                 if let Some(error) = &form.error {
                     ui.add_space(12.0);
@@ -98,12 +103,12 @@ impl DockerView {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if let Some(plan) = &form.plan {
                         if plan.previous_id.as_deref() == Some(&plan.source_id) {
-                            cancel = ui.add_enabled(!busy, design::primary("Done")).clicked();
+                            cancel = ui.add_enabled(!busy, design::primary(ui, "Done")).clicked();
                         } else {
-                            apply = ui.add_enabled(!busy && self.valid, design::primary(if plan.previous_id.is_some() { "Move tag" } else { "Create tag" })).clicked();
+                            apply = ui.add_enabled(!busy && self.valid, design::primary(ui, if plan.previous_id.is_some() { "Move tag" } else { "Create tag" })).clicked();
                         }
                     } else {
-                        review = ui.add_enabled(!busy && self.valid && smol_studio::image_tag::reference(form.reference.trim()).is_ok(), design::primary("Review tag")).clicked();
+                        review = ui.add_enabled(!busy && self.valid && smol_studio::image_tag::reference(form.reference.trim()).is_ok(), design::primary(ui, "Review tag")).clicked();
                     }
                     cancel |= ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();
                 });

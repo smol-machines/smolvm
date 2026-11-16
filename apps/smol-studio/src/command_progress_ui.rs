@@ -1,5 +1,5 @@
-use crate::design::{self, MUTED};
-use eframe::egui::{self, Color32, RichText};
+use crate::design;
+use eframe::egui::{self, RichText};
 use smol_studio::command_progress::{Progress, Snapshot, Status};
 
 #[derive(Default)]
@@ -48,8 +48,8 @@ impl ProgressView {
             .max_size(if self.expanded { 280.0 } else { 50.0 })
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
-                    .stroke(egui::Stroke::new(1.0, design::LINE))
+                    .fill(design::palette(ui).base)
+                    .stroke(egui::Stroke::new(1.0, design::palette(ui).line))
                     .inner_margin(12),
             )
             .show(ui, |ui| {
@@ -80,9 +80,9 @@ impl ProgressView {
                             ui.ctx().copy_text(snapshot.text.clone());
                         }
                         let (label, color) = match snapshot.status {
-                            Status::Running => ("Running", MUTED),
-                            Status::Succeeded => ("Completed", design::GREEN),
-                            Status::Failed => ("Failed", design::RED),
+                            Status::Running => ("Running", design::palette(ui).muted),
+                            Status::Succeeded => ("Completed", design::palette(ui).green),
+                            Status::Failed => ("Failed", design::palette(ui).red),
                         };
                         ui.label(RichText::new(label).size(11.5).color(color));
                         if snapshot.status == Status::Running {
@@ -130,10 +130,10 @@ impl ProgressView {
                     if count == 1 { "line" } else { "lines" },
                     if query.is_empty() { "" } else if count == 1 { " matches" } else { " match" },
                     if snapshot.discarded { " · older output discarded" } else { "" },
-                )).size(10.5).color(MUTED));
+                )).size(10.5).color(design::palette(ui).muted));
                 ui.add_space(4.0);
                 egui::Frame::new()
-                    .fill(design::SURFACE)
+                    .fill(design::palette(ui).surface)
                     .corner_radius(6)
                     .inner_margin(8)
                     .show(ui, |ui| {
@@ -145,7 +145,7 @@ impl ProgressView {
                                 "Waiting for command output…"
                             } else {
                                 "No command output."
-                            }).size(12.0).color(MUTED));
+                            }).size(12.0).color(design::palette(ui).muted));
                             return;
                         }
                         let row_height = ui.fonts_mut(|fonts|
@@ -169,7 +169,7 @@ impl ProgressView {
                                     let (number, line) = lines[index];
                                     ui.horizontal(|ui| {
                                         ui.label(RichText::new(format!("{:>4}", number + 1))
-                                            .monospace().size(11.5).color(MUTED));
+                                            .monospace().size(11.5).color(design::palette(ui).muted));
                                         ui.add(egui::Label::new(RichText::new(line)
                                             .monospace().size(11.5))
                                             .wrap_mode(egui::TextWrapMode::Extend)

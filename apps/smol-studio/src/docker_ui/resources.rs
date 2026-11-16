@@ -28,7 +28,11 @@ fn field(details: &smol_studio::storage::Details, label: &str) -> String {
 fn metadata(ui: &mut egui::Ui, label: &str, value: &str, copy: bool) {
     ui.vertical(|ui| {
         ui.horizontal(|ui| {
-            ui.label(RichText::new(label).size(11.5).color(MUTED));
+            ui.label(
+                RichText::new(label)
+                    .size(11.5)
+                    .color(design::palette(ui).muted),
+            );
             if copy && !value.is_empty() {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -91,7 +95,11 @@ impl DockerView {
             .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
+            .frame(
+                egui::Frame::new()
+                    .fill(design::palette(ui).surface)
+                    .inner_margin(12),
+            )
             .show(ui, |ui| {
                 design::search(
                     ui,
@@ -143,7 +151,7 @@ impl DockerView {
                             "No matches"
                         })
                         .small()
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 }
                 ui.add_enabled_ui(self.pending.is_none(), |ui| {
@@ -228,7 +236,7 @@ impl DockerView {
             ui.vertical_centered(|ui| {
                 if self.pending.is_some() {
                     ui.spinner();
-                    ui.label(RichText::new("Loading resources…").color(MUTED));
+                    ui.label(RichText::new("Loading resources…").color(design::palette(ui).muted));
                     return;
                 }
                 let empty = self.valid && self.rows.is_empty();
@@ -274,11 +282,14 @@ impl DockerView {
                     && !filtered
                     && matches!(self.kind, Kind::Images | Kind::Volumes)
                     && ui
-                        .add(design::primary(if self.kind == Kind::Images {
-                            "Pull image…"
-                        } else {
-                            "Create volume…"
-                        }))
+                        .add(design::primary(
+                            ui,
+                            if self.kind == Kind::Images {
+                                "Pull image…"
+                            } else {
+                                "Create volume…"
+                            },
+                        ))
                         .clicked()
                 {
                     self.resource_input.clear();
@@ -322,7 +333,7 @@ impl DockerView {
             match self.resource_tab {
                 Tab::Overview => {
             ui.horizontal_wrapped(|ui| {
-                if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary("Run…")).clicked() {
+                if details.kind == Kind::Images && ui.add_enabled(enabled, design::primary(ui, "Run…")).clicked() {
                     self.open_run_container(runtime,Some(smol_studio::container_run::Image {id:details.id.clone(),label:title.clone()}));
                 }
                 if details.kind == Kind::Images && ui.add_enabled(enabled, egui::Button::new("Tag image…")).clicked() {
@@ -334,7 +345,7 @@ impl DockerView {
                 if ui.button(if details.kind == Kind::Images { "Copy image ID" } else { "Copy volume name" }).clicked() { ui.ctx().copy_text(details.id.clone()); }
                 ui.add_enabled_ui(enabled, |ui| {
                     ui.menu_button("More", |ui| {
-                        if ui.add_enabled(details.users.is_empty(), egui::Button::new(RichText::new("Remove…").color(design::RED))).on_disabled_hover_text("Remove the containers that reference this resource first.").clicked() {
+                        if ui.add_enabled(details.users.is_empty(), egui::Button::new(RichText::new("Remove…").color(design::palette(ui).red))).on_disabled_hover_text("Remove the containers that reference this resource first.").clicked() {
                             self.confirm = Some(Action::StorageRemove { kind: details.kind, id: details.id.clone(), created: details.created.clone() });
                             ui.close();
                         }
@@ -342,7 +353,7 @@ impl DockerView {
                 });
             });
                     ui.add_space(16.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         for label in if details.kind == Kind::Images { ["Platform", "Image size", "Created"] } else { ["Driver", "Scope", "Created"] } {
                             let value = field(&details, label);
@@ -354,7 +365,7 @@ impl DockerView {
                     ui.add_space(20.0);
                     if details.kind == Kind::Images {
                         ui.label(design::heading("Tags", 14.0)); ui.add_space(8.0);
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             for (index, tag) in field(&details, "Tags").lines().enumerate() {
                                 if index > 0 { ui.separator(); }
@@ -362,19 +373,19 @@ impl DockerView {
                             }
                         });
                         ui.add_space(20.0);
-                        design::card().show(ui, |ui| { ui.set_width(ui.available_width()); metadata(ui, "Image ID", &details.id, true); });
+                        design::card(ui.ctx()).show(ui, |ui| { ui.set_width(ui.available_width()); metadata(ui, "Image ID", &details.id, true); });
                     } else {
                         ui.label(design::heading("Storage", 14.0)); ui.add_space(8.0);
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             metadata(ui, "Engine storage path", &field(&details, "Storage path"), true);
                         });
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Data persists when containers stop or are removed.").size(12.0).color(MUTED));
+                        ui.label(RichText::new("Data persists when containers stop or are removed.").size(12.0).color(design::palette(ui).muted));
                     }
                 }
                 Tab::Containers => {
-                    ui.label(RichText::new("Containers that reference this resource, including stopped containers.").size(12.0).color(MUTED));
+                    ui.label(RichText::new("Containers that reference this resource, including stopped containers.").size(12.0).color(design::palette(ui).muted));
                     ui.add_space(12.0);
                     if details.users.is_empty() { Self::empty_connections(ui); }
                     for user in &details.users {
@@ -402,7 +413,7 @@ impl DockerView {
         ui.add_space(16.0);
     }
     fn empty_connections(ui: &mut egui::Ui) {
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.label(RichText::new("No containers attached").size(13.0));
         });
@@ -430,7 +441,7 @@ impl DockerView {
                         ui.ctx().copy_text(details.name.clone());
                     }
                     ui.add_space(16.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         design::property(ui, "Driver", &details.driver);
                         design::property(ui, "Scope", &details.scope);
@@ -444,12 +455,12 @@ impl DockerView {
                         ui.label(
                             RichText::new("No IP address pools reported for this network.")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(design::palette(ui).muted),
                         );
                     }
                     for (index, subnet) in details.subnets.iter().enumerate() {
                         ui.push_id(index, |ui| {
-                            design::card().show(ui, |ui| {
+                            design::card(ui.ctx()).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 metadata(ui, "Subnet", &subnet.subnet, true);
                                 ui.add_space(10.0);
@@ -463,7 +474,7 @@ impl DockerView {
                         ui.add_space(8.0);
                     }
                     ui.add_space(12.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         metadata(ui, "Network ID", &details.id, true);
                     });
@@ -472,7 +483,7 @@ impl DockerView {
                     ui.label(
                         RichText::new("Attached endpoints reported by this network.")
                             .size(12.0)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                     );
                     ui.add_space(12.0);
                     if details.endpoints.is_empty() {
@@ -480,7 +491,7 @@ impl DockerView {
                     }
                     for endpoint in &details.endpoints {
                         ui.push_id(&endpoint.id, |ui| {
-                            design::card().show(ui, |ui| {
+                            design::card(ui.ctx()).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.horizontal(|ui| {
                                     ui.with_layout(

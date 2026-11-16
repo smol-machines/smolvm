@@ -44,7 +44,7 @@ impl CloudView {
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
                         if !self.valid {
-                            ui.label(RichText::new("Showing the last loaded details.").size(12.0).color(MUTED));
+                            ui.label(RichText::new("Showing the last loaded details.").size(12.0).color(design::palette(ui).muted));
                             ui.add_space(8.0);
                         }
                         if let Some(error) = &self.error {
@@ -52,7 +52,7 @@ impl CloudView {
                         }
                         match self.account_tab {
                             Tab::Overview => {
-                                design::card().show(ui, |ui| {
+                                design::card(ui.ctx()).show(ui, |ui| {
                                     ui.set_width(ui.available_width());
                                     design::property(ui, "Status", identity.tenant_status.as_deref().unwrap_or("Not reported"));
                                     let plan = self.snapshot.account.as_ref().and_then(|a| a["plan"]["name"].as_str()).unwrap_or("Not reported");
@@ -72,7 +72,7 @@ impl CloudView {
                                 ui.label(design::heading("Usage this period", 14.0));
                                 ui.add_space(8.0);
                                 if let Some(account) = &self.snapshot.account {
-                                    design::card().show(ui, |ui| {
+                                    design::card(ui.ctx()).show(ui, |ui| {
                                         ui.set_width(ui.available_width());
                                         for (label, amount) in [
                                             ("Gross usage", &account["periodCost"]["totalMicros"]),
@@ -83,14 +83,14 @@ impl CloudView {
                                         }
                                     });
                                     ui.add_space(6.0);
-                                    ui.label(RichText::new("USD · amounts reported by Smol Cloud at the last refresh.").size(11.5).color(MUTED));
+                                    ui.label(RichText::new("USD · amounts reported by Smol Cloud at the last refresh.").size(11.5).color(design::palette(ui).muted));
                                 } else {
                                     account_unavailable(ui, &identity);
                                 }
                             }
                             Tab::Limits => {
                                 if let Some(account) = &self.snapshot.account {
-                                    design::card().show(ui, |ui| {
+                                    design::card(ui.ctx()).show(ui, |ui| {
                                         ui.set_width(ui.available_width());
                                         for (label, field, unit) in [
                                             ("Machines", "effectiveMaxMachines", ""),
@@ -103,7 +103,7 @@ impl CloudView {
                                         }
                                     });
                                     ui.add_space(8.0);
-                                    ui.label(RichText::new("Limits apply to this cloud account. Local machines use your computer’s resources.").size(12.0).color(MUTED));
+                                    ui.label(RichText::new("Limits apply to this cloud account. Local machines use your computer’s resources.").size(12.0).color(design::palette(ui).muted));
                                 } else {
                                     account_unavailable(ui, &identity);
                                 }
@@ -120,13 +120,13 @@ impl CloudView {
                 ui.horizontal(|ui| {
                     if self.pending {
                         ui.spinner();
-                        ui.label(RichText::new("Refreshing account…").size(11.5).color(MUTED));
+                        ui.label(RichText::new("Refreshing account…").size(11.5).color(design::palette(ui).muted));
                     } else {
                         let age = self.last.elapsed().as_secs();
-                        ui.label(RichText::new(if self.valid { format!("Checked {age}s ago") } else { "Refresh needed".into() }).size(11.5).color(MUTED));
+                        ui.label(RichText::new(if self.valid { format!("Checked {age}s ago") } else { "Refresh needed".into() }).size(11.5).color(design::palette(ui).muted));
                     }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        close = ui.add(design::primary("Done")).clicked();
+                        close = ui.add(design::primary(ui, "Done")).clicked();
                         if ui.add_enabled(!self.pending, egui::Button::new("Refresh")).clicked() {
                             self.refresh();
                         }
@@ -153,7 +153,11 @@ fn account_unavailable(ui: &mut egui::Ui, identity: &smol_studio::cloud::Identit
 fn copy_detail(ui: &mut egui::Ui, label: &str, value: &str) {
     ui.add_space(8.0);
     ui.horizontal(|ui| {
-        ui.label(RichText::new(label).size(11.5).color(MUTED));
+        ui.label(
+            RichText::new(label)
+                .size(11.5)
+                .color(design::palette(ui).muted),
+        );
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
             if ui
                 .small_button("Copy")

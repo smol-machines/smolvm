@@ -246,7 +246,7 @@ impl FilesView {
                     if ui
                         .add_enabled(
                             self.listing.is_some() && self.error.is_none(),
-                            design::primary("Upload…"),
+                            design::primary(ui, "Upload…"),
                         )
                         .clicked()
                     {
@@ -265,7 +265,11 @@ impl FilesView {
             design::error_notice(ui, "Files could not be loaded or transferred.", error);
         }
         if let Some(notice) = &self.notice {
-            ui.label(RichText::new(notice).small().color(design::MUTED));
+            ui.label(
+                RichText::new(notice)
+                    .small()
+                    .color(design::palette(ui).muted),
+            );
         }
         if let Some(listing) = &self.listing {
             let query = self.filter.to_lowercase();
@@ -292,7 +296,7 @@ impl FilesView {
                             }
                         ))
                         .small()
-                        .color(design::MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 });
             });
@@ -314,7 +318,7 @@ impl FilesView {
                         "Try another name or show hidden files."
                     })
                     .size(12.0)
-                    .color(design::MUTED),
+                    .color(design::palette(ui).muted),
                 );
                 if !listing.entries.is_empty() && ui.button("Clear filters").clicked() {
                     self.filter.clear();
@@ -356,9 +360,9 @@ impl FilesView {
                                     });
                                     let rect = response.rect;
                                     let color = if ui.is_enabled() {
-                                        design::INK
+                                        design::palette(ui).ink
                                     } else {
-                                        design::MUTED
+                                        design::palette(ui).muted
                                     };
                                     design::icon(
                                         ui.painter(),
@@ -371,7 +375,7 @@ impl FilesView {
                                         } else {
                                             design::Icon::File
                                         },
-                                        design::MUTED,
+                                        design::palette(ui).muted,
                                     );
                                     let mut job = egui::text::LayoutJob::simple_singleline(
                                         display,
@@ -414,7 +418,7 @@ impl FilesView {
                                                 ui.label(
                                                     RichText::new(byte_size(entry.size))
                                                         .small()
-                                                        .color(design::MUTED),
+                                                        .color(design::palette(ui).muted),
                                                 );
                                             } else {
                                                 ui.label(
@@ -424,7 +428,7 @@ impl FilesView {
                                                         _ => "Special file",
                                                     })
                                                     .small()
-                                                    .color(design::MUTED),
+                                                    .color(design::palette(ui).muted),
                                                 );
                                             }
                                         },
@@ -493,7 +497,7 @@ impl FilesView {
                     if self.container { "Copy a file from your computer into this container." } else { "Copy a file from your computer into this machine." }
                 } else {
                     "Save a copy of this file to your computer."
-                }).size(12.0).color(design::MUTED));
+                }).size(12.0).color(design::palette(ui).muted));
                 ui.add_space(12.0);
                 let body_height = (ui.available_height() - 60.0).max(180.0);
                 egui::ScrollArea::vertical()
@@ -504,24 +508,24 @@ impl FilesView {
                             design::error_notice(ui, "Transfer failed. Your paths are kept below.", error);
                             ui.add_space(12.0);
                         }
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new("On your computer").size(11.5).color(design::MUTED));
+                            ui.label(RichText::new("On your computer").size(11.5).color(design::palette(ui).muted));
                             ui.add(egui::Label::new(transfer.local.display().to_string()).wrap().selectable(true));
                         });
                         ui.add_space(12.0);
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new(format!("In {}", self.display_name)).size(11.5).color(design::MUTED));
+                            ui.label(RichText::new(format!("In {}", self.display_name)).size(11.5).color(design::palette(ui).muted));
                             ui.add_enabled_ui(!busy, |ui| {
                                 ui.add(egui::TextEdit::singleline(&mut transfer.guest).desired_width(f32::INFINITY));
                             });
                             if let Err(error) = files::validate_path(&transfer.guest) {
-                                ui.label(RichText::new(error).small().color(design::RED));
+                                ui.label(RichText::new(error).small().color(design::palette(ui).red));
                             }
                         });
                         ui.add_space(12.0);
-                        ui.label(RichText::new(if self.container && transfer.upload { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else if self.container { "An existing file at the destination will be replaced." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::MUTED));
+                        ui.label(RichText::new(if self.container && transfer.upload { "An existing file at the destination will be replaced. Uploads support files up to 4095 MiB." } else if self.container { "An existing file at the destination will be replaced." } else { "An existing file at the destination will be replaced. Files up to 4 GiB are supported." }).size(11.5).color(design::palette(ui).muted));
                     });
                 ui.add_space((ui.available_height() - 48.0).max(12.0));
                 ui.separator();
@@ -529,7 +533,7 @@ impl FilesView {
                 ui.horizontal(|ui| {
                     if busy { ui.spinner(); ui.label("Transferring…"); }
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok(), design::primary(if transfer.upload { "Upload file" } else { "Save file" })).clicked() {
+                        if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok(), design::primary(ui, if transfer.upload { "Upload file" } else { "Save file" })).clicked() {
                             self.error = None;
                             action = Some(Request::Transfer {
                                 target: transfer.name.clone(), guest: transfer.guest.clone(),

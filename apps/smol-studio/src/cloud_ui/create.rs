@@ -25,7 +25,7 @@ impl CloudView {
                     "Cloud resources are billed to this account. Your machine starts stopped.",
                 )
                 .size(12.0)
-                .color(MUTED),
+                .color(design::palette(ui).muted),
             );
             ui.add_space(16.0);
             egui::ScrollArea::vertical()
@@ -33,9 +33,13 @@ impl CloudView {
                 .max_height((ctx.content_rect().height() - 310.0).max(170.0))
                 .show(ui, |ui| {
                     ui.add_enabled_ui(!busy, |ui| {
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            ui.label(RichText::new("Name").size(12.0).color(MUTED));
+                            ui.label(
+                                RichText::new("Name")
+                                    .size(12.0)
+                                    .color(design::palette(ui).muted),
+                            );
                             ui.add(
                                 egui::TextEdit::singleline(&mut draft.name)
                                     .desired_width(f32::INFINITY)
@@ -43,7 +47,11 @@ impl CloudView {
                                     .margin(egui::Margin::symmetric(10, 9)),
                             );
                             ui.add_space(10.0);
-                            ui.label(RichText::new("Container image").size(12.0).color(MUTED));
+                            ui.label(
+                                RichText::new("Container image")
+                                    .size(12.0)
+                                    .color(design::palette(ui).muted),
+                            );
                             ui.add(
                                 egui::TextEdit::singleline(&mut draft.image)
                                     .desired_width(f32::INFINITY)
@@ -54,14 +62,17 @@ impl CloudView {
                         ui.add_space(16.0);
                         ui.label(design::heading("Resources", 14.0));
                         ui.add_space(8.0);
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
+                            let colors = design::palette(ui);
                             ui.columns(2, |columns| {
-                                columns[0]
-                                    .label(RichText::new("CPU cores").size(12.0).color(MUTED));
+                                columns[0].label(
+                                    RichText::new("CPU cores").size(12.0).color(colors.muted),
+                                );
                                 columns[0].add(egui::DragValue::new(&mut draft.cpus).range(1..=64));
-                                columns[1]
-                                    .label(RichText::new("Memory (MB)").size(12.0).color(MUTED));
+                                columns[1].label(
+                                    RichText::new("Memory (MB)").size(12.0).color(colors.muted),
+                                );
                                 columns[1].add(
                                     egui::DragValue::new(&mut draft.memory_mib)
                                         .range(256..=262144)
@@ -93,7 +104,11 @@ impl CloudView {
                 && !draft.name.is_empty()
             {
                 ui.add_space(8.0);
-                ui.label(RichText::new(error).size(12.0).color(design::RED));
+                ui.label(
+                    RichText::new(error)
+                        .size(12.0)
+                        .color(design::palette(ui).red),
+                );
             }
             ui.add_space(12.0);
             ui.separator();
@@ -111,7 +126,7 @@ impl CloudView {
                     submit = ui
                         .add_enabled(
                             valid.is_ok() && self.valid && !busy,
-                            design::primary("Create machine"),
+                            design::primary(ui, "Create machine"),
                         )
                         .clicked();
                     cancel = ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();

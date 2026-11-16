@@ -66,7 +66,7 @@ impl TerminalWindow {
                     ui.label(
                         egui::RichText::new(&state.status)
                             .size(11.5)
-                            .color(design::MUTED),
+                            .color(design::palette(ui).muted),
                     );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         let screen = state.parser.screen();
@@ -92,7 +92,7 @@ impl TerminalWindow {
                             ui.label(
                                 egui::RichText::new(format!("{offset} lines back"))
                                     .size(11.5)
-                                    .color(design::MUTED),
+                                    .color(design::palette(ui).muted),
                             );
                         }
                     });
@@ -102,7 +102,7 @@ impl TerminalWindow {
                         "Drag to select · scroll for history · Shift+Page Up / Down",
                     )
                     .size(11.0)
-                    .color(design::MUTED),
+                    .color(design::palette(ui).muted),
                 );
                 ui.add_space(6.0);
                 if let Some(error) = &self.error {

@@ -6,7 +6,7 @@ impl DockerView {
         details: &smol_studio::container_details::ContainerDetails,
     ) {
         if details.state != "running" {
-            design::card().inner_margin(14).show(ui, |ui| {
+            design::card(ui.ctx()).inner_margin(14).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label(
                     RichText::new(match details.state.as_str() {
@@ -15,13 +15,13 @@ impl DockerView {
                         _ => "Resource usage is available while this container is running.",
                     })
                     .size(12.0)
-                    .color(MUTED),
+                    .color(design::palette(ui).muted),
                 );
             });
             return;
         }
         let sample = self.usage.sample.as_ref();
-        design::card().inner_margin(14).show(ui, |ui| {
+        design::card(ui.ctx()).inner_margin(14).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 ui.label(design::heading("Machine usage", 14.0))
@@ -39,7 +39,7 @@ impl DockerView {
                     } else {
                         "Measuring…".into()
                     };
-                    ui.label(RichText::new(status).size(11.0).color(MUTED))
+                    ui.label(RichText::new(status).size(11.0).color(design::palette(ui).muted))
                         .on_hover_text("Updates every 5 seconds while this view is active.");
                 });
             });
@@ -48,10 +48,11 @@ impl DockerView {
                 ("CPU", sample.map(|(_, s)| s.cpu.as_str()).unwrap_or("—")),
                 ("Memory", sample.map(|(_, s)| s.memory.as_str()).unwrap_or("—")),
             ];
-            ui.columns(2, |columns| {
+            let colors = design::palette(ui);
+ui.columns(2, |columns| {
                 for (column, (label, value)) in columns.iter_mut().zip(values) {
                     column.spacing_mut().item_spacing.y = 2.0;
-                    column.label(RichText::new(label).size(11.5).color(MUTED));
+                    column.label(RichText::new(label).size(11.5).color(colors.muted));
                     let (value, limit) = value.split_once('/').map_or((value, None), |(used, limit)| {
                         (used.trim(), Some(limit.trim()))
                     });
@@ -61,11 +62,11 @@ impl DockerView {
                         ui.spacing_mut().item_spacing.x = 4.0;
                         ui.label(design::heading(amount.trim(), 23.0));
                         if !unit.is_empty() {
-                            ui.label(RichText::new(unit).size(12.0).color(MUTED));
+                            ui.label(RichText::new(unit).size(12.0).color(colors.muted));
                         }
                     });
                     if let Some(limit) = limit {
-                        column.label(RichText::new(format!("of {limit} limit")).size(11.0).color(MUTED));
+                        column.label(RichText::new(format!("of {limit} limit")).size(11.0).color(colors.muted));
                     }
                 }
             });

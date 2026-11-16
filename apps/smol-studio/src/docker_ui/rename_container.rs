@@ -45,7 +45,7 @@ impl DockerView {
                     ui.label(
                         RichText::new("Change this container’s name without restarting it.")
                             .size(12.0)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                     );
                     ui.add_space(12.0);
                     design::property(ui, "Current name", &form.original);
@@ -63,7 +63,7 @@ impl DockerView {
                         form.error = None;
                     }
                     if let Err(error) = smol_studio::docker::validate_container_name(&form.name) {
-                        ui.label(RichText::new(error).size(12.0).color(design::RED));
+                        ui.label(RichText::new(error).size(12.0).color(design::palette(ui).red));
                     }
                     if let Some(error) = &form.error {
                         ui.add_space(12.0);
@@ -91,7 +91,7 @@ impl DockerView {
                             !busy
                                 && form.name != form.original
                                 && smol_studio::docker::validate_container_name(&form.name).is_ok(),
-                            design::primary("Rename container"),
+                            design::primary(ui, "Rename container"),
                         )
                         .clicked();
                     cancel = ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked();

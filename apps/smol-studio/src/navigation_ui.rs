@@ -1,4 +1,4 @@
-use crate::design::{self, Icon, MUTED};
+use crate::design::{self, Icon};
 use eframe::egui::{self, Key, Modifiers, RichText};
 use smol_studio::docker::Kind;
 
@@ -84,7 +84,7 @@ impl Switcher {
         let mut chosen = None;
         let modal =
             egui::Modal::new(egui::Id::unique("workspace-switcher"))
-                .frame(design::card().inner_margin(18))
+                .frame(design::card(ctx).inner_margin(18))
                 .show(ctx, |ui| {
                     ui.set_width(440.0);
                     ui.horizontal(|ui| {
@@ -157,7 +157,10 @@ impl Switcher {
                         .max_height(330.0)
                         .show(ui, |ui| {
                             if rows.is_empty() {
-                                ui.label(RichText::new("No matching workspaces.").color(MUTED));
+                                ui.label(
+                                    RichText::new("No matching workspaces.")
+                                        .color(design::palette(ui).muted),
+                                );
                                 ui.add_space(12.0);
                             }
                             for (index, destination) in rows.iter().enumerate() {
@@ -172,7 +175,7 @@ impl Switcher {
                                             egui::Align2::RIGHT_CENTER,
                                             destination.hint(ctx),
                                             egui::FontId::proportional(12.0),
-                                            MUTED,
+                                            design::palette(ui).muted,
                                         );
                                         if moved && self.selected == index {
                                             row.scroll_to_me(Some(egui::Align::Center));
@@ -191,7 +194,7 @@ impl Switcher {
                     "Docker workspaces will be available when the current operation finishes."
                 } else {
                     "↑ ↓ to navigate   ·   Enter to open   ·   Esc to close"
-                }).size(11.0).color(MUTED));
+                }).size(11.0).color(design::palette(ui).muted));
                 });
         if modal.should_close() || chosen.is_some() {
             self.open = false;

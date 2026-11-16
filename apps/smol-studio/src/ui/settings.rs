@@ -106,7 +106,7 @@ impl Studio {
             ui.label(
                 RichText::new("Studio uses the Smol CLI to manage your local machines.")
                     .size(12.0)
-                    .color(MUTED),
+                    .color(design::palette(ui).muted),
             );
             ui.add_space(16.0);
             egui::ScrollArea::vertical()
@@ -114,7 +114,7 @@ impl Studio {
                 .max_height((ctx.content_rect().height() - 360.0).clamp(160.0, 300.0))
                 .auto_shrink([false, false])
                 .show(ui, |ui| {
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         let status = if self.inventory_valid {
                             format!(
@@ -134,10 +134,14 @@ impl Studio {
                     ui.add_space(16.0);
                     ui.label(design::heading("Smol CLI", 14.0));
                     ui.add_space(8.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.add_enabled_ui(!checking && !picking, |ui| {
-                            ui.label(RichText::new("Installation path").size(11.5).color(MUTED));
+                            ui.label(
+                                RichText::new("Installation path")
+                                    .size(11.5)
+                                    .color(design::palette(ui).muted),
+                            );
                             if ui
                                 .add(
                                     egui::TextEdit::singleline(&mut self.runtime_path)
@@ -182,7 +186,7 @@ impl Studio {
                     ui.label(
                         RichText::new("Studio checks the CLI before saving a new connection.")
                             .size(11.5)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                     );
                     ui.add_space(12.0);
                     if let Some(error) = &self.settings_error {
@@ -199,10 +203,14 @@ impl Studio {
                         ui.label(
                             RichText::new("Your machines keep running when you close Studio.")
                                 .size(12.0)
-                                .color(MUTED),
+                                .color(design::palette(ui).muted),
                         );
                         ui.add_space(8.0);
-                        ui.label(RichText::new("Current CLI").size(11.5).color(MUTED));
+                        ui.label(
+                            RichText::new("Current CLI")
+                                .size(11.5)
+                                .color(design::palette(ui).muted),
+                        );
                         ui.add(
                             egui::Label::new(
                                 RichText::new(self.runtime.executable.to_string_lossy())
@@ -216,7 +224,11 @@ impl Studio {
                         }
                         if let Some(path) = &self.runtime.state_dir {
                             ui.add_space(8.0);
-                            ui.label(RichText::new("Machine data folder").size(11.5).color(MUTED));
+                            ui.label(
+                                RichText::new("Machine data folder")
+                                    .size(11.5)
+                                    .color(design::palette(ui).muted),
+                            );
                             ui.add(
                                 egui::Label::new(
                                     RichText::new(path.to_string_lossy()).monospace().size(11.5),
@@ -232,17 +244,29 @@ impl Studio {
             ui.horizontal(|ui| {
                 if checking {
                     ui.spinner();
-                    ui.label(RichText::new("Checking CLI…").size(11.5).color(MUTED));
+                    ui.label(
+                        RichText::new("Checking CLI…")
+                            .size(11.5)
+                            .color(design::palette(ui).muted),
+                    );
                 } else if self.settings_error.is_some() {
                     ui.label(
                         RichText::new("Connection failed")
                             .size(11.5)
-                            .color(design::RED),
+                            .color(design::palette(ui).red),
                     );
                 } else if let Some(message) = &self.settings_feedback {
-                    ui.label(RichText::new(message).size(11.5).color(GREEN));
+                    ui.label(
+                        RichText::new(message)
+                            .size(11.5)
+                            .color(design::palette(ui).green),
+                    );
                 } else if changed {
-                    ui.label(RichText::new("Unsaved change").size(11.5).color(MUTED));
+                    ui.label(
+                        RichText::new("Unsaved change")
+                            .size(11.5)
+                            .color(design::palette(ui).muted),
+                    );
                 }
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     connect = ui
@@ -250,11 +274,14 @@ impl Studio {
                             self.pending.is_none()
                                 && !picking
                                 && !self.runtime_path.trim().is_empty(),
-                            design::primary(if changed {
-                                "Save & connect"
-                            } else {
-                                "Check connection"
-                            }),
+                            design::primary(
+                                ui,
+                                if changed {
+                                    "Save & connect"
+                                } else {
+                                    "Check connection"
+                                },
+                            ),
                         )
                         .clicked();
                     close = ui

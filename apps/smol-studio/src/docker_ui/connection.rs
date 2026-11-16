@@ -36,16 +36,16 @@ impl DockerView {
     }
     fn connection_summary(&self, ui: &mut egui::Ui) {
         let checking = matches!(self.pending, Some(Action::Status));
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.horizontal(|ui| {
                 if checking {
                     ui.spinner();
                 } else {
                     let color = if self.connected() {
-                        design::GREEN
+                        design::palette(ui).green
                     } else {
-                        MUTED
+                        design::palette(ui).muted
                     };
                     let (rect, _) =
                         ui.allocate_exact_size(egui::vec2(8.0, 8.0), egui::Sense::hover());
@@ -70,7 +70,7 @@ impl DockerView {
                         Connection::description,
                     ))
                     .size(12.0)
-                    .color(MUTED),
+                    .color(design::palette(ui).muted),
                 );
             }
             if let Some(report) = &self.connection {
@@ -87,13 +87,13 @@ impl DockerView {
         ui.horizontal_wrapped(|ui| {
             match self.connection.as_ref().map(|c| c.state) {
                 Some(State::MissingCli) => {
-                    if ui.add(design::primary("Get Docker CLI")).clicked() {
+                    if ui.add(design::primary(ui, "Get Docker CLI")).clicked() {
                         ui.ctx().open_url(egui::OpenUrl::new_tab(
                             if cfg!(target_os = "macos") { "https://docs.docker.com/engine/install/binaries/#install-client-binaries-on-macos" } else { "https://docs.docker.com/engine/install/binaries/" },
                         ));
                     }
                 }
-                Some(state) if state != State::Ready && ui.add_enabled(self.pending.is_none(), design::primary(
+                Some(state) if state != State::Ready && ui.add_enabled(self.pending.is_none(), design::primary(ui,
                         if state == State::MissingContext { "Set up Docker…" } else { "Restore connection…" },
                     )).clicked() => {
                     self.connection_open = false;
@@ -119,9 +119,9 @@ impl DockerView {
         if report.state == State::Ready {
             ui.label(design::heading("Use Smol from your terminal", 14.0));
             ui.add_space(8.0);
-            ui.label(RichText::new("These commands select Smol explicitly, regardless of your default Docker context.").size(12.0).color(MUTED));
+            ui.label(RichText::new("These commands select Smol explicitly, regardless of your default Docker context.").size(12.0).color(design::palette(ui).muted));
             ui.add_space(10.0);
-            design::card().show(ui, |ui| {
+            design::card(ui.ctx()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 command_row(ui, "Containers", "docker --context smol ps");
                 ui.add_space(8.0);
@@ -199,13 +199,13 @@ impl DockerView {
             .collapsible(false)
             .open(&mut open)
             .show(ctx, |ui| {
-                ui.label(RichText::new("Connect your local development tools to Smol.").size(12.0).color(MUTED));
+                ui.label(RichText::new("Connect your local development tools to Smol.").size(12.0).color(design::palette(ui).muted));
                 ui.add_space(16.0);
                 egui::ScrollArea::vertical()
                     .id_salt("docker-connection-setup")
                     .max_height((ctx.content_rect().height() - 270.0).clamp(160.0, 360.0))
                     .show(ui, |ui| {
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             setup_item(ui, "Docker & Compose", "Select smol as your default Docker context. Docker commands in your terminal will use Smol.");
                             ui.separator();
@@ -214,14 +214,14 @@ impl DockerView {
                             setup_item(ui, "Testcontainers", "Configure Smol’s socket when no other engine is already configured.");
                         });
                         ui.add_space(12.0);
-                        ui.label(RichText::new("Smol starts its Docker adapter on demand. Your machines keep running when you close Studio.").size(12.0).color(MUTED));
+                        ui.label(RichText::new("Smol starts its Docker adapter on demand. Your machines keep running when you close Studio.").size(12.0).color(design::palette(ui).muted));
                     });
                 ui.add_space(12.0);
                 ui.separator();
                 ui.add_space(8.0);
                 ui.horizontal(|ui| {
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                        apply = ui.add_enabled(self.pending.is_none(), design::primary("Set up Docker")).clicked();
+                        apply = ui.add_enabled(self.pending.is_none(), design::primary(ui, "Set up Docker")).clicked();
                         cancel = ui.button("Cancel").clicked();
                     });
                 });
@@ -237,7 +237,11 @@ impl DockerView {
 }
 
 fn command_row(ui: &mut egui::Ui, label: &str, command: &str) {
-    ui.label(RichText::new(label).size(11.5).color(MUTED));
+    ui.label(
+        RichText::new(label)
+            .size(11.5)
+            .color(design::palette(ui).muted),
+    );
     ui.add_space(5.0);
     ui.horizontal(|ui| {
         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
@@ -263,6 +267,10 @@ fn setup_item(ui: &mut egui::Ui, title: &str, description: &str) {
     ui.add_space(6.0);
     ui.label(design::heading(title, 13.0));
     ui.add_space(4.0);
-    ui.label(RichText::new(description).size(12.0).color(MUTED));
+    ui.label(
+        RichText::new(description)
+            .size(12.0)
+            .color(design::palette(ui).muted),
+    );
     ui.add_space(8.0);
 }

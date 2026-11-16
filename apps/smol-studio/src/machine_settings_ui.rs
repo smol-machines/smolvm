@@ -26,7 +26,11 @@ pub struct Editor {
 }
 
 fn label(ui: &mut egui::Ui, text: &str) {
-    ui.label(RichText::new(text).size(12.0).color(design::MUTED));
+    ui.label(
+        RichText::new(text)
+            .size(12.0)
+            .color(design::palette(ui).muted),
+    );
 }
 
 impl Editor {
@@ -172,7 +176,10 @@ impl Editor {
             ui.add_space(4.0);
             // Keep validation and actions visible even when a folder list is long.
             if let Err(error) = &next {
-                ui.add(egui::Label::new(RichText::new(error).small().color(design::RED)).wrap());
+                ui.add(
+                    egui::Label::new(RichText::new(error).small().color(design::palette(ui).red))
+                        .wrap(),
+                );
             } else {
                 label(
                     ui,
@@ -200,7 +207,7 @@ impl Editor {
                     if ui
                         .add_enabled(
                             enabled && next.as_ref().is_ok_and(|next| next != &self.original),
-                            design::primary("Save changes"),
+                            design::primary(ui, "Save changes"),
                         )
                         .clicked()
                     {
@@ -223,7 +230,7 @@ impl Editor {
     }
 
     fn resources(&mut self, ui: &mut egui::Ui) {
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.columns(2, |columns| {
                 label(&mut columns[0], "CPU limit");
@@ -244,7 +251,7 @@ impl Editor {
         ui.add_space(16.0);
         ui.label(design::heading("Disks", 14.0));
         ui.add_space(8.0);
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.columns(2, |columns| {
                 for (column, (name, value)) in columns.iter_mut().zip([
@@ -266,7 +273,7 @@ impl Editor {
             );
         });
         ui.add_space(16.0);
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.checkbox(&mut self.draft.network, "Enable networking");
             label(
@@ -291,7 +298,7 @@ impl Editor {
         }
         ui.add_space(12.0);
         if self.draft.shared_folders.is_empty() {
-            design::card().show(ui, |ui| {
+            design::card(ui.ctx()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label("No shared folders");
                 label(ui, "Files already stored inside the machine stay there.");
@@ -301,7 +308,7 @@ impl Editor {
         let mut pick = None;
         for (index, folder) in self.draft.shared_folders.iter_mut().enumerate() {
             ui.push_id(("folder", index), |ui| {
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     label(ui, "On your computer");
                     ui.horizontal(|ui| {
@@ -367,7 +374,7 @@ impl Editor {
         }
         ui.add_space(12.0);
         if self.draft.port_mappings.is_empty() {
-            design::card().show(ui, |ui| {
+            design::card(ui.ctx()).show(ui, |ui| {
                 ui.set_width(ui.available_width());
                 ui.label("No published ports");
                 label(ui, "Publish a port to reach a service from your computer.");
@@ -376,7 +383,7 @@ impl Editor {
         let mut remove = None;
         for (index, port) in self.draft.port_mappings.iter_mut().enumerate() {
             ui.push_id(("port", index), |ui| {
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.columns(3, |columns| {
                         label(&mut columns[0], "On your computer");

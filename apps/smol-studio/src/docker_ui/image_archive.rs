@@ -87,7 +87,7 @@ impl DockerView {
                     "Load images from a Docker or OCI archive."
                 })
                 .size(12.0)
-                .color(MUTED),
+                .color(design::palette(ui).muted),
             );
             ui.add_space(12.0);
             egui::ScrollArea::vertical()
@@ -95,25 +95,28 @@ impl DockerView {
                 .max_height((ctx.content_rect().height() - 240.0).clamp(160.0, 320.0))
                 .show(ui, |ui| {
                     if let Some(id) = &form.image_id {
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
-                            design::eyebrow(ui, "SELECTED IMAGE");
+                            design::eyebrow(ui, "design::palette(ui).selected IMAGE");
                             ui.add(egui::Label::new(RichText::new(&form.label).strong()).wrap());
                             ui.add(
                                 egui::Label::new(
-                                    RichText::new(id).monospace().size(11.0).color(MUTED),
+                                    RichText::new(id)
+                                        .monospace()
+                                        .size(11.0)
+                                        .color(design::palette(ui).muted),
                                 )
                                 .wrap(),
                             );
                         });
                         ui.add_space(12.0);
                     }
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         ui.label(
                             RichText::new(if exporting { "Save to" } else { "Archive file" })
                                 .small()
-                                .color(MUTED),
+                                .color(design::palette(ui).muted),
                         );
                         ui.horizontal(|ui| {
                             ui.with_layout(
@@ -146,12 +149,12 @@ impl DockerView {
                                 "Supports tar archives, including gzip and zstd compression."
                             })
                             .size(11.0)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                         );
                     });
                     if let Some(plan) = &form.plan {
                         ui.add_space(12.0);
-                        let review_card = design::card().show(ui, |ui| {
+                        let review_card = design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             design::eyebrow(ui, "REVIEW");
                             ui.add(
@@ -186,7 +189,7 @@ impl DockerView {
                                             if plan.tags.len() == 1 { "tag" } else { "tags" }
                                         ))
                                         .small()
-                                        .color(MUTED),
+                                        .color(design::palette(ui).muted),
                                     );
                                     for tag in &plan.tags {
                                         ui.add(
@@ -241,13 +244,13 @@ impl DockerView {
                             "Export image"
                         };
                         apply = ui
-                            .add_enabled(!busy && self.valid, design::primary(label))
+                            .add_enabled(!busy && self.valid, design::primary(ui, label))
                             .clicked();
                     } else {
                         review = ui
                             .add_enabled(
                                 !busy && self.valid && !form.path.is_empty(),
-                                design::primary("Review"),
+                                design::primary(ui, "Review"),
                             )
                             .clicked();
                     }

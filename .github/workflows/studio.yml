@@ -30,7 +30,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libvulkan-dev
+          sudo apt-get install -y libxkbcommon-dev libwayland-dev libx11-dev libvulkan-dev dbus-daemon
       - run: cargo fmt --all -- --check
       - name: Runtime bundle permissions
         run: python -m unittest discover -s packaging -p "test_*.py"

@@ -1,7 +1,7 @@
 mod account;
 mod create;
 
-use crate::design::{self, ACCENT, MUTED, SURFACE};
+use crate::design;
 use eframe::egui::{self, Color32, RichText};
 use smol_cloud::types::{CreateMachine, Network, Resources, Source};
 use smol_studio::{
@@ -252,7 +252,7 @@ impl CloudView {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
+                    .fill(design::palette(ui).base)
                     .inner_margin(egui::Margin::symmetric(22, 14)),
             )
             .show(ui, |ui| {
@@ -274,7 +274,7 @@ impl CloudView {
                                     self.valid
                                         && !self.pending
                                         && identity.allows("machine:create"),
-                                    design::primary("+  New machine"),
+                                    design::primary(ui, "+  New machine"),
                                 )
                                 .clicked()
                             {
@@ -299,37 +299,37 @@ impl CloudView {
                 }
             });
         if self.snapshot.identity.is_none() || self.device.is_some() {
-            egui::CentralPanel::default().frame(egui::Frame::new().fill(SURFACE).inner_margin(32)).show(ui, |ui| {
+            egui::CentralPanel::default().frame(egui::Frame::new().fill(design::palette(ui).surface).inner_margin(32)).show(ui, |ui| {
                 egui::ScrollArea::vertical().show(ui, |ui| {
                     ui.add_space((ctx.content_rect().height() - 640.0).clamp(12.0, 32.0));
                     ui.vertical_centered(|ui| {
                         ui.set_max_width(480.0);
                         let (r,_) = ui.allocate_exact_size(egui::Vec2::splat(64.0),egui::Sense::hover());
-                        ui.painter().rect_filled(r,18,design::SELECTED);
-                        design::icon(ui.painter(),r.shrink(17.0),design::Icon::Cloud,ACCENT);
+                        ui.painter().rect_filled(r,18,design::palette(ui).selected);
+                        design::icon(ui.painter(),r.shrink(17.0),design::Icon::Cloud,design::palette(ui).accent);
                         ui.add_space(20.0);
                         if let Some((code,url,expires)) = self.device.clone() {
                             ui.label(RichText::new("Finish signing in").size(28.0).strong());
-                            ui.label(RichText::new("Enter this code in your browser to connect your account.").color(MUTED));
+                            ui.label(RichText::new("Enter this code in your browser to connect your account.").color(design::palette(ui).muted));
                             ui.add_space(24.0);
                             ui.label(RichText::new(&code).monospace().size(32.0).strong());
                             if ui.button("Copy code").clicked() { ctx.copy_text(code); }
                             ui.add_space(20.0);
                             ui.hyperlink_to("Open sign-in page",url);
-                            ui.label(RichText::new(format!("Code expires in {} seconds",expires.saturating_duration_since(Instant::now()).as_secs())).small().color(MUTED));
+                            ui.label(RichText::new(format!("Code expires in {} seconds",expires.saturating_duration_since(Instant::now()).as_secs())).small().color(design::palette(ui).muted));
                             if ui.button("Cancel").clicked() { self.send(Action::CancelLogin); }
                         } else {
                             ui.label(design::heading(if self.pending { "Connecting to Smol Cloud" } else { "Connect to Smol Cloud" },28.0));
                             ui.add_space(8.0);
-                            ui.label(RichText::new("Connect your Smol account to manage cloud machines\nand switch between your personal and team workspaces.").color(MUTED));
+                            ui.label(RichText::new("Connect your Smol account to manage cloud machines\nand switch between your personal and team workspaces.").color(design::palette(ui).muted));
                             ui.add_space(28.0);
                             if self.pending {
                                 ui.spinner();
-                                ui.label(RichText::new("Checking your sign-in…").color(MUTED));
+                                ui.label(RichText::new("Checking your sign-in…").color(design::palette(ui).muted));
                                 ui.add_space(12.0);
                             }
                             ui.add_enabled_ui(!self.pending, |ui| {
-                                if ui.add_sized([240.0,40.0],design::primary("Sign in with Smol")).clicked() { self.tenant=None; self.send(Action::Login); }
+                                if ui.add_sized([240.0,40.0],design::primary(ui, "Sign in with Smol")).clicked() { self.tenant=None; self.send(Action::Login); }
                                 ui.add_space(8.0);
                                 if ui.add_sized([240.0,36.0],egui::Button::new("Use CLI sign-in")).clicked() { self.tenant=None; self.send(Action::UseCli); }
                                 ui.add_space(20.0);
@@ -350,12 +350,16 @@ impl CloudView {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(Color32::WHITE)
+                    .fill(design::palette(ui).base)
                     .inner_margin(egui::Margin::symmetric(24, 12)),
             )
             .show(ui, |ui| {
                 ui.horizontal(|ui| {
-                    ui.label(RichText::new("Account").small().color(MUTED));
+                    ui.label(
+                        RichText::new("Account")
+                            .small()
+                            .color(design::palette(ui).muted),
+                    );
                     ui.add_enabled_ui(!self.pending, |ui| {
                         let mut next = self.tenant.clone();
                         egui::ComboBox::from_id_salt("cloud-account")
@@ -410,7 +414,7 @@ impl CloudView {
                     ui.label(
                         RichText::new("Refresh this account to manage its machines.")
                             .small()
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                     );
                 }
             });
@@ -419,7 +423,11 @@ impl CloudView {
             .default_size(248.0)
             .min_size(224.0)
             .max_size(380.0)
-            .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
+            .frame(
+                egui::Frame::new()
+                    .fill(design::palette(ui).surface)
+                    .inner_margin(12),
+            )
             .show(ui, |ui| {
                 design::search(ui, &mut self.query, "Search cloud machines…");
                 ui.add_space(14.0);
@@ -451,7 +459,9 @@ impl CloudView {
                     }
                 }
                 if rows.is_empty() && self.valid {
-                    ui.label(RichText::new("No matching machines.").color(MUTED));
+                    ui.label(
+                        RichText::new("No matching machines.").color(design::palette(ui).muted),
+                    );
                 }
                 let mut list = egui::ScrollArea::vertical().id_salt("cloud-machines");
                 if self.focus_selected
@@ -493,7 +503,7 @@ impl CloudView {
                 });
             });
         egui::CentralPanel::default()
-            .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24))
+            .frame(egui::Frame::new().fill(design::palette(ui).base).inner_margin(24))
             .show(ui, |ui| {
                 let Some(machine) = self
                     .snapshot
@@ -513,7 +523,7 @@ impl CloudView {
                             RichText::new(
                                 if self.query.is_empty() { "Select a machine to see its resources and activity." } else { "Try another name or clear your search." },
                             )
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                         );
                         if !self.query.is_empty() && ui.button("Clear search").clicked() {
                             self.query.clear();
@@ -530,7 +540,7 @@ impl CloudView {
                     design::badge(ui, if machine.is_started() && !machine.is_ready() { "starting" } else { &machine.state });
                     if let Some(source) = &machine.source {
                         let label = source.reference.as_deref().unwrap_or(&source.source_type);
-                        ui.add(egui::Label::new(RichText::new(label).small().color(MUTED)).truncate()).on_hover_text(label);
+                        ui.add(egui::Label::new(RichText::new(label).small().color(design::palette(ui).muted)).truncate()).on_hover_text(label);
                     }
                 });
                 ui.add_space(12.0);
@@ -566,7 +576,7 @@ impl CloudView {
                                 if machine.is_ready() && ui
                                     .add_enabled(
                                         identity.allows("machine:exec"),
-                                        design::primary("Console"),
+                                        design::primary(ui, "Console"),
                                     )
                                     .clicked()
                                 {
@@ -576,7 +586,7 @@ impl CloudView {
                                     && ui
                                         .add_enabled(
                                             identity.allows("machine:create"),
-                                            design::primary("Start machine"),
+                                            design::primary(ui, "Start machine"),
                                         )
                                         .clicked()
                                 {
@@ -596,7 +606,7 @@ impl CloudView {
                                     && ui
                                         .add_enabled(
                                             identity.allows("machine:create"),
-                                            design::primary("Resume machine"),
+                                            design::primary(ui, "Resume machine"),
                                         )
                                         .clicked()
                                 {
@@ -613,7 +623,7 @@ impl CloudView {
                                                 identity.allows("machine:delete"),
                                                 egui::Button::new(
                                                     RichText::new("Delete machine…")
-                                                        .color(design::RED),
+                                                        .color(design::palette(ui).red),
                                                 ),
                                             )
                                             .clicked()
@@ -632,7 +642,7 @@ impl CloudView {
                         if let Some(resources) = &machine.resources {
                             ui.label(design::heading("Configuration", 14.0));
                             ui.add_space(10.0);
-                            design::card().show(ui, |ui| {
+                            design::card(ui.ctx()).show(ui, |ui| {
                                 ui.set_width(ui.available_width());
                                 ui.columns(2, |columns| {
                                     design::metric(
@@ -658,13 +668,13 @@ impl CloudView {
                                     ui.label(
                                         RichText::new(format!("Disk limit: {disk} GB"))
                                             .small()
-                                            .color(MUTED),
+                                            .color(design::palette(ui).muted),
                                     );
                                 }
                             });
                             ui.add_space(24.0);
                         }
-                        design::card().show(ui, |ui| {
+                        design::card(ui.ctx()).show(ui, |ui| {
                             ui.set_width(ui.available_width());
                             design::property(ui, "Account", self.account_label());
                             ui.add_space(8.0);
@@ -684,7 +694,7 @@ impl CloudView {
                         });
                     } else if self.tab == Tab::Console {
                         if !machine.is_ready() {
-                            ui.label(RichText::new("Start this machine and wait for it to be ready to run commands.").size(12.0).color(MUTED));
+                            ui.label(RichText::new("Start this machine and wait for it to be ready to run commands.").size(12.0).color(design::palette(ui).muted));
                             ui.add_space(12.0);
                         }
                         design::eyebrow(ui, "CONSOLE");
@@ -692,7 +702,7 @@ impl CloudView {
                         ui.label(
                             RichText::new("Run a command · 60 second limit")
                                 .small()
-                                .color(MUTED),
+                                .color(design::palette(ui).muted),
                         );
                         ui.add(
                             egui::TextEdit::multiline(&mut self.command)
@@ -708,7 +718,7 @@ impl CloudView {
                                     && machine.is_ready()
                                     && identity.allows("machine:exec")
                                     && !self.command.trim().is_empty(),
-                                design::primary("Run command"),
+                                design::primary(ui, "Run command"),
                             )
                             .clicked()
                         {
@@ -771,7 +781,7 @@ impl CloudView {
                             "Console snapshot"
                         })
                         .small()
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 });
             });
@@ -784,13 +794,13 @@ impl CloudView {
                 60..3600 => format!("{}m ago", seconds / 60),
                 _ => format!("{}h ago", seconds / 3600),
             };
-            ui.label(RichText::new(format!("Fetched {age} · last 200 lines requested")).small().color(MUTED))
+            ui.label(RichText::new(format!("Fetched {age} · last 200 lines requested")).small().color(design::palette(ui).muted))
                 .on_hover_text("Time this snapshot was received. Timestamps inside the output come from the cloud service.");
         } else {
             ui.label(
                 RichText::new("Recent console output · last 200 lines requested")
                     .small()
-                    .color(MUTED),
+                    .color(design::palette(ui).muted),
             );
         }
         if let Some(error) = &self.log_error {
@@ -816,13 +826,15 @@ impl CloudView {
                     } else {
                         "Reload to read this machine’s recent output."
                     })
-                    .color(MUTED),
+                    .color(design::palette(ui).muted),
                 );
             }
             return;
         };
         if text.is_empty() {
-            ui.label(RichText::new("No console output was returned.").color(MUTED));
+            ui.label(
+                RichText::new("No console output was returned.").color(design::palette(ui).muted),
+            );
             return;
         }
         let query = self.log_filter.to_lowercase();
@@ -833,7 +845,9 @@ impl CloudView {
             .filter(|(_, line)| query.is_empty() || line.to_lowercase().contains(&query))
             .collect();
         if lines.is_empty() {
-            ui.label(RichText::new("No log lines match this filter.").color(MUTED));
+            ui.label(
+                RichText::new("No log lines match this filter.").color(design::palette(ui).muted),
+            );
             return;
         }
         ui.label(
@@ -843,9 +857,9 @@ impl CloudView {
                 format!("{} of {total} lines", lines.len())
             })
             .small()
-            .color(MUTED),
+            .color(design::palette(ui).muted),
         );
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             ui.spacing_mut().interact_size.y = 18.0;
             egui::ScrollArea::both()
@@ -860,7 +874,7 @@ impl CloudView {
                                 RichText::new(format!("{:>4}", number + 1))
                                     .monospace()
                                     .size(11.0)
-                                    .color(MUTED),
+                                    .color(design::palette(ui).muted),
                             );
                             ui.add(
                                 egui::Label::new(RichText::new(line).monospace().size(12.0))
@@ -895,12 +909,15 @@ impl CloudView {
                     ui.add_space(8.0);
                     ui.label(format!("Permanently delete “{name}” and its disks?"));
                     ui.add_space(12.0);
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
                         design::property(ui, "Account", self.account_label());
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&id).monospace().size(11.5).color(MUTED),
+                                RichText::new(&id)
+                                    .monospace()
+                                    .size(11.5)
+                                    .color(design::palette(ui).muted),
                             )
                             .wrap(),
                         );
@@ -916,7 +933,7 @@ impl CloudView {
                                     egui::Button::new(
                                         RichText::new("Delete machine").color(Color32::WHITE),
                                     )
-                                    .fill(design::RED),
+                                    .fill(design::palette(ui).danger_fill),
                                 )
                                 .clicked()
                             {

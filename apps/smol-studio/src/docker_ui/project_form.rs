@@ -1,5 +1,5 @@
 use super::{DockerView, PickMode};
-use crate::design::{self, MUTED};
+use crate::design;
 use eframe::egui::{self, RichText};
 use smol_studio::docker::Action;
 
@@ -11,11 +11,11 @@ impl DockerView {
         egui::ScrollArea::vertical().id_salt("compose-form").max_height(body_height).auto_shrink([false, false]).show(ui, |ui| {
             ui.add_space(12.0);
             ui.label(design::heading(if self.compose_name.is_some() { "Project settings" } else { "Open a Compose project" }, 20.0));
-            if let Some(name) = &self.compose_name { ui.add(egui::Label::new(RichText::new(name).color(MUTED)).wrap()); }
+            if let Some(name) = &self.compose_name { ui.add(egui::Label::new(RichText::new(name).color(design::palette(ui).muted)).wrap()); }
             if self.compose_discovered { ui.add_space(8.0); hint(ui, "Detected from Compose containers. Review profiles and environment before applying: the original profile choices and shell variables are not recorded."); }
             ui.add_space(16.0);
             ui.add_enabled_ui(enabled, |ui| {
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(design::heading("Compose files", 14.0));
                     hint(ui, "Applied in order. Later files override the base configuration.");
@@ -36,7 +36,7 @@ impl DockerView {
                     });
                 });
                 ui.add_space(12.0);
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(design::heading("Environment", 14.0));
                     hint(ui, "Choose files for Compose variable substitution. Later files override earlier values; inherited shell variables take precedence.");
@@ -55,7 +55,7 @@ impl DockerView {
                     hint(ui, "Studio remembers file paths, not their contents.");
                 });
                 ui.add_space(12.0);
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.label(design::heading("Profiles", 14.0));
                     hint(ui, "Enable additional services. Separate profiles with commas, or use * for all.");
@@ -65,7 +65,7 @@ impl DockerView {
             });
             if let Some(error) = &self.file_error { ui.add_space(8.0); design::notice(ui, error); }
             if self.compose_files.iter().any(|p| !p.is_empty()) && let Err(error) = self.compose_source().validate() {
-                ui.add_space(8.0); ui.label(RichText::new(error).small().color(design::RED));
+                ui.add_space(8.0); ui.label(RichText::new(error).small().color(design::palette(ui).red));
             }
             ui.add_space(12.0);
         });
@@ -74,7 +74,7 @@ impl DockerView {
         let source = self.compose_source();
         ui.add_enabled_ui(enabled && source.validate().is_ok(), |ui| {
             ui.horizontal_wrapped(|ui| {
-                if ui.add(design::primary("Apply project…")).clicked() {
+                if ui.add(design::primary(ui, "Apply project…")).clicked() {
                     self.confirm = Some(Action::Compose {
                         source: source.clone(),
                         up: true,
@@ -93,7 +93,14 @@ impl DockerView {
 }
 
 fn hint(ui: &mut egui::Ui, text: &str) {
-    ui.add(egui::Label::new(RichText::new(text).size(11.5).color(MUTED)).wrap());
+    ui.add(
+        egui::Label::new(
+            RichText::new(text)
+                .size(11.5)
+                .color(design::palette(ui).muted),
+        )
+        .wrap(),
+    );
 }
 
 fn paths(ui: &mut egui::Ui, files: &mut Vec<String>, allow_empty: bool) -> bool {
@@ -114,7 +121,7 @@ fn paths(ui: &mut egui::Ui, files: &mut Vec<String>, allow_empty: bool) -> bool 
                 egui::Label::new(
                     RichText::new(format!("{}. {filename}", index + 1))
                         .small()
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                 )
                 .truncate(),
             );

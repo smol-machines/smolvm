@@ -77,15 +77,15 @@ impl DockerView {
             window = window.open(&mut open);
         }
         window.show(ctx, |ui| {
-            ui.label(RichText::new("Start a container from an image stored in Smol.").size(12.0).color(MUTED));
+            ui.label(RichText::new("Start a container from an image stored in Smol.").size(12.0).color(design::palette(ui).muted));
             ui.add_space(12.0);
             let mut scroll = egui::ScrollArea::vertical().id_salt("run-container-form").max_height((ctx.content_rect().height()-265.0).clamp(160.0,420.0));
             if std::mem::take(&mut form.reset_scroll) { scroll = scroll.vertical_scroll_offset(0.0); }
             scroll.show(ui, |ui| {
                 ui.add_enabled_ui(!busy, |ui| {
-                    design::card().show(ui, |ui| {
+                    design::card(ui.ctx()).show(ui, |ui| {
                         ui.set_width(ui.available_width());
-                        ui.label(RichText::new("Image").size(11.5).color(MUTED));
+                        ui.label(RichText::new("Image").size(11.5).color(design::palette(ui).muted));
                         if !form.loaded {
                             ui.horizontal(|ui| { if busy { ui.spinner(); } ui.label(if busy {"Loading local images…"} else {"Couldn’t load local images. Refresh to try again."}); });
                         } else if form.images.is_empty() {
@@ -98,17 +98,17 @@ impl DockerView {
                                 for image in &form.images { ui.selectable_value(&mut form.draft.image,image.id.clone(),&image.label); }
                             });
                             if !form.draft.image.is_empty() {
-                                ui.add(egui::Label::new(RichText::new(&form.draft.image).monospace().size(10.5).color(MUTED)).truncate()).on_hover_text(&form.draft.image);
+                                ui.add(egui::Label::new(RichText::new(&form.draft.image).monospace().size(10.5).color(design::palette(ui).muted)).truncate()).on_hover_text(&form.draft.image);
                             }
                         }
                         ui.add_space(10.0);
-                        ui.label(RichText::new("Container name").size(11.5).color(MUTED));
+                        ui.label(RichText::new("Container name").size(11.5).color(design::palette(ui).muted));
                         let name=ui.add(egui::TextEdit::singleline(&mut form.draft.name).desired_width(f32::INFINITY).hint_text("my-app"));
                         if form.focus && !busy { name.request_focus(); form.focus=false; }
                     });
                     ui.add_space(12.0);
                     ui.collapsing("Command", |ui| {
-                        ui.label(RichText::new("Leave empty to use the image’s command. Each field is one argument; the image’s entrypoint is preserved.").size(12.0).color(MUTED));
+                        ui.label(RichText::new("Leave empty to use the image’s command. Each field is one argument; the image’s entrypoint is preserved.").size(12.0).color(design::palette(ui).muted));
                         let mut remove=None;
                         for (index,arg) in form.draft.command.iter_mut().enumerate() {
                             ui.horizontal(|ui| {
@@ -124,7 +124,7 @@ impl DockerView {
                     });
                     ui.add_space(8.0);
                     ui.collapsing("Ports", |ui| {
-                        ui.label(RichText::new("Published on this computer’s localhost (127.0.0.1).").size(12.0).color(MUTED));
+                        ui.label(RichText::new("Published on this computer’s localhost (127.0.0.1).").size(12.0).color(design::palette(ui).muted));
                         let mut remove=None;
                         for (index,port) in form.draft.ports.iter_mut().enumerate() {
                             ui.push_id(index,|ui| { ui.horizontal(|ui| {
@@ -142,7 +142,7 @@ impl DockerView {
                         let mut remove=None;
                         for (index,mount) in form.draft.mounts.iter_mut().enumerate() {
                             ui.push_id(index,|ui| {
-                                design::card().show(ui,|ui| {
+                                design::card(ui.ctx()).show(ui,|ui| {
                                     ui.set_width(ui.available_width());
                                     ui.horizontal(|ui| {
                                         ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
@@ -160,7 +160,7 @@ impl DockerView {
                     });
                     ui.add_space(8.0);
                     ui.collapsing("Environment",|ui| {
-                        ui.label(RichText::new("Values override the image’s environment and are stored in the container configuration.").size(12.0).color(MUTED));
+                        ui.label(RichText::new("Values override the image’s environment and are stored in the container configuration.").size(12.0).color(design::palette(ui).muted));
                         let mut remove=None;
                         for (index,(key,value)) in form.draft.environment.iter_mut().enumerate() {
                             ui.push_id(index,|ui| { ui.horizontal(|ui| {
@@ -183,7 +183,7 @@ impl DockerView {
             ui.horizontal(|ui| {
                 if running {ui.spinner();ui.label("Creating and starting…");}
                 if !running { ui.with_layout(egui::Layout::right_to_left(egui::Align::Center),|ui| {
-                    run=ui.add_enabled(!busy && form.loaded && !form.draft.image.is_empty(),design::primary("Run container")).clicked();
+                    run=ui.add_enabled(!busy && form.loaded && !form.draft.image.is_empty(),design::primary(ui, "Run container")).clicked();
                     cancel=ui.add_enabled(!busy,egui::Button::new("Cancel")).clicked();
                     reload=ui.add_enabled(!busy,egui::Button::new("Refresh images")).clicked();
                 }); }

@@ -41,3 +41,8 @@ objc2-app-kit = { version = "0.3.2", default-features = false, features = ["std"
 [[test]]
 name = "desktop_menu"
 harness = false
+
+[target.'cfg(target_os = "linux")'.dependencies]
+async-channel = "2.5"
+futures-lite = "2.6"
+zbus = "5.19"

@@ -9,7 +9,7 @@ use smol_studio::{
 };
 use std::time::Instant;
 
-use crate::design::{self, GREEN, Icon, MUTED, SURFACE, theme};
+use crate::design::{self, Icon, theme};
 
 #[derive(Clone, Copy, PartialEq)]
 enum Filter {
@@ -36,6 +36,7 @@ enum Workspace {
 
 pub struct Studio {
     brand: egui::TextureHandle,
+    appearance: crate::appearance::Appearance,
     desktop_menu: crate::desktop_menu::DesktopMenu,
     switcher: crate::navigation_ui::Switcher,
     cloud: crate::cloud_ui::CloudView,
@@ -91,6 +92,7 @@ impl Studio {
         let runtime_path = runtime.executable.to_string_lossy().into_owned();
         let mut app = Self {
             brand: design::brand_texture(&cc.egui_ctx),
+            appearance: crate::appearance::Appearance::new(&cc.egui_ctx),
             desktop_menu: crate::desktop_menu::DesktopMenu::new(&cc.egui_ctx),
             switcher: crate::navigation_ui::Switcher::default(),
             cloud: crate::cloud_ui::CloudView::new(&cc.egui_ctx),
@@ -356,7 +358,11 @@ impl Studio {
         egui::Panel::left("navigation")
             .resizable(false)
             .default_size(184.0)
-            .frame(egui::Frame::new().fill(design::SIDEBAR).inner_margin(12))
+            .frame(
+                egui::Frame::new()
+                    .fill(design::palette(ui).sidebar)
+                    .inner_margin(12),
+            )
             .show(ui, |ui| {
                 ui.add_space(6.0);
                 ui.horizontal(|ui| {
@@ -364,7 +370,11 @@ impl Studio {
                     ui.vertical(|ui| {
                         ui.spacing_mut().item_spacing.y = 1.0;
                         ui.label(design::heading("smol studio", 15.0));
-                        ui.label(RichText::new("by smol machines").size(10.0).color(MUTED));
+                        ui.label(
+                            RichText::new("by smol machines")
+                                .size(10.0)
+                                .color(design::palette(ui).muted),
+                        );
                     });
                 });
                 ui.add_space(12.0);
@@ -469,7 +479,7 @@ impl Studio {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(self.local_ready(), design::primary("+  New machine"))
+                    .add_enabled(self.local_ready(), design::primary(ui, "+  New machine"))
                     .clicked()
                 {
                     self.create = Some(crate::new_machine_ui::Editor::default());
@@ -535,9 +545,13 @@ impl Studio {
                         self.open_settings();
                     }
                 } else if self.machines.is_empty() {
-                    ui.label(RichText::new("No machines yet").color(MUTED));
+                    ui.label(RichText::new("No machines yet").color(design::palette(ui).muted));
                 } else {
-                    ui.label(RichText::new("No results").size(12.0).color(MUTED));
+                    ui.label(
+                        RichText::new("No results")
+                            .size(12.0)
+                            .color(design::palette(ui).muted),
+                    );
                 }
             });
             return;
@@ -563,21 +577,21 @@ impl Studio {
         ui.horizontal_wrapped(|ui| {
             if m.can_start()
                 && ui
-                    .add_enabled(enabled, design::primary("Start machine"))
+                    .add_enabled(enabled, design::primary(ui, "Start machine"))
                     .clicked()
             {
                 self.submit(Operation::Start(m.name.clone()));
             }
             if m.state == "paused"
                 && ui
-                    .add_enabled(enabled, design::primary("Resume machine"))
+                    .add_enabled(enabled, design::primary(ui, "Resume machine"))
                     .clicked()
             {
                 self.submit(Operation::Resume(m.name.clone()));
             }
             if m.state == "running"
                 && ui
-                    .add_enabled(enabled, design::primary("Open terminal"))
+                    .add_enabled(enabled, design::primary(ui, "Open terminal"))
                     .clicked()
             {
                 self.terminal = Some(crate::terminal_ui::TerminalWindow::new(
@@ -602,7 +616,7 @@ impl Studio {
                     if m.can_delete() {
                         ui.separator();
                         if ui
-                            .button(RichText::new("Delete machine…").color(design::RED))
+                            .button(RichText::new("Delete machine…").color(design::palette(ui).red))
                             .clicked()
                         {
                             self.delete = Some(m.name.clone());
@@ -688,7 +702,7 @@ impl Studio {
                 }
             }
             Tab::Console => {
-                design::card().show(ui, |ui| {
+                design::card(ui.ctx()).show(ui, |ui| {
                     ui.set_width(ui.available_width());
                     ui.horizontal(|ui| {
                         ui.label(design::heading("Run a command", 14.0));
@@ -698,7 +712,7 @@ impl Studio {
                                     enabled
                                         && m.state == "running"
                                         && !self.command.trim().is_empty(),
-                                    design::primary("Run"),
+                                    design::primary(ui, "Run"),
                                 )
                                 .clicked()
                             {
@@ -732,7 +746,7 @@ impl Studio {
                             "Start this machine to run commands."
                         })
                         .size(11.5)
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 });
                 ui.add_space(16.0);
@@ -749,9 +763,9 @@ impl Studio {
                     if let Some(snapshot) = snapshot {
                         use smol_studio::command_progress::Status;
                         let (label, color) = match snapshot.status {
-                            Status::Running => ("Running", MUTED),
-                            Status::Succeeded => ("Completed", GREEN),
-                            Status::Failed => ("Failed", design::RED),
+                            Status::Running => ("Running", design::palette(ui).muted),
+                            Status::Succeeded => ("Completed", design::palette(ui).green),
+                            Status::Failed => ("Failed", design::palette(ui).red),
                         };
                         ui.label(RichText::new(label).size(11.5).color(color));
                     }
@@ -767,7 +781,7 @@ impl Studio {
                     ui.label(
                         RichText::new("Recent output · older output discarded")
                             .size(11.0)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                     );
                 }
                 ui.add_space(8.0);
@@ -791,7 +805,7 @@ impl Studio {
                             }
                         });
                 } else {
-                    ui.label(RichText::new(if matches!(&self.pending, Some(Operation::Exec { name, .. }) if name == &m.name) { "Waiting for command output…" } else { "Command output will appear here." }).size(12.0).color(MUTED));
+                    ui.label(RichText::new(if matches!(&self.pending, Some(Operation::Exec { name, .. }) if name == &m.name) { "Waiting for command output…" } else { "Command output will appear here." }).size(12.0).color(design::palette(ui).muted));
                 }
             }
 
@@ -820,7 +834,7 @@ impl Studio {
             });
         });
         ui.add_space(8.0);
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             let memory = design::memory(m.memory_mib);
             let (memory_value, memory_unit) = memory.split_once(' ').unwrap_or((&memory, ""));
@@ -856,11 +870,14 @@ impl Studio {
                 if index > 0 {
                     ui.add_space(12.0);
                 }
+                let colors = design::palette(ui);
                 ui.columns(column_count, |columns| {
                     for (column, (label, value, unit)) in columns.iter_mut().zip(row) {
                         design::metric(column, label, value, unit);
                         if *value == "—" {
-                            column.label(RichText::new("Not reported").size(11.0).color(MUTED));
+                            column.label(
+                                RichText::new("Not reported").size(11.0).color(colors.muted),
+                            );
                         }
                     }
                 });
@@ -869,7 +886,7 @@ impl Studio {
         ui.add_space(16.0);
         ui.label(design::heading("Connections", 14.0));
         ui.add_space(8.0);
-        design::card().show(ui, |ui| {
+        design::card(ui.ctx()).show(ui, |ui| {
             ui.set_width(ui.available_width());
             design::property(
                 ui,
@@ -881,7 +898,11 @@ impl Studio {
                 },
             );
             ui.separator();
-            ui.label(RichText::new("Published ports").size(12.0).color(MUTED));
+            ui.label(
+                RichText::new("Published ports")
+                    .size(12.0)
+                    .color(design::palette(ui).muted),
+            );
             match &m.port_mappings {
                 Some(ports) if !ports.is_empty() => {
                     for port in ports {
@@ -916,7 +937,7 @@ impl Studio {
                                 port.guest
                             ))
                             .size(11.5)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                         );
                     }
                 }
@@ -928,13 +949,17 @@ impl Studio {
                             format!("{} ports · details not reported", m.ports)
                         })
                         .size(12.0)
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 }
             }
             ui.add_space(8.0);
             ui.separator();
-            ui.label(RichText::new("Shared folders").size(12.0).color(MUTED));
+            ui.label(
+                RichText::new("Shared folders")
+                    .size(12.0)
+                    .color(design::palette(ui).muted),
+            );
             match &m.shared_folders {
                 Some(folders) if !folders.is_empty() => {
                     for folder in folders {
@@ -954,7 +979,9 @@ impl Studio {
                                             egui::Layout::left_to_right(egui::Align::Center),
                                             |ui| {
                                                 ui.label(
-                                                    RichText::new(label).size(11.0).color(MUTED),
+                                                    RichText::new(label)
+                                                        .size(11.0)
+                                                        .color(design::palette(ui).muted),
                                                 );
                                                 ui.add(
                                                     egui::Label::new(
@@ -977,7 +1004,7 @@ impl Studio {
                                 mode => mode,
                             })
                             .size(11.5)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                         );
                     }
                 }
@@ -989,7 +1016,7 @@ impl Studio {
                             format!("{} folders · details not reported", m.mounts)
                         })
                         .size(12.0)
-                        .color(MUTED),
+                        .color(design::palette(ui).muted),
                     );
                 }
             }
@@ -1011,7 +1038,10 @@ impl Studio {
                     ui.with_layout(egui::Layout::left_to_right(egui::Align::Center), |ui| {
                         ui.add(
                             egui::Label::new(
-                                RichText::new(&command).monospace().size(11.0).color(MUTED),
+                                RichText::new(&command)
+                                    .monospace()
+                                    .size(11.0)
+                                    .color(design::palette(ui).muted),
                             )
                             .truncate(),
                         )
@@ -1076,7 +1106,7 @@ impl Studio {
                 ui.add_space(16.0);
                 let allowed = self.local_ready() && self.machines.iter().any(|m| m.name == name && m.can_delete());
                 ui.horizontal(|ui| {
-                    if ui.add_enabled(allowed, egui::Button::new(RichText::new("Delete machine").color(Color32::WHITE)).fill(design::RED)).clicked() {
+                    if ui.add_enabled(allowed, egui::Button::new(RichText::new("Delete machine").color(Color32::WHITE)).fill(design::palette(ui).danger_fill)).clicked() {
                         self.submit(Operation::Delete(name)); self.delete = None;
                     }
                     if ui.button("Cancel").clicked() { self.delete = None; }
@@ -1092,6 +1122,7 @@ impl Studio {
 
 impl eframe::App for Studio {
     fn raw_input_hook(&mut self, ctx: &egui::Context, raw: &mut egui::RawInput) {
+        self.appearance.input(raw);
         if self.desktop_menu.input(raw) {
             if self.pending.as_ref().is_some_and(Operation::is_mutation)
                 || self.cloud.mutating()
@@ -1213,7 +1244,7 @@ impl eframe::App for Studio {
             .resizable(false)
             .frame(
                 egui::Frame::new()
-                    .fill(SURFACE)
+                    .fill(design::palette(ui).surface)
                     .inner_margin(Margin::symmetric(16, 4)),
             )
             .show(ui, |ui| {
@@ -1244,7 +1275,11 @@ impl eframe::App for Studio {
                     if self.workspace == Workspace::Local && self.pending.is_some() {
                         ui.spinner();
                     }
-                    ui.label(RichText::new(label).size(11.0).color(MUTED));
+                    ui.label(
+                        RichText::new(label)
+                            .size(11.0)
+                            .color(design::palette(ui).muted),
+                    );
                     ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                         ui.label(
                             RichText::new(if self.inventory_valid {
@@ -1253,14 +1288,18 @@ impl eframe::App for Studio {
                                 "Local engine unavailable"
                             })
                             .size(10.0)
-                            .color(MUTED),
+                            .color(design::palette(ui).muted),
                         )
                         .on_hover_text("Machines keep running when you close Studio.");
                         let (r, _) = ui.allocate_exact_size(Vec2::splat(5.0), egui::Sense::hover());
                         ui.painter().circle_filled(
                             r.center(),
                             2.5,
-                            if self.inventory_valid { GREEN } else { MUTED },
+                            if self.inventory_valid {
+                                design::palette(ui).green
+                            } else {
+                                design::palette(ui).muted
+                            },
                         );
                     });
                 });
@@ -1274,7 +1313,7 @@ impl eframe::App for Studio {
                     .resizable(false)
                     .frame(
                         egui::Frame::new()
-                            .fill(Color32::WHITE)
+                            .fill(design::palette(ui).base)
                             .inner_margin(Margin::symmetric(22, 14)),
                     )
                     .show(ui, |ui| self.header(ui));
@@ -1283,7 +1322,11 @@ impl eframe::App for Studio {
                     .default_size(248.0)
                     .min_size(224.0)
                     .max_size(380.0)
-                    .frame(egui::Frame::new().fill(SURFACE).inner_margin(12))
+                    .frame(
+                        egui::Frame::new()
+                            .fill(design::palette(ui).surface)
+                            .inner_margin(12),
+                    )
                     .show(ui, |ui| {
                         design::search(ui, &mut self.query, "Search machines…");
                         ui.add_space(8.0);
@@ -1300,7 +1343,11 @@ impl eframe::App for Studio {
                         self.machine_list(ui);
                     });
                 egui::CentralPanel::default()
-                    .frame(egui::Frame::new().fill(Color32::WHITE).inner_margin(24))
+                    .frame(
+                        egui::Frame::new()
+                            .fill(design::palette(ui).base)
+                            .inner_margin(24),
+                    )
                     .show(ui, |ui| {
                         if self.selected.is_some() {
                             self.details(ui, frame);
@@ -1332,7 +1379,7 @@ impl eframe::App for Studio {
                                 if ui
                                     .add_enabled(
                                         self.local_ready(),
-                                        design::primary("+  New machine"),
+                                        design::primary(ui, "+  New machine"),
                                     )
                                     .clicked()
                                 {

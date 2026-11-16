@@ -1,5 +1,5 @@
-use crate::design::{self, MUTED};
-use eframe::egui::{self, Color32, RichText};
+use crate::design;
+use eframe::egui::{self, RichText};
 use smol_studio::log_stream::{LogStream, Status};
 
 pub struct LiveLogs {
@@ -144,7 +144,11 @@ impl LiveLogs {
                     Status::Failed(_) => "Log connection failed".into(),
                 }
             };
-            ui.label(RichText::new(label).size(11.5).color(MUTED));
+            ui.label(
+                RichText::new(label)
+                    .size(11.5)
+                    .color(design::palette(ui).muted),
+            );
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if !self.paused && self.stream.is_some() && self.status == Status::Following {
                     if ui.button("Pause updates").clicked() {
@@ -170,7 +174,11 @@ impl LiveLogs {
         if let Status::Failed(error) = &self.status {
             design::error_notice(ui, "Logs could not be followed.", error);
         }
-        ui.label(RichText::new(history_hint).size(11.0).color(MUTED));
+        ui.label(
+            RichText::new(history_hint)
+                .size(11.0)
+                .color(design::palette(ui).muted),
+        );
         ui.add_space(8.0);
         design::search(ui, &mut self.filter, "Filter log lines…");
         ui.add_space(12.0);
@@ -181,7 +189,7 @@ impl LiveLogs {
                 } else {
                     "No output received."
                 })
-                .color(MUTED),
+                .color(design::palette(ui).muted),
             );
             return;
         }
@@ -193,7 +201,9 @@ impl LiveLogs {
             .filter(|(_, line)| query.is_empty() || line.to_lowercase().contains(&query))
             .collect();
         if lines.is_empty() {
-            ui.label(RichText::new("No log lines match this filter.").color(MUTED));
+            ui.label(
+                RichText::new("No log lines match this filter.").color(design::palette(ui).muted),
+            );
             return;
         }
         ui.label(
@@ -208,11 +218,11 @@ impl LiveLogs {
                 }
             ))
             .size(11.0)
-            .color(MUTED),
+            .color(design::palette(ui).muted),
         );
         egui::Frame::new()
-            .fill(Color32::WHITE)
-            .stroke(egui::Stroke::new(1.0, design::LINE))
+            .fill(design::palette(ui).base)
+            .stroke(egui::Stroke::new(1.0, design::palette(ui).line))
             .corner_radius(8)
             .inner_margin(12)
             .show(ui, |ui| {
@@ -232,7 +242,7 @@ impl LiveLogs {
                                         RichText::new(format!("{:>4}", number + 1))
                                             .monospace()
                                             .size(11.0)
-                                            .color(MUTED),
+                                            .color(design::palette(ui).muted),
                                     );
                                     ui.add(
                                         egui::Label::new(
