@@ -1,5 +1,6 @@
 use eframe::egui::{self, Color32, Margin, RichText, Vec2};
 use smol_studio::{
+    inventory::Inventory,
     model::{Machine, Operation},
     runtime::{Payload, Runtime, Worker},
     schedule::{REFRESH_INTERVAL, RefreshSchedule},
@@ -40,6 +41,7 @@ pub struct Studio {
     docker: crate::docker_ui::DockerView,
     runtime: Runtime,
     worker: Worker,
+    inventory: Inventory,
     machines: Vec<Machine>,
     selected: Option<String>,
     filter: Filter,
@@ -70,6 +72,8 @@ impl Studio {
         let ctx = cc.egui_ctx.clone();
         theme(&ctx);
         let worker = Worker::new(move || ctx.request_repaint());
+        let ctx = cc.egui_ctx.clone();
+        let inventory = Inventory::new(move || ctx.request_repaint());
         let runtime_path = runtime.executable.to_string_lossy().into_owned();
         let mut app = Self {
             brand: design::brand_texture(&cc.egui_ctx),
@@ -81,6 +85,7 @@ impl Studio {
             docker: crate::docker_ui::DockerView::new(&cc.egui_ctx),
             runtime,
             worker,
+            inventory,
             machines: Vec::new(),
             selected: None,
             filter: Filter::All,
@@ -106,7 +111,7 @@ impl Studio {
             output: None,
         };
         app.cloud.restore();
-        app.submit(Operation::Refresh);
+        app.refresh_inventory();
         app
     }
 
@@ -116,6 +121,9 @@ impl Studio {
         }
         match self.worker.submit(self.runtime.clone(), op.clone()) {
             Ok(()) => {
+                if op.is_mutation() {
+                    self.inventory.invalidate();
+                }
                 self.pending = Some(op);
             }
             Err(e) => {
@@ -133,10 +141,6 @@ impl Studio {
     fn receive(&mut self) {
         while let Ok(done) = self.worker.responses.try_recv() {
             self.pending = None;
-            let mutation = done.operation.is_mutation();
-            if matches!(done.operation, Operation::Refresh) {
-                self.schedule.completed(Instant::now());
-            }
             match done.result {
                 Ok(Payload::Files { name, listing }) => {
                     self.files.receive(&name, listing);
@@ -149,27 +153,8 @@ impl Studio {
                     }
                     self.settings_request = None;
                 }
-                Ok(Payload::Machines(machines)) => {
-                    if self.refresh_error {
-                        self.error = None;
-                        self.refresh_error = false;
-                    }
-                    self.machines = machines;
-                    self.inventory_valid = true;
-                    self.last_refresh = Some(Instant::now());
-                    if !self
-                        .machines
-                        .iter()
-                        .any(|m| Some(&m.name) == self.selected.as_ref())
-                    {
-                        self.selected = self.machines.first().map(|m| m.name.clone());
-                        self.logs.reset();
-                        self.tab = Tab::Overview;
-                    }
-                    if self.activity == "Connecting to Smol…" {
-                        self.activity = "Ready".into();
-                    }
-                }
+                // Inventory has its own observer; command responses never replace the list.
+                Ok(Payload::Machines(_)) => {}
                 // The visible Logs tab owns its reader independently of the operation worker.
                 Ok(Payload::Logs { .. }) => {}
                 Ok(Payload::Output { name, text }) => {
@@ -227,17 +212,73 @@ impl Studio {
                             shown_in_editor = true;
                         }
                     }
-                    self.refresh_error = matches!(done.operation, Operation::Refresh);
-                    if matches!(done.operation, Operation::Refresh) {
-                        self.inventory_valid = false;
-                    }
+                    self.refresh_error = false;
                     self.error = if shown_in_editor { None } else { Some(e) };
                 }
             }
-            if mutation {
-                self.submit(Operation::Refresh);
+        }
+    }
+
+    fn local_ready(&self) -> bool {
+        self.inventory_valid && self.inventory.current() && self.pending.is_none()
+    }
+
+    fn refresh_inventory(&mut self) {
+        self.inventory.request();
+        self.start_inventory();
+    }
+
+    fn start_inventory(&mut self) {
+        // After an action, reconciliation may finish while its retry dialog is open.
+        if self.pending.is_none()
+            && (!self.modal_open() || !self.inventory.current())
+            && let Err(error) = self.inventory.start(&self.runtime)
+        {
+            self.inventory_valid = false;
+            self.refresh_error = true;
+            self.error = Some(error);
+        }
+    }
+
+    fn receive_inventory(&mut self) {
+        if self.pending.is_some() || (self.modal_open() && self.inventory.current()) {
+            return;
+        }
+        if let Some(result) = self.inventory.poll() {
+            self.schedule.completed(Instant::now());
+            match result {
+                Ok(machines) => {
+                    if self.refresh_error {
+                        self.error = None;
+                        self.refresh_error = false;
+                    }
+                    self.machines = machines;
+                    self.inventory_valid = true;
+                    self.last_refresh = Some(Instant::now());
+                    if !self
+                        .machines
+                        .iter()
+                        .any(|m| Some(&m.name) == self.selected.as_ref())
+                    {
+                        self.selected = self.machines.first().map(|m| m.name.clone());
+                        self.logs.reset();
+                        self.tab = Tab::Overview;
+                    }
+                    if self.activity == "Connecting to Smol…" {
+                        self.activity = "Ready".into();
+                    }
+                }
+                Err(error) => {
+                    self.inventory_valid = false;
+                    // Keep a user-command failure visible until a successful user action.
+                    if self.error.is_none() || self.refresh_error {
+                        self.error = Some(error);
+                        self.refresh_error = true;
+                    }
+                }
             }
         }
+        self.start_inventory();
     }
 
     fn navigate(&mut self, destination: crate::navigation_ui::Destination) {
@@ -365,7 +406,7 @@ impl Studio {
                     ui,
                     "Machines",
                     &if !self.inventory_valid {
-                        if self.pending.is_some() {
+                        if self.inventory.busy() {
                             "Connecting to Smol…".into()
                         } else {
                             "Connection unavailable".into()
@@ -389,19 +430,23 @@ impl Studio {
             });
             ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                 if ui
-                    .add_enabled(
-                        self.inventory_valid && self.pending.is_none(),
-                        design::primary("+  New machine"),
-                    )
+                    .add_enabled(self.local_ready(), design::primary("+  New machine"))
                     .clicked()
                 {
                     self.create = Some(crate::new_machine_ui::Editor::default());
                 }
                 if ui
-                    .add_enabled(self.pending.is_none(), egui::Button::new("Refresh"))
+                    .add_enabled(
+                        self.pending.is_none() && !self.inventory.busy(),
+                        egui::Button::new(if self.inventory.busy() {
+                            "Refreshing…"
+                        } else {
+                            "Refresh"
+                        }),
+                    )
                     .clicked()
                 {
-                    self.submit(Operation::Refresh);
+                    self.refresh_inventory();
                 }
             });
         });
@@ -427,7 +472,7 @@ impl Studio {
             })
             .map(|(i, _)| i)
             .collect();
-        let awaiting_created_machine = matches!(self.pending, Some(Operation::Refresh))
+        let awaiting_created_machine = self.inventory.busy()
             && self
                 .selected
                 .as_ref()
@@ -540,7 +585,7 @@ impl Studio {
             return;
         };
         ui.spacing_mut().item_spacing.y = 4.0;
-        let enabled = self.pending.is_none() && self.inventory_valid;
+        let enabled = self.local_ready();
         let wide = ui.available_width() >= 640.0;
         ui.horizontal(|ui| {
             let title_width = (ui.available_width() - if wide { 260.0 } else { 0.0 }).max(120.0);
@@ -763,7 +808,7 @@ impl Studio {
                 frame,
                 &self.machines,
                 self.pending.as_ref(),
-                self.inventory_valid,
+                self.inventory_valid && self.inventory.current(),
             );
             if !close {
                 self.create = Some(editor);
@@ -778,7 +823,7 @@ impl Studio {
                 ui.label(format!("Delete “{name}” and its machine disks?"));
                 ui.label("Data stored inside this machine will be permanently removed. Shared host folders remain on your computer.");
                 ui.add_space(16.0);
-                let allowed = self.inventory_valid && self.pending.is_none() && self.machines.iter().any(|m| m.name == name && m.can_delete());
+                let allowed = self.local_ready() && self.machines.iter().any(|m| m.name == name && m.can_delete());
                 ui.horizontal(|ui| {
                     if ui.add_enabled(allowed, egui::Button::new(RichText::new("Delete machine").color(Color32::WHITE)).fill(design::RED)).clicked() {
                         self.submit(Operation::Delete(name)); self.delete = None;
@@ -906,6 +951,7 @@ impl Studio {
                 match result {
                     Ok(()) => {
                         self.runtime.executable = self.runtime_path.trim().into();
+                        self.inventory.invalidate();
                         self.inventory_valid = false;
                         self.machines.clear();
                         self.selected = None;
@@ -914,7 +960,7 @@ impl Studio {
                         self.activity = "Connecting to Smol…".into();
                         self.settings = false;
                         self.settings_error = None;
-                        self.submit(Operation::Refresh);
+                        self.refresh_inventory();
                     }
                     Err(error) => self.settings_error = Some(error),
                 }
@@ -941,6 +987,7 @@ impl eframe::App for Studio {
 
     fn logic(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.receive();
+        self.receive_inventory();
         self.logs.set_visible(
             self.workspace == Workspace::Local
                 && self.tab == Tab::Logs
@@ -975,6 +1022,7 @@ impl eframe::App for Studio {
             Instant::now(),
             active && (self.workspace == Workspace::Local),
             self.pending.is_some()
+                || self.inventory.busy()
                 || self.files.modal_open()
                 || self.settings
                 || self.switcher.open
@@ -982,7 +1030,7 @@ impl eframe::App for Studio {
                 || self.editing.is_some()
                 || self.delete.is_some(),
         ) {
-            self.submit(Operation::Refresh);
+            self.refresh_inventory();
         }
         if active && self.workspace == Workspace::Local {
             ctx.request_repaint_after(REFRESH_INTERVAL);
@@ -1123,7 +1171,7 @@ impl eframe::App for Studio {
                                 ui.add_space(20.0);
                                 if ui
                                     .add_enabled(
-                                        self.inventory_valid && self.pending.is_none(),
+                                        self.local_ready(),
                                         design::primary("+  New machine"),
                                     )
                                     .clicked()

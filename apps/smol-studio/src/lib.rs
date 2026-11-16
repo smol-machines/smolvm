@@ -1,4 +1,5 @@
 pub mod cloud;
+pub mod inventory;
 pub mod machine_settings;
 pub mod model;
 pub mod preferences;
