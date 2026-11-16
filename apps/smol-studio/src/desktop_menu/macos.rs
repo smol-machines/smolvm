@@ -244,7 +244,7 @@ impl DesktopMenu {
         let mut docker = Vec::new();
         for (title, key, code) in [
             ("Machines", "1", Key::Num1),
-            ("Containers", "2", Key::Num2),
+            ("Docker Containers", "2", Key::Num2),
             ("Projects", "3", Key::Num3),
             ("Images", "4", Key::Num4),
             ("Volumes", "5", Key::Num5),

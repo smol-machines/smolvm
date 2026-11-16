@@ -283,7 +283,15 @@ impl FilesView {
         });
         ui.add_space(10.0);
         if let Some(error) = &self.error {
-            design::error_notice(ui, "Files could not be loaded or transferred.", error);
+            if files::guest_storage_failure(error) {
+                design::error_notice(ui, "The machine reported a storage error.", error);
+                ui.label(
+                    RichText::new("The VM is running, but its persistent filesystem could not be accessed. Commands may fail too; changing DNS settings will not resolve this storage error.")
+                        .size(12.0).color(design::palette(ui).muted),
+                );
+            } else {
+                design::error_notice(ui, "Files could not be loaded or transferred.", error);
+            }
         }
         if let Some(notice) = &self.notice {
             ui.label(

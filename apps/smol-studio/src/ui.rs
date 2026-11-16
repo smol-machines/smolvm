@@ -421,7 +421,11 @@ impl Studio {
                 }
                 ui.add_enabled_ui(!self.docker.navigating(), |ui| {
                     for (destination, icon, label) in [
-                        (Some(Kind::Containers), Icon::Containers, "Containers"),
+                        (
+                            Some(Kind::Containers),
+                            Icon::Containers,
+                            "Docker containers",
+                        ),
                         (None, Icon::Project, "Projects"),
                     ] {
                         let selected = self.workspace == Workspace::Containers
@@ -534,7 +538,7 @@ impl Studio {
                         ui,
                         Icon::Machine,
                         &m.name,
-                        &format!("Local · {}", m.image_label()),
+                        &format!("Local VM · {}", m.workspace_label()),
                         &m.state,
                         None,
                     );
@@ -869,6 +873,12 @@ impl Studio {
         });
         ui.add_space(16.0);
         ui.collapsing("Command line & process", |ui| {
+            design::property(ui, "Workload type", "Virtual machine");
+            if let Some(owner) = m.owner_label() {
+                design::property(ui, "Created by", owner);
+            }
+            ui.label(RichText::new(m.image_label()).monospace().size(11.0))
+                .on_hover_text("Machine image or local image source");
             if let Some(parent) = &m.parent_machine {
                 design::property(ui, "Branched from", parent);
             }

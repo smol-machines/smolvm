@@ -25,7 +25,9 @@ impl Destination {
     fn details(self) -> (&'static str, Icon, Key) {
         match self {
             Self::Machines => ("Machines", Icon::Machine, Key::Num1),
-            Self::Docker(Some(Kind::Containers)) => ("Containers", Icon::Containers, Key::Num2),
+            Self::Docker(Some(Kind::Containers)) => {
+                ("Docker containers", Icon::Containers, Key::Num2)
+            }
             Self::Docker(None) => ("Projects", Icon::Project, Key::Num3),
             Self::Docker(Some(Kind::Images)) => ("Images", Icon::Image, Key::Num4),
             Self::Docker(Some(Kind::Volumes)) => ("Volumes", Icon::Volume, Key::Num5),

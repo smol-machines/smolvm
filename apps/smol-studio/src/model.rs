@@ -81,6 +81,24 @@ impl Machine {
     pub fn image_label(&self) -> &str {
         self.image.as_deref().unwrap_or("Bare Linux machine")
     }
+
+    /// Ownership is supplied by the creator's metadata, never inferred from
+    /// a name prefix: a user-created `exo-demo` is still an ordinary VM.
+    pub fn owner_label(&self) -> Option<&'static str> {
+        self.labels
+            .as_ref()
+            .and_then(|labels| labels.get("exo.sandbox.key"))
+            .filter(|key| !key.is_empty())
+            .map(|_| "Exo")
+    }
+
+    pub fn workspace_label(&self) -> &str {
+        if self.owner_label().is_some() {
+            "Exo sandbox"
+        } else {
+            self.image_label()
+        }
+    }
 }
 
 pub fn parse_machines(bytes: &[u8]) -> Result<Vec<Machine>, String> {
@@ -245,6 +263,18 @@ impl Operation {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exo_ownership_comes_from_metadata_without_hiding_the_vm() {
+        let mut rows = parse_machines(br#"[{"name":"exo-user-named","state":"running","cpus":1,"memory_mib":512},{"name":"sandbox","state":"running","cpus":1,"memory_mib":512,"image":"local-dir:/cache/layers","labels":{"exo.sandbox.key":"sandbox-id"}}]"#).unwrap();
+        assert_eq!(rows.len(), 2);
+        let ordinary = rows.remove(0);
+        assert_eq!(ordinary.owner_label(), None);
+        let managed = rows.remove(0);
+        assert_eq!(managed.owner_label(), Some("Exo"));
+        assert_eq!(managed.workspace_label(), "Exo sandbox");
+        assert_eq!(managed.image_label(), "local-dir:/cache/layers");
+    }
 
     #[test]
     fn reads_cli_schema_without_confusing_limits_with_usage() {

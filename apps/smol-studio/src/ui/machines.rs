@@ -32,7 +32,7 @@ fn rows(
         rows.extend(local.iter().map(|m| Row {
             target: Target::Local(m.name.clone()),
             name: m.name.clone(),
-            source: format!("Local · {}", m.image_label()),
+            source: format!("Local VM · {}", m.workspace_label()),
             state: m.state.clone(),
         }));
     }
@@ -41,7 +41,7 @@ fn rows(
             target: Target::Cloud(m.id.clone()),
             name: m.display_name().into(),
             source: format!(
-                    "Cloud · {}",
+                    "Cloud VM · {}",
                     m.source
                         .as_ref()
                         .and_then(|s| s.reference.as_deref())
@@ -96,7 +96,7 @@ impl Studio {
                 ui,
                 "Machines",
                 &format!(
-                    "{} local · {} cloud",
+                    "Virtual machines · {} local · {} cloud",
                     self.machines.len(),
                     self.cloud.inventory().len()
                 ),

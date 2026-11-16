@@ -433,7 +433,7 @@ impl CloudView {
             ui,
             design::Icon::Machine,
             machine.display_name(),
-            &format!("Cloud · {} · {source}", self.account_label()),
+            &format!("Cloud VM · {} · {source}", self.account_label()),
             if machine.is_started() {
                 if machine.is_ready() {
                     "running"

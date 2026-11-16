@@ -1,6 +1,14 @@
 use serde::Deserialize;
 use std::collections::HashSet;
 
+/// Classify the guest resolver preparation failure narrowly. A generic host
+/// upload error must not be described as a damaged guest filesystem.
+pub fn guest_storage_failure(error: &str) -> bool {
+    error.contains("refresh persistent overlay resolver ")
+        && (error.contains("I/O error (os error 5)")
+            || error.contains("Read-only file system (os error 30)"))
+}
+
 #[derive(Clone, Debug)]
 pub enum Request {
     List {
@@ -164,6 +172,27 @@ impl Listing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn guest_storage_hint_does_not_misclassify_host_io_or_dns_errors() {
+        let prefix = "Error: agent operation failed: run command: refresh persistent overlay resolver /storage/overlays/persistent-exo/merged/etc/resolv.conf: ";
+        assert!(guest_storage_failure(&format!(
+            "{prefix}I/O error (os error 5)"
+        )));
+        assert!(guest_storage_failure(&format!(
+            "{prefix}Read-only file system (os error 30)"
+        )));
+        for error in [
+            "Download failed: I/O error (os error 5)",
+            "DNS lookup failed",
+            "Permission denied (os error 13)",
+        ] {
+            assert!(!guest_storage_failure(error));
+        }
+        assert!(!guest_storage_failure(&format!(
+            "{prefix}Permission denied (os error 13)"
+        )));
+    }
     #[test]
     fn folder_names_cannot_escape_the_selected_destination() {
         for name in [
