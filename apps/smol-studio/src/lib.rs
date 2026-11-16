@@ -5,6 +5,7 @@ pub mod model;
 pub mod preferences;
 pub mod runtime;
 pub mod schedule;
+pub mod usage;
 
 pub mod docker;
 

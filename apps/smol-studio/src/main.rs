@@ -12,6 +12,7 @@ mod navigation_ui;
 mod new_machine_ui;
 mod terminal_ui;
 mod ui;
+mod usage_ui;
 
 use eframe::egui;
 use smol_studio::runtime::Runtime;

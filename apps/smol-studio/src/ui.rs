@@ -19,6 +19,7 @@ enum Filter {
 #[derive(Clone, Copy, PartialEq)]
 enum Tab {
     Overview,
+    Usage,
     Files,
     Logs,
     Console,
@@ -42,6 +43,7 @@ pub struct Studio {
     runtime: Runtime,
     worker: Worker,
     inventory: Inventory,
+    usage: smol_studio::usage::Usage,
     machines: Vec<Machine>,
     selected: Option<String>,
     filter: Filter,
@@ -74,6 +76,8 @@ impl Studio {
         let worker = Worker::new(move || ctx.request_repaint());
         let ctx = cc.egui_ctx.clone();
         let inventory = Inventory::new(move || ctx.request_repaint());
+        let ctx = cc.egui_ctx.clone();
+        let usage = smol_studio::usage::Usage::new(move || ctx.request_repaint());
         let runtime_path = runtime.executable.to_string_lossy().into_owned();
         let mut app = Self {
             brand: design::brand_texture(&cc.egui_ctx),
@@ -86,6 +90,7 @@ impl Studio {
             runtime,
             worker,
             inventory,
+            usage,
             machines: Vec::new(),
             selected: None,
             filter: Filter::All,
@@ -627,6 +632,7 @@ impl Studio {
         ui.horizontal(|ui| {
             for (tab, label) in [
                 (Tab::Overview, "Overview"),
+                (Tab::Usage, "Usage"),
                 (Tab::Files, "Files"),
                 (Tab::Logs, "Logs"),
                 (Tab::Console, "Console"),
@@ -640,6 +646,7 @@ impl Studio {
         ui.separator();
         ui.add_space(16.0);
         match self.tab {
+            Tab::Usage => crate::usage_ui::show(ui, &self.usage, &m),
             Tab::Files => {
                 if let Some(action) = self.files.show(ui, frame, &m, enabled) {
                     self.submit(action);
@@ -666,15 +673,6 @@ impl Studio {
                             name: m.name.clone(),
                             command: self.command.clone(),
                         });
-                    }
-                    if ui
-                        .add_enabled(
-                            enabled && m.state == "running",
-                            egui::Button::new("Usage snapshot"),
-                        )
-                        .clicked()
-                    {
-                        self.submit(Operation::Stats(m.name.clone()));
                     }
                 });
                 if let Some((_, text)) = self.output.as_ref().filter(|(name, _)| name == &m.name) {
@@ -1016,6 +1014,27 @@ impl eframe::App for Studio {
         }
         let active = ctx
             .input(|i| i.viewport().focused == Some(true) && i.viewport().minimized != Some(true));
+        let machine = self
+            .machines
+            .iter()
+            .find(|m| self.selected.as_ref() == Some(&m.name));
+        let usage_target = machine.map(|m| smol_studio::usage::Target {
+            runtime: self.runtime.clone(),
+            name: m.name.clone(),
+            pid: m.pid,
+        });
+        let usage_active = active
+            && self.workspace == Workspace::Local
+            && self.tab == Tab::Usage
+            && machine.is_some_and(|m| m.state == "running")
+            && self.local_ready()
+            && !self.modal_open();
+        let now = Instant::now();
+        self.usage.update(usage_target, usage_active, now);
+        if let Some(after) = self.usage.repaint_after(now) {
+            ctx.request_repaint_after(after);
+        }
+
         self.cloud
             .logic(ctx, active && (self.workspace == Workspace::Cloud));
         if self.schedule.due(

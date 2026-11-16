@@ -17,7 +17,7 @@ const INVENTORY_LIMIT: u64 = 4 * 1024 * 1024;
 const LOG_LIMIT: u64 = 256 * 1024;
 const ERROR_LIMIT: u64 = 64 * 1024;
 
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq)]
 pub struct Runtime {
     pub executable: PathBuf,
     pub state_dir: Option<PathBuf>,
