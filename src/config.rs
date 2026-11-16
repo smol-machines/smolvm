@@ -1235,6 +1235,38 @@ impl VmRecord {
         }
     }
 
+    /// The machine's recorded process, when the kernel is holding it after
+    /// SIGKILL: still present, running no code, and impossible to remove
+    /// before the host reboots. `None` once it is gone or if the PID now
+    /// belongs to another process.
+    pub fn held_process(&self) -> Option<crate::process::HeldProcess> {
+        let pid = self.pid?;
+        if !crate::process::is_our_process(pid, self.pid_start_time) {
+            return None;
+        }
+        crate::process::held_after_kill(pid)
+    }
+
+    /// Whether the recorded process can still run guest or VMM code: it is
+    /// alive and not held by the kernel after SIGKILL.
+    pub fn process_can_run(&self) -> bool {
+        self.is_process_alive() && self.held_process().is_none()
+    }
+
+    /// Record that the machine is stopped. This is the one way a stop
+    /// forgets the process, on every surface: the PID is cleared unless the
+    /// kernel is still holding that process, in which case it stays so a
+    /// later start is refused while the process has the machine's disks
+    /// open. [`crate::agent::state_probe::refuse_start_while_held`] clears
+    /// it once the process is gone.
+    pub fn mark_process_stopped(&mut self) {
+        self.state = RecordState::Stopped;
+        if self.held_process().is_none() {
+            self.pid = None;
+            self.pid_start_time = None;
+        }
+    }
+
     /// Get the actual state, checking if running process is still alive.
     pub fn actual_state(&self) -> RecordState {
         if self.state == RecordState::Running {

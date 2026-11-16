@@ -160,7 +160,6 @@ pub(crate) fn recover_unreachable_machine_in_db(
     record: &VmRecord,
     db: &SmolvmDb,
 ) -> crate::Result<()> {
-    let mut held_pid = None;
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
@@ -186,7 +185,6 @@ pub(crate) fn recover_unreachable_machine_in_db(
                     record.name,
                     held.explain()
                 );
-                held_pid = Some(pid);
             }
         }
     }
@@ -201,13 +199,37 @@ pub(crate) fn recover_unreachable_machine_in_db(
 
     // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full
     // in-memory config load; the update is targeted to the one record.
-    db.update_vm(&record.name, |r| {
-        r.state = RecordState::Stopped;
-        if held_pid.is_none() {
-            r.pid = None;
-            r.pid_start_time = None;
-        }
-    })?;
+    db.update_vm(&record.name, VmRecord::mark_process_stopped)?;
+    Ok(())
+}
+
+/// Refuse to start a machine whose previous process the kernel is still
+/// holding after SIGKILL, and forget that process once it is gone.
+///
+/// A stop that ends with a held process leaves the machine `Stopped` with
+/// the PID still recorded. Every start path calls this first:
+/// - the process is still present: an error naming it, on every surface;
+/// - the process is gone (the kernel call returned, or the host rebooted),
+///   or the PID now belongs to something else: the PID is cleared and the
+///   start goes ahead, with no manual step.
+pub fn refuse_start_while_held(db: &SmolvmDb, name: &str) -> crate::Result<()> {
+    let Some(record) = db.get_vm(name)? else {
+        return Ok(());
+    };
+    let (RecordState::Stopped, Some(pid)) = (&record.state, record.pid) else {
+        return Ok(());
+    };
+    if let Some(held) = record.held_process() {
+        return Err(crate::Error::agent("start agent", held.start_refusal()));
+    }
+    if !record.is_process_alive() {
+        db.update_vm(name, |r| {
+            if r.state == RecordState::Stopped && r.pid == Some(pid) {
+                r.pid = None;
+                r.pid_start_time = None;
+            }
+        })?;
+    }
     Ok(())
 }
 
@@ -474,5 +496,121 @@ mod tests {
         assert_eq!(persisted.state, RecordState::Unreachable);
         assert_eq!(persisted.pid, r.pid);
         assert_eq!(persisted.pid_start_time, r.pid_start_time);
+    }
+}
+
+/// A machine whose process the kernel holds after SIGKILL, as the stop,
+/// recovery and start paths see it. The process is a stand-in registered
+/// with `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    fn running_on(db: &SmolvmDb, name: &str, pid: i32, start_time: Option<u64>) -> VmRecord {
+        let mut record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = start_time;
+        db.insert_vm(name, &record).unwrap();
+        record
+    }
+
+    /// What `machine stop` does for a machine whose agent no longer answers.
+    #[test]
+    fn stopping_a_held_machine_records_it_stopped_and_keeps_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "held-stop-keeps-pid";
+        let record = running_on(&db, name, held.pid, Some(fake_held::START_TIME));
+
+        let started = std::time::Instant::now();
+        recover_unreachable_machine_in_db(&record, &db).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+        assert_eq!(stored.pid_start_time, Some(fake_held::START_TIME));
+        // The list shows the record's state: stopped, not running.
+        assert_eq!(resolve_state(name, &stored), RecordState::Stopped);
+        assert!(!stored.process_can_run());
+    }
+
+    #[test]
+    fn a_start_is_refused_while_the_process_is_held() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "held-start-refused";
+        let record = running_on(&db, name, held.pid, Some(fake_held::START_TIME));
+        recover_unreachable_machine_in_db(&record, &db).unwrap();
+
+        let error = refuse_start_while_held(&db, name).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!(
+                "process {} is still present after SIGKILL",
+                held.pid
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("refusing a second launch on its disks"),
+            "{error}"
+        );
+        // Refusing changes nothing: the next start is refused the same way.
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, Some(held.pid));
+        assert!(refuse_start_while_held(&db, name).is_err());
+    }
+
+    #[test]
+    fn the_held_pid_is_forgotten_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "held-then-gone";
+        let record = running_on(&db, name, held.pid, Some(fake_held::START_TIME));
+        recover_unreachable_machine_in_db(&record, &db).unwrap();
+        assert!(refuse_start_while_held(&db, name).is_err());
+
+        // The host reboots, or the kernel call returns: the process is gone.
+        held.disappear();
+
+        refuse_start_while_held(&db, name).unwrap();
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    /// After a reboot the old PID can belong to an unrelated process. Its
+    /// start time differs, so it is not taken for the machine's.
+    #[test]
+    fn a_pid_now_owned_by_another_process_does_not_block_the_start() {
+        let (_dir, db) = db();
+        let name = "held-pid-reused";
+        let me = std::process::id() as i32;
+        let other_start = crate::process::process_start_time(me).unwrap() + 1_000_000;
+        running_on(&db, name, me, Some(other_start));
+        db.update_vm(name, |r| r.state = RecordState::Stopped)
+            .unwrap();
+
+        refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
+    }
+
+    #[test]
+    fn a_machine_that_stopped_normally_starts_without_a_check() {
+        let (_dir, db) = db();
+        let name = "stopped-normally";
+        let mut record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Stopped;
+        db.insert_vm(name, &record).unwrap();
+        refuse_start_while_held(&db, name).unwrap();
+        refuse_start_while_held(&db, "no-such-machine").unwrap();
     }
 }

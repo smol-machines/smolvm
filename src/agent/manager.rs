@@ -3041,7 +3041,11 @@ impl AgentManager {
         }
         // The database can retain identity when a PID file is missing.
         if let Some(name) = self.name() {
-            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+            let db = crate::db::SmolvmDb::open()?;
+            // A stopped machine keeps the PID of a process the kernel is
+            // holding: refused while it is present, forgotten once it is gone.
+            super::state_probe::refuse_start_while_held(&db, name)?;
+            if let Some(record) = db.get_vm(name)? {
                 if let Some(pid) = record.pid {
                     refuse_live_launch_pid(pid)?;
                 }
@@ -4814,14 +4818,7 @@ fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
     if let Some(held) = process::held_after_kill(pid) {
         // Its files and published ports stay open until the kernel lets it
         // go, and a write it had in flight can still land on the disks.
-        return Err(Error::agent(
-            "start agent",
-            format!(
-                "the previous run of this machine was stopped, but {}; refusing a second \
-                 launch on its disks until then (delete the machine with --force to remove it)",
-                held.explain()
-            ),
-        ));
+        return Err(Error::agent("start agent", held.start_refusal()));
     }
     if process::is_alive(pid) {
         return Err(Error::agent(

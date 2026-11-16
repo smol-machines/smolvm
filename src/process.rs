@@ -2647,6 +2647,10 @@ pub fn is_alive(pid: Pid) -> bool {
     if pid <= 0 {
         return false;
     }
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return true;
+    }
     if unsafe { libc::kill(pid, 0) } != 0 {
         // Permission to signal a process is independent of its liveness.
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
@@ -2872,6 +2876,10 @@ pub fn process_start_time(pid: Pid) -> Option<u64> {
 /// Get the start time of a process (clock ticks since boot from /proc/pid/stat field 22).
 #[cfg(target_os = "linux")]
 pub fn process_start_time(pid: Pid) -> Option<u64> {
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return Some(fake_held::START_TIME);
+    }
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     // Format: pid (comm) state ppid ... starttime ...
     // comm can contain spaces and parentheses, so find the last ')' first.
@@ -3940,6 +3948,18 @@ impl HeldProcess {
     }
 }
 
+impl HeldProcess {
+    /// Why a machine whose previous process is held cannot be started. Every
+    /// start path (CLI, API server, embedded runtime) refuses with this text.
+    pub fn start_refusal(&self) -> String {
+        format!(
+            "the previous run of this machine was stopped, but {}; refusing a second \
+             launch on its disks until then (delete the machine with --force to remove it)",
+            self.explain()
+        )
+    }
+}
+
 /// How [`stop_vm_process_bounded`] ended.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum VmStop {
@@ -3994,6 +4014,10 @@ impl ProcessControl for HostProcesses {
 pub fn held_after_kill(pid: Pid) -> Option<HeldProcess> {
     if pid <= 0 || !is_alive(pid) {
         return None;
+    }
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return Some(fake_held::held(pid));
     }
     let leader_stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
     let leader_exited = matches!(linux_stat_state(&leader_stat), Some('Z' | 'X' | 'x'));
@@ -4106,7 +4130,73 @@ pub fn stop_vm_process_bounded(
     sigterm_timeout: Duration,
     sigkill_timeout: Duration,
 ) -> Result<VmStop> {
+    #[cfg(all(test, target_os = "linux"))]
+    if fake_held::is_held(pid) {
+        return Ok(VmStop::Held(fake_held::held(pid)));
+    }
     stop_vm_process_with(&HostProcesses, pid, sigterm_timeout, sigkill_timeout)
+}
+
+/// A stand-in for a process the kernel is holding after SIGKILL, for tests of
+/// the code that stops, deletes and restarts machines. Such a process cannot
+/// be produced on demand, so a test registers a PID here and the liveness,
+/// start-time, held-state and stop functions above answer for it as they
+/// would for the real thing. The PIDs are above the kernel's largest
+/// possible PID, so no real process is ever looked at or signalled.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod fake_held {
+    use super::{HeldProcess, Pid};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Mutex;
+
+    /// The start time every fake process reports.
+    pub(crate) const START_TIME: u64 = 424_242;
+
+    /// Linux caps PIDs at 4194304.
+    static NEXT_PID: AtomicI32 = AtomicI32::new(5_000_000);
+    static HELD: Mutex<BTreeSet<Pid>> = Mutex::new(BTreeSet::new());
+
+    /// A fake held process. Dropping it, or calling [`FakeHeld::disappear`],
+    /// is the host reboot: the process is gone.
+    pub(crate) struct FakeHeld {
+        pub(crate) pid: Pid,
+    }
+
+    impl FakeHeld {
+        /// The process goes away, as it does when the host reboots.
+        pub(crate) fn disappear(&self) {
+            HELD.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.pid);
+        }
+    }
+
+    impl Drop for FakeHeld {
+        fn drop(&mut self) {
+            self.disappear();
+        }
+    }
+
+    /// Register a new fake held process with a PID of its own.
+    pub(crate) fn hold() -> FakeHeld {
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
+        FakeHeld { pid }
+    }
+
+    pub(crate) fn is_held(pid: Pid) -> bool {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid)
+    }
+
+    pub(crate) fn held(pid: Pid) -> HeldProcess {
+        HeldProcess {
+            pid,
+            blocked_threads: vec![(pid + 1_000_000, 'D')],
+        }
+    }
 }
 
 pub(crate) fn stop_vm_process_with(
@@ -4301,6 +4391,11 @@ fn wait_for_exit_event(_pid: Pid, _timeout: Duration) -> ExitEvent {
 /// seen when it happens. Elsewhere it polls, aggressively at first and then
 /// backing off.
 pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
+    #[cfg(all(test, target_os = "linux"))]
+    if fake_held::is_held(pid) {
+        let _ = timeout;
+        return None;
+    }
     if let Some(code) = try_wait(pid) {
         return Some(code);
     }

@@ -197,3 +197,8 @@ number; `stop_timeout` is whole seconds, at most 300. The same settings are
 `machine create --stop-signal` and `--stop-timeout`, and `machine stop
 --timeout SECS` overrides the wait for one stop (`0` kills at once).
 `machine delete` does not wait.
+
+If the machine's process is still present after `SIGKILL` because the kernel
+is holding one of its threads, `machine stop` still finishes and names the
+PID, `machine delete --force` removes the machine, and a start is refused
+until that process is gone (the kernel call returns or the host reboots).
