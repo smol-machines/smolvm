@@ -28,6 +28,8 @@ pub struct FilesView {
     notice: Option<String>,
     filter: String,
     hidden: bool,
+    history: files::History,
+    history_target: Option<usize>,
     picker: FilePicker,
     picking: Option<Pick>,
     transfer: Option<Transfer>,
@@ -44,6 +46,8 @@ impl Default for FilesView {
             notice: None,
             filter: String::new(),
             hidden: false,
+            history: files::History::default(),
+            history_target: None,
             picker: FilePicker::default(),
             picking: None,
             transfer: None,
@@ -56,12 +60,15 @@ impl FilesView {
     }
     pub fn receive(&mut self, name: &str, listing: Listing) {
         if self.machine == name && self.requested == listing.path {
+            self.history
+                .record(&listing.path, self.history_target.take());
             self.listing = Some(listing);
             self.error = None;
         }
     }
     pub fn failed(&mut self, name: &str, error: String) {
         if self.machine == name {
+            self.history_target = None;
             self.error = Some(error);
         }
     }
@@ -78,13 +85,18 @@ impl FilesView {
     }
     fn request(&mut self) -> Option<Operation> {
         self.attempted = true;
+        self.history_target = None;
+        if self.path != self.requested {
+            self.notice = None;
+            self.filter.clear();
+        }
+        self.listing = None;
         if let Err(error) = files::validate_path(&self.path) {
             self.error = Some(error);
             return None;
         }
         self.requested = self.path.clone();
         self.error = None;
-        self.listing = None;
         Some(Operation::ListFiles {
             name: self.machine.clone(),
             path: self.path.clone(),
@@ -104,7 +116,13 @@ impl FilesView {
             };
         }
         if machine.state != "running" {
-            ui.label("Start this machine to browse and transfer its files.");
+            ui.add_space(24.0);
+            design::empty_state(
+                ui,
+                design::Icon::Project,
+                "Files are available when running",
+                "Start this machine to browse its folders and transfer files.",
+            );
             return None;
         }
         let mut action = None;
@@ -113,17 +131,33 @@ impl FilesView {
         }
         ui.add_enabled_ui(enabled && action.is_none(), |ui| {
             ui.horizontal(|ui| {
+                let back = self.history.back().map(|(i, p)| (i, p.to_owned()));
+                let forward = self.history.forward().map(|(i, p)| (i, p.to_owned()));
+                for (label, hint, target) in [("←", "Back", back), ("→", "Forward", forward)] {
+                    if ui
+                        .add_enabled(target.is_some(), egui::Button::new(label))
+                        .on_hover_text(hint)
+                        .clicked()
+                        && let Some((index, path)) = target
+                    {
+                        self.path = path;
+                        self.filter.clear();
+                        action = self.request();
+                        self.history_target = Some(index);
+                    }
+                }
                 if ui
                     .add_enabled(self.path != "/", egui::Button::new("↑"))
                     .on_hover_text("Parent folder")
                     .clicked()
                 {
                     self.path = files::parent(&self.path);
+                    self.filter.clear();
                     action = self.request();
                 }
                 let response = ui.add(
                     egui::TextEdit::singleline(&mut self.path)
-                        .desired_width((ui.available_width() - 152.0).max(120.0))
+                        .desired_width((ui.available_width() - 140.0).max(60.0))
                         .hint_text("/workspace"),
                 );
                 if ui.button("Go").clicked()
@@ -136,12 +170,9 @@ impl FilesView {
                 }
             });
             ui.add_space(8.0);
+            design::search(ui, &mut self.filter, "Filter files…");
+            ui.add_space(8.0);
             ui.horizontal(|ui| {
-                ui.add(
-                    egui::TextEdit::singleline(&mut self.filter)
-                        .hint_text("Filter files…")
-                        .desired_width(160.0),
-                );
                 ui.checkbox(&mut self.hidden, "Hidden files");
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     if ui
@@ -183,9 +214,14 @@ impl FilesView {
                 ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
                     ui.label(
                         RichText::new(format!(
-                            "{} {}",
+                            "{} of {} {}",
                             entries.len(),
-                            if entries.len() == 1 { "item" } else { "items" }
+                            listing.entries.len(),
+                            if listing.entries.len() == 1 {
+                                "item"
+                            } else {
+                                "items"
+                            }
                         ))
                         .small()
                         .color(design::MUTED),
@@ -194,16 +230,33 @@ impl FilesView {
             });
             ui.separator();
             if entries.is_empty() {
-                ui.add_space(24.0);
-                ui.label(if listing.entries.is_empty() {
-                    "This folder is empty."
-                } else {
-                    "No files match these filters."
-                });
+                ui.add_space(12.0);
+                ui.label(design::heading(
+                    if listing.entries.is_empty() {
+                        "This folder is empty"
+                    } else {
+                        "No matching files"
+                    },
+                    14.0,
+                ));
+                ui.label(
+                    RichText::new(if listing.entries.is_empty() {
+                        "Upload a file to put it in this folder."
+                    } else {
+                        "Try another name or show hidden files."
+                    })
+                    .size(12.0)
+                    .color(design::MUTED),
+                );
+                if !listing.entries.is_empty() && ui.button("Clear filters").clicked() {
+                    self.filter.clear();
+                    self.hidden = true;
+                }
+                return action;
             }
             let mut navigate = None;
             egui::ScrollArea::vertical()
-                .id_salt("guest-file-list")
+                .id_salt(("guest-file-list", &self.machine, &listing.path))
                 .max_height(
                     (ui.clip_rect().bottom() - ui.cursor().top() - 12.0).clamp(100.0, 380.0),
                 )
@@ -332,24 +385,67 @@ impl FilesView {
         let mut open = true;
         let mut cancel = false;
         let mut action = None;
-        egui::Window::new(if transfer.upload { "Upload file" } else { "Save file" }).anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO).collapsible(false).resizable(false).fixed_size(egui::vec2(500.0, (ctx.content_rect().height()-120.0).clamp(320.0, 460.0))).open(&mut open).show(ctx, |ui| {
-            egui::ScrollArea::vertical().max_height((ui.available_height()-60.0).max(120.0)).show(ui, |ui| {
-            ui.label(format!("Machine · {}", transfer.name)); ui.add_space(12.0);
-            ui.label("Local file"); ui.label(transfer.local.display().to_string()); ui.add_space(10.0);
-            ui.label("Machine path");
-            ui.add_enabled_ui(!busy, |ui| { ui.add(egui::TextEdit::singleline(&mut transfer.guest).desired_width(f32::INFINITY)); });
-            ui.add_space(10.0); ui.label(RichText::new("An existing file at the destination will be replaced. Transfers support files up to 4 GiB.").small().color(design::MUTED));
-            if let Some(error) = &self.error { design::error_notice(ui, "Transfer failed. You can retry.", error); }
+        egui::Window::new(if transfer.upload { "Upload file" } else { "Save file" })
+            .anchor(egui::Align2::CENTER_CENTER, egui::Vec2::ZERO)
+            .collapsible(false)
+            .resizable(false)
+            .fixed_size(egui::vec2(
+                500.0,
+                (ctx.content_rect().height() - 120.0).clamp(360.0, 460.0),
+            ))
+            .open(&mut open)
+            .show(ctx, |ui| {
+                ui.label(RichText::new(if transfer.upload {
+                    "Copy a file from your computer into this machine."
+                } else {
+                    "Save a copy of a machine file to your computer."
+                }).size(12.0).color(design::MUTED));
+                ui.add_space(12.0);
+                let body_height = (ui.available_height() - 60.0).max(180.0);
+                egui::ScrollArea::vertical()
+                    .id_salt("file-transfer-form")
+                    .max_height(body_height)
+                    .show(ui, |ui| {
+                        if let Some(error) = &self.error {
+                            design::error_notice(ui, "Transfer failed. Your paths are kept below.", error);
+                            ui.add_space(12.0);
+                        }
+                        design::card().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new("On your computer").size(11.5).color(design::MUTED));
+                            ui.add(egui::Label::new(transfer.local.display().to_string()).wrap().selectable(true));
+                        });
+                        ui.add_space(12.0);
+                        design::card().show(ui, |ui| {
+                            ui.set_width(ui.available_width());
+                            ui.label(RichText::new(format!("In {}", transfer.name)).size(11.5).color(design::MUTED));
+                            ui.add_enabled_ui(!busy, |ui| {
+                                ui.add(egui::TextEdit::singleline(&mut transfer.guest).desired_width(f32::INFINITY));
+                            });
+                            if let Err(error) = files::validate_path(&transfer.guest) {
+                                ui.label(RichText::new(error).small().color(design::RED));
+                            }
+                        });
+                        ui.add_space(12.0);
+                        ui.label(RichText::new("An existing file at the destination will be replaced. Files up to 4 GiB are supported.").size(11.5).color(design::MUTED));
+                    });
+                ui.add_space((ui.available_height() - 48.0).max(12.0));
+                ui.separator();
+                ui.add_space(8.0);
+                ui.horizontal(|ui| {
+                    if busy { ui.spinner(); ui.label("Transferring…"); }
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok(), design::primary(if transfer.upload { "Upload file" } else { "Save file" })).clicked() {
+                            self.error = None;
+                            action = Some(Operation::TransferFile {
+                                name: transfer.name.clone(), guest: transfer.guest.clone(),
+                                local: transfer.local.clone(), upload: transfer.upload,
+                            });
+                        }
+                        if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() { cancel = true; }
+                    });
+                });
             });
-            ui.add_space(12.0); ui.horizontal(|ui| {
-                if ui.add_enabled(!busy && files::validate_path(&transfer.guest).is_ok(), design::primary(if transfer.upload { "Upload" } else { "Save" })).clicked() {
-                    self.error = None;
-                    action = Some(Operation::TransferFile { name: transfer.name.clone(), guest: transfer.guest.clone(), local: transfer.local.clone(), upload: transfer.upload });
-                }
-                if ui.add_enabled(!busy, egui::Button::new("Cancel")).clicked() { cancel = true; }
-                if busy { ui.spinner(); ui.label("Transferring…"); }
-            });
-        });
         if !busy && (cancel || !open || ctx.input(|i| i.key_pressed(egui::Key::Escape))) {
             self.transfer = None;
         }
