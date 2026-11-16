@@ -218,7 +218,6 @@ impl DockerView {
         self.rows.clear();
         self.valid = false;
         self.query.clear();
-        self.stats = None;
         self.live_logs.reset();
         self.container_tab = ContainerTab::Overview;
         self.submit(runtime, Action::List(Kind::Containers));

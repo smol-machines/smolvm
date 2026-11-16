@@ -5,6 +5,7 @@ mod project_form;
 mod rename_container;
 mod resources;
 mod run_container;
+mod usage;
 
 use crate::design::{self, MUTED, SURFACE};
 use eframe::egui::{self, Color32, RichText};
@@ -80,7 +81,7 @@ pub struct DockerView {
     opened: bool,
     selected: Option<String>,
     details: Option<smol_studio::container_details::ContainerDetails>,
-    stats: Option<Value>,
+    usage: smol_studio::container_usage::Usage,
     container_tab: ContainerTab,
     live_logs: crate::live_logs_ui::LiveLogs,
     terminal: Option<crate::terminal_ui::TerminalWindow>,
@@ -150,6 +151,7 @@ impl DockerView {
     }
 
     pub fn new(ctx: &egui::Context) -> Self {
+        let repaint = ctx.clone();
         let ctx = ctx.clone();
         Self {
             worker: DockerWorker::new(move || ctx.request_repaint()),
@@ -201,7 +203,7 @@ impl DockerView {
             opened: false,
             selected: None,
             details: None,
-            stats: None,
+            usage: smol_studio::container_usage::Usage::new(move || repaint.request_repaint()),
             container_tab: ContainerTab::Overview,
             live_logs: crate::live_logs_ui::LiveLogs::default(),
             terminal: None,
@@ -232,7 +234,6 @@ impl DockerView {
         self.resource_tab = resources::Tab::Overview;
         self.storage_selected = None;
         self.details = None;
-        self.stats = None;
         self.live_logs.reset();
         self.container_tab = ContainerTab::Overview;
         self.rows.clear();
@@ -467,7 +468,6 @@ impl DockerView {
                                 self.submit(runtime, Action::Inspect(id));
                             } else {
                                 self.details = None;
-                                self.stats = None;
                             }
                         }
                     }
@@ -480,14 +480,9 @@ impl DockerView {
                     }
                     if self.selected.as_deref() == Some(&details.id) {
                         self.details = Some(*details);
-                        self.stats = None;
                     }
                 }
-                Ok(Output::Stats { id, value }) => {
-                    if self.selected.as_ref() == Some(&id) {
-                        self.stats = Some(value);
-                    }
-                }
+                Ok(Output::Stats { .. }) => {}
                 Ok(Output::Text(text)) => self.text = text,
                 Ok(Output::DiscoveredSource(source)) => {
                     if source.name == self.project_selected {
@@ -611,7 +606,6 @@ impl DockerView {
                     .into();
                     self.details = None;
                     self.storage = None;
-                    self.stats = None;
                     self.live_logs.reset();
                     self.text.clear();
                     self.refresh(runtime);
@@ -693,6 +687,39 @@ impl DockerView {
             }
         }
     }
+    pub fn sample_usage(
+        &mut self,
+        ctx: &egui::Context,
+        runtime: &Runtime,
+        visible: bool,
+        modal: bool,
+    ) {
+        let target = self
+            .details
+            .as_ref()
+            .filter(|d| self.selected.as_ref() == Some(&d.id) && d.state == "running")
+            .map(|d| smol_studio::container_usage::Target {
+                runtime: runtime.clone(),
+                id: d.id.clone(),
+                started_at: d.started_at.clone(),
+            });
+        let active = visible
+            && ctx.input(|i| i.viewport().focused == Some(true))
+            && self.connected()
+            && self.valid
+            && !self.compose
+            && self.kind == Kind::Containers
+            && self.container_tab == ContainerTab::Overview
+            && self.pending.is_none()
+            && !self.modal_open()
+            && !modal;
+        let now = std::time::Instant::now();
+        self.usage.update(target, active, now);
+        if let Some(delay) = self.usage.repaint_after(now) {
+            ctx.request_repaint_after(delay);
+        }
+    }
+
     pub fn watch(&mut self, ctx: &egui::Context, runtime: &Runtime, visible: bool, modal: bool) {
         let repaint = ctx.clone();
         let poll = self.events.poll(
@@ -1078,7 +1105,6 @@ impl DockerView {
                             self.query.clear();
                             self.selected = Some(container.id.clone());
                             self.details = None;
-                            self.stats = None;
                             self.container_tab = ContainerTab::Overview;
                             self.live_logs.reset();
                             self.text.clear();
@@ -1305,22 +1331,9 @@ impl DockerView {
                         }
                     }); }
                     ui.add_space(20.0);
-                    ui.horizontal(|ui| {
-                        ui.label(design::heading("Resource usage", 14.0));
-                        ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
-                            if ui.add_enabled(enabled && details.state == "running", egui::Button::new("Measure now")).clicked() { self.submit(runtime, Action::Stats(details.id.clone())); }
-                        });
-                    });
+                    ui.label(design::heading("Resource usage", 14.0));
                     ui.add_space(8.0);
-                    design::card().show(ui, |ui| {
-                        ui.set_width(ui.available_width());
-                        if let Some(stats) = &self.stats {
-                            for (label, key) in [("Machine CPU", "CPUPerc"), ("Guest memory / limit", "MemUsage")] {
-                                if let Some(value) = stats[key].as_str() { design::property(ui, label, value); }
-                            }
-                            ui.label(RichText::new("Snapshot · network, disk I/O and process counts unavailable").size(11.0).color(MUTED));
-                        } else { ui.label(RichText::new(if details.state == "running" { "Measure to take a CPU and memory snapshot." } else { "Start this container to measure resource usage." }).size(12.0).color(MUTED)); }
-                    });
+                    self.container_usage_ui(ui, &details);
                     if let Some(project) = &details.project {
                         ui.add_space(20.0); ui.label(design::heading("Compose project", 14.0));
                         if ui.link(project).clicked() && enabled {
@@ -1605,7 +1618,6 @@ impl DockerView {
                                 {
                                     self.selected = Some(id.clone());
                                     self.details = None;
-                                    self.stats = None;
                                     self.live_logs.reset();
                                     self.container_tab = ContainerTab::Overview;
                                     self.submit(runtime, Action::Inspect(id));

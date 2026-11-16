@@ -1126,6 +1126,12 @@ impl eframe::App for Studio {
         let docker_visible = self.workspace == Workspace::Containers
             && ctx.input(|i| i.viewport().minimized != Some(true));
         self.docker.logs_visibility(docker_visible);
+        self.docker.sample_usage(
+            ctx,
+            &self.runtime,
+            docker_visible,
+            self.settings || self.switcher.open,
+        );
         self.docker.watch(
             ctx,
             &self.runtime,

@@ -32,3 +32,5 @@ pub mod image_tag;
 pub mod image_archive;
 
 pub mod container_run;
+
+pub mod container_usage;
