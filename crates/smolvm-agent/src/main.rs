@@ -94,6 +94,7 @@ mod cuda;
 mod dirwatch;
 mod disk_trim;
 mod docker_bridge;
+mod file_metadata;
 mod forkpoint;
 mod io_target;
 #[cfg(target_os = "linux")]
@@ -3089,6 +3090,8 @@ fn handle_request(
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
 
+        AgentRequest::StatPath { path, target } => file_metadata::handle(&path, target.as_ref()),
+
         AgentRequest::FileWrite {
             path,
             data,
@@ -3248,6 +3251,7 @@ fn apply_mode_best_effort(_path: &std::path::Path, _mode: u32) {}
 #[derive(Clone, Copy, Debug)]
 enum FilePathAccess {
     Read,
+    Metadata,
     Write,
 }
 
@@ -3363,6 +3367,31 @@ fn ensure_descendant_after_canonicalize(
                 return Err(invalid_guest_path_error(
                     original_path,
                     "resolved path escapes allowed root",
+                ));
+            }
+        }
+        FilePathAccess::Metadata => {
+            // Describe the final link without following it, including a dangling
+            // link. Its parent must still resolve within the selected root.
+            let parent = if path == root {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            let parent = parent.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    e.to_string(),
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        error_codes::NOT_FOUND
+                    } else {
+                        error_codes::FILE_IO_FAILED
+                    },
+                )
+            })?;
+            if !parent.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved parent escapes allowed root",
                 ));
             }
         }

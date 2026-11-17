@@ -14,7 +14,7 @@ use axum::body::Body;
 use axum::extract::{Path, Query, State};
 use axum::http::{header, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
-use smolvm_protocol::{AgentRequest, AgentResponse, WorkloadTarget};
+use smolvm_protocol::{AgentRequest, AgentResponse, PathMetadata, WorkloadTarget};
 
 use super::containers::Container;
 use super::util::{ApiError, ApiResult};
@@ -35,6 +35,15 @@ fn path_param(q: &std::collections::HashMap<String, String>) -> ApiResult<String
     } else {
         format!("/{path}")
     })
+}
+
+/// Docker distinguishes copying a directory from copying its contents (`dir/.`).
+/// Guest paths use `/` on every host; `Path::file_name` would erase the final dot.
+fn archive_basename(path: &str) -> Option<&str> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
 }
 
 /// A machine to talk to for the container's files: its own when it runs,
@@ -286,61 +295,68 @@ pub(super) fn target(c: &Container) -> WorkloadTarget {
     }
 }
 
-/// What `path` is in the container: `(kind, size)`, or `None` when absent.
+/// Read guest metadata without scanning the parent or inventing host permissions.
 async fn stat(
     socket: &std::path::Path,
     target: &WorkloadTarget,
     path: &str,
-) -> ApiResult<Option<(String, u64)>> {
-    if path == "/" {
-        return Ok(Some(("dir".into(), 0)));
-    }
-    let p = std::path::Path::new(path);
-    let parent = p
-        .parent()
-        .map(|p| p.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".into());
-    let name = p
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
+) -> ApiResult<Option<PathMetadata>> {
     let reply = super::runtime::request(
         socket,
-        &AgentRequest::ListDirectory {
-            path: parent,
+        &AgentRequest::StatPath {
+            path: path.into(),
             target: Some(target.clone()),
         },
     )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?;
-    let entries = match reply {
-        AgentResponse::Ok { data: Some(data) } => data,
-        _ => return Ok(None),
-    };
-    let list = entries.get("entries").cloned().unwrap_or(entries.clone());
-    let entries: Vec<smolvm_protocol::DirectoryEntry> =
-        serde_json::from_value(list).unwrap_or_default();
-    Ok(entries
-        .into_iter()
-        .find(|e| e.name == name)
-        .map(|e| (e.kind, e.size)))
+    match reply {
+        AgentResponse::Ok { data: Some(data) } => serde_json::from_value(data)
+            .map(Some)
+            .map_err(|e| ApiError::internal(format!("invalid guest metadata: {e}"))),
+        AgentResponse::Error { code, .. }
+            if code.as_deref() == Some(smolvm_protocol::error_codes::NOT_FOUND) =>
+        {
+            Ok(None)
+        }
+        AgentResponse::Error { message, .. } => Err(ApiError::internal(message)),
+        _ => Err(ApiError::internal("guest did not return path metadata")),
+    }
 }
 
-fn stat_header(path: &str, kind: &str, size: u64) -> HeaderValue {
+fn stat_header(path: &str, metadata: &PathMetadata) -> HeaderValue {
     use base64::Engine as _;
-    // Go's os.FileMode bits: ModeDir is 1<<31, ModeSymlink 1<<27.
-    let mode: u64 = match kind {
-        "dir" => (1 << 31) | 0o755,
-        "symlink" => (1 << 27) | 0o777,
-        _ => 0o644,
+    // Go's FileMode stores type and special permission bits above the low nine.
+    let mut mode = (metadata.mode & 0o777) as u64;
+    mode |= match metadata.kind.as_str() {
+        "dir" => 1 << 31,
+        "symlink" => 1 << 27,
+        "file" => 0,
+        _ => 1 << 19, // ModeIrregular, never report a device as an ordinary file.
     };
-    let name = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".into());
+    for (posix, go) in [(0o4000, 1 << 23), (0o2000, 1 << 22), (0o1000, 1 << 20)] {
+        if metadata.mode & posix != 0 {
+            mode |= go;
+        }
+    }
+    let epoch = std::time::UNIX_EPOCH;
+    let time = if metadata.modified_secs >= 0 {
+        epoch.checked_add(std::time::Duration::from_secs(
+            metadata.modified_secs as u64,
+        ))
+    } else {
+        epoch.checked_sub(std::time::Duration::from_secs(
+            metadata.modified_secs.unsigned_abs(),
+        ))
+    }
+    .and_then(|t| {
+        t.checked_add(std::time::Duration::from_nanos(
+            metadata.modified_nanos.into(),
+        ))
+    });
     let json = serde_json::json!({
-        "name": name, "size": size, "mode": mode,
-        "mtime": super::util::now_rfc3339(), "linkTarget": "",
+        "name": archive_basename(path).unwrap_or("/"), "size": metadata.size, "mode": mode,
+        "mtime": super::util::rfc3339(time.unwrap_or(epoch)), "linkTarget": metadata.resolved_link_target,
     });
     HeaderValue::from_str(&base64::engine::general_purpose::STANDARD.encode(json.to_string()))
         .unwrap_or_else(|_| HeaderValue::from_static(""))
@@ -363,11 +379,11 @@ pub(crate) async fn head_archive(
     let machine = files_machine(&engine, &c).await?;
     let found = stat(&machine.socket, &target(&c), &path).await;
     machine.finish().await;
-    let (kind, size) = found?.ok_or_else(|| no_such_path(&path))?;
+    let metadata = found?.ok_or_else(|| no_such_path(&path))?;
     let mut r = StatusCode::OK.into_response();
     r.headers_mut().insert(
         "X-Docker-Container-Path-Stat",
-        stat_header(&path, &kind, size),
+        stat_header(&path, &metadata),
     );
     Ok(r)
 }
@@ -384,14 +400,32 @@ pub(crate) async fn get_archive(
     let path = path_param(&q)?;
     let machine = files_machine(&engine, &c).await?;
     let target = target(&c);
-    let (kind, size) = stat(&machine.socket, &target, &path)
+    let metadata = stat(&machine.socket, &target, &path)
         .await?
         .ok_or_else(|| no_such_path(&path))?;
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".into());
-    let request = if kind == "dir" {
+    let name = archive_basename(&path).unwrap_or(".").to_owned();
+    if metadata.kind == "symlink" {
+        // Copy the link itself; Docker's -L resolves linkTarget with another request.
+        let bytes = single_file_archive(std::io::empty(), Vec::new(), &name, &metadata)
+            .map_err(|e| ApiError::internal(e.to_string()))?;
+        machine.finish().await;
+        let mut response = Response::new(Body::from(bytes));
+        response.headers_mut().insert(
+            header::CONTENT_TYPE,
+            HeaderValue::from_static("application/x-tar"),
+        );
+        response.headers_mut().insert(
+            "X-Docker-Container-Path-Stat",
+            stat_header(&path, &metadata),
+        );
+        return Ok(response);
+    }
+    if metadata.kind != "file" && metadata.kind != "dir" {
+        return Err(ApiError::bad_request(
+            "only regular files, directories and symbolic links can be copied",
+        ));
+    }
+    let request = if metadata.kind == "dir" {
         AgentRequest::ArchiveDirectory {
             path: path.clone(),
             target: Some(target),
@@ -461,14 +495,15 @@ pub(crate) async fn get_archive(
         drop(_writer);
         machine.finish().await;
     });
-    let directory = kind == "dir";
+    let directory = metadata.kind == "dir";
+    let archive_metadata = metadata.clone();
     tokio::task::spawn_blocking(move || {
         let source = transfer::Reader::new(incoming);
         let destination = transfer::Writer::new(output.clone());
         let result = if directory {
             prefix_archive(source, destination, &name)
         } else {
-            single_file_archive(source, destination, &name, size)
+            single_file_archive(source, destination, &name, &archive_metadata)
         }
         .and_then(|mut writer| writer.flush());
         if let Err(error) = result {
@@ -484,7 +519,7 @@ pub(crate) async fn get_archive(
     );
     r.headers_mut().insert(
         "X-Docker-Container-Path-Stat",
-        stat_header(&path, &kind, size),
+        stat_header(&path, &metadata),
     );
     Ok(r)
 }
@@ -572,16 +607,36 @@ fn single_file_archive<R: std::io::Read, W: std::io::Write>(
     mut source: R,
     destination: W,
     name: &str,
-    size: u64,
+    metadata: &PathMetadata,
 ) -> std::io::Result<W> {
     let mut out = tar::Builder::new(transfer::AbortWriter::new(destination));
     let result = (|| {
         let mut header = tar::Header::new_gnu();
-        header.set_size(size);
-        header.set_mode(0o644);
-        header.set_mtime(now_secs());
+        header.set_mode(metadata.mode);
+        header.set_uid(metadata.uid.into());
+        header.set_gid(metadata.gid.into());
+        header.set_mtime(metadata.modified_secs.max(0) as u64);
+        if metadata.modified_secs < 0 || metadata.modified_nanos != 0 {
+            let nanos =
+                metadata.modified_secs as i128 * 1_000_000_000 + metadata.modified_nanos as i128;
+            let sign = if nanos < 0 { "-" } else { "" };
+            let nanos = nanos.unsigned_abs();
+            let time = format!(
+                "{sign}{}.{:09}",
+                nanos / 1_000_000_000,
+                nanos % 1_000_000_000
+            );
+            out.append_pax_extensions([("mtime", time.as_bytes())])?;
+        }
+        if metadata.kind == "symlink" {
+            header.set_size(0);
+            header.set_entry_type(tar::EntryType::Symlink);
+            out.append_link(&mut header, name, &metadata.link_target)?;
+            return Ok(());
+        }
+        header.set_size(metadata.size);
         header.set_entry_type(tar::EntryType::Regular);
-        let mut limited = source.by_ref().take(size);
+        let mut limited = source.by_ref().take(metadata.size);
         out.append_data(&mut header, name, &mut limited)?;
         if limited.limit() != 0 {
             return Err(std::io::Error::new(
@@ -865,6 +920,118 @@ pub(crate) async fn export(
 mod tests {
     use super::*;
 
+    fn file_metadata(size: u64) -> PathMetadata {
+        PathMetadata {
+            kind: "file".into(),
+            size,
+            mode: 0o751,
+            uid: 1234,
+            gid: 2345,
+            modified_secs: 1_600_000_000,
+            modified_nanos: 0,
+            link_target: String::new(),
+            resolved_link_target: String::new(),
+        }
+    }
+
+    #[test]
+    fn individual_archives_preserve_guest_metadata_and_symbolic_links() {
+        use base64::Engine as _;
+        let name = "café 雪\nscript";
+        let mut metadata = file_metadata(7);
+        metadata.mode = 0o6751;
+        metadata.modified_nanos = 123_456_789;
+        let bytes = single_file_archive(&b"payload"[..], Vec::new(), name, &metadata).unwrap();
+        let mut tar = tar::Archive::new(&bytes[..]);
+        let mut entries = tar.entries().unwrap();
+        let mut file = entries.next().unwrap().unwrap();
+        assert_eq!(file.path().unwrap().to_str(), Some(name));
+        assert_eq!(file.header().mode().unwrap(), 0o6751);
+        assert_eq!(file.header().uid().unwrap(), 1234);
+        assert_eq!(file.header().gid().unwrap(), 2345);
+        let extensions: Vec<_> = file
+            .pax_extensions()
+            .unwrap()
+            .unwrap()
+            .map(|item| {
+                let item = item.unwrap();
+                (
+                    item.key().unwrap().to_owned(),
+                    item.value().unwrap().to_owned(),
+                )
+            })
+            .collect();
+        assert!(extensions.contains(&("mtime".into(), "1600000000.123456789".into())));
+        let mut contents = String::new();
+        file.read_to_string(&mut contents).unwrap();
+        assert_eq!(contents, "payload");
+        assert!(entries.next().is_none());
+        let encoded = stat_header("/app/script", &metadata);
+        let stat: serde_json::Value = serde_json::from_slice(
+            &base64::engine::general_purpose::STANDARD
+                .decode(encoded.as_bytes())
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(stat["mode"], 0o751 | (1 << 23) | (1 << 22));
+        assert_eq!(stat["mtime"], "2020-09-13T12:26:40.123456789Z");
+
+        metadata.kind = "symlink".into();
+        metadata.link_target = "missing 雪\nfile".into();
+        let bytes = single_file_archive(std::io::empty(), Vec::new(), "link", &metadata).unwrap();
+        let mut tar = tar::Archive::new(&bytes[..]);
+        let link = tar.entries().unwrap().next().unwrap().unwrap();
+        assert!(link.header().entry_type().is_symlink());
+        assert_eq!(link.size(), 0);
+        assert_eq!(
+            link.link_name().unwrap().unwrap().to_str(),
+            Some(metadata.link_target.as_str())
+        );
+    }
+
+    #[test]
+    fn directory_contents_keep_the_trailing_dot_in_metadata_and_archive() {
+        use base64::Engine as _;
+        let mut input = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o751);
+        input
+            .append_data(&mut header, "./file", &b"hi"[..])
+            .unwrap();
+        let input = input.into_inner().unwrap();
+        for (path, name, copied_file) in [
+            ("/app/project", "project", "project/file"),
+            ("/app/project/", "project", "project/file"),
+            ("/app/project/.", ".", "file"),
+            ("/app/project/./", ".", "file"),
+            ("/.", ".", "file"),
+        ] {
+            let stat = stat_header(
+                path,
+                &PathMetadata {
+                    kind: "dir".into(),
+                    ..file_metadata(0)
+                },
+            );
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(stat.as_bytes())
+                .unwrap();
+            let stat: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            assert_eq!(stat["name"], name, "{path}");
+            let output =
+                prefix_archive(&input[..], Vec::new(), archive_basename(path).unwrap()).unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            tar::Archive::new(&output[..])
+                .unpack(destination.path())
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination.path().join(copied_file)).unwrap(),
+                b"hi"
+            );
+        }
+    }
+
     #[test]
     fn a_directory_archive_gets_its_name_at_the_top() {
         let mut b = tar::Builder::new(Vec::new());
@@ -974,7 +1141,10 @@ mod tests {
     fn changed_file_size_never_finishes_a_successful_archive() {
         for (bytes, expected) in [(&b"short"[..], 50), (&b"too long"[..], 2)] {
             let mut output = Vec::new();
-            assert!(single_file_archive(bytes, &mut output, "file.txt", expected).is_err());
+            assert!(
+                single_file_archive(bytes, &mut output, "file.txt", &file_metadata(expected))
+                    .is_err()
+            );
             assert!(
                 !output.ends_with(&[0u8; 1024]),
                 "failed copy acquired a tar footer"
@@ -995,7 +1165,8 @@ mod tests {
 
     #[test]
     fn directory_transport_failure_after_tar_footer_is_not_hidden() {
-        let bytes = single_file_archive(&b"payload"[..], Vec::new(), "file", 7).unwrap();
+        let bytes =
+            single_file_archive(&b"payload"[..], Vec::new(), "file", &file_metadata(7)).unwrap();
         let mut output = Vec::new();
         let error = prefix_archive(FailsAtEnd(std::io::Cursor::new(bytes)), &mut output, "app")
             .unwrap_err();
@@ -1010,8 +1181,13 @@ mod tests {
     async fn streamed_directory_preserves_file_bytes_and_literal_names() {
         let literal = "a ; $(false) &?#+%\n雪.txt";
         let payload = vec![0x93; 512 * 1024 + 13];
-        let archive =
-            single_file_archive(&payload[..], Vec::new(), literal, payload.len() as u64).unwrap();
+        let archive = single_file_archive(
+            &payload[..],
+            Vec::new(),
+            literal,
+            &file_metadata(payload.len() as u64),
+        )
+        .unwrap();
         let (tx, rx) = transfer::channel();
         let (out, mut downloaded) = transfer::channel();
         let producer = tokio::spawn(async move {
