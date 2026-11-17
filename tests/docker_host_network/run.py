@@ -2,7 +2,7 @@
 # Config keys: engine, docker, rootfs, lib, probe, out (absolute paths).
 # Build guest.rs for the guest architecture with rustc --edition=2021
 # --target <arch>-unknown-linux-musl -C linker=rust-lld -o /path/to/probe.
-# Requires KVM or an HVF-entitled engine and ABI-1 host-network firmware.
+# Requires KVM or an HVF-entitled engine and ABI-2 host-network firmware.
 # Uses only a private engine socket, Docker config, and temporary state directory.
 import hashlib, json, os, pathlib, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, traceback
 
