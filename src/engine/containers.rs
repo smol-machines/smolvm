@@ -1621,6 +1621,9 @@ pub(crate) fn overlay_id(record: &ContainerRecord) -> String {
 /// The container's command ended: record it, stop the machine, and apply the
 /// restart policy.
 async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
+    // Once the record becomes exited it no longer keeps its supervisor alive.
+    // VM/network teardown and auto-removal still belong to this supervisor.
+    let activity = engine.activity.hold();
     tracing::info!(container = %c.id(), name = %c.name(), code = exit.code, oom = exit.oom, "container exited");
     let vm_guard = c.vm.clone().lock_owned().await;
     let running = c.running.lock().take();
@@ -1673,6 +1676,8 @@ async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
         r.state.status = "restarting".into();
         r.restart_count += 1;
     });
+    // The restarting state owns the lifetime during backoff; cleanup is done.
+    drop(activity);
     tokio::time::sleep(delay).await;
     let _op = c.op.lock().await;
     let current = c.record();
