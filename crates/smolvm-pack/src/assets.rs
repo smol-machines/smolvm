@@ -680,6 +680,10 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
 
     let mut decoder = zstd::Decoder::new(File::open(src)?)?;
     let mut buf = vec![0u8; 512 * 1024];
+    // Slice equality uses the platform's bulk comparison instead of branching
+    // on every byte of the multi-GiB zero runs in a disk template. This scratch
+    // buffer is released when first-use expansion finishes.
+    let zeros = vec![0u8; buf.len()];
     let mut offset: u64 = 0;
     loop {
         let mut filled = 0;
@@ -695,7 +699,7 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
             break;
         }
         let chunk = &buf[..filled];
-        if chunk.iter().any(|&b| b != 0) {
+        if chunk != &zeros[..filled] {
             out.seek(SeekFrom::Start(offset))?;
             out.write_all(chunk)?;
         }
@@ -2704,6 +2708,30 @@ mod template_expand_tests {
         let src = tmp.path().join("t.ext4.zst");
         let dest = tmp.path().join("t.ext4");
         let data = template_bytes();
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        assert_eq!(fs::read(&dest).expect("read"), data);
+    }
+
+    #[test]
+    fn expansion_preserves_isolated_bytes_at_chunk_and_partial_tail_boundaries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("boundaries.ext4.zst");
+        let dest = tmp.path().join("boundaries.ext4");
+        let chunk = 512 * 1024;
+        let mut data = vec![0; 3 * chunk + 17];
+        for offset in [
+            0,
+            chunk - 1,
+            chunk,
+            2 * chunk - 1,
+            3 * chunk,
+            3 * chunk + 16,
+        ] {
+            data[offset] = 0x80;
+        }
         compress_to(&src, &data);
 
         materialize_template(&src, &dest).expect("materialize");
