@@ -2612,21 +2612,7 @@ pub(crate) fn matches(engine: &Engine, c: &Container, filters: &Filters) -> bool
     let r = c.record();
     let running = c.is_running();
     filters.any("id", |id| r.id.starts_with(id))
-        && filters.any("name", |n| {
-            let n = n.trim_start_matches('/');
-            let anchored = n.starts_with('^');
-            let n = n.trim_start_matches('^');
-            let (n, end) = match n.strip_suffix('$') {
-                Some(n) => (n, true),
-                None => (n, false),
-            };
-            match (anchored, end) {
-                (true, true) => r.name == n,
-                (true, false) => r.name.starts_with(n),
-                (false, true) => r.name.ends_with(n),
-                (false, false) => r.name.contains(n),
-            }
-        })
+        && filters.container_name_matches(&r.name)
         && filters.labels_match("label", &r.config.labels)
         && filters.any("status", |s| s == r.state.status)
         && filters.any("exited", |code| {
