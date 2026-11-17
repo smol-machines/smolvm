@@ -5500,7 +5500,7 @@ fn cs_template_dir() -> Option<PathBuf> {
         );
     }
     Some(
-        dirs::cache_dir()?
+        smolvm_paths::cache_dir()?
             .join("smolvm")
             .join("cs-volume-templates"),
     )
