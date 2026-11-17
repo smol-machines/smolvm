@@ -4138,11 +4138,24 @@ fn checkpoint_credential_ca(
     let Some(launch) = crate::credentials::CredentialLaunch::for_record(name, vm) else {
         return Ok(None);
     };
-    if !smolvm_credentials::MachineCa::exists(&launch.ca_dir) {
+    stage_credential_ca(&launch.ca_dir, &launch.ca_owner, snapshot_dir)
+}
+
+/// Stage the CA in `ca_dir` (of lineage `ca_owner`) in `snapshot_dir`; see
+/// [`checkpoint_credential_ca`].
+fn stage_credential_ca(
+    ca_dir: &Path,
+    ca_owner: &str,
+    snapshot_dir: &Path,
+) -> Result<Option<CheckpointAsset>> {
+    if !smolvm_credentials::MachineCa::exists(ca_dir) {
         return Ok(None);
     }
-    let ca = smolvm_credentials::MachineCa::load(&launch.ca_dir, &launch.ca_owner)
-        .map_err(|e| Error::agent("capture credential CA", format!("{e:#}")))?;
+    // The CA directory belongs to the machine's user, and this may run as
+    // root: read it without following links, so the machine cannot make a
+    // host key it linked there travel in the checkpoint.
+    let ca = crate::credentials::load_ca(ca_dir, ca_owner)
+        .map_err(|e| Error::agent("capture credential CA", e.to_string()))?;
     let path = snapshot_dir.join("credential-ca.json");
     {
         use std::io::Write;
@@ -4183,9 +4196,13 @@ fn install_credential_ca(
             .map_err(|e| Error::agent("read checkpoint credential CA", e.to_string()))?,
     );
     let _ = std::fs::remove_file(&staged);
-    smolvm_credentials::MachineCa::import(&document)
-        .and_then(|ca| ca.save(&vm_data_dir.join(crate::credentials::CA_DIR_NAME)))
-        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))
+    let ca = smolvm_credentials::MachineCa::import(&document)
+        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))?;
+    // The machine's directory may be its user's (a paused machine resumed
+    // from this checkpoint): never write the key, or anything else, through
+    // a link left in it.
+    crate::credentials::save_ca_without_links(&ca, vm_data_dir)
+        .map_err(|e| Error::agent("install checkpoint credential CA", e.to_string()))
 }
 
 fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
@@ -4231,8 +4248,12 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         // interceptor and the workload's requests carry the bare placeholder
         // upstream. Bindings and placeholders are not secret; the value is
         // resolved from the restore host's environment.
-        credential_policy: vm.credential_policy.clone().filter(|p| !p.is_empty()),
+        // An empty policy is kept: the machine had bindings, so its boot has
+        // the CA device and the interceptor, which the restore must recreate.
+        credential_policy: vm.credential_policy.clone(),
         credential_placeholders: vm.credential_placeholders.clone(),
+        credential_ca_device: Some(vm.credential_ca_boot_device()),
+        guest_credential_trust: vm.guest_credential_trust,
     }
 }
 
@@ -7897,6 +7918,86 @@ mod tests {
             install_credential_ca(extracted.path(), other.path(), partial.path(), &misplaced)
                 .is_err()
         );
+    }
+
+    /// Capturing a checkpoint reads the machine's CA without following
+    /// links: a key the machine's user linked in its place (a host key root
+    /// can read) is refused, never exported into the checkpoint. Nor is a
+    /// restored CA written through a link.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_ca_key_is_never_captured_or_written_through() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("credentials");
+        let ca = smolvm_credentials::MachineCa::generate("cred", &["api.a.com".into()]).unwrap();
+        ca.save(&ca_dir).unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+        let asset = stage_credential_ca(&ca_dir, "cred", snapshot.path())
+            .unwrap()
+            .expect("a CA to capture");
+        assert_eq!(asset.path, CREDENTIAL_CA_ASSET);
+
+        // Another key root could read, linked in place of the CA's.
+        let host_key = dir.path().join("host.key");
+        let other = smolvm_credentials::MachineCa::generate("host", &["h.com".into()]).unwrap();
+        other.save(&dir.path().join("host")).unwrap();
+        std::fs::copy(dir.path().join("host").join("ca.key"), &host_key).unwrap();
+        std::fs::remove_file(ca_dir.join("ca.key")).unwrap();
+        std::os::unix::fs::symlink(&host_key, ca_dir.join("ca.key")).unwrap();
+        let snapshot = tempfile::tempdir().unwrap();
+        let err = stage_credential_ca(&ca_dir, "cred", snapshot.path()).unwrap_err();
+        assert!(err.to_string().contains("load machine CA"), "{err}");
+        assert!(
+            std::fs::read_dir(snapshot.path()).unwrap().next().is_none(),
+            "nothing staged"
+        );
+
+        // Restoring into a machine whose CA directory is a link is refused.
+        let extracted = tempfile::tempdir().unwrap();
+        std::fs::create_dir(extracted.path().join(ASSET_DIR)).unwrap();
+        let source = extracted.path().join(CREDENTIAL_CA_ASSET);
+        std::fs::write(&source, ca.export().as_bytes()).unwrap();
+        let asset = describe_asset(&source, CREDENTIAL_CA_ASSET).unwrap();
+        let machine = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path(),
+            machine.path().join(crate::credentials::CA_DIR_NAME),
+        )
+        .unwrap();
+        let partial = tempfile::tempdir().unwrap();
+        assert!(
+            install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset)
+                .is_err()
+        );
+        assert!(std::fs::read_dir(elsewhere.path())
+            .unwrap()
+            .next()
+            .is_none());
+
+        // Nor through a link below it: `credentials/guest` linked elsewhere,
+        // or the key itself linked to a file root owns.
+        let machine = tempfile::tempdir().unwrap();
+        let ca_dir = machine.path().join(crate::credentials::CA_DIR_NAME);
+        std::fs::create_dir(&ca_dir).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), ca_dir.join("guest")).unwrap();
+        let root_file = elsewhere.path().join("root-owned");
+        std::fs::write(&root_file, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&root_file, ca_dir.join("ca.key")).unwrap();
+        assert!(
+            install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&root_file).unwrap(), b"untouched");
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            1,
+            "nothing written into the linked directory"
+        );
+        // The key's link was replaced, not followed.
+        assert!(std::fs::symlink_metadata(ca_dir.join("ca.key"))
+            .unwrap()
+            .is_file());
     }
 
     /// An extracted checkpoint with raw storage and overlay disks, ready to install.

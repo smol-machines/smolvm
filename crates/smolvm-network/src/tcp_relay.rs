@@ -129,6 +129,12 @@ pub struct TcpRelayTable {
     /// Redirect selected streams after egress admits their real destination.
     /// `None` relays every flow directly.
     intercept: Option<crate::StreamInterception>,
+    /// Credential interceptor published after boot, used for HTTPS while
+    /// `intercept` is unset.
+    late_https_intercept: Option<crate::LateHttpsIntercept>,
+    /// How many publications of `late_https_intercept` this table has acted
+    /// on: one it has not ends the flows it would now intercept.
+    late_published_seen: u64,
     /// Guest ports already reported as refusing published connections, so a
     /// client retrying in a loop produces one warning rather than one per
     /// attempt.
@@ -259,6 +265,9 @@ struct TrackedConnection {
     next_poll: Option<i64>,
     // keep-alive toward the guest was armed after the guest closed its side
     guest_closed_keepalive: bool,
+    // relayed directly to an HTTPS port that a credential interceptor
+    // published after boot would take: ended when one is
+    late_interceptable: bool,
 }
 
 impl Drop for TrackedConnection {
@@ -493,6 +502,8 @@ impl TcpRelayTable {
             gateway_ips,
             host_service,
             intercept: None,
+            late_https_intercept: None,
+            late_published_seen: 0,
             unaccepted_guest_ports: HashSet::new(),
             reactor: None,
             next_flow_id: 0,
@@ -574,8 +585,95 @@ impl TcpRelayTable {
         self
     }
 
+    /// Route HTTPS through a credential interceptor once one is published in
+    /// `slot`, while no other interception is configured.
+    pub fn with_late_https_intercept(mut self, slot: Option<crate::LateHttpsIntercept>) -> Self {
+        self.late_published_seen = slot.map_or(0, |slot| slot.published());
+        self.late_https_intercept = slot;
+        self
+    }
+
+    /// Whether a flow to `destination` relayed directly now would go through
+    /// a credential interceptor published later.
+    fn late_interceptable(&self, destination: SocketAddr, target: &RelayTarget) -> bool {
+        self.late_https_intercept.is_some()
+            && self.intercept.is_none()
+            && matches!(target, RelayTarget::Connect(_))
+            && destination.port() == INTERCEPTED_PORT
+            && !self.gateway_ips.contains(&destination.ip())
+    }
+
+    /// Once an interceptor is published after boot, end every HTTPS flow
+    /// the guest opened directly before it, before any segment of an open
+    /// flow moves or any new flow opens: a new flow reaches the interceptor
+    /// only once no older, unchecked one to the same hosts is left.
+    fn end_flows_a_published_interceptor_takes(&mut self) {
+        let Some(slot) = self.late_https_intercept else {
+            return;
+        };
+        self.end_flows_published_by(slot.snapshot());
+    }
+
+    /// [`Self::end_flows_a_published_interceptor_takes`] for one read of the
+    /// late slot.
+    fn end_flows_published_by(&mut self, late: crate::LateSlot) {
+        let published = late.published;
+        if published == self.late_published_seen {
+            return;
+        }
+        self.late_published_seen = published;
+        let mut ended = 0;
+        for (id, connection) in &mut self.connections {
+            if !connection.late_interceptable {
+                continue;
+            }
+            connection.late_interceptable = false;
+            connection
+                .set
+                .get_mut::<tcp::Socket>(connection.handle)
+                .abort();
+            connection.to_proxy = None;
+            connection.pending_proxy_endpoints = None;
+            connection.relay_spawned = true;
+            connection
+                .exit_state
+                .guest_gone
+                .store(true, Ordering::Release);
+            connection.relay_waker.wake();
+            self.touched.push(*id);
+            ended += 1;
+        }
+        if ended > 0 {
+            tracing::info!(
+                flows = ended,
+                "credential interceptor started: HTTPS connections opened before it were reset"
+            );
+        }
+    }
+
+    /// The interception in force given a read of the late slot.
+    fn intercept_with(&self, late: Option<crate::LateSlot>) -> Option<crate::StreamInterception> {
+        self.intercept.or_else(|| {
+            late.and_then(|slot| slot.endpoint)
+                .map(crate::StreamInterception::Https)
+        })
+    }
+
     /// Relay target for a guest-initiated flow that egress already admitted.
+    #[cfg(test)]
     fn outbound_target(&self, destination: SocketAddr) -> RelayTarget {
+        self.outbound_target_with(
+            destination,
+            self.late_https_intercept.map(|slot| slot.snapshot()),
+        )
+    }
+
+    /// [`Self::outbound_target`] given a read of the late slot.
+    fn outbound_target_with(
+        &self,
+        destination: SocketAddr,
+        late: Option<crate::LateSlot>,
+    ) -> RelayTarget {
         // The dedicated rollout ingress is a smolvm-owned service on the
         // gateway, not an outbound origin. Keep it available even when every
         // external TCP flow is delegated to a broker.
@@ -614,7 +712,7 @@ impl TcpRelayTable {
             }
             _ => {}
         }
-        match self.intercept {
+        match self.intercept_with(late) {
             Some(crate::StreamInterception::Https(endpoint))
                 if destination.port() == INTERCEPTED_PORT
                     && !self.gateway_ips.contains(&destination.ip()) =>
@@ -757,6 +855,7 @@ impl TcpRelayTable {
         device: &mut D,
         now: smoltcp::time::Instant,
     ) -> PollIngressSingleResult {
+        self.end_flows_a_published_interceptor_takes();
         let Some(connection) = self.connections.get_mut(&id) else {
             return PollIngressSingleResult::None;
         };
@@ -797,6 +896,7 @@ impl TcpRelayTable {
         device: &mut D,
         now: smoltcp::time::Instant,
     ) -> Vec<NewTcpConnection> {
+        self.end_flows_a_published_interceptor_takes();
         let mut ids = std::mem::take(&mut self.touched);
         for id in self.poll_queue.take() {
             if let Some(connection) = self.connections.get(&id) {
@@ -947,6 +1047,14 @@ impl TcpRelayTable {
             return false;
         }
 
+        // Older direct flows end before this one can reach an interceptor:
+        // both decided from one read of the slot, so the interceptor this
+        // flow may go to is never one whose publication was not acted on.
+        let late = self.late_https_intercept.map(|slot| slot.snapshot());
+        if let Some(late) = late {
+            self.end_flows_published_by(late);
+        }
+        let relay_target = self.outbound_target_with(destination, late);
         let (rx_bytes, tx_bytes) = self.next_buffer_bytes();
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; rx_bytes]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; tx_bytes]);
@@ -980,10 +1088,11 @@ impl TcpRelayTable {
                 to_proxy: Some(to_proxy_tx),
                 from_proxy: from_proxy_rx,
 
+                late_interceptable: self.late_interceptable(destination, &relay_target),
                 pending_proxy_endpoints: Some(PendingProxyEndpoints {
                     from_smoltcp: to_proxy_rx,
                     to_smoltcp: from_proxy_tx,
-                    relay_target: self.outbound_target(destination),
+                    relay_target,
                     proxy_wake,
                     watch_opening: Some(self.egress.clone()),
                 }),
@@ -1107,6 +1216,7 @@ impl TcpRelayTable {
                 opened_at: Instant::now(),
                 relay_waker,
                 guest_closed_keepalive: false,
+                late_interceptable: false,
                 set,
                 handle,
                 key,
@@ -2280,6 +2390,7 @@ mod tests {
             opened_at: Instant::now(),
             relay_waker: RelayWaker::standalone(),
             guest_closed_keepalive: false,
+            late_interceptable: false,
             set,
             handle,
             key: (
@@ -2787,6 +2898,119 @@ mod tests {
         assert!(
             matches!(plain.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
         );
+    }
+
+    /// A machine that booted without a credential interceptor relays HTTPS
+    /// directly until one is published, and through it from the next flow on.
+    #[test]
+    fn https_flows_follow_an_interceptor_published_after_boot() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        let slot = crate::LateHttpsIntercept::new();
+        let table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None)
+            .with_late_https_intercept(Some(slot));
+        let https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let http = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 80);
+        assert!(
+            matches!(table.outbound_target(https), RelayTarget::Connect(addr) if addr == https)
+        );
+        slot.set(endpoint);
+        assert!(matches!(
+            table.outbound_target(https),
+            RelayTarget::Intercept { endpoint: e, destination } if destination == https && e == endpoint
+        ));
+        assert!(matches!(table.outbound_target(http), RelayTarget::Connect(addr) if addr == http));
+        assert!(matches!(
+            table.outbound_target(SocketAddr::new(gateway, 443)),
+            RelayTarget::Connect(addr) if addr.ip().is_loopback()
+        ));
+    }
+
+    /// A reader of the late slot never sees an interceptor without the
+    /// publication that ends the direct flows before it: both are read and
+    /// written at once.
+    #[test]
+    fn a_published_interceptor_is_never_seen_before_its_publication() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        for _ in 0..200 {
+            let slot = crate::LateHttpsIntercept::new();
+            let writer = std::thread::spawn(move || slot.set(endpoint));
+            loop {
+                let seen = slot.snapshot();
+                assert!(seen.endpoint.is_none() || seen.published > 0);
+                if seen.endpoint.is_some() {
+                    break;
+                }
+                if writer.is_finished() {
+                    assert!(slot.snapshot().published == 1);
+                    break;
+                }
+            }
+            writer.join().unwrap();
+        }
+    }
+
+    /// HTTPS flows opened directly before a credential interceptor is
+    /// published after boot are ended once it is, before the next flow
+    /// opens (which goes through it); other flows are left alone.
+    #[test]
+    fn publishing_an_interceptor_ends_the_https_flows_opened_before_it() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        let gateway = IpAddr::V4(Ipv4Addr::new(100, 96, 0, 1));
+        let slot = crate::LateHttpsIntercept::new();
+        let mut table = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None)
+            .with_late_https_intercept(Some(slot));
+        let guest = |port| SocketAddr::new(IpAddr::V4(Ipv4Addr::new(100, 96, 0, 2)), port);
+        let https = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 443);
+        let http = SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 0, 2, 10)), 80);
+        assert!(table.create_tcp_socket(guest(40000), https));
+        assert!(table.create_tcp_socket(guest(40001), http));
+        let old_https = table.flow_for(guest(40000), https).unwrap();
+        let old_http = table.flow_for(guest(40001), http).unwrap();
+        let state = |table: &TcpRelayTable, id: u64| {
+            let connection = &table.connections[&id];
+            connection.set.get::<tcp::Socket>(connection.handle).state()
+        };
+        assert_eq!(state(&table, old_https), tcp::State::Listen);
+
+        slot.set(endpoint);
+        // The next flow the guest opens finds the old HTTPS one already gone.
+        assert!(table.create_tcp_socket(guest(40002), https));
+        assert_eq!(state(&table, old_https), tcp::State::Closed);
+        assert!(table.connections[&old_https]
+            .pending_proxy_endpoints
+            .is_none());
+        assert_eq!(
+            state(&table, old_http),
+            tcp::State::Listen,
+            "plain HTTP is not intercepted"
+        );
+        let new = table.flow_for(guest(40002), https).unwrap();
+        assert!(matches!(
+            table.connections[&new]
+                .pending_proxy_endpoints
+                .as_ref()
+                .unwrap()
+                .relay_target,
+            RelayTarget::Intercept { .. }
+        ));
+        assert_eq!(
+            state(&table, new),
+            tcp::State::Listen,
+            "the new flow is not ended"
+        );
+        // Acted on once: a later flow ends nothing more.
+        assert!(table.create_tcp_socket(guest(40003), https));
+        assert_eq!(state(&table, new), tcp::State::Listen);
     }
 
     /// `--block-private --allow-private 100.81.17.207/32` with a `--credential`

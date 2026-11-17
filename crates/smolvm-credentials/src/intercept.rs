@@ -17,7 +17,10 @@
 //!
 //! Every response from a credential host is scrubbed of the values its
 //! bindings carry (see [`crate::scrub`]), so a host that reflects a request's
-//! credential cannot hand it to the guest. To keep that check complete,
+//! credential cannot hand it to the guest. A host a binding stops covering
+//! (the binding removed, or moved to other hosts) may still hold a value sent
+//! to it, so for as long as the interceptor runs it keeps terminating that
+//! host and scrubbing the values sent there, without injecting anything. To keep that check complete,
 //! requests ask for an uncompressed whole response: `Accept-Encoding` is set to
 //! `identity` and range requests are dropped. A server that compresses anyway
 //! has a gzip or deflate body decoded before the check; any other encoding is
@@ -40,10 +43,10 @@ use hyper_util::rt::TokioIo;
 use smolvm_protocol::intercept::{
     connect_verdict, preamble_len, InterceptEndpoint, HEADER_LEN, TOKEN_LEN,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::task::{Context as TaskContext, Poll};
 use std::time::Duration;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, ReadBuf};
@@ -55,10 +58,29 @@ const REQUEST_LIMIT: usize = 8 * 1024 * 1024;
 const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(10);
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 const MAX_SESSIONS: usize = 256;
+/// Longest a guest may leave a request body to a credential host idle: one
+/// that stops sending is answered `408` rather than held open; one that keeps
+/// sending, however slowly, is never cut off.
+const BODY_IDLE_TIMEOUT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(60)
+};
 const MAX_CACHED_CLIENTS: usize = 64;
 /// Values remembered per binding for scrubbing: a rotated credential's old
 /// value may still be stored upstream.
 const MAX_REMEMBERED_VALUES: usize = 4;
+/// Values kept for scrubbing on hosts their bindings no longer cover, across
+/// every host: the oldest value goes first. The hosts themselves are never
+/// forgotten (see [`RetiredSet`]).
+const MAX_RETIRED_VALUES: usize = 256;
+/// Longest a change of bindings waits for a flow it ends (one spliced to a
+/// host the change intercepts) to be gone before it takes effect.
+const SPLICE_END_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
 /// Largest compressed body decoded for scrubbing, from a server that ignored
 /// `Accept-Encoding: identity`.
 const ENCODED_LIMIT: usize = 64 * 1024 * 1024;
@@ -84,21 +106,191 @@ pub struct InterceptorConfig {
 /// A running interceptor. Dropping it stops the listener and every session.
 pub struct Interceptor {
     endpoint: InterceptEndpoint,
+    state: Arc<State>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct State {
-    machine: String,
+/// Changes a running interceptor's bindings and CA. Cloneable; outlives
+/// nothing: once the [`Interceptor`] is dropped, changes have no effect.
+#[derive(Clone)]
+pub struct InterceptorControl(Arc<State>);
+
+/// The bindings an interceptor enforces, swapped as one value so a request
+/// never sees one binding's policy beside another's placeholders.
+struct Bindings {
     policy: CredentialPolicy,
     /// placeholder → binding name
-    bindings_by_placeholder: HashMap<String, String>,
+    by_placeholder: HashMap<String, String>,
     /// binding name → placeholder
-    placeholders: BTreeMap<String, String>,
-    /// binding name → values it has resolved to in this process, newest last.
-    /// An entry with no values is a binding that could not be resolved.
-    resolved: Mutex<HashMap<String, Vec<zeroize::Zeroizing<String>>>>,
-    ca: MachineCa,
+    placeholders: HashMap<String, String>,
+    /// binding name → generation of the secret behind it: kept across a swap
+    /// that keeps the binding's secret, new otherwise.
+    generations: HashMap<String, u64>,
+}
+
+impl Bindings {
+    fn new(
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        generations: HashMap<String, u64>,
+    ) -> Self {
+        let placeholders: HashMap<String, String> = placeholders
+            .iter()
+            .filter(|(binding, _)| policy.binding(binding).is_some())
+            .map(|(binding, placeholder)| (binding.clone(), placeholder.clone()))
+            .collect();
+        Self {
+            by_placeholder: placeholders
+                .iter()
+                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
+                .collect(),
+            placeholders,
+            generations,
+            policy,
+        }
+    }
+
+    /// Whether `name` is the very same binding in `self` and `other`: the
+    /// same definition, placeholder and secret generation.
+    fn same_binding(&self, other: &Bindings, name: &str) -> bool {
+        self.policy.binding(name).is_some()
+            && self.policy.binding(name) == other.policy.binding(name)
+            && self.placeholders.get(name) == other.placeholders.get(name)
+            && self.generations.get(name) == other.generations.get(name)
+    }
+}
+
+/// Source of fresh secret generations, shared by every interceptor of the
+/// process.
+static NEXT_GENERATION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+
+fn fresh_generations(policy: &CredentialPolicy) -> HashMap<String, u64> {
+    policy
+        .credentials
+        .iter()
+        .map(|b| {
+            (
+                b.name.clone(),
+                NEXT_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            )
+        })
+        .collect()
+}
+
+/// What a binding has resolved to in this process, for scrubbing.
+#[derive(Default)]
+struct Remembered {
+    /// The newest secret generation a resolution was made for. A binding
+    /// whose secret was replaced since is resolved again before a response
+    /// from its host is checked.
+    generation: u64,
+    /// Values seen, newest last, across generations: a rotated credential's
+    /// old value may still be stored upstream. Empty for a binding that could
+    /// not be resolved.
+    values: Vec<zeroize::Zeroizing<String>>,
+}
+
+/// What bindings that stopped covering a host leave behind there: the host
+/// may have stored a value sent to it, and may hand it back.
+#[derive(Default)]
+struct RetiredSet {
+    /// Host patterns, as bindings named them, that values were sent to. Kept
+    /// for as long as the interceptor runs: such a host stays terminated
+    /// (its responses checked, nothing injected, old placeholders refused)
+    /// and is never spliced through again. Bounded by the distinct host
+    /// patterns ever bound on this machine.
+    hosts: std::collections::BTreeSet<String>,
+    /// `(host pattern, value)` still scrubbed there, newest last, at most
+    /// [`MAX_RETIRED_VALUES`].
+    values: VecDeque<(String, zeroize::Zeroizing<String>)>,
+}
+
+/// A flow spliced through untouched (its host was not intercepted when it
+/// opened), which a change of bindings that intercepts its host ends.
+struct Splice {
+    /// The server name its ClientHello gave, if any.
+    host: Option<String>,
+    cancel: tokio::sync::Notify,
+    ended: std::sync::Mutex<bool>,
+    ended_signal: std::sync::Condvar,
+}
+
+impl Splice {
+    fn has_ended(&self) -> bool {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn end(&self) {
+        self.cancel.notify_one();
+    }
+
+    /// Wait until the flow is gone, at most `limit`; whether it is.
+    fn wait_ended(&self, limit: Duration) -> bool {
+        let ended = self.ended.lock().unwrap_or_else(|e| e.into_inner());
+        let (ended, _) = self
+            .ended_signal
+            .wait_timeout_while(ended, limit, |ended| !*ended)
+            .unwrap_or_else(|e| e.into_inner());
+        *ended
+    }
+}
+
+/// Hosts a change of bindings is about to intercept: new connections to them
+/// wait for it rather than being spliced or seeing the old bindings.
+struct PendingIntercept {
+    /// Host patterns.
+    hosts: Vec<String>,
+    /// Connections with no server name wait too.
+    unnamed: bool,
+}
+
+/// A change of bindings whose spliced connections have ended, ready to be
+/// committed with [`InterceptorControl::commit_bindings`]. Dropped without
+/// that, it changes nothing and lets held connections go on.
+pub struct PreparedBindings {
+    state: Arc<State>,
+}
+
+impl Drop for PreparedBindings {
+    fn drop(&mut self) {
+        *self.state.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.state.pending_changed.notify_waiters();
+    }
+}
+
+/// Marks its [`Splice`] ended when the flow's task lets go of it.
+struct SpliceGuard(Arc<Splice>);
+
+impl Drop for SpliceGuard {
+    fn drop(&mut self) {
+        *self.0.ended.lock().unwrap_or_else(|e| e.into_inner()) = true;
+        self.0.ended_signal.notify_all();
+    }
+}
+
+struct State {
+    machine: String,
+    bindings: RwLock<Arc<Bindings>>,
+    /// binding name → values it has resolved to in this process.
+    resolved: Mutex<HashMap<String, Remembered>>,
+    /// What bindings that stopped covering a host left behind there.
+    retired: Mutex<RetiredSet>,
+    /// Flows spliced through untouched, still open (ended ones are pruned).
+    /// Held while a flow decides between splicing and terminating, and while
+    /// bindings change, so no flow is spliced to a host the new bindings
+    /// intercept.
+    spliced: Mutex<Vec<Arc<Splice>>>,
+    /// Hosts a change of bindings is about to intercept, while it ends the
+    /// connections spliced to them.
+    pending: Mutex<Option<PendingIntercept>>,
+    /// Wakes connections held for a pending change once it is decided.
+    pending_changed: tokio::sync::Notify,
+    /// Grows whenever the values a response may need scrubbed of can have
+    /// grown: bindings swapped, or a value resolved. A response being
+    /// streamed rebuilds its scrubber when it changes.
+    secrets_epoch: std::sync::atomic::AtomicU64,
+    ca: RwLock<Arc<MachineCa>>,
     resolver: Arc<dyn CredentialResolver>,
     endpoint: InterceptEndpoint,
     leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
@@ -125,15 +317,17 @@ impl Interceptor {
             .collect::<Result<Vec<_>>>()?;
         let state = Arc::new(State {
             machine: config.machine,
-            bindings_by_placeholder: config
-                .placeholders
-                .iter()
-                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
-                .collect(),
-            placeholders: config.placeholders,
+            bindings: RwLock::new(Arc::new({
+                let generations = fresh_generations(&config.policy);
+                Bindings::new(config.policy, &config.placeholders, generations)
+            })),
             resolved: Mutex::new(HashMap::new()),
-            policy: config.policy,
-            ca: config.ca,
+            retired: Mutex::new(RetiredSet::default()),
+            spliced: Mutex::new(Vec::new()),
+            pending: Mutex::new(None),
+            pending_changed: tokio::sync::Notify::new(),
+            secrets_epoch: std::sync::atomic::AtomicU64::new(0),
+            ca: RwLock::new(Arc::new(config.ca)),
             resolver,
             endpoint,
             leaves: Mutex::new(HashMap::new()),
@@ -142,6 +336,7 @@ impl Interceptor {
             sessions: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let served = state.clone();
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .thread_name("smolvm-credentials")
@@ -160,7 +355,7 @@ impl Interceptor {
                         }
                     };
                     tokio::select! {
-                        _ = accept_loop(state, listener) => {}
+                        _ = accept_loop(served, listener) => {}
                         _ = shutdown_rx => {}
                     }
                 });
@@ -169,6 +364,7 @@ impl Interceptor {
             .context("interceptor thread")?;
         Ok(Self {
             endpoint,
+            state,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -177,6 +373,179 @@ impl Interceptor {
     /// Where the network backend should redirect flows, and with which token.
     pub fn endpoint(&self) -> InterceptEndpoint {
         self.endpoint
+    }
+
+    /// A handle that changes this interceptor's bindings and CA while it runs.
+    pub fn control(&self) -> InterceptorControl {
+        InterceptorControl(self.state.clone())
+    }
+}
+
+impl InterceptorControl {
+    /// Enforce `policy` with `placeholders` from the next request on, every
+    /// binding with a new secret. See [`Self::replace_bindings_keeping`].
+    pub fn replace_bindings(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+    ) -> std::result::Result<(), String> {
+        self.replace_bindings_keeping(policy, placeholders, &[])
+    }
+
+    /// Enforce `policy` with `placeholders` from the next request on. The
+    /// bindings named in `kept` keep the secret they had (the caller kept
+    /// their source and value); every other one has a new secret.
+    ///
+    /// A request in flight that resolved a binding's value is sent only if
+    /// that binding is still the very same one (definition, placeholder and
+    /// secret) once the value is in hand; otherwise it is refused with a
+    /// `503` rather than sent with a value it was not checked against. A swap
+    /// that leaves a request's binding alone (an unrelated addition, an
+    /// identical re-send) does not disturb it. A caller that also changes
+    /// the resolver's values must do both under the lock its resolver takes
+    /// to read them, so no resolution sees one without the other. A host no
+    /// binding allows any more is spliced through untouched on its next
+    /// connection, and a placeholder whose binding is gone is refused —
+    /// unless a value was sent to it: then it stays terminated, and its
+    /// responses scrubbed of those values, while the interceptor runs.
+    ///
+    /// A connection spliced through untouched to a host these bindings now
+    /// intercept (opened before a binding covered it) is ended before they
+    /// take effect: no value is injected toward a host while a connection to
+    /// it that nothing checks is open. One with no server name is ended when
+    /// the change intercepts any new host.
+    pub fn replace_bindings_keeping(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        kept: &[String],
+    ) -> std::result::Result<(), String> {
+        let prepared = self.prepare_bindings(&policy)?;
+        self.commit_bindings(prepared, policy, placeholders, kept);
+        Ok(())
+    }
+
+    /// The first half of [`Self::replace_bindings_keeping`]: end every
+    /// connection spliced through untouched to a host `policy` will
+    /// intercept, holding new connections to those hosts until the change is
+    /// committed or dropped. Takes no lock while it waits, so the
+    /// interceptor keeps serving. Refused, changing nothing, if a connection
+    /// has not ended by [`SPLICE_END_WAIT`]: bindings that intercept a host
+    /// never take effect while an unchecked connection to it is open.
+    pub fn prepare_bindings(
+        &self,
+        policy: &CredentialPolicy,
+    ) -> std::result::Result<PreparedBindings, String> {
+        let state = &self.0;
+        let (ending, prepared) = {
+            let mut spliced = state.spliced.lock().expect("spliced flows");
+            let current = state.bindings();
+            let leaving = state.retire_preview(&current.policy, policy);
+            let new_host = policy
+                .credentials
+                .iter()
+                .flat_map(|b| b.allowed_hosts.iter())
+                .any(|host| {
+                    !current
+                        .policy
+                        .credentials
+                        .iter()
+                        .any(|b| b.allowed_hosts.contains(host))
+                });
+            let mut hosts: Vec<String> = policy
+                .credentials
+                .iter()
+                .flat_map(|b| b.allowed_hosts.iter().cloned())
+                .collect();
+            hosts.extend(leaving);
+            let will_intercept = |host: &str| {
+                hosts
+                    .iter()
+                    .any(|pattern| smolvm_protocol::credentials::host_matches(pattern, host))
+                    || state.has_retired(host)
+            };
+            spliced.retain(|splice| !splice.has_ended());
+            let ending: Vec<Arc<Splice>> = spliced
+                .iter()
+                .filter(|splice| match &splice.host {
+                    Some(host) => will_intercept(host),
+                    None => new_host,
+                })
+                .cloned()
+                .collect();
+            // From here until commit or drop, new connections to these hosts
+            // wait: none is spliced, and none sees the old bindings.
+            *state.pending.lock().expect("pending intercept") = Some(PendingIntercept {
+                hosts: hosts.clone(),
+                unnamed: new_host,
+            });
+            (
+                ending,
+                PreparedBindings {
+                    state: state.clone(),
+                },
+            )
+        };
+        for splice in &ending {
+            splice.end();
+        }
+        let deadline = std::time::Instant::now() + SPLICE_END_WAIT;
+        let lingering: Vec<Option<String>> = ending
+            .iter()
+            .filter(|splice| {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                !splice.wait_ended(left)
+            })
+            .map(|splice| splice.host.clone())
+            .collect();
+        if !lingering.is_empty() {
+            tracing::warn!(machine = %state.machine, hosts = ?lingering, "connections to hosts these bindings intercept did not end in time; bindings not changed");
+            // Dropping `prepared` lets held connections go on as before.
+            return Err(format!(
+                "connections opened before these bindings to hosts they intercept ({}) did not \
+                 close in time; nothing changed, retry",
+                lingering
+                    .iter()
+                    .map(|host| host.as_deref().unwrap_or("no server name"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+        Ok(prepared)
+    }
+
+    /// The second half of [`Self::replace_bindings_keeping`]: enforce
+    /// `policy` from the next request on, then let held connections decide.
+    pub fn commit_bindings(
+        &self,
+        prepared: PreparedBindings,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        kept: &[String],
+    ) {
+        {
+            let _spliced = self.0.spliced.lock().expect("spliced flows");
+            let mut slot = self.0.bindings.write().unwrap_or_else(|e| e.into_inner());
+            self.0.retire(&slot.policy, &policy);
+            let mut generations = fresh_generations(&policy);
+            for name in kept {
+                let same = slot.policy.binding(name) == policy.binding(name)
+                    && slot.placeholders.get(name) == placeholders.get(name);
+                if let (true, Some(old)) = (same, slot.generations.get(name)) {
+                    generations.insert(name.clone(), *old);
+                }
+            }
+            *slot = Arc::new(Bindings::new(policy, placeholders, generations));
+            self.0.bump_secrets();
+        }
+        // Lets held connections decide, under the new bindings.
+        drop(prepared);
+    }
+
+    /// Sign leaves with `ca` from the next handshake on.
+    pub fn replace_ca(&self, ca: MachineCa) {
+        *self.0.ca.write().unwrap_or_else(|e| e.into_inner()) = Arc::new(ca);
+        self.0.leaves.lock().expect("leaf cache").clear();
     }
 }
 
@@ -250,15 +619,48 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     .await
     .context("client hello timeout")??;
 
-    match peek {
-        Peek::ServerName(host) if state.policy.bindings_for_host(&host).next().is_some() => {
+    let host = match peek {
+        Peek::ServerName(host) => Some(host),
+        Peek::NoServerName | Peek::Incomplete => None,
+    };
+    // Decided under the spliced-flow lock, which a change of bindings holds
+    // while it swaps them: a flow spliced now is one that change ends if it
+    // intercepts the flow's host.
+    // A connection to a host a pending change will intercept waits for it.
+    let splice = loop {
+        let notified = state.pending_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let mut spliced = state.spliced.lock().expect("spliced flows");
+            if !state.pending_covers(host.as_deref()) {
+                break match &host {
+                    Some(name) if state.intercepts(name) => None,
+                    _ => {
+                        spliced.retain(|splice| !splice.has_ended());
+                        let splice = Arc::new(Splice {
+                            host: host.clone(),
+                            cancel: tokio::sync::Notify::new(),
+                            ended: std::sync::Mutex::new(false),
+                            ended_signal: std::sync::Condvar::new(),
+                        });
+                        spliced.push(splice.clone());
+                        Some(SpliceGuard(splice))
+                    }
+                };
+            }
+        }
+        // Decided within the wait of the change; checked again either way.
+        let _ = tokio::time::timeout(SPLICE_END_WAIT * 2, notified).await;
+    };
+    match (splice, host) {
+        (Some(guard), _) => passthrough(stream, upstream, buffered, guard).await,
+        (None, Some(host)) => {
             // The upstream client opens its own verified connection.
             drop(upstream);
             terminate(state, stream, buffered, host, destination).await
         }
-        Peek::ServerName(_) | Peek::NoServerName | Peek::Incomplete => {
-            passthrough(stream, upstream, buffered).await
-        }
+        (None, None) => unreachable!("only a named host is terminated"),
     }
 }
 
@@ -272,14 +674,31 @@ async fn read_preamble(state: &State, stream: &mut TcpStream) -> Result<SocketAd
     Ok(state.endpoint.read_preamble(&full[..])?)
 }
 
+/// Splice a flow through untouched until either side closes, or a change of
+/// bindings intercepts its host and ends it. Dropping `guard` (with the
+/// sockets) tells that change it is gone.
 async fn passthrough(
     mut guest: TcpStream,
     mut upstream: TcpStream,
     buffered: Vec<u8>,
+    guard: SpliceGuard,
 ) -> Result<()> {
-    let _ = upstream.set_nodelay(true);
-    upstream.write_all(&buffered).await?;
-    let _ = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await;
+    let splice = guard.0.clone();
+    let spliced = async {
+        let _ = upstream.set_nodelay(true);
+        upstream.write_all(&buffered).await?;
+        let _ = tokio::io::copy_bidirectional(&mut guest, &mut upstream).await;
+        Ok::<_, std::io::Error>(())
+    };
+    tokio::select! {
+        result = spliced => result?,
+        () = splice.cancel.notified() => {
+            tracing::info!(host = ?splice.host, "spliced connection ended: its host is now intercepted");
+        }
+    }
+    drop(guest);
+    drop(upstream);
+    drop(guard);
     Ok(())
 }
 
@@ -324,10 +743,124 @@ async fn terminate(
 }
 
 impl State {
+    /// Keep scrubbing, on every host a binding of `old` covered and its
+    /// namesake in `new` does not, the values that binding resolved to here;
+    /// and keep each such host intercepted for as long as this runs.
+    fn retire(&self, old: &CredentialPolicy, new: &CredentialPolicy) {
+        let resolved = self.resolved.lock().expect("resolved values");
+        let mut retired = self.retired.lock().expect("retired values");
+        for binding in &old.credentials {
+            let Some(seen) = resolved.get(&binding.name).filter(|s| !s.values.is_empty()) else {
+                continue;
+            };
+            let successor = new.binding(&binding.name);
+            for host in &binding.allowed_hosts {
+                if successor.is_some_and(|b| b.allowed_hosts.contains(host)) {
+                    continue;
+                }
+                retired.hosts.insert(host.clone());
+                for value in &seen.values {
+                    if retired.values.iter().any(|(h, v)| h == host && v == value) {
+                        continue;
+                    }
+                    if retired.values.len() == MAX_RETIRED_VALUES {
+                        retired.values.pop_front();
+                    }
+                    retired.values.push_back((host.clone(), value.clone()));
+                }
+            }
+        }
+    }
+
+    /// The host patterns [`Self::retire`] would keep intercepted for a change
+    /// from `old` to `new`.
+    fn retire_preview(&self, old: &CredentialPolicy, new: &CredentialPolicy) -> Vec<String> {
+        let resolved = self.resolved.lock().expect("resolved values");
+        old.credentials
+            .iter()
+            .filter(|b| resolved.get(&b.name).is_some_and(|s| !s.values.is_empty()))
+            .flat_map(|binding| {
+                let successor = new.binding(&binding.name);
+                binding
+                    .allowed_hosts
+                    .iter()
+                    .filter(move |host| !successor.is_some_and(|b| b.allowed_hosts.contains(host)))
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Whether a connection to `host` (or with no server name) must wait for
+    /// a pending change of bindings.
+    fn pending_covers(&self, host: Option<&str>) -> bool {
+        match self.pending.lock().expect("pending intercept").as_ref() {
+            None => false,
+            Some(pending) => match host {
+                Some(host) => pending
+                    .hosts
+                    .iter()
+                    .any(|pattern| smolvm_protocol::credentials::host_matches(pattern, host)),
+                None => pending.unnamed,
+            },
+        }
+    }
+
+    /// Whether `host` is one a binding sent values to and covers no more.
+    fn has_retired(&self, host: &str) -> bool {
+        self.retired
+            .lock()
+            .expect("retired values")
+            .hosts
+            .iter()
+            .any(|pattern| smolvm_protocol::credentials::host_matches(pattern, host))
+    }
+
+    /// Whether flows to `host` are terminated here rather than spliced.
+    fn intercepts(&self, host: &str) -> bool {
+        self.bindings()
+            .policy
+            .bindings_for_host(host)
+            .next()
+            .is_some()
+            || self.has_retired(host)
+    }
+
+    fn bump_secrets(&self) {
+        self.secrets_epoch
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    fn secrets_epoch(&self) -> u64 {
+        self.secrets_epoch
+            .load(std::sync::atomic::Ordering::Acquire)
+    }
+
+    fn bindings(&self) -> Arc<Bindings> {
+        self.bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Whether binding `name` of `seen` is still in force, unchanged. A value
+    /// is resolved by binding name; checked after resolving, this proves the
+    /// value belongs to the binding the request was checked against, not to
+    /// a binding of the same name that replaced it meanwhile (the controller
+    /// swaps bindings and the resolver's values as one step).
+    fn binding_unchanged(&self, seen: &Arc<Bindings>, name: &str) -> bool {
+        let now = self.bindings();
+        Arc::ptr_eq(seen, &now) || seen.same_binding(&now, name)
+    }
+
+    fn ca(&self) -> Arc<MachineCa> {
+        self.ca.read().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     /// Ask the resolver for `binding`'s value for this request. The inner
     /// `Err` is the reply to send the guest when it has none.
     async fn resolve(
         &self,
+        bindings: &Bindings,
         binding: &str,
         host: &str,
         destination: SocketAddr,
@@ -346,7 +879,8 @@ impl State {
         let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&request))
             .await
             .context("resolver task")?;
-        self.remember(binding, resolved.as_ref().ok());
+        let generation = bindings.generations.get(binding).copied().unwrap_or(0);
+        self.remember(binding, generation, resolved.as_ref().ok());
         Ok(resolved.map_err(|e| {
             tracing::warn!(machine = %self.machine, binding, host, error = %e, "credential resolution failed");
             text(
@@ -356,16 +890,22 @@ impl State {
         }))
     }
 
-    /// Note what `binding` resolved to, or that it did not resolve.
-    fn remember(&self, binding: &str, value: Option<&zeroize::Zeroizing<String>>) {
+    /// Note what `binding` resolved to under secret `generation`, or that it
+    /// did not resolve.
+    fn remember(&self, binding: &str, generation: u64, value: Option<&zeroize::Zeroizing<String>>) {
         let mut resolved = self.resolved.lock().expect("resolved values");
-        let values = resolved.entry(binding.to_string()).or_default();
+        let remembered = resolved.entry(binding.to_string()).or_default();
+        // Generations only grow, so a resolution that finishes after a newer
+        // one never makes the newer secret look unseen.
+        remembered.generation = remembered.generation.max(generation);
+        let values = &mut remembered.values;
         if let Some(value) = value {
             if !values.iter().any(|known| known == value) {
                 if values.len() == MAX_REMEMBERED_VALUES {
                     values.remove(0);
                 }
                 values.push(value.clone());
+                self.bump_secrets();
             }
         }
     }
@@ -374,49 +914,77 @@ impl State {
     /// resolving the ones this process has not seen yet. A guest that stored a
     /// value with one request could read it back with another that injects
     /// nothing, so every response from the host is checked.
+    ///
+    /// Both the bindings the request was checked against (`snapshot`) and the
+    /// ones in force now count, and the values left with the host by bindings
+    /// that stopped covering it: a value bound while a response is on its
+    /// way is scrubbed from what is left of it.
     async fn scrubber_for(
         &self,
+        snapshot: &Bindings,
         host: &str,
         destination: SocketAddr,
         method: &str,
         path: &str,
     ) -> Result<Option<Scrubber>> {
-        let unseen: Vec<String> = {
-            let resolved = self.resolved.lock().expect("resolved values");
-            self.policy
-                .bindings_for_host(host)
-                .filter(|b| !resolved.contains_key(&b.name))
-                .map(|b| b.name.clone())
-                .collect()
-        };
-        for binding in unseen {
-            // Recorded either way by `resolve`; a failure only means there is
-            // nothing of this binding's to look for.
-            let _ = self
-                .resolve(&binding, host, destination, method, path)
-                .await?;
+        let current = self.bindings();
+        let views: [&Bindings; 2] = [snapshot, &current];
+        for bindings in views {
+            let unseen: Vec<String> = {
+                let resolved = self.resolved.lock().expect("resolved values");
+                bindings
+                    .policy
+                    .bindings_for_host(host)
+                    .filter(|b| {
+                        resolved.get(&b.name).is_none_or(|seen| {
+                            bindings
+                                .generations
+                                .get(&b.name)
+                                .is_some_and(|current| seen.generation < *current)
+                        })
+                    })
+                    .map(|b| b.name.clone())
+                    .collect()
+            };
+            for binding in unseen {
+                // Recorded either way by `resolve`; a failure only means there
+                // is nothing of this binding's to look for.
+                let _ = self
+                    .resolve(bindings, &binding, host, destination, method, path)
+                    .await?;
+            }
         }
         let resolved = self.resolved.lock().expect("resolved values");
-        let secrets: Vec<Secret<'_>> = self
-            .policy
-            .bindings_for_host(host)
-            .flat_map(|b| {
+        let retired = self.retired.lock().expect("retired values");
+        let mut secrets: Vec<Secret<'_>> = Vec::new();
+        for bindings in views {
+            for b in bindings.policy.bindings_for_host(host) {
                 // A header-setting binding's guest never holds a placeholder.
                 let placeholder = b
                     .set_header
                     .is_none()
-                    .then(|| self.placeholders.get(&b.name).map(String::as_str))
+                    .then(|| bindings.placeholders.get(&b.name).map(String::as_str))
                     .flatten();
-                resolved
-                    .get(&b.name)
-                    .into_iter()
-                    .flatten()
-                    .map(move |value| Secret {
+                secrets.extend(resolved.get(&b.name).into_iter().flat_map(|seen| {
+                    seen.values.iter().map(move |value| Secret {
                         value: value.as_bytes(),
                         placeholder,
                     })
-            })
-            .collect();
+                }));
+            }
+        }
+        // Values sent here under bindings that no longer cover the host have
+        // no placeholder the guest could still use.
+        secrets.extend(
+            retired
+                .values
+                .iter()
+                .filter(|(pattern, _)| smolvm_protocol::credentials::host_matches(pattern, host))
+                .map(|(_, value)| Secret {
+                    value: value.as_bytes(),
+                    placeholder: None,
+                }),
+        );
         Ok(Scrubber::new(&secrets))
     }
 
@@ -424,7 +992,7 @@ impl State {
         if let Some(config) = self.leaves.lock().expect("leaf cache").get(host) {
             return Ok(config.clone());
         }
-        let (chain, key) = self.ca.issue_leaf(host)?;
+        let (chain, key) = self.ca().issue_leaf(host)?;
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -468,7 +1036,7 @@ impl State {
     }
 
     async fn forward(
-        &self,
+        self: &Arc<Self>,
         host: &str,
         destination: SocketAddr,
         request: Request<Incoming>,
@@ -523,6 +1091,9 @@ impl State {
             return Ok(reply);
         }
 
+        // One view of the bindings for the whole request, so a replacement
+        // landing mid-request never pairs one policy with other placeholders.
+        let bindings = self.bindings();
         let (parts, body) = request.into_parts();
         let target = parts
             .uri
@@ -540,14 +1111,9 @@ impl State {
             Ok(found) => found,
             Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
         };
-        let body = match Limited::new(body, REQUEST_LIMIT).collect().await {
-            Ok(collected) => collected.to_bytes(),
-            Err(_) => {
-                return Ok(text(
-                    StatusCode::PAYLOAD_TOO_LARGE,
-                    "smolvm credentials: request body exceeds 8 MiB",
-                ))
-            }
+        let body = match read_body(body).await {
+            Ok(body) => body,
+            Err(reply) => return Ok(*reply),
         };
         let body_placeholder = match find_body_placeholder(&body) {
             Ok(found) => found,
@@ -571,13 +1137,13 @@ impl State {
             .map(|(_, placeholder)| placeholder)
             .or(body_placeholder.as_ref())
         {
-            let Some(binding_name) = self.bindings_by_placeholder.get(placeholder) else {
+            let Some(binding_name) = bindings.by_placeholder.get(placeholder) else {
                 return Ok(text(
                     StatusCode::FORBIDDEN,
                     "smolvm credentials: unknown placeholder",
                 ));
             };
-            let binding = self
+            let binding = bindings
                 .policy
                 .binding(binding_name)
                 .context("binding vanished from policy")?;
@@ -622,6 +1188,7 @@ impl State {
             }
             let secret = match self
                 .resolve(
+                    &bindings,
                     binding_name,
                     host,
                     destination,
@@ -633,6 +1200,9 @@ impl State {
                 Ok(secret) => secret,
                 Err(reply) => return Ok(reply),
             };
+            if !self.binding_unchanged(&bindings, binding_name) {
+                return Ok(bindings_changed());
+            }
             if let Some((header_name, _)) = &substitution {
                 let current = headers
                     .get(header_name)
@@ -665,13 +1235,14 @@ impl State {
 
         // Header-setting bindings: the host supplies the whole value and it
         // replaces whatever the guest sent, placeholder or not.
-        for binding in self.policy.header_bindings(host, parts.method.as_str()) {
+        for binding in bindings.policy.header_bindings(host, parts.method.as_str()) {
             let header_name = binding
                 .set_header
                 .as_deref()
                 .context("header binding without a header")?;
             let secret = match self
                 .resolve(
+                    &bindings,
                     &binding.name,
                     host,
                     destination,
@@ -683,6 +1254,9 @@ impl State {
                 Ok(secret) => secret,
                 Err(reply) => return Ok(reply),
             };
+            if !self.binding_unchanged(&bindings, &binding.name) {
+                return Ok(bindings_changed());
+            }
             let (Ok(name), Ok(mut value)) = (
                 header::HeaderName::from_bytes(header_name.as_bytes()),
                 header::HeaderValue::from_bytes(secret.as_bytes()),
@@ -722,21 +1296,12 @@ impl State {
         let status = upstream.status();
         let mut response_headers = upstream.headers().clone();
         strip_hop_headers(&mut response_headers);
-        let Some(scrubber) = self
-            .scrubber_for(host, destination, method.as_str(), &target)
-            .await?
-        else {
-            let body = StreamBody::new(
-                upstream
-                    .bytes_stream()
-                    .map_ok(Frame::data)
-                    .map_err(|e| Box::new(e) as BoxError),
-            );
-            let mut reply = Response::new(BodyExt::boxed(body));
-            *reply.status_mut() = status;
-            *reply.headers_mut() = response_headers;
-            return Ok(reply);
-        };
+        // Read before the scrubber is built: any value added from here on
+        // shows as a newer epoch, and the body is checked for it too.
+        let epoch = self.secrets_epoch();
+        let scrubber = self
+            .scrubber_for(&bindings, host, destination, method.as_str(), &target)
+            .await?;
         let has_body = method != Method::HEAD
             && status != StatusCode::NO_CONTENT
             && status != StatusCode::NOT_MODIFIED;
@@ -761,6 +1326,7 @@ impl State {
         };
         let mut header_hits = 0;
         for value in response_headers.values_mut() {
+            let Some(scrubber) = &scrubber else { break };
             if let Some(clean) = scrubber.scrub(value.as_bytes()) {
                 header_hits += 1;
                 *value = header::HeaderValue::from_bytes(&clean)
@@ -796,8 +1362,21 @@ impl State {
                     "smolvm credentials: the compressed response could not be decoded to check it for credentials",
                 ));
             };
-            let mut clean = Vec::with_capacity(plain.len());
-            let (_, hits) = scrubber.scan(&plain, true, &mut clean);
+            // Values bound while the body was collected count too.
+            let scrubber = if self.secrets_epoch() != epoch {
+                self.scrubber_for(&bindings, host, destination, method.as_str(), &target)
+                    .await?
+            } else {
+                scrubber
+            };
+            let (clean, hits) = match &scrubber {
+                Some(scrubber) => {
+                    let mut clean = Vec::with_capacity(plain.len());
+                    let (_, hits) = scrubber.scan(&plain, true, &mut clean);
+                    (clean, hits)
+                }
+                None => (plain, 0),
+            };
             if hits > 0 {
                 tracing::warn!(machine = %self.machine, host, count = hits, "credential value removed from a response body");
             }
@@ -817,8 +1396,15 @@ impl State {
                 scrubbed(
                     upstream.bytes_stream(),
                     scrubber,
-                    self.machine.clone(),
-                    host.to_string(),
+                    Rescrub {
+                        state: self.clone(),
+                        snapshot: bindings.clone(),
+                        epoch,
+                        host: host.to_string(),
+                        destination,
+                        method: method.to_string(),
+                        path: target.clone(),
+                    },
                 )
                 .map_ok(Frame::data),
             ))
@@ -856,68 +1442,111 @@ fn decode_body(encoding: &str, compressed: &[u8]) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// What a streamed response needs to rebuild its scrubber when the values
+/// it must be checked for change while it streams (a long poll, an event
+/// stream): the request it answers, and the epoch its scrubber was built at.
+struct Rescrub {
+    state: Arc<State>,
+    snapshot: Arc<Bindings>,
+    epoch: u64,
+    host: String,
+    destination: SocketAddr,
+    method: String,
+    path: String,
+}
+
 /// `body` with every credential form `scrubber` knows replaced. Holds back the
-/// tail of each chunk that could start a form the next chunk finishes.
+/// tail of each chunk that could start a form the next chunk finishes. Before
+/// each chunk, a scrubber built before a value was bound or resolved is built
+/// again, so a value bound mid-response is scrubbed from the rest of it.
 fn scrubbed<S>(
     body: S,
-    scrubber: Scrubber,
-    machine: String,
-    host: String,
+    scrubber: Option<Scrubber>,
+    rescrub: Rescrub,
 ) -> impl Stream<Item = std::result::Result<Bytes, BoxError>> + Send
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
 {
     struct Scan<S> {
         body: S,
+        scrubber: Option<Arc<Scrubber>>,
+        rescrub: Rescrub,
         carry: Vec<u8>,
         hits: usize,
         done: bool,
     }
-    let scrubber = Arc::new(scrubber);
+    impl<S> Scan<S> {
+        /// Rebuild the scrubber if the values to look for may have grown.
+        async fn refresh(&mut self) -> Result<()> {
+            let now = self.rescrub.state.secrets_epoch();
+            if now == self.rescrub.epoch {
+                return Ok(());
+            }
+            let r = &self.rescrub;
+            self.scrubber = r
+                .state
+                .scrubber_for(&r.snapshot, &r.host, r.destination, &r.method, &r.path)
+                .await?
+                .map(Arc::new);
+            self.rescrub.epoch = now;
+            Ok(())
+        }
+
+        fn scan(&mut self, last: bool) -> Vec<u8> {
+            let mut out = Vec::with_capacity(self.carry.len());
+            match &self.scrubber {
+                Some(scrubber) => {
+                    let (used, hits) = scrubber.scan(&self.carry, last, &mut out);
+                    self.carry.drain(..used);
+                    self.hits += hits;
+                }
+                None => out.append(&mut self.carry),
+            }
+            out
+        }
+    }
     futures_util::stream::unfold(
         Scan {
             body,
+            scrubber: scrubber.map(Arc::new),
+            rescrub,
             carry: Vec::new(),
             hits: 0,
             done: false,
         },
-        move |mut scan| {
-            let scrubber = scrubber.clone();
-            let (machine, host) = (machine.clone(), host.clone());
-            async move {
-                if scan.done {
-                    return None;
+        move |mut scan| async move {
+            if scan.done {
+                return None;
+            }
+            loop {
+                let next = scan.body.next().await;
+                if let Err(e) = scan.refresh().await {
+                    scan.done = true;
+                    return Some((Err(e.into()), scan));
                 }
-                loop {
-                    match scan.body.next().await {
-                        Some(Ok(chunk)) => {
-                            scan.carry.extend_from_slice(&chunk);
-                            let mut out = Vec::with_capacity(scan.carry.len());
-                            let (used, hits) = scrubber.scan(&scan.carry, false, &mut out);
-                            scan.carry.drain(..used);
-                            scan.hits += hits;
-                            if !out.is_empty() {
-                                return Some((Ok(Bytes::from(out)), scan));
-                            }
-                        }
-                        Some(Err(e)) => {
-                            scan.done = true;
-                            return Some((Err(Box::new(e) as BoxError), scan));
-                        }
-                        None => {
-                            scan.done = true;
-                            let mut out = Vec::with_capacity(scan.carry.len());
-                            let (_, hits) = scrubber.scan(&scan.carry, true, &mut out);
-                            scan.hits += hits;
-                            scan.carry.clear();
-                            if scan.hits > 0 {
-                                tracing::warn!(machine = %machine, host = %host, count = scan.hits, "credential value removed from a response body");
-                            }
-                            if out.is_empty() {
-                                return None;
-                            }
+                match next {
+                    Some(Ok(chunk)) => {
+                        scan.carry.extend_from_slice(&chunk);
+                        let out = scan.scan(false);
+                        if !out.is_empty() {
                             return Some((Ok(Bytes::from(out)), scan));
                         }
+                    }
+                    Some(Err(e)) => {
+                        scan.done = true;
+                        return Some((Err(Box::new(e) as BoxError), scan));
+                    }
+                    None => {
+                        scan.done = true;
+                        let out = scan.scan(true);
+                        scan.carry.clear();
+                        if scan.hits > 0 {
+                            tracing::warn!(machine = %scan.rescrub.state.machine, host = %scan.rescrub.host, count = scan.hits, "credential value removed from a response body");
+                        }
+                        if out.is_empty() {
+                            return None;
+                        }
+                        return Some((Ok(Bytes::from(out)), scan));
                     }
                 }
             }
@@ -1050,6 +1679,49 @@ fn strip_hop_headers(headers: &mut header::HeaderMap) {
     }
     headers.remove("keep-alive");
     headers.remove("proxy-connection");
+}
+
+/// Buffer a request body of at most [`REQUEST_LIMIT`] bytes, giving up on one
+/// that sends nothing for [`BODY_IDLE_TIMEOUT`].
+async fn read_body(mut body: Incoming) -> std::result::Result<Bytes, Box<Reply>> {
+    let mut buffered = Vec::new();
+    loop {
+        match tokio::time::timeout(BODY_IDLE_TIMEOUT, body.frame()).await {
+            Err(_) => {
+                return Err(Box::new(text(
+                    StatusCode::REQUEST_TIMEOUT,
+                    "smolvm credentials: request body stalled",
+                )))
+            }
+            Ok(None) => return Ok(Bytes::from(buffered)),
+            Ok(Some(Err(_))) => {
+                return Err(Box::new(text(
+                    StatusCode::BAD_REQUEST,
+                    "smolvm credentials: request body could not be read",
+                )))
+            }
+            Ok(Some(Ok(frame))) => {
+                if let Ok(data) = frame.into_data() {
+                    if buffered.len() + data.len() > REQUEST_LIMIT {
+                        return Err(Box::new(text(
+                            StatusCode::PAYLOAD_TOO_LARGE,
+                            "smolvm credentials: request body exceeds 8 MiB",
+                        )));
+                    }
+                    buffered.extend_from_slice(&data);
+                }
+            }
+        }
+    }
+}
+
+/// The reply to a request whose bindings were replaced while it was being
+/// handled: nothing was sent upstream, and a retry runs under the new ones.
+fn bindings_changed() -> Reply {
+    text(
+        StatusCode::SERVICE_UNAVAILABLE,
+        "smolvm credentials: credential bindings changed during the request; retry",
+    )
 }
 
 fn text(status: StatusCode, message: &'static str) -> Reply {
@@ -1255,6 +1927,38 @@ mod tests {
                                         header::CONTENT_ENCODING,
                                         header::HeaderValue::from_static("gzip"),
                                     );
+                                    reply
+                                }
+                                // A response whose second half comes later and
+                                // carries the value named in the path.
+                                p if p.starts_with("/slow/") => {
+                                    let value = p["/slow/".len()..].to_string();
+                                    let parts = futures_util::stream::unfold(0u8, move |step| {
+                                        let value = value.clone();
+                                        async move {
+                                            match step {
+                                                0 => Some((
+                                                    Ok::<_, BoxError>(Frame::data(
+                                                        Bytes::from_static(b"start\n"),
+                                                    )),
+                                                    1,
+                                                )),
+                                                1 => {
+                                                    tokio::time::sleep(Duration::from_millis(800))
+                                                        .await;
+                                                    Some((
+                                                        Ok(Frame::data(Bytes::from(format!(
+                                                            "late {value}\n"
+                                                        )))),
+                                                        2,
+                                                    ))
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                    });
+                                    let mut reply = text(StatusCode::OK, "");
+                                    *reply.body_mut() = BodyExt::boxed(StreamBody::new(parts));
                                     reply
                                 }
                                 "/brotli" => {
@@ -1495,6 +2199,303 @@ mod tests {
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(seen[0].0, format!("Bearer {}", f.placeholder));
         assert_eq!(seen[0].1, "/raw");
+    }
+
+    /// Bindings and the CA change under a running interceptor: a kept
+    /// binding keeps substituting with its placeholder, a new one substitutes
+    /// on its own host under the new CA, and a removed one stops substituting
+    /// from its next request.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn replaced_bindings_take_effect_on_the_next_request() {
+        let binding = |name: &str, host: &str| CredentialBinding {
+            name: name.into(),
+            environment_variable: format!("{}_TOKEN", name.to_uppercase()),
+            allowed_hosts: vec![host.into()],
+            injection_location: InjectionLocation::default(),
+            methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+            set_header: None,
+        };
+        let f = fixture_with_policy(
+            CredentialPolicy {
+                credentials: vec![binding("svc", CRED_HOST)],
+            },
+            CRED_HOST,
+            StaticResolver::new()
+                .with("svc", "svc-secret")
+                .with("other", "other-secret"),
+        )
+        .await;
+        let request = |host: &str, placeholder: &str| {
+            format!(
+                "GET /p HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let control = f.interceptor.control();
+        let other_placeholder = crate::policy::generate_placeholder("other");
+        let wider = MachineCa::generate(
+            "test-machine",
+            &[CRED_HOST.to_string(), OTHER_HOST.to_string()],
+        )
+        .unwrap();
+        let wider_pem = wider.certificate_pem().to_string();
+        control.replace_ca(wider);
+        control
+            .replace_bindings(
+                CredentialPolicy {
+                    credentials: vec![binding("svc", CRED_HOST), binding("other", OTHER_HOST)],
+                },
+                &[
+                    ("svc".to_string(), f.placeholder.clone()),
+                    ("other".to_string(), other_placeholder.clone()),
+                ]
+                .into(),
+            )
+            .unwrap();
+        let kept = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            CRED_HOST,
+            &request(CRED_HOST, &f.placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(kept.starts_with("HTTP/1.1 200"), "{kept}");
+        let added = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            OTHER_HOST,
+            &request(OTHER_HOST, &other_placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(added.starts_with("HTTP/1.1 200"), "{added}");
+
+        control
+            .replace_bindings(
+                CredentialPolicy {
+                    credentials: vec![binding("other", OTHER_HOST)],
+                },
+                &[("other".to_string(), other_placeholder.clone())].into(),
+            )
+            .unwrap();
+        // A value was sent to the removed binding's host, so the host stays
+        // terminated (to scrub it) and its placeholder is refused there.
+        let removed = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            CRED_HOST,
+            &request(CRED_HOST, &f.placeholder),
+        )
+        .await
+        .unwrap();
+        assert!(removed.starts_with("HTTP/1.1 403"), "{removed}");
+        assert!(removed.contains("unknown placeholder"), "{removed}");
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen.iter()
+                .map(|(auth, _)| auth.as_str())
+                .collect::<Vec<_>>(),
+            ["Bearer svc-secret", "Bearer other-secret"]
+        );
+    }
+
+    /// A resolver that holds every resolution until released, so a test can
+    /// replace the bindings while a request is between check and send.
+    struct GatedResolver {
+        entered: std::sync::mpsc::SyncSender<()>,
+        release: Mutex<std::sync::mpsc::Receiver<()>>,
+    }
+
+    impl CredentialResolver for GatedResolver {
+        fn resolve(
+            &self,
+            _request: &CredentialRequest,
+        ) -> std::result::Result<zeroize::Zeroizing<String>, crate::resolver::ResolveError>
+        {
+            let _ = self.entered.send(());
+            let _ = self.release.lock().unwrap().recv();
+            Ok(zeroize::Zeroizing::new("value-of-the-old-binding".into()))
+        }
+    }
+
+    fn svc_policy() -> CredentialPolicy {
+        CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "svc".into(),
+                environment_variable: "SVC_TOKEN".into(),
+                allowed_hosts: vec![CRED_HOST.into()],
+                injection_location: InjectionLocation::default(),
+                methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+                set_header: None,
+            }],
+        }
+    }
+
+    /// Run one request for `svc` whose resolution is held until `swap` has
+    /// changed the bindings, and return the response.
+    async fn request_across_a_swap(
+        swap: impl FnOnce(&InterceptorControl, &CredentialPolicy, &BTreeMap<String, String>)
+            + Send
+            + 'static,
+    ) -> (String, Fixture) {
+        let upstream = start_upstream().await;
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let placeholder = placeholders["svc"].clone();
+        let ca = MachineCa::generate(
+            "test-machine",
+            &[CRED_HOST.to_string(), OTHER_HOST.to_string()],
+        )
+        .unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+            },
+            Arc::new(GatedResolver {
+                entered: entered_tx,
+                release: Mutex::new(release_rx),
+            }),
+        )
+        .unwrap();
+        let f = Fixture {
+            upstream,
+            interceptor,
+            placeholder: placeholder.clone(),
+            ca_pem,
+        };
+        let control = f.interceptor.control();
+        let swapper = std::thread::spawn(move || {
+            entered_rx.recv().unwrap();
+            swap(&control, &policy, &placeholders);
+            release_tx.send(()).unwrap();
+        });
+        let request = format!(
+            "GET /p HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        swapper.join().unwrap();
+        (response, f)
+    }
+
+    /// Bindings replaced while a request resolves its value refuse the
+    /// request when its own binding changed: the value was resolved by name
+    /// and may belong to the binding that replaced the one it was checked
+    /// against.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_request_whose_bindings_change_while_it_resolves_is_refused() {
+        let (response, f) = request_across_a_swap(|control, policy, placeholders| {
+            // The same name, now bound elsewhere.
+            let mut moved = policy.clone();
+            moved.credentials[0].allowed_hosts = vec![OTHER_HOST.into()];
+            control.replace_bindings(moved, placeholders).unwrap();
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+        assert!(
+            response.contains("changed during the request"),
+            "{response}"
+        );
+        assert!(
+            f.upstream.seen.lock().unwrap().is_empty(),
+            "nothing went upstream"
+        );
+
+        // The same binding, but its secret was replaced (not kept).
+        let (response, _f) = request_across_a_swap(|control, policy, placeholders| {
+            control
+                .replace_bindings(policy.clone(), placeholders)
+                .unwrap();
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+    }
+
+    /// A swap that leaves a request's own binding and its secret alone (an
+    /// unrelated addition, an identical re-send) does not disturb it.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_swap_that_keeps_the_requests_binding_lets_it_through() {
+        let (response, f) = request_across_a_swap(|control, policy, placeholders| {
+            let mut more = policy.clone();
+            let mut other = more.credentials[0].clone();
+            other.name = "other".into();
+            other.environment_variable = "OTHER_TOKEN".into();
+            other.allowed_hosts = vec![OTHER_HOST.into()];
+            more.credentials.push(other);
+            let mut placeholders = placeholders.clone();
+            placeholders.insert("other".into(), crate::policy::generate_placeholder("other"));
+            control
+                .replace_bindings_keeping(more, &placeholders, &["svc".to_string()])
+                .unwrap();
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap()[0].0,
+            "Bearer value-of-the-old-binding"
+        );
+        let (response, _f) = request_across_a_swap(|control, policy, placeholders| {
+            control
+                .replace_bindings_keeping(policy.clone(), placeholders, &["svc".to_string()])
+                .unwrap();
+        })
+        .await;
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+    }
+
+    /// A body that keeps arriving, however slowly, is read whole; one that
+    /// stops is answered `408`.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn only_an_idle_request_body_times_out() {
+        let f = fixture().await;
+        let send = |gaps: Vec<u64>| {
+            let endpoint = f.interceptor.endpoint();
+            let upstream = f.upstream.addr;
+            let ca_pem = f.ca_pem.clone();
+            let placeholder = f.placeholder.clone();
+            async move {
+                let mut tcp = TcpStream::connect(endpoint.addr).await.unwrap();
+                tcp.write_all(&endpoint.preamble(upstream)).await.unwrap();
+                let mut verdict = [0u8; 1];
+                tcp.read_exact(&mut verdict).await.unwrap();
+                let connector = TlsConnector::from(client_config(ca_pem.as_bytes()));
+                let mut tls = connector
+                    .connect(ServerName::try_from(CRED_HOST.to_string()).unwrap(), tcp)
+                    .await
+                    .unwrap();
+                let chunks = gaps.len() + 1;
+                tls.write_all(
+                    format!(
+                        "POST /p HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {placeholder}\r\nContent-Length: {chunks}\r\nConnection: close\r\n\r\nx"
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+                for gap in gaps {
+                    tokio::time::sleep(Duration::from_millis(gap)).await;
+                    if tls.write_all(b"x").await.is_err() {
+                        break;
+                    }
+                }
+                let mut out = Vec::new();
+                let _ = tls.read_to_end(&mut out).await;
+                String::from_utf8_lossy(&out).into_owned()
+            }
+        };
+        // Four 300 ms gaps: longer than the idle limit in all, never idle.
+        let slow = send(vec![300, 300, 300, 300]).await;
+        assert!(slow.starts_with("HTTP/1.1 200"), "{slow}");
+        let stalled = send(vec![900]).await;
+        assert!(stalled.starts_with("HTTP/1.1 408"), "{stalled}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1821,6 +2822,415 @@ mod tests {
             .await
             .unwrap();
         assert!(!response.contains("ghp_storedsecret45678"), "{response}");
+    }
+
+    /// A resolver whose value a test can rotate.
+    struct RotatingResolver(Mutex<String>);
+
+    impl CredentialResolver for RotatingResolver {
+        fn resolve(
+            &self,
+            _request: &CredentialRequest,
+        ) -> std::result::Result<zeroize::Zeroizing<String>, crate::resolver::ResolveError>
+        {
+            Ok(zeroize::Zeroizing::new(self.0.lock().unwrap().clone()))
+        }
+    }
+
+    /// Bindings replaced with a new secret are looked up again before the
+    /// next response from their host is checked, so a value supplied with the
+    /// replacement is scrubbed even from a request that injects nothing, and
+    /// the value before it still is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_secret_is_scrubbed_before_any_request_injects_it() {
+        let upstream = start_upstream().await;
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let resolver = Arc::new(RotatingResolver(Mutex::new("ghp_firstsecret1111".into())));
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+            },
+            resolver.clone(),
+        )
+        .unwrap();
+        let f = Fixture {
+            upstream,
+            interceptor,
+            placeholder: placeholders["svc"].clone(),
+            ca_pem,
+        };
+        let echo = |value: &str| {
+            format!(
+                "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: {value}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let first = guest_request(
+            &f,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &echo("ghp_firstsecret1111"),
+        )
+        .await
+        .unwrap();
+        assert!(!first.contains("ghp_firstsecret1111"), "{first}");
+
+        *resolver.0.lock().unwrap() = "ghp_secondsecret2222".into();
+        f.interceptor
+            .control()
+            .replace_bindings(policy, &placeholders)
+            .unwrap();
+        for value in ["ghp_secondsecret2222", "ghp_firstsecret1111"] {
+            let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &echo(value))
+                .await
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(!response.contains(value), "{value}: {response}");
+        }
+    }
+
+    /// A host a binding stops covering, because the binding was removed or
+    /// moved to other hosts, may have stored a value sent to it: its responses
+    /// are still scrubbed of that value. A host no value was ever sent to is
+    /// relayed untouched again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_a_binding_left_is_still_scrubbed_of_what_it_was_sent() {
+        let echo = |value: &str| {
+            format!(
+                "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: {value}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let moved = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                allowed_hosts: vec![OTHER_HOST.into()],
+                ..svc_policy().credentials[0].clone()
+            }],
+        };
+        for next in [CredentialPolicy::default(), moved] {
+            let f = fixture_with_secret("ghp_retiredsecret4321").await;
+            let sent = format!(
+                "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                f.placeholder
+            );
+            let first = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &sent)
+                .await
+                .unwrap();
+            assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+            let placeholders = crate::policy::generate_placeholders(&next);
+            f.interceptor
+                .control()
+                .replace_bindings(next.clone(), &placeholders)
+                .unwrap();
+            // The guest stored the value upstream; reading it back finds it gone.
+            let response = guest_request(
+                &f,
+                f.ca_pem.as_bytes(),
+                CRED_HOST,
+                &echo("ghp_retiredsecret4321"),
+            )
+            .await
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(
+                !response.contains("ghp_retiredsecret4321"),
+                "{next:?}: {response}"
+            );
+            assert!(response.contains("[smolvm-redacted]"), "{response}");
+            // Nothing is injected there any more.
+            let refused = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &sent)
+                .await
+                .unwrap();
+            assert!(!refused.starts_with("HTTP/1.1 200"), "{refused}");
+        }
+
+        // A binding that never resolved anything leaves its host to the guest.
+        let f = fixture_with_secret("ghp_neversent00000").await;
+        f.interceptor
+            .control()
+            .replace_bindings(CredentialPolicy::default(), &BTreeMap::new())
+            .unwrap();
+        assert!(
+            guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &echo("x"))
+                .await
+                .is_err(),
+            "relayed untouched: the upstream's own certificate is not the machine CA"
+        );
+    }
+
+    /// The values kept for hosts bindings left are bounded, but the hosts
+    /// are not forgotten: one stays intercepted however many values came
+    /// and went after it, never spliced through again.
+    #[test]
+    fn retired_values_are_bounded_and_their_hosts_kept() {
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: Vec::new(),
+            },
+            Arc::new(StaticResolver::new()),
+        )
+        .unwrap();
+        let control = interceptor.control();
+        let moved = |host: &str| CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                allowed_hosts: vec![host.to_string()],
+                ..policy.credentials[0].clone()
+            }],
+        };
+        // The first host a value was sent to, then many values elsewhere.
+        control.0.remember(
+            "svc",
+            u64::MAX,
+            Some(&zeroize::Zeroizing::new("first-value-0000".into())),
+        );
+        control
+            .replace_bindings(moved(OTHER_HOST), &placeholders)
+            .unwrap();
+        for round in 0..(MAX_RETIRED_VALUES * 2) {
+            let value = zeroize::Zeroizing::new(format!("secret-value-{round:04}"));
+            control.0.remember("svc", u64::MAX, Some(&value));
+            control
+                .replace_bindings(CredentialPolicy::default(), &BTreeMap::new())
+                .unwrap();
+            control
+                .replace_bindings(moved(OTHER_HOST), &placeholders)
+                .unwrap();
+        }
+        let retired = control.0.retired.lock().unwrap();
+        assert_eq!(retired.values.len(), MAX_RETIRED_VALUES);
+        assert!(!retired
+            .values
+            .iter()
+            .any(|(_, v)| v.as_str() == "first-value-0000"));
+        drop(retired);
+        assert!(
+            control.0.has_retired(CRED_HOST),
+            "its values evicted, the first host is still intercepted"
+        );
+        assert!(control.0.intercepts(CRED_HOST));
+    }
+
+    /// A TLS connection spliced through untouched to a host no binding
+    /// covered stays open until a binding covers that host: the change ends
+    /// it before it takes effect, so nothing injected toward the host can be
+    /// read back on a connection nothing checks. New connections to the host
+    /// are intercepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_spliced_connection_ends_before_its_host_is_intercepted() {
+        let f = fixture().await;
+        let mut tcp = TcpStream::connect(f.interceptor.endpoint().addr)
+            .await
+            .unwrap();
+        tcp.write_all(&f.interceptor.endpoint().preamble(f.upstream.addr))
+            .await
+            .unwrap();
+        let mut verdict = [0xffu8; 1];
+        tcp.read_exact(&mut verdict).await.unwrap();
+        // Spliced: only the upstream's own certificate is trusted.
+        let connector = TlsConnector::from(client_config(&f.upstream.cert_pem));
+        let name = ServerName::try_from(OTHER_HOST.to_string()).unwrap();
+        let mut tls = connector.connect(name, tcp).await.unwrap();
+        let request = format!("GET /public HTTP/1.1\r\nHost: {OTHER_HOST}\r\n\r\n");
+        tls.write_all(request.as_bytes()).await.unwrap();
+        let mut first = vec![0u8; 4096];
+        let n = tls.read(&mut first).await.unwrap();
+        assert!(String::from_utf8_lossy(&first[..n]).starts_with("HTTP/1.1 200"));
+
+        let control = f.interceptor.control();
+        let wider =
+            MachineCa::generate("test-machine", &[CRED_HOST.into(), OTHER_HOST.into()]).unwrap();
+        let wider_pem = wider.certificate_pem().to_string();
+        control.replace_ca(wider);
+        let other = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "other".into(),
+                allowed_hosts: vec![OTHER_HOST.into()],
+                ..svc_policy().credentials[0].clone()
+            }],
+        };
+        let placeholders = crate::policy::generate_placeholders(&other);
+        tokio::task::spawn_blocking(move || control.replace_bindings(other, &placeholders))
+            .await
+            .unwrap()
+            .unwrap();
+
+        // The old connection is gone: nothing more comes back on it.
+        let _ = tls.write_all(request.as_bytes()).await;
+        let mut rest = Vec::new();
+        let read = tokio::time::timeout(Duration::from_secs(5), tls.read_to_end(&mut rest))
+            .await
+            .expect("the spliced connection was closed");
+        assert!(
+            read.is_err() || !String::from_utf8_lossy(&rest).contains("HTTP/1.1"),
+            "{rest:?}"
+        );
+        assert!(f
+            .interceptor
+            .state
+            .spliced
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|s| *s.ended.lock().unwrap()));
+        // And a new one to the host is terminated with the machine CA.
+        let fresh = guest_request(
+            &f,
+            wider_pem.as_bytes(),
+            OTHER_HOST,
+            &format!("GET /public HTTP/1.1\r\nHost: {OTHER_HOST}\r\nConnection: close\r\n\r\n"),
+        )
+        .await
+        .unwrap();
+        assert!(fresh.starts_with("HTTP/1.1 200"), "{fresh}");
+    }
+
+    /// A connection to a host a change of bindings is about to intercept
+    /// waits for the change: it is neither spliced nor served under the old
+    /// bindings, and once the change lands it is intercepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_to_a_host_being_intercepted_waits_for_the_change() {
+        let f = fixture().await;
+        let control = f.interceptor.control();
+        let wider =
+            MachineCa::generate("test-machine", &[CRED_HOST.into(), OTHER_HOST.into()]).unwrap();
+        let wider_pem = wider.certificate_pem().to_string();
+        control.replace_ca(wider);
+        let other = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "other".into(),
+                allowed_hosts: vec![OTHER_HOST.into()],
+                ..svc_policy().credentials[0].clone()
+            }],
+        };
+        let placeholders = crate::policy::generate_placeholders(&other);
+        let prepared = control.prepare_bindings(&other).unwrap();
+        let request =
+            format!("GET /public HTTP/1.1\r\nHost: {OTHER_HOST}\r\nConnection: close\r\n\r\n");
+        let held = {
+            let f = &f;
+            let pem = wider_pem.clone();
+            async move { guest_request(f, pem.as_bytes(), OTHER_HOST, &request).await }
+        };
+        tokio::pin!(held);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), held.as_mut())
+                .await
+                .is_err(),
+            "held while the change is pending"
+        );
+        control.commit_bindings(prepared, other, &placeholders, &[]);
+        let response = held.await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "intercepted: {response}"
+        );
+    }
+
+    /// A spliced connection that does not end in time refuses the change
+    /// whole: the bindings stay as they were, and connections are no longer
+    /// held.
+    #[test]
+    fn a_change_waits_for_spliced_connections_or_changes_nothing() {
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: CredentialPolicy::default(),
+                placeholders: BTreeMap::new(),
+                ca,
+                upstream_roots_pem: Vec::new(),
+            },
+            Arc::new(StaticResolver::new()),
+        )
+        .unwrap();
+        let control = interceptor.control();
+        // A spliced connection whose task never lets go of it.
+        control.0.spliced.lock().unwrap().push(Arc::new(Splice {
+            host: Some(CRED_HOST.into()),
+            cancel: tokio::sync::Notify::new(),
+            ended: std::sync::Mutex::new(false),
+            ended_signal: std::sync::Condvar::new(),
+        }));
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let started = std::time::Instant::now();
+        let refused = control.replace_bindings(policy, &placeholders).unwrap_err();
+        assert!(refused.contains(CRED_HOST), "{refused}");
+        assert!(
+            started.elapsed() < SPLICE_END_WAIT * 3,
+            "one deadline for all"
+        );
+        assert!(control.0.bindings().policy.is_empty(), "nothing changed");
+        assert!(!control.0.pending_covers(Some(CRED_HOST)), "nothing held");
+    }
+
+    /// A value bound while a response streams (a long poll, an event stream)
+    /// is scrubbed from the rest of that response.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_bound_mid_response_is_scrubbed_from_the_rest() {
+        let upstream = start_upstream().await;
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let resolver = Arc::new(RotatingResolver(Mutex::new("ghp_earlysecret1111".into())));
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+            },
+            resolver.clone(),
+        )
+        .unwrap();
+        let f = Fixture {
+            upstream,
+            interceptor,
+            placeholder: placeholders["svc"].clone(),
+            ca_pem,
+        };
+        let late = "ghp_latesecret22222";
+        let request =
+            format!("GET /slow/{late} HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+        let control = f.interceptor.control();
+        let (response, ()) = tokio::join!(
+            guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request),
+            async {
+                // While the response waits for its second half, a new
+                // secret is bound to the host.
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                *resolver.0.lock().unwrap() = late.into();
+                let (policy, placeholders) = (policy.clone(), placeholders.clone());
+                tokio::task::spawn_blocking(move || {
+                    control.replace_bindings(policy, &placeholders)
+                })
+                .await
+                .unwrap()
+                .unwrap();
+            }
+        );
+        let response = response.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(response.contains("start"), "{response}");
+        assert!(!response.contains(late), "{response}");
+        assert!(
+            response.contains("[smolvm-redacted]") || response.contains(&f.placeholder),
+            "{response}"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

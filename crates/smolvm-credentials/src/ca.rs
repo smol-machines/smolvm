@@ -41,6 +41,19 @@ pub struct MachineCa {
     key: KeyPair,
 }
 
+/// Refuse a key that is not the certificate's: a CA directory, or an exported
+/// CA, holding some other key (one linked or copied in from elsewhere) must
+/// never be loaded, signed with or exported as the machine's.
+fn key_matches_certificate(key: &KeyPair, cert_der: &[u8]) -> Result<()> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, cert) = X509Certificate::from_der(cert_der).context("parse CA certificate")?;
+    anyhow::ensure!(
+        cert.public_key().raw == key.public_key_der().as_slice(),
+        "the CA key does not belong to the CA certificate"
+    );
+    Ok(())
+}
+
 fn ca_params(machine: &str) -> CertificateParams {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -62,11 +75,17 @@ impl MachineCa {
     /// `permitted_hosts` (and their subdomains): a critical name constraint
     /// makes clients reject any leaf it signs for another domain.
     pub fn generate(machine: &str, permitted_hosts: &[String]) -> Result<Self> {
+        let key = KeyPair::generate().context("generate CA key")?;
+        Self::certify(machine, key, permitted_hosts)
+    }
+
+    /// Self-sign a CA certificate for `key`, named after `machine` and
+    /// constrained to `permitted_hosts`.
+    fn certify(machine: &str, key: KeyPair, permitted_hosts: &[String]) -> Result<Self> {
         anyhow::ensure!(
             !permitted_hosts.is_empty(),
             "a machine CA needs at least one permitted host"
         );
-        let key = KeyPair::generate().context("generate CA key")?;
         let mut params = ca_params(machine);
         params.name_constraints = Some(NameConstraints {
             permitted_subtrees: permitted_hosts
@@ -85,41 +104,138 @@ impl MachineCa {
         })
     }
 
+    /// The DNS subtrees the certificate permits leaves for.
+    pub fn permitted_hosts(&self) -> Result<Vec<String>> {
+        use x509_parser::extensions::GeneralName;
+        use x509_parser::prelude::{FromDer, X509Certificate};
+        let (_, cert) =
+            X509Certificate::from_der(&self.cert_der).context("parse CA certificate")?;
+        let constraints = cert
+            .name_constraints()
+            .context("read CA name constraints")?
+            .context("CA certificate has no name constraints")?;
+        Ok(constraints
+            .value
+            .permitted_subtrees
+            .iter()
+            .flatten()
+            .filter_map(|subtree| match subtree.base {
+                GeneralName::DNSName(name) => Some(name.to_string()),
+                _ => None,
+            })
+            .collect())
+    }
+
+    /// This CA re-certified so it also permits every host in `hosts`, with
+    /// the same key and name, or `None` when it already permits them all.
+    ///
+    /// Only ever widens: a subtree the certificate permits stays permitted,
+    /// because processes in the guest (and in branches sharing the CA) may
+    /// already trust the current certificate for it. Leaves the new
+    /// certificate signs chain to the old one as well, since both carry the
+    /// same subject and key, so a process that loaded the old certificate
+    /// keeps trusting the hosts it already permitted; only hosts it never
+    /// permitted need the new one.
+    pub fn widened(&self, hosts: &[String]) -> Result<Option<Self>> {
+        let mut permitted = self.permitted_hosts()?;
+        let mut changed = false;
+        for host in hosts {
+            let covered = permitted
+                .iter()
+                .any(|p| host == p || host.ends_with(&format!(".{p}")));
+            if !covered {
+                permitted.push(host.clone());
+                changed = true;
+            }
+        }
+        if !changed {
+            return Ok(None);
+        }
+        let key =
+            KeyPair::from_pem(&Zeroizing::new(self.key.serialize_pem())).context("copy CA key")?;
+        Self::certify(&self.name, key, &permitted).map(Some)
+    }
+
     /// Persist the CA into `dir` (created if needed): `ca.key` owner-private
     /// beside a `guest/ca.pem` copy of the public certificate, which is the
     /// only path ever mounted into the machine.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        let guest = Self::guest_dir(dir);
-        std::fs::create_dir_all(&guest).with_context(|| format!("create {}", guest.display()))?;
-        std::fs::write(dir.join(GUEST_CA_FILE), &self.cert_pem)?;
-        std::fs::write(guest.join(GUEST_CA_FILE), &self.cert_pem)?;
-        std::fs::write(dir.join(CA_NAME_FILE), &self.name)?;
-        let key_path = dir.join(CA_KEY_FILE);
-        std::fs::write(&key_path, Zeroizing::new(self.key.serialize_pem()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
+        std::fs::create_dir_all(Self::guest_dir(dir))
+            .with_context(|| format!("create {}", Self::guest_dir(dir).display()))?;
+        self.save_with(|path, bytes, mode| {
+            let path = path.iter().fold(dir.to_path_buf(), |p, c| p.join(c));
+            write_replacing(&path, bytes, mode).map_err(std::io::Error::other)
+        })
+    }
+
+    /// [`MachineCa::save`], handing each file to `write` as its path relative
+    /// to the CA directory (`["ca.key"]`, `["guest", "ca.pem"]`, …), its
+    /// contents and its mode, in the order a reader relies on. A process
+    /// writing into a directory another user owns passes a writer that never
+    /// follows a link.
+    pub fn save_with(
+        &self,
+        mut write: impl FnMut(&[&str], &[u8], u32) -> std::io::Result<()>,
+    ) -> Result<()> {
+        // The key first: a reader that finds a certificate must find its key.
+        write(
+            &[CA_KEY_FILE],
+            Zeroizing::new(self.key.serialize_pem()).as_bytes(),
+            0o600,
+        )
+        .context("write ca.key")?;
+        write(&[CA_NAME_FILE], self.name.as_bytes(), 0o644).context("write ca.name")?;
+        write(&[GUEST_CA_FILE], self.cert_pem.as_bytes(), 0o644).context("write ca.pem")?;
+        // A running guest may be reading this one through its mount: replace
+        // it whole, never truncate it in place.
+        write(
+            &[GUEST_SUBDIR, GUEST_CA_FILE],
+            self.cert_pem.as_bytes(),
+            0o644,
+        )
+        .context("write guest/ca.pem")?;
         Ok(())
     }
 
     /// Load a CA previously written by [`MachineCa::save`]. `machine` names
     /// it only when the directory predates the recorded name.
     pub fn load(dir: &Path, machine: &str) -> Result<Self> {
-        let name = std::fs::read_to_string(dir.join(CA_NAME_FILE))
-            .map(|name| name.trim().to_string())
-            .unwrap_or_else(|_| machine.to_string());
-        let cert_pem = std::fs::read_to_string(dir.join(GUEST_CA_FILE))
-            .with_context(|| format!("read {}", dir.join(GUEST_CA_FILE).display()))?;
-        let key_pem = Zeroizing::new(
-            std::fs::read_to_string(dir.join(CA_KEY_FILE))
-                .with_context(|| format!("read {}", dir.join(CA_KEY_FILE).display()))?,
-        );
+        Self::load_with(machine, |file| std::fs::read(dir.join(file)))
+    }
+
+    /// [`MachineCa::load`], reading each file of the CA directory (named
+    /// relative to it: `ca.name`, `ca.pem`, `ca.key`) through `read`. A
+    /// process reading a directory another user owns passes a reader that
+    /// refuses links, so the owner cannot make it load some other key.
+    pub fn load_with(
+        machine: &str,
+        read: impl Fn(&str) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Self> {
+        let text = |file: &str| -> Result<Zeroizing<String>> {
+            let bytes = Zeroizing::new(read(file).with_context(|| format!("read {file}"))?);
+            Ok(Zeroizing::new(
+                std::str::from_utf8(&bytes)
+                    .with_context(|| format!("{file} is not text"))?
+                    .to_string(),
+            ))
+        };
+        // Only a directory from before the name was recorded lacks it; one
+        // that cannot be read is refused, never replaced by a guess.
+        let name = match read(CA_NAME_FILE) {
+            Ok(bytes) => std::str::from_utf8(&bytes)
+                .context("ca.name is not text")?
+                .trim()
+                .to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => machine.to_string(),
+            Err(error) => return Err(error).context("read ca.name"),
+        };
+        let cert_pem = text(GUEST_CA_FILE)?.to_string();
+        let key_pem = text(CA_KEY_FILE)?;
         let key = KeyPair::from_pem(&key_pem).context("parse CA key")?;
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .context("CA certificate missing")??;
+        key_matches_certificate(&key, &cert_der)?;
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
@@ -172,6 +288,7 @@ impl MachineCa {
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .context("exported CA has no certificate")??;
+        key_matches_certificate(&key, &cert_der)?;
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
@@ -218,13 +335,76 @@ impl MachineCa {
             .signed_by(&leaf_key, &self.issuer, &self.key)
             .context("sign leaf")?;
         let key = PrivateKeyDer::Pkcs8(PrivatePkcs8KeyDer::from(leaf_key.serialize_der()));
-        Ok((vec![leaf.der().clone(), self.cert_der.clone()], key))
+        // The leaf alone: the guest holds the CA as a trust anchor, and after
+        // the CA was widened it may hold an earlier certificate for the same
+        // key, which a presented copy of the current one would only compete
+        // with during path building.
+        Ok((vec![leaf.der().clone()], key))
     }
+}
+
+/// Write `bytes` to `path` through a sibling temporary file renamed over it,
+/// so a concurrent reader sees the old content or the new, never a mix.
+fn write_replacing(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let dir = path.parent().context("path has no parent")?;
+    let name = path
+        .file_name()
+        .context("path has no file name")?
+        .to_string_lossy();
+    let tmp = dir.join(format!(".{name}.{}.tmp", std::process::id()));
+    let _ = std::fs::remove_file(&tmp);
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    // Created with its final mode, so a private key is never readable by
+    // others, not even briefly.
+    #[cfg(unix)]
+    std::os::unix::fs::OpenOptionsExt::mode(&mut options, mode);
+    #[cfg(not(unix))]
+    let _ = mode;
+    let written = options
+        .open(&tmp)
+        .and_then(|mut file| std::io::Write::write_all(&mut file, bytes));
+    if let Err(error) = written {
+        let _ = std::fs::remove_file(&tmp);
+        return Err(error).with_context(|| format!("write {}", tmp.display()));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(mode))?;
+    }
+    std::fs::rename(&tmp, path).with_context(|| format!("replace {}", path.display()))?;
+    Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CA whose key is not its certificate's is refused, on disk and as
+    /// an exported document.
+    #[test]
+    fn a_key_that_is_not_the_certificates_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        ca.save(dir.path()).unwrap();
+        let other = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        other.save(other_dir.path()).unwrap();
+        std::fs::copy(
+            other_dir.path().join(CA_KEY_FILE),
+            dir.path().join(CA_KEY_FILE),
+        )
+        .unwrap();
+        let err = MachineCa::load(dir.path(), "demo").err().expect("refused");
+        assert!(format!("{err:#}").contains("does not belong"), "{err:#}");
+
+        let mut document: serde_json::Value = serde_json::from_str(&ca.export()).unwrap();
+        let other_doc: serde_json::Value = serde_json::from_str(&other.export()).unwrap();
+        document["key"] = other_doc["key"].clone();
+        assert!(MachineCa::import(&document.to_string()).is_err());
+        assert!(MachineCa::import(&ca.export()).is_ok());
+    }
 
     #[test]
     fn save_load_and_issue_round_trip() {
@@ -236,8 +416,11 @@ mod tests {
         let loaded = MachineCa::load(dir.path(), "demo").unwrap();
         assert_eq!(loaded.certificate_pem(), ca.certificate_pem());
         let (chain, _key) = loaded.issue_leaf("api.example.com").unwrap();
-        assert_eq!(chain.len(), 2);
-        assert_eq!(chain[1], ca.cert_der);
+        assert_eq!(
+            chain.len(),
+            1,
+            "the guest holds the CA; only the leaf is sent"
+        );
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
@@ -323,6 +506,63 @@ mod tests {
             "the CA key must not be able to vouch for any other domain"
         );
         assert!(MachineCa::generate("demo", &[]).is_err());
+    }
+
+    /// Widening re-certifies the same key for more hosts: a guest holding the
+    /// earlier certificate keeps verifying the hosts it permitted, a guest
+    /// holding the new one also verifies the new hosts, and neither verifies
+    /// a host the CA never permitted.
+    #[test]
+    fn a_widened_ca_keeps_earlier_certificates_valid_for_their_hosts() {
+        use rustls::client::danger::ServerCertVerifier;
+        use rustls::client::WebPkiServerVerifier;
+        use rustls_pki_types::{ServerName, UnixTime};
+
+        let dir = tempfile::tempdir().unwrap();
+        let original = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        original.save(dir.path()).unwrap();
+        assert!(original
+            .widened(&["v2.api.example.com".to_string()])
+            .unwrap()
+            .is_none());
+        let widened = MachineCa::load(dir.path(), "demo")
+            .unwrap()
+            .widened(&["other.example.org".to_string()])
+            .unwrap()
+            .expect("a new subtree widens");
+        widened.save(dir.path()).unwrap();
+        let reloaded = MachineCa::load(dir.path(), "demo").unwrap();
+        let mut hosts = reloaded.permitted_hosts().unwrap();
+        hosts.sort();
+        assert_eq!(hosts, ["api.example.com", "other.example.org"]);
+
+        let verifier = |trusted: &CertificateDer<'static>| {
+            let mut roots = rustls::RootCertStore::empty();
+            roots.add(trusted.clone()).unwrap();
+            WebPkiServerVerifier::builder_with_provider(
+                std::sync::Arc::new(roots),
+                std::sync::Arc::new(rustls::crypto::ring::default_provider()),
+            )
+            .build()
+            .unwrap()
+        };
+        let verifies = |trusted: &CertificateDer<'static>, host: &'static str| {
+            let (chain, _key) = reloaded.issue_leaf(host).unwrap();
+            verifier(trusted)
+                .verify_server_cert(
+                    &chain[0],
+                    &chain[1..],
+                    &ServerName::try_from(host).unwrap(),
+                    &[],
+                    UnixTime::now(),
+                )
+                .is_ok()
+        };
+        assert!(verifies(&original.cert_der, "api.example.com"));
+        assert!(!verifies(&original.cert_der, "other.example.org"));
+        assert!(verifies(&reloaded.cert_der, "api.example.com"));
+        assert!(verifies(&reloaded.cert_der, "other.example.org"));
+        assert!(!verifies(&reloaded.cert_der, "bank.example.net"));
     }
 
     /// A leaf names its own key and its issuer's: the Authority Key

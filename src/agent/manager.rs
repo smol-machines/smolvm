@@ -239,6 +239,11 @@ struct RunningVmConfig {
     /// the machine forkable, so every later fork fails "no memfd-backed RAM".
     #[serde(default)]
     forkable: bool,
+    /// Whether the running VM's network is a Kubernetes pod's: its NIC is
+    /// bridged to the pod's interface, past the host relay that redirects
+    /// HTTPS flows to a credential interceptor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pod_network: bool,
 }
 
 impl RunningVmConfig {
@@ -351,6 +356,8 @@ struct AgentInner {
     /// a config-change restart preserves forkability instead of relaunching a
     /// forkable golden as a plain VM. Restored from disk on reconnect.
     forkable: bool,
+    /// Whether the running VM was launched on a Kubernetes pod network.
+    pod_network: bool,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
     /// True for the most recent launch via a fork snapshot. A clone resumes past
@@ -401,10 +408,46 @@ pub fn running_forkable(name: &str) -> Option<bool> {
 }
 
 fn forkable_in_running_config(path: &Path) -> Option<bool> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<RunningVmConfig>(&content)
-        .ok()
-        .map(|config| config.forkable)
+    running_config_at(path).map(|config| config.forkable)
+}
+
+fn running_config_at(path: &Path) -> Option<RunningVmConfig> {
+    serde_json::from_slice::<RunningVmConfig>(&read_running_config(path).ok()?).ok()
+}
+
+/// Largest running configuration read back: mounts, ports and resources.
+const MAX_RUNNING_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a running configuration from the machine's data directory, which the
+/// machine's own user owns under per-VM uid isolation while the reader may be
+/// root: never through a link, never blocking on a FIFO, never past
+/// [`MAX_RUNNING_CONFIG_BYTES`].
+fn read_running_config(path: &Path) -> std::io::Result<Vec<u8>> {
+    let (dir, name) = split_file_path(path)?;
+    crate::nofollow::read(dir, &[name], MAX_RUNNING_CONFIG_BYTES)
+}
+
+/// Replace a running configuration in the machine's data directory, never
+/// writing through a link left there.
+fn write_running_config(path: &Path, json: &[u8]) -> std::io::Result<()> {
+    let (dir, name) = split_file_path(path)?;
+    crate::nofollow::write_replacing(dir, &[name], json, 0o644)
+}
+
+fn split_file_path(path: &Path) -> std::io::Result<(&Path, &str)> {
+    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) => Ok((dir, name)),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+    }
+}
+
+/// Whether the VM named `name` is running on a Kubernetes pod network, as its
+/// running configuration says. Its guest NIC is bridged to the pod's
+/// interface, so no host relay sees its flows to hand them to a credential
+/// interceptor. False when it is not running.
+pub fn running_on_pod_network(name: &str) -> bool {
+    running_config_at(&vm_data_dir(name).join("agent.config.json"))
+        .is_some_and(|config| config.pod_network)
 }
 
 /// Whether `record`'s machine can be branched as it is now. A running machine is
@@ -689,25 +732,307 @@ fn published_set(
     mappings
 }
 
+/// How a request to a running machine's credentials socket failed, and so
+/// whether the machine's boot process may have acted on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveCredentialError {
+    /// It never reached the machine's boot process: there is no socket, the
+    /// path is not one (a link, say), the process serving it is not the
+    /// machine's own, or nothing answered the connection. Nothing changed.
+    Unreached(String),
+    /// The boot process answered with a refusal. Nothing changed.
+    Refused(String),
+    /// It was sent and its answer lost: the boot process may have acted on it.
+    Lost(String),
+}
+
+impl LiveCredentialError {
+    /// Whether the boot process certainly did not act on the request.
+    pub fn changed_nothing(&self) -> bool {
+        !matches!(self, Self::Lost(_))
+    }
+
+    /// Why it failed.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Unreached(reason) | Self::Refused(reason) | Self::Lost(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for LiveCredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// What a boot process from before binding changes, and only one, answers
+/// to a message it cannot parse.
+const MALFORMED_REQUEST: &str = "malformed request";
+
+/// Send `rendered` to running machine `name`'s credentials socket and return
+/// the data of an `ok` answer.
+///
+/// The socket is in the machine's directory, which its own user owns: the
+/// path must be a socket, not a link to another machine's, and the process
+/// that answers must run as the directory's owner (the machine's boot
+/// process), so a process escaped from one machine cannot have a root CLI or
+/// server hand it another machine's bindings or values.
+fn credentials_query(
+    name: &str,
+    rendered: &str,
+) -> std::result::Result<String, LiveCredentialError> {
+    use std::io::{Read, Write};
+    let dir = vm_data_dir(name);
+    let path = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+    let unreached = |reason: String| LiveCredentialError::Unreached(reason);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+        unreached(format!(
+            "{e}; a machine started before live changes were supported needs a restart"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if !meta.file_type().is_socket() {
+            return Err(unreached(format!("{} is not a socket", path.display())));
+        }
+    }
+    #[cfg(not(unix))]
+    if meta.file_type().is_symlink() {
+        return Err(unreached(format!("{} is a link", path.display())));
+    }
+    let mut stream =
+        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2))
+            .map_err(|e| unreached(e.to_string()))?;
+    // What was reached is read off the connected socket, not the path: a
+    // link swapped in after the check above still cannot route this to a
+    // socket bound anywhere but this machine's own path.
+    #[cfg(unix)]
+    match stream.peer_path() {
+        Ok(Some(bound)) if same_socket_place(&bound, &path) => {}
+        Ok(bound) => {
+            return Err(unreached(format!(
+                "{} reached a socket bound at {}, not the machine's own",
+                path.display(),
+                bound.map_or("no path".into(), |b| b.display().to_string())
+            )))
+        }
+        Err(e) => return Err(unreached(e.to_string())),
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::symlink_metadata(&dir)
+            .map_err(|e| unreached(e.to_string()))?
+            .uid();
+        let peer = stream.peer_uid().map_err(|e| unreached(e.to_string()))?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !peer_may_serve(peer, owner, me) {
+            return Err(unreached(format!(
+                "{} is served by uid {peer}, not by the machine's own process (uid {owner})",
+                path.display()
+            )));
+        }
+    }
+    let lost = |e: std::io::Error| LiveCredentialError::Lost(e.to_string());
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| unreached(e.to_string()))?;
+    stream
+        .write_all(rendered.as_bytes())
+        .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+        .map_err(lost)?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).map_err(lost)?;
+    credentials_reply(&reply)
+}
+
+/// Whether a socket bound at `bound` is the one at `ours`: the same name in
+/// the same directory, the directories compared by device and inode so a
+/// differently spelled path (a linked home or cache directory) still
+/// matches. Never by the socket file itself: a link to another machine's
+/// socket shares its inode.
+#[cfg(unix)]
+fn same_socket_place(bound: &Path, ours: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if bound == ours {
+        return true;
+    }
+    let dir_id = |path: &Path| {
+        let meta = std::fs::metadata(path.parent()?).ok()?;
+        Some((meta.dev(), meta.ino()))
+    };
+    bound.file_name().is_some()
+        && bound.file_name() == ours.file_name()
+        && dir_id(bound).is_some()
+        && dir_id(bound) == dir_id(ours)
+}
+
+/// Whether a process running as `peer` may answer for a machine whose data
+/// directory `owner` owns, asked by a process running as `me`, once the
+/// socket it serves is known to be bound at the machine's own path (which
+/// only the machine's user and root can bind): the machine's own user, or
+/// one at least as trusted as the asker (itself, or root) —
+/// a boot process run without the per-VM user drop (`SMOLVM_VM_UID_DROP=off`)
+/// keeps the host's user while its directory may still belong to the uid an
+/// earlier boot dropped to. Any other user is another machine's.
+#[cfg(unix)]
+fn peer_may_serve(peer: u32, owner: u32, me: u32) -> bool {
+    peer == owner || peer == me || peer == 0
+}
+
+/// The data of an `ok` answer from a credentials socket, or why not.
+fn credentials_reply(reply: &str) -> std::result::Result<String, LiveCredentialError> {
+    let reply = reply.trim();
+    match reply.split_once('\n') {
+        Some(("ok", data)) => Ok(data.trim().to_string()),
+        None if reply == "ok" => Ok(String::new()),
+        _ => match reply.strip_prefix("error: ") {
+            Some(reason) => Err(LiveCredentialError::Refused(reason.to_string())),
+            // No answer at all: the process may have died after acting.
+            None if reply.is_empty() => Err(LiveCredentialError::Lost(
+                "the machine's boot process closed the connection without answering".into(),
+            )),
+            None => Err(LiveCredentialError::Refused(reply.to_string())),
+        },
+    }
+}
+
 /// Hand running machine `name` new values for its credential bindings, by
-/// binding name: its next request to a bound host uses them.
+/// binding name: its next request to a bound host uses them. `expect` is the
+/// bindings the values were read for (the record's, under the caller's lock):
+/// a value whose binding has changed in the boot process since is refused,
+/// so it never reaches a binding that replaced the one it was meant for.
 pub fn apply_live_credential_values(
     name: &str,
     values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+    expect: &crate::credentials::CredentialPolicy,
 ) -> Result<()> {
+    send_credential_values(values, expect, |request| credentials_query(name, request)).map_err(
+        |reason| {
+            Error::config(
+                "credentials",
+                format!(
+                    "could not hand machine '{name}' its new credential values while it runs: \
+                     {reason}"
+                ),
+            )
+        },
+    )
+}
+
+/// [`apply_live_credential_values`] through `send`. A boot process from
+/// before bindings could change knows values without `expect`, and answers a
+/// message carrying it with exactly "malformed request": only then are the
+/// values sent alone, which is safe because such a process never changes its
+/// bindings while it runs. A current boot process answers a message it cannot
+/// read otherwise ([`crate::credentials::UNREADABLE_REQUEST`]) and never takes
+/// values without `expect`, so a fallback can never reach one.
+fn send_credential_values(
+    values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+    expect: &crate::credentials::CredentialPolicy,
+    mut send: impl FnMut(&str) -> std::result::Result<String, LiveCredentialError>,
+) -> std::result::Result<(), LiveCredentialError> {
     let values: std::collections::BTreeMap<&str, &str> = values
         .iter()
         .map(|(binding, value)| (binding.as_str(), value.as_str()))
         .collect();
-    let request = zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
-    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
-        Error::config(
+    let expected: std::collections::BTreeMap<&str, &crate::credentials::CredentialBinding> = values
+        .keys()
+        .filter_map(|binding| expect.binding(binding).map(|b| (*binding, b)))
+        .collect();
+    let request = zeroize::Zeroizing::new(
+        serde_json::json!({ "values": values, "expect": expected }).to_string(),
+    );
+    match send(&request) {
+        Err(LiveCredentialError::Refused(reason)) if reason == MALFORMED_REQUEST => {
+            let legacy =
+                zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+            send(&legacy).map(|_| ())
+        }
+        other => other.map(|_| ()),
+    }
+}
+
+/// A failed request to a running machine's credentials socket: the error to
+/// report, and whether the boot process certainly did not act on it.
+#[derive(Debug)]
+pub struct LiveCredentialFailure {
+    pub error: Error,
+    pub changed_nothing: bool,
+}
+
+/// Replace running machine `name`'s credential bindings through its
+/// credentials socket: the boot process widens the CA as needed and swaps
+/// policy, placeholders and resolver state at once, starting an interceptor
+/// if the machine booted without bindings. Answers with the CA certificate.
+pub fn apply_live_credential_policy(
+    name: &str,
+    message: &crate::credentials::BindingsMessage,
+) -> std::result::Result<crate::credentials::BindingsReply, LiveCredentialFailure> {
+    let request = serde_json::json!({ "bindings": message }).to_string();
+    let fail = |reason: String, changed_nothing: bool| LiveCredentialFailure {
+        error: Error::config(
             "credentials",
             format!(
-                "could not hand machine '{name}' its new credential values while it runs: {reason}"
+                "could not change machine '{name}''s credential bindings while it runs: {reason}"
             ),
-        )
-    })
+        ),
+        changed_nothing,
+    };
+    let reply = credentials_query(name, &request).map_err(|error| match error {
+        // A boot process from before binding changes knows only values.
+        LiveCredentialError::Refused(reason) if reason == MALFORMED_REQUEST => fail(
+            "this machine was started before live binding changes were supported and needs a \
+             restart"
+                .to_string(),
+            true,
+        ),
+        other => fail(other.reason().to_string(), other.changed_nothing()),
+    })?;
+    // It acted, and its answer is unreadable: treat it as taken.
+    serde_json::from_str(&reply).map_err(|e| fail(format!("unreadable answer: {e}"), false))
+}
+
+/// Return running machine `name`'s boot process to exactly the bindings it
+/// had before the last ones it was sent.
+pub fn roll_back_live_credential_policy(
+    name: &str,
+) -> std::result::Result<(), LiveCredentialFailure> {
+    credentials_query(name, r#"{"rollback":true}"#)
+        .map(|_| ())
+        .map_err(|error| LiveCredentialFailure {
+            changed_nothing: error.changed_nothing(),
+            error: Error::config(
+                "credentials",
+                format!("could not restore machine '{name}''s credential bindings: {error}"),
+            ),
+        })
+}
+
+/// Have running machine `name`'s guest trust `pem` as its credential CA,
+/// in the machine root and every workload container.
+pub fn install_live_credential_trust(name: &str, pem: &str) -> Result<()> {
+    let mut client = AgentManager::for_vm(name)?.connect()?;
+    if !client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)? {
+        return Err(Error::config(
+            "credentials",
+            format!(
+                "machine '{name}' runs a guest agent that cannot take a credential CA while it \
+                 runs; restart it to apply bindings for new hosts"
+            ),
+        ));
+    }
+    client.install_credential_trust(pem)
+}
+
+/// Whether running machine `name`'s guest can take a credential CA live.
+pub fn supports_live_credential_trust(name: &str) -> Result<bool> {
+    AgentManager::for_vm(name)?
+        .connect()?
+        .supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)
 }
 
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
@@ -745,6 +1070,8 @@ pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
     Ok(mapping.0)
 }
 
+/// Send `rendered` to one of running machine `name`'s control sockets and
+/// return its whole reply.
 fn send_live_request(
     name: &str,
     socket: &str,
@@ -759,7 +1086,7 @@ fn send_live_request(
             },
         )?;
     stream
-        .set_read_timeout(Some(Duration::from_secs(5)))
+        .set_read_timeout(Some(Duration::from_secs(30)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
         .map_err(|e| e.to_string())?;
@@ -1875,6 +2202,7 @@ impl AgentManager {
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
                 forkable: false,
+                pod_network: false,
                 detached: false,
                 is_clone: false,
                 is_cuda_clone: false,
@@ -2398,6 +2726,7 @@ impl AgentManager {
                             inner.ports = config.ports;
                             inner.resources = config.resources;
                             inner.forkable = config.forkable;
+                            inner.pod_network = config.pod_network;
                             inner.config_state = ConfigState::Known;
                         }
                         Err(reason) => {
@@ -2444,16 +2773,12 @@ impl AgentManager {
             // Read from inner: the launch path sets `inner.forkable` before this
             // runs, so the persisted config records how the VM was actually booted.
             forkable: self.inner.lock().forkable,
+            pod_network: self.inner.lock().pod_network,
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
-                let tmp = self.config_file.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp, &json) {
-                    tracing::warn!(error = %e, "failed to write VM config tmp file");
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp, &self.config_file) {
-                    tracing::warn!(error = %e, "failed to rename VM config file");
+                if let Err(e) = write_running_config(&self.config_file, json.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to write VM config file");
                 }
             }
             Err(e) => {
@@ -2467,9 +2792,9 @@ impl AgentManager {
     /// Returns an error string describing why the load failed, so callers
     /// can log it and treat the config as unknown (fail-closed).
     fn load_running_config(&self) -> std::result::Result<RunningVmConfig, String> {
-        let content = std::fs::read_to_string(&self.config_file)
+        let content = read_running_config(&self.config_file)
             .map_err(|e| format!("config file {}: {}", self.config_file.display(), e))?;
-        serde_json::from_str(&content)
+        serde_json::from_slice(&content)
             .map_err(|e| format!("invalid JSON in {}: {}", self.config_file.display(), e))
     }
 
@@ -3211,9 +3536,26 @@ impl AgentManager {
                 features.pod_netns.is_some(),
             )?;
         }
+        let mut credential_identity = None;
+        // Held until this boot is up: a change to the machine's bindings
+        // waits for it, and this boot never reads bindings a change is
+        // replacing.
+        // Only a machine with a record has bindings to change, so only one
+        // takes the lock: a helper or an unregistered run leaves no lock file.
+        let _bindings_lock = match self.name() {
+            Some(name) if crate::db::SmolvmDb::open()?.get_vm(name)?.is_some() => {
+                Some(crate::credentials::lock_bindings(name)?)
+            }
+            _ => None,
+        };
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
+                // This boot enforces the record's bindings, whatever a failed
+                // undo left in the boot process it replaces.
+                if record.credential_bindings_unsettled {
+                    db.update_vm(name, |r| r.credential_bindings_unsettled = false)?;
+                }
                 // The userland this boot runs on, for the checkpoints and pauses
                 // taken from it. A branch boots its golden's live snapshot, so
                 // it runs on the golden's rootfs: after a roll that installed a
@@ -3262,6 +3604,39 @@ impl AgentManager {
                         r.agent_rootfs_digest = Some(rootfs_digest.clone());
                         r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
+                }
+                // A fresh boot mounts the credential CA as a device; a restore
+                // must rebuild the device set its saved memory was taken with,
+                // which has the CA only if that boot mounted it.
+                let restoring = features.snapshot_dir.is_some();
+                let identity = crate::credentials::CredentialIdentity::of(name, &record);
+                // The record, read under the lock, decides the bindings this
+                // boot enforces, whatever the caller loaded earlier (an API
+                // entry, a supervisor restart): a change made by another
+                // process since must not be booted over.
+                if record.credential_policy.is_some() {
+                    features.credentials =
+                        crate::credentials::CredentialLaunch::for_record(name, &record);
+                } else if restoring && record.credential_ca_boot_device() {
+                    // No binding any more, but the saved guest has the CA
+                    // device: recreate it, with an interceptor that has none.
+                    features.credentials =
+                        Some(crate::credentials::CredentialLaunch::without_bindings(
+                            &identity,
+                            record.credentials_supplied_by_api,
+                        ));
+                } else {
+                    // A record without bindings boots none, whatever a caller
+                    // loaded before they were removed.
+                    features.credentials = None;
+                }
+                if let Some(launch) = features.credentials.as_mut() {
+                    launch.ca_boot_mount = !restoring || record.credential_ca_boot_device();
+                }
+                credential_identity = Some(identity);
+                let ca_device = features.credentials.is_some();
+                if !restoring && record.credential_ca_device != Some(ca_device) {
+                    db.update_vm(name, |r| r.credential_ca_device = Some(ca_device))?;
                 }
                 if record.mediated_egress_required {
                     // A persisted mediated boundary cannot be downgraded by
@@ -3503,6 +3878,7 @@ impl AgentManager {
             inner.is_clone = fork_clone;
             inner.is_cuda_clone = cuda_clone;
             inner.forkable = features.forkable;
+            inner.pod_network = features.pod_netns.is_some();
         }
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
@@ -3642,6 +4018,20 @@ impl AgentManager {
             None
         };
 
+        // The guest trusts the CA it was last given; a restored one may have
+        // been saved before the CA was widened, or before the machine had
+        // bindings at all. Settled once the guest answers.
+        let launched_credentials = features
+            .credentials
+            .clone()
+            .map(|launch| (launch, features.snapshot_dir.is_some()));
+        let trusted_ca = match (self.name(), &launched_credentials) {
+            (Some(name), Some(_)) => crate::db::SmolvmDb::open()?
+                .get_vm(name)?
+                .and_then(|record| record.credential_ca_trusted),
+            _ => None,
+        };
+
         // Supplied credential values ride in the boot process's own
         // environment, never in the boot config written below.
         let credential_env = features
@@ -3679,6 +4069,7 @@ impl AgentManager {
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
+            credential_identity,
             external_interceptor: features.external_interceptor,
             mediated_egress: features.mediated_egress,
             mediated_parent_id: features.mediated_parent_id,
@@ -3977,7 +4368,94 @@ impl AgentManager {
         if let (Err(_), Some(name)) = (&launched, adopted_scope) {
             release_failed_launch_scope(name, child_pid);
         }
+        if let (Ok(()), Some((launch, restored))) = (&launched, launched_credentials) {
+            self.settle_credential_trust(&launch, restored, trusted_ca.as_deref());
+        }
+        if launched.is_ok() {
+            self.record_guest_credential_trust();
+        }
         launched
+    }
+
+    /// Make sure the guest that just answered trusts `launch`'s current CA,
+    /// and record which certificate that is. A fresh boot read it from its CA
+    /// mount; a restore is handed it unless the guest was saved already
+    /// trusting this very certificate.
+    fn settle_credential_trust(
+        &self,
+        launch: &crate::credentials::CredentialLaunch,
+        restored: bool,
+        trusted: Option<&str>,
+    ) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let pem = match launch.ca_certificate_pem() {
+            Ok(pem) => pem,
+            Err(error) => {
+                tracing::warn!(%error, "credential CA unreadable after boot");
+                return;
+            }
+        };
+        let current = crate::credentials::CredentialLaunch::ca_fingerprint(&pem);
+        if trusted == Some(current.as_str()) {
+            return;
+        }
+        if restored {
+            if let Err(error) = self.install_credential_trust(&pem) {
+                if launch.ca_boot_mount {
+                    tracing::warn!(%error, "restored guest keeps the credential CA it was saved with");
+                } else {
+                    tracing::error!(%error, "restored guest does not trust the credential CA; requests to bound hosts will fail TLS until it restarts");
+                }
+                return;
+            }
+        }
+        let recorded = crate::db::SmolvmDb::open()
+            .and_then(|db| db.update_vm(name, |r| r.credential_ca_trusted = Some(current)));
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the credential CA the guest trusts");
+        }
+    }
+
+    /// Record whether the guest that just answered can be handed a credential
+    /// CA while it runs, so a change to the bindings of a machine resuming
+    /// memory saved from this boot knows whether its guest can take them.
+    fn record_guest_credential_trust(&self) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let capable = match self.connect().and_then(|mut client| {
+            client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)
+        }) {
+            Ok(capable) => capable,
+            Err(error) => {
+                tracing::debug!(%error, "could not ask the guest agent what it supports");
+                return;
+            }
+        };
+        let recorded = crate::db::SmolvmDb::open().and_then(|db| {
+            db.update_vm(name, |r| {
+                if r.guest_credential_trust != Some(capable) {
+                    r.guest_credential_trust = Some(capable);
+                }
+            })
+        });
+        if let Err(error) = recorded {
+            tracing::warn!(%error, "could not record the guest agent's credential support");
+        }
+    }
+
+    /// Hand the running guest `pem` as its credential CA.
+    fn install_credential_trust(&self, pem: &str) -> Result<()> {
+        let mut client = self.connect()?;
+        if !client.supports_capability(smolvm_protocol::CREDENTIAL_TRUST_CAPABILITY)? {
+            return Err(Error::agent(
+                "install credential trust",
+                "the guest agent predates live credential trust",
+            ));
+        }
+        client.install_credential_trust(pem)
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.
@@ -5052,6 +5530,34 @@ mod tests {
         assert_eq!(super::forkable_in_running_config(&path), None);
     }
 
+    /// The host reads and writes a machine's running configuration without
+    /// following links: a link to `/dev/zero` or a FIFO left in its place is
+    /// refused at once, not read forever or waited on, and a write replaces
+    /// the link instead of writing through it.
+    #[cfg(unix)]
+    #[test]
+    fn the_running_configuration_is_read_and_written_without_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(read_running_config(&path).is_err());
+        assert_eq!(super::forkable_in_running_config(&path), None);
+        std::fs::remove_file(&path).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(read_running_config(&path).is_err(), "refused, not blocked");
+        std::fs::remove_file(&path).unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("root-file");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        write_running_config(&path, br#"{"x":1}"#).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
+    }
+
     #[test]
     fn a_running_machine_reports_how_it_was_launched_and_a_stopped_one_its_record() {
         use crate::config::VmRecord;
@@ -5719,6 +6225,7 @@ mod tests {
             ports: Vec::new(),
             resources: VmResources::default(),
             forkable: true,
+            pod_network: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: RunningVmConfig = serde_json::from_str(&json).unwrap();
@@ -5726,6 +6233,7 @@ mod tests {
             back.forkable,
             "forkable must round-trip through the config file"
         );
+        assert!(!back.pod_network && !json.contains("pod_network"));
 
         // Backward compatibility: a config written before this field existed (drop
         // it from a real serialization) must still load, defaulting to
@@ -5738,6 +6246,210 @@ mod tests {
             !parsed.forkable,
             "a missing forkable field defaults to false"
         );
+    }
+
+    /// A boot process from before bindings could change parses its socket
+    /// messages strictly and knows values alone: one carrying `expect` is
+    /// refused as malformed, and the values are sent again without it, in
+    /// the shape it takes.
+    #[test]
+    fn values_reach_a_boot_process_from_before_binding_changes() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct OldRequest {
+            values: Option<std::collections::BTreeMap<String, String>>,
+        }
+        let old_boot_process = |request: &str| match serde_json::from_str::<OldRequest>(request) {
+            Ok(OldRequest { values: Some(_) }) => Ok(String::new()),
+            _ => Err(LiveCredentialError::Refused(MALFORMED_REQUEST.into())),
+        };
+        let expect = crate::credentials::CredentialPolicy {
+            credentials: vec![
+                crate::credentials::parse_credential_flag("gh=GH_TOKEN@github.com").unwrap(),
+            ],
+        };
+        let values = [("gh".to_string(), zeroize::Zeroizing::new("v".to_string()))].into();
+        let mut sent = Vec::new();
+        send_credential_values(&values, &expect, |request| {
+            sent.push(request.to_string());
+            old_boot_process(request)
+        })
+        .unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("\"expect\""));
+        assert!(!sent[1].contains("\"expect\""));
+
+        // A current one takes the first, and any other refusal is final.
+        let mut sent = 0;
+        send_credential_values(&values, &expect, |_| {
+            sent += 1;
+            Ok(String::new())
+        })
+        .unwrap();
+        assert_eq!(sent, 1);
+        let refused = send_credential_values(&values, &expect, |_| {
+            Err(LiveCredentialError::Refused("changed since".into()))
+        });
+        assert_eq!(
+            refused,
+            Err(LiveCredentialError::Refused("changed since".into()))
+        );
+        // A current boot process that cannot read the message is not taken
+        // for an old one: no retry without `expect`.
+        let mut sent = 0;
+        let unreadable = send_credential_values(&values, &expect, |_| {
+            sent += 1;
+            Err(LiveCredentialError::Refused(format!(
+                "{}: unknown field",
+                crate::credentials::UNREADABLE_REQUEST
+            )))
+        });
+        assert!(unreadable.is_err());
+        assert_eq!(sent, 1);
+    }
+
+    /// Answers are classified by what they prove: a refusal changed nothing,
+    /// a closed connection may have come after the process acted.
+    #[test]
+    fn credentials_answers_say_whether_anything_changed() {
+        assert_eq!(credentials_reply("ok\n").unwrap(), "");
+        assert_eq!(credentials_reply("ok\n{\"a\":1}\n").unwrap(), "{\"a\":1}");
+        let refused = credentials_reply("error: malformed request\n").unwrap_err();
+        assert_eq!(
+            refused,
+            LiveCredentialError::Refused(MALFORMED_REQUEST.into())
+        );
+        assert!(refused.changed_nothing());
+        assert!(!credentials_reply("").unwrap_err().changed_nothing());
+    }
+
+    /// What the host reached is judged by the connected socket: a socket of
+    /// another machine linked in at this machine's path (as a link swapped
+    /// in after the check would) is refused, the machine's own is talked to.
+    #[cfg(unix)]
+    #[test]
+    fn the_credentials_socket_reached_must_be_bound_at_the_machines_path() {
+        use std::io::{Read, Write};
+        let name = format!(
+            "cred-peer-{}",
+            crate::db::SmolvmDb::create_reservation_token()
+        );
+        let dir = vm_data_dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+        // Another machine's socket, on the same filesystem.
+        let other_dir = vm_data_dir(&format!("{name}-other"));
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = other_dir.join(crate::credentials::CREDENTIALS_SOCKET);
+        let _other = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        std::fs::hard_link(&other, &ours).unwrap();
+        let refused = credentials_query(&name, "{}").unwrap_err();
+        assert!(refused.changed_nothing());
+        assert!(refused.reason().contains("bound at"), "{refused}");
+
+        std::fs::remove_file(&ours).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&ours).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"ok\n").unwrap();
+        });
+        assert_eq!(credentials_query(&name, "{}").unwrap(), "");
+        server.join().unwrap();
+
+        // Bound through a differently spelled path (a linked directory): the
+        // same place, so it is the machine's own.
+        std::fs::remove_file(&ours).unwrap();
+        let spelled = tempfile::tempdir().unwrap();
+        let link = spelled.path().join("machine");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(
+            link.join(crate::credentials::CREDENTIALS_SOCKET),
+        )
+        .unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"ok\n").unwrap();
+        });
+        assert_eq!(credentials_query(&name, "{}").unwrap(), "");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
+    }
+
+    /// The process answering a machine's credentials socket must be the
+    /// machine's own user, the asker's, or root; another machine's is refused.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_machines_own_or_a_trusted_user_serves_its_socket() {
+        // A dropped boot process: the machine's uid owns the directory.
+        assert!(peer_may_serve(5001, 5001, 0));
+        // Started without the drop after one with it: root serves, the
+        // directory still belongs to the uid of the earlier boot.
+        assert!(peer_may_serve(0, 5001, 0));
+        // A plain user's CLI and its own boot process.
+        assert!(peer_may_serve(1000, 1000, 1000));
+        assert!(peer_may_serve(1000, 5001, 1000));
+        // Another machine's process, linked or listening in its place.
+        assert!(!peer_may_serve(5002, 5001, 0));
+        assert!(!peer_may_serve(5002, 1000, 1000));
+    }
+
+    /// The host talks to a machine's credentials socket only if the path is
+    /// a socket, not a link, and its server runs as the machine directory's
+    /// owner.
+    #[cfg(unix)]
+    #[test]
+    fn the_credentials_socket_is_never_reached_through_a_link() {
+        let name = format!(
+            "cred-sock-{}",
+            crate::db::SmolvmDb::create_reservation_token()
+        );
+        let dir = vm_data_dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = elsewhere.path().join("other.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        std::os::unix::fs::symlink(&other, dir.join(crate::credentials::CREDENTIALS_SOCKET))
+            .unwrap();
+        let refused = credentials_query(&name, "{}").unwrap_err();
+        assert!(refused.changed_nothing());
+        assert!(refused.reason().contains("not a socket"), "{refused}");
+        // No socket at all: unreached, nothing changed.
+        std::fs::remove_file(dir.join(crate::credentials::CREDENTIALS_SOCKET)).unwrap();
+        assert!(matches!(
+            credentials_query(&name, "{}"),
+            Err(LiveCredentialError::Unreached(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A VM launched on a pod network says so in its running configuration,
+    /// which is how a binding change made from another process learns it.
+    #[test]
+    fn running_config_records_a_pod_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        let cfg = RunningVmConfig {
+            version: RunningVmConfig::CURRENT_VERSION,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            forkable: false,
+            pod_network: true,
+        };
+        std::fs::write(&path, serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(running_config_at(&path).unwrap().pod_network);
+        let plain = RunningVmConfig {
+            pod_network: false,
+            ..cfg
+        };
+        std::fs::write(&path, serde_json::to_string(&plain).unwrap()).unwrap();
+        assert!(!running_config_at(&path).unwrap().pod_network);
     }
 
     /// The three denial shapes the virtio-net runtime emits parse into
