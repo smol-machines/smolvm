@@ -60,6 +60,140 @@ pub fn run_container_init() -> i32 {
     1
 }
 
+const EXEC_AS_ARG: &str = "exec-as";
+
+/// Whether this agent invocation is the credential helper a command entering a
+/// snapshot-restored container runs through (see [`exec_as_args`]).
+pub fn exec_as_requested() -> bool {
+    std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(EXEC_AS_ARG))
+}
+
+/// The arguments that make `exe` (this agent binary) become `command` as
+/// `uid:gid` holding `groups`: `exe exec-as UID GID GROUPS -- command...`, with
+/// GROUPS comma-separated (`-` for none).
+///
+/// `nsenter --setgid` drops every supplementary group (it calls
+/// `setgroups(0, NULL)` itself), so a command that enters a container through
+/// nsenter cannot keep its user's groups that way. nsenter enters the
+/// namespaces as root and runs this helper instead, which sets the groups,
+/// then the gid, then the uid, and execs the command, as `initgroups` and a
+/// login do.
+pub fn exec_as_args(
+    exe: &str,
+    uid: u32,
+    gid: u32,
+    groups: &[u32],
+    command: &[String],
+) -> Vec<String> {
+    let groups = if groups.is_empty() {
+        "-".to_string()
+    } else {
+        groups
+            .iter()
+            .map(u32::to_string)
+            .collect::<Vec<_>>()
+            .join(",")
+    };
+    let mut args = vec![
+        exe.to_string(),
+        EXEC_AS_ARG.to_string(),
+        uid.to_string(),
+        gid.to_string(),
+        groups,
+        "--".to_string(),
+    ];
+    args.extend(command.iter().cloned());
+    args
+}
+
+/// What an `exec-as` invocation asks for.
+#[derive(Debug, PartialEq, Eq)]
+struct ExecAs<'a> {
+    uid: u32,
+    gid: u32,
+    groups: Vec<u32>,
+    command: &'a [String],
+}
+
+/// Parse [`exec_as_args`] (without the executable) back into an [`ExecAs`].
+fn parse_exec_as(args: &[String]) -> Result<ExecAs<'_>, String> {
+    let [arg, uid, gid, groups, sep, command @ ..] = args else {
+        return Err("usage: exec-as UID GID GROUPS -- COMMAND...".to_string());
+    };
+    if arg != EXEC_AS_ARG || sep != "--" || command.is_empty() {
+        return Err("usage: exec-as UID GID GROUPS -- COMMAND...".to_string());
+    }
+    let id = |value: &str| {
+        value
+            .parse::<u32>()
+            .map_err(|_| format!("exec-as: invalid id '{value}'"))
+    };
+    let groups = if groups == "-" {
+        Vec::new()
+    } else {
+        groups.split(',').map(id).collect::<Result<_, _>>()?
+    };
+    Ok(ExecAs {
+        uid: id(uid)?,
+        gid: id(gid)?,
+        groups,
+        command,
+    })
+}
+
+/// Entry point for `smolvm-agent exec-as`: set the credentials, then exec the
+/// command (searching `PATH`). Returns only on failure, with the shell's exit
+/// codes: 127 for a command that does not exist, 126 otherwise.
+#[cfg(target_os = "linux")]
+pub fn run_exec_as() -> i32 {
+    use std::os::unix::process::CommandExt as _;
+
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let ExecAs {
+        uid,
+        gid,
+        groups,
+        command,
+    } = match parse_exec_as(&args) {
+        Ok(parsed) => parsed,
+        Err(error) => {
+            eprintln!("smolvm: {error}");
+            return 126;
+        }
+    };
+    let groups: Vec<libc::gid_t> = groups.into_iter().map(|g| g as libc::gid_t).collect();
+    // SAFETY: plain credential syscalls on this single-threaded process; the
+    // pointer and length describe `groups`, which outlives the call.
+    unsafe {
+        if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            eprintln!("smolvm: setgroups: {}", std::io::Error::last_os_error());
+            return 126;
+        }
+        if libc::setgid(gid) != 0 {
+            eprintln!("smolvm: setgid {gid}: {}", std::io::Error::last_os_error());
+            return 126;
+        }
+        if libc::setuid(uid) != 0 {
+            eprintln!("smolvm: setuid {uid}: {}", std::io::Error::last_os_error());
+            return 126;
+        }
+    }
+    let error = std::process::Command::new(&command[0])
+        .args(&command[1..])
+        .exec();
+    eprintln!("smolvm: exec {}: {error}", command[0]);
+    if error.kind() == std::io::ErrorKind::NotFound {
+        127
+    } else {
+        126
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn run_exec_as() -> i32 {
+    126
+}
+
 /// Exit code used when a command is killed due to timeout.
 pub const TIMEOUT_EXIT_CODE: i32 = 124;
 
@@ -87,9 +221,15 @@ pub fn exit_code_from_status(status: &std::process::ExitStatus) -> i32 {
 ///   11 MiB × 2 × 4/3 ≈ 29.3 MiB encoded + ~2.7 MiB JSON headroom.
 pub const MAX_EXEC_OUTPUT: usize = 11 * 1024 * 1024;
 
-/// Maximum time to wait for reader threads to finish after the child is killed.
-/// Guards against pathological cases where an inherited fd keeps a pipe open.
-const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+/// How long an exec that exited waits for the rest of its output. A process it
+/// left running in the background (`sh -c 'server &'`) can hold the output
+/// pipe open for as long as it lives; the reply goes out without waiting for it.
+pub(crate) const READER_JOIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long a killed exec waits for output still in flight before replying.
+/// Every process holding the output pipe was killed with the command, so the
+/// pipe normally closes at once; this only bounds the reply if one survived.
+pub(crate) const KILLED_OUTPUT_GRACE: Duration = Duration::from_millis(500);
 
 /// Captured output from a child process.
 #[derive(Debug, Default)]
@@ -111,6 +251,217 @@ pub enum WaitResult {
     /// Process was killed because the requesting client disconnected.
     /// Used to free the accept loop when the client gives up mid-exec.
     ClientDisconnected { output: ChildOutput },
+}
+
+/// Kill `child` and every process descended from it, then reap `child`.
+///
+/// A command run in an image container is not the agent's child: the agent
+/// spawns `crun exec` (or a namespace-entering helper) and the command is that
+/// helper's child. Killing only the direct child orphans the command, which
+/// keeps running in the container after its client disconnected or its timeout
+/// passed. The agent's PID namespace contains the container's, so the whole
+/// tree is visible in `/proc`.
+///
+/// Processes that left the tree are killed too when they still write to the
+/// command's output: a child that double-forked or was re-parented holds the
+/// pipe open, so the exec could not finish and would keep running after the
+/// command was declared dead. Only the command's own output pipes count (ones
+/// this process reads), never an inherited stdout other processes share.
+pub fn kill_child_tree(child: &mut Child) {
+    kill_tree(child, false);
+}
+
+/// [`kill_child_tree`] plus the child's process group, for a command spawned as
+/// the leader of its own session.
+pub fn kill_child_group_tree(child: &mut Child) {
+    kill_tree(child, true);
+}
+
+fn kill_tree(child: &mut Child, group: bool) {
+    #[cfg(target_os = "linux")]
+    {
+        let root = child.id();
+        // Read before anything dies: the pipes go away with the child's fds.
+        let pipes = own_output_pipes(root);
+        freeze_and_kill(|| {
+            let mut pids = live_descendants(root);
+            pids.extend(pipe_writers(&pipes));
+            pids
+        });
+        if group {
+            // SAFETY: plain signal delivery. The child is not reaped yet, so
+            // its pid still names its process group.
+            unsafe { libc::killpg(root as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = group;
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// SIGKILL every process `scan` finds (never this one).
+///
+/// The set is frozen first: once an intermediate process dies its children are
+/// re-parented and no longer look like descendants, and a live process could
+/// fork between a walk and the kill. So SIGSTOP everything found, re-walk until
+/// no new process appears (a stopped process cannot fork), then SIGKILL the
+/// whole set. Bounded, so a fork bomb cannot pin the agent.
+#[cfg(target_os = "linux")]
+fn freeze_and_kill(mut scan: impl FnMut() -> Vec<u32>) {
+    let me = std::process::id();
+    let mut frozen = std::collections::BTreeSet::new();
+    for _ in 0..32 {
+        let fresh: Vec<u32> = scan()
+            .into_iter()
+            .filter(|pid| *pid != me && !frozen.contains(pid))
+            .collect();
+        if fresh.is_empty() {
+            break;
+        }
+        for pid in fresh {
+            // SAFETY: plain signal delivery to a PID read from /proc.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGSTOP) };
+            frozen.insert(pid);
+        }
+    }
+    for pid in frozen {
+        // SAFETY: as above. A stopped process still dies on SIGKILL.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+    }
+}
+
+/// Live (non-zombie) descendants of `root`, read from `/proc`.
+#[cfg(target_os = "linux")]
+fn live_descendants(root: u32) -> Vec<u32> {
+    let mut children: std::collections::HashMap<u32, Vec<u32>> = Default::default();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    for entry in entries.flatten() {
+        let Some(pid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|n| n.parse::<u32>().ok())
+        else {
+            continue;
+        };
+        let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) else {
+            continue;
+        };
+        if let Some((state, ppid)) = parse_stat_state_ppid(&stat) {
+            if state != 'Z' {
+                children.entry(ppid).or_default().push(pid);
+            }
+        }
+    }
+    let mut found = Vec::new();
+    let mut queue = vec![root];
+    while let Some(pid) = queue.pop() {
+        if let Some(kids) = children.get(&pid) {
+            for &kid in kids {
+                found.push(kid);
+                queue.push(kid);
+            }
+        }
+    }
+    found
+}
+
+/// The pipes `pid` writes its stdout and stderr to that this process holds only
+/// the read end of: the output pipes of a command this process spawned. A pipe
+/// this process also writes (its own stdout handed down) is shared with other
+/// processes, so it is left out.
+#[cfg(target_os = "linux")]
+fn own_output_pipes(pid: u32) -> Vec<String> {
+    let mine = open_pipes(std::process::id());
+    let ours = |link: &str| {
+        mine.iter()
+            .any(|(l, mode)| l == link && *mode == libc::O_RDONLY)
+            && !mine
+                .iter()
+                .any(|(l, mode)| l == link && *mode != libc::O_RDONLY)
+    };
+    let mut pipes = Vec::new();
+    for fd in [1, 2] {
+        let Ok(link) = std::fs::read_link(format!("/proc/{pid}/fd/{fd}")) else {
+            continue;
+        };
+        let link = link.to_string_lossy().into_owned();
+        if link.starts_with("pipe:[") && ours(&link) && !pipes.contains(&link) {
+            pipes.push(link);
+        }
+    }
+    pipes
+}
+
+/// Every process other than this one that has one of `pipes` open for writing.
+#[cfg(target_os = "linux")]
+fn pipe_writers(pipes: &[String]) -> Vec<u32> {
+    if pipes.is_empty() {
+        return Vec::new();
+    }
+    let me = std::process::id();
+    let Ok(entries) = std::fs::read_dir("/proc") else {
+        return Vec::new();
+    };
+    entries
+        .flatten()
+        .filter_map(|e| e.file_name().to_str()?.parse::<u32>().ok())
+        .filter(|pid| *pid != me)
+        .filter(|pid| {
+            open_pipes(*pid)
+                .iter()
+                .any(|(link, mode)| *mode != libc::O_RDONLY && pipes.contains(link))
+        })
+        .collect()
+}
+
+/// `(pipe:[inode], access mode)` for every pipe `pid` has open.
+#[cfg(target_os = "linux")]
+fn open_pipes(pid: u32) -> Vec<(String, i32)> {
+    let Ok(fds) = std::fs::read_dir(format!("/proc/{pid}/fd")) else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for fd in fds.flatten() {
+        let Ok(link) = std::fs::read_link(fd.path()) else {
+            continue;
+        };
+        let link = link.to_string_lossy();
+        if !link.starts_with("pipe:[") {
+            continue;
+        }
+        let name = fd.file_name();
+        let Some(mode) =
+            std::fs::read_to_string(format!("/proc/{pid}/fdinfo/{}", name.to_string_lossy()))
+                .ok()
+                .and_then(|info| fdinfo_access_mode(&info))
+        else {
+            continue;
+        };
+        out.push((link.into_owned(), mode));
+    }
+    out
+}
+
+/// The access mode (`O_RDONLY`, `O_WRONLY`, `O_RDWR`) from a fdinfo file,
+/// whose `flags:` line is octal.
+#[cfg(target_os = "linux")]
+fn fdinfo_access_mode(info: &str) -> Option<i32> {
+    let flags = info.lines().find_map(|l| l.strip_prefix("flags:"))?.trim();
+    Some(i32::from_str_radix(flags, 8).ok()? & libc::O_ACCMODE)
+}
+
+/// `(state, ppid)` from a `/proc/<pid>/stat` line. The command name is in
+/// parentheses and may itself contain spaces or `)`, so fields are read after
+/// the LAST `)`.
+fn parse_stat_state_ppid(stat: &str) -> Option<(char, u32)> {
+    let rest = stat.get(stat.rfind(')')? + 1..)?;
+    let mut fields = rest.split_whitespace();
+    let state = fields.next()?.chars().next()?;
+    let ppid = fields.next()?.parse().ok()?;
+    Some((state, ppid))
 }
 
 /// Check whether the peer on `fd` has closed the connection.
@@ -156,6 +507,115 @@ pub fn is_peer_closed(fd: std::os::unix::io::RawFd) -> bool {
 #[cfg(not(target_os = "linux"))]
 pub fn is_peer_closed(_fd: std::os::unix::io::RawFd) -> bool {
     false
+}
+
+/// Receive `rx` into `buf` until its sender is gone or `deadline` passes.
+pub(crate) fn drain_until_closed(
+    rx: &std::sync::mpsc::Receiver<Vec<u8>>,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+) {
+    loop {
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(chunk) => buf.extend_from_slice(&chunk),
+            Err(_) => {
+                // Disconnected (reader finished) or out of time: take whatever
+                // arrived meanwhile and stop.
+                buf.extend(rx.try_iter().flatten());
+                return;
+            }
+        }
+    }
+}
+
+/// Read `pipe` to EOF on a thread of its own and throw the bytes away.
+///
+/// For a command's output pipe after its reply went out: a process the command
+/// left running in the background may still hold the pipe, and with no reader
+/// its next write would kill it with SIGPIPE.
+pub(crate) fn drain_in_background<P>(pipe: Option<P>)
+where
+    P: std::io::Read + std::os::unix::io::AsRawFd + Send + 'static,
+{
+    let Some(mut pipe) = pipe else {
+        return;
+    };
+    // A session may have read it non-blocking.
+    let fd = pipe.as_raw_fd();
+    // SAFETY: fcntl on an fd this function owns.
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags >= 0 && flags & libc::O_NONBLOCK != 0 {
+            libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK);
+        }
+    }
+    let _ = std::thread::Builder::new()
+        .name("exec-drain".into())
+        .spawn(move || {
+            let mut buf = [0u8; 16 * 1024];
+            loop {
+                match pipe.read(&mut buf) {
+                    Ok(0) => break,
+                    Ok(_) => {}
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+        });
+}
+
+/// Wakes a waiter when a child exits: a pidfd that polls readable on exit.
+/// Without one (a kernel older than 5.3), waiting is a plain sleep.
+pub(crate) struct ExitSignal(#[cfg(target_os = "linux")] Option<std::os::fd::OwnedFd>);
+
+impl ExitSignal {
+    #[cfg(target_os = "linux")]
+    pub(crate) fn open(child: &Child) -> Self {
+        use std::os::fd::FromRawFd;
+        // SAFETY: pidfd_open takes a pid and flags and returns a new fd or -1.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, child.id() as libc::pid_t, 0) };
+        // SAFETY: a non-negative return is a fresh fd this process owns.
+        Self((fd >= 0).then(|| unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) }))
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    pub(crate) fn open(_child: &Child) -> Self {
+        Self()
+    }
+
+    /// The pidfd, for callers that wait on it alongside other fds. It
+    /// becomes readable when the child exits. `None` without pidfd support.
+    pub(crate) fn raw_fd(&self) -> Option<std::os::fd::RawFd> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            self.0.as_ref().map(|fd| fd.as_raw_fd())
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            None
+        }
+    }
+
+    /// Return after `timeout`, or sooner if the child exits.
+    pub(crate) fn wait(&self, timeout: Duration) {
+        #[cfg(target_os = "linux")]
+        if let Some(fd) = &self.0 {
+            use std::os::fd::AsRawFd;
+            let mut pollfd = libc::pollfd {
+                fd: fd.as_raw_fd(),
+                events: libc::POLLIN,
+                revents: 0,
+            };
+            let ms = timeout.as_millis().clamp(1, i32::MAX as u128) as i32;
+            // SAFETY: one valid pollfd. An EINTR or error only ends this wait
+            // early; the caller checks the child again either way.
+            unsafe { libc::poll(&mut pollfd, 1, ms) };
+            return;
+        }
+        std::thread::sleep(timeout);
+    }
 }
 
 /// Try to wait for a child process, handling EINTR by retrying.
@@ -211,25 +671,33 @@ where
     let (stdout_tx, stdout_rx) = mpsc::channel::<Vec<u8>>();
     let (stderr_tx, stderr_rx) = mpsc::channel::<Vec<u8>>();
 
-    let stdout_handle = child.stdout.take().and_then(|mut out| {
+    let _stdout_reader = child.stdout.take().and_then(|mut out| {
         std::thread::Builder::new()
             .name("crun-stdout".into())
             .spawn(move || {
                 let mut total = 0usize;
+                let mut attached = true;
                 loop {
                     let mut chunk = vec![0u8; CHUNK_SIZE];
                     match out.read(&mut chunk) {
                         Ok(0) => break, // EOF
+                        // The caller replied: keep the pipe drained so a
+                        // process still writing to it is not killed by SIGPIPE.
+                        Ok(_) if !attached => {}
                         Ok(n) => {
                             total += n;
                             chunk.truncate(n);
                             if stdout_tx.send(chunk).is_err() {
-                                break; // receiver dropped
+                                attached = false;
+                                continue;
                             }
-                            if total >= MAX_EXEC_OUTPUT {
-                                break; // cap reached
+                            // Stop only once past the cap, so output of exactly
+                            // the cap is not mistaken for truncated output.
+                            if total > MAX_EXEC_OUTPUT {
+                                break;
                             }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
                     }
                 }
@@ -237,25 +705,29 @@ where
             .ok()
     });
 
-    let stderr_handle = child.stderr.take().and_then(|mut err| {
+    let _stderr_reader = child.stderr.take().and_then(|mut err| {
         std::thread::Builder::new()
             .name("crun-stderr".into())
             .spawn(move || {
                 let mut total = 0usize;
+                let mut attached = true;
                 loop {
                     let mut chunk = vec![0u8; CHUNK_SIZE];
                     match err.read(&mut chunk) {
                         Ok(0) => break,
+                        Ok(_) if !attached => {}
                         Ok(n) => {
                             total += n;
                             chunk.truncate(n);
                             if stderr_tx.send(chunk).is_err() {
-                                break;
+                                attached = false;
+                                continue;
                             }
-                            if total >= MAX_EXEC_OUTPUT {
+                            if total > MAX_EXEC_OUTPUT {
                                 break;
                             }
                         }
+                        Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                         Err(_) => break,
                     }
                 }
@@ -269,6 +741,8 @@ where
 
     let poll_interval = Duration::from_millis(10);
     let deadline = timeout_ms.map(|ms| Instant::now() + Duration::from_millis(ms));
+    // Wakes the loop the moment the child exits, rather than at the next tick.
+    let exit_signal = ExitSignal::open(child);
 
     // Drain any available chunks from the channels into local buffers.
     let drain_channels = |stdout_rx: &mpsc::Receiver<Vec<u8>>,
@@ -290,21 +764,13 @@ where
         match try_wait_with_eintr(child) {
             Ok(Some(status)) => {
                 // Child exited — give reader threads a bounded window to finish.
-                // After the child dies, pipe write ends close and readers see EOF.
-                // Use is_finished() on handles to detect completion without consuming
-                // chunks (try_recv as a probe races and can drop data).
+                // After the child dies, pipe write ends close and readers see EOF;
+                // a reader's channel disconnects as soon as it returns, so wait on
+                // that instead of polling. A background process still holding a
+                // pipe keeps its reader open until the deadline, as before.
                 let join_deadline = Instant::now() + READER_JOIN_TIMEOUT;
-                while Instant::now() < join_deadline {
-                    drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
-                    let stdout_done = stdout_handle.as_ref().is_none_or(|h| h.is_finished());
-                    let stderr_done = stderr_handle.as_ref().is_none_or(|h| h.is_finished());
-                    if stdout_done && stderr_done {
-                        break;
-                    }
-                    std::thread::sleep(Duration::from_millis(10));
-                }
-                // Final drain after threads are done (or timed out).
-                drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
+                drain_until_closed(&stdout_rx, &mut stdout_buf, join_deadline);
+                drain_until_closed(&stderr_rx, &mut stderr_buf, join_deadline);
                 let exit_code = exit_code_from_status(&status);
                 return Ok(WaitResult::Completed {
                     exit_code,
@@ -318,9 +784,10 @@ where
                 if let Some(fd) = client_fd {
                     if is_peer_closed(fd) {
                         on_abort();
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
+                        kill_child_tree(child);
+                        let grace = Instant::now() + KILLED_OUTPUT_GRACE;
+                        drain_until_closed(&stdout_rx, &mut stdout_buf, grace);
+                        drain_until_closed(&stderr_rx, &mut stderr_buf, grace);
                         return Ok(WaitResult::ClientDisconnected {
                             output: ChildOutput {
                                 stdout: stdout_buf,
@@ -333,9 +800,10 @@ where
                 if let Some(deadline) = deadline {
                     if Instant::now() >= deadline {
                         on_abort();
-                        let _ = child.kill();
-                        let _ = child.wait();
-                        drain_channels(&stdout_rx, &stderr_rx, &mut stdout_buf, &mut stderr_buf);
+                        kill_child_tree(child);
+                        let grace = Instant::now() + KILLED_OUTPUT_GRACE;
+                        drain_until_closed(&stdout_rx, &mut stdout_buf, grace);
+                        drain_until_closed(&stderr_rx, &mut stderr_buf, grace);
                         return Ok(WaitResult::TimedOut {
                             output: ChildOutput {
                                 stdout: stdout_buf,
@@ -346,7 +814,12 @@ where
                     }
                 }
 
-                std::thread::sleep(poll_interval);
+                let tick = deadline.map_or(poll_interval, |deadline| {
+                    deadline
+                        .saturating_duration_since(Instant::now())
+                        .min(poll_interval)
+                });
+                exit_signal.wait(tick);
             }
             Err(e) => return Err(e),
         }
@@ -356,6 +829,283 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn exec_as_round_trips_the_user_its_groups_and_the_command() {
+        let command = vec!["sh".to_string(), "-c".to_string(), "id -G".to_string()];
+        let args = exec_as_args("/proc/self/fd/7", 1001, 1001, &[1001, 27, 123], &command);
+        assert_eq!(
+            args,
+            [
+                "/proc/self/fd/7",
+                "exec-as",
+                "1001",
+                "1001",
+                "1001,27,123",
+                "--",
+                "sh",
+                "-c",
+                "id -G"
+            ]
+        );
+        assert_eq!(
+            parse_exec_as(&args[1..]).unwrap(),
+            ExecAs {
+                uid: 1001,
+                gid: 1001,
+                groups: vec![1001, 27, 123],
+                command: command.as_slice(),
+            }
+        );
+
+        // No groups at all is spelled `-` and parses back to none.
+        let args = exec_as_args("exe", 0, 0, &[], &command);
+        assert_eq!(args[4], "-");
+        assert!(parse_exec_as(&args[1..]).unwrap().groups.is_empty());
+    }
+
+    #[test]
+    fn exec_as_refuses_malformed_arguments() {
+        let parse = |args: &[&str]| {
+            let args: Vec<String> = args.iter().map(|a| a.to_string()).collect();
+            parse_exec_as(&args).map(|_| ())
+        };
+        assert!(parse(&["exec-as", "1001", "1001", "-", "--"]).is_err());
+        assert!(parse(&["exec-as", "1001", "1001", "-", "sh"]).is_err());
+        assert!(parse(&["exec-as", "runner", "1001", "-", "--", "sh"]).is_err());
+        assert!(parse(&["exec-as", "1001", "1001", "27,x", "--", "sh"]).is_err());
+        assert!(parse(&["exec-as", "1001", "1001", "-", "--", "sh"]).is_ok());
+    }
+
+    #[test]
+    fn stat_parsing_survives_odd_command_names() {
+        let stat = "4242 (weird) name)) S 17 4242 4242 0 -1 4194560 0 0";
+        assert_eq!(parse_stat_state_ppid(stat), Some(('S', 17)));
+        assert_eq!(parse_stat_state_ppid("7 (sh) Z 1 7"), Some(('Z', 1)));
+        assert_eq!(parse_stat_state_ppid("garbage"), None);
+    }
+
+    // The case that motivated it: the command is a GRANDCHILD (crun exec ->
+    // command -> its own children). Killing only the direct child used to leave
+    // the rest running.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_child_tree_kills_grandchildren() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "sh -c 'sleep 30 & sleep 30 & wait' & wait"])
+            .spawn()
+            .unwrap();
+        // Let the tree form.
+        let mut tree = Vec::new();
+        for _ in 0..50 {
+            tree = live_descendants(child.id());
+            if tree.len() >= 3 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(tree.len() >= 3, "expected sh + two sleeps, got {tree:?}");
+        kill_child_tree(&mut child);
+        std::thread::sleep(Duration::from_millis(100));
+        for pid in tree {
+            let alive = std::fs::read_to_string(format!("/proc/{pid}/stat"))
+                .ok()
+                .and_then(|s| parse_stat_state_ppid(&s))
+                .is_some_and(|(state, _)| state != 'Z');
+            assert!(!alive, "descendant {pid} survived");
+        }
+    }
+
+    /// Spawn `sh -c <script>` with piped output and read the PID it prints first.
+    #[cfg(target_os = "linux")]
+    fn spawn_printing_pid(script: &str) -> (std::process::Child, u32) {
+        use std::io::Read as _;
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", script])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        let out = child.stdout.as_mut().unwrap();
+        let mut line = Vec::new();
+        let mut byte = [0u8; 1];
+        while out.read(&mut byte).unwrap() == 1 && byte[0] != b'\n' {
+            line.push(byte[0]);
+        }
+        let pid = String::from_utf8(line).unwrap().trim().parse().unwrap();
+        (child, pid)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn is_live(pid: u32) -> bool {
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| parse_stat_state_ppid(&s))
+            .is_some_and(|(state, _)| state != 'Z')
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_child_tree_kills_a_reparented_process_still_writing_the_output() {
+        // The subshell exits, so the writer is no longer a descendant.
+        let (mut child, writer) =
+            spawn_printing_pid("(sh -c 'echo $$; exec sleep 30' &); exec sleep 30");
+        assert!(is_live(writer));
+        kill_child_tree(&mut child);
+        std::thread::sleep(Duration::from_millis(100));
+        let survived = is_live(writer);
+        if survived {
+            // SAFETY: plain signal delivery to the PID the test started.
+            unsafe { libc::kill(writer as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(!survived, "writer {writer} survived");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kill_child_tree_spares_writers_of_a_pipe_this_process_also_writes() {
+        use std::os::fd::{FromRawFd, OwnedFd};
+        // A pipe this process holds both ends of stands for its own stdout
+        // handed down: other processes write to it too, so they are not the
+        // command's to kill.
+        let mut fds = [0; 2];
+        // SAFETY: fds is a valid two-int array.
+        assert_eq!(unsafe { libc::pipe(fds.as_mut_ptr()) }, 0);
+        // SAFETY: both fds were just created and are owned here.
+        let (_read, write) =
+            unsafe { (OwnedFd::from_raw_fd(fds[0]), OwnedFd::from_raw_fd(fds[1])) };
+        let mut bystander = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::from(write.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdout(std::process::Stdio::from(write.try_clone().unwrap()))
+            .spawn()
+            .unwrap();
+        kill_child_tree(&mut child);
+        std::thread::sleep(Duration::from_millis(100));
+        let spared = is_live(bystander.id());
+        let _ = bystander.kill();
+        let _ = bystander.wait();
+        assert!(spared, "a writer of a shared pipe was killed");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn timed_out_wait_kills_a_reparented_writer_and_answers_on_time() {
+        let (mut child, writer) =
+            spawn_printing_pid("(sh -c 'echo $$; exec sleep 30' &); exec sleep 30");
+        let started = Instant::now();
+        let result =
+            wait_with_timeout_cleanup_and_liveness(&mut child, Some(300), None, || {}).unwrap();
+        let elapsed = started.elapsed();
+        std::thread::sleep(Duration::from_millis(100));
+        let survived = is_live(writer);
+        if survived {
+            // SAFETY: plain signal delivery to the PID the test started.
+            unsafe { libc::kill(writer as libc::pid_t, libc::SIGKILL) };
+        }
+        assert!(matches!(result, WaitResult::TimedOut { .. }));
+        assert!(elapsed < Duration::from_secs(2), "took {elapsed:?}");
+        assert!(!survived, "writer {writer} survived the timeout");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn finished_wait_leaves_a_background_writer_alive_and_drained() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("finished");
+        let mut child = std::process::Command::new("sh")
+            .args([
+                "-c",
+                &format!(
+                    "echo hi; (sleep 6; echo late; sleep 0.5; echo later; touch '{}') &",
+                    marker.display()
+                ),
+            ])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        match wait_with_timeout_cleanup_and_liveness(&mut child, None, None, || {}).unwrap() {
+            WaitResult::Completed { exit_code, output } => {
+                assert_eq!(exit_code, 0);
+                assert_eq!(output.stdout, b"hi\n");
+            }
+            _ => panic!("expected the command to complete"),
+        }
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while !marker.exists() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            marker.exists(),
+            "the background job died writing to the drained pipe"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn fdinfo_access_mode_reads_the_octal_flags() {
+        assert_eq!(
+            fdinfo_access_mode("pos:\t0\nflags:\t02000001\nmnt_id:\t15\n"),
+            Some(libc::O_WRONLY)
+        );
+        assert_eq!(
+            fdinfo_access_mode("flags:\t0100000\n"),
+            Some(libc::O_RDONLY)
+        );
+        assert_eq!(fdinfo_access_mode("pos:\t0\n"), None);
+    }
+
+    // A command that exits at once used to wait out a 10 ms poll tick, plus
+    // another while its output readers finished.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn quick_command_returns_without_a_poll_tick() {
+        let mut best = Duration::MAX;
+        for _ in 0..20 {
+            let mut child = std::process::Command::new("true")
+                .stdin(std::process::Stdio::null())
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .spawn()
+                .unwrap();
+            let started = Instant::now();
+            let result =
+                wait_with_timeout_cleanup_and_liveness(&mut child, None, None, || {}).unwrap();
+            best = best.min(started.elapsed());
+            assert!(matches!(result, WaitResult::Completed { exit_code: 0, .. }));
+        }
+        assert!(
+            best < Duration::from_millis(8),
+            "fastest wait took {best:?}"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn output_is_complete_when_the_child_exits() {
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", "head -c 300000 /dev/zero; echo err >&2"])
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+            .unwrap();
+        match wait_with_timeout_cleanup_and_liveness(&mut child, Some(10_000), None, || {}).unwrap()
+        {
+            WaitResult::Completed { output, .. } => {
+                assert_eq!(output.stdout.len(), 300_000);
+                assert_eq!(output.stderr, b"err\n");
+            }
+            _ => panic!("expected the command to complete"),
+        }
+    }
 
     #[test]
     fn test_timeout_exit_code_value() {

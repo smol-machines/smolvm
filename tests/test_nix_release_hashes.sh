@@ -125,6 +125,26 @@ EOF
     printf '%s\n' "$output" | grep -q "has no line in the checksums"
 }
 
+test_rewrites_hashes_with_slash_and_plus() {
+    # base64 uses `/` and `+`; a hash containing them used to end the
+    # substitution early and leave that platform on its old hash.
+    local tmp nixf sums rc got
+    tmp=$(mktemp -d)
+    nixf="$tmp/smolvm.nix"; sums="$tmp/checksums.sha256"
+    make_nix_fixture "$nixf"
+    make_checksums_fixture "$sums"
+    sed -i.bak 's/^1111*  smolvm-9.9.9-darwin/fbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbefbeffff  smolvm-9.9.9-darwin/' "$sums"
+
+    SMOLVM_NIX_FILE="$nixf" SMOLVM_CHECKSUMS_FILE="$sums" \
+        "$UPDATE_HASHES" 9.9.9 >/dev/null 2>&1
+    rc=$?
+    got=$(hash_for "$nixf" "darwin-arm64.tar.gz")
+    rm -rf "$tmp"
+
+    [[ $rc -eq 0 ]] || { echo "update exited $rc"; return 1; }
+    [[ "$got" == "sha256-++++++++++++++++++++++++++++++++++++++++//8=" ]] || { echo "darwin: got $got"; return 1; }
+}
+
 test_cut_release_does_not_bump_the_flake() {
     # The regression itself: cutting a release must not rewrite the flake's
     # version, because the hashes it would then contradict cannot be computed
@@ -135,6 +155,7 @@ test_cut_release_does_not_bump_the_flake() {
 run_test "Rewrites every pinned hash" test_rewrites_every_pinned_hash || true
 run_test "Leaves the version alone" test_leaves_the_version_alone || true
 run_test "Missing asset fails loudly" test_missing_asset_fails_loudly || true
+run_test "Rewrites hashes containing / and +" test_rewrites_hashes_with_slash_and_plus || true
 run_test "Cutting a release does not bump the flake" test_cut_release_does_not_bump_the_flake || true
 
 print_summary "Nix Release Hash Tests"

@@ -157,6 +157,17 @@ pub fn freeze_internal_filesystems() -> io::Result<()> {
     if state.complete {
         return Ok(());
     }
+    // Freezing a superblock acquires its three freeze levels through a percpu
+    // rwsem, and each acquisition waits out a full RCU grace period. On an
+    // idle guest those grace periods are ~300ms of pure waiting across the two
+    // disks, nearly the whole cost of a machine stop. Expedited RCU replaces
+    // the waits with IPIs, which is what the kernel itself does around
+    // suspend (rcu_pm_notify). Both callers power the VM off right after the
+    // freeze, so the setting is never restored; if a failed freeze leaves the
+    // guest running, staying expedited costs a few IPIs per grace period and
+    // nothing in correctness. Best effort: without the knob the freeze runs
+    // at the normal pace.
+    let _ = std::fs::write("/sys/kernel/rcu_expedited", "1");
     let mounts = internal_mounts(&std::fs::read_to_string("/proc/self/mountinfo")?)?;
     struct DiskOperations(BTreeMap<String, std::fs::File>);
     impl DiskOperations {

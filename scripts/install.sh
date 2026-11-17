@@ -13,7 +13,7 @@
 #
 # Options:
 #   --version VERSION   Install specific version (default: latest)
-#   --prefix DIR        Install to DIR (default: ~/.smolvm)
+#   --prefix DIR        Install to DIR (default: ~/.smolvm, or /opt/smolvm as root on Linux)
 #   --no-modify-path    Don't modify shell profile
 #   --uninstall         Remove smolvm installation
 #   --help              Show this help message
@@ -27,6 +27,11 @@ BIN_DIR="${HOME}/.local/bin"
 MODIFY_PATH=true
 VERSION=""
 UNINSTALL=false
+PREFIX_SET=false
+# Root on Linux installs system-wide. `smolvm serve` run as root gives every VM
+# its own unprivileged uid, and those uids cannot read anything under /root
+# (mode 0700), so an install there boots no VM at all.
+SYSTEM_INSTALL=false
 
 # Colors (disabled if not a terminal)
 if [ -t 1 ]; then
@@ -392,7 +397,10 @@ install_smolvm() {
 
     # Extract
     info "Extracting archive..."
-    tar -xzf "$archive" -C "$tmp_dir" || {
+    # --no-same-owner: as root, tar would otherwise give every file the uid/gid
+    # stored in the archive (the release builder's), and `cp -a` below carries
+    # that owner into the installed agent-rootfs.
+    tar --no-same-owner -xzf "$archive" -C "$tmp_dir" || {
         error "Failed to extract archive"
         rm -rf "$tmp_dir"
         exit 1
@@ -418,8 +426,9 @@ install_smolvm() {
             ;;
     esac
 
-    # Safety: warn if installing outside home directory
-    if [[ "$prefix" != "$HOME"* ]] && [[ "$prefix" != /tmp/* ]]; then
+    # Safety: warn if installing outside home directory. The system install
+    # chose /opt/smolvm itself, a directory only smolvm uses.
+    if [[ "$SYSTEM_INSTALL" != true ]] && [[ "$prefix" != "$HOME"* ]] && [[ "$prefix" != /tmp/* ]]; then
         warn "Installing outside of home directory: $prefix"
         warn "This will remove $prefix/lib/ and $prefix/smolvm if they exist."
         if [ -t 0 ]; then
@@ -555,9 +564,12 @@ install_smolvm() {
         exit 1
     fi
 
-    # Install agent-rootfs to data directory
+    # Install agent-rootfs to data directory. A system install keeps it beside
+    # the binary, where the launcher script finds it, so it stays readable.
     local data_dir
-    if [[ "$(uname -s)" == "Darwin" ]]; then
+    if [[ "$SYSTEM_INSTALL" == true ]]; then
+        data_dir="$prefix"
+    elif [[ "$(uname -s)" == "Darwin" ]]; then
         data_dir="$HOME/Library/Application Support/smolvm"
     else
         data_dir="${XDG_DATA_HOME:-$HOME/.local/share}/smolvm"
@@ -605,6 +617,29 @@ install_smolvm() {
                 warn "It will run (quarantine was cleared), but Gatekeeper may warn on first launch."
             fi
         fi
+    fi
+
+    # Everything a dropped VM uid loads must be readable and traversable by it.
+    # Only root may change it: the agent-rootfs holds the init every VM boots.
+    if [[ "$SYSTEM_INSTALL" == true ]]; then
+        chown -R 0:0 "$prefix"
+        chmod -R a+rX "$prefix"
+        # An earlier install under root's home would otherwise shadow this one
+        # through its ~/.local/bin symlink.
+        local old_link
+        for old_link in "$HOME/.local/bin/smolvm" "$HOME/.local/bin/smol"; do
+            if [[ -L "$old_link" && "$(readlink "$old_link")" == "$HOME/.smolvm/"* ]]; then
+                ln -sf "$prefix/$(basename "$old_link")" "$old_link"
+                info "Pointed $old_link at the system install"
+            fi
+        done
+    fi
+
+    # The Docker Engine API is opt-in: `smolvm engine` selects the `smol` Docker
+    # context, which would redirect a user's existing docker CLI, so an install
+    # or upgrade never runs it. It only says how.
+    if [[ "$SYSTEM_INSTALL" != true ]] && "$prefix/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
+        info "To run docker, Compose and Testcontainers on smolvm, run 'smolvm engine' (it switches your Docker context to 'smol')."
     fi
 
     # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
@@ -669,6 +704,9 @@ modify_path() {
 
 # Uninstall smolvm
 uninstall_smolvm() {
+    if [[ -x "$1/smolvm" ]]; then
+        "$1/smolvm" engine unregister >/dev/null 2>&1 || true
+    fi
     local prefix="$1"
 
     info "Uninstalling smolvm..."
@@ -786,6 +824,7 @@ parse_args() {
                 ;;
             --prefix)
                 INSTALL_PREFIX="$2"
+                PREFIX_SET=true
                 shift 2
                 ;;
             --no-modify-path)
@@ -812,6 +851,13 @@ parse_args() {
 # Main
 main() {
     parse_args "$@"
+
+    if [[ "$(uname -s)" == "Linux" && "$(id -u)" == "0" && "$PREFIX_SET" == false ]]; then
+        SYSTEM_INSTALL=true
+        INSTALL_PREFIX="/opt/smolvm"
+        BIN_DIR="/usr/local/bin"
+        MODIFY_PATH=false
+    fi
 
     echo ""
     echo -e "${BOLD}smolvm installer${NC}"

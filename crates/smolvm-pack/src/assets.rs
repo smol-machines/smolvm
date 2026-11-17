@@ -243,10 +243,18 @@ fn digest_to_filename(digest: &str) -> Result<String> {
 /// Level 19 was ~100x slower for only ~10% better compression.
 pub const ZSTD_LEVEL: i32 = 3;
 
-fn compression_permit(cache: &Path) -> Result<File> {
+/// zstd workers one asset compressor uses at most.
+const MAX_COMPRESSION_WORKERS: usize = 4;
+
+/// How long the waiting compressor sleeps between looks for a free slot.
+const COMPRESSION_SLOT_POLL: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Admission to one of `slots` asset compressors per cache root, shared with
+/// every process using that cache. Released when the file is closed.
+fn compression_permit(cache: &Path, slots: usize) -> Result<File> {
     fs::create_dir_all(cache)?;
-    // Never unlink this file: API exports run in separate CLI processes and
-    // must lock the same inode. Closing the handle releases admission on errors
+    // Never unlink these files: API exports run in separate CLI processes and
+    // must lock the same inodes. Closing the handle releases admission on errors
     // and process exit as well as success.
     let mut options = fs::OpenOptions::new();
     options.create(true).write(true).truncate(false);
@@ -255,9 +263,36 @@ fn compression_permit(cache: &Path) -> Result<File> {
         use std::os::unix::fs::OpenOptionsExt;
         options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
     }
-    let file = options.open(cache.join("asset-compression.lock"))?;
-    crate::extract::lock_file_exclusive(&file)?;
-    Ok(file)
+    // The first slot keeps the single lock's name, so a process of an older
+    // release still shares admission with this one.
+    let slot_path = |slot: usize| match slot {
+        0 => cache.join("asset-compression.lock"),
+        n => cache.join(format!("asset-compression.{n}.lock")),
+    };
+    let try_slots = || -> Result<Option<File>> {
+        for slot in 0..slots.max(1) {
+            let file = options.open(slot_path(slot))?;
+            match file.try_lock() {
+                Ok(()) => return Ok(Some(file)),
+                Err(fs::TryLockError::WouldBlock) => {}
+                Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+        Ok(None)
+    };
+    if let Some(file) = try_slots()? {
+        return Ok(file);
+    }
+    // Every slot is taken. Waiters queue on this lock in the kernel, and only
+    // its holder looks for the next slot to come free.
+    let waiters = options.open(cache.join("asset-compression.wait.lock"))?;
+    crate::extract::lock_file_exclusive(&waiters)?;
+    loop {
+        if let Some(file) = try_slots()? {
+            return Ok(file);
+        }
+        std::thread::sleep(COMPRESSION_SLOT_POLL);
+    }
 }
 
 fn compression_workers(parallelism: usize) -> u32 {
@@ -265,22 +300,262 @@ fn compression_workers(parallelism: usize) -> u32 {
     if parallelism <= 1 {
         0
     } else {
-        parallelism.min(4) as u32
+        parallelism.min(MAX_COMPRESSION_WORKERS) as u32
+    }
+}
+
+/// How many asset compressors may run at once: as many as keep all their
+/// workers within the host's CPUs, and always one.
+fn compression_slots(parallelism: usize) -> usize {
+    (parallelism / MAX_COMPRESSION_WORKERS).max(1)
+}
+
+/// Content digest, `sha256:<hex>`, of the agent rootfs at `rootfs_dir`: every
+/// entry's path, type and permission bits, a regular file's bytes and a
+/// symlink's target, in sorted order. Owners and times are left out, so the
+/// tree a checkpoint's `agent-rootfs.tar` unpacks to has the digest of the tree
+/// it was packed from, and the host's per-boot ready markers are skipped as the
+/// tar skips them. This names the userland a guest booted with: a checkpoint
+/// records it and a restore boots the rootfs with that digest, since the
+/// captured processes keep that userland mapped.
+///
+/// A symlink counts with mode `0o777` whatever its own bits: Linux gives every
+/// symlink those and ignores them, while macOS keeps the bits it was created
+/// with, so a tree packed on a Mac and unpacked on Linux would otherwise never
+/// have the digest the Mac recorded.
+pub fn agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    rootfs_digest(rootfs_dir, false)
+}
+
+/// [`agent_rootfs_digest`] as smolvm 1.34.3 and older computed it, counting a
+/// symlink's own mode bits. On Linux it is always equal to the current digest;
+/// on macOS it is the digest machines started there before the change recorded.
+pub fn legacy_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    rootfs_digest(rootfs_dir, true)
+}
+
+/// Mode every symlink counts with in [`agent_rootfs_digest`].
+#[cfg(unix)]
+const SYMLINK_DIGEST_MODE: u32 = 0o777;
+
+fn rootfs_digest(rootfs_dir: &Path, symlink_own_mode: bool) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    fn walk(
+        dir: &Path,
+        relative: &Path,
+        top: bool,
+        symlink_own_mode: bool,
+        hash: &mut Sha256,
+    ) -> std::io::Result<()> {
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if top
+                && name
+                    .to_string_lossy()
+                    .starts_with(smolvm_protocol::AGENT_READY_MARKER)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = relative.join(&name);
+            hash.update(relative.to_string_lossy().as_bytes());
+            hash.update([0]);
+            let kind = metadata.file_type();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let mode = if kind.is_symlink() && !symlink_own_mode {
+                    SYMLINK_DIGEST_MODE
+                } else {
+                    metadata.mode() & 0o7777
+                };
+                hash.update(mode.to_le_bytes());
+            }
+            #[cfg(not(unix))]
+            let _ = symlink_own_mode;
+            if kind.is_symlink() {
+                hash.update(b"l");
+                hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if kind.is_dir() {
+                hash.update(b"d");
+                walk(&path, &relative, false, symlink_own_mode, hash)?;
+            } else if kind.is_file() {
+                hash.update(b"f");
+                hash.update(metadata.len().to_le_bytes());
+                let mut file = File::open(&path)?;
+                let mut content = Sha256::new();
+                std::io::copy(&mut file, &mut content)?;
+                hash.update(content.finalize());
+            } else {
+                // a device node or fifo in the tree: its kind and name count
+                hash.update(b"o");
+            }
+            hash.update([0]);
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"smolvm-agent-rootfs-v1\0");
+    walk(rootfs_dir, Path::new(""), true, symlink_own_mode, &mut hash)?;
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+/// [`agent_rootfs_digest`], remembered beside the rootfs tar cache under the
+/// tree's metadata hash, so a tree that has not changed is not read again: a
+/// launch asks for the digest of the rootfs it boots, and reading a rootfs is
+/// a few hundred milliseconds. Any change to the tree misses the cache.
+pub fn cached_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    let cached = rootfs_metadata_hash(rootfs_dir).and_then(|hash| {
+        let dir = dirs::cache_dir()?
+            .join("smolvm")
+            // v2: symlinks count with one fixed mode (see agent_rootfs_digest),
+            // so a value cached before that change may be wrong on macOS.
+            .join("agent-rootfs-digests-v2");
+        fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(hash))
+    });
+    if let Some(path) = &cached {
+        if let Ok(digest) = fs::read_to_string(path) {
+            let digest = digest.trim();
+            if digest.len() == "sha256:".len() + 64 && digest.starts_with("sha256:") {
+                return Ok(digest.to_string());
+            }
+        }
+    }
+    let digest = agent_rootfs_digest(rootfs_dir)?;
+    if let Some(path) = &cached {
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&temporary, &digest).is_ok() && fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+    Ok(digest)
+}
+
+/// A hash of every entry's path, type, size, mode, owner, inode and change
+/// time under `rootfs_dir`: any change to the tree, including a reinstall,
+/// gives a new value. `None` when the tree cannot be read.
+fn rootfs_metadata_hash(rootfs_dir: &Path) -> Option<String> {
+    use sha2::{Digest, Sha256};
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    fn walk(dir: &Path, relative: &Path, top: bool, hash: &mut Sha256) -> std::io::Result<()> {
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            // Skipped by the tar too: host-side readiness markers.
+            if top
+                && name
+                    .to_string_lossy()
+                    .starts_with(smolvm_protocol::AGENT_READY_MARKER)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = relative.join(&name);
+            hash.update(relative.to_string_lossy().as_bytes());
+            hash.update([0]);
+            #[cfg(unix)]
+            {
+                for value in [
+                    metadata.mode() as u64,
+                    metadata.uid() as u64,
+                    metadata.gid() as u64,
+                    metadata.size(),
+                    metadata.ino(),
+                    metadata.ctime() as u64,
+                    metadata.ctime_nsec() as u64,
+                    metadata.mtime() as u64,
+                    metadata.mtime_nsec() as u64,
+                ] {
+                    hash.update(value.to_le_bytes());
+                }
+            }
+            #[cfg(not(unix))]
+            {
+                hash.update(metadata.len().to_le_bytes());
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        hash.update(since.as_nanos().to_le_bytes());
+                    }
+                }
+            }
+            if metadata.file_type().is_symlink() {
+                hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if metadata.is_dir() {
+                walk(&path, &relative, false, hash)?;
+            }
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"agent-rootfs-tar-v1\0");
+    walk(rootfs_dir, Path::new(""), true, &mut hash).ok()?;
+    Some(format!("{:x}", hash.finalize()))
+}
+
+/// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
+/// later packs can reuse it. The name is the tree's metadata hash, so any
+/// change to the tree gives a new name. `None` when the tree cannot be read.
+fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
+    let hash = rootfs_metadata_hash(rootfs_dir)?;
+    let cache = dirs::cache_dir()?.join("smolvm").join("agent-rootfs-tars");
+    fs::create_dir_all(&cache).ok()?;
+    Some(cache.join(format!("{hash}.tar")))
+}
+
+/// Keep the tar just built at `built` as `cached` for later packs, and drop
+/// all but the newest few. Best effort: a failure only costs a rebuild.
+fn publish_agent_rootfs_tar(built: &Path, cached: &Path) {
+    const KEEP: usize = 4;
+    let Some(dir) = cached.parent() else {
+        return;
+    };
+    let temporary = dir.join(format!(
+        ".{}.{}",
+        cached.file_name().unwrap_or_default().to_string_lossy(),
+        std::process::id()
+    ));
+    let _ = fs::remove_file(&temporary);
+    if fs::hard_link(built, &temporary).is_err() || fs::rename(&temporary, cached).is_err() {
+        let _ = fs::remove_file(&temporary);
+        return;
+    }
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    let mut tars: Vec<(std::time::SystemTime, PathBuf)> = entries
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| entry.file_name().to_string_lossy().ends_with(".tar"))
+        .filter_map(|entry| Some((entry.metadata().ok()?.modified().ok()?, entry.path())))
+        .collect();
+    tars.sort_by_key(|tar| std::cmp::Reverse(tar.0));
+    for (_, path) in tars.into_iter().skip(KEEP) {
+        let _ = fs::remove_file(path);
     }
 }
 
 /// Find a pre-formatted disk template by filename.
 ///
 /// Searches in order:
-/// 1. `~/.smolvm/{filename}` (installed location)
-/// 2. Next to the current executable (development)
+/// 1. Directories registered with [`add_template_root`] (an embedder's bundle)
+/// 2. `~/.smolvm/{filename}` (installed location)
+/// 3. Next to the current executable (development)
 ///
 /// Each location is checked for the plain file first and then for a `.zst`
 /// sibling, which is expanded on demand by [`materialize_template`]. Releases
 /// ship only the compressed form; the plain file is still honored so existing
 /// installs and development trees keep working untouched.
 pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<PathBuf> = TEMPLATE_ROOTS
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default();
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".smolvm"));
     }
@@ -311,6 +586,21 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Directories searched for templates before the default locations.
+static TEMPLATE_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Also look for templates in `dir`, ahead of `~/.smolvm` and the executable's
+/// directory. An embedder (the Python or Node SDK) ships them beside its other
+/// assets; without them a Linux host with no reflink copies a whole image seed
+/// into every new machine instead of layering a qcow2 overlay on it.
+pub fn add_template_root(dir: PathBuf) {
+    if let Ok(mut roots) = TEMPLATE_ROOTS.lock() {
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    }
 }
 
 /// Expand `compressed` into a sparse file and return the expanded path.
@@ -426,10 +716,34 @@ pub const WORKSPACE_SEED_DIR: &str = "workspace-seed";
 /// Name of the workspace seed tar inside [`WORKSPACE_SEED_DIR`].
 pub const WORKSPACE_SEED_FILE: &str = "workspace.tar";
 
+/// A file packed with a few byte ranges replaced, while the file itself is
+/// only read.
+///
+/// This packs an immutable file the caller must not modify, such as a qcow2
+/// layer still backing a running machine, with a rewritten header and without
+/// copying it first.
+#[derive(Debug)]
+pub struct PatchedFile {
+    /// Relative path of the entry in the archive.
+    pub archive_path: String,
+    /// The open file whose bytes are packed. Holding it open keeps exactly
+    /// these bytes even if the file's path is replaced or removed meanwhile.
+    pub source: File,
+    /// Permission bits of the archive entry.
+    pub mode: u32,
+    /// `(offset, bytes)` written over the source's bytes in the archive.
+    pub patches: Vec<(u64, Vec<u8>)>,
+}
+
 /// Asset collector for gathering runtime components.
 pub struct AssetCollector {
     staging_dir: PathBuf,
     inventory: AssetInventory,
+    /// Link host assets into staging instead of copying them. Only for a
+    /// staging tree that is packed and then discarded unchanged.
+    link_host_assets: bool,
+    /// Files packed under `checkpoint/` from outside the staging tree.
+    patched_files: Vec<PatchedFile>,
 }
 
 impl AssetCollector {
@@ -453,7 +767,53 @@ impl AssetCollector {
                 overlay_logical_size: None,
                 workspace_seed: None,
             },
+            link_host_assets: false,
+            patched_files: Vec::new(),
         })
+    }
+
+    /// Pack `file` under `checkpoint/`, after the staged checkpoint files.
+    /// Its archive path must not also exist in the staging tree.
+    pub fn add_patched_file(&mut self, file: PatchedFile) -> Result<()> {
+        let path = Path::new(&file.archive_path);
+        let mut components = path.components();
+        if components.next() != Some(std::path::Component::Normal("checkpoint".as_ref()))
+            || !components.all(|c| matches!(c, std::path::Component::Normal(_)))
+            || file.archive_path.len() > 100
+            || fs::symlink_metadata(self.staging_dir.join(path)).is_ok()
+            || self
+                .patched_files
+                .iter()
+                .any(|other| other.archive_path == file.archive_path)
+        {
+            return Err(PackError::Tar(format!(
+                "invalid patched archive path {}",
+                file.archive_path
+            )));
+        }
+        self.patched_files.push(file);
+        Ok(())
+    }
+
+    /// Hard-link the libraries and storage template into staging, and reuse
+    /// an agent rootfs tar built earlier from the same tree, instead of
+    /// writing fresh copies. Use only when the staging tree is packed and then
+    /// discarded: nothing may modify a staged file in place.
+    pub fn with_linked_host_assets(mut self) -> Self {
+        self.link_host_assets = true;
+        self
+    }
+
+    /// Stage `src` at `dst`: a hard link when enabled and possible, else a copy.
+    /// Like the copy, the link is to the file a symlink names.
+    fn stage_host_file(&self, src: &Path, dst: &Path) -> Result<()> {
+        if self.link_host_assets
+            && fs::canonicalize(src).is_ok_and(|file| fs::hard_link(file, dst).is_ok())
+        {
+            return Ok(());
+        }
+        fs::copy(src, dst)?;
+        Ok(())
     }
 
     /// Get the staging directory path.
@@ -497,7 +857,7 @@ impl AssetCollector {
             }
 
             let dst = self.staging_dir.join("lib").join(name);
-            fs::copy(&src, &dst)?;
+            self.stage_host_file(&src, &dst)?;
 
             let metadata = fs::metadata(&dst)?;
             self.inventory.libraries.push(AssetEntry {
@@ -577,6 +937,22 @@ impl AssetCollector {
         }
 
         let tar_path = self.staging_dir.join("agent-rootfs.tar");
+        let cached = if self.link_host_assets {
+            agent_rootfs_tar_cache(rootfs_dir)
+        } else {
+            None
+        };
+        if cached
+            .as_ref()
+            .is_some_and(|cached| fs::hard_link(cached, &tar_path).is_ok())
+        {
+            let metadata = fs::metadata(&tar_path)?;
+            self.inventory.agent_rootfs = AssetEntry {
+                path: "agent-rootfs.tar".to_string(),
+                size: metadata.len(),
+            };
+            return Ok(());
+        }
         let tar_file = File::create(&tar_path)?;
         let mut tar_builder = tar::Builder::new(BufWriter::new(tar_file));
 
@@ -617,9 +993,17 @@ impl AssetCollector {
             }
         }
 
-        tar_builder
-            .finish()
-            .map_err(|e| PackError::Tar(e.to_string()))?;
+        let tar_file = tar_builder
+            .into_inner()
+            .map_err(|e| PackError::Tar(e.to_string()))?
+            .into_inner()
+            .map_err(|e| PackError::Io(e.into_error()))?;
+        if let Some(cached) = &cached {
+            // Later packs trust the cached tar as complete.
+            tar_file.sync_all()?;
+            publish_agent_rootfs_tar(&tar_path, cached);
+        }
+        drop(tar_file);
 
         let metadata = fs::metadata(&tar_path)?;
         self.inventory.agent_rootfs = AssetEntry {
@@ -729,7 +1113,12 @@ impl AssetCollector {
             // (multi-GiB) sparse file, and a plain fs::copy densifies it into its
             // full logical size of zeros on some Linux filesystems/mounts —
             // ballooning the staging dir and failing pack builds with ENOSPC.
-            crate::extract::sparse_copy(&existing, &template_path)?;
+            if !(self.link_host_assets
+                && fs::canonicalize(&existing)
+                    .is_ok_and(|file| fs::hard_link(file, &template_path).is_ok()))
+            {
+                crate::extract::sparse_copy(&existing, &template_path)?;
+            }
             let metadata = fs::metadata(&template_path)?;
             self.inventory.storage_template = Some(AssetEntry {
                 path: TEMPLATE_NAME.to_string(),
@@ -930,49 +1319,81 @@ impl AssetCollector {
     /// (two-file mode: libs are embedded in the stub binary instead).
     /// When false, everything is included (single-file mode).
     pub fn compress(&self, output: &Path, exclude_libs: bool) -> Result<u64> {
-        let output_file = self.compress_with(|| File::create(output), exclude_libs)?;
+        let output_file = self.compress_with(|| File::create(output), exclude_libs, None)?;
         Ok(output_file.metadata()?.len())
     }
 
     /// Compress into an owned writer so callers can checksum bytes as they are
     /// emitted instead of copying and rereading a multi-GiB archive.
     pub(crate) fn compress_to<W: Write>(&self, output: W, exclude_libs: bool) -> Result<W> {
-        self.compress_with(|| Ok(output), exclude_libs)
+        self.compress_with(|| Ok(output), exclude_libs, None)
+    }
+
+    pub(crate) fn compress_checkpoint_to<W: Write>(
+        &self,
+        output: W,
+        stream: &mut crate::checkpoint_stream::CheckpointStream<'_>,
+    ) -> Result<W> {
+        match fs::symlink_metadata(self.staging_dir.join("checkpoint/memory.bin")) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+            Ok(_) => {
+                return Err(PackError::Tar(
+                    "checkpoint RAM appears in both staging and stream".into(),
+                ))
+            }
+        }
+        self.compress_with(|| Ok(output), false, Some(stream))
     }
 
     fn compress_with<W: Write>(
         &self,
         output: impl FnOnce() -> std::io::Result<W>,
         exclude_libs: bool,
+        stream: Option<&mut crate::checkpoint_stream::CheckpointStream<'_>>,
     ) -> Result<W> {
-        // One asset compressor per cache root, including API subprocesses.
+        // A bounded number of asset compressors per cache root, including API
+        // subprocesses, so their workers together stay within the host's CPUs.
         // The permit also covers finish(), which drains outstanding zstd jobs.
+        let parallelism =
+            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
         let cache = dirs::cache_dir()
             .ok_or_else(|| PackError::Compression("cannot locate compression cache".into()))?
             .join("smolvm");
-        let _permit = compression_permit(&cache).map_err(|error| {
-            PackError::Compression(format!(
-                "acquire compression admission at {}: {error}",
-                cache.display()
-            ))
-        })?;
+        let _permit =
+            compression_permit(&cache, compression_slots(parallelism)).map_err(|error| {
+                PackError::Compression(format!(
+                    "acquire compression admission at {}: {error}",
+                    cache.display()
+                ))
+            })?;
         let mut encoder = zstd::stream::Encoder::new(output()?, ZSTD_LEVEL)
             .map_err(|e| PackError::Compression(e.to_string()))?;
-        let workers = compression_workers(
-            std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get),
-        );
+        let workers = compression_workers(parallelism);
         if workers > 0 {
             encoder
                 .multithread(workers)
                 .map_err(|e| PackError::Compression(e.to_string()))?;
         }
         let mut tar_builder = tar::Builder::new(encoder);
+        // Put resume inputs before disks and portable runtime assets so local
+        // resume can stop decoding after the files it needs are extracted.
+        let checkpoint_dir = self.staging_dir.join("checkpoint");
+        let streamed = stream.is_some();
+        if streamed && checkpoint_dir.is_dir() {
+            tar_builder
+                .append_dir("checkpoint", &checkpoint_dir)
+                .map_err(|error| PackError::Tar(error.to_string()))?;
+        }
+        if let Some(stream) = stream {
+            stream.append(&mut tar_builder)?;
+        }
 
         // Sort entries for deterministic tar ordering (consistent checksums)
         let mut entries: Vec<_> = fs::read_dir(&self.staging_dir)?
             .filter_map(|e| e.ok())
             .collect();
-        entries.sort_by_key(|e| e.file_name());
+        entries.sort_by_key(|e| (e.file_name() != "checkpoint", e.file_name()));
 
         for entry in entries {
             let name = entry.file_name();
@@ -980,6 +1401,29 @@ impl AssetCollector {
                 continue; // libs go in the stub, not the sidecar
             }
             let path = entry.path();
+            if name == "checkpoint" && path.is_dir() {
+                if !streamed {
+                    tar_builder
+                        .append_dir("checkpoint", &path)
+                        .map_err(|error| PackError::Tar(error.to_string()))?;
+                }
+                let mut children = fs::read_dir(&path)?.collect::<std::io::Result<Vec<_>>>()?;
+                children.sort_by_key(|child| (child.file_name() == "disks", child.file_name()));
+                for child in children {
+                    let child_path = child.path();
+                    let child_name = Path::new("checkpoint").join(child.file_name());
+                    #[cfg(target_os = "macos")]
+                    append_macos_tree(&mut tar_builder, &child_path, &child_name)?;
+                    #[cfg(not(target_os = "macos"))]
+                    append_checkpoint_tree(&mut tar_builder, &child_path, &child_name)?;
+                }
+                let mut patched: Vec<_> = self.patched_files.iter().collect();
+                patched.sort_by(|a, b| a.archive_path.cmp(&b.archive_path));
+                for file in patched {
+                    append_patched_file(tar_builder.get_mut(), file)?;
+                }
+                continue;
+            }
             #[cfg(target_os = "macos")]
             append_macos_tree(&mut tar_builder, &path, Path::new(&name))?;
             #[cfg(not(target_os = "macos"))]
@@ -1005,20 +1449,358 @@ impl AssetCollector {
     }
 }
 
+/// The data ranges of `file`, `len` bytes long, as `(offset, length)`.
+/// A filesystem without hole reporting gives one range for the whole file.
+#[cfg(unix)]
+fn data_ranges(file: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    use std::os::unix::io::AsRawFd;
+    let seek = |offset: u64, whence| -> std::io::Result<Option<u64>> {
+        let offset = i64::try_from(offset)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "offset"))?;
+        // Safety: the descriptor is a live regular file borrowed for the call.
+        match unsafe { libc::lseek(file.as_raw_fd(), offset as libc::off_t, whence) } {
+            -1 => match std::io::Error::last_os_error() {
+                error if error.raw_os_error() == Some(libc::ENXIO) => Ok(None),
+                error => Err(error),
+            },
+            found => Ok(Some(found as u64)),
+        }
+    };
+    let mut ranges = Vec::new();
+    let mut offset = 0;
+    while offset < len {
+        let start = match seek(offset, libc::SEEK_DATA) {
+            Ok(Some(start)) if start >= offset => start.min(len),
+            Ok(Some(_)) => {
+                return Err(std::io::Error::other("SEEK_DATA went backwards"));
+            }
+            Ok(None) => break,
+            // No hole reporting: treat the rest of the file as data.
+            Err(error) if error.raw_os_error() == Some(libc::EINVAL) && ranges.is_empty() => {
+                return Ok(vec![(0, len)]);
+            }
+            Err(error) => return Err(error),
+        };
+        if start >= len {
+            break;
+        }
+        let end = seek(start, libc::SEEK_HOLE)?.unwrap_or(len).min(len);
+        if end <= start {
+            return Err(std::io::Error::other("SEEK_HOLE did not advance"));
+        }
+        ranges.push((start, end - start));
+        offset = end;
+    }
+    Ok(ranges)
+}
+
+#[cfg(not(unix))]
+fn data_ranges(_file: &File, len: u64) -> std::io::Result<Vec<(u64, u64)>> {
+    Ok(if len == 0 { Vec::new() } else { vec![(0, len)] })
+}
+
+/// Sorted, disjoint ranges covering `ranges` and every patch, 512-aligned
+/// around patches so they stay sector-aligned.
+fn ranges_with_patches(
+    mut ranges: Vec<(u64, u64)>,
+    patches: &[(u64, Vec<u8>)],
+    len: u64,
+) -> std::io::Result<Vec<(u64, u64)>> {
+    for (offset, bytes) in patches {
+        let end = offset
+            .checked_add(bytes.len() as u64)
+            .filter(|end| *end <= len && !bytes.is_empty())
+            .ok_or_else(|| std::io::Error::other("patch lies outside the file"))?;
+        let start = offset - offset % 512;
+        let end = end.div_ceil(512).saturating_mul(512).min(len);
+        ranges.push((start, end - start));
+    }
+    ranges.sort_unstable();
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(ranges.len());
+    for (offset, length) in ranges {
+        match merged.last_mut() {
+            Some((last, last_len)) if offset <= *last + *last_len => {
+                *last_len = (*last_len).max(offset + length - *last);
+            }
+            _ => merged.push((offset, length)),
+        }
+    }
+    Ok(merged)
+}
+
+/// Write a tar header for `path`: a regular entry when `ranges` is the whole
+/// file, else an old-GNU sparse entry listing `ranges`, whose bytes follow
+/// back to back.
+pub(crate) fn write_sparse_header<W: Write>(
+    archive: &mut W,
+    mut header: tar::Header,
+    logical: u64,
+    ranges: &[(u64, u64)],
+) -> std::io::Result<u64> {
+    let stored: u64 = ranges.iter().map(|(_, len)| *len).sum();
+    header.set_size(stored);
+    if ranges == [(0, logical)] || logical == 0 {
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_cksum();
+        archive.write_all(header.as_bytes())?;
+        return Ok(stored);
+    }
+    let mut map = ranges.to_vec();
+    // The terminal entry gives the logical size even when it ends in a hole.
+    map.push((logical, 0));
+    header.set_entry_type(tar::EntryType::GNUSparse);
+    let gnu = header
+        .as_gnu_mut()
+        .ok_or_else(|| std::io::Error::other("sparse entries need a GNU header"))?;
+    gnu.set_real_size(logical);
+    for ((offset, len), slot) in map.iter().zip(gnu.sparse.iter_mut()) {
+        slot.set_offset(*offset);
+        slot.set_length(*len);
+    }
+    let slots = gnu.sparse.len();
+    gnu.set_is_extended(map.len() > slots);
+    header.set_cksum();
+    archive.write_all(header.as_bytes())?;
+    let rest = &map[map.len().min(slots)..];
+    for (index, chunk) in rest.chunks(21).enumerate() {
+        let mut extra = tar::GnuExtSparseHeader::new();
+        for ((offset, len), slot) in chunk.iter().zip(extra.sparse_mut().iter_mut()) {
+            slot.set_offset(*offset);
+            slot.set_length(*len);
+        }
+        extra.set_is_extended((index + 1) * 21 < rest.len());
+        archive.write_all(extra.as_bytes())?;
+    }
+    Ok(stored)
+}
+
+/// Append `file` with its patches applied, keeping its holes.
+fn append_patched_file<W: Write>(archive: &mut W, file: &PatchedFile) -> Result<()> {
+    append_file_entry(
+        archive,
+        &file.archive_path,
+        &file.source,
+        file.mode,
+        &file.patches,
+        false,
+    )
+}
+
+/// Granularity of a checkpoint archive's RAM map. RAM is serialized as
+/// whole aligned blocks of the logical image, each either data or a hole, so
+/// however fragmented the source's extents are, the archive lists a few large
+/// runs and a restore writes them with a few large writes.
+pub(crate) const RAM_BLOCK: u64 = 64 * 1024;
+
+/// `ranges` widened to whole `block`-aligned blocks within `logical` bytes,
+/// with overlapping and adjacent blocks merged.
+pub(crate) fn align_ranges(ranges: &[(u64, u64)], block: u64, logical: u64) -> Vec<(u64, u64)> {
+    let mut aligned: Vec<(u64, u64)> = Vec::new();
+    for &(offset, len) in ranges.iter().filter(|(_, len)| *len > 0) {
+        let start = offset - offset % block;
+        let end = (offset + len)
+            .div_ceil(block)
+            .saturating_mul(block)
+            .min(logical);
+        match aligned.last_mut() {
+            Some((last, last_len)) if start <= *last + *last_len => {
+                *last_len = end.max(*last + *last_len) - *last;
+            }
+            _ => aligned.push((start, end - start)),
+        }
+    }
+    aligned
+}
+
+/// The [`RAM_BLOCK`]-aligned blocks of `file` covering `ranges` that are not
+/// entirely zero, with adjacent blocks merged.
+fn nonzero_ranges(
+    file: &File,
+    ranges: &[(u64, u64)],
+    logical: u64,
+) -> std::io::Result<Vec<(u64, u64)>> {
+    let mut found: Vec<(u64, u64)> = Vec::new();
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for (start, len) in align_ranges(ranges, RAM_BLOCK, logical) {
+        let end = start + len;
+        let mut position = start;
+        while position < end {
+            let count = (end - position).min(buffer.len() as u64) as usize;
+            read_exact_at(file, &mut buffer[..count], position)?;
+            for (index, bytes) in buffer[..count].chunks(RAM_BLOCK as usize).enumerate() {
+                if crate::is_zero_filled(bytes) {
+                    continue;
+                }
+                let block = position + index as u64 * RAM_BLOCK;
+                let block_end = block + bytes.len() as u64;
+                match found.last_mut() {
+                    Some((last, last_len)) if *last + *last_len == block => {
+                        *last_len = block_end - *last;
+                    }
+                    _ => found.push((block, block_end - block)),
+                }
+            }
+            position += count as u64;
+        }
+    }
+    Ok(found)
+}
+
+fn read_exact_at(file: &File, buffer: &mut [u8], offset: u64) -> std::io::Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        file.read_exact_at(buffer, offset)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = file;
+        file.seek(SeekFrom::Start(offset))?;
+        file.read_exact(buffer)
+    }
+}
+
+/// Append the regular file `source` as `archive_path`: a sparse entry of its
+/// data extents, or with `ram_blocks` of its [`RAM_BLOCK`]-aligned blocks that
+/// are not entirely zero, with `patches` written over its bytes. Reads are large and sequential so a cold
+/// file streams at the device's rate. `source` itself is only read.
+fn append_file_entry<W: Write>(
+    archive: &mut W,
+    archive_path: &str,
+    source: &File,
+    mode: u32,
+    patches: &[(u64, Vec<u8>)],
+    ram_blocks: bool,
+) -> Result<()> {
+    let before = source.metadata()?;
+    if !before.is_file() {
+        return Err(PackError::Tar(format!(
+            "{archive_path} is not a regular file"
+        )));
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::io::AsRawFd;
+        // Safety: advisory only, on a live descriptor.
+        unsafe { libc::posix_fadvise(source.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL) };
+    }
+    let logical = before.len();
+    let mut ranges = data_ranges(source, logical)?;
+    if ram_blocks {
+        ranges = nonzero_ranges(source, &ranges, logical)?;
+    }
+    let ranges = ranges_with_patches(ranges, patches, logical)?;
+    let mut header = tar::Header::new_gnu();
+    header
+        .set_path(archive_path)
+        .map_err(|error| PackError::Tar(error.to_string()))?;
+    header.set_mode(mode);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        header.set_uid(u64::from(before.uid()));
+        header.set_gid(u64::from(before.gid()));
+    }
+    header.set_mtime(
+        before
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |time| time.as_secs()),
+    );
+    let stored = write_sparse_header(archive, header, logical, &ranges)?;
+    let mut buffer = vec![0_u8; 1024 * 1024];
+    for &(offset, len) in &ranges {
+        let mut position = offset;
+        let end = offset + len;
+        while position < end {
+            let chunk = (end - position).min(buffer.len() as u64) as usize;
+            let bytes = &mut buffer[..chunk];
+            read_exact_at(source, bytes, position)?;
+            for (patch_offset, patch) in patches {
+                let from = (*patch_offset).max(position);
+                let to = (patch_offset + patch.len() as u64).min(position + chunk as u64);
+                if from < to {
+                    bytes[(from - position) as usize..(to - position) as usize].copy_from_slice(
+                        &patch[(from - patch_offset) as usize..(to - patch_offset) as usize],
+                    );
+                }
+            }
+            archive.write_all(bytes)?;
+            position += chunk as u64;
+        }
+    }
+    let padding = (512 - stored % 512) % 512;
+    archive.write_all(&[0; 512][..padding as usize])?;
+    let after = source.metadata()?;
+    if after.len() != logical || after.modified().ok() != before.modified().ok() {
+        return Err(PackError::Tar(format!(
+            "{archive_path} changed while it was packed"
+        )));
+    }
+    Ok(())
+}
+
+/// Append the staged checkpoint tree at `path` as `name`: directories in
+/// sorted order, files through [`append_file_entry`], with all-zero RAM left
+/// out as holes.
+#[cfg(not(target_os = "macos"))]
+fn append_checkpoint_tree<W: Write>(
+    builder: &mut tar::Builder<W>,
+    path: &Path,
+    name: &Path,
+) -> Result<()> {
+    let metadata = fs::symlink_metadata(path)?;
+    // Tar paths use `/` on every host; a Windows `Path` joins with `\`.
+    let archive_path = name
+        .to_str()
+        .ok_or_else(|| PackError::Tar(format!("{} is not UTF-8", name.display())))?
+        .replace('\\', "/");
+    let archive_path = archive_path.as_str();
+    if metadata.is_dir() {
+        builder
+            .append_dir(name, path)
+            .map_err(|error| PackError::Tar(error.to_string()))?;
+        let mut children = fs::read_dir(path)?.collect::<std::io::Result<Vec<_>>>()?;
+        children.sort_by_key(|child| child.file_name());
+        for child in children {
+            append_checkpoint_tree(builder, &child.path(), &name.join(child.file_name()))?;
+        }
+        return Ok(());
+    }
+    if !metadata.is_file() || archive_path.len() > 100 {
+        return builder
+            .append_path_with_name(path, name)
+            .map_err(|error| PackError::Tar(error.to_string()));
+    }
+    #[cfg(unix)]
+    let mode = {
+        use std::os::unix::fs::PermissionsExt;
+        metadata.permissions().mode() & 0o7777
+    };
+    #[cfg(not(unix))]
+    let mode = 0o644;
+    append_file_entry(
+        builder.get_mut(),
+        archive_path,
+        &File::open(path)?,
+        mode,
+        &[],
+        archive_path == "checkpoint/memory.bin",
+    )
+}
+
 // =============================================================================
 // Sparse-aware overlay copy
 // =============================================================================
 
 /// Copy a sparse overlay disk to `dst`, stripping trailing zeros.
 ///
-/// Scans backwards from the end of the source to find the last non-zero byte,
-/// then copies only bytes `[0, last_nonzero+1]` to `dst`, skipping zero
-/// chunks in the forward pass.
-///
-/// `SEEK_DATA`/`SEEK_HOLE` is avoided because APFS reports zero-fill extents
-/// (efficiently stored but containing zeros) as "data", making lseek-based
-/// hole detection return the full file size even when 90%+ is zeros.
-/// Content scanning works correctly on both APFS and Linux ext4/xfs.
+/// Only the source's data ranges are read. Holes read as zeros, and a VM disk
+/// is almost all hole, so a 20 GiB disk with a few MiB written reads a few MiB
+/// instead of 20 GiB. A data range can still hold zeros (APFS reports written
+/// zeros as data), so each range is scanned and its zero chunks stay holes in
+/// `dst`. Trailing zeros are stripped from the end.
 ///
 /// Returns the original full (logical) size so the caller can record it for
 /// the extraction side to restore the sparse skeleton via `ftruncate`.
@@ -1026,11 +1808,10 @@ impl AssetCollector {
 fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
     let mut src_file = File::open(src)?;
     let logical_size = src_file.metadata()?.len();
+    let ranges = data_ranges(&src_file, logical_size)?;
 
     // Scan backwards to find the last non-zero byte (= safe truncation point).
-    // On APFS, zero-fill regions are served from page cache without disk I/O,
-    // so even scanning 8+ GiB of trailing zeros takes only ~100–200 ms.
-    let truncated_size = find_last_data_byte(&mut src_file, logical_size)?;
+    let truncated_size = find_last_data_byte(&mut src_file, &ranges)?;
 
     // Create destination as a sparse skeleton; keep the handle for writing.
     let mut dst_file = File::create(dst)?;
@@ -1043,28 +1824,26 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
     crate::extract::mark_file_sparse(&dst_file)?;
     dst_file.set_len(truncated_size)?;
 
-    if truncated_size == 0 {
-        return Ok((logical_size, 0));
-    }
-
-    // Forward copy: read [0, truncated_size) in 512 KiB chunks,
-    // writing only non-zero chunks (zero chunks remain as holes).
-    src_file.seek(SeekFrom::Start(0))?;
+    // Forward copy of each data range below the truncation point, in 512 KiB
+    // chunks, writing only non-zero chunks (zero chunks remain as holes).
     let mut buf = vec![0u8; 512 * 1024];
-    let mut offset: u64 = 0;
-
-    while offset < truncated_size {
-        let to_read = (truncated_size - offset).min(buf.len() as u64) as usize;
-        let n = src_file.read(&mut buf[..to_read])?;
-        if n == 0 {
-            break;
+    for &(start, len) in &ranges {
+        let end = (start + len).min(truncated_size);
+        let mut offset = start;
+        src_file.seek(SeekFrom::Start(offset))?;
+        while offset < end {
+            let to_read = (end - offset).min(buf.len() as u64) as usize;
+            let n = src_file.read(&mut buf[..to_read])?;
+            if n == 0 {
+                break;
+            }
+            let chunk = &buf[..n];
+            if chunk.iter().any(|&b| b != 0) {
+                dst_file.seek(SeekFrom::Start(offset))?;
+                dst_file.write_all(chunk)?;
+            }
+            offset += n as u64;
         }
-        let chunk = &buf[..n];
-        if chunk.iter().any(|&b| b != 0) {
-            dst_file.seek(SeekFrom::Start(offset))?;
-            dst_file.write_all(chunk)?;
-        }
-        offset += n as u64;
     }
 
     Ok((logical_size, truncated_size))
@@ -1072,35 +1851,33 @@ fn sparse_copy_overlay(src: &Path, dst: &Path) -> std::io::Result<(u64, u64)> {
 
 /// Find the truncation point: offset of the last non-zero byte + 1.
 ///
-/// Reads the file backwards in 1 MiB chunks until a non-zero byte is found.
-/// Returns 0 if the entire file is zeros.
-fn find_last_data_byte(file: &mut File, logical_size: u64) -> std::io::Result<u64> {
-    if logical_size == 0 {
-        return Ok(0);
-    }
-
+/// Reads `ranges` (sorted `(offset, length)` data ranges) backwards in 1 MiB
+/// chunks until a non-zero byte is found. Returns 0 if every range is zeros.
+fn find_last_data_byte(file: &mut File, ranges: &[(u64, u64)]) -> std::io::Result<u64> {
     const CHUNK: u64 = 1024 * 1024; // 1 MiB scan chunk
     let mut buf = vec![0u8; CHUNK as usize];
-    let mut pos = logical_size;
 
-    while pos > 0 {
-        let chunk_start = pos.saturating_sub(CHUNK);
-        let chunk_size = (pos - chunk_start) as usize;
+    for &(start, len) in ranges.iter().rev() {
+        let mut pos = start + len;
+        while pos > start {
+            let chunk_start = pos.saturating_sub(CHUNK).max(start);
+            let chunk_size = (pos - chunk_start) as usize;
 
-        file.seek(SeekFrom::Start(chunk_start))?;
-        let n = file.read(&mut buf[..chunk_size])?;
-        if n == 0 {
-            break;
-        }
-
-        // Scan backwards for the last non-zero byte in this chunk.
-        for i in (0..n).rev() {
-            if buf[i] != 0 {
-                return Ok(chunk_start + i as u64 + 1);
+            file.seek(SeekFrom::Start(chunk_start))?;
+            let n = file.read(&mut buf[..chunk_size])?;
+            if n == 0 {
+                break;
             }
-        }
 
-        pos = chunk_start;
+            // Scan backwards for the last non-zero byte in this chunk.
+            for i in (0..n).rev() {
+                if buf[i] != 0 {
+                    return Ok(chunk_start + i as u64 + 1);
+                }
+            }
+
+            pos = chunk_start;
+        }
     }
 
     Ok(0) // Entire file is zeros
@@ -1198,6 +1975,19 @@ pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
 mod tests {
     use super::*;
 
+    // An embedder's registered directory is searched first, so an SDK that
+    // ships templates beside its assets gets them without touching ~/.smolvm.
+    #[test]
+    fn a_registered_template_root_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "registered-root-test-template.ext4";
+        std::fs::write(dir.path().join(name), b"template").unwrap();
+        assert_eq!(find_existing_template(name), None);
+        add_template_root(dir.path().to_path_buf());
+        add_template_root(dir.path().to_path_buf());
+        assert_eq!(find_existing_template(name), Some(dir.path().join(name)));
+    }
+
     #[test]
     fn digest_to_filename_rejects_path_traversal() {
         // A valid hex digest is accepted.
@@ -1224,7 +2014,7 @@ mod tests {
         let temp = tempfile::NamedTempFile::new().unwrap();
         fs::write(temp.path(), vec![0u8; 4096]).unwrap();
         let mut file = File::open(temp.path()).unwrap();
-        assert_eq!(find_last_data_byte(&mut file, 4096).unwrap(), 0);
+        assert_eq!(find_last_data_byte(&mut file, &[(0, 4096)]).unwrap(), 0);
     }
 
     #[test]
@@ -1234,7 +2024,7 @@ mod tests {
         data[99] = 0xAB; // non-zero at 99, then 4000 trailing zeros
         fs::write(temp.path(), &data).unwrap();
         let mut file = File::open(temp.path()).unwrap();
-        assert_eq!(find_last_data_byte(&mut file, 4100).unwrap(), 100);
+        assert_eq!(find_last_data_byte(&mut file, &[(0, 4100)]).unwrap(), 100);
     }
 
     #[test]
@@ -1245,7 +2035,7 @@ mod tests {
         data[1023] = 1;
         fs::write(temp.path(), &data).unwrap();
         let mut file = File::open(temp.path()).unwrap();
-        assert_eq!(find_last_data_byte(&mut file, 1024).unwrap(), 1024);
+        assert_eq!(find_last_data_byte(&mut file, &[(0, 1024)]).unwrap(), 1024);
     }
 
     #[test]
@@ -1283,6 +2073,28 @@ mod tests {
         assert_eq!(dst_data[0], 0x01);
         assert_eq!(dst_data[511], 0xFF);
         assert_eq!(dst_data[256], 0x00); // interior zero is preserved
+    }
+
+    #[test]
+    fn test_sparse_copy_overlay_keeps_data_between_holes() {
+        // Data separated by large holes, the shape of a VM disk: only the data
+        // ranges are read, and every written byte must still reach the copy.
+        let temp_dir = tempfile::tempdir().unwrap();
+        let src = temp_dir.path().join("src.raw");
+        let dst = temp_dir.path().join("dst.raw");
+        let mut file = File::create(&src).unwrap();
+        file.set_len(64 << 20).unwrap();
+        for (offset, byte) in [(4096, 0x11), (24 << 20, 0x22), ((40 << 20) + 7, 0x33)] {
+            file.seek(SeekFrom::Start(offset)).unwrap();
+            file.write_all(&[byte; 1000]).unwrap();
+        }
+        drop(file);
+
+        let (logical, truncated) = sparse_copy_overlay(&src, &dst).unwrap();
+        assert_eq!(logical, 64 << 20);
+        assert_eq!(truncated, (40 << 20) + 7 + 1000);
+        let source = fs::read(&src).unwrap();
+        assert_eq!(fs::read(&dst).unwrap(), source[..truncated as usize]);
     }
 
     #[test]
@@ -1336,6 +2148,103 @@ mod tests {
         // lib/ is only created when collect_libraries() is called
         assert!(!staging.join("lib").exists());
         assert!(staging.join("layers").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_symlinks_own_mode_does_not_change_the_rootfs_digest() {
+        // macOS keeps a symlink's mode bits and Linux reports 0o777 for every
+        // one, so a tree packed on a Mac and unpacked on Linux must keep its
+        // digest. The legacy digest still counts them, for machines that
+        // recorded it.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/busybox"), b"busybox").unwrap();
+        std::os::unix::fs::symlink("busybox", root.join("bin/sh")).unwrap();
+        let set_link_mode = |mode: libc::mode_t| {
+            let path = CString::new(root.join("bin/sh").as_os_str().as_bytes()).unwrap();
+            let set = unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    mode,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        };
+        set_link_mode(0o777);
+        let linux_like = agent_rootfs_digest(&root).unwrap();
+        let legacy_linux_like = legacy_agent_rootfs_digest(&root).unwrap();
+        assert_eq!(
+            legacy_linux_like, linux_like,
+            "the formulas agree on a 0o777 symlink"
+        );
+        set_link_mode(0o700);
+        assert_eq!(agent_rootfs_digest(&root).unwrap(), linux_like);
+        assert_ne!(legacy_agent_rootfs_digest(&root).unwrap(), linux_like);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rootfs_digest_names_content_not_times_owners_or_markers() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let rootfs = temp.path().join(name);
+            fs::create_dir_all(rootfs.join("bin")).unwrap();
+            fs::create_dir_all(rootfs.join("sbin")).unwrap();
+            fs::write(rootfs.join("bin/sh"), b"#!/bin/sh\nexec busybox sh\n").unwrap();
+            fs::set_permissions(rootfs.join("bin/sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", rootfs.join("sbin/init"))
+                .unwrap();
+            rootfs
+        };
+        let a = make("a");
+        let b = make("b");
+        // a host's per-boot marker and a later modification time are not content
+        fs::write(
+            b.join(format!("{}.cafef00d", smolvm_protocol::AGENT_READY_MARKER)),
+            b"1",
+        )
+        .unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        File::open(b.join("bin/sh"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let digest = agent_rootfs_digest(&a).unwrap();
+        assert!(
+            digest.starts_with("sha256:") && digest.len() == 71,
+            "{digest}"
+        );
+        assert_eq!(agent_rootfs_digest(&b).unwrap(), digest);
+        assert_eq!(cached_agent_rootfs_digest(&a).unwrap(), digest);
+
+        // a byte, a permission bit and a link target each change it
+        fs::write(b.join("bin/sh"), b"#!/bin/sh\nexec busybox ash\n").unwrap();
+        let changed_bytes = agent_rootfs_digest(&b).unwrap();
+        assert_ne!(changed_bytes, digest);
+        fs::set_permissions(b.join("bin/sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let changed_mode = agent_rootfs_digest(&b).unwrap();
+        assert_ne!(changed_mode, changed_bytes);
+        fs::remove_file(b.join("sbin/init")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", b.join("sbin/init")).unwrap();
+        assert_ne!(agent_rootfs_digest(&b).unwrap(), changed_mode);
+
+        // the tar a checkpoint carries unpacks to a tree with the same digest
+        let staging = temp.path().join("staging");
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        collector.collect_agent_rootfs(&a).unwrap();
+        let unpacked = temp.path().join("unpacked");
+        fs::create_dir_all(&unpacked).unwrap();
+        let mut archive = tar::Archive::new(File::open(staging.join("agent-rootfs.tar")).unwrap());
+        archive.set_preserve_permissions(true);
+        archive.unpack(&unpacked).unwrap();
+        assert_eq!(agent_rootfs_digest(&unpacked).unwrap(), digest);
     }
 
     #[test]
@@ -1417,6 +2326,154 @@ mod tests {
     }
 
     #[test]
+    fn patched_files_pack_patched_bytes_and_keep_holes_and_source() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        fs::create_dir_all(staging.join("checkpoint/disks/storage")).unwrap();
+        fs::write(staging.join("checkpoint/disks/storage/0"), b"top").unwrap();
+        // Data, a 4 MiB hole, data, and a trailing hole.
+        let source = temp_dir.path().join("layer");
+        let mut file = File::create(&source).unwrap();
+        file.write_all(&vec![7_u8; 65536]).unwrap();
+        file.seek(SeekFrom::Start(4 << 20)).unwrap();
+        file.write_all(&vec![9_u8; 65536]).unwrap();
+        file.set_len(8 << 20).unwrap();
+        drop(file);
+        let original = fs::read(&source).unwrap();
+        let mut expected = original.clone();
+        expected[100..104].copy_from_slice(b"name");
+        expected[(4 << 20) + 10] = 1;
+
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        let patched = |path: &str| PatchedFile {
+            archive_path: path.to_string(),
+            source: File::open(&source).unwrap(),
+            mode: 0o600,
+            patches: vec![(100, b"name".to_vec()), ((4 << 20) + 10, vec![1])],
+        };
+        collector
+            .add_patched_file(patched("checkpoint/disks/storage/1"))
+            .unwrap();
+        // Paths outside `checkpoint/`, already staged, or repeated are refused.
+        for path in [
+            "other/1",
+            "checkpoint/../x",
+            "checkpoint/disks/storage/0",
+            "checkpoint/disks/storage/1",
+        ] {
+            assert!(collector.add_patched_file(patched(path)).is_err(), "{path}");
+        }
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        assert_eq!(fs::read(&source).unwrap(), original);
+
+        let output = temp_dir.path().join("output");
+        decompress_assets_from_file(&compressed, &output).unwrap();
+        let restored = output.join("checkpoint/disks/storage/1");
+        assert_eq!(fs::read(&restored).unwrap(), expected);
+        assert_eq!(
+            fs::read(output.join("checkpoint/disks/storage/0")).unwrap(),
+            b"top"
+        );
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+            let allocated = fs::metadata(&restored).unwrap().blocks() * 512;
+            assert!(allocated < 1 << 20, "holes were filled: {allocated} bytes");
+        }
+    }
+
+    // macOS packs checkpoints through `append_macos_sparse_file` instead.
+    #[cfg(not(target_os = "macos"))]
+    #[test]
+    fn checkpoint_ram_is_packed_as_aligned_nonzero_blocks() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let staging = temp_dir.path().join("staging");
+        fs::create_dir_all(staging.join("checkpoint")).unwrap();
+        // Scattered small pages, and a megabyte of zeros written as data.
+        let logical = 8_u64 << 20;
+        let mut memory = File::create(staging.join("checkpoint/memory.bin")).unwrap();
+        memory.set_len(logical).unwrap();
+        let mut expected = vec![0_u8; logical as usize];
+        for (index, offset) in [4096_u64, 12288, 70_000, 3 << 20, (5 << 20) + 100]
+            .into_iter()
+            .enumerate()
+        {
+            memory.seek(SeekFrom::Start(offset)).unwrap();
+            memory.write_all(&[index as u8 + 1; 4096]).unwrap();
+            expected[offset as usize..offset as usize + 4096].fill(index as u8 + 1);
+        }
+        memory.seek(SeekFrom::Start(6 << 20)).unwrap();
+        memory.write_all(&vec![0_u8; 1 << 20]).unwrap();
+        drop(memory);
+
+        let collector = AssetCollector::new(staging).unwrap();
+        let compressed = temp_dir.path().join("assets.tar.zst");
+        collector.compress(&compressed, false).unwrap();
+        let decoder = zstd::stream::read::Decoder::new(File::open(&compressed).unwrap()).unwrap();
+        let mut archive = tar::Archive::new(decoder);
+        let mut entries = archive.entries().unwrap();
+        let mut entry = loop {
+            let entry = entries.next().unwrap().unwrap();
+            if entry.path().unwrap() == Path::new("checkpoint/memory.bin") {
+                break entry;
+            }
+        };
+        let gnu = entry.header().as_gnu().unwrap();
+        let map: Vec<_> = gnu
+            .sparse
+            .iter()
+            .map(|s| (s.offset().unwrap(), s.length().unwrap()))
+            .collect();
+        // Blocks [0, 128 KiB), [3 MiB, +64 KiB), [5 MiB, +64 KiB): the zeros
+        // written as data are a hole.
+        assert_eq!(
+            map,
+            [
+                (0, 131_072),
+                (3 << 20, 65536),
+                (5 << 20, 65536),
+                (logical, 0)
+            ]
+        );
+        let mut restored = Vec::new();
+        entry.read_to_end(&mut restored).unwrap();
+        assert_eq!(restored, expected);
+    }
+
+    #[test]
+    fn aligned_ranges_cover_and_merge() {
+        assert_eq!(
+            align_ranges(&[(100, 10), (65_000, 1000), (200_000, 5)], 65536, 1 << 20),
+            [(0, 131_072), (196_608, 65536)]
+        );
+        assert_eq!(
+            align_ranges(&[(70_000, 10)], 65536, 70_010),
+            [(65536, 4474)]
+        );
+        assert!(align_ranges(&[(0, 0)], 65536, 10).is_empty());
+    }
+
+    #[test]
+    fn patches_outside_the_file_are_refused_and_merge_with_data() {
+        assert!(ranges_with_patches(Vec::new(), &[(10, vec![1; 4])], 12).is_err());
+        assert!(ranges_with_patches(Vec::new(), &[(0, Vec::new())], 12).is_err());
+        assert_eq!(
+            ranges_with_patches(
+                vec![(0, 4096), (8192, 4096)],
+                &[(4000, vec![1; 200])],
+                1 << 20
+            )
+            .unwrap(),
+            [(0, 4608), (8192, 4096)]
+        );
+        assert_eq!(
+            ranges_with_patches(vec![(4096, 4096)], &[(9000, vec![1; 4])], 9100).unwrap(),
+            [(4096, 4096), (8704, 396)]
+        );
+    }
+
+    #[test]
     fn compression_worker_budget_is_bounded() {
         assert_eq!(compression_workers(0), 0);
         assert_eq!(compression_workers(1), 0);
@@ -1427,6 +2484,43 @@ mod tests {
     }
 
     #[test]
+    fn compression_slots_keep_workers_within_the_host() {
+        assert_eq!(compression_slots(0), 1);
+        assert_eq!(compression_slots(1), 1);
+        assert_eq!(compression_slots(4), 1);
+        assert_eq!(compression_slots(7), 1);
+        assert_eq!(compression_slots(8), 2);
+        assert_eq!(compression_slots(12), 3);
+        assert_eq!(compression_slots(64), 16);
+    }
+
+    #[test]
+    fn compression_admission_runs_up_to_its_slots_at_once() {
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().to_path_buf();
+        // Each permit is its own open file, as in separate threads or processes.
+        let mut held: Vec<_> = (0..3)
+            .map(|_| compression_permit(&root, 3).unwrap())
+            .collect();
+        let (admitted, wait) = std::sync::mpsc::channel();
+        let waiter = std::thread::spawn(move || {
+            let permit = compression_permit(&root, 3).unwrap();
+            admitted.send(()).unwrap();
+            drop(permit);
+        });
+        assert!(wait.recv_timeout(Duration::from_millis(150)).is_err());
+        drop(held.remove(1));
+        // CI may schedule this thread alongside multi-GiB archive tests; the
+        // ten-second receive bound checks release without a scheduler-latency
+        // assertion that spuriously fails on a loaded Windows runner.
+        wait.recv_timeout(Duration::from_secs(10))
+            .expect("waiter stayed blocked after a slot was released");
+        waiter.join().unwrap();
+    }
+
+    #[test]
     #[ignore = "subprocess helper for compression_admission_is_cross_process"]
     fn compression_admission_child() {
         let Some(root) = std::env::var_os("SMOLVM_TEST_COMPRESSION_ADMISSION") else {
@@ -1434,7 +2528,7 @@ mod tests {
         };
         let root = PathBuf::from(root);
         fs::write(root.join("ready"), b"ready").unwrap();
-        let _permit = compression_permit(&root).unwrap();
+        let _permit = compression_permit(&root, 1).unwrap();
         fs::write(root.join("admitted"), b"admitted").unwrap();
     }
 
@@ -1451,7 +2545,7 @@ mod tests {
         }
 
         let temp = tempfile::tempdir().unwrap();
-        let permit = compression_permit(temp.path()).unwrap();
+        let permit = compression_permit(temp.path(), 1).unwrap();
         let mut child = Child(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
@@ -1491,7 +2585,7 @@ mod tests {
         // The inode remains available for later processes; it is not a stale
         // ownership marker and does not need cleanup after the owner exits.
         assert!(temp.path().join("asset-compression.lock").exists());
-        drop(compression_permit(temp.path()).unwrap());
+        drop(compression_permit(temp.path(), 1).unwrap());
     }
 
     #[test]

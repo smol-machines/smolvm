@@ -55,10 +55,12 @@ while read -r suffix; do
   # Rewrite the hash inside this asset's attribute block only. The block runs
   # from its asset line to its hash line, so a range address pins it without
   # needing to name the nix system attribute.
-  perl -i -pe "
-    if (/asset = \"smolvm-\\\${version}-\Q$suffix\E\";/) { \$in = 1 }
-    if (\$in && s/hash = \"[^\"]*\";/hash = \"$sri\";/) { \$in = 0 }
-  " "$NIX_FILE"
+  # The values go in through the environment, not the program text: base64
+  # uses `/` and `+`, which would end or corrupt an interpolated s///.
+  SUFFIX="$suffix" SRI="$sri" perl -i -pe '
+    if (/asset = "smolvm-\$\{version\}-\Q$ENV{SUFFIX}\E";/) { $in = 1 }
+    if ($in && s/hash = "[^"]*";/hash = "$ENV{SRI}";/) { $in = 0 }
+  ' "$NIX_FILE"
   echo "$asset: $sri"
 done <<EOF
 $ASSETS

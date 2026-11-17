@@ -1,9 +1,9 @@
 //! smolvm CLI entry point.
 
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 use tracing_subscriber::EnvFilter;
 
-mod cli;
+use smolvm::cli;
 
 /// smolvm - build and run portable, self-contained virtual machines
 #[derive(Parser, Debug)]
@@ -17,8 +17,25 @@ mod cli;
 )]
 #[command(version)]
 struct Cli {
+    /// How a failure is reported on stderr: `text`, or `json` for
+    /// `{"error":{"code":"NOT_FOUND","message":"…"}}` with a stable code
+    #[arg(long, global = true, value_enum, default_value_t = ErrorFormat::Text)]
+    error_format: ErrorFormat,
+
+    /// Keep all smolvm state (machines, images, caches, the database) under
+    /// PATH instead of the user's default directories, for example to run a
+    /// second engine version beside an installed one. Not supported on Windows.
+    #[arg(long, global = true, value_name = "PATH")]
+    state_dir: Option<std::path::PathBuf>,
+
     #[command(subcommand)]
     command: Commands,
+}
+
+#[derive(clap::ValueEnum, Clone, Copy, Debug, PartialEq, Eq)]
+enum ErrorFormat {
+    Text,
+    Json,
 }
 
 #[derive(Subcommand, Debug)]
@@ -39,6 +56,18 @@ enum Commands {
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
+
+    /// Serve the Docker Engine API: docker, Compose and Testcontainers run
+    /// every container as a machine
+    #[cfg(unix)]
+    Engine(cli::engine::EngineCmd),
+
+    /// Print a shell completion script to stdout
+    #[command(after_help = cli::completion::AFTER_HELP)]
+    Completion {
+        /// Shell to generate completions for
+        shell: clap_complete::Shell,
+    },
 
     /// Internal: boot a VM subprocess (not for direct use)
     #[command(name = "_boot-vm", hide = true)]
@@ -125,7 +154,42 @@ fn stray_stub_note(exe_stem: &str) -> Option<String> {
     ))
 }
 
+/// `--state-dir` must take effect before anything computes a path, which is
+/// before clap runs, so it is read from argv here and handed to the
+/// `SMOLVM_DATA_DIR` root that child processes inherit. Arguments after `--`
+/// belong to the workload and are never read. A relative path is made
+/// absolute so children started in another directory agree on it.
+#[cfg_attr(not(unix), allow(dead_code))]
+fn state_dir_from_args(
+    args: impl IntoIterator<Item = std::ffi::OsString>,
+) -> Option<std::path::PathBuf> {
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
+        let value = match arg.to_str() {
+            Some("--") => return None,
+            Some("--state-dir") => args.next()?,
+            Some(other) => match other.strip_prefix("--state-dir=") {
+                Some(value) => value.into(),
+                None => continue,
+            },
+            None => continue,
+        };
+        let path = std::path::PathBuf::from(value);
+        return Some(if path.is_absolute() {
+            path
+        } else {
+            std::env::current_dir().ok()?.join(path)
+        });
+    }
+    None
+}
+
 fn main() {
+    cli::broken_pipe::install();
+    cli::broken_pipe::run(run_cli);
+}
+
+fn run_cli() {
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
     smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
@@ -133,6 +197,10 @@ fn main() {
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
     // first, single-threaded, so the set_var is safe.
+    #[cfg(unix)]
+    if let Some(dir) = state_dir_from_args(std::env::args_os().skip(1)) {
+        std::env::set_var("SMOLVM_DATA_DIR", dir);
+    }
     smolvm::process::apply_system_data_root(/* allow_auto */ false);
 
     // Auto-detect packed binary mode BEFORE parsing the normal CLI.
@@ -178,6 +246,11 @@ fn main() {
     }
 
     let cli = Cli::parse();
+    let error_format = cli.error_format;
+    if cli.state_dir.is_some() && !cfg!(unix) {
+        eprintln!("Error: --state-dir is not supported on Windows");
+        std::process::exit(2);
+    }
 
     // Initialize logging based on RUST_LOG or default to warn
     init_logging();
@@ -185,12 +258,18 @@ fn main() {
     tracing::debug!(version = smolvm::VERSION, "starting smolvm");
 
     // Execute command
-    // Note: orphan cleanup is handled per-command (skipped for ephemeral `machine run`).
+    // Note: orphan cleanup is handled per-command (skipped for ephemeral `machnie run`).
     let result = match cli.command {
         Commands::Machine(cmd) => (*cmd).run(),
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
+        #[cfg(unix)]
+        Commands::Engine(cmd) => cmd.run(),
+        Commands::Completion { shell } => {
+            let mut cmd = cli::completion::without_hidden(&Cli::command());
+            cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)
+        }
         Commands::BootVm { config } => smolvm::internal_boot::run(config),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
@@ -239,7 +318,13 @@ fn main() {
     // Handle errors
     if let Err(e) = result {
         tracing::debug!(error = %e, "command failed");
-        eprintln!("Error: {}", e);
+        match error_format {
+            ErrorFormat::Text => eprintln!("Error: {}", e),
+            ErrorFormat::Json => eprintln!(
+                "{}",
+                serde_json::json!({ "error": { "code": e.code(), "message": e.to_string() } })
+            ),
+        }
         std::process::exit(1);
     }
 }
@@ -283,6 +368,44 @@ mod tests {
     use super::*;
 
     #[test]
+    fn state_dir_is_read_before_the_workload_arguments_only() {
+        let args = |list: &[&str]| {
+            list.iter()
+                .map(std::ffi::OsString::from)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            state_dir_from_args(args(&["--state-dir", "/srv/smol", "machine", "ls"])),
+            Some("/srv/smol".into())
+        );
+        assert_eq!(
+            state_dir_from_args(args(&["machine", "ls", "--state-dir=/srv/smol"])),
+            Some("/srv/smol".into())
+        );
+        assert_eq!(
+            state_dir_from_args(args(&["machine", "run", "--", "app", "--state-dir", "/x"])),
+            None
+        );
+        assert_eq!(
+            state_dir_from_args(args(&["machine", "ls", "--state-dir"])),
+            None
+        );
+        let relative = state_dir_from_args(args(&["--state-dir", "state", "machine", "ls"]))
+            .expect("a relative state dir is accepted");
+        assert!(relative.is_absolute() && relative.ends_with("state"));
+    }
+
+    #[test]
+    fn state_dir_is_a_global_flag() {
+        assert!(
+            Cli::try_parse_from(["smolvm", "--state-dir", "/srv/smol", "machine", "ls"]).is_ok()
+        );
+        assert!(
+            Cli::try_parse_from(["smolvm", "machine", "ls", "--state-dir", "/srv/smol"]).is_ok()
+        );
+    }
+
+    #[test]
     fn the_shipped_binary_name_is_not_flagged() {
         // The regression this file exists to prevent: install.sh ships
         // `smolvm-bin` behind a `smolvm` launcher, so flagging it printed a
@@ -293,6 +416,75 @@ mod tests {
     #[test]
     fn the_launcher_name_is_not_flagged() {
         assert_eq!(stray_stub_note("smolvm"), None);
+    }
+
+    #[test]
+    fn completion_parses_a_known_shell_and_rejects_an_unknown_one() {
+        assert!(Cli::try_parse_from(["smolvm", "completion", "bash"]).is_ok());
+        let err = Cli::try_parse_from(["smolvm", "completion", "nushell"]).unwrap_err();
+        let rendered = err.to_string();
+        assert!(
+            rendered.contains("nushell") || rendered.contains("possible value"),
+            "{rendered}"
+        );
+    }
+
+    #[test]
+    fn completion_scripts_offer_public_commands_only() {
+        use clap_complete::Shell;
+
+        for shell in [
+            Shell::Bash,
+            Shell::Elvish,
+            Shell::Fish,
+            Shell::PowerShell,
+            Shell::Zsh,
+        ] {
+            let mut buf = Vec::new();
+            let mut cmd = cli::completion::without_hidden(&Cli::command());
+            cli::completion::write(shell, &mut cmd, &mut buf).unwrap();
+            let script = String::from_utf8(buf).expect("completion script is utf-8");
+            assert!(
+                !script.contains('\u{1b}'),
+                "{shell:?} script contains ANSI styling"
+            );
+            assert!(
+                script.contains("machine") && script.contains("completion"),
+                "{shell:?} script is missing public commands"
+            );
+            assert!(
+                script.contains("--net") || script.contains("-l net"),
+                "{shell:?} script is missing flags"
+            );
+            assert!(
+                script_offers_vm_alias(shell, &script),
+                "{shell:?} script dropped the vm alias:\n{script}"
+            );
+            for hidden in [
+                "_boot-vm",
+                "_cuda-daemon",
+                "_cuda-clone-worker",
+                "_cuda-mps-supervisor",
+                "_video-encoder",
+                "_cleanup-ephemeral",
+            ] {
+                assert!(
+                    !script.contains(hidden),
+                    "{shell:?} script offers hidden command {hidden}"
+                );
+            }
+        }
+    }
+
+    fn script_offers_vm_alias(shell: clap_complete::Shell, script: &str) -> bool {
+        match shell {
+            clap_complete::Shell::Bash => script.contains("smolvm,vm)"),
+            clap_complete::Shell::Fish => script.contains("-a \"vm\""),
+            clap_complete::Shell::Zsh => script.contains("'vm:"),
+            clap_complete::Shell::PowerShell => script.contains("'vm', 'vm'"),
+            clap_complete::Shell::Elvish => script.contains("vm '"),
+            _ => false,
+        }
     }
 
     #[test]

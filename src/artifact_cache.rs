@@ -15,7 +15,7 @@ use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::os::unix::fs::{MetadataExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const CACHE_LOCK_FILENAME: &str = ".artifact-cache.lock";
@@ -106,6 +106,41 @@ impl Drop for ArtifactCacheLock {
 }
 
 fn lock_artifact_cache(vm_root: &Path, exclusive: bool) -> io::Result<ArtifactCacheLock> {
+    let file = open_artifact_cache_lock(vm_root)?;
+    let operation = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    Ok(ArtifactCacheLock(file))
+}
+
+/// The cache lock, or `None` while someone holds it in a conflicting mode: any
+/// holder for an exclusive lock, an exclusive holder for a shared one.
+fn try_lock_artifact_cache(
+    vm_root: &Path,
+    exclusive: bool,
+) -> io::Result<Option<ArtifactCacheLock>> {
+    let file = open_artifact_cache_lock(vm_root)?;
+    let operation = if exclusive {
+        libc::LOCK_EX
+    } else {
+        libc::LOCK_SH
+    };
+    if unsafe { libc::flock(file.as_raw_fd(), operation | libc::LOCK_NB) } != 0 {
+        let error = io::Error::last_os_error();
+        if error.kind() == io::ErrorKind::WouldBlock {
+            return Ok(None);
+        }
+        return Err(error);
+    }
+    Ok(Some(ArtifactCacheLock(file)))
+}
+
+fn open_artifact_cache_lock(vm_root: &Path) -> io::Result<fs::File> {
     fs::create_dir_all(vm_root)?;
     let path = vm_root.join(CACHE_LOCK_FILENAME);
     let file = fs::OpenOptions::new()
@@ -118,15 +153,7 @@ fn lock_artifact_cache(vm_root: &Path, exclusive: bool) -> io::Result<ArtifactCa
         .open(&path)?;
     // Do not trust an older umask or manually-created lock file.
     file.set_permissions(fs::Permissions::from_mode(0o600))?;
-    let operation = if exclusive {
-        libc::LOCK_EX
-    } else {
-        libc::LOCK_SH
-    };
-    if unsafe { libc::flock(file.as_raw_fd(), operation) } != 0 {
-        return Err(io::Error::last_os_error());
-    }
-    Ok(ArtifactCacheLock(file))
+    Ok(file)
 }
 
 fn is_lower_hex(value: &str, len: usize) -> bool {
@@ -238,6 +265,18 @@ fn read_lease_from_machine_dir(
     machine_dir: &Path,
     shared_root: &Path,
 ) -> io::Result<Option<SharedPackLease>> {
+    let Some(shared_dir) = read_leased_shared_dir(machine_dir, shared_root)? else {
+        return Ok(None);
+    };
+    let artifact_sha256 = read_artifact_digest(&shared_dir)?;
+    Ok(Some(SharedPackLease {
+        shared_dir,
+        artifact_sha256,
+    }))
+}
+
+/// The shared extraction a machine directory's pointer names, if it has one.
+fn read_leased_shared_dir(machine_dir: &Path, shared_root: &Path) -> io::Result<Option<PathBuf>> {
     let pointer = machine_dir.join(SHARED_PACK_POINTER);
     let metadata = match fs::symlink_metadata(&pointer) {
         Ok(metadata) => metadata,
@@ -261,12 +300,7 @@ fn read_lease_from_machine_dir(
             format!("empty shared pack pointer: {}", pointer.display()),
         ));
     }
-    let shared_dir = canonical_shared_dir(Path::new(target), shared_root)?;
-    let artifact_sha256 = read_artifact_digest(&shared_dir)?;
-    Ok(Some(SharedPackLease {
-        shared_dir,
-        artifact_sha256,
-    }))
+    canonical_shared_dir(Path::new(target), shared_root).map(Some)
 }
 
 fn touch_lease(lease: &SharedPackLease) {
@@ -287,11 +321,34 @@ pub fn materialize_shared_pack_lease(
     machine_layers_dir: &Path,
     debug: bool,
 ) -> io::Result<SharedPackLease> {
+    materialize_shared_pack_lease_with_options(
+        sidecar_path,
+        footer,
+        machine_layers_dir,
+        debug,
+        smolvm_pack::extract::SharedExtractOptions::default(),
+    )
+}
+
+/// [`materialize_shared_pack_lease`] with the shortcuts a restore can take
+/// (see [`smolvm_pack::extract::SharedExtractOptions`]).
+pub fn materialize_shared_pack_lease_with_options(
+    sidecar_path: &Path,
+    footer: &smolvm_pack::PackFooter,
+    machine_layers_dir: &Path,
+    debug: bool,
+    options: smolvm_pack::extract::SharedExtractOptions,
+) -> io::Result<SharedPackLease> {
     let vm_root = vm_cache_root();
     let shared_root = shared_pack_cache_root();
     let _lock = lock_artifact_cache(&vm_root, false)?;
-    let shared_dir =
-        smolvm_pack::extract::extract_sidecar_shared(sidecar_path, &shared_root, footer, debug)?;
+    let shared_dir = smolvm_pack::extract::extract_sidecar_shared_with_options(
+        sidecar_path,
+        &shared_root,
+        footer,
+        debug,
+        options,
+    )?;
     let shared_dir = canonical_shared_dir(&shared_dir, &shared_root)?;
     let artifact_sha256 = read_artifact_digest(&shared_dir)?;
     fs::create_dir_all(machine_layers_dir)?;
@@ -544,6 +601,13 @@ impl CacheCandidate {
             .cloned()
             .collect()
     }
+
+    /// Whether this artifact is extracted at `_shared/<checksum>`.
+    fn extracted_as(&self, checksum: &str) -> bool {
+        self.shared_dirs
+            .iter()
+            .any(|dir| dir.file_name().is_some_and(|name| name == checksum))
+    }
 }
 
 fn is_vm_dir_name(name: &str) -> bool {
@@ -580,10 +644,24 @@ fn collect_machine_leases(
                 ),
             ));
         }
-        if let Some(lease) = read_lease_from_machine_dir(&entry.path(), shared_root)? {
-            digests.insert(lease.artifact_sha256);
-            shared_dirs.insert(lease.shared_dir);
+        // A pointer to an extraction that is already gone protects nothing, and
+        // one extracted before artifact digests were recorded is protected by
+        // its path alone. Neither may abort the scan: every caller is a cleanup
+        // that would otherwise never run again on this host.
+        let shared_dir = match read_leased_shared_dir(&entry.path(), shared_root) {
+            Ok(Some(shared_dir)) => shared_dir,
+            Ok(None) => continue,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        match read_artifact_digest(&shared_dir) {
+            Ok(digest) => {
+                digests.insert(digest);
+            }
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
         }
+        shared_dirs.insert(shared_dir);
     }
     Ok((digests, shared_dirs))
 }
@@ -596,7 +674,16 @@ fn metadata_paths_for_shared(shared_dir: &Path) -> Vec<PathBuf> {
         digest.with_extension("artifact-sha256.lock"),
         shared_dir.with_extension("artifact-source.json"),
         shared_dir.with_extension("prepared.smolcheckpoint"),
+        smolvm_pack::extract::unsynced_marker_path(shared_dir),
     ]
+}
+
+/// Whether a restore in this boot is still writing `shared_dir`'s RAM back to
+/// disk. A marker left by an earlier boot only means the data is suspect, and
+/// such an extraction is extracted again on its next use, so it may go.
+fn write_back_in_progress(shared_dir: &Path) -> bool {
+    let marker = smolvm_pack::extract::unsynced_marker_path(shared_dir);
+    marker.exists() && !smolvm_pack::extract::unsynced_before_this_boot(&marker)
 }
 
 fn allocated_usage(path: &Path) -> io::Result<u64> {
@@ -622,18 +709,40 @@ fn path_modified(path: &Path) -> io::Result<SystemTime> {
     }
 }
 
-fn add_candidate_path(candidate: &mut CacheCandidate, path: &Path) -> io::Result<()> {
-    candidate.allocated_bytes = candidate
-        .allocated_bytes
-        .saturating_add(allocated_usage(path)?);
+fn add_candidate_path(
+    candidate: &mut CacheCandidate,
+    path: &Path,
+    measure: bool,
+) -> io::Result<()> {
+    if measure {
+        candidate.allocated_bytes = candidate
+            .allocated_bytes
+            .saturating_add(allocated_usage(path)?);
+    }
     candidate.modified = candidate.modified.max(path_modified(path)?);
     Ok(())
 }
 
+/// Fill in `allocated_bytes` for an entry listed without `measure`.
+fn measure_candidate(candidate: &mut CacheCandidate) -> io::Result<()> {
+    let paths = candidate.visible_paths();
+    for path in paths.iter().chain(&candidate.metadata_files) {
+        candidate.allocated_bytes = candidate
+            .allocated_bytes
+            .saturating_add(allocated_usage(path)?);
+    }
+    Ok(())
+}
+
+/// Every cache entry, keyed by artifact. With `measure`, each entry's
+/// `allocated_bytes` is filled in, which walks every file of every extraction:
+/// on a busy node that is over a million files and seconds of work, so callers
+/// that only act on a few entries list them without it and measure those.
 fn inventory_candidates(
     shared_root: &Path,
     cow_root: &Path,
     referenced_shared: &HashSet<PathBuf>,
+    measure: bool,
 ) -> io::Result<HashMap<String, CacheCandidate>> {
     let mut candidates = HashMap::<String, CacheCandidate>::new();
 
@@ -668,15 +777,20 @@ fn inventory_candidates(
                     );
                     (format!("shared:{name}"), None)
                 }
+                // A machine still uses this pre-digest extraction; the lease
+                // keeps it, so it needs no digest to be left alone.
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {
+                    (format!("shared:{name}"), None)
+                }
                 Err(error) => return Err(error),
             };
             let candidate = candidates
                 .entry(key.clone())
                 .or_insert_with(|| CacheCandidate::new(key, digest));
-            add_candidate_path(candidate, &shared_dir)?;
+            add_candidate_path(candidate, &shared_dir, measure)?;
             candidate.shared_dirs.push(shared_dir.clone());
             for metadata_path in metadata_paths_for_shared(&shared_dir) {
-                add_candidate_path(candidate, &metadata_path)?;
+                add_candidate_path(candidate, &metadata_path, measure)?;
                 candidate.metadata_files.push(metadata_path);
             }
         }
@@ -706,7 +820,7 @@ fn inventory_candidates(
             let candidate = candidates
                 .entry(digest.clone())
                 .or_insert_with(|| CacheCandidate::new(digest.clone(), Some(digest.clone())));
-            add_candidate_path(candidate, &cow_dir)?;
+            add_candidate_path(candidate, &cow_dir, measure)?;
             candidate.cow_dirs.push(cow_dir);
         }
     }
@@ -756,6 +870,7 @@ fn remove_candidate(candidate: &CacheCandidate) -> io::Result<()> {
     for path in &candidate.shared_dirs {
         smolvm_pack::extract::force_detach_layers_volume(path);
         make_tree_owner_writable(path)?;
+        smolvm_pack::extract::invalidate_extraction(path)?;
         fs::remove_dir_all(path)?;
     }
     for path in &candidate.metadata_files {
@@ -773,16 +888,31 @@ fn prune_artifact_caches_in(
     keep: usize,
     dry_run: bool,
 ) -> io::Result<ArtifactCachePruneReport> {
+    prune_selected_in(vm_root, None, keep, dry_run)
+}
+
+/// Remove unused artifacts past the `keep` most recent, looking only at the
+/// one extracted at `_shared/<only>` when `only` is set.
+fn prune_selected_in(
+    vm_root: &Path,
+    only: Option<&str>,
+    keep: usize,
+    dry_run: bool,
+) -> io::Result<ArtifactCachePruneReport> {
     let _lock = lock_artifact_cache(vm_root, true)?;
     let shared_root = vm_root.join("_shared");
     let cow_root = vm_root.join("_cow-bases");
     let (referenced_digests, referenced_shared) = collect_machine_leases(vm_root, &shared_root)?;
     // Finish the complete reference scan and candidate inventory before the
-    // first mutation. Any malformed live pointer therefore fails closed.
-    let candidates = inventory_candidates(&shared_root, &cow_root, &referenced_shared)?;
+    // first mutation. Any malformed live pointer therefore fails closed. The
+    // listing does not walk the extractions: only what goes is sized, below.
+    let candidates = inventory_candidates(&shared_root, &cow_root, &referenced_shared, false)?;
     let mut referenced_entries = 0usize;
     let mut unused = Vec::new();
     for candidate in candidates.into_values() {
+        if only.is_some_and(|checksum| !candidate.extracted_as(checksum)) {
+            continue;
+        }
         let referenced = candidate
             .digest
             .as_ref()
@@ -804,8 +934,14 @@ fn prune_artifact_caches_in(
             .then_with(|| left.artifact.cmp(&right.artifact))
     });
 
+    // Size everything before the first removal, so a failure removes nothing.
+    let mut selected: Vec<_> = unused.into_iter().skip(keep).collect();
+    for candidate in &mut selected {
+        measure_candidate(candidate)?;
+    }
+
     let mut entries = Vec::new();
-    for candidate in unused.into_iter().skip(keep) {
+    for candidate in selected {
         if !dry_run {
             remove_candidate(&candidate)?;
         }
@@ -828,6 +964,280 @@ fn prune_artifact_caches_in(
 /// returned report describes the selection without changing the filesystem.
 pub fn prune_artifact_caches(keep: usize, dry_run: bool) -> io::Result<ArtifactCachePruneReport> {
     prune_artifact_caches_in(&vm_cache_root(), keep, dry_run)
+}
+
+/// Prune the one artifact extracted at `_shared/<checksum>`, with its COW bases.
+///
+/// An artifact a machine references is retained and counted in
+/// `referenced_entries`, as in [`prune_artifact_caches`].
+pub fn prune_artifact_cache(checksum: &str, dry_run: bool) -> io::Result<ArtifactCachePruneReport> {
+    prune_selected_in(&vm_cache_root(), Some(checksum), 0, dry_run)
+}
+
+/// Bound the shared extractions no machine leases any more.
+///
+/// A restore extracts its checkpoint into the shared store, links what the
+/// machine needs into the machine's own directory, and then drops the lease, so
+/// nothing ever referenced the extraction again: every restored checkpoint
+/// stayed on disk after its machines were deleted. The most recently used
+/// extractions are worth keeping, because restoring the same checkpoint again
+/// reuses one without extracting it, so this keeps those the restore cache
+/// policy allows ([`crate::portable_checkpoint::RestoreCache`]) and removes the
+/// rest. Prepared captures keep their own budget and are left alone.
+///
+/// Never waits: when another process holds the cache lock (an extraction in
+/// progress), it returns `None` and a later call trims instead.
+pub fn trim_unleased_shared_packs() -> io::Result<Option<ArtifactCachePruneReport>> {
+    let policy = crate::portable_checkpoint::RestoreCache::process();
+    trim_unleased_shared_packs_in(&vm_cache_root(), policy.entries, policy.max_bytes)
+}
+
+/// A background trim is running in this process.
+static TRIM_RUNNING: AtomicBool = AtomicBool::new(false);
+/// A trim was asked for since the running one last started a pass.
+static TRIM_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// [`trim_unleased_shared_packs`] on a background thread, for request paths
+/// that must not wait on removing gigabytes.
+///
+/// One trim runs at a time. Every machine delete asks for one, and each pass
+/// sizes the whole cache, so a burst of deletes used to run that many passes
+/// at once; now a request made during a pass makes the running thread do one
+/// more pass after it instead.
+pub fn trim_unleased_shared_packs_soon() {
+    TRIM_REQUESTED.store(true, Ordering::SeqCst);
+    if TRIM_RUNNING.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let spawned = std::thread::Builder::new()
+        .name("shared-pack-trim".into())
+        .spawn(|| loop {
+            while TRIM_REQUESTED.swap(false, Ordering::SeqCst) {
+                log_trim(trim_unleased_shared_packs());
+            }
+            TRIM_RUNNING.store(false, Ordering::SeqCst);
+            // A request that arrived after the last pass but before the flag
+            // cleared saw a running trim and left the work to it.
+            if !TRIM_REQUESTED.load(Ordering::SeqCst) || TRIM_RUNNING.swap(true, Ordering::SeqCst) {
+                return;
+            }
+        });
+    if let Err(error) = spawned {
+        TRIM_RUNNING.store(false, Ordering::SeqCst);
+        tracing::warn!(%error, "could not start shared extraction trim");
+    }
+}
+
+/// Log what a trim removed, or why it could not run.
+pub fn log_trim(result: io::Result<Option<ArtifactCachePruneReport>>) {
+    match result {
+        Ok(Some(report)) if !report.entries.is_empty() => tracing::info!(
+            removed = report.entries.len(),
+            bytes = report
+                .entries
+                .iter()
+                .map(|entry| entry.allocated_bytes)
+                .sum::<u64>(),
+            "trimmed unleased shared extractions"
+        ),
+        Ok(_) => {}
+        Err(error) => tracing::warn!(%error, "could not trim unleased shared extractions"),
+    }
+}
+
+/// Who still needs a cache entry, as far as a trim is concerned.
+#[derive(Debug, PartialEq, Eq)]
+enum EntryUse {
+    /// A machine leases it.
+    Leased,
+    /// A prepared capture or a RAM write-back still needs it.
+    Busy,
+    /// Nothing does: a trim may remove it.
+    Unused,
+}
+
+fn entry_use(
+    candidate: &CacheCandidate,
+    referenced_digests: &HashSet<String>,
+    referenced_shared: &HashSet<PathBuf>,
+) -> EntryUse {
+    let referenced = candidate
+        .digest
+        .as_ref()
+        .is_some_and(|digest| referenced_digests.contains(digest))
+        || candidate
+            .shared_dirs
+            .iter()
+            .any(|path| referenced_shared.contains(path));
+    if referenced {
+        return EntryUse::Leased;
+    }
+    let prepared = candidate
+        .shared_dirs
+        .iter()
+        .any(|dir| dir.with_extension("prepared.smolcheckpoint").is_file());
+    let writing_back = candidate
+        .shared_dirs
+        .iter()
+        .any(|dir| write_back_in_progress(dir));
+    if prepared || writing_back {
+        EntryUse::Busy
+    } else {
+        EntryUse::Unused
+    }
+}
+
+/// Bytes under `paths`, or `None` when part of them vanished while being
+/// walked, as an extraction's scratch files do under a shared lock.
+fn usage_while_shared(
+    paths: &[PathBuf],
+    usage: fn(&Path) -> io::Result<u64>,
+) -> io::Result<Option<u64>> {
+    let mut bytes = 0u64;
+    for path in paths {
+        match usage(path) {
+            Ok(used) => bytes = bytes.saturating_add(used),
+            Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(Some(bytes))
+}
+
+/// Decide under the shared lock and remove under the exclusive one.
+///
+/// Sizing the unleased extractions walks every file in them, which on a busy
+/// node is over a million files and several seconds. Holding the exclusive lock
+/// for that stalled every branch of a pack-backed machine, which links its
+/// source's extraction under the shared lock, until the walk finished; and
+/// every machine delete starts a trim. So the walk shares the lock with them,
+/// and the exclusive lock covers only a re-check of the chosen entries, from a
+/// listing that does not walk their files, and their removal. An entry that
+/// gained a lease, a capture or a write-back, or was used again in between,
+/// stays until a later trim.
+fn trim_unleased_shared_packs_in(
+    vm_root: &Path,
+    keep: usize,
+    max_bytes: u64,
+) -> io::Result<Option<ArtifactCachePruneReport>> {
+    trim_unleased_shared_packs_with(vm_root, keep, max_bytes, || {})
+}
+
+/// [`trim_unleased_shared_packs_in`], running `after_scan` once the choice is
+/// made, while the shared lock is still held, as a publisher would be.
+fn trim_unleased_shared_packs_with(
+    vm_root: &Path,
+    keep: usize,
+    max_bytes: u64,
+    after_scan: impl FnOnce(),
+) -> io::Result<Option<ArtifactCachePruneReport>> {
+    let shared_root = vm_root.join("_shared");
+    let cow_root = vm_root.join("_cow-bases");
+    let (referenced_entries, planned) = {
+        let Some(_shared) = try_lock_artifact_cache(vm_root, false)? else {
+            return Ok(None);
+        };
+        let (referenced_digests, referenced_shared) =
+            collect_machine_leases(vm_root, &shared_root)?;
+        let candidates = inventory_candidates(&shared_root, &cow_root, &referenced_shared, false)?;
+        let mut referenced_entries = 0usize;
+        let mut unleased = Vec::new();
+        for candidate in candidates.into_values() {
+            match entry_use(&candidate, &referenced_digests, &referenced_shared) {
+                EntryUse::Leased => referenced_entries += 1,
+                EntryUse::Unused => unleased.push(candidate),
+                EntryUse::Busy => {}
+            }
+        }
+        unleased.sort_by(|left, right| {
+            right
+                .modified
+                .cmp(&left.modified)
+                .then_with(|| left.artifact.cmp(&right.artifact))
+        });
+        let mut kept = 0usize;
+        let mut kept_bytes = 0u64;
+        let mut planned = Vec::new();
+        for mut candidate in unleased {
+            let paths: Vec<PathBuf> = candidate
+                .visible_paths()
+                .into_iter()
+                .chain(candidate.metadata_files.iter().cloned())
+                .collect();
+            // Count only what removal frees: RAM still linked into a live restored
+            // machine costs the cache nothing until that machine is deleted.
+            let Some(bytes) = usage_while_shared(&paths, unshared_usage)? else {
+                continue;
+            };
+            if kept < keep && bytes <= max_bytes.saturating_sub(kept_bytes) {
+                kept += 1;
+                kept_bytes += bytes;
+                continue;
+            }
+            let Some(allocated) = usage_while_shared(&paths, allocated_usage)? else {
+                continue;
+            };
+            candidate.allocated_bytes = allocated;
+            planned.push(candidate);
+        }
+        after_scan();
+        (referenced_entries, planned)
+    };
+    if planned.is_empty() {
+        return Ok(Some(ArtifactCachePruneReport {
+            entries: Vec::new(),
+            referenced_entries,
+        }));
+    }
+
+    let Some(_exclusive) = try_lock_artifact_cache(vm_root, true)? else {
+        return Ok(None);
+    };
+    let (referenced_digests, referenced_shared) = collect_machine_leases(vm_root, &shared_root)?;
+    let mut current = inventory_candidates(&shared_root, &cow_root, &referenced_shared, false)?;
+    let mut entries = Vec::new();
+    for candidate in planned {
+        let Some(now) = current.remove(&candidate.artifact) else {
+            continue;
+        };
+        let unchanged = now.shared_dirs == candidate.shared_dirs
+            && now.cow_dirs == candidate.cow_dirs
+            && now.modified == candidate.modified;
+        if !unchanged
+            || entry_use(&now, &referenced_digests, &referenced_shared) != EntryUse::Unused
+        {
+            continue;
+        }
+        remove_candidate(&now)?;
+        entries.push(ArtifactCachePruneEntry {
+            artifact: candidate.artifact.clone(),
+            paths: candidate.visible_paths(),
+            allocated_bytes: candidate.allocated_bytes,
+        });
+    }
+    Ok(Some(ArtifactCachePruneReport {
+        entries,
+        referenced_entries,
+    }))
+}
+
+/// Allocated bytes under `path` held only by this tree: a file also linked
+/// elsewhere frees nothing when the tree is removed.
+fn unshared_usage(path: &Path) -> io::Result<u64> {
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(0),
+        Err(error) => return Err(error),
+    };
+    let own = metadata.blocks().saturating_mul(512);
+    if metadata.file_type().is_dir() {
+        let mut bytes = own;
+        for entry in fs::read_dir(path)? {
+            bytes = bytes.saturating_add(unshared_usage(&entry?.path())?);
+        }
+        return Ok(bytes);
+    }
+    Ok(if metadata.nlink() > 1 { 0 } else { own })
 }
 
 /// Bound unused prepared state without removing inputs leased by machines.
@@ -863,7 +1273,7 @@ fn prune_prepared_checkpoints_in(vm_root: &Path, max_bytes: u64) -> io::Result<(
             }
         }
     }
-    let candidates = inventory_candidates(&shared, &vm_root.join("_cow-bases"), &leases)?;
+    let candidates = inventory_candidates(&shared, &vm_root.join("_cow-bases"), &leases, true)?;
     let mut unused: Vec<_> = candidates
         .into_values()
         .filter(|candidate| {
@@ -1048,6 +1458,244 @@ mod tests {
         assert!(!shared.join("deadbeef.artifact-sha256").exists());
     }
 
+    /// Date every part of an artifact's cache entry, so trims order it.
+    fn age_artifact(shared: &Path, digest: &str, seconds_ago: u64) {
+        let when = SystemTime::now() - std::time::Duration::from_secs(seconds_ago);
+        let root = shared.parent().unwrap().parent().unwrap();
+        for path in [
+            shared.to_path_buf(),
+            smolvm_pack::extract::shared_artifact_sha256_path(shared),
+            root.join("_cow-bases").join(digest),
+        ] {
+            fs::File::open(path).unwrap().set_modified(when).unwrap();
+        }
+    }
+
+    #[test]
+    fn trim_keeps_the_newest_unleased_extractions_and_every_leased_one() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        const DIGEST_D: &str = "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (oldest, oldest_cow) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let (middle, _) = install_artifact(&root, "bbbbbbbb", DIGEST_B);
+        let (newest, _) = install_artifact(&root, "cccccccc", DIGEST_C);
+        let (leased, leased_cow) = install_artifact(&root, "dddddddd", DIGEST_D);
+        age_artifact(&oldest, DIGEST_A, 300);
+        age_artifact(&middle, DIGEST_B, 200);
+        age_artifact(&newest, DIGEST_C, 100);
+        age_artifact(&leased, DIGEST_D, 400);
+        publish_test_lease(&machine_dir(&root, "01"), &leased);
+
+        let report = trim_unleased_shared_packs_in(&root, 2, u64::MAX)
+            .unwrap()
+            .unwrap();
+
+        assert_eq!(report.referenced_entries, 1);
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].artifact, DIGEST_A);
+        assert!(!oldest.exists() && !oldest_cow.exists());
+        assert!(!smolvm_pack::extract::shared_artifact_sha256_path(&oldest).exists());
+        assert!(middle.exists() && newest.exists());
+        assert!(leased.exists() && leased_cow.exists());
+    }
+
+    #[test]
+    fn trim_survives_leases_on_pre_digest_and_vanished_extractions() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        const DIGEST_C: &str = "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc";
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (legacy, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let (gone, _) = install_artifact(&root, "bbbbbbbb", DIGEST_B);
+        let (stale, stale_cow) = install_artifact(&root, "cccccccc", DIGEST_C);
+        age_artifact(&stale, DIGEST_C, 300);
+        publish_test_lease(&machine_dir(&root, "01"), &legacy);
+        publish_test_lease(&machine_dir(&root, "02"), &gone);
+        // Extracted before digests were recorded, and removed out from under
+        // its machine: neither may stop the trim.
+        fs::remove_file(smolvm_pack::extract::shared_artifact_sha256_path(&legacy)).unwrap();
+        fs::remove_dir_all(&gone).unwrap();
+        fs::remove_file(smolvm_pack::extract::shared_artifact_sha256_path(&gone)).unwrap();
+
+        let report = trim_unleased_shared_packs_in(&root, 0, u64::MAX)
+            .unwrap()
+            .unwrap();
+
+        assert!(
+            legacy.exists(),
+            "a leased extraction is kept without a digest"
+        );
+        assert!(!stale.exists() && !stale_cow.exists());
+        assert!(report
+            .entries
+            .iter()
+            .any(|entry| entry.artifact == DIGEST_C));
+    }
+
+    #[test]
+    fn trim_budget_counts_only_what_removal_frees() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (restored, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let (older, _) = install_artifact(&root, "bbbbbbbb", DIGEST_B);
+        let ram = vec![1u8; 1 << 20];
+        fs::write(restored.join("memory.bin"), &ram).unwrap();
+        fs::write(older.join("memory.bin"), &ram).unwrap();
+        // A live restored machine still links the newer extraction's RAM.
+        let machine = machine_dir(&root, "01");
+        fs::create_dir_all(&machine).unwrap();
+        fs::hard_link(restored.join("memory.bin"), machine.join("memory.bin")).unwrap();
+        age_artifact(&restored, DIGEST_A, 100);
+        age_artifact(&older, DIGEST_B, 200);
+
+        trim_unleased_shared_packs_in(&root, 8, 512 * 1024)
+            .unwrap()
+            .unwrap();
+        assert!(restored.exists(), "linked RAM frees nothing, so it fits");
+        assert!(
+            !older.exists(),
+            "1 MiB held only by the cache exceeds the budget"
+        );
+
+        // Once the machine is gone its RAM is the cache's alone.
+        fs::remove_dir_all(&machine).unwrap();
+        trim_unleased_shared_packs_in(&root, 8, 512 * 1024)
+            .unwrap()
+            .unwrap();
+        assert!(!restored.exists());
+    }
+
+    #[test]
+    fn trim_leaves_prepared_captures_and_waits_for_no_one() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (prepared, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        fs::write(prepared.with_extension("prepared.smolcheckpoint"), b"x").unwrap();
+        let (unleased, _) = install_artifact(&root, "bbbbbbbb", DIGEST_B);
+
+        let busy = lock_artifact_cache(&root, false).unwrap();
+        assert!(trim_unleased_shared_packs_in(&root, 0, 0)
+            .unwrap()
+            .is_none());
+        assert!(unleased.exists());
+        drop(busy);
+
+        trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
+        assert!(prepared.exists());
+        assert!(!unleased.exists());
+    }
+
+    #[test]
+    fn a_branch_links_its_source_extraction_while_a_trim_sizes_the_cache() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (leased, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let (unleased, _) = install_artifact(&root, "bbbbbbbb", DIGEST_B);
+        let source = machine_dir(&root, "01");
+        publish_test_lease(&source, &leased);
+        let child = machine_dir(&root, "02");
+
+        let report = trim_unleased_shared_packs_with(&root, 0, 0, || {
+            let linked = copy_shared_pack_lease_in(
+                &root,
+                &root.join("_shared"),
+                &source.join("pack"),
+                &child.join("pack"),
+            )
+            .unwrap();
+            assert_eq!(linked.unwrap().shared_dir, leased.canonicalize().unwrap());
+        })
+        .unwrap()
+        .unwrap();
+
+        assert_eq!(report.entries.len(), 1);
+        assert!(!unleased.exists() && leased.exists());
+    }
+
+    #[test]
+    fn trim_keeps_an_extraction_leased_while_it_was_scanning() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared, cow) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+
+        let report = trim_unleased_shared_packs_with(&root, 0, 0, || {
+            publish_test_lease(&machine_dir(&root, "01"), &shared);
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(report.entries.is_empty());
+        assert!(shared.exists() && cow.exists());
+    }
+
+    #[test]
+    fn trim_keeps_an_extraction_used_again_while_it_was_scanning() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared, cow) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        age_artifact(&shared, DIGEST_A, 300);
+
+        let report = trim_unleased_shared_packs_with(&root, 0, 0, || {
+            touch_lease(&SharedPackLease {
+                shared_dir: shared.clone(),
+                artifact_sha256: DIGEST_A.to_string(),
+            });
+        })
+        .unwrap()
+        .unwrap();
+
+        assert!(report.entries.is_empty());
+        assert!(shared.exists() && cow.exists());
+        trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
+        assert!(!shared.exists(), "a later trim removes it");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn trim_waits_for_a_ram_write_back_and_then_removes_its_marker() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (writing, _) = install_artifact(&root, "aaaaaaaa", DIGEST_A);
+        let marker = smolvm_pack::extract::unsynced_marker_path(&writing);
+        smolvm_pack::extract::mark_unsynced(&marker).unwrap();
+
+        trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
+        assert!(
+            writing.exists(),
+            "an extraction still being written back stays"
+        );
+
+        smolvm_pack::extract::clear_unsynced(&marker).unwrap();
+        fs::write(&marker, b"an earlier boot\n").unwrap();
+        trim_unleased_shared_packs_in(&root, 0, 0).unwrap().unwrap();
+        assert!(!writing.exists());
+        assert!(!marker.exists(), "the marker goes with its extraction");
+    }
+
     #[test]
     fn leases_protect_both_caches_until_the_last_machine_is_deleted() {
         let temp = tempfile::tempdir().unwrap();
@@ -1157,6 +1805,102 @@ mod tests {
         assert_eq!(real.entries.len(), 1);
         assert!(!shared_a.exists() && !cow_a.exists());
         assert!(shared_b.exists() && cow_b.exists());
+    }
+
+    #[test]
+    fn targeted_prune_removes_only_the_named_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, cow_a) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, cow_b) = install_artifact(&root, "cafebabe", DIGEST_B);
+
+        let dry = prune_selected_in(&root, Some("deadbeef"), 0, true).unwrap();
+        assert_eq!(dry.entries.len(), 1);
+        assert_eq!(dry.entries[0].artifact, DIGEST_A);
+        assert!(dry.entries[0].allocated_bytes > 0);
+        assert!(shared_a.exists() && cow_a.exists());
+
+        let real = prune_selected_in(&root, Some("deadbeef"), 0, false).unwrap();
+        assert_eq!(real, dry);
+        assert!(!shared_a.exists() && !cow_a.exists());
+        assert!(shared_b.exists() && cow_b.exists());
+
+        let gone = prune_selected_in(&root, Some("deadbeef"), 0, false).unwrap();
+        assert!(gone.entries.is_empty());
+        assert_eq!(gone.referenced_entries, 0);
+    }
+
+    #[test]
+    fn targeted_prune_retains_an_artifact_a_machine_references() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, cow_a) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, _) = install_artifact(&root, "cafebabe", DIGEST_B);
+        publish_test_lease(&machine_dir(&root, "01"), &shared_a);
+        publish_test_lease(&machine_dir(&root, "02"), &shared_b);
+
+        let report = prune_selected_in(&root, Some("deadbeef"), 0, false).unwrap();
+        assert!(report.entries.is_empty());
+        assert_eq!(report.referenced_entries, 1);
+        assert!(shared_a.exists() && cow_a.exists());
+    }
+
+    #[test]
+    fn prune_sizes_only_the_artifacts_it_removes() {
+        // Root reads through the mode that would catch a walk of the kept entry.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, _) = install_artifact(&root, "cafebabe", DIGEST_B);
+        fs::OpenOptions::new()
+            .read(true)
+            .open(smolvm_pack::extract::shared_artifact_sha256_path(&shared_b))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        let unreadable = shared_b.join("layers");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = prune_artifact_caches_in(&root, 1, false);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        let report = report.unwrap();
+        assert_eq!(report.entries.len(), 1);
+        assert_eq!(report.entries[0].artifact, DIGEST_A);
+        assert!(report.entries[0].allocated_bytes > 0);
+        assert!(!shared_a.exists());
+        assert!(shared_b.exists());
+    }
+
+    #[test]
+    fn a_sizing_failure_removes_nothing() {
+        // Root reads through the mode that makes sizing fail here.
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("vms");
+        let (shared_a, _) = install_artifact(&root, "deadbeef", DIGEST_A);
+        let (shared_b, _) = install_artifact(&root, "cafebabe", DIGEST_B);
+        // The newer entry comes first, so the one that cannot be sized is second.
+        fs::OpenOptions::new()
+            .read(true)
+            .open(smolvm_pack::extract::shared_artifact_sha256_path(&shared_b))
+            .unwrap()
+            .set_modified(SystemTime::now())
+            .unwrap();
+        let unreadable = shared_a.join("layers");
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o000)).unwrap();
+
+        let report = prune_artifact_caches_in(&root, 0, false);
+        fs::set_permissions(&unreadable, fs::Permissions::from_mode(0o755)).unwrap();
+
+        assert!(report.is_err());
+        assert!(shared_a.exists());
+        assert!(shared_b.exists());
     }
 
     #[test]

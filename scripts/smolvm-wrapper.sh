@@ -4,7 +4,10 @@
 
 set -e
 
-# Resolve symlinks to get the actual script location
+# Resolve symlinks to get the actual script location. Every `$(...)` forks a
+# subshell, and this runs before every smolvm command, so the result goes in
+# RESOLVED rather than through command substitution, and directories are taken
+# with parameter expansion: only `readlink` runs, once per symlink hop.
 resolve_symlink() {
     local target="$1"
     # If target is a relative path or bare command from PATH, resolve it to an absolute path first
@@ -23,20 +26,20 @@ resolve_symlink() {
     fi
 
     while [[ -L "$target" ]]; do
-        local link_dir
-        link_dir="$(cd "$(dirname "$target")" && pwd)"
+        local link_dir="${target%/*}"
         target="$(readlink "$target")"
         # Handle relative symlinks
         if [[ "$target" != /* ]]; then
             target="$link_dir/$target"
         fi
     done
-    echo "$target"
+    RESOLVED="$target"
 }
 
 # Get the directory where the actual script lives (resolving symlinks)
-SCRIPT_PATH="$(resolve_symlink "${BASH_SOURCE[0]}")"
-SCRIPT_DIR="$(cd "$(dirname "$SCRIPT_PATH")" && pwd)"
+resolve_symlink "${BASH_SOURCE[0]}"
+SCRIPT_PATH="$RESOLVED"
+SCRIPT_DIR="${SCRIPT_PATH%/*}"
 
 # The actual binary and libraries are in the same directory
 SMOLVM_BIN="$SCRIPT_DIR/smolvm-bin"
@@ -62,7 +65,7 @@ if [[ ! -d "$SMOLVM_LIB" ]]; then
 fi
 
 # Set library path based on OS and run
-if [[ "$(uname -s)" == "Darwin" ]]; then
+if [[ "$OSTYPE" == darwin* ]]; then
     export DYLD_LIBRARY_PATH="$SMOLVM_LIB${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
 else
     export LD_LIBRARY_PATH="$SMOLVM_LIB${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}"

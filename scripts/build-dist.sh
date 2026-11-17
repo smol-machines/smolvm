@@ -88,6 +88,16 @@ fi
 
 echo "Building smolvm distribution: ${DIST_NAME}"
 
+# The base agent rootfs is built separately. Check for it before the long
+# compile below, not after it.
+ROOTFS_SRC="$PROJECT_ROOT/target/agent-rootfs"
+if [[ ! -d "$ROOTFS_SRC" ]]; then
+    echo "Error: target/agent-rootfs not found"
+    echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs"
+    echo "(--no-build-agent is enough; this script builds the agent itself)."
+    exit 1
+fi
+
 # Check for git-lfs (required for library binaries)
 if ! command -v git-lfs &> /dev/null && ! git lfs version &> /dev/null 2>&1; then
     echo "Error: git-lfs is required to build smolvm distributions"
@@ -246,15 +256,32 @@ if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkru
     exit 1
 fi
 
+# Build a release binary. On Linux, LINUX_GLIBC=2.31 links it against that
+# glibc with zig and cargo-zigbuild instead of the build host's, so it runs on
+# hosts that old; the binary still lands in target/release for the steps below.
+cargo_release() { # $1 = binary name, rest = cargo args
+    local bin="$1"
+    shift
+    if [[ "$(uname -s)" == "Linux" && -n "${LINUX_GLIBC:-}" ]]; then
+        local triple
+        triple="$(uname -m)-unknown-linux-gnu"
+        cargo zigbuild --release --target "${triple}.${LINUX_GLIBC}" "$@"
+        mkdir -p target/release
+        cp "target/${triple}/release/${bin}" "target/release/${bin}"
+    else
+        cargo build --release "$@"
+    fi
+}
+
 # Build release binaries
 echo "Building release binaries..."
-LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release --bin smolvm
+LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo_release smolvm --bin smolvm
 
 # The containerd shim, so a release can run pods as microVMs under Kubernetes
 # without a source checkout. Linux only: containerd is the only consumer, and
 # there is nothing to register it with on macOS or Windows.
 if [[ "$(uname -s)" == "Linux" ]]; then
-    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo build --release -p smolvm-shim --bin containerd-shim-smolvm-v2
+    LIBKRUN_BUNDLE="$WORK_LIB_DIR" cargo_release containerd-shim-smolvm-v2 -p smolvm-shim --bin containerd-shim-smolvm-v2
 fi
 
 # Build the unified `smol` CLI if its source is present (it lives in a sibling
@@ -265,7 +292,7 @@ BUILD_SMOL=0
 if [[ -f "./smol/Cargo.toml" ]]; then
     echo "Building unified smol CLI..."
     _ABS_LIB_BUNDLE="$(cd "$WORK_LIB_DIR" && pwd)"
-    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo build --release --bin smol )
+    ( cd ./smol && LIBKRUN_BUNDLE="$_ABS_LIB_BUNDLE" cargo_release smol --bin smol )
     BUILD_SMOL=1
 else
     echo "smol CLI source (./smol) not found — building engine-only distribution"
@@ -522,12 +549,6 @@ fi
 
 # Build agent-rootfs
 echo "Building agent-rootfs..."
-ROOTFS_SRC="$PROJECT_ROOT/target/agent-rootfs"
-if [[ ! -d "$ROOTFS_SRC" ]]; then
-    echo "Error: target/agent-rootfs not found"
-    echo "Run ./scripts/build-agent-rootfs.sh first to create the base rootfs."
-    exit 1
-fi
 
 # Copy rootfs and update agent binary
 # Use cp -a to preserve symlinks (busybox creates many symlinks in /bin)
@@ -654,7 +675,7 @@ PREREQUISITES
 
 macOS:
   - macOS 11.0 (Big Sur) or later
-  - Apple Silicon or Intel Mac
+  - Apple Silicon Mac
 
 Linux:
   - KVM support (/dev/kvm must exist)
@@ -709,15 +730,26 @@ fi
 echo "Cleaning up existing tarball..."
 rm -f "smolvm-*.tar.gz"
 
+# Everything shipped must load on the glibc floor the build asked for.
+if [[ "$(uname -s)" == "Linux" && -n "${LINUX_GLIBC:-}" ]]; then
+    floor_files=("$DIST_DIR/smolvm-bin")
+    for f in "$DIST_DIR/containerd-shim-smolvm-v2" "$DIST_DIR/smol-bin" "$DIST_DIR"/lib/libkrun.so*; do
+        [[ -f "$f" && ! -L "$f" ]] && floor_files+=("$f")
+    done
+    ./scripts/check-glibc-floor.sh "$LINUX_GLIBC" "${floor_files[@]}"
+fi
+
 # Create tarball. Preserve sparseness so the 20/10 GiB-virtual disk templates
 # (a few hundred KiB physical) don't balloon to full size on extraction. GNU tar
-# needs --sparse; bsdtar (macOS) detects holes automatically.
+# needs --sparse; bsdtar (macOS) detects holes automatically. Store every entry
+# as root: the builder's uid/gid means nothing on the host that extracts it,
+# and a root extraction would otherwise give the files to that uid.
 echo "Creating tarball..."
 cd dist
 if tar --version 2>/dev/null | grep -qi gnu; then
-    tar --sparse -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+    tar --sparse --owner=0 --group=0 --numeric-owner -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
 else
-    tar -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+    tar --uid 0 --gid 0 --uname root --gname root -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
 fi
 cd ..
 

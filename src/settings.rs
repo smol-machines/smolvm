@@ -25,6 +25,7 @@
 //! - `[cloud]` — smolfleet API credentials
 //! - `[machines]` — credentials for OCI registries storing .smolmachine artifacts
 //! - `[images]` — credentials for container image registries (base images for VMs)
+//! - `[usage]` — local usage journal (`record`, default true) and sharing (`share`, default false)
 
 use crate::error::{Error, Result};
 use crate::registry::RegistryConfig;
@@ -43,6 +44,9 @@ pub struct SmolSettings {
     /// Credentials for container image registries.
     #[serde(default)]
     pub images: RegistryConfig,
+    /// Local usage journal and optional sharing.
+    #[serde(default)]
+    pub usage: crate::usage::UsageSection,
 }
 
 /// smolfleet API configuration.

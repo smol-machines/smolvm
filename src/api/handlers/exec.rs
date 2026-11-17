@@ -17,14 +17,29 @@ use std::time::Duration;
 
 use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
-use crate::api::types::{
-    ApiErrorResponse, EnvVar, ExecRequest, ExecResponse, LogsQuery, RunRequest,
-};
+use crate::api::types::{ApiErrorResponse, ExecRequest, ExecResponse, LogsQuery, RunRequest};
 use crate::api::validate_command;
 use crate::api::TraceId;
 use crate::data::consts::BYTES_PER_MIB;
 use crate::data::storage::HostMount;
 use tokio::sync::Semaphore;
+
+/// Refuse, rather than boot, a machine that is not already running.
+pub(crate) async fn require_running(
+    entry: &std::sync::Arc<parking_lot::Mutex<crate::api::state::MachineEntry>>,
+) -> Result<(), ApiError> {
+    let entry = entry.clone();
+    let running =
+        tokio::task::spawn_blocking(move || entry.lock().manager.try_connect_existing().is_some())
+            .await?;
+    if running {
+        Ok(())
+    } else {
+        Err(ApiError::Conflict(
+            "machine is not running and autoStart is false".to_string(),
+        ))
+    }
+}
 
 /// Execute a command in a machine.
 ///
@@ -41,6 +56,7 @@ use tokio::sync::Semaphore;
         (status = 200, description = "Command executed", body = ExecResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine not running and autoStart is false", body = ApiErrorResponse),
         (status = 500, description = "Execution failed", body = ApiErrorResponse)
     )
 )]
@@ -55,10 +71,14 @@ pub async fn exec_command(
 
     let entry = state.get_machine(&id)?;
 
-    // Ensure machine is running and persist state to DB
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
+    if req.auto_start {
+        // Ensure machine is running and persist state to DB
+        ensure_running_and_persist(&state, &id, &entry)
+            .await
+            .map_err(classify_ensure_running_error)?;
+    } else {
+        require_running(&entry).await?;
+    }
 
     // Resolve secrets ONCE, before the background/foreground split, so a
     // detached workload gets them too (a long-lived daemon usually needs its
@@ -67,13 +87,14 @@ pub async fn exec_command(
     // TrustedLocal actor) → req.secrets (ad-hoc, Untrusted). Validation runs
     // before resolution so structural/scope violations surface as 400 without
     // the resolution audit firing.
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
+    let machine_rec = state.lookup_vm(&id).await?;
+    let (env, workdir) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_rec.as_ref(),
+        &req.env,
+        &req.secrets,
+        req.workdir.clone(),
+    )?;
 
     // Detached/background: spawn the process and return its PID immediately, so a
     // long-lived daemon (dev server, agent runner) keeps running after the
@@ -81,9 +102,8 @@ pub async fn exec_command(
     // overlay); plain machines run it in the VM.
     if req.background {
         let command = req.command.clone();
-        let workdir = req.workdir.clone();
         let user = req.user.clone();
-        let machine_rec = state.lookup_vm(&id).await?;
+        let machine_rec = machine_rec.clone();
         // An exec may be what establishes the workload container — the machine's
         // command exited, or the image's own default was short-lived — and that
         // container is where the mount lives, so the config has to target the
@@ -131,10 +151,9 @@ pub async fn exec_command(
         }));
     }
 
-    // Secrets already resolved into `env` above (shared with the background
-    // path); env precedence is req.env < record.secret_refs < req.secrets.
+    // Env and workdir were resolved once above, shared with the background
+    // path (see `machine_command_context` for precedence).
     let command = req.command.clone();
-    let workdir = req.workdir.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
     let stdin_data = req.stdin.clone();
@@ -144,7 +163,6 @@ pub async fn exec_command(
     // sessions. Without this, exec runs in the bare agent VM (no `python3`,
     // etc.) — the image is never entered. Plain machines exec in the VM
     // directly via `vm_exec`.
-    let machine_rec = state.lookup_vm(&id).await?;
     // An exec may be what establishes the workload container — the machine's
     // command exited, or the image's own default was short-lived — and that
     // container is where the mount lives, so the config has to target the
@@ -215,6 +233,7 @@ pub async fn exec_command(
     responses(
         (status = 200, description = "Streaming output (SSE)", content_type = "text/event-stream"),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine not running and autoStart is false", body = ApiErrorResponse),
         (status = 500, description = "Execution failed", body = ApiErrorResponse)
     )
 )]
@@ -228,28 +247,33 @@ pub async fn exec_stream(
     validate_command(&req.command)?;
 
     let entry = state.get_machine(&id)?;
-    ensure_running_and_persist(&state, &id, &entry)
-        .await
-        .map_err(classify_ensure_running_error)?;
+    if req.auto_start {
+        ensure_running_and_persist(&state, &id, &entry)
+            .await
+            .map_err(classify_ensure_running_error)?;
+    } else {
+        require_running(&entry).await?;
+    }
 
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+    let machine_rec = state.lookup_vm(&id).await?;
+    let (env, workdir) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_rec.as_ref(),
+        &req.env,
+        &req.secrets,
+        req.workdir.clone(),
+    )?;
 
     let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
+    let stdin_data = req.stdin.map(String::into_bytes);
 
     // Image-based machines stream from a container in their image (persistent
     // overlay keyed by machine name); plain machines stream from the VM
     // directly. Without this, streaming exec on an image machine produces no
     // output (the agent-base streaming path doesn't enter the container).
-    let machine_rec = state.lookup_vm(&id).await?;
+    let machine_rec = machine_rec.clone();
     // An exec may be what establishes the workload container — the machine's
     // command exited, or the image's own default was short-lived — and that
     // container is where the mount lives, so the config has to target the
@@ -257,16 +281,10 @@ pub async fn exec_stream(
     let machine_for_run = machine_rec.clone();
     let machine_image = machine_rec.and_then(|r| r.image);
 
-    // Bridge the blocking, synchronous vsock streaming exec to an async SSE
-    // stream: a spawned blocking task runs the exec and pushes each ExecEvent
-    // into an unbounded channel AS IT ARRIVES; the SSE stream below yields
-    // them live. Previously this collected every event into a Vec and only
-    // built the SSE stream AFTER the command completed, so the "stream"
-    // delivered nothing until exit — defeating streaming exec (F-16). The
-    // per-session output cap is still enforced inside the agent client's
-    // streaming collector (MAX_STREAMING_EXEC_OUTPUT), which emits a
-    // truncation Error event and stops relaying.
-    let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<crate::agent::ExecEvent>();
+    // Bridge blocking vsock exec to a bounded async SSE channel. The callback
+    // runs inside spawn_blocking, so backpressure does not block the reactor;
+    // preserve the existing stdin forwarding and UTF-8 decoding paths.
+    let (tx, rx) = tokio::sync::mpsc::channel::<crate::agent::ExecEvent>(EXEC_STREAM_QUEUE_SIZE);
     let err_tx = tx.clone();
     let entry_exec = entry.clone();
     let start = std::time::Instant::now();
@@ -294,15 +312,15 @@ pub async fn exec_stream(
                     .with_mounts(mounts_config)
                     .with_timeout(timeout)
                     .in_machine_opt(machine_for_run.as_ref(), &id, &env_for_volumes);
-                c.run_streaming_with(config, |e| {
-                    let _ = tx.send(e);
+                c.run_streaming_with_stdin(config, stdin_data, |e| {
+                    forward_exec_event(&tx, e);
                 })
             })
             .await
         } else {
             with_machine_client_traced(&entry_exec, tid, move |c| {
-                c.vm_exec_streaming_with(command, env, workdir, timeout, |e| {
-                    let _ = tx.send(e);
+                c.vm_exec_streaming_with_stdin(command, env, workdir, timeout, stdin_data, |e| {
+                    forward_exec_event(&tx, e);
                 })
             })
             .await
@@ -312,32 +330,136 @@ pub async fn exec_stream(
         // status once the SSE has begun, so surface them as a terminal error
         // event instead of silently ending the stream.
         if let Err(e) = result {
-            let _ = err_tx.send(crate::agent::ExecEvent::Error(format!("{e:?}")));
+            let _ = err_tx
+                .send(crate::agent::ExecEvent::Error(format!("{e:?}")))
+                .await;
         }
     });
 
     // Yield each event as an SSE frame the instant it lands in the channel.
-    let stream = async_stream::stream! {
-        while let Some(event) = rx.recv().await {
-            let sse_event = match event {
-                crate::agent::ExecEvent::Stdout(data) => Event::default()
-                    .event("stdout")
-                    .data(String::from_utf8_lossy(&data)),
-                crate::agent::ExecEvent::Stderr(data) => Event::default()
-                    .event("stderr")
-                    .data(String::from_utf8_lossy(&data)),
-                crate::agent::ExecEvent::Exit(code) => Event::default()
-                    .event("exit")
-                    .data(format!("{{\"exitCode\":{}}}", code)),
-                crate::agent::ExecEvent::Error(msg) => Event::default()
-                    .event("error")
-                    .data(format!("{{\"message\":\"{}\"}}", msg)),
-            };
-            yield Ok::<_, Infallible>(sse_event);
-        }
-    };
+    Ok(Sse::new(exec_event_stream(rx)).keep_alive(KeepAlive::default()))
+}
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+fn exec_event_stream(
+    mut rx: tokio::sync::mpsc::Receiver<crate::agent::ExecEvent>,
+) -> impl futures_util::Stream<Item = Result<Event, Infallible>> {
+    async_stream::stream! {
+        let mut stdout = Utf8ExecOutput::default();
+        let mut stderr = Utf8ExecOutput::default();
+        while let Some(event) = rx.recv().await {
+            match event {
+                crate::agent::ExecEvent::Stdout(bytes) => {
+                    if let Some(text) = stdout.decode(&bytes) {
+                        yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+                    }
+                }
+                crate::agent::ExecEvent::Stderr(bytes) => {
+                    if let Some(text) = stderr.decode(&bytes) {
+                        yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+                    }
+                }
+                terminal => {
+                    // A stream can end in the middle of a UTF-8 character. Emit
+                    // the replacement before exit/error, while keeping complete
+                    // characters intact across guest output chunks.
+                    if let Some(text) = stdout.finish() {
+                        yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+                    }
+                    if let Some(text) = stderr.finish() {
+                        yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+                    }
+                    yield Ok::<_, Infallible>(exec_event_to_sse(terminal));
+                }
+            }
+        }
+        if let Some(text) = stdout.finish() {
+            yield Ok::<_, Infallible>(Event::default().event("stdout").data(text));
+        }
+        if let Some(text) = stderr.finish() {
+            yield Ok::<_, Infallible>(Event::default().event("stderr").data(text));
+        }
+    }
+}
+
+/// Decode one output stream without replacing a valid code point split across
+/// two agent frames. Only an incomplete trailing character is retained.
+#[derive(Default)]
+struct Utf8ExecOutput {
+    partial: Vec<u8>,
+}
+
+impl Utf8ExecOutput {
+    fn decode(&mut self, bytes: &[u8]) -> Option<String> {
+        if self.partial.is_empty() {
+            if let Ok(valid) = std::str::from_utf8(bytes) {
+                return (!valid.is_empty()).then(|| valid.to_owned());
+            }
+        }
+        let mut buffer = std::mem::take(&mut self.partial);
+        buffer.extend_from_slice(bytes);
+        let mut result = String::new();
+        let mut cursor = 0;
+        while cursor < buffer.len() {
+            match std::str::from_utf8(&buffer[cursor..]) {
+                Ok(valid) => {
+                    result.push_str(valid);
+                    break;
+                }
+                Err(err) => {
+                    let valid_end = cursor + err.valid_up_to();
+                    result.push_str(std::str::from_utf8(&buffer[cursor..valid_end]).unwrap());
+                    cursor = valid_end;
+                    match err.error_len() {
+                        Some(len) => {
+                            result.push('\u{fffd}');
+                            cursor += len;
+                        }
+                        None => {
+                            self.partial.extend_from_slice(&buffer[cursor..]);
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+        (!result.is_empty()).then_some(result)
+    }
+
+    fn finish(&mut self) -> Option<String> {
+        let partial = std::mem::take(&mut self.partial);
+        (!partial.is_empty()).then(|| String::from_utf8_lossy(&partial).into_owned())
+    }
+}
+
+/// Maximum number of guest events waiting for a slow HTTP reader.
+const EXEC_STREAM_QUEUE_SIZE: usize = 8;
+
+fn forward_exec_event(
+    tx: &tokio::sync::mpsc::Sender<crate::agent::ExecEvent>,
+    event: crate::agent::ExecEvent,
+) {
+    // Called only from the spawn_blocking agent callback. A closed HTTP stream
+    // drops its receiver, which releases a blocked sender immediately.
+    let _ = tx.blocking_send(event);
+}
+
+/// Encode a guest exec event as an SSE frame. Errors can include arbitrary
+/// guest or transport text, so JSON-escape their payload before sending it.
+fn exec_event_to_sse(event: crate::agent::ExecEvent) -> Event {
+    match event {
+        crate::agent::ExecEvent::Stdout(data) => Event::default()
+            .event("stdout")
+            .data(String::from_utf8_lossy(&data)),
+        crate::agent::ExecEvent::Stderr(data) => Event::default()
+            .event("stderr")
+            .data(String::from_utf8_lossy(&data)),
+        crate::agent::ExecEvent::Exit(code) => Event::default()
+            .event("exit")
+            .data(serde_json::json!({"exitCode": code}).to_string()),
+        crate::agent::ExecEvent::Error(msg) => Event::default()
+            .event("error")
+            .data(serde_json::json!({"message": msg}).to_string()),
+    }
 }
 
 /// Run a command in an image.
@@ -374,17 +496,20 @@ pub async fn run_command(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let record_env = crate::api::handlers::record_secret_refs_env(&entry)?;
-    let req_env = crate::api::handlers::resolve_request_secrets(&req.secrets)?;
+    let machine_rec = state.lookup_vm(&id).await?;
+    // `run` starts a different image in the machine, where the machine's own
+    // workdir may not exist: it takes the machine's env, not its workdir.
+    let (env, _) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_rec.as_ref(),
+        &req.env,
+        &req.secrets,
+        None,
+    )?;
+    let workdir = req.workdir.clone();
 
     let image = req.image.clone();
     let command = req.command.clone();
-    let mut env = EnvVar::to_tuples(&req.env);
-    env.extend(crate::secrets::expose_into_env(record_env));
-    env.extend(crate::secrets::expose_into_env(req_env));
-    let workdir = req.workdir.clone();
     let user = req.user.clone();
     let timeout = req.timeout_secs.map(Duration::from_secs);
 
@@ -424,24 +549,69 @@ pub async fn run_command(
     }))
 }
 
-/// Query parameters for an interactive PTY session.
+/// Query parameters for an interactive session.
 #[derive(Debug, serde::Deserialize)]
 pub struct InteractiveQuery {
-    /// Program to run (single argv[0]); defaults to `/bin/sh`.
+    /// Program to run (argv[0]); defaults to `/bin/sh`. Its arguments follow as
+    /// repeated `arg` parameters, in order.
     pub cmd: Option<String>,
-    /// Initial terminal width in columns.
+    /// Initial terminal width in columns (`tty=true` only).
     pub cols: Option<u16>,
-    /// Initial terminal height in rows.
+    /// Initial terminal height in rows (`tty=true` only).
     pub rows: Option<u16>,
+    /// Run the command on a PTY (the default). `tty=false` runs it on pipes
+    /// instead: a byte stream in both directions with nothing between them and
+    /// the command, no terminal line discipline, and stderr kept apart.
+    pub tty: Option<bool>,
 }
 
-/// Interactive PTY session over a WebSocket.
+/// Largest piece of a WebSocket message forwarded to the command as one stdin
+/// frame. The agent protocol carries stdin as JSON and bounds a frame, so a
+/// large message is split rather than ending the session.
+const STDIN_CHUNK_BYTES: usize = 64 * 1024;
+
+/// Stdin events that may wait for the session to take them. Beyond this the
+/// WebSocket is no longer read, which pushes back on the client.
+const INPUT_QUEUE_EVENTS: usize = 64;
+
+/// The command an interactive session runs: the program, then every `arg`
+/// query parameter in the order given (an empty argument is an argument).
+fn interactive_command(
+    program: Option<String>,
+    parameters: Vec<(String, String)>,
+) -> Result<Vec<String>, ApiError> {
+    let mut command = vec![program.unwrap_or_else(|| "/bin/sh".to_string())];
+    if command[0].is_empty() {
+        return Err(ApiError::BadRequest("command cannot be empty".into()));
+    }
+    command.extend(
+        parameters
+            .into_iter()
+            .filter(|(name, _)| name == "arg")
+            .map(|(_, value)| value),
+    );
+    validate_command(&command)?;
+    Ok(command)
+}
+
+/// Interactive session over a WebSocket.
 ///
 /// The client connects a WebSocket; binary frames are forwarded to the
-/// command's stdin and the PTY's output is sent back as binary frames. A JSON
-/// text frame `{"type":"resize","cols":N,"rows":N}` resizes the terminal. When
-/// the command exits, a final text frame `{"type":"exit","code":N}` is sent
-/// before the socket closes.
+/// command's stdin and its output is sent back as binary frames. A JSON text
+/// frame `{"type":"resize","cols":N,"rows":N}` resizes the terminal. When the
+/// command exits, a final text frame `{"type":"exit","code":N}` is sent before
+/// the socket closes. Closing the socket ends the session, and the command is
+/// killed.
+///
+/// Query parameters: `cmd` is the program and each `arg` one argument to it;
+/// `tty` chooses between a PTY (the default, which merges stderr into stdout)
+/// and pipes.
+///
+/// With `tty=false` stdin is written with backpressure and nothing is ever
+/// dropped: the WebSocket is read only as fast as the command takes its input.
+/// Standard output is the binary frames, byte for byte. Standard error is
+/// reported as text frames `{"type":"stderr","data":"..."}` (lossily decoded
+/// as UTF-8), so it never mixes into the stream.
 ///
 /// Image machines run the program in their persistent-overlay container (the
 /// same filesystem `exec` uses); plain machines run it directly in the VM.
@@ -449,9 +619,13 @@ pub async fn exec_interactive(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(q): Query<InteractiveQuery>,
+    Query(parameters): Query<Vec<(String, String)>>,
     _trace_id: Option<axum::Extension<TraceId>>,
     ws: WebSocketUpgrade,
 ) -> Result<axum::response::Response, ApiError> {
+    let command = interactive_command(q.cmd.clone(), parameters)?;
+    let tty = q.tty.unwrap_or(true);
+
     let entry = state.get_machine(&id)?;
     ensure_running_and_persist(&state, &id, &entry)
         .await
@@ -462,8 +636,17 @@ pub async fn exec_interactive(
     // An interactive session may be what establishes the workload container,
     // and the mount lives there.
     let machine_for_run = machine_record.clone();
+    // A terminal sees what an `exec` sees: the machine's environment, secrets
+    // and working directory. Without them a console shell ran with none, so a
+    // tool reading an API key from the environment found nothing.
+    let (env, workdir) = crate::api::handlers::machine_command_context(
+        &entry,
+        machine_record.as_ref(),
+        &[],
+        &Default::default(),
+        None,
+    )?;
 
-    let command = vec![q.cmd.clone().unwrap_or_else(|| "/bin/sh".to_string())];
     let init_size = (q.cols.unwrap_or(80), q.rows.unwrap_or(24));
 
     // Snapshot mounts now (used only for image runs) so the upgrade closure
@@ -477,147 +660,195 @@ pub async fn exec_interactive(
             .collect::<Vec<_>>()
     };
 
-    Ok(ws.on_upgrade(move |socket| async move {
-        let (mut ws_tx, mut ws_rx) = socket.split();
-
-        // Input channel: WS task → blocking session (sync mpsc; session try_recv's it).
-        let (in_tx, in_rx) = std::sync::mpsc::channel::<crate::agent::InteractiveInput>();
-        // Output channel: blocking session → WS task (tokio mpsc; blocking_send from session).
-        let (out_tx, mut out_rx) =
-            tokio::sync::mpsc::channel::<crate::agent::InteractiveOutput>(256);
-
-        // Seed the initial PTY size before any input.
-        let _ = in_tx.send(crate::agent::InteractiveInput::Resize {
-            cols: init_size.0,
-            rows: init_size.1,
-        });
-
-        // Run the interactive session on a DEDICATED agent connection — NOT the
-        // shared per-machine client. A PTY can outlive its usefulness (a client
-        // that disconnects while a `sleep` or daemon keeps running), and holding
-        // the shared client lock for the whole session would block every other
-        // operation on that machine until the command exits. A fresh connection
-        // also lets the agent kill the PTY child the moment we drop it on
-        // disconnect. We lock the entry only briefly, to dial.
-        let session_entry = entry.clone();
-        let session = tokio::spawn(async move {
-            let connect = { session_entry.lock().manager.connect() };
-            let mut client = match connect {
-                Ok(c) => c,
-                Err(e) => {
-                    tracing::warn!(error = ?e, "pty: failed to open dedicated agent connection");
-                    return -1;
-                }
-            };
-            tokio::task::spawn_blocking(move || {
-                let on_output = move |o| {
-                    // If the WS side is gone, the receiver is dropped; ignore.
-                    let _ = out_tx.blocking_send(o);
+    Ok(ws.on_upgrade(move |socket| {
+        bridge_interactive(socket, tty, init_size, move |input, out_tx| {
+            // Run the session on a DEDICATED agent connection — NOT the shared
+            // per-machine client. A PTY can outlive its usefulness (a client
+            // that disconnects while a `sleep` or daemon keeps running), and
+            // holding the shared client lock for the whole session would block
+            // every other operation on that machine until the command exits. A
+            // fresh connection also lets the agent kill the child the moment we
+            // drop it on disconnect. We lock the entry only briefly, to dial.
+            async move {
+                let connect = { entry.lock().manager.connect() };
+                let mut client = match connect {
+                    Ok(c) => c,
+                    Err(e) => {
+                        tracing::warn!(error = ?e, "interactive: failed to open dedicated agent connection");
+                        return -1;
+                    }
                 };
-                if let Some(image) = machine_image {
-                    match client.query(&image) {
-                        Ok(Some(_)) => {}
-                        Ok(None) => {
-                            if let Err(e) = client.pull_with_registry_config(&image) {
-                                tracing::warn!(error = ?e, "pty: image pull failed");
+                tokio::task::spawn_blocking(move || {
+                    let on_output = move |o| {
+                        // If the WS side is gone, the receiver is dropped; ignore.
+                        let _ = out_tx.blocking_send(o);
+                    };
+                    if let Some(image) = machine_image {
+                        match client.query(&image) {
+                            Ok(Some(_)) => {}
+                            Ok(None) => {
+                                if let Err(e) = client.pull_with_registry_config(&image) {
+                                    tracing::warn!(error = ?e, "interactive: image pull failed");
+                                    return -1;
+                                }
+                            }
+                            Err(e) => {
+                                tracing::warn!(error = ?e, "interactive: image query failed");
                                 return -1;
                             }
                         }
-                        Err(e) => {
-                            tracing::warn!(error = ?e, "pty: image query failed");
-                            return -1;
+                        let config = crate::agent::RunConfig::new(image, command)
+                            .with_env(env.clone())
+                            .with_workdir(workdir)
+                            .with_mounts(mounts_config)
+                            .with_tty(tty)
+                            .in_machine_opt(machine_for_run.as_ref(), &id, &env);
+                        client
+                            .run_interactive_io(config, input, on_output)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = ?e, "interactive: run failed");
+                                -1
+                            })
+                    } else {
+                        client
+                            .vm_exec_interactive_io(command, env, workdir, tty, input, on_output)
+                            .unwrap_or_else(|e| {
+                                tracing::warn!(error = ?e, "interactive: vm exec failed");
+                                -1
+                            })
+                    }
+                })
+                .await
+                .unwrap_or(-1)
+            }
+        })
+    }))
+}
+
+/// Carry one WebSocket to an interactive agent session and back.
+///
+/// `session` starts the session, given the receiving half of the input channel
+/// and the sending half of the output channel, and returns the command's exit
+/// code (or a sentinel: -1 on internal error, 130 on disconnect).
+pub(crate) async fn bridge_interactive<S, F>(
+    socket: axum::extract::ws::WebSocket,
+    tty: bool,
+    size: (u16, u16),
+    session: S,
+) where
+    S: FnOnce(
+        crate::agent::InteractiveInputReceiver,
+        tokio::sync::mpsc::Sender<crate::agent::InteractiveOutput>,
+    ) -> F,
+    F: std::future::Future<Output = i32> + Send + 'static,
+{
+    use crate::agent::{InteractiveInput, InteractiveOutput};
+
+    let (mut ws_tx, mut ws_rx) = socket.split();
+    let exit_frame =
+        |code: i32| Message::Text(format!("{{\"type\":\"exit\",\"code\":{code}}}").into());
+
+    let (in_tx, in_rx) = match crate::agent::interactive_input(INPUT_QUEUE_EVENTS) {
+        Ok(channel) => channel,
+        Err(e) => {
+            tracing::warn!(error = ?e, "interactive: could not create the input channel");
+            let _ = ws_tx.send(exit_frame(-1)).await;
+            let _ = ws_tx.send(Message::Close(None)).await;
+            return;
+        }
+    };
+    // Output channel: blocking session -> WS task (the session blocks in send).
+    let (out_tx, mut out_rx) = tokio::sync::mpsc::channel::<InteractiveOutput>(256);
+
+    // Seed the initial PTY size before any input.
+    if tty {
+        let _ = in_tx
+            .send(InteractiveInput::Resize {
+                cols: size.0,
+                rows: size.1,
+            })
+            .await;
+    }
+
+    let session = tokio::spawn(session(in_rx, out_tx));
+
+    // Pump WS -> session input. Dropping `in_tx` (when this task ends) tells the
+    // session its peer is gone.
+    let input_pump = tokio::spawn(async move {
+        while let Some(Ok(msg)) = ws_rx.next().await {
+            let sent = match msg {
+                Message::Binary(b) => {
+                    let mut sent = Ok(());
+                    for chunk in b.chunks(STDIN_CHUNK_BYTES) {
+                        sent = in_tx.send(InteractiveInput::Stdin(chunk.to_vec())).await;
+                        if sent.is_err() {
+                            break;
                         }
                     }
-                    let config = crate::agent::RunConfig::new(image, command)
-                        .with_mounts(mounts_config)
-                        .with_tty(true)
-                        .in_machine_opt(machine_for_run.as_ref(), &id, &[]);
-                    client
-                        .run_interactive_io(config, in_rx, on_output)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = ?e, "pty: interactive run failed");
-                            -1
-                        })
-                } else {
-                    client
-                        .vm_exec_interactive_io(command, Vec::new(), None, true, in_rx, on_output)
-                        .unwrap_or_else(|e| {
-                            tracing::warn!(error = ?e, "pty: interactive vm_exec failed");
-                            -1
-                        })
+                    sent
                 }
-            })
-            .await
-            .unwrap_or(-1)
-        });
-
-        // Pump WS → session input. Dropping `in_tx` (when this task ends) signals
-        // EOF to the session via channel disconnect.
-        let input_pump = tokio::spawn(async move {
-            while let Some(Ok(msg)) = ws_rx.next().await {
-                match msg {
-                    Message::Binary(b)
-                        if in_tx
-                            .send(crate::agent::InteractiveInput::Stdin(b.to_vec()))
-                            .is_err() =>
-                    {
-                        break;
-                    }
-                    Message::Binary(_) => {}
-                    Message::Text(t) => {
-                        // Control frames are JSON; anything else is treated as raw stdin.
-                        match serde_json::from_str::<serde_json::Value>(t.as_str()) {
-                            Ok(v) if v["type"] == "resize" => {
+                Message::Text(t) => {
+                    // Control frames are JSON; anything else is treated as raw stdin.
+                    match serde_json::from_str::<serde_json::Value>(t.as_str()) {
+                        Ok(v) if v["type"] == "resize" => {
+                            if tty {
                                 let cols = v["cols"].as_u64().unwrap_or(80) as u16;
                                 let rows = v["rows"].as_u64().unwrap_or(24) as u16;
-                                let _ = in_tx
-                                    .send(crate::agent::InteractiveInput::Resize { cols, rows });
-                            }
-                            Ok(v) if v["type"] == "stdin" => {
-                                if let Some(d) = v["data"].as_str() {
-                                    let _ = in_tx.send(crate::agent::InteractiveInput::Stdin(
-                                        d.as_bytes().to_vec(),
-                                    ));
-                                }
-                            }
-                            _ => {
-                                let _ = in_tx.send(crate::agent::InteractiveInput::Stdin(
-                                    t.as_bytes().to_vec(),
-                                ));
+                                in_tx.send(InteractiveInput::Resize { cols, rows }).await
+                            } else {
+                                Ok(())
                             }
                         }
+                        Ok(v) if v["type"] == "stdin" => match v["data"].as_str() {
+                            Some(d) => {
+                                in_tx
+                                    .send(InteractiveInput::Stdin(d.as_bytes().to_vec()))
+                                    .await
+                            }
+                            None => Ok(()),
+                        },
+                        _ => {
+                            in_tx
+                                .send(InteractiveInput::Stdin(t.as_bytes().to_vec()))
+                                .await
+                        }
                     }
-                    Message::Close(_) => {
-                        let _ = in_tx.send(crate::agent::InteractiveInput::Eof);
-                        break;
-                    }
-                    _ => {}
                 }
-            }
-        });
-
-        // Pump session output → WS. Ends when the session drops `out_tx` (command exit).
-        while let Some(o) = out_rx.recv().await {
-            let bytes = match o {
-                crate::agent::InteractiveOutput::Stdout(d)
-                | crate::agent::InteractiveOutput::Stderr(d) => d,
+                Message::Close(_) => {
+                    let _ = in_tx.send(InteractiveInput::Eof).await;
+                    return;
+                }
+                _ => Ok(()),
             };
-            if ws_tx.send(Message::Binary(bytes.into())).await.is_err() {
-                break;
+            if sent.is_err() {
+                return;
             }
         }
+    });
 
-        // Report the exit code and close. The session task returns the command's
-        // exit code (or a sentinel: -1 on internal error, 130 on disconnect).
-        let code = session.await.unwrap_or(-1);
-        let _ = ws_tx
-            .send(Message::Text(
-                format!("{{\"type\":\"exit\",\"code\":{code}}}").into(),
-            ))
-            .await;
-        let _ = ws_tx.send(Message::Close(None)).await;
-        input_pump.abort();
-    }))
+    // Pump session output -> WS. Ends when the session drops `out_tx` (command exit).
+    while let Some(o) = out_rx.recv().await {
+        let message = match o {
+            InteractiveOutput::Stdout(d) => Message::Binary(d.into()),
+            // A PTY has one output stream, which the agent reports as stdout. On
+            // pipes stderr is a stream of its own and must not join the bytes.
+            InteractiveOutput::Stderr(d) if tty => Message::Binary(d.into()),
+            InteractiveOutput::Stderr(d) => Message::Text(
+                serde_json::json!({"type": "stderr", "data": String::from_utf8_lossy(&d)})
+                    .to_string()
+                    .into(),
+            ),
+        };
+        if ws_tx.send(message).await.is_err() {
+            break;
+        }
+    }
+
+    // Report the exit code and close.
+    let code = session.await.unwrap_or(-1);
+    let _ = ws_tx.send(exit_frame(code)).await;
+    let _ = ws_tx.send(Message::Close(None)).await;
+    input_pump.abort();
 }
 
 /// Maximum number of concurrent log-follow SSE streams.
@@ -634,7 +865,8 @@ static LOG_FOLLOW_SEMAPHORE: std::sync::LazyLock<Semaphore> =
     params(
         ("id" = String, Path, description = "Machine name"),
         ("follow" = Option<bool>, Query, description = "Follow the logs (like tail -f)"),
-        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end")
+        ("tail" = Option<usize>, Query, description = "Number of lines to show from the end"),
+        ("source" = Option<String>, Query, description = "\"console\" (default) for the agent and kernel console, or \"workload\" for the workload's stdout and stderr, readable while the machine is stopped")
     ),
     responses(
         (status = 200, description = "Log stream (SSE)", content_type = "text/event-stream"),
@@ -645,15 +877,49 @@ pub async fn stream_logs(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     Query(query): Query<LogsQuery>,
-) -> Result<Sse<impl tokio_stream::Stream<Item = Result<Event, Infallible>>>, ApiError> {
+    headers: axum::http::HeaderMap,
+) -> Result<axum::response::Response, ApiError> {
+    let last_event_id = headers
+        .get("last-event-id")
+        .and_then(|v| v.to_str().ok())
+        .and_then(|v| v.trim().parse::<u64>().ok());
+    let log_path = match query.source.as_deref() {
+        None | Some("console") => console_log_path(&state, &id)?,
+        Some("workload") => workload_log_path(&state, &id).await?,
+        Some(other) => {
+            return Err(ApiError::BadRequest(format!(
+                "unknown log source '{other}': use \"console\" or \"workload\""
+            )))
+        }
+    };
+    stream_log_file(&id, log_path, query, last_event_id).await
+}
+
+/// A machine's workload log. It lives in the machine's data directory and is
+/// kept across restarts, so it is served whether or not the machine runs.
+async fn workload_log_path(state: &ApiState, id: &str) -> Result<PathBuf, ApiError> {
+    let db = state.db().clone();
+    let name = id.to_string();
+    let known = tokio::task::spawn_blocking(move || matches!(db.get_vm(&name), Ok(Some(_))))
+        .await
+        .map_err(ApiError::internal)?;
+    if !known {
+        return Err(ApiError::NotFound(format!("machine '{id}' not found")));
+    }
+    Ok(crate::workload_log::workload_log_path(
+        &crate::agent::vm_data_dir(id),
+    ))
+}
+
+fn console_log_path(state: &ApiState, id: &str) -> Result<PathBuf, ApiError> {
     // get_machine only knows machines in the running map. Distinguish a real
     // typo (absent from the DB too) from a machine that exists but was never
     // started (present in the DB, no console log yet) so clients don't read a
     // created machine as "not found".
-    let entry = match state.get_machine(&id) {
+    let entry = match state.get_machine(id) {
         Ok(e) => e,
         Err(_) => {
-            let known = matches!(state.db().get_vm(&id), Ok(Some(_)));
+            let known = matches!(state.db().get_vm(id), Ok(Some(_)));
             return Err(if known {
                 ApiError::NotFound(format!(
                     "machine '{id}' has not been started yet — no logs available"
@@ -664,16 +930,20 @@ pub async fn stream_logs(
         }
     };
 
-    // Get console log path
-    let log_path: PathBuf = {
-        let entry = entry.lock();
-        entry
-            .manager
-            .console_log()
-            .ok_or_else(|| ApiError::NotFound("console log not configured".into()))?
-            .to_path_buf()
-    };
+    let entry = entry.lock();
+    Ok(entry
+        .manager
+        .console_log()
+        .ok_or_else(|| ApiError::NotFound("console log not configured".into()))?
+        .to_path_buf())
+}
 
+async fn stream_log_file(
+    id: &str,
+    log_path: PathBuf,
+    query: LogsQuery,
+    last_event_id: Option<u64>,
+) -> Result<axum::response::Response, ApiError> {
     // Check if file exists (blocking check is acceptable here since it's fast)
     let path_check = log_path.clone();
     let exists = tokio::task::spawn_blocking(move || path_check.exists())
@@ -694,6 +964,11 @@ pub async fn stream_logs(
     let follow = query.follow;
     let tail = query.tail;
     let json_only = query.format.as_deref() == Some("json");
+    // A resumed read starts at the offset the client last received (`after`,
+    // or the SSE `Last-Event-ID` its client library sends on reconnect), and
+    // every event then carries the offset just past its line as its `id`.
+    let resume_from = query.after.or(last_event_id);
+    let with_ids = query.ids || resume_from.is_some();
 
     // Validate tail value upfront
     const MAX_TAIL_LINES: usize = 10_000;
@@ -719,42 +994,127 @@ pub async fn stream_logs(
         None
     };
 
-    // For tail, read last N lines upfront using spawn_blocking with bounded memory
-    let (initial_lines, start_pos) = if let Some(n) = tail {
-        let path = log_path.clone();
-        tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
-            .await
-            .map_err(ApiError::internal)?
-            .map_err(ApiError::internal)?
-    } else {
-        (Vec::new(), 0)
+    // For tail, read last N lines upfront using spawn_blocking with bounded
+    // memory. A resumed read has no tail: it continues where it left off.
+    let (initial_lines, start_pos) = match (tail, resume_from) {
+        (Some(n), None) => {
+            let path = log_path.clone();
+            tokio::task::spawn_blocking(move || read_last_n_lines_bounded(&path, n))
+                .await
+                .map_err(ApiError::internal)?
+                .map_err(ApiError::internal)?
+        }
+        _ => (Vec::new(), 0),
     };
 
-    // Create the SSE stream
-    let stream = async_stream::stream! {
+    let stream = log_event_stream(
+        log_path,
+        LogRead {
+            follow,
+            tail: tail.filter(|_| resume_from.is_none()),
+            start_pos: resume_from.unwrap_or(start_pos),
+            json_only,
+            with_ids,
+        },
+        initial_lines,
+        follow_permit,
+    );
+
+    use axum::response::IntoResponse as _;
+    Ok((
+        [
+            (axum::http::header::CONTENT_TYPE, "text/event-stream"),
+            (axum::http::header::CACHE_CONTROL, "no-cache"),
+        ],
+        axum::body::Body::from_stream(stream),
+    )
+        .into_response())
+}
+
+/// How to read a log for [`log_event_stream`].
+#[derive(Debug, Clone, Copy)]
+struct LogRead {
+    /// Keep reading as the file grows.
+    follow: bool,
+    /// The read began with this many tail lines (already read).
+    tail: Option<usize>,
+    /// The file offset to read from: where the tail lines end, or where a
+    /// resumed read left off; 0 for a read of the whole file.
+    start_pos: u64,
+    /// Only lines that parse as JSON.
+    json_only: bool,
+    /// Give every event the offset just past its line as its SSE `id`.
+    with_ids: bool,
+}
+
+/// The log at `log_path` as an SSE body: the `tail` lines already read
+/// (`initial_lines`, each with the offset just past it), then the file from
+/// `start_pos`, to its end or, with `follow`, as it grows.
+///
+/// The live log is rotated by copying it to `<log>.1` and truncating it. A
+/// read whose offset is past the end of the file therefore lost the race
+/// with a rotation: it finishes the copied part from `<log>.1` and goes on
+/// from the start of the live file, instead of waiting for the file to grow
+/// back past its old offset.
+fn log_event_stream(
+    log_path: PathBuf,
+    read: LogRead,
+    initial_lines: Vec<(String, u64)>,
+    follow_permit: Option<tokio::sync::SemaphorePermit<'static>>,
+) -> impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>> {
+    let LogRead {
+        follow,
+        tail,
+        start_pos,
+        json_only,
+        with_ids,
+    } = read;
+    // One SSE event per line, as before, but many lines per write. Each write
+    // reaches an HTTP/2 client as its own DATA frame, and a client that receives
+    // too many small frames faster than it reads them (h2 counts them per
+    // connection) closes the whole connection, failing everything else on it.
+    async_stream::stream! {
         // Hold the follow permit for the stream's lifetime so it's released
         // when the client disconnects or the stream ends.
         let _permit = follow_permit;
+        let mut batch = LogEvents::default();
+        let keep = |line: &str| !json_only || serde_json::from_str::<serde_json::Value>(line).is_ok();
 
         // Emit initial tail lines first
-        for line in initial_lines {
-            if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
+        for (line, end) in initial_lines {
+            if !keep(&line) {
                 continue; // skip non-JSON lines in json mode
             }
-            yield Ok(Event::default().data(line));
+            batch.push_event(&line, with_ids.then_some(end));
+            if batch.is_full() {
+                yield Ok::<_, Infallible>(batch.take());
+            }
+        }
+        if !batch.is_empty() {
+            yield Ok(batch.take());
         }
 
         if tail.is_some() && !follow {
             return;
         }
 
+        // A resumable read names where it stands before any line arrives, so a
+        // client that loses the stream before the first line still resumes
+        // from here (an event of an id alone sets the client's last id).
+        if with_ids {
+            yield Ok(axum::body::Bytes::from(format!("id: {start_pos}\n\n")));
+        }
+
         // For following or full read, poll the file for new content
-        let mut pos = if tail.is_some() { start_pos } else { 0 };
-        let mut partial_line = String::new();
+        let mut pos = start_pos;
+        let mut partial: Vec<u8> = Vec::new();
+        let mut last_write = tokio::time::Instant::now();
+        // A read from the copy of a rotated log, then the live file from 0.
+        let mut reading_rotated = false;
 
         loop {
             // Read new content in spawn_blocking
-            let path = log_path.clone();
+            let path = if reading_rotated { rotated_log_path(&log_path) } else { log_path.clone() };
             let current_pos = pos;
 
             let result = tokio::task::spawn_blocking(move || {
@@ -763,55 +1123,180 @@ pub async fn stream_logs(
             .await
             .unwrap_or_else(|e| Err(std::io::Error::other(e)));
 
-            match result {
-                Ok((new_data, new_pos)) => {
-                    pos = new_pos;
-                    if !new_data.is_empty() {
-                        partial_line.push_str(&new_data);
-                        // Yield complete lines
-                        while let Some(newline_pos) = partial_line.find('\n') {
-                            let line = partial_line[..newline_pos].trim_end_matches('\r').to_string();
-                            partial_line = partial_line[newline_pos + 1..].to_string();
-                            if json_only && serde_json::from_str::<serde_json::Value>(&line).is_err() {
-                                continue; // skip non-JSON lines in json mode
-                            }
-                            yield Ok(Event::default().data(line));
+            let read_more = match result {
+                Ok(ReadAt::Data(data)) => {
+                    let chunk_start = pos;
+                    pos += data.len() as u64;
+                    let mut line_start = 0;
+                    for (i, b) in data.iter().enumerate() {
+                        if *b != b'\n' {
+                            continue;
                         }
-                        // Flush partial line if it exceeds the safety cap
-                        if partial_line.len() > MAX_PARTIAL_LINE {
-                            yield Ok(Event::default().data(partial_line.clone()));
-                            partial_line.clear();
+                        partial.extend_from_slice(&data[line_start..i]);
+                        line_start = i + 1;
+                        let line = String::from_utf8_lossy(&partial).trim_end_matches('\r').to_string();
+                        partial.clear();
+                        if keep(&line) {
+                            batch.push_event(&line, with_ids.then_some(chunk_start + i as u64 + 1));
                         }
                     }
+                    partial.extend_from_slice(&data[line_start..]);
+                    // Flush partial line if it exceeds the safety cap
+                    if partial.len() > MAX_PARTIAL_LINE {
+                        let line = String::from_utf8_lossy(&partial).into_owned();
+                        partial.clear();
+                        batch.push_event(&line, with_ids.then_some(pos));
+                    }
+                    true
+                }
+                Ok(ReadAt::End) => false,
+                Ok(ReadAt::PastEnd) if !reading_rotated => {
+                    // Rotated since this offset: finish the copy, if it is
+                    // the generation the offset belongs to.
+                    reading_rotated = true;
+                    true
+                }
+                Ok(ReadAt::PastEnd) => {
+                    // The copy is shorter too: it was rotated more than once.
+                    // Go on from the start of the live file.
+                    reading_rotated = false;
+                    pos = 0;
+                    partial.clear();
+                    true
+                }
+                Err(e) if reading_rotated && e.kind() == std::io::ErrorKind::NotFound => {
+                    reading_rotated = false;
+                    pos = 0;
+                    true
                 }
                 Err(e) => {
-                    yield Ok(Event::default().data(format!("error: {}", e)));
+                    batch.push_event(&format!("error: {}", e), None);
+                    yield Ok(batch.take());
                     break;
                 }
+            };
+            if reading_rotated && !read_more {
+                // The copy is read to its end: its last line is complete (a
+                // rotation copies whole writes). Continue with the live file.
+                if !partial.is_empty() {
+                    let line = String::from_utf8_lossy(&partial).into_owned();
+                    partial.clear();
+                    if keep(&line) {
+                        batch.push_event(&line, with_ids.then_some(pos));
+                    }
+                }
+                reading_rotated = false;
+                pos = 0;
+                continue;
+            }
+            if !batch.is_empty() {
+                yield Ok(batch.take());
+                last_write = tokio::time::Instant::now();
             }
 
             if !follow {
+                // A full read goes on to the end of the file, a chunk at a time.
+                if read_more {
+                    continue;
+                }
                 // Yield any remaining partial line
-                if !partial_line.is_empty() {
-                    yield Ok(Event::default().data(partial_line.clone()));
+                if !partial.is_empty() {
+                    let line = String::from_utf8_lossy(&partial).into_owned();
+                    batch.push_event(&line, with_ids.then_some(pos));
+                    yield Ok(batch.take());
                 }
                 break;
+            }
+            if read_more {
+                continue;
+            }
+
+            // Keep an idle follower's connection open, as SSE keep-alive did.
+            if last_write.elapsed() >= LOG_KEEP_ALIVE {
+                yield Ok(axum::body::Bytes::from_static(b":\n\n"));
+                last_write = tokio::time::Instant::now();
             }
 
             // Wait before polling again
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-    };
+    }
+}
 
-    Ok(Sse::new(stream).keep_alive(KeepAlive::default()))
+/// Where the log rotation copies the live log.
+fn rotated_log_path(path: &std::path::Path) -> PathBuf {
+    let mut name = path.as_os_str().to_owned();
+    name.push(".1");
+    PathBuf::from(name)
+}
+
+/// How long a followed log stream may go quiet before it sends a keep-alive
+/// comment, the interval axum's SSE keep-alive used.
+const LOG_KEEP_ALIVE: Duration = Duration::from_secs(15);
+
+/// Log lines encoded as SSE events, written out together once they fill a
+/// read's worth.
+#[derive(Default)]
+struct LogEvents(Vec<u8>);
+
+impl LogEvents {
+    /// Appends `line` as one SSE event, encoded exactly as axum's
+    /// `Event::default().data(line)`: a `data: ` field per `\r`- or
+    /// `\n`-delimited piece, then a blank line; an empty line is the blank line
+    /// alone.
+    #[cfg(test)]
+    fn push(&mut self, line: &str) {
+        self.push_event(line, None)
+    }
+
+    /// [`Self::push`], with an `id: <offset>` field first when given.
+    fn push_event(&mut self, line: &str, id: Option<u64>) {
+        let out = &mut self.0;
+        if let Some(id) = id {
+            out.extend_from_slice(format!("id: {id}\n").as_bytes());
+        }
+        if !line.is_empty() {
+            out.extend_from_slice(b"data: ");
+            let bytes = line.as_bytes();
+            let mut last = 0;
+            let delimiters = bytes
+                .iter()
+                .enumerate()
+                .filter(|(_, b)| matches!(b, b'\n' | b'\r'));
+            for (delimiter, _) in delimiters {
+                out.extend_from_slice(&bytes[last..=delimiter]);
+                out.extend_from_slice(b"data: ");
+                last = delimiter + 1;
+            }
+            out.extend_from_slice(&bytes[last..]);
+            out.push(b'\n');
+        } else if id.is_some() {
+            // An event of an id alone is dispatched by no client; an empty
+            // line still has to reach it as an (empty) data field.
+            out.extend_from_slice(b"data: \n");
+        }
+        out.push(b'\n');
+    }
+
+    fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    fn is_full(&self) -> bool {
+        self.0.len() >= MAX_READ_CHUNK as usize
+    }
+
+    fn take(&mut self) -> axum::body::Bytes {
+        axum::body::Bytes::from(std::mem::take(&mut self.0))
+    }
 }
 
 /// Read the last N lines from a file using a bounded ring buffer.
-/// Returns (lines, file_position_at_end) for follow mode.
+/// Returns each line with the offset just past it, and the file's length.
 fn read_last_n_lines_bounded(
     path: &std::path::Path,
     n: usize,
-) -> std::io::Result<(Vec<String>, u64)> {
+) -> std::io::Result<(Vec<(String, u64)>, u64)> {
     use std::collections::VecDeque;
 
     let file = std::fs::File::open(path)?;
@@ -823,20 +1308,33 @@ fn read_last_n_lines_bounded(
         return Ok((Vec::new(), file_len));
     }
 
-    let reader = BufReader::new(file);
+    let mut reader = BufReader::new(file);
 
     // Use a ring buffer to keep only the last N lines in memory
-    let mut ring: VecDeque<String> = VecDeque::with_capacity(n + 1);
-
-    for line in reader.lines() {
-        let line = line?;
+    let mut ring: VecDeque<(String, u64)> = VecDeque::with_capacity(n + 1);
+    let mut pos = 0u64;
+    let mut buf = Vec::new();
+    loop {
+        buf.clear();
+        let read = reader.read_until(b'\n', &mut buf)?;
+        if read == 0 {
+            break;
+        }
+        pos += read as u64;
+        let mut line = &buf[..];
+        if line.last() == Some(&b'\n') {
+            line = &line[..line.len() - 1];
+            if line.last() == Some(&b'\r') {
+                line = &line[..line.len() - 1];
+            }
+        }
         if ring.len() == n {
             ring.pop_front();
         }
-        ring.push_back(line);
+        ring.push_back((String::from_utf8_lossy(line).into_owned(), pos));
     }
 
-    Ok((ring.into_iter().collect(), file_len))
+    Ok((ring.into_iter().collect(), pos))
 }
 
 /// Maximum bytes to read per poll cycle (64 KiB).
@@ -849,26 +1347,600 @@ const MAX_READ_CHUNK: u64 = 64 * 1024;
 /// buffer is flushed as-is to prevent unbounded memory growth.
 const MAX_PARTIAL_LINE: usize = BYTES_PER_MIB as usize;
 
+/// What a read at an offset found.
+enum ReadAt {
+    /// Up to [`MAX_READ_CHUNK`] new bytes.
+    Data(Vec<u8>),
+    /// Nothing past the offset yet.
+    End,
+    /// The file is shorter than the offset: it was rotated.
+    PastEnd,
+}
+
 /// Read new content from a file starting at a given position.
 /// Reads at most `MAX_READ_CHUNK` bytes per call.
-fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<(String, u64)> {
+fn read_from_position(path: &std::path::Path, pos: u64) -> std::io::Result<ReadAt> {
     use std::io::Read as _;
 
     let mut file = std::fs::File::open(path)?;
     let metadata = file.metadata()?;
     let file_len = metadata.len();
 
-    if pos >= file_len {
-        // No new content
-        return Ok((String::new(), pos));
+    if pos > file_len {
+        return Ok(ReadAt::PastEnd);
+    }
+    if pos == file_len {
+        return Ok(ReadAt::End);
     }
 
     file.seek(SeekFrom::Start(pos))?;
     let to_read = std::cmp::min(file_len - pos, MAX_READ_CHUNK) as usize;
     let mut buf = vec![0u8; to_read];
     file.read_exact(&mut buf)?;
-    let new_pos = pos + to_read as u64;
+    Ok(ReadAt::Data(buf))
+}
 
-    let text = String::from_utf8_lossy(&buf).into_owned();
-    Ok((text, new_pos))
+#[cfg(all(test, unix))]
+mod interactive_tests {
+    //! The interactive WebSocket, end to end but for the VM: a real server and
+    //! client, the handler's query parsing and bridge, the agent client's session
+    //! loop, and a stand-in guest that runs the command as a real process on pipes.
+    use super::*;
+    use crate::agent::{test_guest::FakeGuest, AgentClient};
+    use crate::platform::uds::UdsStream;
+    use axum::{routing::get, Router};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tokio_tungstenite::{connect_async, tungstenite::Message as Wire};
+
+    #[derive(Default)]
+    struct Guests {
+        resizes: std::sync::Mutex<Vec<Arc<AtomicUsize>>>,
+    }
+
+    /// Parses the same query as [`exec_interactive`] and bridges to a stand-in
+    /// guest instead of a machine.
+    async fn session(
+        State(guests): State<Arc<Guests>>,
+        Query(q): Query<InteractiveQuery>,
+        Query(parameters): Query<Vec<(String, String)>>,
+        ws: WebSocketUpgrade,
+    ) -> Result<axum::response::Response, ApiError> {
+        let command = interactive_command(q.cmd, parameters)?;
+        let tty = q.tty.unwrap_or(true);
+        let (client_stream, guest_stream) = UdsStream::pair().unwrap();
+        let guest = FakeGuest::spawn(guest_stream);
+        guests.resizes.lock().unwrap().push(guest.resizes.clone());
+        Ok(ws.on_upgrade(move |socket| {
+            bridge_interactive(socket, tty, (100, 40), move |input, out_tx| async move {
+                let code = tokio::task::spawn_blocking(move || {
+                    let on_output = move |o| {
+                        let _ = out_tx.blocking_send(o);
+                    };
+                    AgentClient::from_stream(client_stream)
+                        .vm_exec_interactive_io(command, Vec::new(), None, tty, input, on_output)
+                        .unwrap_or(-1)
+                })
+                .await
+                .unwrap_or(-1);
+                let _ = tokio::task::spawn_blocking(move || guest.finish()).await;
+                code
+            })
+        }))
+    }
+
+    async fn args(
+        Query(q): Query<InteractiveQuery>,
+        Query(parameters): Query<Vec<(String, String)>>,
+    ) -> Result<Json<Vec<String>>, ApiError> {
+        Ok(Json(interactive_command(q.cmd, parameters)?))
+    }
+
+    async fn server() -> (String, Arc<Guests>) {
+        let guests = Arc::new(Guests::default());
+        let app = Router::new()
+            .route("/session", get(session))
+            .route("/args", get(args))
+            .with_state(guests.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        (address.to_string(), guests)
+    }
+
+    type Client = tokio_tungstenite::WebSocketStream<
+        tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>,
+    >;
+
+    async fn connect(address: &str, query: &str) -> Client {
+        connect_async(format!("ws://{address}/session?{query}"))
+            .await
+            .expect("upgrade")
+            .0
+    }
+
+    /// Everything the session sends until it says the command exited.
+    struct Transcript {
+        stdout: Vec<u8>,
+        stderr: String,
+        exit: Option<i64>,
+    }
+
+    async fn transcript(client: &mut Client) -> Transcript {
+        let mut all = Transcript {
+            stdout: Vec::new(),
+            stderr: String::new(),
+            exit: None,
+        };
+        while let Some(message) = tokio::time::timeout(Duration::from_secs(20), client.next())
+            .await
+            .expect("the session stalled")
+        {
+            match message.unwrap() {
+                Wire::Binary(data) => all.stdout.extend(data.iter()),
+                Wire::Text(text) => {
+                    let frame: serde_json::Value = serde_json::from_str(text.as_str()).unwrap();
+                    match frame["type"].as_str() {
+                        Some("stderr") => all.stderr.push_str(frame["data"].as_str().unwrap()),
+                        Some("exit") => all.exit = frame["code"].as_i64(),
+                        other => panic!("unexpected frame type {other:?}"),
+                    }
+                }
+                Wire::Close(_) => break,
+                _ => {}
+            }
+        }
+        all
+    }
+
+    /// Read binary frames until `count` bytes have arrived.
+    async fn receive(client: &mut Client, count: usize) -> Vec<u8> {
+        let mut received = Vec::new();
+        while received.len() < count {
+            match tokio::time::timeout(Duration::from_secs(20), client.next())
+                .await
+                .expect("the echo stalled")
+                .expect("the session ended early")
+                .unwrap()
+            {
+                Wire::Binary(data) => received.extend(data.iter()),
+                Wire::Text(text) => panic!("unexpected text frame {text}"),
+                _ => {}
+            }
+        }
+        received
+    }
+
+    fn pattern(length: usize, seed: usize) -> Vec<u8> {
+        (0..length).map(|i| ((seed + i) % 251) as u8).collect()
+    }
+
+    #[tokio::test]
+    async fn arguments_arrive_in_order_and_empty_ones_count() {
+        let (address, _) = server().await;
+        let get = |query: &str| {
+            let url = format!("http://{address}/args?{query}");
+            async move { reqwest::get(url).await.unwrap() }
+        };
+        let answer = get("cmd=/bin/printf&arg=%25s-%25s&arg=a%20b&arg=&arg=c%26d")
+            .await
+            .json::<Vec<String>>()
+            .await
+            .unwrap();
+        assert_eq!(answer, ["/bin/printf", "%s-%s", "a b", "", "c&d"]);
+        // Without arguments the program is the whole command, and the default is a shell.
+        let answer = get("cmd=/bin/cat")
+            .await
+            .json::<Vec<String>>()
+            .await
+            .unwrap();
+        assert_eq!(answer, ["/bin/cat"]);
+        let answer = get("cols=80").await.json::<Vec<String>>().await.unwrap();
+        assert_eq!(answer, ["/bin/sh"]);
+        assert_eq!(get("cmd=").await.status(), 400);
+    }
+
+    #[tokio::test]
+    async fn the_command_runs_with_the_given_argument_vector() {
+        let (address, _) = server().await;
+        let mut client = connect(
+            &address,
+            "tty=false&cmd=/bin/sh&arg=-c&arg=printf%20%25s%20%22%241%7C%242%22&arg=x&arg=one%20two&arg=",
+        )
+        .await;
+        let all = transcript(&mut client).await;
+        assert_eq!(all.exit, Some(0));
+        assert_eq!(String::from_utf8(all.stdout).unwrap(), "one two|");
+    }
+
+    #[tokio::test]
+    async fn stdin_on_pipes_arrives_intact_whatever_its_size_and_pacing() {
+        let (address, _) = server().await;
+        let mut client = connect(&address, "tty=false&cmd=/bin/cat").await;
+
+        // The message the terminal path delivered only 9,728 bytes of.
+        let large = pattern(256 * 1024, 7);
+        client
+            .send(Wire::Binary(large.clone().into()))
+            .await
+            .unwrap();
+        assert!(receive(&mut client, large.len()).await == large);
+
+        // A burst that delivered less than a third of it.
+        let mut burst = Vec::new();
+        for i in 0..50 {
+            let piece = pattern(1000, i);
+            client
+                .send(Wire::Binary(piece.clone().into()))
+                .await
+                .unwrap();
+            burst.extend(piece);
+        }
+        assert!(receive(&mut client, burst.len()).await == burst);
+
+        // Every byte value, including the ones a terminal treats specially.
+        let all: Vec<u8> = (0..=255).collect();
+        client.send(Wire::Binary(all.clone().into())).await.unwrap();
+        assert_eq!(receive(&mut client, all.len()).await, all);
+
+        client.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_message_bigger_than_a_frame_is_split_rather_than_refused() {
+        let (address, _) = server().await;
+        let mut client = connect(&address, "tty=false&cmd=/bin/cat").await;
+        let huge = pattern(3 * 1024 * 1024 + 5, 3);
+        client
+            .send(Wire::Binary(huge.clone().into()))
+            .await
+            .unwrap();
+        assert!(receive(&mut client, huge.len()).await == huge);
+        client.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn an_echo_needs_no_help_from_the_guest_to_be_prompt() {
+        // The session loop used to notice input only when its 100 ms poll timed
+        // out, so an idle round trip took anywhere from 0 to 100 ms. The gaps are
+        // jittered so no timer can phase-lock with the loop's.
+        let (address, _) = server().await;
+        let mut client = connect(&address, "tty=false&cmd=/bin/cat").await;
+        let mut trips = Vec::new();
+        for i in 0..30u64 {
+            tokio::time::sleep(Duration::from_millis(20 + (i * 37) % 61)).await;
+            let message = pattern(100, i as usize);
+            let began = std::time::Instant::now();
+            client
+                .send(Wire::Binary(message.clone().into()))
+                .await
+                .unwrap();
+            assert_eq!(receive(&mut client, message.len()).await, message);
+            trips.push(began.elapsed());
+        }
+        trips.sort();
+        eprintln!(
+            "idle echo round trip over 30 messages: min {:?}, median {:?}, max {:?}",
+            trips[0], trips[15], trips[29]
+        );
+        assert!(
+            trips[15] < Duration::from_millis(40),
+            "an idle round trip takes {:?} at the median; input waits for the poll timeout",
+            trips[15]
+        );
+        client.close(None).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn on_pipes_stderr_is_a_frame_of_its_own_and_the_exit_code_is_reported() {
+        let (address, _) = server().await;
+        let mut client = connect(
+            &address,
+            "tty=false&cmd=/bin/sh&arg=-c&arg=printf%20out%3B%20printf%20err%20%3E%262%3B%20exit%207",
+        )
+        .await;
+        let all = transcript(&mut client).await;
+        assert_eq!(all.stdout, b"out");
+        assert_eq!(all.stderr, "err");
+        assert_eq!(all.exit, Some(7));
+    }
+
+    #[tokio::test]
+    async fn on_a_terminal_output_stays_one_stream_and_the_size_is_sent() {
+        let (address, guests) = server().await;
+        let mut client = connect(
+            &address,
+            "cmd=/bin/sh&arg=-c&arg=printf%20out%3B%20printf%20err%20%3E%262",
+        )
+        .await;
+        let all = transcript(&mut client).await;
+        // A PTY has one output stream, so stderr is not reported apart.
+        assert_eq!(all.stderr, "");
+        assert_eq!(all.stdout.len(), 6);
+        assert_eq!(all.exit, Some(0));
+        let mut piped = connect(&address, "tty=false&cmd=/bin/true").await;
+        transcript(&mut piped).await;
+        let resizes: Vec<_> = guests
+            .resizes
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|r| r.load(Ordering::SeqCst))
+            .collect();
+        assert_eq!(resizes, [1, 0], "only a terminal is told its size");
+    }
+}
+
+#[cfg(test)]
+mod exec_stream_queue_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn slow_sse_reader_applies_backpressure_without_losing_events() {
+        use crate::agent::ExecEvent;
+        let (tx, mut rx) = tokio::sync::mpsc::channel(EXEC_STREAM_QUEUE_SIZE);
+        let (filled_tx, filled_rx) = tokio::sync::oneshot::channel();
+        let mut sender = tokio::task::spawn_blocking(move || {
+            for n in 0..EXEC_STREAM_QUEUE_SIZE {
+                forward_exec_event(&tx, ExecEvent::Stdout(vec![n as u8]));
+            }
+            let _ = filled_tx.send(());
+            forward_exec_event(&tx, ExecEvent::Exit(7));
+        });
+        filled_rx.await.unwrap();
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), &mut sender)
+                .await
+                .is_err(),
+            "sender must wait until the HTTP reader consumes an event"
+        );
+        for n in 0..EXEC_STREAM_QUEUE_SIZE {
+            assert!(matches!(rx.recv().await, Some(ExecEvent::Stdout(data)) if data == [n as u8]));
+        }
+        assert!(matches!(rx.recv().await, Some(ExecEvent::Exit(7))));
+        sender.await.unwrap();
+    }
+}
+
+#[cfg(test)]
+mod log_stream_tests {
+    use super::*;
+    use futures_util::StreamExt;
+
+    #[tokio::test]
+    async fn streamed_exec_keeps_split_utf8_intact_and_flushes_incomplete_output_before_exit() {
+        use crate::agent::ExecEvent;
+        use axum::response::IntoResponse as _;
+
+        let (tx, rx) = tokio::sync::mpsc::channel(EXEC_STREAM_QUEUE_SIZE);
+        tx.try_send(ExecEvent::Stdout(vec![b'h', b'i', b' ', 0xf0]))
+            .unwrap();
+        tx.try_send(ExecEvent::Stderr(vec![0xe2])).unwrap();
+        tx.try_send(ExecEvent::Stdout(vec![0x9f])).unwrap();
+        tx.try_send(ExecEvent::Stderr(vec![0x82, 0xac])).unwrap();
+        tx.try_send(ExecEvent::Stdout(vec![0x90, 0xb1, 0xff, b'!', 0xe2]))
+            .unwrap();
+        tx.try_send(ExecEvent::Exit(0)).unwrap();
+        drop(tx);
+
+        let response = Sse::new(exec_event_stream(rx)).into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let body = std::str::from_utf8(&body).unwrap();
+        assert_eq!(
+            body,
+            concat!(
+                "event: stdout\ndata: hi \n\n",
+                "event: stderr\ndata: €\n\n",
+                "event: stdout\ndata: 🐱�!\n\n",
+                "event: stdout\ndata: �\n\n",
+                "event: exit\ndata: {\"exitCode\":0}\n\n",
+            )
+        );
+    }
+
+    /// What axum's `Sse` writes for these lines, one `Event::default().data(line)` each.
+    async fn axum_sse_bytes(lines: &[&str]) -> Vec<u8> {
+        use axum::response::IntoResponse as _;
+        let events: Vec<Result<Event, Infallible>> = lines
+            .iter()
+            .map(|line| Ok(Event::default().data(*line)))
+            .collect();
+        let response = Sse::new(futures_util::stream::iter(events)).into_response();
+        axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap()
+            .to_vec()
+    }
+
+    #[tokio::test]
+    async fn exec_error_preserves_quotes_backslashes_newlines_and_control_bytes() {
+        use axum::response::IntoResponse as _;
+        let original = "guest \"failure\" at C:\\tmp\\file\nsecond line\u{0001} ✓";
+        let response = Sse::new(futures_util::stream::iter([Ok::<_, Infallible>(
+            exec_event_to_sse(crate::agent::ExecEvent::Error(original.into())),
+        )]))
+        .into_response();
+        let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        let text = std::str::from_utf8(&body).unwrap();
+        assert!(text.starts_with("event: error\ndata: "), "{text}");
+        let payload = text
+            .strip_prefix("event: error\ndata: ")
+            .unwrap()
+            .strip_suffix("\n\n")
+            .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(payload).unwrap();
+        assert_eq!(parsed["message"], original);
+    }
+
+    #[tokio::test]
+    async fn log_events_are_encoded_as_axum_sse_encoded_them() {
+        let lines = [
+            "[    0.000000] Linux version 6.12",
+            "",
+            "carriage\rreturn inside",
+            "data: looks like a field",
+            "  leading spaces and ünïcode ✓",
+            ":starts like a comment",
+        ];
+        let mut ours = LogEvents::default();
+        for line in lines {
+            ours.push(line);
+        }
+        assert_eq!(ours.take().to_vec(), axum_sse_bytes(&lines).await);
+    }
+
+    async fn read_all(
+        stream: impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>>,
+    ) -> Vec<axum::body::Bytes> {
+        let mut writes = Vec::new();
+        let mut stream = std::pin::pin!(stream);
+        while let Some(chunk) = stream.next().await {
+            writes.push(chunk.unwrap());
+        }
+        writes
+    }
+
+    /// Splits an SSE body of single-field events back into their lines.
+    fn lines_of(writes: &[axum::body::Bytes]) -> Vec<String> {
+        let body: Vec<u8> = writes.iter().flat_map(|w| w.to_vec()).collect();
+        String::from_utf8(body)
+            .unwrap()
+            .split("\n\n")
+            .filter(|event| !event.is_empty())
+            .map(|event| event.strip_prefix("data: ").unwrap().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_full_read_sends_the_whole_log_a_read_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        let lines: Vec<String> = (0..12_000)
+            .map(|i| format!("[{i:>6}] console line {i}"))
+            .collect();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+        let size = std::fs::metadata(&path).unwrap().len();
+        assert!(size > 3 * MAX_READ_CHUNK, "the log must span several reads");
+
+        let writes = read_all(log_event_stream(
+            path,
+            LogRead {
+                follow: false,
+                tail: None,
+                start_pos: 0,
+                json_only: false,
+                with_ids: false,
+            },
+            Vec::new(),
+            None,
+        ))
+        .await;
+
+        // Every line, past the first read's 64 KiB, which a full read used to stop at.
+        assert_eq!(lines_of(&writes), lines);
+        // A write per read of the file, not per line.
+        assert!(
+            writes.len() as u64 <= size / MAX_READ_CHUNK + 2,
+            "{} writes for {} lines",
+            writes.len(),
+            lines.len()
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tail_sends_only_its_lines_in_one_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        let (initial, end) = read_last_n_lines_bounded(&path, 2).unwrap();
+
+        let writes = read_all(log_event_stream(
+            path,
+            LogRead {
+                follow: false,
+                tail: Some(2),
+                start_pos: end,
+                json_only: false,
+                with_ids: false,
+            },
+            initial,
+            None,
+        ))
+        .await;
+
+        assert_eq!(writes.len(), 1);
+        assert_eq!(lines_of(&writes), ["two", "three"]);
+    }
+
+    /// Splits an SSE body of `id` + `data` events into (id, line) pairs.
+    fn events_of(writes: &[axum::body::Bytes]) -> Vec<(u64, String)> {
+        let body: Vec<u8> = writes.iter().flat_map(|w| w.to_vec()).collect();
+        String::from_utf8(body)
+            .unwrap()
+            .split("\n\n")
+            .filter(|event| !event.is_empty() && event.contains('\n'))
+            .map(|event| {
+                let (id, data) = event.split_once('\n').unwrap();
+                (
+                    id.strip_prefix("id: ").unwrap().parse().unwrap(),
+                    data.strip_prefix("data: ").unwrap().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn resumed(
+        path: PathBuf,
+        from: u64,
+    ) -> impl tokio_stream::Stream<Item = Result<axum::body::Bytes, Infallible>> {
+        log_event_stream(
+            path,
+            LogRead {
+                follow: false,
+                tail: None,
+                start_pos: from,
+                json_only: false,
+                with_ids: true,
+            },
+            Vec::new(),
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn a_read_resumed_from_an_event_id_continues_after_that_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        std::fs::write(&path, "one\r\ntwo\n\nfour\n").unwrap();
+        let all = events_of(&read_all(resumed(path.clone(), 0)).await);
+        assert_eq!(
+            all,
+            [
+                (5, "one".to_string()),
+                (9, "two".to_string()),
+                (10, String::new()),
+                (15, "four".to_string())
+            ]
+        );
+        let rest = events_of(&read_all(resumed(path.clone(), 9)).await);
+        assert_eq!(rest, [(10, String::new()), (15, "four".to_string())]);
+        let (tail, end) = read_last_n_lines_bounded(&path, 2).unwrap();
+        assert_eq!(tail, [(String::new(), 10), ("four".to_string(), 15)]);
+        assert_eq!(end, 15);
+    }
+
+    #[tokio::test]
+    async fn a_read_resumed_past_a_rotation_finishes_the_copy_then_reads_the_live_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("console.log");
+        // Rotated by copy and truncate after "b": the copy holds a..c, the
+        // live log restarted with d.
+        std::fs::write(rotated_log_path(&path), "a\nb\nc\n").unwrap();
+        std::fs::write(&path, "d\n").unwrap();
+        let rest = events_of(&read_all(resumed(path.clone(), 4)).await);
+        assert_eq!(rest, [(6, "c".to_string()), (2, "d".to_string())]);
+    }
 }

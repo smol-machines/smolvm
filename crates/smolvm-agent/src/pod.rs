@@ -36,6 +36,9 @@ pub const POD_SHARE_TAG: &str = "podshare";
 /// Guest directory holding per-pod-container state (crun bundle dirs).
 const POD_STATE_DIR: &str = "/storage/containers/pods";
 
+/// Guest overlay and materialized mounts for each pod container.
+const POD_OVERLAY_DIR: &str = "/storage/pods";
+
 // ============================================================================
 // Registry
 // ============================================================================
@@ -342,7 +345,7 @@ fn crun_state_pid(id: &str) -> Option<u32> {
 /// process, so this is normally a few ms; the deadline caps a container that
 /// exits instantly (nothing to wait for) so Start still returns promptly.
 #[cfg(target_os = "linux")]
-fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
+pub(crate) fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -399,7 +402,7 @@ fn proc_parent_pairs() -> Vec<(u32, u32)> {
 /// `root` plus all its descendants, from a single /proc snapshot. Used for
 /// `PodPids` — with the crun cgroup manager disabled there is no per-container
 /// cgroup.procs file to read, so the process tree under init IS the container.
-fn descendant_pids(root: u32) -> Vec<u32> {
+pub(crate) fn descendant_pids(root: u32) -> Vec<u32> {
     let pairs = proc_parent_pairs();
     let mut pids = vec![root];
     let mut i = 0;
@@ -756,6 +759,38 @@ fn ticks_to_ns(ticks: u64) -> u64 {
     ticks
 }
 
+/// Detach a container's rootfs overlay before removing its writable state.
+/// A retry may find neither the mount nor the directory.
+#[cfg(target_os = "linux")]
+fn remove_pod_overlay(root: &Path, id: &str) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+
+    validate_id(id).map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let dir = root.join(id);
+    let metadata = match std::fs::symlink_metadata(&dir) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(e) => return Err(e),
+    };
+    if !metadata.is_dir() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "pod overlay state is not a directory",
+        ));
+    }
+    let merged = dir.join("merged");
+    let merged_c = std::ffi::CString::new(merged.as_os_str().as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // Even a stopped container's overlay stays mounted until the VM exits.
+    if merged.exists() && unsafe { libc::umount2(merged_c.as_ptr(), libc::MNT_DETACH) } != 0 {
+        let e = std::io::Error::last_os_error();
+        if !matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOENT)) {
+            return Err(e);
+        }
+    }
+    std::fs::remove_dir_all(dir)
+}
+
 /// `PodDelete`: drop an exec registration, or tear down the whole container
 /// (crun delete --force best-effort + bundle dir removal + registry entry).
 /// Idempotent: deleting something unknown is Ok.
@@ -770,9 +805,10 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
     let existed = lock_registry().remove(id).is_some();
     // Best-effort: `crun run` auto-deletes on exit, and the container may
     // never have started; ignore failures.
-    let _ = crun::CrunCommand::delete(id, true)
+    let deleted = crun::CrunCommand::delete(id, true)
         .discard_output()
-        .output();
+        .output()
+        .is_ok_and(|output| output.status.success());
     // Only touch the bundle dir for ids we actually created (or whose dir
     // exists) — pod_dir(id) is validated-id-safe but stay conservative.
     if validate_id(id).is_ok() {
@@ -781,6 +817,17 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
             if let Err(e) = std::fs::remove_dir_all(&dir) {
                 warn!(id = %id, error = %e, "failed to remove pod state dir");
             }
+        }
+    }
+    #[cfg(target_os = "linux")]
+    if !deleted && validate_id(id).is_ok() && crun_state_pid(id).is_some() {
+        // A failed crun delete must not tear the filesystem out from under a
+        // container that is still running. A later retry can reclaim it.
+        warn!(id = %id, "container still running after crun delete; retaining pod overlay");
+    } else {
+        #[cfg(target_os = "linux")]
+        if let Err(e) = remove_pod_overlay(Path::new(POD_OVERLAY_DIR), id) {
+            warn!(id = %id, error = %e, "failed to remove pod overlay");
         }
     }
     info!(id = %id, existed = existed, "pod container deleted");
@@ -797,7 +844,7 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
 /// requests handled by the reused I/O pumps.
 #[cfg(target_os = "linux")]
 pub fn handle_pod_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     request: smolvm_protocol::AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (id, exec_id) = match request {
@@ -819,7 +866,7 @@ pub fn handle_pod_start(
 /// Non-Linux stub so `cargo test` on macOS compiles the dispatch.
 #[cfg(not(target_os = "linux"))]
 pub fn handle_pod_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     _request: smolvm_protocol::AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::send_response(
@@ -916,7 +963,7 @@ fn write_pod_bundle(
         });
     }
 
-    spec.add_gpu_devices_if_available();
+    spec.add_vm_devices_if_available();
 
     // CRI mounts (volumes + generated /etc/resolv.conf, /etc/hosts) as bind mounts.
     // Added last so they layer on TOP of the default mounts (e.g. a volume at
@@ -1058,7 +1105,7 @@ fn materialize_pod_mounts(id: &str, mounts: &[PodMount]) -> Vec<(PathBuf, String
     // The copy makes the volume writable + guest-local (correct emptyDir/configMap
     // /secret semantics; smolvm's virtiofs share is read-only so a live bind of the
     // host source couldn't be written).
-    let base = Path::new("/storage/pods").join(id).join("mnt");
+    let base = Path::new(POD_OVERLAY_DIR).join(id).join("mnt");
     let mut binds = Vec::new();
     for (n, m) in mounts.iter().enumerate() {
         let dst = base.join(n.to_string());
@@ -1268,7 +1315,7 @@ fn cgroups_available() -> bool {
 /// unmounted first.
 #[cfg(target_os = "linux")]
 fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, String> {
-    let base = Path::new("/storage/pods").join(id);
+    let base = Path::new(POD_OVERLAY_DIR).join(id);
     let upper = base.join("upper");
     let work = base.join("work");
     let merged = base.join("merged");
@@ -1313,7 +1360,7 @@ fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, S
 
 #[cfg(target_os = "linux")]
 fn start_init_process(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::ensure_storage_mounted();
@@ -1537,7 +1584,7 @@ fn prepare_exec_process_json(raw: &str) -> Result<String, Box<dyn std::error::Er
 /// and pump its I/O until exit. Same streaming contract as the init path.
 #[cfg(target_os = "linux")]
 fn start_exec_process(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     id: &str,
     exec_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1679,6 +1726,25 @@ mod tests {
         assert!(validate_id("-flag").is_err());
         assert!(validate_id("a/b").is_err());
         assert!(validate_id(&"x".repeat(201)).is_err());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn deleting_pod_overlay_reclaims_writes_and_is_idempotent() {
+        let root = tempfile::tempdir().unwrap();
+        let previous = root.path().join("old-pod");
+        let live = root.path().join("live-pod");
+        std::fs::create_dir_all(previous.join("upper")).unwrap();
+        std::fs::create_dir_all(previous.join("mnt")).unwrap();
+        std::fs::write(previous.join("upper/data"), b"reclaimed").unwrap();
+        std::fs::create_dir(&live).unwrap();
+
+        remove_pod_overlay(root.path(), "old-pod").unwrap();
+        remove_pod_overlay(root.path(), "old-pod").unwrap();
+        assert!(!previous.exists());
+        assert!(live.exists());
+        assert!(remove_pod_overlay(root.path(), "../live-pod").is_err());
+        assert!(live.exists());
     }
 
     #[test]

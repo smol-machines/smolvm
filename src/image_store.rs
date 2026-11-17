@@ -17,7 +17,9 @@
 //! the first candidate registry that answers, including one the caller controls,
 //! so a digest alone is not proof of entitlement to previously cached bytes.
 
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
+use smolvm_registry::{OciManifest, RegistryClient};
 
 use crate::registry::{registry_client, PullAuth, Reference};
 use crate::{Error, Result};
@@ -28,6 +30,198 @@ use crate::{Error, Result};
 /// The registry authorizes `repository:<repo>:pull` for the caller's credentials
 /// during resolution; an unauthorized caller is rejected here.
 pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    let (_client, _repo, manifest_bytes) = resolve_manifest(reference, auth, None).await?;
+    Ok(manifest_digest(&manifest_bytes))
+}
+
+/// The digest `reference` currently points to (for a multi-arch tag, its image
+/// index), authorized with `auth`, from a single manifest HEAD. The registry
+/// authorizes `repository:<repo>:pull` for the request exactly as it does for a
+/// GET, so this is the same gate as [`authorized_digest`] at a fraction of the
+/// cost. A caller keying cached content on it must add the platform.
+pub async fn authorized_reference_digest(reference: &str, auth: &PullAuth) -> Result<String> {
+    let reference = &without_pinned_tag(reference);
+    let parsed = Reference::parse(reference)
+        .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
+    let want = parsed
+        .digest
+        .clone()
+        .or_else(|| parsed.tag.clone())
+        .unwrap_or_else(|| "latest".to_string());
+    let config = crate::SmolSettings::load()?.images;
+    let host = crate::registry::extract_registry(reference);
+    let client = registry_client(&host, &config, auth);
+    let repo = repo_for(&host, &parsed);
+    client
+        .head_manifest_digest(&repo, &want)
+        .await
+        .map_err(|e| Error::agent("image-auth", e.to_string()))
+}
+
+/// The config and ordered layers of the platform image the caller can pull.
+/// This identifies the bytes the guest actually stores even when a tag moves
+/// during a seed build or a registry mirror serves different content.
+pub async fn authorized_image_content(
+    reference: &str,
+    auth: &PullAuth,
+) -> Result<(String, Vec<String>)> {
+    let (_, _, bytes) = resolve_manifest(reference, auth, None).await?;
+    let manifest: serde_json::Value =
+        serde_json::from_slice(&bytes).map_err(|e| Error::agent("image-auth", e.to_string()))?;
+    let config = manifest["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| Error::agent("image-auth", "manifest lacks config digest"))?;
+    let layers = manifest["layers"]
+        .as_array()
+        .ok_or_else(|| Error::agent("image-auth", "manifest lacks layers"))?
+        .iter()
+        .map(|layer| layer["digest"].as_str().map(str::to_owned))
+        .collect::<Option<Vec<_>>>()
+        .ok_or_else(|| Error::agent("image-auth", "manifest layer lacks digest"))?;
+    Ok((config.to_string(), layers))
+}
+
+/// The image's default command, resolved without pulling its layers.
+///
+/// The `--oci-cache` run path needs the image's declared ENTRYPOINT/CMD to run
+/// it as a workload, but must not re-pull the image on a cache hit. Fetching the
+/// manifest and config blob is a few hundred bytes over the same authorized
+/// round-trip that resolves the digest — never the layer pull the cache avoids.
+#[derive(Debug, Clone, Default)]
+pub struct ImageRunConfig {
+    /// Manifest digest — the content address callers key their cache on.
+    pub digest: String,
+    /// The image's ENTRYPOINT; empty when the image declares none.
+    pub entrypoint: Vec<String>,
+    /// The image's CMD; empty when the image declares none.
+    pub cmd: Vec<String>,
+}
+
+/// Resolve `reference`'s digest AND its declared ENTRYPOINT/CMD, authorized with
+/// `auth`. Same authorization gate as [`authorized_digest`] — the registry
+/// authorizes the pull during manifest resolution — plus one small config-blob
+/// fetch. No image layers are pulled.
+pub async fn authorized_image_config(reference: &str, auth: &PullAuth) -> Result<ImageRunConfig> {
+    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, None).await?;
+    let digest = manifest_digest(&manifest_bytes);
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("parse image manifest", e.to_string()))?;
+    let config_bytes = client
+        .pull_blob(&repo, &manifest.config.digest)
+        .await
+        .map_err(|e| Error::agent("fetch image config", e.to_string()))?;
+    let blob: OciImageConfigBlob = serde_json::from_slice(&config_bytes)
+        .map_err(|e| Error::agent("parse image config", e.to_string()))?;
+    Ok(ImageRunConfig {
+        digest,
+        entrypoint: blob.config.entrypoint.unwrap_or_default(),
+        cmd: blob.config.cmd.unwrap_or_default(),
+    })
+}
+
+/// An image's identity and full config, as a container engine reports it.
+#[derive(Debug, Clone)]
+pub struct ImageMetadata {
+    /// Digest of the resolved single-platform manifest.
+    pub manifest_digest: String,
+    /// Digest of the config blob: the image id.
+    pub config_digest: String,
+    /// The whole config blob (`architecture`, `os`, `config`, `rootfs`,
+    /// `history`, ...).
+    pub config: serde_json::Value,
+    /// Sum of the compressed layer sizes.
+    pub compressed_size: u64,
+}
+
+/// Resolve `reference` (for `oci_platform`, or this host's platform) and
+/// fetch its config blob, authorized with `auth`. Same authorization as
+/// [`authorized_digest`]; no image layers are pulled.
+pub async fn authorized_image_metadata(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<ImageMetadata> {
+    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform).await?;
+    let manifest_digest = manifest_digest(&manifest_bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("parse image manifest", e.to_string()))?;
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| Error::agent("parse image manifest", "manifest has no config"))?
+        .to_string();
+    let compressed_size = manifest["layers"]
+        .as_array()
+        .map(|layers| layers.iter().map(|l| l["size"].as_u64().unwrap_or(0)).sum())
+        .unwrap_or(0);
+    let config_bytes = client
+        .pull_blob(&repo, &config_digest)
+        .await
+        .map_err(|e| Error::agent("fetch image config", e.to_string()))?;
+    if manifest_digest_matches(&config_bytes, &config_digest).is_err() {
+        return Err(Error::agent(
+            "fetch image config",
+            format!("config blob does not match {config_digest}"),
+        ));
+    }
+    let config = serde_json::from_slice(&config_bytes)
+        .map_err(|e| Error::agent("parse image config", e.to_string()))?;
+    Ok(ImageMetadata {
+        manifest_digest,
+        config_digest,
+        config,
+        compressed_size,
+    })
+}
+
+fn manifest_digest_matches(bytes: &[u8], digest: &str) -> std::result::Result<(), ()> {
+    if manifest_digest(bytes) == digest {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
+/// Resolve `reference` to its platform manifest and return the summed
+/// `layers[].size` — the image's total COMPRESSED footprint, authorized with
+/// `auth`. `oci_platform` selects the index entry the way the guest's pull
+/// would (`None` = this host's architecture, matching `authorized_digest`).
+///
+/// Callers use this to provision for an image BEFORE it is pulled: the
+/// manifest is the only pre-pull bound on how much data the pull will write.
+/// The returned bytes are compressed; extraction inflates them.
+pub async fn image_compressed_size(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<u64> {
+    let (_client, _repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform).await?;
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("image-size", format!("bad manifest JSON: {e}")))?;
+    let layers = manifest["layers"].as_array().ok_or_else(|| {
+        Error::agent(
+            "image-size",
+            "resolved manifest has no layers array".to_string(),
+        )
+    })?;
+    Ok(layers.iter().map(|l| l["size"].as_u64().unwrap_or(0)).sum())
+}
+
+fn manifest_digest(manifest_bytes: &[u8]) -> String {
+    format!("sha256:{}", hex::encode(Sha256::digest(manifest_bytes)))
+}
+
+/// The winning registry client, its repo path, and the resolved (single-
+/// platform) manifest bytes for `reference`. Shared by [`authorized_digest`],
+/// [`authorized_image_config`] and [`image_compressed_size`] so all authorize
+/// identically and so the config fetch reuses the same client/repo that
+/// resolved the manifest. `oci_platform` selects an index entry; `None` is this
+/// host's architecture.
+async fn resolve_manifest(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<(RegistryClient, String, Vec<u8>)> {
+    let reference = &without_pinned_tag(reference);
     let parsed = Reference::parse(reference)
         .map_err(|e| Error::config("image-auth", format!("bad reference: {}", e.reason)))?;
     let want = parsed
@@ -39,33 +233,373 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
     // config the in-guest pull consults.
     let config = crate::SmolSettings::load()?.images;
 
-    // Resolve the registry the way the GUEST does — via `registry_pull_hosts`, not
-    // the configured default — so the host-side gate targets the same registry the
-    // in-guest pull would (a bare `alpine` is Docker Hub, not the smol registry).
-    let mut first_err: Option<String> = None;
-    for host in &crate::registry::registry_pull_hosts(reference) {
-        let client = registry_client(host, &config, auth);
-        let repo = repo_for(host, &parsed);
-        match client.get_manifest_resolved(&repo, &want).await {
-            Ok(manifest_bytes) => {
-                return Ok(format!(
-                    "sha256:{}",
-                    hex::encode(Sha256::digest(&manifest_bytes))
-                ));
+    // Ask the reference's own registry, as the in-guest pull does. Not
+    // `registry_pull_hosts`: that is an egress allow-list of DNS apexes (Docker
+    // Hub's includes its `docker.com` blob CDN, whose website answers any path
+    // with a 200 page), and querying it masked the real 401/404/429.
+    let host = crate::registry::extract_registry(reference);
+    let client = registry_client(&host, &config, auth);
+    let repo = repo_for(&host, &parsed);
+    let platform = oci_platform.map(smolvm_registry::OciPlatform::parse);
+    let manifest_bytes = match &platform {
+        Some(p) => client.get_manifest_resolved_platform(&repo, &want, p).await,
+        None => client.get_manifest_resolved(&repo, &want).await,
+    }
+    .map_err(|e| Error::agent("image-auth", e.to_string()))?;
+    // A manifest is a JSON object. Anything else is not from a registry, and
+    // must not be hashed into a digest or trusted as one.
+    if !matches!(
+        serde_json::from_slice::<serde_json::Value>(&manifest_bytes),
+        Ok(serde_json::Value::Object(_))
+    ) {
+        return Err(Error::agent(
+            "image-auth",
+            format!("{host} did not return an image manifest for {reference}"),
+        ));
+    }
+    Ok((client, repo, manifest_bytes))
+}
+
+/// A registry image the host fetched: the `local:` reference it boots from and
+/// the manifest digest that was fetched.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FetchedImage {
+    /// The `local:<hash>` reference the machine boots from.
+    pub local: String,
+    /// The manifest digest of the image that was fetched.
+    pub digest: String,
+}
+
+/// Fetch `reference` on the HOST into a `docker save` archive and stage it in
+/// the local image cache, returning the `local:<hash>` reference to boot from
+/// and the manifest digest that was fetched.
+///
+/// This is how a machine with no network gets a registry image: the guest
+/// would pull it itself, but it has no network to pull with. The archive is
+/// what `--image ./saved.tar` would have produced, so the guest flattens it
+/// offline exactly as it does a user's own `docker save`.
+///
+/// Authorization is the registry's, with `auth`, on every call, as for the
+/// guest's own pull. Every blob is checked against its manifest digest and
+/// size before anything is staged. A repeat fetch of the same image from the
+/// same registry and repository reuses the staged archive.
+pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<FetchedImage> {
+    let (client, repo, manifest_bytes) =
+        resolve_manifest(reference, auth, None)
+            .await
+            .map_err(|error| match &error {
+                // Say what the guest's own pull says for a reference that does not
+                // exist, so callers tell a typo (never retryable) from a fault.
+                Error::Agent { reason, .. }
+                    if reason.contains("registry returned 404")
+                        || reason.contains("blob not found")
+                        || reason.contains("MANIFEST_UNKNOWN")
+                        || reason.contains("NAME_UNKNOWN") =>
+                {
+                    Error::agent_not_found(
+                        "fetch image",
+                        format!("image not found in the registry: {reference}"),
+                    )
+                }
+                _ => error,
+            })?;
+    let digest = manifest_digest(&manifest_bytes);
+    let key = fetched_key(
+        &crate::registry::extract_registry(reference),
+        &repo,
+        &digest,
+    );
+    if let Some(local) = crate::data::image_source::fetched_archive(&key) {
+        return Ok(FetchedImage { local, digest });
+    }
+    let manifest: OciManifest = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("fetch image", format!("parse manifest: {e}")))?;
+    let total = manifest.config.size + manifest.layers.iter().map(|l| l.size).sum::<u64>();
+    let limit = crate::data::image_source::max_archive_bytes();
+    if total > limit {
+        return Err(Error::config(
+            "fetch image",
+            format!("{reference} is {total} bytes, over the {limit}-byte image limit"),
+        ));
+    }
+
+    let staging = crate::data::image_source::archive_staging_dir()?;
+    // A manifest may name one layer twice (the 32-byte empty layer, often).
+    // Each digest is one file in staging, so fetch it once: two downloads
+    // of the same digest would truncate and write the same path at once.
+    let mut seen = std::collections::HashSet::new();
+    let blobs = std::iter::once(&manifest.config)
+        .chain(manifest.layers.iter())
+        .filter(|blob| seen.insert(blob.digest.clone()));
+    futures_util::future::try_join_all(
+        blobs.map(|blob| download_blob(&client, &repo, blob, staging.path().join(blob_file(blob)))),
+    )
+    .await?;
+
+    let dir = staging.path().to_path_buf();
+    let OciManifest { config, layers, .. } = manifest;
+    let mtime = archive_mtime_for(&digest);
+    let local = tokio::task::spawn_blocking(move || -> Result<String> {
+        let archive = dir.join("image.tar");
+        write_save_archive(&dir, &archive, &config, &layers)?;
+        match crate::data::image_source::resolve(crate::data::image_source::ImageSource::Archive(
+            crate::data::image_source::ArchiveInput::File(archive),
+        ))? {
+            crate::data::image_source::ResolvedImage::Local { reference, .. } => {
+                // The guest keys its flattened copy on the archive's size and
+                // time, so the same image gets the same time on every host: a
+                // checkpoint then restores onto a fresh fetch without a copy.
+                if let Some(staged) = crate::data::image_source::archive_file_for_ref(&reference) {
+                    crate::data::image_source::set_archive_mtime(&staged, mtime)?;
+                }
+                Ok(reference)
             }
-            // Keep the FIRST failure. `registry_pull_hosts` is a DNS allow-list,
-            // not a list of real endpoints — Docker Hub yields
-            // ["docker.io", "docker.com"] — so letting the later marketing-host
-            // failure overwrite the real 401/429 would surface a nonsense error.
-            Err(e) => {
-                let _ = first_err.get_or_insert_with(|| e.to_string());
+            crate::data::image_source::ResolvedImage::Registry(_) => {
+                unreachable!("an archive resolves to a local reference")
+            }
+        }
+    })
+    .await
+    .map_err(|e| Error::agent("fetch image", e.to_string()))??;
+    crate::data::image_source::record_fetched_archive(&key, &local)?;
+    drop(staging);
+    Ok(FetchedImage { local, digest })
+}
+
+/// The index key of a fetched image: the registry and repository that
+/// authorized it, and its manifest digest.
+fn fetched_key(host: &str, repo: &str, digest: &str) -> String {
+    hex::encode(Sha256::digest(format!("{host}/{repo}@{digest}")))
+}
+
+/// The modification time a fetched archive is given: derived from its manifest
+/// digest, so the same image gets the same time on every host and another
+/// image almost never shares it.
+fn archive_mtime_for(digest: &str) -> u64 {
+    let hex = digest.strip_prefix("sha256:").unwrap_or(digest);
+    // 31 bits keeps the time well inside every platform's file-time range.
+    u64::from_str_radix(hex.get(..8).unwrap_or("0"), 16).unwrap_or(0) & 0x7fff_ffff
+}
+
+/// Fetch the image a checkpoint's machine booted from a host-fetched archive,
+/// for a restore. Unlike [`fetch_image_archive`], a digest-pinned reference
+/// this host already fetched is reused after a manifest HEAD (which the
+/// registry authorizes for `auth` like a pull, without counting it as one),
+/// so restoring many copies does not download the manifest again for each.
+pub async fn fetch_checkpoint_image(reference: &str, auth: &PullAuth) -> Result<FetchedImage> {
+    let unpinned = without_pinned_tag(reference);
+    if let Ok(parsed) = Reference::parse(&unpinned) {
+        if let Some(digest) = parsed.digest.clone() {
+            let host = crate::registry::extract_registry(&unpinned);
+            let key = fetched_key(&host, &repo_for(&host, &parsed), &digest);
+            if let Some(local) = crate::data::image_source::fetched_archive(&key) {
+                let authorized = authorized_reference_digest(reference, auth).await?;
+                if authorized == digest {
+                    return Ok(FetchedImage { local, digest });
+                }
             }
         }
     }
-    Err(Error::agent(
-        "image-auth",
-        first_err.unwrap_or_else(|| "no candidate registry resolved the image".to_string()),
-    ))
+    fetch_image_archive(reference, auth).await
+}
+
+/// The config digest a `docker save` archive's `manifest.json` names.
+pub fn archive_config_digest(archive: &std::path::Path) -> Result<String> {
+    let fail = |message: String| {
+        Error::agent(
+            "read image archive",
+            format!("{}: {message}", archive.display()),
+        )
+    };
+    let mut tar = tar::Archive::new(std::fs::File::open(archive)?);
+    for entry in tar.entries().map_err(|e| fail(e.to_string()))? {
+        let mut entry = entry.map_err(|e| fail(e.to_string()))?;
+        if entry.path().map_err(|e| fail(e.to_string()))?.as_os_str() != "manifest.json" {
+            continue;
+        }
+        let mut body = Vec::new();
+        std::io::Read::read_to_end(&mut entry, &mut body)?;
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&body).map_err(|e| fail(e.to_string()))?;
+        let config = manifest[0]["Config"]
+            .as_str()
+            .ok_or_else(|| fail("manifest.json names no config".to_string()))?;
+        // `sha256-<hex>` as written by this host's fetch, or a `docker save`
+        // path such as `blobs/sha256/<hex>` / `<hex>.json`.
+        let name = config.rsplit('/').next().unwrap_or(config);
+        let name = name.strip_suffix(".json").unwrap_or(name);
+        let hex = name.strip_prefix("sha256-").unwrap_or(name);
+        return Ok(format!("sha256:{hex}"));
+    }
+    Err(fail("no manifest.json".to_string()))
+}
+
+/// The local reference `record` should boot from when its registry image must
+/// be fetched on the host (see [`crate::config::VmRecord::image_needs_host_fetch`]),
+/// or `None` when the guest pulls it as usual. For the synchronous start
+/// paths; the caller persists the pin with
+/// [`crate::config::VmRecord::pin_host_fetched_image`].
+pub fn host_fetch_for(
+    record: &crate::config::VmRecord,
+    auth: &PullAuth,
+) -> Result<Option<FetchedImage>> {
+    if !record.image_needs_host_fetch() {
+        return Ok(None);
+    }
+    let Some(image) = record.image.as_deref() else {
+        return Ok(None);
+    };
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(|e| Error::agent("fetch image", e.to_string()))?;
+    rt.block_on(fetch_image_archive(image, auth)).map(Some)
+}
+
+/// [`host_fetch_for`], then persist the pin on `name`'s record so this and every
+/// later start boot the same bytes. Returns the record to launch.
+pub fn pin_for_start(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    record: crate::config::VmRecord,
+    auth: &PullAuth,
+) -> Result<crate::config::VmRecord> {
+    let Some(fetched) = host_fetch_for(&record, auth)? else {
+        return Ok(record);
+    };
+    db.update_vm_durable(name, |r| {
+        r.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone())
+    })?
+    .ok_or_else(|| Error::vm_not_found(name))
+}
+
+/// The file a blob is written to in a staged archive: its digest, which the
+/// archive's `manifest.json` names.
+fn blob_file(blob: &smolvm_registry::OciDescriptor) -> String {
+    blob.digest.replace(':', "-")
+}
+
+/// Stream one blob to `dest`, refusing it unless it is exactly the bytes the
+/// manifest names.
+async fn download_blob(
+    client: &RegistryClient,
+    repo: &str,
+    blob: &smolvm_registry::OciDescriptor,
+    dest: std::path::PathBuf,
+) -> Result<()> {
+    use futures_util::StreamExt;
+    use tokio::io::AsyncWriteExt;
+    let fail = |message: String| Error::agent("fetch image", message);
+    let mut stream = client
+        .pull_blob_stream(repo, &blob.digest)
+        .await
+        .map_err(|e| fail(format!("{}: {e}", blob.digest)))?;
+    let mut file = tokio::fs::File::create(&dest).await?;
+    let mut hasher = Sha256::new();
+    let mut written = 0_u64;
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| fail(format!("{}: {e}", blob.digest)))?;
+        written += chunk.len() as u64;
+        if written > blob.size {
+            return Err(fail(format!(
+                "{} is larger than the {} bytes its manifest declares",
+                blob.digest, blob.size
+            )));
+        }
+        hasher.update(&chunk);
+        file.write_all(&chunk).await?;
+    }
+    file.flush().await?;
+    let got = format!("sha256:{}", hex::encode(hasher.finalize()));
+    if got != blob.digest || written != blob.size {
+        return Err(fail(format!(
+            "{} arrived as {got} ({written} bytes); refusing it",
+            blob.digest
+        )));
+    }
+    Ok(())
+}
+
+/// Write the blobs downloaded into `dir` as a `docker save` archive at
+/// `archive`: a `manifest.json` naming the config and the layers in order,
+/// beside the blobs themselves. This is the format the guest's `crane export`
+/// flattens and its config recovery reads.
+fn write_save_archive(
+    dir: &std::path::Path,
+    archive: &std::path::Path,
+    config: &smolvm_registry::OciDescriptor,
+    layers: &[smolvm_registry::OciDescriptor],
+) -> Result<()> {
+    let manifest = serde_json::json!([{
+        "Config": blob_file(config),
+        "RepoTags": [],
+        "Layers": layers.iter().map(blob_file).collect::<Vec<_>>(),
+    }]);
+    let manifest =
+        serde_json::to_vec(&manifest).map_err(|e| Error::agent("fetch image", e.to_string()))?;
+    let mut tar = tar::Builder::new(std::fs::File::create(archive)?);
+    let mut header = tar::Header::new_gnu();
+    header.set_size(manifest.len() as u64);
+    header.set_mode(0o644);
+    header.set_cksum();
+    tar.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+    let mut archived = std::collections::HashSet::new();
+    for blob in std::iter::once(config).chain(layers) {
+        let name = blob_file(blob);
+        // A layer the manifest names twice goes in once: `manifest.json`
+        // points at the same file for both positions, and the loose copy is
+        // gone after the first pass.
+        if !archived.insert(name.clone()) {
+            continue;
+        }
+        // Fixed metadata, so the same image makes the same archive bytes on
+        // every host rather than carrying this download's time and owner.
+        let file = std::fs::File::open(dir.join(&name))?;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(file.metadata()?.len());
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, &name, file)?;
+        // The archive now holds the blob; drop the loose copy as we go so
+        // staging peaks near one image's size, not two.
+        std::fs::remove_file(dir.join(&name))?;
+    }
+    tar.into_inner()?.sync_all()?;
+    Ok(())
+}
+
+/// `reference` without its tag when a digest also pins it (`alpine:3.21@sha256:…`
+/// → `alpine@sha256:…`). The digest decides the content, as it does for Docker
+/// and `crane`; the tag is only a label, and the parser takes one or the other.
+fn without_pinned_tag(reference: &str) -> String {
+    let Some((name, digest)) = reference.split_once('@') else {
+        return reference.to_string();
+    };
+    let tag_at = name
+        .rfind(':')
+        .filter(|at| name.rfind('/').is_none_or(|slash| *at > slash));
+    match tag_at {
+        Some(at) => format!("{}@{digest}", &name[..at]),
+        None => reference.to_string(),
+    }
+}
+
+/// The slice of an OCI image config blob the run path needs: its default
+/// command. OCI/Docker spell these fields `Entrypoint`/`Cmd` (PascalCase), and
+/// either may be absent.
+#[derive(Deserialize)]
+struct OciImageConfigBlob {
+    #[serde(default)]
+    config: OciImageConfigInner,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(rename_all = "PascalCase")]
+struct OciImageConfigInner {
+    #[serde(default)]
+    entrypoint: Option<Vec<String>>,
+    #[serde(default)]
+    cmd: Option<Vec<String>>,
 }
 
 /// The repository path for a reference against a candidate `host`. Docker Hub
@@ -75,7 +609,7 @@ pub async fn authorized_digest(reference: &str, auth: &PullAuth) -> Result<Strin
 fn repo_for(host: &str, r: &Reference) -> String {
     let docker_hub = matches!(
         host,
-        "docker.io" | "docker.com" | "index.docker.io" | "registry-1.docker.io"
+        "docker.io" | "index.docker.io" | "registry-1.docker.io"
     );
     match &r.namespace {
         Some(ns) => format!("{}/{}", ns, r.name),
@@ -87,6 +621,225 @@ fn repo_for(host: &str, r: &Reference) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn descriptor(bytes: &[u8]) -> smolvm_registry::OciDescriptor {
+        smolvm_registry::OciDescriptor {
+            media_type: "application/vnd.oci.image.layer.v1.tar+gzip".into(),
+            digest: format!("sha256:{}", hex::encode(Sha256::digest(bytes))),
+            size: bytes.len() as u64,
+        }
+    }
+
+    #[test]
+    fn a_digest_pinned_reference_drops_its_tag() {
+        assert_eq!(
+            without_pinned_tag("alpine:3.21@sha256:ab"),
+            "alpine@sha256:ab"
+        );
+        assert_eq!(
+            without_pinned_tag("reg.io:5000/org/app:v1@sha256:ab"),
+            "reg.io:5000/org/app@sha256:ab"
+        );
+        // A registry port is not a tag.
+        assert_eq!(
+            without_pinned_tag("reg.io:5000/app@sha256:ab"),
+            "reg.io:5000/app@sha256:ab"
+        );
+        assert_eq!(without_pinned_tag("alpine:3.21"), "alpine:3.21");
+        assert!(Reference::parse(&without_pinned_tag(
+            "alpine:3.21@sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507"
+        ))
+        .is_ok());
+    }
+
+    #[test]
+    fn a_fetched_image_is_written_as_a_docker_save_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = descriptor(br#"{"architecture":"arm64"}"#);
+        let layer = descriptor(b"layer bytes");
+        std::fs::write(
+            dir.path().join(blob_file(&config)),
+            br#"{"architecture":"arm64"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(blob_file(&layer)), b"layer bytes").unwrap();
+        let archive = dir.path().join("image.tar");
+        write_save_archive(dir.path(), &archive, &config, std::slice::from_ref(&layer)).unwrap();
+
+        let mut entries = std::collections::HashMap::new();
+        for entry in tar::Archive::new(std::fs::File::open(&archive).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let mut entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            let mut body = Vec::new();
+            std::io::Read::read_to_end(&mut entry, &mut body).unwrap();
+            entries.insert(name, body);
+        }
+        // What the guest's config recovery and `crane export` read.
+        let manifest: serde_json::Value =
+            serde_json::from_slice(&entries["manifest.json"]).unwrap();
+        assert_eq!(manifest[0]["Config"], blob_file(&config));
+        assert_eq!(manifest[0]["Layers"][0], blob_file(&layer));
+        assert_eq!(entries[&blob_file(&layer)], b"layer bytes");
+        assert!(
+            !dir.path().join(blob_file(&layer)).exists(),
+            "loose blobs are dropped once archived"
+        );
+    }
+
+    /// `ghcr.io/tobi/wrap:desktop` names the empty layer twice; the archive
+    /// holds it once and `manifest.json` lists it at both positions (issue #2024).
+    #[test]
+    fn a_layer_the_manifest_names_twice_is_archived_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = descriptor(br#"{"architecture":"amd64"}"#);
+        let empty = descriptor(b"empty layer");
+        let other = descriptor(b"other layer");
+        std::fs::write(
+            dir.path().join(blob_file(&config)),
+            br#"{"architecture":"amd64"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(blob_file(&empty)), b"empty layer").unwrap();
+        std::fs::write(dir.path().join(blob_file(&other)), b"other layer").unwrap();
+        let archive = dir.path().join("image.tar");
+        write_save_archive(
+            dir.path(),
+            &archive,
+            &config,
+            &[
+                descriptor(b"empty layer"),
+                descriptor(b"other layer"),
+                descriptor(b"empty layer"),
+            ],
+        )
+        .unwrap();
+
+        // one entry per distinct file, each name once
+        let mut names = Vec::new();
+        for entry in tar::Archive::new(std::fs::File::open(&archive).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            if name == "manifest.json" {
+                let manifest: serde_json::Value = serde_json::from_reader(entry).unwrap();
+                let layers = manifest[0]["Layers"].as_array().unwrap();
+                assert_eq!(layers.len(), 3);
+                assert_eq!(layers[0], blob_file(&empty));
+                assert_eq!(layers[2], blob_file(&empty));
+            }
+            names.push(name);
+        }
+        names.sort();
+        let mut expected = vec![
+            blob_file(&config),
+            blob_file(&empty),
+            blob_file(&other),
+            "manifest.json".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
+    }
+
+    #[test]
+    fn a_fetched_archive_is_the_same_bytes_on_every_host() {
+        let config = descriptor(br#"{"architecture":"amd64"}"#);
+        let layer = descriptor(b"layer bytes");
+        let build = || {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(
+                dir.path().join(blob_file(&config)),
+                br#"{"architecture":"amd64"}"#,
+            )
+            .unwrap();
+            std::fs::write(dir.path().join(blob_file(&layer)), b"layer bytes").unwrap();
+            let archive = dir.path().join("image.tar");
+            write_save_archive(dir.path(), &archive, &config, std::slice::from_ref(&layer))
+                .unwrap();
+            (dir, archive)
+        };
+        let (_first_dir, first) = build();
+        // Another download lands with another time.
+        std::thread::sleep(std::time::Duration::from_millis(1100));
+        let (_second_dir, second) = build();
+        assert_eq!(
+            std::fs::read(&first).unwrap(),
+            std::fs::read(&second).unwrap()
+        );
+        assert_eq!(archive_config_digest(&first).unwrap(), config.digest);
+    }
+
+    #[test]
+    fn a_fetched_archives_time_follows_its_digest() {
+        let a = archive_mtime_for(
+            "sha256:ce64758a109eb420d874a118f87920e625e12d3634e03b4a5573fd9f6e5d3507",
+        );
+        assert_eq!(a, 0xce64758a & 0x7fff_ffff);
+        assert_eq!(a, archive_mtime_for("sha256:ce64758aff"));
+        assert_ne!(a, archive_mtime_for("sha256:0164758aff"));
+    }
+
+    #[test]
+    fn a_save_archives_config_digest_is_read_from_its_manifest() {
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join("save.tar");
+        let mut tar = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let manifest = br#"[{"Config":"blobs/sha256/abcd","Layers":[]}]"#;
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "manifest.json", &manifest[..])
+            .unwrap();
+        tar.into_inner().unwrap();
+        assert_eq!(archive_config_digest(&archive).unwrap(), "sha256:abcd");
+    }
+
+    #[test]
+    fn a_blob_that_is_not_what_the_manifest_names_is_refused() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            let wanted = descriptor(b"the real layer");
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/library/x/blobs/{}", wanted.digest)))
+                .respond_with(
+                    ResponseTemplate::new(200).set_body_bytes(b"a substituted layer".to_vec()),
+                )
+                .mount(&server)
+                .await;
+            let client = RegistryClient::new(server.uri());
+            let dir = tempfile::tempdir().unwrap();
+            let error = download_blob(&client, "library/x", &wanted, dir.path().join("blob"))
+                .await
+                .expect_err("substituted bytes must be refused");
+            assert!(error.to_string().contains(&wanted.digest), "{error}");
+
+            Mock::given(method("GET"))
+                .and(path(
+                    "/v2/library/x/blobs/sha256:".to_string() + &hex::encode(Sha256::digest(b"ok")),
+                ))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(b"ok".to_vec()))
+                .mount(&server)
+                .await;
+            download_blob(
+                &client,
+                "library/x",
+                &descriptor(b"ok"),
+                dir.path().join("ok"),
+            )
+            .await
+            .unwrap();
+            assert_eq!(std::fs::read(dir.path().join("ok")).unwrap(), b"ok");
+        });
+    }
 
     #[test]
     fn repo_for_maps_docker_hub_and_namespaced_refs() {
@@ -149,6 +902,175 @@ mod tests {
                 format!("sha256:{}", hex::encode(Sha256::digest(&body))),
                 "the digest is the content address of the manifest"
             );
+            let content = authorized_image_content(
+                &reference,
+                &PullAuth::Bearer("good-token".into()),
+            )
+            .await
+            .expect("authorized caller should resolve image content");
+            assert_eq!(
+                content,
+                (format!("sha256:{}", "0".repeat(64)), Vec::new())
+            );
+        });
+    }
+
+    /// A host that answers 200 with something other than a manifest, like the
+    /// web page Docker Hub's `docker.com` returns for any path, is not a
+    /// registry: its body must never become a digest.
+    #[test]
+    fn non_manifest_response_is_rejected() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/latest"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/html")
+                        .set_body_string("<!doctype html><title>Docker</title>"),
+                )
+                .mount(&server)
+                .await;
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let err = authorized_digest(&format!("{host}/myrepo:latest"), &PullAuth::Anonymous)
+                .await
+                .expect_err("a web page is not a manifest");
+            assert!(
+                err.to_string().contains("did not return an image manifest"),
+                "{err}"
+            );
+        });
+    }
+
+    /// The registry's own failure reaches the caller: nothing else is asked
+    /// that could replace a real "not found" with an unrelated error.
+    #[test]
+    fn registry_error_is_reported_as_is() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/no-such-tag"))
+                .respond_with(ResponseTemplate::new(404))
+                .expect(1)
+                .mount(&server)
+                .await;
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let err =
+                authorized_digest(&format!("{host}/myrepo:no-such-tag"), &PullAuth::Anonymous)
+                    .await
+                    .expect_err("a missing tag must fail");
+            assert!(err.to_string().contains("myrepo:no-such-tag"), "{err}");
+        });
+    }
+
+    /// Regression for #1334: `--oci-cache` lost the image's own ENTRYPOINT/CMD
+    /// because the bake records `/bin/true`. `authorized_image_config` recovers
+    /// them from the image config over the same authorized round-trip, without
+    /// pulling layers, so the run path can run the image's command.
+    #[test]
+    fn image_config_resolves_entrypoint_and_cmd() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+
+            // The image config blob, with a real ENTRYPOINT + CMD. pull_blob
+            // verifies the blob hashes to the digest the manifest names, so the
+            // manifest below must reference this content's actual sha256.
+            let config_body =
+                br#"{"config":{"Entrypoint":["/usr/local/bin/greet"],"Cmd":["--loud"]}}"#.to_vec();
+            let config_digest =
+                format!("sha256:{}", hex::encode(Sha256::digest(&config_body)));
+            let manifest = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[]}}"#,
+                config_body.len()
+            )
+            .into_bytes();
+
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/latest"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                        .set_body_bytes(manifest.clone()),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/myrepo/blobs/{config_digest}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(config_body.clone()))
+                .mount(&server)
+                .await;
+
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let reference = format!("{host}/myrepo:latest");
+
+            let cfg = authorized_image_config(&reference, &PullAuth::Anonymous)
+                .await
+                .expect("config should resolve");
+            assert_eq!(cfg.entrypoint, vec!["/usr/local/bin/greet".to_string()]);
+            assert_eq!(cfg.cmd, vec!["--loud".to_string()]);
+            assert_eq!(
+                cfg.digest,
+                format!("sha256:{}", hex::encode(Sha256::digest(&manifest))),
+                "digest still tracks the manifest content, as the cache key needs"
+            );
+        });
+    }
+
+    /// An image that declares neither ENTRYPOINT nor CMD yields empty vectors
+    /// (not an error), so the run path falls through to its shell/idle default
+    /// exactly as the non-cached path does.
+    #[test]
+    fn image_config_tolerates_missing_command() {
+        use wiremock::matchers::{method, path};
+        use wiremock::{Mock, MockServer, ResponseTemplate};
+
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let server = MockServer::start().await;
+            let config_body = br#"{"config":{}}"#.to_vec();
+            let config_digest =
+                format!("sha256:{}", hex::encode(Sha256::digest(&config_body)));
+            let manifest = format!(
+                r#"{{"schemaVersion":2,"mediaType":"application/vnd.oci.image.manifest.v1+json","config":{{"mediaType":"application/vnd.oci.image.config.v1+json","digest":"{config_digest}","size":{}}},"layers":[]}}"#,
+                config_body.len()
+            )
+            .into_bytes();
+
+            Mock::given(method("GET"))
+                .and(path("/v2/myrepo/manifests/latest"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "application/vnd.oci.image.manifest.v1+json")
+                        .set_body_bytes(manifest),
+                )
+                .mount(&server)
+                .await;
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/myrepo/blobs/{config_digest}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(config_body))
+                .mount(&server)
+                .await;
+
+            let host = server.uri().strip_prefix("http://").unwrap().to_string();
+            let reference = format!("{host}/myrepo:latest");
+
+            let cfg = authorized_image_config(&reference, &PullAuth::Anonymous)
+                .await
+                .expect("config should resolve");
+            assert!(cfg.entrypoint.is_empty());
+            assert!(cfg.cmd.is_empty());
         });
     }
 }

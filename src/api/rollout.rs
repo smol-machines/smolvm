@@ -1637,7 +1637,7 @@ impl RolloutExecutor {
             });
         }
         self.queued
-            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
+            .try_update(Ordering::AcqRel, Ordering::Acquire, |queued| {
                 (queued < self.config.max_queue_depth).then_some(queued + 1)
             })
             .map_err(|_| {
@@ -2108,7 +2108,7 @@ mod tests {
             state.unloads.lock().await.push(body);
             if state
                 .unload_failures
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
+                .try_update(Ordering::AcqRel, Ordering::Acquire, |remaining| {
                     remaining.checked_sub(1)
                 })
                 .is_ok()

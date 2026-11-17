@@ -4,6 +4,7 @@
 //! config.json files used by crun to execute containers.
 
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::fs;
 use std::io::ErrorKind;
 use std::path::Path;
@@ -20,7 +21,15 @@ pub struct OciSpec {
     pub mounts: Vec<OciMount>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub hostname: Option<String>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub annotations: BTreeMap<String, String>,
 }
+
+/// Annotation naming the workload's `uid:gid` in a bundle's `config.json`.
+/// The container's own process is the keep-alive init, which runs as root, so
+/// `process.user` no longer says who the workload is; uploads with no explicit
+/// owner read this instead.
+pub const WORKLOAD_USER_ANNOTATION: &str = "run.smolmachines.workload-user";
 
 /// Root filesystem configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -91,6 +100,8 @@ pub struct OciUser {
 pub struct ProcessIdentity {
     pub user: OciUser,
     pub home: Option<String>,
+    /// The rootfs can load the `C.UTF-8` locale, so `LANG` may default to it.
+    pub c_utf8: bool,
 }
 
 impl ProcessIdentity {
@@ -99,9 +110,10 @@ impl ProcessIdentity {
             user: OciUser {
                 uid: 0,
                 gid: 0,
-                additional_gids: vec![],
+                additional_gids: vec![0],
             },
             home: Some("/root".to_string()),
+            c_utf8: false,
         }
     }
 }
@@ -130,6 +142,39 @@ struct ResolvedUser {
 }
 
 pub fn resolve_process_identity(
+    rootfs: &Path,
+    user_spec: Option<&str>,
+) -> Result<ProcessIdentity, String> {
+    let mut identity = resolve_user_identity(rootfs, user_spec)?;
+    identity.c_utf8 = has_c_utf8_locale(rootfs);
+    Ok(identity)
+}
+
+/// Whether programs in `rootfs` can load `C.UTF-8`: glibc images that ship it
+/// (Debian, Ubuntu, Fedora, Amazon Linux) and musl, which needs no locale files.
+/// `LANG` stays unset elsewhere, since a locale that fails to load makes perl
+/// and others warn on every start.
+fn has_c_utf8_locale(rootfs: &Path) -> bool {
+    let locales = rootfs.join("usr/lib/locale");
+    if ["C.utf8", "C.UTF-8"]
+        .iter()
+        .any(|name| locales.join(name).is_dir())
+    {
+        return true;
+    }
+    ["lib", "usr/lib"].iter().any(|dir| {
+        std::fs::read_dir(rootfs.join(dir)).is_ok_and(|entries| {
+            entries.flatten().any(|entry| {
+                entry
+                    .file_name()
+                    .to_str()
+                    .is_some_and(|name| name.starts_with("ld-musl-"))
+            })
+        })
+    })
+}
+
+fn resolve_user_identity(
     rootfs: &Path,
     user_spec: Option<&str>,
 ) -> Result<ProcessIdentity, String> {
@@ -173,6 +218,7 @@ pub fn resolve_process_identity(
             additional_gids,
         },
         home,
+        c_utf8: false,
     })
 }
 
@@ -198,8 +244,9 @@ pub fn home_for(identity: &ProcessIdentity) -> &str {
 /// inheriting the container's) go through here, so the two can no longer
 /// drift: earlier they did, and first `SSH_AUTH_SOCK` and then `HOME` were
 /// present on one path and silently absent on the other. The caller's
-/// variables always win; `PATH`, `TERM` and `HOME` are only filled in when the
-/// caller left them out, and nothing is ever duplicated.
+/// variables always win; `PATH`, `TERM`, `HOME` and `LANG` are only filled in
+/// when the caller left them out, and nothing is ever duplicated. `LANG` is
+/// `C.UTF-8` as on GitHub's runners, where the rootfs can load it.
 pub fn process_env_for(
     identity: &ProcessIdentity,
     env: &[(String, String)],
@@ -209,8 +256,9 @@ pub fn process_env_for(
         ("PATH", crate::crun::DEFAULT_CONTAINER_PATH),
         ("TERM", "xterm-256color"),
         ("HOME", home_for(identity)),
+        ("LANG", if identity.c_utf8 { "C.UTF-8" } else { "" }),
     ] {
-        if !out.iter().any(|(k, _)| k == key) {
+        if !value.is_empty() && !out.iter().any(|(k, _)| k == key) {
             out.push((key.to_string(), value.to_string()));
         }
     }
@@ -226,20 +274,39 @@ pub fn apply_process_env(rootfs: &Path, user_spec: Option<&str>, env: &mut Vec<(
     }
 }
 
-/// Returns `Ok(None)` for an empty/absent spec so the exec keeps the container
-/// default. Names are resolved against the rootfs `/etc/passwd` via
-/// [`resolve_process_identity`], so this stays consistent with the `crun run`
-/// path's resolution (same uid/gid, home, groups).
-pub fn resolve_exec_user_spec(
-    rootfs: &Path,
-    user_spec: Option<&str>,
-) -> Result<Option<String>, String> {
-    let normalized = user_spec.map(str::trim).filter(|s| !s.is_empty());
-    if normalized.is_none() {
-        return Ok(None);
-    }
+/// Always returns a user, so an exec never falls back to the container's own:
+/// that is the keep-alive init, which runs as root whatever the workload's
+/// user is. An empty/absent spec is root, as on the `crun run` path. Names are
+/// resolved against the rootfs `/etc/passwd` via [`resolve_process_identity`],
+/// so this stays consistent with that path's resolution (same uid/gid, home,
+/// groups).
+pub fn resolve_exec_user_spec(rootfs: &Path, user_spec: Option<&str>) -> Result<String, String> {
     let identity = resolve_process_identity(rootfs, user_spec)?;
-    Ok(Some(format!("{}:{}", identity.user.uid, identity.user.gid)))
+    Ok(user_spec_of(&identity))
+}
+
+/// The numeric `uid:gid` of `identity`, the form `crun exec --user` takes.
+pub fn user_spec_of(identity: &ProcessIdentity) -> String {
+    format!("{}:{}", identity.user.uid, identity.user.gid)
+}
+
+/// The ids of a numeric `uid:gid`, as [`user_spec_of`] writes it.
+fn parse_numeric_user(user: &str) -> Option<(u32, u32)> {
+    let (uid, gid) = user.split_once(':')?;
+    Some((uid.parse().ok()?, gid.parse().ok()?))
+}
+
+/// [`OciSpec::workload_user`] of a bundle's `config.json` read back as JSON,
+/// or `None` when it names no user.
+pub fn workload_user_of_config(config: &serde_json::Value) -> Option<(u32, u32)> {
+    let annotated = config["annotations"][WORKLOAD_USER_ANNOTATION]
+        .as_str()
+        .and_then(parse_numeric_user);
+    annotated.or_else(|| {
+        let user = &config["process"]["user"];
+        let id = |field: &str| u32::try_from(user[field].as_u64()?).ok();
+        Some((id("uid")?, id("gid")?))
+    })
 }
 
 fn parse_user_spec(spec: &str) -> Result<(&str, Option<&str>), String> {
@@ -273,6 +340,7 @@ fn resolve_default_root_identity(
                 ),
             },
             home: Some(root.home.clone()),
+            c_utf8: false,
         };
     }
 
@@ -323,25 +391,35 @@ fn resolve_group_token(group: &str, group_entries: &[GroupEntry]) -> Result<u32,
         .ok_or_else(|| format!("group '{}' not found in container rootfs", group))
 }
 
+/// The groups a process for `username` holds, as `initgroups(3)` (a login, or
+/// `docker exec`) sets them: its primary group first, then every `/etc/group`
+/// entry that lists it as a member, each gid once. The primary group is part of
+/// the list as containerd puts it there (CVE-2023-25173), so dropping to it
+/// with `setgroups` keeps it. A numeric user with no passwd entry has no name
+/// to look up and holds only its primary group.
 fn supplemental_group_ids(
     group_entries: &[GroupEntry],
     username: Option<&str>,
     primary_gid: u32,
 ) -> Vec<u32> {
+    let mut gids = vec![primary_gid];
     let Some(username) = username else {
-        return Vec::new();
+        return gids;
     };
-
-    let mut gids = Vec::new();
     for entry in group_entries {
-        if entry.gid != primary_gid
-            && entry.members.iter().any(|member| member == username)
-            && !gids.contains(&entry.gid)
-        {
+        if entry.members.iter().any(|member| member == username) && !gids.contains(&entry.gid) {
             gids.push(entry.gid);
         }
     }
     gids
+}
+
+impl OciUser {
+    /// Whether this user holds a group besides its primary one, which
+    /// `crun exec --user uid:gid` cannot express (it sets uid and gid only).
+    pub fn has_supplementary_groups(&self) -> bool {
+        self.additional_gids.iter().any(|gid| *gid != self.gid)
+    }
 }
 
 fn load_passwd_entries(rootfs: &Path) -> Result<Vec<PasswdEntry>, String> {
@@ -642,6 +720,7 @@ impl OciSpec {
                 mounts
             },
             hostname: Some(container_hostname()),
+            annotations: BTreeMap::new(),
         }
     }
 
@@ -698,6 +777,37 @@ impl OciSpec {
         });
     }
 
+    /// Expose the DMA-BUF heaps (/dev/dma_heap) to the container if the VM has them.
+    ///
+    /// Android allocates its graphics buffers from /dev/dma_heap/system, so the
+    /// Android emulator and Android containers fail without it. Like /dev/kvm,
+    /// the node lives in the VM's /dev, which crun's tmpfs hides, so it is
+    /// bind-mounted, the same as `--device /dev/dma_heap`.
+    pub fn add_dma_heap_devices_if_available(&mut self) {
+        if self.mounts.iter().any(|m| m.destination == "/dev/dma_heap") {
+            return;
+        }
+        if !std::path::Path::new("/dev/dma_heap").exists() {
+            return; // a guest kernel built without DMA-BUF heaps
+        }
+        self.mounts.push(OciMount {
+            destination: "/dev/dma_heap".to_string(),
+            mount_type: Some("bind".to_string()),
+            source: "/dev/dma_heap".to_string(),
+            options: vec!["bind".to_string(), "rprivate".to_string()],
+        });
+    }
+
+    /// Expose every device the VM offers its workloads: GPU render nodes,
+    /// /dev/kvm and the DMA-BUF heaps, each only when the VM has it. Every path
+    /// that builds a workload spec calls this, so `run`, `exec`, interactive
+    /// shells and pods all see the same devices.
+    pub fn add_vm_devices_if_available(&mut self) {
+        self.add_gpu_devices_if_available();
+        self.add_kvm_device_if_available();
+        self.add_dma_heap_devices_if_available();
+    }
+
     /// Expose GPU render nodes to the container if /dev/dri exists in the VM.
     ///
     /// Detects virtio-gpu devices at runtime and adds a bind mount to the OCI
@@ -730,10 +840,60 @@ impl OciSpec {
         });
     }
 
+    /// Leave the workload's /tmp to its root filesystem: drop the default tmpfs
+    /// mount there. A separate /tmp mount, tmpfs or bind, made rename(2) from
+    /// /tmp into the rest of the filesystem fail with EXDEV, and a tmpfs sized
+    /// from boot RAM ran out of space with the disk mostly empty; GitHub's
+    /// runners and most VMs keep /tmp on the root filesystem. The overlay's
+    /// upper layer gets a fresh, opaque /tmp at each boot
+    /// (`storage::reset_workload_tmp`), and exports leave its contents out.
+    /// Only the default tmpfs goes: a caller's own /tmp mount is kept, and a
+    /// read-only root keeps the tmpfs, as it has no writable /tmp of its own.
+    fn tmp_on_root(&mut self) {
+        if self.root.readonly {
+            return;
+        }
+        self.mounts.retain(|mount| {
+            !(mount.destination == "/tmp"
+                && mount.mount_type.as_deref() == Some("tmpfs")
+                && mount.source == "tmpfs")
+        });
+    }
+
+    /// Record who the workload runs as ([`WORKLOAD_USER_ANNOTATION`]), for a
+    /// bundle whose own process may be the keep-alive init instead.
+    pub fn set_workload_user(&mut self, identity: &ProcessIdentity) {
+        self.annotations
+            .insert(WORKLOAD_USER_ANNOTATION.to_string(), user_spec_of(identity));
+    }
+
+    /// The `uid:gid` the workload runs as: the one [`Self::set_workload_user`]
+    /// recorded, else the spec's own process user (a spec that runs the
+    /// workload itself, or one written before the record existed).
+    pub fn workload_user(&self) -> (u32, u32) {
+        self.annotations
+            .get(WORKLOAD_USER_ANNOTATION)
+            .and_then(|user| parse_numeric_user(user))
+            .unwrap_or((self.process.user.uid, self.process.user.gid))
+    }
+
     /// Write the OCI spec to a config.json file in the bundle directory.
+    ///
+    /// When the bundle sits in an overlay (an [`OVERLAY_UPPER_DIR`] beside it)
+    /// whose boot prepared the upper layer's /tmp (no [`TMP_KEEP_TMPFS_MARKER`]
+    /// beside it), the written spec leaves /tmp to the root filesystem (see
+    /// [`Self::tmp_on_root`]); otherwise the tmpfs stays.
     pub fn write_to(&self, bundle_dir: &Path) -> std::io::Result<()> {
         let config_path = bundle_dir.join("config.json");
-        let json = serde_json::to_string_pretty(self)
+        let tmp_on_root = bundle_dir.parent().is_some_and(|overlay| {
+            overlay.join(OVERLAY_UPPER_DIR).is_dir()
+                && !overlay.join(TMP_KEEP_TMPFS_MARKER).exists()
+        });
+        let mut spec = std::borrow::Cow::Borrowed(self);
+        if tmp_on_root {
+            spec.to_mut().tmp_on_root();
+        }
+        let json = serde_json::to_string_pretty(&*spec)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(config_path, json)
     }
@@ -1001,7 +1161,7 @@ fn full_capabilities() -> Vec<String> {
 /// Default device nodes for container execution.
 /// These are standard Linux devices that should exist in /dev.
 fn default_devices() -> Vec<OciDevice> {
-    vec![
+    let mut devices = vec![
         // /dev/null - discard all writes, reads return EOF
         OciDevice {
             device_type: "c".to_string(),
@@ -1093,7 +1253,61 @@ fn default_devices() -> Vec<OciDevice> {
             uid: Some(0),
             gid: Some(0),
         },
-    ]
+    ];
+    devices.extend(attached_disk_devices());
+    devices
+}
+
+/// Block-device nodes for disks attached with `--disk`.
+///
+/// The guest kernel's devtmpfs has them, but the container's `/dev` is a fresh
+/// tmpfs built from this list, so an attached disk is invisible inside the
+/// container until someone runs `mknod` by hand on every boot. Worse than
+/// invisible: `dd of=/dev/vdc` in a container without the node silently creates
+/// a regular file on that tmpfs and reports success, so a caller can appear to
+/// write a disk and lose everything.
+///
+/// `/dev/vda` (the machine's storage disk) and `/dev/vdb` (its overlay) are
+/// deliberately left out. They back the container's own filesystem, so handing
+/// the workload raw access would let it corrupt the ground it stands on.
+/// Everything past them was attached by the caller and is exactly what they
+/// asked to reach.
+fn attached_disk_devices() -> Vec<OciDevice> {
+    let mut out = Vec::new();
+    let Ok(entries) = std::fs::read_dir("/sys/block") else {
+        return out;
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|n| n.starts_with("vd") && n > &"vdb".to_string())
+        .collect();
+    // Stable order so the container's /dev matches the attach order.
+    names.sort();
+    for name in names {
+        // `/sys/block/<dev>/dev` holds "major:minor".
+        let Ok(raw) = std::fs::read_to_string(format!("/sys/block/{name}/dev")) else {
+            continue;
+        };
+        let Some((major, minor)) = raw.trim().split_once(':') else {
+            continue;
+        };
+        let (Ok(major), Ok(minor)) = (major.parse::<u32>(), minor.parse::<u32>()) else {
+            continue;
+        };
+        out.push(OciDevice {
+            device_type: "b".to_string(),
+            path: format!("/dev/{name}"),
+            major,
+            minor,
+            // Root-only: an attached disk is raw storage, not something every
+            // uid in the image should be able to overwrite.
+            file_mode: Some(0o600),
+            uid: Some(0),
+            gid: Some(0),
+        });
+    }
+    out
 }
 
 /// The guest's `/dev/net/tun`, bind-mounted into the container.
@@ -1115,6 +1329,26 @@ fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
         source: guest_node.display().to_string(),
         options: vec!["bind".to_string(), "rprivate".to_string()],
     })
+}
+
+/// The upper layer beside an overlay's `bundle`: a bundle with one is an overlay workload's.
+pub const OVERLAY_UPPER_DIR: &str = "upper";
+
+/// A file beside the upper layer that a boot leaves when the upper layer's
+/// /tmp could not be prepared (cleared, created, made opaque): the bundle then
+/// keeps its tmpfs /tmp rather than show the image's /tmp or an earlier boot's
+/// files. See `storage::reset_workload_tmp`.
+pub const TMP_KEEP_TMPFS_MARKER: &str = "tmp-keep-tmpfs";
+
+/// The workload's /dev/shm size: the machine's `--shm-size`, else half the
+/// guest's RAM, as on a Linux VM or a hosted CI runner rather than Docker's
+/// 64 MiB (browsers and ML loaders size buffers from it). tmpfs takes memory
+/// only as files are written.
+fn shm_size() -> String {
+    std::env::var(smolvm_protocol::guest_env::SHM_SIZE)
+        .ok()
+        .and_then(|size| smolvm_protocol::guest_env::shm_size_option(&size).ok())
+        .unwrap_or_else(|| "50%".to_string())
 }
 
 /// Default mounts for container execution.
@@ -1166,7 +1400,7 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
                 "noexec".to_string(),
                 "nodev".to_string(),
                 "mode=1777".to_string(),
-                "size=65536k".to_string(),
+                format!("size={}", shm_size()),
             ],
         },
         // /dev/mqueue - POSIX message queues
@@ -1211,6 +1445,10 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
         // them means the workload doesn't have to mount them itself, and read-only
         // rootfs images still get writable runtime dirs. Omitted when unprivileged
         // (the workload can't mount, but also isn't expected to be an init system).
+        // The image's own files under /run are copied in (`tmpcopyup`): an
+        // image that ships a directory there, such as a database's socket
+        // directory owned by its service user, finds it as it would on a
+        // container engine that mounts nothing over /run.
         mounts.push(OciMount {
             destination: "/run".to_string(),
             mount_type: Some("tmpfs".to_string()),
@@ -1220,6 +1458,7 @@ fn default_mounts(unprivileged: bool) -> Vec<OciMount> {
                 "nodev".to_string(),
                 "mode=0755".to_string(),
                 "size=65536k".to_string(),
+                "tmpcopyup".to_string(),
             ],
         });
         mounts.push(OciMount {
@@ -1311,6 +1550,40 @@ fn is_dns_label(s: &str) -> bool {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn the_run_tmpfs_starts_with_the_image_files_under_it() {
+        let run = super::default_mounts(false)
+            .into_iter()
+            .find(|mount| mount.destination == "/run")
+            .expect("/run is mounted");
+        assert_eq!(run.mount_type.as_deref(), Some("tmpfs"));
+        assert!(run.options.iter().any(|option| option == "tmpcopyup"));
+    }
+
+    #[test]
+    fn dev_shm_takes_half_the_guest_ram_unless_the_machine_sets_a_size() {
+        let shm_size = |unprivileged| {
+            super::default_mounts(unprivileged)
+                .into_iter()
+                .find(|mount| mount.destination == "/dev/shm")
+                .expect("/dev/shm is mounted")
+                .options
+                .into_iter()
+                .find(|option| option.starts_with("size="))
+        };
+        let key = smolvm_protocol::guest_env::SHM_SIZE;
+        std::env::remove_var(key);
+        for unprivileged in [false, true] {
+            assert_eq!(shm_size(unprivileged).as_deref(), Some("size=50%"));
+        }
+        std::env::set_var(key, "2G");
+        assert_eq!(shm_size(false).as_deref(), Some("size=2g"));
+        // A value the validator refuses never reaches the mount.
+        std::env::set_var(key, "1g,mode=0777");
+        assert_eq!(shm_size(false).as_deref(), Some("size=50%"));
+        std::env::remove_var(key);
+    }
+
     #[test]
     fn dns_label_check_accepts_valid_names_rejects_the_rest() {
         use super::is_dns_label;
@@ -1586,8 +1859,86 @@ mod tests {
 
         assert_eq!(identity.user.uid, 1000);
         assert_eq!(identity.user.gid, 1000);
-        assert_eq!(identity.user.additional_gids, vec![29, 44]);
+        assert_eq!(identity.user.additional_gids, vec![1000, 29, 44]);
         assert_eq!(identity.home.as_deref(), Some("/home/steam"));
+    }
+
+    #[test]
+    fn test_supplementary_groups_come_from_etc_group_like_initgroups() {
+        let rootfs = tempdir().unwrap();
+        let etc = rootfs.path().join("etc");
+        std::fs::create_dir_all(&etc).unwrap();
+        std::fs::write(
+            etc.join("passwd"),
+            "root:x:0:0:root:/root:/bin/bash\n\
+             runner:x:1001:1001::/home/runner:/bin/bash\n\
+             loner:x:1002:1002::/home/loner:/bin/sh\n",
+        )
+        .unwrap();
+        // runner is in several groups, is listed in its own primary group, and
+        // is in two groups that share gid 123; loner is in none.
+        std::fs::write(
+            etc.join("group"),
+            "root:x:0:\n\
+             adm:x:4:syslog,runner\n\
+             users:x:100:someone,runner\n\
+             runner:x:1001:runner\n\
+             docker:x:123:runner\n\
+             dockerroot:x:123:runner\n\
+             loner:x:1002:\n",
+        )
+        .unwrap();
+        let gids = |user: &str| {
+            resolve_process_identity(rootfs.path(), Some(user))
+                .unwrap()
+                .user
+                .additional_gids
+        };
+
+        // Primary group first, then each membership once, in file order.
+        assert_eq!(gids("runner"), vec![1001, 4, 100, 123]);
+        // A numeric uid with a passwd entry is that user.
+        assert_eq!(gids("1001"), vec![1001, 4, 100, 123]);
+        assert_eq!(gids("1001:1001"), vec![1001, 4, 100, 123]);
+        // An explicit group becomes the primary; memberships still apply.
+        assert_eq!(gids("runner:docker"), vec![123, 4, 100, 1001]);
+        // A user listed in no group holds only its primary group.
+        assert_eq!(gids("loner"), vec![1002]);
+        // A numeric user with no passwd entry gets no extra groups.
+        assert_eq!(gids("5000:5000"), vec![5000]);
+        assert_eq!(gids("5000"), vec![0]);
+
+        let runner = resolve_process_identity(rootfs.path(), Some("runner")).unwrap();
+        assert!(runner.user.has_supplementary_groups());
+        let loner = resolve_process_identity(rootfs.path(), Some("loner")).unwrap();
+        assert!(!loner.user.has_supplementary_groups());
+    }
+
+    #[test]
+    fn the_workload_user_is_the_annotated_one_not_the_keepalive_init() {
+        let rootfs = tempdir().unwrap();
+        std::fs::create_dir_all(rootfs.path().join("etc")).unwrap();
+        let workload = resolve_process_identity(rootfs.path(), Some("405:100")).unwrap();
+        let spec_for = |process: &ProcessIdentity| {
+            OciSpec::new(&["true".to_string()], &[], "/", false, process, false)
+        };
+
+        // The keep-alive init runs as root; the workload is who it records.
+        let mut keepalive = spec_for(&ProcessIdentity::root());
+        keepalive.set_workload_user(&workload);
+        assert_eq!(keepalive.workload_user(), (405, 100));
+
+        // A spec with no record is its own process's user, as bundles written
+        // before the annotation existed ran the workload as the process.
+        assert_eq!(spec_for(&workload).workload_user(), (405, 100));
+        assert_eq!(spec_for(&ProcessIdentity::root()).workload_user(), (0, 0));
+
+        // The same answer from the bundle's config.json, as other code reads it.
+        let config = serde_json::to_value(&keepalive).unwrap();
+        assert_eq!(workload_user_of_config(&config), Some((405, 100)));
+        let config = serde_json::to_value(spec_for(&workload)).unwrap();
+        assert_eq!(workload_user_of_config(&config), Some((405, 100)));
+        assert_eq!(workload_user_of_config(&serde_json::json!({})), None);
     }
 
     #[test]
@@ -1599,7 +1950,8 @@ mod tests {
 
         assert_eq!(identity.user.uid, 1234);
         assert_eq!(identity.user.gid, 2345);
-        assert!(identity.user.additional_gids.is_empty());
+        // No passwd entry, so no name to look up: only the primary group.
+        assert_eq!(identity.user.additional_gids, vec![2345]);
         assert!(identity.home.is_none());
     }
 
@@ -1620,23 +1972,24 @@ mod tests {
         // A username resolves to its uid:gid.
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("nobody")).unwrap(),
-            Some("65534:65534".to_string())
+            "65534:65534"
         );
         // `root` is also a name — it must resolve to 0:0, not be rejected.
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("root")).unwrap(),
-            Some("0:0".to_string())
+            "0:0"
         );
         // Numeric specs pass through unchanged.
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("65534")).unwrap(),
-            Some("65534:65534".to_string())
+            "65534:65534"
         );
-        // No user / blank → None (exec keeps the container default).
-        assert_eq!(resolve_exec_user_spec(rootfs.path(), None).unwrap(), None);
+        // No user / blank → root, named explicitly: the container's own user
+        // is the keep-alive init's, so an exec never relies on it.
+        assert_eq!(resolve_exec_user_spec(rootfs.path(), None).unwrap(), "0:0");
         assert_eq!(
             resolve_exec_user_spec(rootfs.path(), Some("  ")).unwrap(),
-            None
+            "0:0"
         );
     }
 
@@ -1668,6 +2021,7 @@ mod tests {
                     additional_gids: vec![29],
                 },
                 home: Some("/home/steam".to_string()),
+                c_utf8: false,
             },
             false,
         );
@@ -1832,6 +2186,85 @@ mod tests {
         assert_eq!(spec.process.env, expected);
     }
 
+    /// An overlay workload's /tmp is its root filesystem's (no /tmp mount, so a
+    /// rename from /tmp into the workspace stays on one filesystem) while later
+    /// mounts under /tmp still apply; a bundle outside an overlay and a
+    /// read-only root keep the tmpfs.
+    #[test]
+    fn an_overlay_workloads_tmp_is_on_its_root_filesystem() {
+        let written = |overlay: &Path, readonly: bool| {
+            let bundle = overlay.join("bundle");
+            std::fs::create_dir_all(&bundle).unwrap();
+            let mut spec = OciSpec::new(
+                &["sh".to_string()],
+                &[],
+                "/",
+                false,
+                &ProcessIdentity::root(),
+                false,
+            );
+            spec.root.readonly = readonly;
+            spec.add_bind_mount("/storage/cache", "/tmp/cache", false);
+            spec.write_to(&bundle).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
+                    .unwrap();
+            json["mounts"].as_array().unwrap().clone()
+        };
+        let tmp_mount = |mounts: &[serde_json::Value]| {
+            mounts.iter().find(|m| m["destination"] == "/tmp").cloned()
+        };
+
+        let plain = tempfile::tempdir().unwrap();
+        assert_eq!(
+            tmp_mount(&written(plain.path(), false)).unwrap()["type"],
+            "tmpfs"
+        );
+
+        let overlay = tempfile::tempdir().unwrap();
+        std::fs::create_dir(overlay.path().join(OVERLAY_UPPER_DIR)).unwrap();
+        let mounts = written(overlay.path(), false);
+        assert!(tmp_mount(&mounts).is_none(), "no /tmp mount: {mounts:?}");
+        assert!(mounts.iter().any(|m| m["destination"] == "/tmp/cache"));
+        assert_eq!(
+            tmp_mount(&written(overlay.path(), true)).unwrap()["type"],
+            "tmpfs"
+        );
+        // a boot that could not prepare the upper layer's /tmp keeps the tmpfs
+        std::fs::write(overlay.path().join(TMP_KEEP_TMPFS_MARKER), b"").unwrap();
+        assert_eq!(
+            tmp_mount(&written(overlay.path(), false)).unwrap()["type"],
+            "tmpfs"
+        );
+    }
+
+    /// LANG defaults to C.UTF-8 only for a rootfs that can load it, and never
+    /// overrides the image's or the caller's.
+    #[test]
+    fn lang_defaults_to_c_utf8_where_the_rootfs_has_it() {
+        let lang = |rootfs: &Path, env: &[(String, String)]| {
+            let identity = resolve_process_identity(rootfs, None).unwrap();
+            process_env_for(&identity, env)
+                .into_iter()
+                .filter(|(k, _)| k == "LANG")
+                .map(|(_, v)| v)
+                .collect::<Vec<_>>()
+        };
+        let bare = tempfile::tempdir().unwrap();
+        assert!(lang(bare.path(), &[]).is_empty());
+
+        let glibc = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(glibc.path().join("usr/lib/locale/C.utf8")).unwrap();
+        assert_eq!(lang(glibc.path(), &[]), ["C.UTF-8"]);
+        let own = [("LANG".to_string(), "en_US.UTF-8".to_string())];
+        assert_eq!(lang(glibc.path(), &own), ["en_US.UTF-8"]);
+
+        let musl = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(musl.path().join("lib")).unwrap();
+        std::fs::write(musl.path().join("lib/ld-musl-x86_64.so.1"), b"").unwrap();
+        assert_eq!(lang(musl.path(), &[]), ["C.UTF-8"]);
+    }
+
     /// A numeric uid that has no passwd entry still gets a HOME, as Docker
     /// gives it, so tools that write under $HOME do not fail on an empty path.
     #[test]
@@ -1843,6 +2276,7 @@ mod tests {
                 additional_gids: vec![],
             },
             home: None,
+            c_utf8: false,
         };
         let spec = OciSpec::new(&["sh".to_string()], &[], "/", false, &identity, false);
         assert!(spec.process.env.contains(&"HOME=/".to_string()));
@@ -1858,6 +2292,33 @@ mod tests {
         );
         assert!(spec.process.env.contains(&"HOME=/srv".to_string()));
         assert!(!spec.process.env.contains(&"HOME=/".to_string()));
+    }
+
+    /// The machine's own storage and overlay disks must never be exposed to the
+    /// container: raw access to them lets a workload corrupt the filesystem it
+    /// is running on. Everything past `vdb` was attached by the caller.
+    #[test]
+    fn attached_disk_nodes_skip_the_machines_own_disks() {
+        let keep = |n: &str| n.starts_with("vd") && n > "vdb";
+        assert!(!keep("vda"), "storage disk stays out of the container");
+        assert!(!keep("vdb"), "overlay disk stays out of the container");
+        assert!(keep("vdc"), "the first attached disk is exposed");
+        assert!(keep("vdd"));
+        assert!(!keep("sda"), "only virtio disks are considered");
+    }
+
+    /// Whatever `/sys/block` reports, the node must be a block device owned by
+    /// root: an attached disk is raw storage, not something every uid in the
+    /// image should be able to overwrite.
+    #[test]
+    fn attached_disk_nodes_are_root_owned_block_devices() {
+        for d in attached_disk_devices() {
+            assert_eq!(d.device_type, "b", "{}", d.path);
+            assert_eq!(d.file_mode, Some(0o600), "{}", d.path);
+            assert_eq!(d.uid, Some(0));
+            assert_eq!(d.gid, Some(0));
+            assert!(d.path.starts_with("/dev/vd"), "{}", d.path);
+        }
     }
 
     #[test]
@@ -1904,6 +2365,27 @@ mod tests {
                 .count(),
             1
         );
+    }
+
+    #[test]
+    fn vm_devices_bind_the_dma_heaps_when_the_vm_has_them() {
+        let identity = ProcessIdentity::root();
+        let mut spec = OciSpec::new(&["echo".to_string()], &[], "/", false, &identity, false);
+        spec.add_vm_devices_if_available();
+        spec.add_vm_devices_if_available();
+
+        let heaps: Vec<_> = spec
+            .mounts
+            .iter()
+            .filter(|m| m.destination == "/dev/dma_heap")
+            .collect();
+        if std::path::Path::new("/dev/dma_heap").exists() {
+            assert_eq!(heaps.len(), 1, "added once however often it is called");
+            assert_eq!(heaps[0].source, "/dev/dma_heap");
+            assert!(heaps[0].options.contains(&"bind".to_string()));
+        } else {
+            assert!(heaps.is_empty());
+        }
     }
 
     #[test]

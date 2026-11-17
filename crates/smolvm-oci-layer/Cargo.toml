@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-oci-layer"
-version = "1.16.1"
+version = "1.35.0"
 edition = "2021"
 description = "Pure-Rust OCI image-layer extraction: decompress a layer blob and unpack it into an overlayfs lowerdir, translating OCI whiteouts"
 license = "Apache-2.0"
@@ -17,7 +17,7 @@ path = "src/lib.rs"
 [dependencies]
 tar = "0.4"
 flate2 = "1"
-ruzstd = "0.7"
+ruzstd = "0.9.1"
 tracing = { workspace = true }
 
 [target.'cfg(target_os = "linux")'.dependencies]
@@ -28,4 +28,4 @@ libc = "0.2"
 [dev-dependencies]
 tempfile = "3"
 # C-backed zstd is fine in tests (host-only, no musl link) for encoding fixtures.
-zstd = "0.13"
+zstd = "0.14.3"

@@ -17,14 +17,10 @@ Upgrades arrive with your normal `apt-get update && apt-get upgrade`.
 
 ## Notes
 
-- It is a **flat, unsigned repository** (installed with `[trusted=yes]`), which
-  matches the pacman repo's posture — integrity comes from packages built by CI
-  from the release artifacts and served over HTTPS. Package signing (GPG) is
-  planned; until then keep the `[trusted=yes]` flag.
-- Served from an atomic GitHub Pages deployment; packages are built by CI and
-  published on every release (`.github/workflows/pacman-repo.yml`). It is a
-  rolling repo — the latest release only (older versions remain on the GitHub
-  Releases page).
+- A **flat, unsigned repository**, hence `[trusted=yes]`, as the pacman repo is: integrity comes from CI-built
+  packages of the release artifacts, served over HTTPS. Keep the flag until GPG signing, which is planned, lands.
+- A rolling repo of the latest release only (older versions stay on the GitHub Releases page), built by CI on every
+  release (`.github/workflows/pacman-repo.yml`) and served from an atomic GitHub Pages deployment.
 - The package installs the wrapper at `/usr/bin/smolvm` and bundles the
   smol-machines `libkrun`/`libkrunfw` fork under `/usr/lib/smolvm` — it does not
   conflict with any system `libkrun`.

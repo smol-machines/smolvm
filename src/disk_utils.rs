@@ -112,11 +112,24 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
     } else if current_size > size_bytes {
         // A request below the template's size is a promise about an upper
         // bound (a quota, a dense host), so it is honored rather than rounded
-        // up. Shrinking has to happen here, before the first boot: the guest
-        // grows the filesystem to its block device at every boot, so a file
-        // left at the template size would simply grow back. It is a one-time
-        // cost on this machine's first start, about half a second.
-        shrink_ext4_image::<D>(disk_path, size_bytes)?;
+        // up. The disk has to be cut down here, before the first boot: the
+        // guest grows the filesystem to its block device at every boot, so a
+        // file left at the template size would simply grow back.
+        //
+        // The shipped template is a small filesystem at the front of a large
+        // sparse file, so the filesystem usually fits already and cutting the
+        // file is enough; the guest grows it to the disk. Only a filesystem
+        // that really is larger than the request needs resize2fs.
+        let fits = ext4_filesystem_bytes(disk_path).is_some_and(|fs| fs <= size_bytes);
+        if fits {
+            OpenOptions::new()
+                .write(true)
+                .open(disk_path)
+                .and_then(|file| file.set_len(size_bytes))
+                .map_err(|e| Error::storage("truncate disk", e.to_string()))?;
+        } else {
+            shrink_ext4_image::<D>(disk_path, size_bytes)?;
+        }
     }
 
     tracing::info!(
@@ -126,6 +139,34 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
         D::NAME
     );
     Ok(())
+}
+
+/// Size in bytes of the ext4 filesystem at the start of `disk_path`, read from
+/// its superblock, or `None` when there is no ext4 filesystem there.
+pub(crate) fn ext4_filesystem_bytes(disk_path: &Path) -> Option<u64> {
+    use std::io::{Read, Seek, SeekFrom};
+    const SUPERBLOCK_OFFSET: u64 = 1024;
+    const EXT4_MAGIC: u16 = 0xEF53;
+    const INCOMPAT_64BIT: u32 = 0x80;
+    let mut sb = [0u8; 1024];
+    let mut file = std::fs::File::open(disk_path).ok()?;
+    file.seek(SeekFrom::Start(SUPERBLOCK_OFFSET)).ok()?;
+    file.read_exact(&mut sb).ok()?;
+    let u16_at = |o: usize| u16::from_le_bytes([sb[o], sb[o + 1]]);
+    let u32_at = |o: usize| u32::from_le_bytes(sb[o..o + 4].try_into().expect("4 bytes"));
+    if u16_at(0x38) != EXT4_MAGIC {
+        return None;
+    }
+    let log_block_size = u32_at(0x18);
+    if log_block_size > 6 {
+        return None;
+    }
+    let block_size = 1024u64 << log_block_size;
+    let mut blocks = u64::from(u32_at(0x04));
+    if u32_at(0x60) & INCOMPAT_64BIT != 0 {
+        blocks |= u64::from(u32_at(0x150)) << 32;
+    }
+    blocks.checked_mul(block_size)
 }
 
 /// Shrink the ext4 filesystem in `disk_path` to `size_bytes` and truncate
@@ -203,6 +244,32 @@ pub(crate) fn expand_sparse_disk<D: DiskType>(path: &Path, new_size_gb: u64) -> 
             ),
         )
     })?;
+    // A qcow2 disk's size is its header's virtual size, not its file length:
+    // lengthening the file only pads the image and the guest never sees it.
+    if let Some(current_size) = qcow2_virtual_size(path)? {
+        if new_size_bytes == current_size {
+            return Ok(());
+        }
+        if new_size_bytes < current_size {
+            return Err(Error::storage(
+                "expand disk",
+                format!(
+                    "new size ({} GiB) must be larger than current size ({} GiB). Shrinking is not supported.",
+                    new_size_gb,
+                    current_size / BYTES_PER_GIB
+                ),
+            ));
+        }
+        tracing::info!(
+            path = %path.display(),
+            disk_type = D::NAME,
+            current_gb = current_size / BYTES_PER_GIB,
+            new_gb = new_size_gb,
+            "expanding {} qcow2 disk",
+            D::NAME
+        );
+        return set_qcow2_virtual_size(path, new_size_bytes);
+    }
     let current_size = std::fs::metadata(path)
         .map_err(|e| Error::storage("get disk metadata", e.to_string()))?
         .len();
@@ -329,6 +396,41 @@ pub(crate) fn format_disk_with_mkfs<D: DiskType>(disk_path: &Path) -> Result<()>
     Ok(())
 }
 
+/// Byte offset of the virtual disk size in a qcow2 header (big-endian u64).
+const QCOW2_SIZE_OFFSET: u64 = 24;
+
+/// The virtual size recorded in a qcow2 header, or `None` for any other file.
+fn qcow2_virtual_size(path: &Path) -> Result<Option<u64>> {
+    use std::io::Read;
+    let mut header = [0u8; 32];
+    let mut file =
+        std::fs::File::open(path).map_err(|e| Error::storage("open disk", e.to_string()))?;
+    match file.read_exact(&mut header) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(Error::storage("read disk header", e.to_string())),
+    }
+    if header[..4] != *b"QFI\xfb" {
+        return Ok(None);
+    }
+    Ok(Some(u64::from_be_bytes(header[24..32].try_into().unwrap())))
+}
+
+/// Grow a qcow2 image by rewriting its header's virtual size. Clusters past
+/// the old end are unallocated, so they read through to any backing file and
+/// as zeros past its end; the L1 table grows on the first write that needs it.
+fn set_qcow2_virtual_size(path: &Path, new_size_bytes: u64) -> Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .open(path)
+        .map_err(|e| Error::storage("open disk for expansion", e.to_string()))?;
+    file.seek(SeekFrom::Start(QCOW2_SIZE_OFFSET))
+        .and_then(|_| file.write_all(&new_size_bytes.to_be_bytes()))
+        .and_then(|()| file.sync_all())
+        .map_err(|e| Error::storage("write qcow2 size", e.to_string()))
+}
+
 pub(crate) fn write_last_byte(
     file: &mut std::fs::File,
     size_bytes: u64,
@@ -440,7 +542,7 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
             // Safety: both descriptors are live regular files owned by this
             // scope; FICLONE reads the source fd and clones into destination.
             let result =
-                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE, source.as_raw_fd()) };
+                unsafe { libc::ioctl(destination.as_raw_fd(), FICLONE as _, source.as_raw_fd()) };
             if result != 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -655,17 +757,26 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
+/// Copy `remaining` bytes, seeking past chunks that are all zeros instead of
+/// writing them. The destination is already sized and reads as zeros there, so
+/// the result is identical, but written zeros in the source (a template that
+/// was copied with a tool that fills holes) stay holes in the copy instead of
+/// becoming gigabytes of dirty page cache the guest's first flush must sync.
 #[cfg(target_os = "linux")]
 fn copy_extent_exact(
     source: &mut impl std::io::Read,
-    destination: &mut impl std::io::Write,
+    destination: &mut (impl std::io::Write + std::io::Seek),
     mut remaining: u64,
     buffer: &mut [u8],
 ) -> std::io::Result<()> {
     while remaining > 0 {
         let count = remaining.min(buffer.len() as u64) as usize;
         source.read_exact(&mut buffer[..count])?;
-        destination.write_all(&buffer[..count])?;
+        if buffer[..count].iter().all(|&byte| byte == 0) {
+            destination.seek(std::io::SeekFrom::Current(count as i64))?;
+        } else {
+            destination.write_all(&buffer[..count])?;
+        }
         remaining -= count as u64;
     }
     Ok(())
@@ -696,6 +807,11 @@ mod tests {
                 Ok(())
             }
         }
+        impl Seek for ShortWriter {
+            fn seek(&mut self, _: SeekFrom) -> std::io::Result<u64> {
+                unreachable!("the input has no all-zero chunk")
+            }
+        }
         let input = b"every byte in this extent must survive";
         let mut source = &input[..];
         let mut destination = ShortWriter {
@@ -715,17 +831,60 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_extent_copy_rejects_truncated_input() {
-        let error =
-            copy_extent_exact(&mut &b"short"[..], &mut Vec::new(), 6, &mut [0; 8]).unwrap_err();
+        let error = copy_extent_exact(
+            &mut &b"short"[..],
+            &mut std::io::Cursor::new(Vec::new()),
+            6,
+            &mut [0; 8],
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
     #[cfg(target_os = "linux")]
     #[test]
     fn sparse_extent_copy_rejects_stalled_output() {
-        let error =
-            copy_extent_exact(&mut &b"data"[..], &mut &mut [][..], 4, &mut [0; 8]).unwrap_err();
+        let error = copy_extent_exact(
+            &mut &b"data"[..],
+            &mut std::io::Cursor::new(&mut [][..]),
+            4,
+            &mut [0; 8],
+        )
+        .unwrap_err();
         assert_eq!(error.kind(), std::io::ErrorKind::WriteZero);
+    }
+
+    /// A template whose free space is written zeros rather than holes (what
+    /// `scp` or a plain `cp` leaves) must still copy as a sparse file, or every
+    /// machine created from it starts with its whole disk dirty in page cache.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_copy_leaves_written_zeros_as_holes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src.img");
+        let dst = dir.path().join("dst.img");
+        let zeros = 64 * 1024 * 1024;
+        {
+            let mut file = std::fs::File::create(&src).unwrap();
+            file.write_all(b"superblock").unwrap();
+            file.write_all(&vec![0u8; zeros]).unwrap();
+            file.write_all(b"tail").unwrap();
+            file.sync_all().unwrap();
+        }
+        assert!(
+            std::fs::metadata(&src).unwrap().blocks() * 512 >= zeros as u64,
+            "the source must really hold its zeros"
+        );
+
+        sparse_copy(&src, &dst).unwrap();
+
+        assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
+        let allocated = std::fs::metadata(&dst).unwrap().blocks() * 512;
+        assert!(
+            allocated < 4 * 1024 * 1024,
+            "the copy allocated {allocated} bytes for {zeros} bytes of zeros"
+        );
     }
 
     /// `clone_or_copy_file` must reproduce a sparse file byte-for-byte on every
@@ -860,6 +1019,98 @@ mod tests {
         assert!(
             err.contains("cannot hold") || err.contains("resize2fs failed"),
             "{err}"
+        );
+    }
+
+    /// The shipped template is a small filesystem in a large sparse file. A
+    /// smaller disk only needs the file cut down, since the filesystem already
+    /// fits; resize2fs is not run (it would have grown the filesystem to the
+    /// disk), so hosts without e2fsprogs can create small disks.
+    #[test]
+    fn a_smaller_disk_from_a_small_filesystem_template_needs_no_resize() {
+        let Some(mkfs) = find_e2fsprogs_tool("mkfs.ext4") else {
+            eprintln!("skipping: mkfs.ext4 not found");
+            return;
+        };
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.ext4");
+        let fs_bytes: u64 = 8 * 1024 * 1024;
+        std::fs::File::create(&template)
+            .unwrap()
+            .set_len(fs_bytes)
+            .unwrap();
+        let status = std::process::Command::new(mkfs)
+            .args(["-q", "-F", "-b", "4096"])
+            .arg(&template)
+            .status()
+            .unwrap();
+        assert!(status.success());
+        assert_eq!(ext4_filesystem_bytes(&template), Some(fs_bytes));
+        // Like the shipped template: the file is far larger than its filesystem.
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&template)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+
+        let disk = temp.path().join("storage.raw");
+        let want = 32 * 1024 * 1024;
+        copy_disk_from_template::<crate::storage::Storage>(&disk, want, &template).unwrap();
+        assert_eq!(std::fs::metadata(&disk).unwrap().len(), want);
+        assert_eq!(
+            ext4_filesystem_bytes(&disk),
+            Some(fs_bytes),
+            "the filesystem is left for the guest to grow"
+        );
+    }
+
+    #[test]
+    fn ext4_size_is_none_for_a_disk_without_ext4() {
+        let temp = tempfile::tempdir().unwrap();
+        let blank = temp.path().join("blank.raw");
+        std::fs::File::create(&blank)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        assert_eq!(ext4_filesystem_bytes(&blank), None);
+        assert_eq!(ext4_filesystem_bytes(&temp.path().join("missing")), None);
+    }
+
+    /// A qcow2 disk grows by its header's virtual size; its file (and so every
+    /// cluster and the backing reference) is left exactly as it was.
+    #[test]
+    fn expand_grows_a_qcow2_disk_by_its_virtual_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("storage.qcow2");
+        let mut image = vec![0u8; 4096];
+        image[..4].copy_from_slice(b"QFI\xfb");
+        image[4..8].copy_from_slice(&3u32.to_be_bytes());
+        image[24..32].copy_from_slice(&(80 * BYTES_PER_GIB).to_be_bytes());
+        image[512..520].copy_from_slice(b"backing!");
+        std::fs::write(&path, &image).unwrap();
+
+        expand_sparse_disk::<crate::data::disk::Storage>(&path, 100).unwrap();
+        let grown = std::fs::read(&path).unwrap();
+        assert_eq!(
+            grown.len(),
+            image.len(),
+            "the file itself must not be padded"
+        );
+        assert_eq!(
+            u64::from_be_bytes(grown[24..32].try_into().unwrap()),
+            100 * BYTES_PER_GIB
+        );
+        assert_eq!(grown[..24], image[..24]);
+        assert_eq!(grown[32..], image[32..]);
+
+        // Idempotent at the same size, and never shrinks.
+        expand_sparse_disk::<crate::data::disk::Storage>(&path, 100).unwrap();
+        let err = expand_sparse_disk::<crate::data::disk::Storage>(&path, 90).unwrap_err();
+        assert!(format!("{err}").contains("Shrinking is not supported"));
+        assert_eq!(
+            u64::from_be_bytes(std::fs::read(&path).unwrap()[24..32].try_into().unwrap()),
+            100 * BYTES_PER_GIB
         );
     }
 

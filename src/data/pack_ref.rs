@@ -237,7 +237,9 @@ pub async fn resolve_pack_ref(
     let mut client = smolvm_registry::RegistryClient::new(base_url);
     if let Some(token) = identity_token {
         client = client.with_identity_token(token.to_string());
-    } else if let Some(cred) = configured_credential(&settings, &parsed.registry) {
+    } else if let Some(cred) = configured_credential(&settings, effective_registry) {
+        // A configured mirror is a different endpoint: never send the source
+        // registry's saved credentials to its mirror during the pack probe.
         client = cred.apply(client);
     }
 
@@ -425,6 +427,33 @@ mod tests {
             configured_credential_with(&s, REG, |_| None),
             Some(ProbeCredential::Bearer(t)) if t == "from-machines"
         ));
+    }
+
+    #[test]
+    fn a_mirrored_pack_probe_only_uses_the_destination_credential() {
+        let source = "origin.example.invalid";
+        let mirror = "mirror.example.invalid";
+        let mut settings = settings_with_credential(|s| &mut s.machines, source, "source-secret");
+        settings.machines.registries.get_mut(source).unwrap().mirror = Some(mirror.into());
+        settings.machines.registries.insert(
+            mirror.into(),
+            crate::registry::RegistryEntry {
+                username: Some("token".into()),
+                password: Some("mirror-secret".into()),
+                ..Default::default()
+            },
+        );
+        let effective = settings
+            .machines
+            .get_mirror(source)
+            .unwrap_or(source)
+            .to_string();
+        assert!(matches!(
+            configured_credential_with(&settings, &effective, |_| None),
+            Some(ProbeCredential::Bearer(t)) if t == "mirror-secret"
+        ));
+        settings.machines.registries.remove(mirror);
+        assert!(configured_credential_with(&settings, &effective, |_| None).is_none());
     }
 
     #[test]

@@ -171,6 +171,18 @@ test_packed_help() {
     [[ "$result" == *"run"* ]] || [[ "$result" == *"start"* ]]
 }
 
+test_packed_run_help() {
+    local output="$TEST_DIR/test-alpine"
+
+    if [[ ! -f "$output" ]]; then
+        $SMOLVM pack create --image alpine:latest -o "$output" 2>&1
+    fi
+
+    local result
+    result=$("$output" run --help 2>&1) || true
+    [[ "$result" == *"--ssh-agent"* ]]
+}
+
 test_sidecar_has_magic() {
     local output="$TEST_DIR/test-alpine"
 

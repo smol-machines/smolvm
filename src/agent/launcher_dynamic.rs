@@ -6,11 +6,15 @@
 //!
 //! The static FFI path in `launcher.rs` remains untouched for normal operations.
 
+use crate::agent::vsock_service;
 use crate::network::backend::COMPAT_NET_FEATURES;
 use crate::network::backend::TSI_FEATURE_HIJACK_INET;
 use crate::network::{plan_launch_network, EffectiveNetworkBackend};
+
 use smolvm_network::PortMapping as VirtioPortMapping;
-use smolvm_network::{start_virtio_network, GuestNetworkConfig, VirtioNetworkRuntime};
+use smolvm_network::{
+    start_virtio_network, BoundPublishedPorts, GuestNetworkConfig, VirtioNetworkRuntime,
+};
 use smolvm_protocol::{guest_env, ports};
 #[cfg(unix)]
 use socket2::Socket;
@@ -58,8 +62,8 @@ pub struct PackedLaunchConfig<'a> {
     pub layers_dir: &'a Path,
     /// Volume mounts.
     pub mounts: &'a [PackedMount],
-    /// Port mappings (host, guest).
-    pub port_mappings: &'a [(u16, u16)],
+    /// Published port mappings.
+    pub port_mappings: &'a [crate::data::network::PortMapping],
     /// VM resources.
     pub resources: VmResources,
     /// Debug logging.
@@ -74,6 +78,10 @@ pub struct PackedLaunchConfig<'a> {
     /// `cuda_host` server loaded the real driver. Mirrors the non-packed
     /// launcher's `cuda_socket`.
     pub cuda_socket: Option<&'a Path>,
+    /// Host SSH-agent socket bridged into the guest via the SSH-agent vsock
+    /// service. The guest agent activates its side through `SMOLVM_SSH_AGENT`.
+    pub ssh_agent_socket: Option<&'a Path>,
+
     /// Hostnames the egress policy permits resolving and connecting to
     /// (`--allow-host`), mirroring the main launcher's `egress_refresh_hosts`.
     /// Owned because the launch runs in a forked child that outlives the
@@ -199,6 +207,9 @@ pub fn launch_agent_vm_dynamic(
     {
         free_ctx_on_err!("krun_set_vm_config failed");
     }
+    if unsafe { krun.configure_live_resize(ctx, config.resources.cpus) } < 0 {
+        free_ctx_on_err!("libkrun live resize configuration failed");
+    }
     #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
     {
         let cpu_profile_result = unsafe { (krun.set_cpu_template)(ctx, 1) };
@@ -210,8 +221,25 @@ pub fn launch_agent_vm_dynamic(
     // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
     // explanation of each flag's purpose on Linux vs macOS.
-    if config.resources.gpu {
-        let virgl_flags = super::gpu_virgl_flags();
+    //
+    // A display without `--gpu` also needs the virtio-gpu device, set up so
+    // that nothing on the host GPU is touched (see `GpuDevice`).
+    let display = super::requested_display();
+    let mut gpu_device = super::gpu_device(config.resources.gpu, display);
+    if gpu_device == super::GpuDevice::SoftwareDisplay
+        && (krun.set_gpu_options2.is_none()
+            || krun.add_display.is_none()
+            || krun.set_display_backend.is_none())
+    {
+        tracing::warn!(
+            "SMOLVM_DISPLAY is set but this libkrun has no display support; \
+             starting without a display"
+        );
+        gpu_device = super::GpuDevice::None;
+    }
+    if gpu_device != super::GpuDevice::None {
+        super::select_gpu_backend(gpu_device, display.is_some());
+        let virgl_flags = super::virgl_flags_for(gpu_device);
         let vram_mib = config.resources.effective_gpu_vram_mib();
         let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
 
@@ -224,7 +252,9 @@ pub fn launch_agent_vm_dynamic(
                         ret
                     ));
                 }
-                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                if gpu_device == super::GpuDevice::Accelerated {
+                    tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                }
 
                 // Optional virtio-gpu scanout. Venus gives the guest GPU
                 // *rendering*; a scanout gives it a *display*. Without one the
@@ -233,10 +263,7 @@ pub fn launch_agent_vm_dynamic(
                 // compositors fail with "not a KMS device". Opt-in for now:
                 // adding a connector changes guest topology, and existing GPU
                 // workloads (CUDA, headless Vulkan) neither need nor want one.
-                if let Some((w, h)) =
-                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
-                {
-                    super::default_gpu_backend_for_display();
+                if let Some((w, h)) = display {
                     match krun.add_display {
                         Some(add_display) => {
                             let ret = unsafe { add_display(ctx, w, h) };
@@ -362,14 +389,18 @@ pub fn launch_agent_vm_dynamic(
             root_tag.as_ptr(),
             root.as_ptr(),
             super::virtiofs::rootfs_dax_window(),
-            false,
+            true,
         )
     } < 0
     {
         free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
     }
 
-    let network_plan = plan_launch_network(&config.resources, None, config.port_mappings.len());
+    let network_plan = plan_launch_network(
+        &config.resources,
+        config.dns_filter_hosts.as_deref(),
+        config.port_mappings.len(),
+    );
 
     // `mut` is only needed on unix (the VirtioNet arm assigns it); on Windows
     // the runtime is owned by the accept thread, so the binding stays `None`.
@@ -389,14 +420,10 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_add_vsock with TSI failed");
             }
 
-            let port_cstrings: Vec<CString> = config
-                .port_mappings
-                .iter()
-                .map(|(host, guest)| {
-                    CString::new(format!("{}:{}", host, guest))
-                        .expect("port mapping cannot contain null bytes")
-                })
-                .collect();
+            let port_cstrings = match crate::agent::launcher::tsi_port_map(config.port_mappings) {
+                Ok(ports) => ports,
+                Err(error) => free_ctx_on_err!(error),
+            };
             let mut port_ptrs: Vec<*const libc::c_char> =
                 port_cstrings.iter().map(|s| s.as_ptr()).collect();
             port_ptrs.push(std::ptr::null());
@@ -405,67 +432,11 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
-            // Egress policy: static CIDRs plus DNS allow-host filtering enforced
-            // inside libkrun, mirroring the main launcher's TSI arm. When
-            // allow-hosts are set, guest UDP:53 queries are forwarded only to the
-            // trusted resolver and A/AAAA answers for allowed hosts become
-            // temporarily allowed IPs.
-            let egress_hosts = config.dns_filter_hosts.clone().unwrap_or_default();
-            let has_cidrs = config
-                .resources
-                .allowed_cidrs
-                .as_ref()
-                .is_some_and(|cidrs| !cidrs.is_empty());
-            if has_cidrs || !egress_hosts.is_empty() {
-                let set_egress = krun.set_egress_policy.ok_or_else(|| {
-                    "libkrun does not support egress policy (krun_set_egress_policy not found). \
-                     Update libkrun or remove --allow-cidr/--allow-host flags."
-                        .to_string()
-                })?;
-
-                let mut all_cidrs = config.resources.allowed_cidrs.clone().unwrap_or_default();
-                crate::data::network::ensure_dns_in_cidrs(&mut all_cidrs);
-
-                let cidr_cstrings: Vec<CString> = match all_cidrs
-                    .iter()
-                    .map(|c| CString::new(c.as_str()))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                {
-                    Ok(v) => v,
-                    Err(_) => free_ctx_on_err!("allow-CIDR contains an interior NUL byte"),
-                };
-                let mut cidr_ptrs: Vec<*const libc::c_char> =
-                    cidr_cstrings.iter().map(|s| s.as_ptr()).collect();
-                cidr_ptrs.push(std::ptr::null());
-
-                let host_cstrings: Vec<CString> = match egress_hosts
-                    .iter()
-                    .map(|h| CString::new(h.as_str()))
-                    .collect::<std::result::Result<Vec<_>, _>>()
-                {
-                    Ok(v) => v,
-                    Err(_) => free_ctx_on_err!("allow-host contains an interior NUL byte"),
-                };
-                let mut host_ptrs: Vec<*const libc::c_char> =
-                    host_cstrings.iter().map(|s| s.as_ptr()).collect();
-                host_ptrs.push(std::ptr::null());
-
-                let resolver_cstring =
-                    CString::new(crate::data::network::default_dns_addr().to_string())
-                        .expect("resolver IP has no null bytes");
-                let resolver_ptrs: Vec<*const libc::c_char> =
-                    vec![resolver_cstring.as_ptr(), std::ptr::null()];
-
-                let (host_arg, resolver_arg) = if egress_hosts.is_empty() {
-                    (std::ptr::null(), std::ptr::null())
-                } else {
-                    (host_ptrs.as_ptr(), resolver_ptrs.as_ptr())
-                };
-
-                if unsafe { (set_egress)(ctx, cidr_ptrs.as_ptr(), host_arg, resolver_arg) } < 0 {
-                    free_ctx_on_err!("krun_set_egress_policy failed");
-                }
-            }
+            crate::agent::launcher::start_tsi_dns_forwarder(
+                ctx,
+                krun.set_dns_forwarder,
+                config.resources.dns,
+            );
 
             tracing::info!("network backend: tsi");
             None
@@ -485,21 +456,54 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_add_vsock failed");
             }
 
-            let mut guest_network = GuestNetworkConfig::default();
+            let mut guest_network = match crate::network::launch::apply_guest_subnet(
+                GuestNetworkConfig::default(),
+                &config.resources,
+            ) {
+                Ok(guest_network) => guest_network,
+                Err(error) => free_ctx_on_err!(error),
+            };
             guest_network.host_service = crate::network::launch::guest_host_service()?;
+            // The effective resolver becomes the gateway's upstream, the same way
+            // the static launcher sets it; this arm never applied `--dns` at all.
+            guest_network.upstream_dns = crate::data::network::effective_dns(
+                config.resources.dns,
+                EffectiveNetworkBackend::VirtioNet,
+            )
+            .addr
+            .unwrap_or(guest_network.upstream_dns);
+            guest_network.upstream_resolvers =
+                crate::data::network::dns_forwarder_upstreams(config.resources.dns);
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
                 .iter()
-                .map(|(host, guest)| VirtioPortMapping::new(*host, *guest))
+                .map(crate::agent::launcher::virtio_port_mapping)
                 .collect();
             // Denial sink beside the vsock socket, mirroring the static launcher.
-            let mut egress = smolvm_network::EgressPolicy::new(
-                config.resources.allowed_cidrs.as_deref(),
-                config.dns_filter_hosts.as_deref(),
-            );
+            let mut egress = if network_plan.outbound {
+                smolvm_network::EgressPolicy::new(
+                    config.resources.allowed_cidrs.as_deref(),
+                    config.dns_filter_hosts.as_deref(),
+                )
+                .with_rules(&config.resources.egress_rules)
+                .and_then(|policy| match &config.resources.block_private {
+                    Some(exceptions) => policy.with_private_floor(exceptions),
+                    None => Ok(policy),
+                })
+                .map_err(|reason| format!("invalid egress rules: {reason}"))?
+            } else {
+                // Networked only to serve published ports: inbound only,
+                // and no egress rule may reopen outbound.
+                smolvm_network::EgressPolicy::deny_all()
+            };
             if let Some(dir) = config.vsock_socket.parent() {
                 egress = egress.with_denial_log(dir.join(smolvm_network::EGRESS_DENIALS_LOG));
+                egress = egress.with_watchlist(
+                    dir.join(smolvm_network::watchlist::EGRESS_WATCHLIST_FILE),
+                    dir.join(smolvm_network::EGRESS_SIGNALS_LOG),
+                );
+                crate::network::launch::serve_egress_control(&egress, dir, network_plan.outbound);
             }
 
             // The host/guest ends of the virtio-net channel are an AF_UNIX
@@ -511,13 +515,9 @@ pub fn launch_agent_vm_dynamic(
                     create_unix_stream_pair().map_err(|e| format!("socketpair failed: {e}"))?;
                 // SAFETY: ownership of the host-side socketpair fd transfers here.
                 let host_stream = unsafe { Socket::from_raw_fd(host_fd) };
-                let runtime = match start_virtio_network(
-                    host_stream,
-                    guest_network,
-                    &port_mappings,
-                    egress,
-                    None,
-                ) {
+                let runtime = match BoundPublishedPorts::bind(&port_mappings).and_then(|ports| {
+                    start_virtio_network(host_stream, guest_network, ports, egress, None)
+                }) {
                     Ok(runtime) => runtime,
                     Err(err) => {
                         // SAFETY: guest_fd was created by socketpair above and not moved elsewhere.
@@ -542,10 +542,20 @@ pub fn launch_agent_vm_dynamic(
                     free_ctx_on_err!("krun_add_net_unixstream failed");
                 }
 
+                if let Some(dir) = config.vsock_socket.parent() {
+                    crate::network::launch::serve_ports_control(runtime.published_ports(), dir);
+                }
                 virtio_network_runtime = Some(runtime);
             }
             #[cfg(windows)]
             {
+                // Bind before boot; see the static launcher.
+                let published_ports = match BoundPublishedPorts::bind(&port_mappings) {
+                    Ok(ports) => ports,
+                    Err(e) => {
+                        free_ctx_on_err!(format!("failed to start virtio network runtime: {e}"))
+                    }
+                };
                 let net_sock_path = config.vsock_socket.with_extension("net");
                 let listener = match super::launcher::bind_unix_listener(&net_sock_path) {
                     Ok(listener) => listener,
@@ -576,7 +586,7 @@ pub fn launch_agent_vm_dynamic(
                     .name("smolvm-net-accept".into())
                     .spawn(move || match listener.accept() {
                         Ok((sock, _)) => {
-                            match start_virtio_network(sock, guest_network, &port_mappings, egress, None) {
+                            match start_virtio_network(sock, guest_network, published_ports, egress, None) {
                                 Ok(runtime) => runtime.block_until_shutdown(),
                                 Err(err) => {
                                     tracing::error!(error = %err, "virtio-net runtime failed to start")
@@ -615,6 +625,7 @@ pub fn launch_agent_vm_dynamic(
         disk_path.as_ptr(),
         storage_format,
         config.resources.block_io,
+        config.resources.disk_durability,
     );
     if storage_result < 0 {
         free_ctx_on_err!(dynamic_block_error(
@@ -637,6 +648,7 @@ pub fn launch_agent_vm_dynamic(
             overlay_disk.as_ptr(),
             overlay_format,
             config.resources.block_io,
+            config.resources.disk_durability,
         );
         if overlay_result < 0 {
             free_ctx_on_err!(dynamic_block_error(
@@ -647,7 +659,56 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    // Attached host disks (`--disk`), after storage and overlay, so they land on
+    // /dev/vdc onward in the order the machine recorded. The static launcher has
+    // carried these for the from-vm export helper; the dynamic path dropped them,
+    // which silently gave a packed machine fewer disks than it asked for.
+    for (i, disk) in config.resources.disks.iter().enumerate() {
+        let attached_id = try_or_free_ctx!(
+            CString::new(format!("attached{i}")),
+            "attached disk id contains null byte"
+        );
+        let attached_path =
+            try_or_free_ctx!(path_to_cstring(&disk.path), "disk path contains null byte");
+        let format = try_or_free_ctx!(
+            disk.boot_format(),
+            "attached disk refused: re-read its format from a guest-writable disk"
+        )
+        .to_krun_u32();
+        let result = if disk.read_only {
+            unsafe {
+                (krun.add_disk2)(
+                    ctx,
+                    attached_id.as_ptr(),
+                    attached_path.as_ptr(),
+                    format,
+                    true,
+                )
+            }
+        } else {
+            add_dynamic_block_disk(
+                krun,
+                ctx,
+                attached_id.as_ptr(),
+                attached_path.as_ptr(),
+                format,
+                config.resources.block_io,
+                config.resources.disk_durability,
+            )
+        };
+        if result < 0 {
+            free_ctx_on_err!(dynamic_block_error(
+                &format!("attached disk {} ({})", i, disk.path.display()),
+                config.resources.block_io,
+                result
+            ));
+        }
+    }
+
     // Add vsock port for control channel
+    if let Err(e) = check_socket_path_len(config.vsock_socket) {
+        free_ctx_on_err!(e);
+    }
     let socket_path = try_or_free_ctx!(
         path_to_cstring(config.vsock_socket),
         "vsock socket path contains null byte"
@@ -658,22 +719,54 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_add_vsock_port2 failed");
     }
 
-    // Bridge the guest CUDA client (vsock port `ports::CUDA`) to the host CUDA
-    // server socket. `listen=false`: the guest connects out and libkrun forwards
-    // to the AF_UNIX path where `cuda_host::start` is serving. Mirrors the
-    // non-packed launcher; keeps this launcher policy-free (the caller owns the
-    // server lifecycle).
-    if let Some(cuda_sock) = config.cuda_socket {
-        let cuda_sock_c = try_or_free_ctx!(
-            path_to_cstring(cuda_sock),
-            "cuda socket path contains null byte"
+    // Readiness doorbell, as in `launcher.rs`: the guest dials it at the end of
+    // init and the host accepts. Best-effort, but without it the guest's dial
+    // goes unanswered until the vsock connect timeout, two seconds, before it
+    // falls back to the marker.
+    if let Ok(ready) = path_to_cstring(&config.vsock_socket.with_extension("ready")) {
+        // SAFETY: ctx is valid, ready is a valid C string
+        if unsafe { (krun.add_vsock_port2)(ctx, ports::AGENT_READY, ready.as_ptr(), false) } < 0 {
+            tracing::warn!("readiness-doorbell vsock port failed to add; using ping");
+        }
+    }
+
+    // Guest↔host vsock services. The registry owns both sides of each bridge:
+    // the host port registration below and the guest activation env injected
+    // while building the init environment.
+    let vsock_inputs = vsock_service::VsockServiceInputs {
+        ssh_agent_socket: config.ssh_agent_socket,
+        cuda_socket: config.cuda_socket,
+        docker_socket: None,
+        port_forward_socket: None,
+        auto_ports_socket: None,
+        workload_log_socket: None,
+    };
+    let active_vsock: Vec<_> = vsock_service::registry()
+        .iter()
+        .filter_map(|svc| svc.resolve(&vsock_inputs))
+        .collect();
+    for svc in &active_vsock {
+        debug_assert_ne!(
+            svc.port,
+            ports::AGENT_CONTROL,
+            "{} would shadow the agent control channel",
+            svc.name
         );
-        // SAFETY: ctx is valid, cuda_sock_c is a valid C string.
-        if unsafe { (krun.add_vsock_port2)(ctx, ports::CUDA, cuda_sock_c.as_ptr(), false) } < 0 {
-            free_ctx_on_err!("krun_add_vsock_port2 (CUDA) failed");
+        if svc.listen {
+            if let Err(e) = check_socket_path_len(svc.socket) {
+                free_ctx_on_err!(format!("{}: {e}", svc.name));
+            }
+        }
+        let service_socket = try_or_free_ctx!(
+            path_to_cstring(svc.socket),
+            "vsock service socket path contains null byte"
+        );
+        if unsafe { (krun.add_vsock_port2)(ctx, svc.port, service_socket.as_ptr(), svc.listen) } < 0
+        {
+            free_ctx_on_err!(format!("krun_add_vsock_port2 ({}) failed", svc.name));
         }
         if config.debug {
-            eprintln!("debug: CUDA-over-vsock bridged to {}", cuda_sock.display());
+            eprintln!("debug: {} bridged to {}", svc.name, svc.socket.display());
         }
     }
 
@@ -736,6 +829,16 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
+    if !config.resources.disk_volumes.is_empty() {
+        if let Ok(cstr) = CString::new(format!(
+            "{}={}",
+            smolvm_protocol::guest_env::DISK_VOLUMES,
+            smolvm_protocol::disk_volume::encode(&config.resources.disk_volumes)
+        )) {
+            env_strings.push(cstr);
+        }
+    }
+
     // Tell the agent GPU was requested so it creates /dev/dri nodes and starts
     // seatd after pivot_root. Keep this in sync with the normal launcher.
     if config.resources.gpu {
@@ -745,14 +848,11 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // The packed launcher wires CUDA directly instead of going through the
-    // shared vsock-service builder, so it must carry the same guest feature
-    // sentinel explicitly. Without it the agent never stages the bundled
-    // shims and `pack run --cuda` boots a CUDA bridge that workloads cannot use.
-    if config.cuda_socket.is_some() {
-        let cuda_env = format!("{}={}", guest_env::CUDA_ZEROCOPY, guest_env::VALUE_ON);
-        if let Ok(cstr) = CString::new(cuda_env) {
-            env_strings.push(cstr);
+    // Activate the guest side of each enabled vsock service. These env vars
+    // come from the same registry that wired the host ports above.
+    for svc in &active_vsock {
+        for (key, value) in svc.guest_env {
+            env_strings.push(cstr(&format!("{key}={value}")));
         }
     }
 
@@ -791,6 +891,12 @@ pub fn launch_agent_vm_dynamic(
     env_strings.extend(crate::agent::guest_network_env(
         guest_network,
         config.resources.dns,
+        &config.resources.dns_options,
+        None,
+    ));
+    env_strings.extend(crate::agent::guest_idle_poll_env());
+    env_strings.extend(crate::agent::guest_workload_env(
+        config.resources.shm_size.as_deref(),
     ));
 
     let mut envp: Vec<*const libc::c_char> = env_strings.iter().map(|s| s.as_ptr()).collect();
@@ -819,10 +925,7 @@ pub fn launch_agent_vm_dynamic(
         // Layers the host extracted itself carry their ownership in the
         // override xattr; the Linux server presents it only when asked.
         let override_stat = cfg!(target_os = "linux")
-            && config
-                .layers_dir
-                .join(smolvm_pack::extract::OPAQUE_XATTR_MARKER)
-                .is_file();
+            && smolvm_pack::extract::shares_override_stat_layers(config.layers_dir);
         // SAFETY: ctx is valid, tag and path are valid C strings
         let added = if override_stat {
             let Some(add_virtiofs4) = krun.add_virtiofs4 else {
@@ -833,8 +936,8 @@ pub fn launch_agent_vm_dynamic(
                     ctx,
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
-                    false,
+                    super::virtiofs::legacy_packed_layers_dax_window(),
+                    true,
                     super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                 )
             }
@@ -844,8 +947,8 @@ pub fn launch_agent_vm_dynamic(
                     ctx,
                     layers_tag.as_ptr(),
                     layers_path.as_ptr(),
-                    super::virtiofs::packed_layers_dax_window(),
-                    false,
+                    super::virtiofs::legacy_packed_layers_dax_window(),
+                    true,
                 )
             }
         };
@@ -866,17 +969,36 @@ pub fn launch_agent_vm_dynamic(
         );
 
         let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
+        // A watched share keeps missing names for a second (see the mount
+        // loop in `launcher.rs`); needs krun_add_virtiofs4.
+        let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
         // SAFETY: ctx is valid, tag and host_path are valid C strings
-        if unsafe {
-            add_virtiofs3(
-                ctx,
-                tag.as_ptr(),
-                host_path.as_ptr(),
-                dax_window,
-                mount.read_only,
-            )
-        } < 0
-        {
+        let mut added = -libc::EINVAL;
+        if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
+            added = unsafe {
+                add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
+                )
+            };
+        }
+        // EINVAL also means a libkrun that does not know the flag: attach as before.
+        if added == -libc::EINVAL {
+            added = unsafe {
+                add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                )
+            };
+        }
+        if added < 0 {
             free_ctx_on_err!(format!(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag
@@ -939,16 +1061,30 @@ fn add_dynamic_block_disk(
     disk_path: *const libc::c_char,
     disk_format: u32,
     engine: crate::data::resources::BlockIoEngine,
+    durability: crate::data::resources::DiskDurability,
 ) -> i32 {
+    use crate::data::resources::{BlockIoEngine, DiskDurability};
+    const KRUN_SYNC_RELAXED: u32 = 1;
     const KRUN_SYNC_FULL: u32 = 2;
+    const KRUN_BLOCK_IO_SYNC: u32 = 0;
     const KRUN_BLOCK_IO_ASYNC: u32 = 1;
     const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
 
-    if engine == crate::data::resources::BlockIoEngine::Async {
+    if engine == BlockIoEngine::Async || durability == DiskDurability::Deferred {
         let Some(add_disk4) = krun.add_disk4 else {
             return KRUN_ADD_DISK4_MISSING;
         };
-        // Buffered disk, full guest flush semantics, restricted io_uring engine.
+        // Buffered disk. Both modes honor guest flushes, so libkrun writes its
+        // own caches back to the image; full also fsyncs it, deferred leaves
+        // the data in the host page cache for the kernel to write back.
+        let sync_mode = match durability {
+            DiskDurability::Full => KRUN_SYNC_FULL,
+            DiskDurability::Deferred => KRUN_SYNC_RELAXED,
+        };
+        let io_engine = match engine {
+            BlockIoEngine::Sync => KRUN_BLOCK_IO_SYNC,
+            BlockIoEngine::Async => KRUN_BLOCK_IO_ASYNC,
+        };
         return unsafe {
             add_disk4(
                 ctx,
@@ -957,8 +1093,8 @@ fn add_dynamic_block_disk(
                 disk_format,
                 false,
                 false,
-                KRUN_SYNC_FULL,
-                KRUN_BLOCK_IO_ASYNC,
+                sync_mode,
+                io_engine,
             )
         };
     }
@@ -971,9 +1107,13 @@ fn dynamic_block_error(
     result: i32,
 ) -> String {
     const KRUN_ADD_DISK4_MISSING: i32 = i32::MIN + 4;
-    if engine == crate::data::resources::BlockIoEngine::Async && result == KRUN_ADD_DISK4_MISSING {
+    if result == KRUN_ADD_DISK4_MISSING {
+        let feature = match engine {
+            crate::data::resources::BlockIoEngine::Async => "async block I/O",
+            crate::data::resources::BlockIoEngine::Sync => "deferred disk durability",
+        };
         return format!(
-            "async block I/O for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
+            "{feature} for {disk} requires a newer bundled libkrun (krun_add_disk4 missing)"
         );
     }
     if engine == crate::data::resources::BlockIoEngine::Async
@@ -1178,12 +1318,22 @@ fn describe_start_error_with_probe(ret: i32, kvm_error: Option<&str>) -> String 
         22 => {
             "EINVAL — libkrun rejected the VM configuration; usually a disk/overlay \
                that could not be opened (still held by another VM that has not fully \
-               exited, or a corrupt/foreign-owned image) or an unsupported device option"
+               exited, or a corrupt/foreign-owned image), a Unix socket path too long \
+               for the host, or an unsupported device option"
         }
         5 => "EIO — a backing disk or overlay could not be read/created",
         13 => "EACCES — permission denied opening a VM resource (disk, socket, or rootfs)",
         16 => "EBUSY — a VM resource is already in use by another process",
-        12 => "ENOMEM — out of memory starting the VM",
+        12 => {
+            "ENOMEM — the host could not allocate the machine's RAM or its KVM state: the node \
+               has no room for another VM of this size"
+        }
+        11 => {
+            "EAGAIN — the host ran out of a resource (memory, threads) while starting the VM: \
+               the node is full"
+        }
+        23 | 24 => "EMFILE/ENFILE — the VM process or the host hit its open-file limit",
+        28 => "ENOSPC — no space left for the VM's disk or memory backing",
         1 => "EPERM — the hypervisor rejected the operation (KVM/HVF/WHP access)",
         19 => "ENODEV — the hypervisor device is unavailable (is KVM/HVF/WHP enabled?)",
         _ => "the VM failed to start at the hypervisor layer",
@@ -1201,6 +1351,12 @@ fn describe_start_error_with_probe(ret: i32, kvm_error: Option<&str>) -> String 
 /// e.g. Windows); a failure here is non-fatal.
 pub(crate) fn truncate_console_log(path: &Path) {
     if path.exists() {
+        // Keep the previous boot's console beside the new one: when a VM dies
+        // and is booted again, its console is the only record of why.
+        let previous = path.with_extension("prev.log");
+        if std::fs::metadata(path).is_ok_and(|meta| meta.len() > 0) {
+            let _ = std::fs::copy(path, &previous);
+        }
         if let Err(e) = std::fs::OpenOptions::new()
             .write(true)
             .truncate(true)
@@ -1209,6 +1365,27 @@ pub(crate) fn truncate_console_log(path: &Path) {
             tracing::debug!(path = %path.display(), error = %e, "could not truncate console log");
         }
     }
+}
+
+/// Longest Unix socket path the host accepts: `sockaddr_un.sun_path` holds 104
+/// bytes on macOS and 108 elsewhere, including the terminating NUL.
+const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
+
+/// libkrun binds the sockets it listens on inside `krun_start_enter` and
+/// reports a path that does not fit only as a bare EINVAL, which reads like a
+/// bad disk. Check the length before handing a socket to libkrun so the error
+/// names the path and the way out.
+pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
+    let len = path.as_os_str().len();
+    if len <= MAX_UNIX_SOCKET_PATH {
+        return Ok(());
+    }
+    Err(format!(
+        "socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte limit for Unix \
+         sockets on this host: {}. smolvm keeps machine sockets under your cache \
+         directory, so run it with a shorter HOME (or XDG_CACHE_HOME on Linux)",
+        path.display()
+    ))
 }
 
 /// Convert a Path to a CString.
@@ -1229,22 +1406,10 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
-/// Raise file descriptor limits (required by libkrun).
+/// Raise the open-file limit: the VMM holds one host socket per guest
+/// connection, so this caps how many a guest can have open at once.
 fn raise_fd_limits() {
-    // rlimit is a unix concept; no-op on Windows. The function stays callable
-    // on all platforms so its (unconditional) call sites need no gating.
-    #[cfg(unix)]
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
+    let _ = crate::process::raise_nofile_limit();
 }
 
 #[cfg(test)]
@@ -1263,6 +1428,17 @@ mod tests {
             dynamic_block_error("storage", BlockIoEngine::Async, -libc::EPERM)
                 .contains("use --block-io sync")
         );
+    }
+
+    #[test]
+    fn socket_path_over_the_host_limit_is_named() {
+        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 1)));
+        assert!(check_socket_path_len(&fits).is_ok());
+        let long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH)));
+        let err = check_socket_path_len(&long).unwrap_err();
+        assert!(err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH + 1)));
+        assert!(err.contains(&long.display().to_string()));
+        assert!(err.contains("HOME"));
     }
 
     #[test]

@@ -3,44 +3,44 @@
     "libkrun-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1779235645,
-        "narHash": "sha256-rmRMZ5j3HlueCAXQLydjmMq45+hwhxSLWM02VvHokcY=",
+        "lastModified": 1790725010,
+        "narHash": "sha256-1kL0sdQP6ijlB2oncKzZcl74qzmE6obiX5Hr6ezuqbc=",
         "owner": "smol-machines",
         "repo": "libkrun",
-        "rev": "98163265197caa24a789699f16a68b98e917b65b",
+        "rev": "3285db7404144ed61faf0848bb424c0f82743f41",
         "type": "github"
       },
       "original": {
         "owner": "smol-machines",
         "repo": "libkrun",
-        "rev": "98163265197caa24a789699f16a68b98e917b65b",
+        "rev": "3285db7404144ed61faf0848bb424c0f82743f41",
         "type": "github"
       }
     },
     "libkrunfw-src": {
       "flake": false,
       "locked": {
-        "lastModified": 1778821066,
-        "narHash": "sha256-g2DxDnnh52JCPg4ktPWFBi0J9203FCncGOzB3eiCRxQ=",
+        "lastModified": 1790794569,
+        "narHash": "sha256-S2hB4SVRGLmur4oIcr21gZ8k7n/iXKvQ7unOH9fbZoU=",
         "owner": "smol-machines",
         "repo": "libkrunfw",
-        "rev": "516ceece6aed60ccc84ac8faa459885062e39400",
+        "rev": "bfb229911374698399dcedcc92019287870759ab",
         "type": "github"
       },
       "original": {
         "owner": "smol-machines",
         "repo": "libkrunfw",
-        "rev": "516ceece6aed60ccc84ac8faa459885062e39400",
+        "rev": "bfb229911374698399dcedcc92019287870759ab",
         "type": "github"
       }
     },
     "nixpkgs": {
       "locked": {
-        "lastModified": 1779357205,
-        "narHash": "sha256-cCO8aTqss5x9Ky8GWkpY0Hy5fyTZEbtifSUV8QjSzic=",
+        "lastModified": 1790822859,
+        "narHash": "sha256-69xHQhAeMAD2wDXO7T2pcOZIF9Sga2W+JkmY2a11Ops=",
         "owner": "NixOS",
         "repo": "nixpkgs",
-        "rev": "f83fc3c307e74bc5fd5adb7eb6b8b13ffd2a36e1",
+        "rev": "c59305bab2065cfecc4944690d9eedbb56f3a9fa",
         "type": "github"
       },
       "original": {

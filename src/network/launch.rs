@@ -72,12 +72,33 @@ pub enum EffectiveNetworkBackend {
 pub struct LaunchNetworkPlan {
     /// Selected backend.
     pub backend: EffectiveNetworkBackend,
+    /// Whether the guest may open outbound connections. A machine networked
+    /// only to serve published ports (or the smolvm host service) gets a backend
+    /// for that inbound path but no egress: publishing a port must not quietly
+    /// turn on the internet for a machine created without networking.
+    pub outbound: bool,
 }
 
 impl LaunchNetworkPlan {
     /// Whether the launch should attach any network backend at all.
     pub const fn has_network(self) -> bool {
         !matches!(self.backend, EffectiveNetworkBackend::None)
+    }
+}
+
+/// Move the guest link onto the machine's `--guest-subnet`, when it has one.
+///
+/// Shared by the static and dynamic launchers so the two cannot diverge.
+pub fn apply_guest_subnet(
+    guest_network: smolvm_network::GuestNetworkConfig,
+    resources: &VmResources,
+) -> crate::Result<smolvm_network::GuestNetworkConfig> {
+    match resources.guest_subnet.as_deref() {
+        None => Ok(guest_network),
+        Some(subnet) => subnet
+            .parse::<smolvm_network::GuestSubnet>()
+            .map(|subnet| guest_network.with_guest_subnet(subnet))
+            .map_err(|reason| crate::Error::config("guest subnet", reason)),
     }
 }
 
@@ -91,22 +112,55 @@ pub fn plan_launch_network(
     dns_filter_hosts: Option<&[String]>,
     port_count: usize,
 ) -> LaunchNetworkPlan {
+    plan_launch_network_with(resources, dns_filter_hosts, port_count, false)
+}
+
+/// [`plan_launch_network`] for a machine that may also carry a credential
+/// policy. Credential substitution is enforced by the host-side virtio-net
+/// stack, so a policy implies networking and steers the default backend to
+/// virtio-net exactly as an egress allow-list does; an explicit backend choice
+/// is still honored (TSI then needs the libkrun interception hook).
+pub fn plan_launch_network_with(
+    resources: &VmResources,
+    dns_filter_hosts: Option<&[String]>,
+    port_count: usize,
+    has_credentials: bool,
+) -> LaunchNetworkPlan {
     let has_ports = port_count > 0;
-    let has_cidr_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
-    let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
+    // Some([]) is a deny-all policy, not an absent policy. Treating it as
+    // absent would allow an explicit TSI launch to bypass enforcement.
+    let has_cidr_policy = resources.allowed_cidrs.is_some()
+        || !resources.egress_rules.is_empty()
+        || resources.block_private.is_some();
+    let has_dns_filter = dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
-    let has_fabric = resources.network_name.is_some();
-    let wants_network =
-        resources.network || has_ports || has_cidr_policy || has_dns_filter || has_fabric;
+    // A container switch is fabric-like routing in the host-side stack too.
+    let has_fabric = resources.network_name.is_some() || resources.switch.is_some();
+    // A custom guest subnet shapes the virtio-net link, so like a named
+    // network it implies networking and picks virtio-net.
+    let has_guest_subnet = resources.guest_subnet.is_some();
+    let wants_network = resources.network
+        || has_ports
+        || has_cidr_policy
+        || has_dns_filter
+        || has_fabric
+        || has_guest_subnet
+        || has_credentials;
 
     if !wants_network {
         return LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::None,
+            outbound: false,
         };
     }
+    // Ports and the host service are inbound paths; everything else here is a
+    // request for egress, possibly narrowed by its own allow-list.
+    let outbound = resources.network
+        || has_cidr_policy
+        || has_dns_filter
+        || has_fabric
+        || has_guest_subnet
+        || has_credentials;
 
     // Published ports need the inbound path, which only virtio-net provides.
     // When the caller didn't pick a backend explicitly, default to virtio-net
@@ -138,9 +192,11 @@ pub fn plan_launch_network(
         if has_ports
             || fleet_mode
             || has_cidr_policy
+            || has_credentials
             || has_dns_filter
             || has_host_service
             || has_fabric
+            || has_guest_subnet
         {
             NetworkBackend::VirtioNet
         } else {
@@ -151,12 +207,158 @@ pub fn plan_launch_network(
     // cross-platform and libkrun's net device bridges over an AF_UNIX path
     // (Windows 10 1809+ has native AF_UNIX). See launcher's VirtioNet arm.
     match backend {
+        // TSI serves no published ports and its filter does not hold an empty
+        // allow-list, so a TSI guest that may not open outbound connections
+        // gets no network at all rather than an unfiltered one.
+        NetworkBackend::Tsi if !outbound => LaunchNetworkPlan {
+            backend: EffectiveNetworkBackend::None,
+            outbound: false,
+        },
         NetworkBackend::Tsi => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::Tsi,
+            outbound,
         },
         NetworkBackend::VirtioNet => LaunchNetworkPlan {
             backend: EffectiveNetworkBackend::VirtioNet,
+            outbound,
         },
+    }
+}
+
+/// The longest replacement allow list the egress control socket reads.
+const MAX_EGRESS_REQUEST_BYTES: u64 = 1024 * 1024;
+
+const MAX_PORTS_REQUEST_BYTES: u64 = 256 * 1024;
+
+/// Serve the egress control socket in `vm_dir` for a machine whose guest may
+/// open outbound connections under an allow list: each connection sends a
+/// replacement list, optionally followed by a `rules <json>` line that replaces
+/// the ordered rule list (deny rules included, `--allow-private` exceptions
+/// kept) and is absent when the rules have not changed, and gets back `ok` or
+/// `error: <reason>`. A machine with no allow list, or an inbound-only guest,
+/// gets no socket.
+pub fn serve_egress_control(
+    egress: &smolvm_network::EgressPolicy,
+    vm_dir: &std::path::Path,
+    outbound: bool,
+) {
+    let path = vm_dir.join(smolvm_network::EGRESS_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    if !outbound || !egress.is_restricted() {
+        return;
+    }
+    let egress = egress.clone();
+    serve_control_socket(
+        path,
+        "egress-control",
+        MAX_EGRESS_REQUEST_BYTES,
+        move |request| {
+            egress.replace_allow_list(request)?;
+            tracing::info!("egress allow list and any sent rules replaced");
+            Ok(())
+        },
+    );
+}
+
+/// Serve the ports control socket in `vm_dir`: each connection sends the
+/// complete set of `host:guest` mappings to publish and gets back `ok` or
+/// `error: <reason>`.
+pub fn serve_ports_control(ports: smolvm_network::PublishedPorts, vm_dir: &std::path::Path) {
+    let allocator = ports.clone();
+    serve_ports_requests(
+        vm_dir,
+        move |guest| {
+            allocator
+                .publish_atomic(guest)
+                .map_err(|error| error.to_string())
+        },
+        move |next| ports.replace(next).map_err(|error| error.to_string()),
+    );
+}
+
+/// Serve the ports control socket in `vm_dir`, handing each request's parsed
+/// mappings to `replace`; shared by virtio-net and the TSI port forwarder.
+pub(crate) fn serve_ports_requests(
+    vm_dir: &std::path::Path,
+    allocate: impl Fn(u16) -> Result<smolvm_network::PortMapping, String> + Send + 'static,
+    replace: impl Fn(&[smolvm_network::PortMapping]) -> Result<(), String> + Send + 'static,
+) {
+    let path = vm_dir.join(smolvm_network::PORTS_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    serve_control_socket_with_reply(
+        path,
+        "ports-control",
+        MAX_PORTS_REQUEST_BYTES,
+        move |request| {
+            if let Some(guest) = request.trim().strip_prefix("allocate ") {
+                let guest: u16 = guest
+                    .parse()
+                    .map_err(|_| "invalid guest port".to_string())?;
+                if guest == 0 {
+                    return Err("guest port must be positive".into());
+                }
+                let mapping = allocate(guest)?;
+                return Ok(format!("ok {}:{}\n", mapping.host, mapping.guest));
+            }
+            let next = smolvm_network::parse_port_mappings(request)?;
+            replace(&next)?;
+            // Auto ports leave a port `-p` now publishes to that mapping.
+            super::auto_ports::note_declared_ports(&next);
+            tracing::info!(ports = %smolvm_network::render_port_mappings(&next).trim_end(), "published ports replaced");
+            Ok("ok\n".to_string())
+        },
+    );
+}
+
+pub(crate) fn serve_control_socket(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<(), String> + Send + 'static,
+) {
+    serve_control_socket_with_reply(path, thread_name, max_request_bytes, move |request| {
+        apply(request).map(|()| "ok\n".to_string())
+    });
+}
+
+fn serve_control_socket_with_reply(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<String, String> + Send + 'static,
+) {
+    use std::io::{Read, Write};
+    let listener = match crate::platform::uds::UdsListener::bind(&path) {
+        Ok(listener) => listener,
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "control socket unavailable");
+            return;
+        }
+    };
+    let spawned = std::thread::Builder::new()
+        .name(thread_name.into())
+        .spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else {
+                    continue;
+                };
+                let _ = stream.set_read_timeout(Some(std::time::Duration::from_secs(5)));
+                let mut request = String::new();
+                let reply = match (&mut stream)
+                    .take(max_request_bytes)
+                    .read_to_string(&mut request)
+                {
+                    Ok(_) => match apply(&request) {
+                        Ok(reply) => reply,
+                        Err(reason) => format!("error: {reason}\n"),
+                    },
+                    Err(error) => format!("error: {error}\n"),
+                };
+                let _ = stream.write_all(reply.as_bytes());
+            }
+        });
+    if let Err(error) = spawned {
+        tracing::warn!(%error, thread_name, "control thread unavailable");
     }
 }
 
@@ -172,11 +374,10 @@ pub fn validate_requested_network_backend(
 ) -> crate::Result<()> {
     // An egress policy is only enforced under virtio-net; TSI would silently let
     // it through.
-    let has_egress_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|c| !c.is_empty())
-        || dns_filter_hosts.is_some_and(|h| !h.is_empty());
+    let has_egress_policy = resources.allowed_cidrs.is_some()
+        || !resources.egress_rules.is_empty()
+        || resources.block_private.is_some()
+        || dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
 
     // Mirror plan_launch_network's default: unset backend + (ports OR egress
@@ -187,6 +388,7 @@ pub fn validate_requested_network_backend(
             || has_egress_policy
             || has_host_service
             || resources.network_name.is_some()
+            || resources.guest_subnet.is_some()
         {
             NetworkBackend::VirtioNet
         } else {
@@ -213,11 +415,32 @@ pub fn validate_requested_network_backend(
         ));
     }
 
+    // A custom guest subnet shapes the virtio-net link; TSI has no guest link
+    // for it to apply to, and a named network assigns addresses from its own
+    // pool, so both combinations would silently ignore the subnet.
+    if let Some(subnet) = resources.guest_subnet.as_deref() {
+        subnet
+            .parse::<smolvm_network::GuestSubnet>()
+            .map_err(|reason| crate::Error::config("guest subnet", reason))?;
+        if backend != NetworkBackend::VirtioNet {
+            return Err(crate::Error::config(
+                "guest subnet",
+                "--guest-subnet requires the virtio-net backend; remove --net-backend tsi or set it to virtio-net",
+            ));
+        }
+        if resources.network_name.is_some() {
+            return Err(crate::Error::config(
+                "guest subnet",
+                "--guest-subnet cannot be combined with --network: a named network assigns member addresses itself",
+            ));
+        }
+    }
+
     // Same for an egress policy — fires only on EXPLICIT TSI + policy.
     if has_egress_policy && backend != NetworkBackend::VirtioNet {
         return Err(crate::Error::config(
             "egress",
-            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only) requires the \
+            "egress policy (--allow-cidr/--allow-host/--outbound-localhost-only/--block-private) requires the \
              virtio-net backend; TSI does not enforce it. Remove --net-backend tsi or set it to virtio-net",
         ));
     }
@@ -226,11 +449,10 @@ pub fn validate_requested_network_backend(
         return Ok(());
     }
 
-    let has_cidr_policy = resources
-        .allowed_cidrs
-        .as_ref()
-        .is_some_and(|cidrs| !cidrs.is_empty());
-    let has_dns_filter = dns_filter_hosts.is_some_and(|hosts| !hosts.is_empty());
+    let has_cidr_policy = resources.allowed_cidrs.is_some()
+        || !resources.egress_rules.is_empty()
+        || resources.block_private.is_some();
+    let has_dns_filter = dns_filter_hosts.is_some();
     let wants_network = resources.network || port_count > 0 || has_cidr_policy || has_dns_filter;
 
     if !wants_network {
@@ -249,6 +471,81 @@ mod tests {
 
     fn resources() -> VmResources {
         VmResources::default()
+    }
+
+    #[test]
+    fn a_published_port_without_networking_serves_inbound_only() {
+        let plan = plan_launch_network(&resources(), None, 1);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert!(!plan.outbound, "a published port must not open egress");
+
+        let mut networked = resources();
+        networked.network = true;
+        assert!(plan_launch_network(&networked, None, 1).outbound);
+
+        let mut allow_listed = resources();
+        allow_listed.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
+        assert!(plan_launch_network(&allow_listed, None, 1).outbound);
+        let hosts = ["api.example.com".to_string()];
+        assert!(plan_launch_network(&resources(), Some(&hosts), 1).outbound);
+        assert!(plan_launch_network_with(&resources(), None, 1, true).outbound);
+    }
+
+    #[test]
+    fn tsi_without_outbound_attaches_no_network() {
+        let mut tsi = resources();
+        tsi.network_backend = Some(NetworkBackend::Tsi);
+        tsi.guest_subnet = None;
+        // Nothing asks for networking: no network, as before.
+        assert_eq!(
+            plan_launch_network(&tsi, None, 0).backend,
+            EffectiveNetworkBackend::None
+        );
+        // Asked for networking: TSI with egress.
+        tsi.network = true;
+        let plan = plan_launch_network(&tsi, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::Tsi);
+        assert!(plan.outbound);
+    }
+
+    #[test]
+    fn guest_subnet_implies_virtio_net() {
+        let mut resources = resources();
+        resources.guest_subnet = Some("10.200.0.0/30".into());
+        let plan = plan_launch_network(&resources, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert!(validate_requested_network_backend(&resources, None, 0).is_ok());
+
+        let config =
+            apply_guest_subnet(smolvm_network::GuestNetworkConfig::default(), &resources).unwrap();
+        assert_eq!(config.gateway_ip, std::net::Ipv4Addr::new(10, 200, 0, 1));
+        assert_eq!(config.dns_server, config.gateway_ip);
+    }
+
+    #[test]
+    fn guest_subnet_rejects_tsi_named_networks_and_bad_cidrs() {
+        let mut tsi = resources();
+        tsi.guest_subnet = Some("10.200.0.0/30".into());
+        tsi.network_backend = Some(NetworkBackend::Tsi);
+        assert!(validate_requested_network_backend(&tsi, None, 0).is_err());
+
+        let mut fabric = resources();
+        fabric.guest_subnet = Some("10.200.0.0/30".into());
+        fabric.network_name = Some("lab".into());
+        assert!(validate_requested_network_backend(&fabric, None, 0).is_err());
+
+        let mut bad = resources();
+        bad.guest_subnet = Some("10.200.0.1/30".into());
+        assert!(validate_requested_network_backend(&bad, None, 0).is_err());
+        assert!(apply_guest_subnet(smolvm_network::GuestNetworkConfig::default(), &bad).is_err());
+    }
+
+    #[test]
+    fn no_guest_subnet_keeps_the_default_link() {
+        let config =
+            apply_guest_subnet(smolvm_network::GuestNetworkConfig::default(), &resources())
+                .unwrap();
+        assert_eq!(config, smolvm_network::GuestNetworkConfig::default());
     }
 
     #[test]
@@ -334,6 +631,21 @@ mod tests {
         resources.network_backend = Some(NetworkBackend::Tsi);
         resources.allowed_cidrs = Some(vec!["1.1.1.1/32".into()]);
         assert!(validate_requested_network_backend(&resources, None, 0).is_err());
+    }
+
+    #[test]
+    fn empty_allow_lists_still_require_enforcing_backend() {
+        let mut resources = resources();
+        resources.allowed_cidrs = Some(vec![]);
+        assert_eq!(
+            plan_launch_network(&resources, None, 0).backend,
+            EffectiveNetworkBackend::VirtioNet
+        );
+        resources.network_backend = Some(NetworkBackend::Tsi);
+        assert!(validate_requested_network_backend(&resources, None, 0).is_err());
+
+        resources.allowed_cidrs = None;
+        assert!(validate_requested_network_backend(&resources, Some(&[]), 0).is_err());
     }
 
     #[test]

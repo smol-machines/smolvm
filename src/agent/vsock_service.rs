@@ -21,14 +21,22 @@ use std::path::Path;
 pub struct VsockServiceInputs<'a> {
     /// Host SSH agent socket to forward into the guest.
     pub ssh_agent_socket: Option<&'a Path>,
-    /// Host DNS-filter proxy socket.
-    pub dns_filter_socket: Option<&'a Path>,
     /// Host CUDA-over-vsock server socket (experimental).
     pub cuda_socket: Option<&'a Path>,
     /// Host-side Docker socket to expose. libkrun *listens* on this path and
     /// forwards each host connection to the guest, which proxies it to the
     /// in-guest dockerd socket. When set, the Docker bridge is enabled.
     pub docker_socket: Option<&'a Path>,
+    /// Host-side socket for ports published while a machine without virtio-net
+    /// runs. libkrun *listens* on this path and forwards each connection to the
+    /// guest's port forwarder.
+    pub port_forward_socket: Option<&'a Path>,
+    /// Host socket the guest reports its listening TCP ports to, for auto
+    /// ports. The host listens on this path; the guest connects out.
+    pub auto_ports_socket: Option<&'a Path>,
+    /// Host socket the workload's output is appended from. When set, the
+    /// guest agent forwards a detached workload's stdout and stderr to it.
+    pub workload_log_socket: Option<&'a Path>,
 }
 
 /// A service resolved to "on" for a launch: the concrete wiring the launcher
@@ -72,21 +80,6 @@ impl VsockService for SshAgentService {
     }
 }
 
-/// DNS filtering proxy: the guest forwards DNS queries to a host listener that
-/// enforces the egress allow-list.
-struct DnsFilterService;
-impl VsockService for DnsFilterService {
-    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
-        inputs.dns_filter_socket.map(|socket| ActiveVsockService {
-            name: "DNS filtering",
-            port: ports::DNS_FILTER,
-            listen: false,
-            socket,
-            guest_env: &[],
-        })
-    }
-}
-
 /// CUDA-over-vsock (experimental): the guest CUDA client connects out to a host
 /// server that loads `nvcuda.dll` / `libcuda.so.1` and runs the calls on the
 /// host NVIDIA GPU.
@@ -124,12 +117,119 @@ impl VsockService for DockerSocketService {
     }
 }
 
+/// Live port forwarding for machines without virtio-net: the host's
+/// forwarder connects in, and the guest relays each connection to the guest
+/// port it names.
+struct PortForwardService;
+impl VsockService for PortForwardService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.port_forward_socket.map(|socket| ActiveVsockService {
+            name: "live port forwarding",
+            port: ports::PORT_FORWARD,
+            listen: true,
+            socket,
+            guest_env: &[(
+                smolvm_protocol::guest_env::PORT_FORWARD,
+                smolvm_protocol::guest_env::VALUE_ON,
+            )],
+        })
+    }
+}
+
+/// Auto ports: the guest agent connects out and reports the TCP ports it
+/// listens on whenever they change; the host publishes them through the
+/// port forwarder.
+struct AutoPortsService;
+impl VsockService for AutoPortsService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.auto_ports_socket.map(|socket| ActiveVsockService {
+            name: "auto ports",
+            port: ports::AUTO_PORTS,
+            listen: false,
+            socket,
+            guest_env: &[(guest_env::AUTO_PORTS, guest_env::VALUE_ON)],
+        })
+    }
+}
+
+/// Workload logs: the guest agent connects out and streams a detached
+/// workload's stdout and stderr to a host listener that appends them to the
+/// machine's `workload.log`.
+struct WorkloadLogService;
+impl VsockService for WorkloadLogService {
+    fn resolve<'a>(&self, inputs: &VsockServiceInputs<'a>) -> Option<ActiveVsockService<'a>> {
+        inputs.workload_log_socket.map(|socket| ActiveVsockService {
+            name: "workload logs",
+            port: ports::WORKLOAD_LOGS,
+            listen: false,
+            socket,
+            guest_env: &[(guest_env::WORKLOAD_LOGS, guest_env::VALUE_ON)],
+        })
+    }
+}
+
 /// All known vsock services. Add a capability by appending one entry.
 pub fn registry() -> &'static [&'static dyn VsockService] {
     &[
         &SshAgentService,
-        &DnsFilterService,
         &CudaService,
         &DockerSocketService,
+        &PortForwardService,
+        &AutoPortsService,
+        &WorkloadLogService,
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn ssh_agent_entry_bridges_socket_and_activates_guest_side() {
+        let socket = Path::new("/tmp/ssh-agent.sock");
+        let inputs = VsockServiceInputs {
+            ssh_agent_socket: Some(socket),
+            cuda_socket: None,
+            docker_socket: None,
+            port_forward_socket: None,
+            auto_ports_socket: None,
+            workload_log_socket: None,
+        };
+
+        let active = registry()
+            .iter()
+            .filter_map(|service| service.resolve(&inputs))
+            .find(|service| service.name == "SSH agent forwarding")
+            .expect("SSH agent service should be registered");
+
+        assert_eq!(active.port, ports::SSH_AGENT);
+        assert!(!active.listen);
+        assert_eq!(active.socket, socket);
+        assert_eq!(active.guest_env, &[("SMOLVM_SSH_AGENT", "1")]);
+    }
+
+    #[test]
+    fn auto_ports_entry_takes_guest_reports_and_activates_the_watcher() {
+        let socket = Path::new("/tmp/auto-ports.sock");
+        let inputs = VsockServiceInputs {
+            ssh_agent_socket: None,
+            cuda_socket: None,
+            docker_socket: None,
+            port_forward_socket: None,
+            auto_ports_socket: Some(socket),
+            workload_log_socket: None,
+        };
+        let active: Vec<_> = registry()
+            .iter()
+            .filter_map(|service| service.resolve(&inputs))
+            .collect();
+        assert_eq!(active.len(), 1, "only the auto ports service resolves");
+        assert_eq!(active[0].port, ports::AUTO_PORTS);
+        assert!(!active[0].listen, "the guest connects out");
+        assert_eq!(active[0].socket, socket);
+        assert_eq!(
+            active[0].guest_env,
+            &[(guest_env::AUTO_PORTS, guest_env::VALUE_ON)]
+        );
+    }
 }

@@ -5,12 +5,12 @@
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
 
     libkrun-src = {
-      url = "github:smol-machines/libkrun/98163265197caa24a789699f16a68b98e917b65b";
+      url = "github:smol-machines/libkrun/3285db7404144ed61faf0848bb424c0f82743f41";
       flake = false;
     };
 
     libkrunfw-src = {
-      url = "github:smol-machines/libkrunfw/516ceece6aed60ccc84ac8faa459885062e39400";
+      url = "github:smol-machines/libkrunfw/bfb229911374698399dcedcc92019287870759ab";
       flake = false;
     };
   };

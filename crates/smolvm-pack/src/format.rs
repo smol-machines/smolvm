@@ -56,17 +56,14 @@ pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
 /// Magic bytes for libs footer appended to the stub binary.
 pub const LIBS_MAGIC: &[u8; 8] = b"SMOLLIBS";
 
-/// Current format version — the version stamped into newly written packs.
-pub const FORMAT_VERSION: u32 = 1;
+/// Current format version, stamped into newly written packs. Version 4
+/// requires readers to enforce the manifest's outbound network policy;
+/// older engines must reject these packs rather than ignore restrictions.
+pub const FORMAT_VERSION: u32 = 4;
 
-/// Format versions this build can READ. New packs are always WRITTEN at
-/// `FORMAT_VERSION`, but older `.smolmachine` artifacts stay readable: the
-/// on-disk layout (footer, manifest, assets blob) is identical across these
-/// versions — only the version number ever differed. It was reset 3→1 in a
-/// format refactor, which orphaned pre-reset packs behind a strict
-/// `version == FORMAT_VERSION` check. Accepting the older numbers keeps those
-/// artifacts runnable instead of failing with "unsupported version: 3".
-pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3];
+/// Existing versions retain the same byte layout and remain readable.
+/// Version 4 adds required network-policy semantics to the manifest.
+pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3, 4];
 
 /// Whether a pack stamped with `version` can be read by this build.
 pub fn is_supported_read_version(version: u32) -> bool {
@@ -331,6 +328,59 @@ pub enum PackMode {
     Vm,
 }
 
+/// Where a checkpoint sits in its machine's history.
+///
+/// Every capture is a node: `parent` is the checkpoint the source machine was
+/// last captured to or restored from, so repeated captures of one machine form
+/// a chain and a restore-then-capture forms a branch. Ids are random and
+/// unique per capture; they carry no content meaning.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointLineage {
+    /// This checkpoint's id (32 lowercase hex characters).
+    pub id: String,
+    /// The checkpoint this one continues from, when the source had one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub parent: Option<String>,
+    /// Machine the state was captured from.
+    pub machine: String,
+    /// When the capture was published (RFC 3339).
+    pub created_at: String,
+}
+
+/// The parent a delta checkpoint file depends on.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointBase {
+    /// Lineage id of the parent checkpoint.
+    pub id: String,
+    /// SHA-256 of the parent's stored index (`checkpoint.json`), which names
+    /// every object the parent holds.
+    pub index_sha256: String,
+}
+
+/// How a portable checkpoint file lays out its payload.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum CheckpointLayout {
+    /// The classic single generation: the assets tarball holds the state,
+    /// memory image and disks directly.
+    #[default]
+    Assets,
+    /// A checkpoint store directory packed whole — content-addressed objects
+    /// plus one index per generation — so the file carries its history and
+    /// any generation in it can be restored.
+    Chunked,
+}
+
+/// One generation summarized in a checkpoint file's history.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointGeneration {
+    /// Identity and parent of the generation.
+    #[serde(flatten)]
+    pub lineage: CheckpointLineage,
+    /// Bytes of actual data the generation describes.
+    pub data_bytes: u64,
+}
+
 /// One integrity-protected file belonging to a portable live checkpoint.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointAsset {
@@ -357,7 +407,8 @@ pub struct CheckpointDiskFile {
 /// An exact block-image chain captured for one virtual disk.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointDisk {
-    /// Stable disk role: `storage` or `overlay`.
+    /// Stable disk role: `storage`, `overlay` or, for a machine with a cache
+    /// disk, `cache`.
     pub role: String,
     /// Ordered top-to-base chain. The first file is the disk attached to the VM.
     pub files: Vec<CheckpointDiskFile>,
@@ -390,6 +441,21 @@ pub struct CheckpointWorkload {
     pub restart_max_backoff_secs: u64,
 }
 
+/// A host directory the captured machine had mounted. Recorded only when the
+/// capture opted in (`host_mounts`), because it binds the artifact to a host
+/// where the same paths exist; a restore re-attaches each one at its guest path
+/// so the saved VM finds the device topology it was captured with.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointHostMount {
+    /// Host directory, as given at `machine create`.
+    pub host_path: String,
+    /// Guest mount point.
+    pub guest_path: String,
+    /// Whether the guest sees it read-only.
+    #[serde(default)]
+    pub read_only: bool,
+}
+
 /// One host-to-guest TCP forward restored around a live VM.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointPort {
@@ -412,21 +478,55 @@ pub struct CheckpointNetwork {
     /// Host listeners to recreate around the restored VM.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub ports: Vec<CheckpointPort>,
+    /// UDP forwards to recreate around the restored VM. Absent on checkpoints
+    /// captured before they were recorded.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_ports: Vec<CheckpointPort>,
     /// Effective backend used at capture: `tsi` or `virtio-net`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub backend: Option<String>,
     /// Custom IPv4 DNS resolver, when one was explicitly configured.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<String>,
+    /// Resolver options of the captured guest's resolv.conf, in order. The
+    /// restored guest keeps the file it wrote at boot, so the record must say
+    /// the same.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_options: Vec<String>,
     /// Named local inter-VM network joined by the captured machine.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
+    /// Subnet of the captured guest link, when not the default. The restored
+    /// guest keeps its address in memory, so the host side must match it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
     /// Captured outbound CIDR allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered L4 egress rules captured with the machine.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+    /// Restore must provide a new host mediator binding before execution.
+    #[serde(default)]
+    pub mediated_egress_required: bool,
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
+    /// Captured private-range block (`--block-private`) and its exceptions.
+    /// Absent on checkpoints captured before it was recorded, and on machines
+    /// without the block.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
+    /// Captured credential bindings (`[[network.credentials]]`): binding names,
+    /// env-var names and allowed hosts — never the values, which the restore
+    /// host resolves from its own environment at request time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_policy: Option<smolvm_protocol::CredentialPolicy>,
+    /// Placeholders minted for `credential_policy` on the source machine.
+    /// Carried so a process captured holding its placeholder still matches the
+    /// restored interceptor; placeholders are opaque tokens, not secrets.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub credential_placeholders: std::collections::BTreeMap<String, String>,
 }
 
 /// Versioned host CPU compatibility contract for a live checkpoint.
@@ -437,9 +537,20 @@ pub struct CheckpointNetwork {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum CheckpointCpuContract {
-    /// Stable Haswell-era Intel/KVM virtual CPU profile. The source VM ran
-    /// under this profile from its first instruction, so host-specific extended
-    /// state cannot leak into a live checkpoint.
+    /// libkrun's portable Intel/KVM CPU profile (`KRUN_CPU_TEMPLATE_PORTABLE`).
+    /// The source VM ran under it from its first instruction, so no feature
+    /// that adds XSAVE state beyond x87/SSE/AVX (AVX-512, AMX, PKU, MPX, ...)
+    /// can leak into a live checkpoint.
+    ///
+    /// The name stays `v1` although the profile has grown (it now includes
+    /// SHA, ADX, RDSEED, CLFLUSHOPT, CLWB and RDPID): the exact CPUID the guest
+    /// was given travels in the checkpoint's vCPU state, and libkrun refuses a
+    /// restore on a host whose KVM lacks an instruction set in it (or an XSAVE
+    /// component the guest enabled), naming what is missing. Speculation
+    /// controls and other kernel- or microcode-dependent bits are not
+    /// compared, so restores between identical CPUs on different host kernels
+    /// keep working. Checkpoints captured under the older, narrower mask keep
+    /// restoring, and nothing here has to enumerate the features.
     LinuxKvmIntelPortableV1,
     /// Platforms without a hypervisor-level compatibility check require the
     /// exact source CPU feature fingerprint.
@@ -493,6 +604,11 @@ pub struct PortableCheckpointManifest {
     /// Effective writable overlay size in GiB.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay_gib: Option<u64>,
+    /// Whether a guest flush waits for the host's disk (`full`) or guest writes
+    /// reach it on the host's schedule (`deferred`). Absent on checkpoints
+    /// captured before it was recorded, which restore as `full`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_durability: Option<String>,
     /// Stable identifier for the captured virtual device topology.
     pub device_profile: String,
     /// Serialized VM, vCPU, and device state.
@@ -511,6 +627,185 @@ pub struct PortableCheckpointManifest {
     /// Host networking reconstructed around the restored VM.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network: Option<CheckpointNetwork>,
+    /// Host directories mounted into the captured machine, re-attached on
+    /// restore. Empty unless the capture opted in to host-bound mounts.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub host_mounts: Vec<CheckpointHostMount>,
+    /// The `.smolmachine` whose image layers the captured machine mounted from
+    /// the host. They are not in the artifact, so a restore must attach the same
+    /// pack again to reproduce the captured device topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub packed_layers: Option<CheckpointPackedLayers>,
+    /// The registry image the host fetched for a machine with no network and
+    /// served to it as a saved-image archive over the same virtio-fs device a
+    /// pack's layers use. The archive is not in the artifact, so a restore
+    /// fetches this image again to reproduce the captured device topology.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub host_image: Option<CheckpointHostImage>,
+    /// Position in the source machine's checkpoint history. Absent on
+    /// checkpoints written before lineage was recorded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lineage: Option<CheckpointLineage>,
+    /// Payload layout. `Chunked` files use a distinct format version so
+    /// runtimes that predate them refuse them clearly.
+    #[serde(default)]
+    pub payload: CheckpointLayout,
+    /// The generations a `Chunked` file carries, this one first. Empty for a
+    /// single-generation file.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub history: Vec<CheckpointGeneration>,
+    /// The checkpoint this file's objects are relative to. A `Chunked` file
+    /// with a base carries only the objects its base lacks, so it restores
+    /// only where that exact base (same id and index digest) is present.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base: Option<CheckpointBase>,
+    /// The machine's credential CA (certificate and signing key). The captured
+    /// guest trusts this CA, so a restore keeps it instead of minting a new
+    /// one the guest would reject. Absent for machines without credentials.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub credential_ca: Option<CheckpointAsset>,
+    /// The source host's guest clock source. Absent on checkpoints written
+    /// before it was recorded and on x86_64, where the TSC contract covers it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub clock: Option<CheckpointClock>,
+    /// The CPU features the arm64 guest kernel reported (`/proc/cpuinfo`
+    /// names in `FEAT_` form). A restore on another OS checks these, since the
+    /// contract names the source host's features in that host's own terms.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_cpu_features: Option<Vec<String>>,
+    /// The cache disk the machine ran with. Its own layers are captured as the
+    /// `cache` disk chain; the shared base they sit on is not, so a restore
+    /// attaches the same base, identified here, from the restoring host.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<CheckpointCacheDisk>,
+    /// The captured guest was given the host's virtualization extensions. Its
+    /// vCPUs resume with them, so the restore must expose them again.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub nested_virt: bool,
+    /// Host-side settings of the captured machine that its restore keeps
+    /// unless the restore sets them. Absent on checkpoints captured before
+    /// they were recorded.
+    #[serde(default, skip_serializing_if = "CheckpointSettings::is_empty")]
+    pub settings: CheckpointSettings,
+    /// Content digest (`sha256:…`) of the agent rootfs the captured guest
+    /// booted with. Its processes keep that userland mapped, so a restore boots
+    /// the same rootfs, from the host's store or the copy this artifact
+    /// carries, never whatever the host has installed since. Absent on
+    /// checkpoints written before it was recorded; a restore then takes the
+    /// digest of the carried copy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rootfs_digest: Option<String>,
+}
+
+/// Host-side settings a restored machine keeps from the captured one.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Default)]
+pub struct CheckpointSettings {
+    /// Signal the workload is sent when the machine stops.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u64>,
+    /// Stop the machine once its workload exits.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub stop_on_exit: bool,
+    /// `/dev/shm` size the captured workload runs with.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+    /// Health check command.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_cmd: Option<Vec<String>>,
+    /// Seconds between health checks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_interval_secs: Option<u64>,
+    /// Seconds a health check may take.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_timeout_secs: Option<u64>,
+    /// Failed checks before the workload counts as unhealthy.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_retries: Option<u32>,
+    /// Seconds after boot before health checks start.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub health_startup_grace_secs: Option<u64>,
+}
+
+impl CheckpointSettings {
+    /// Whether nothing was recorded.
+    pub fn is_empty(&self) -> bool {
+        self == &Self::default()
+    }
+}
+
+/// The shared base under a checkpointed machine's cache disk.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointCacheDisk {
+    /// The base's file name on the capturing host.
+    pub base: String,
+    /// SHA-256 (hex) of the base. A restore attaches only a base with this
+    /// digest: the captured layers hold only the blocks the machine wrote.
+    pub sha256: String,
+    /// Absolute guest path the cache filesystem is mounted at.
+    pub mount_path: String,
+    /// The cache disk was a slot: attached but never mounted, so the guest
+    /// never wrote it and its captured layers are empty. A restore may put a
+    /// different base under it and mount that.
+    #[serde(default)]
+    pub slot: bool,
+    /// For a slot, the size in bytes of the device the guest saw. A base put
+    /// under it on restore may not be larger.
+    #[serde(default)]
+    pub slot_bytes: Option<u64>,
+}
+
+/// The arm64 system counter a checkpoint's guest was reading.
+///
+/// A guest kernel fixes the counter rate at boot, so resuming it on a host
+/// whose counter runs at another rate (24 MHz on Apple silicon, 1 GHz on
+/// Armv8.6+ servers) skews every clock unless the kernel notices the change.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointClock {
+    /// The source host's counter frequency (`CNTFRQ_EL0`) in Hz.
+    pub counter_hz: u64,
+    /// The guest kernel keeps time correctly when the counter rate changes.
+    #[serde(default)]
+    pub follows_counter_rate: bool,
+}
+
+/// Identity of the pack a checkpointed machine mounted its image layers from.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointPackedLayers {
+    /// SHA-256 of the whole `.smolmachine` file (its registry blob digest),
+    /// lowercase hex without the `sha256:` prefix.
+    pub artifact_sha256: String,
+    /// The pack footer's checksum, which keys its extracted layers.
+    pub footer_checksum: u32,
+    /// Registry reference the machine was created from, for fetching the pack
+    /// on a host that does not already have it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub registry_ref: Option<String>,
+    /// DAX window (bytes) the captured guest booted its packed layers with. A
+    /// restore must map at least this much; absent on checkpoints taken before
+    /// it was recorded, which restore with the legacy 2 GiB window.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dax_window_bytes: Option<u64>,
+}
+
+/// Identity of the registry image a checkpointed machine booted from a
+/// host-fetched archive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CheckpointHostImage {
+    /// Registry reference to fetch, pinned to the manifest digest the source
+    /// host fetched when it recorded one.
+    pub reference: String,
+    /// Digest of the image config the archive carries. A restore refuses an
+    /// archive with any other config, so a moved tag cannot swap the image.
+    pub config_digest: String,
+    /// Size in bytes of the archive the guest read.
+    pub archive_size: u64,
+    /// Modification time (seconds since the epoch) of the archive the guest
+    /// read. The guest keys its flattened copy of the image on size and
+    /// modification time, so a restore must serve an archive with both.
+    pub archive_mtime: u64,
 }
 
 /// Manifest describing the packed image and configuration.
@@ -571,6 +866,27 @@ pub struct PackManifest {
     #[serde(default)]
     pub network: bool,
 
+    /// Outbound CIDR allow-list carried with the pack (`--allow-cidr` /
+    /// `--outbound-localhost-only` / resolved `--allow-host`). Absent means
+    /// no CIDR restriction (or unrestricted when `dns_filter_hosts` is also absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Hostnames and patterns permitted by the guest DNS filter (`--allow-host` /
+    /// `--allow-host-pattern`). Absent means no hostname filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
+
+    /// Block private destinations, except these explicitly allowed CIDRs.
+    /// `Some([])` blocks all private ranges; `None` leaves the policy unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
+
+    /// Ordered outbound egress rules carried with the pack (`--deny-cidr` /
+    /// `--allow-udp`), deny rules first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
@@ -603,7 +919,7 @@ pub struct PackManifest {
     /// Asset inventory - files included in the assets blob.
     pub assets: AssetInventory,
 
-    /// Live execution state when this artifact is a `.smolcheckpoint`.
+    /// Live execution state when this artifact is a checkpoint (`.checkpoint`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint: Option<PortableCheckpointManifest>,
 }
@@ -700,6 +1016,10 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            block_private: None,
+            allowed_cidrs: None,
+            dns_filter_hosts: None,
+            egress_rules: Vec::new(),
             gpu: false,
             cuda: false,
             host_platform,
@@ -738,6 +1058,16 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_intel_portable_contract_keeps_its_wire_name() {
+        // Checkpoints captured before the portable profile gained SHA carry
+        // this exact tag; it must keep parsing as the same contract.
+        let json = r#"{"kind":"linux-kvm-intel-portable-v1"}"#;
+        let contract: CheckpointCpuContract = serde_json::from_str(json).unwrap();
+        assert_eq!(contract, CheckpointCpuContract::LinuxKvmIntelPortableV1);
+        assert_eq!(serde_json::to_string(&contract).unwrap(), json);
+    }
+
+    #[test]
     fn test_manifest_secret_refs_roundtrip() {
         // Secret refs survive a JSON round-trip through the manifest, and are
         // omitted entirely when empty (skip_serializing_if) so existing packs
@@ -753,13 +1083,31 @@ mod tests {
             !json.contains("secret_refs"),
             "empty secret_refs must not be serialized"
         );
+        assert!(
+            !json.contains("allowed_cidrs")
+                && !json.contains("dns_filter_hosts")
+                && !json.contains("egress_rules"),
+            "absent egress fields must not be serialized"
+        );
 
         let mut m = empty;
+        m.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        m.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
+        m.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
         m.secret_refs.insert(
             "DB_PASSWORD".to_string(),
             smolvm_protocol::SecretRef {
                 from_env: Some("PGPASSWORD".to_string()),
                 from_file: None,
+                from_keychain: None,
             },
         );
         let restored = PackManifest::from_json(&m.to_json().unwrap()).unwrap();
@@ -768,6 +1116,9 @@ mod tests {
             restored.secret_refs["DB_PASSWORD"].from_env.as_deref(),
             Some("PGPASSWORD")
         );
+        assert_eq!(restored.allowed_cidrs, m.allowed_cidrs);
+        assert_eq!(restored.dns_filter_hosts, m.dns_filter_hosts);
+        assert_eq!(restored.egress_rules, m.egress_rules);
     }
 
     #[test]
@@ -813,11 +1164,31 @@ mod tests {
     }
 
     #[test]
-    fn test_footer_reads_legacy_v2_v3() {
+    fn new_packs_require_a_policy_aware_reader() {
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 10,
+            manifest_offset: 10,
+            manifest_size: 20,
+            checksum: 0,
+        };
+        let bytes = footer.to_bytes();
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(version, 4);
+        assert!(
+            ![1, 2, 3].contains(&version),
+            "legacy readers must refuse new packs"
+        );
+        assert!(PackFooter::from_bytes(&bytes).is_ok());
+    }
+
+    #[test]
+    fn test_footer_reads_legacy_v1_v2_v3() {
         // Packs written before FORMAT_VERSION was reset 3->1 stamp version 2 or 3
         // but share the identical byte layout, so they must still read. Regression
         // for "read footer: unsupported version: 3" on pre-reset .smolmachine files.
-        for legacy in [2u32, 3u32] {
+        for legacy in [1u32, 2u32, 3u32] {
             let footer = PackFooter {
                 stub_size: 0,
                 assets_offset: 0,

@@ -5,7 +5,7 @@ use std::io::{self, Write};
 use std::time::Duration;
 
 pub fn respond(
-    stream: &mut impl Write,
+    stream: &mut crate::WireStream<impl Write>,
     progress: bool,
     operation: impl FnOnce() -> io::Result<()> + Send,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -13,7 +13,7 @@ pub fn respond(
 }
 
 fn respond_with_interval(
-    stream: &mut impl Write,
+    stream: &mut crate::WireStream<impl Write>,
     progress: bool,
     operation: impl FnOnce() -> io::Result<()> + Send,
     interval: Duration,
@@ -77,7 +77,13 @@ mod tests {
     #[test]
     fn legacy_shutdown_receives_only_final_ack() {
         let mut out = Vec::new();
-        respond_with_interval(&mut out, false, || Ok(()), Duration::from_millis(1)).unwrap();
+        respond_with_interval(
+            &mut crate::WireStream::new(&mut out),
+            false,
+            || Ok(()),
+            Duration::from_millis(1),
+        )
+        .unwrap();
         assert!(matches!(
             frames(&out).as_slice(),
             [AgentResponse::Ok { .. }]
@@ -93,7 +99,10 @@ mod tests {
     #[test]
     fn failed_flush_never_emits_success() {
         let mut out = Vec::new();
-        respond(&mut out, true, || Err(io::Error::other("flush failed"))).unwrap();
+        respond(&mut crate::WireStream::new(&mut out), true, || {
+            Err(io::Error::other("flush failed"))
+        })
+        .unwrap();
         assert!(
             matches!(frames(&out).as_slice(), [AgentResponse::Error { message, .. }] if message == "flush failed")
         );
@@ -111,11 +120,13 @@ mod tests {
             }
         }
         let complete = std::sync::atomic::AtomicBool::new(false);
-        assert!(respond(&mut Disconnected, true, || {
-            complete.store(true, std::sync::atomic::Ordering::Release);
-            Ok(())
-        })
-        .is_err());
+        assert!(
+            respond(&mut crate::WireStream::new(&mut Disconnected), true, || {
+                complete.store(true, std::sync::atomic::Ordering::Release);
+                Ok(())
+            })
+            .is_err()
+        );
         assert!(complete.load(std::sync::atomic::Ordering::Acquire));
     }
 
@@ -147,7 +158,7 @@ mod tests {
             signal: Some(tx),
         };
         respond_with_interval(
-            &mut out,
+            &mut crate::WireStream::new(&mut out),
             true,
             move || {
                 rx.recv_timeout(Duration::from_secs(3))

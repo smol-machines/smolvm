@@ -23,11 +23,12 @@ kill_orphan_smolvm_processes
 # API server configuration
 API_SOCKET="${XDG_RUNTIME_DIR:-/tmp}/smolvm.sock"
 API_URL="http://localhost"
-SERVER_LOG="$(mktemp -t smolvm-api-test-server)"
+SERVER_LOG="$(mktemp -t smolvm-api-test-server.XXXXXX)"
 SERVER_PID=""
 MACHINE_NAME="api-test-machine"
 REGISTRY_TEST_NAME="registry-coherence-test"
 OUT_OF_BAND_STOP_NAME="api-out-of-band-stop-test"
+FAILED_START_NAME="api-failed-startup-preserves-vm"
 
 # API client shortcut
 CURL=(curl --unix-socket "$API_SOCKET")
@@ -74,6 +75,7 @@ cleanup() {
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$MACHINE_NAME" >/dev/null 2>&1 || true
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$REGISTRY_TEST_NAME" >/dev/null 2>&1 || true
         "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME" >/dev/null 2>&1 || true
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$FAILED_START_NAME" >/dev/null 2>&1 || true
     fi
     stop_server
 
@@ -99,13 +101,44 @@ test_create_and_start_machine() {
     local status
     status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$MACHINE_NAME\", \"network\": true, \"cpus\": 1, \"mem\": 512}")
+        -d "{\"name\": \"$MACHINE_NAME\", \"network\": true, \"cpus\": 1, \"memoryMb\": 512}")
     [[ "$status" != "200" ]] && return 1
 
     # Start machine (boots VM)
     local response
     response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$MACHINE_NAME/start")
     [[ "$response" == *'"state":"running"'* ]]
+}
+
+# A second `serve start` reconnects to the first server's live VM, then
+# fails to bind its rollout ingress. Its teardown must not stop that VM.
+test_failed_startup_preserves_running_machine() {
+    local status response log succeeded=1
+    status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
+        -H "Content-Type: application/json" \
+        -d "{\"name\": \"$FAILED_START_NAME\", \"cpus\": 1, \"memoryMb\": 512}")
+    [[ "$status" == "200" ]] || { echo "create failed: $status"; return 1; }
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$FAILED_START_NAME/start")
+    [[ "$response" == *'"state":"running"'* ]] || { echo "start failed: $response"; return 1; }
+
+    log=$(mktemp)
+    if "$SMOLVM" serve start --listen 127.0.0.1:0 >"$log" 2>&1; then
+        echo "second server unexpectedly started"
+        succeeded=0
+    elif ! grep -q "bind guest rollout ingress" "$log"; then
+        echo "second server failed for the wrong reason: $(cat "$log")"
+        succeeded=0
+    fi
+    response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$FAILED_START_NAME/exec" \
+        -H "Content-Type: application/json" \
+        -d '{"command": ["echo", "still-running-after-failed-serve"]}')
+    [[ "$response" == *'"exitCode":0'* && "$response" == *"still-running-after-failed-serve"* ]] || {
+        echo "failed startup stopped the VM: $response"
+        succeeded=0
+    }
+    "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$FAILED_START_NAME" >/dev/null || true
+    rm -f "$log"
+    [[ "$succeeded" == "1" ]]
 }
 
 test_exec_echo() {
@@ -216,7 +249,7 @@ test_registry_create_start_exec() {
     local status
     status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$REGISTRY_TEST_NAME\", \"network\": true, \"cpus\": 1, \"mem\": 512}")
+        -d "{\"name\": \"$REGISTRY_TEST_NAME\", \"network\": true, \"cpus\": 1, \"memoryMb\": 512}")
     [[ "$status" != "200" ]] && { echo "create failed: $status"; return 1; }
 
     # Start it
@@ -253,7 +286,7 @@ test_out_of_band_stop_reconciliation() {
     local status response
     status=$("${CURL[@]}" -s -o /dev/null -w "%{http_code}" -X POST "$API_URL/api/v1/machines" \
         -H "Content-Type: application/json" \
-        -d "{\"name\": \"$OUT_OF_BAND_STOP_NAME\", \"cpus\": 1, \"mem\": 512}")
+        -d "{\"name\": \"$OUT_OF_BAND_STOP_NAME\", \"cpus\": 1, \"memoryMb\": 512}")
     [[ "$status" == "200" ]] || { echo "create failed: $status"; return 1; }
 
     response=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$OUT_OF_BAND_STOP_NAME/start")
@@ -322,6 +355,7 @@ fi
 
 run_test "Health check" test_health || true
 run_test "Create and start machine" test_create_and_start_machine || true
+run_test "Failed serve startup preserves running machine" test_failed_startup_preserves_running_machine || true
 run_test "Exec echo" test_exec_echo || true
 run_test "Exec reads VM filesystem" test_exec_reads_vm_filesystem || true
 run_test "Exec exit codes" test_exec_exit_codes || true
@@ -631,7 +665,58 @@ echo ""
 echo "--- Create from .smolmachine via API ---"
 echo ""
 
+# A create request's options apply to a pack the way they do to an image, and
+# a restore that asks for what its checkpoint fixes is refused by name.
+test_api_pack_options_apply_and_checkpoint_refuses_topology() {
+    local tmpdir
+    tmpdir=$(mktemp -d)
+    local pack_output="$tmpdir/api-pack-options"
+    $SMOLVM pack create --image alpine:latest -o "$pack_output" --cpus 1 --mem 512 2>&1 >/dev/null || {
+        echo "SKIP: pack create failed"
+        rm -rf "$tmpdir"; return 0
+    }
+    local sidecar="$pack_output.smolmachine"
+    local vm_name="api-pack-options-$$"
+    local resp
+    resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines" -H "Content-Type: application/json" \
+        -d "{\"name\": \"$vm_name\", \"from\": \"$sidecar\", \"cpus\": 2, \"memoryMb\": 768,
+             \"env\": [{\"name\": \"API_PACK\", \"value\": \"set\"}], \"workdir\": \"/tmp\",
+             \"cmd\": [\"sleep\", \"infinity\"]}")
+    echo "$resp" | grep -q '"cpus":2' || {
+        echo "FAIL: create from pack did not record cpus: $resp"
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null; rm -rf "$tmpdir"; return 1
+    }
+    "${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/start" >/dev/null
+    resp=$("${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/exec" -H "Content-Type: application/json" \
+        -d '{"command": ["sh", "-c", "echo $API_PACK $(pwd)"]}')
+    "${CURL[@]}" -s -X POST "$API_URL/api/v1/machines/$vm_name/stop" >/dev/null
+    "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$vm_name" >/dev/null
+    echo "$resp" | grep -q "set /tmp" || {
+        echo "FAIL: env and workdir did not reach the pack machine: $resp"
+        rm -rf "$tmpdir"; return 1
+    }
+
+    local src="api-ckpt-src-$$"
+    $SMOLVM machine create --name "$src" --from "$sidecar" -- sleep infinity >/dev/null 2>&1 || {
+        rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine start --name "$src" --branchable >/dev/null 2>&1 &&
+        $SMOLVM machine checkpoint --name "$src" --output "$tmpdir/src.smolcheckpoint" >/dev/null 2>&1 || {
+        echo "FAIL: could not checkpoint the source"
+        $SMOLVM machine delete --name "$src" -f >/dev/null 2>&1; rm -rf "$tmpdir"; return 1
+    }
+    $SMOLVM machine delete --name "$src" -f >/dev/null 2>&1
+    resp=$("${CURL[@]}" -s -w '\n%{http_code}' -X POST "$API_URL/api/v1/machines" -H "Content-Type: application/json" \
+        -d "{\"name\": \"api-ckpt-$$\", \"from\": \"$tmpdir/src.smolcheckpoint\", \"cpus\": 3}")
+    rm -rf "$tmpdir"
+    [[ "$resp" == *"cpus cannot be set when restoring a live checkpoint"* && "$resp" == *400 ]] || {
+        echo "FAIL: restore with cpus was not refused by name: $resp"
+        "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/api-ckpt-$$" >/dev/null; return 1
+    }
+}
+
 run_test "API: create from .smolmachine" test_api_create_from_smolmachine || true
+run_test "API: pack options apply; a checkpoint refuses topology by name" test_api_pack_options_apply_and_checkpoint_refuses_topology || true
 run_test "API: run from .smolmachine (offline)" test_api_run_from_smolmachine_offline || true
 run_test "API: from + image conflict" test_api_from_and_image_conflict || true
 run_test "API: from nonexistent sidecar" test_api_from_nonexistent_sidecar || true
@@ -666,8 +751,10 @@ test_created_machine_survives_restart() {
         return 1
     }
 
-    # Cleanup
+    # Cleanup. run_test runs this in a subshell, so the server started above
+    # is this subshell's to stop; the suite's own trap never learns its PID.
     "${CURL[@]}" -s -X DELETE "$API_URL/api/v1/machines/$name" >/dev/null 2>&1 || true
+    stop_server
 }
 
 run_test "API: created machine survives server restart" test_created_machine_survives_restart || true

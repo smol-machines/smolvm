@@ -66,11 +66,22 @@ pub mod api;
 /// Reference-safe lifecycle management for Linux shared pack and COW caches.
 #[cfg(target_os = "linux")]
 pub mod artifact_cache;
+pub mod attach;
 pub mod config;
+pub mod credentials;
 // The shared CUDA daemon manages unix-domain sockets, flock, and detached
 // process groups — all POSIX. GPU acceleration is unavailable on Windows anyway,
 // so the module (and its callers in cuda_host) are unix-only.
+pub mod checkpoint_delta;
+pub mod checkpoint_retention;
 pub mod checkpoint_store;
+/// The engine's command-line commands, usable by other front ends (the `smol` CLI
+/// flattens them so every engine flag is available without a second implementation).
+#[allow(missing_docs)]
+pub mod cli;
+// The CLI modules name this crate as a dependency would, so they compile
+// unchanged inside it.
+extern crate self as smolvm;
 #[cfg(unix)]
 pub mod cuda_daemon;
 pub mod cuda_host;
@@ -83,6 +94,10 @@ pub mod dns_filter_listener;
 pub mod docker_config;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+/// The Docker Engine API, answered by smolvm: every container is a machine.
+#[cfg(unix)]
+pub mod engine;
+pub mod image_seed;
 pub mod image_store;
 /// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
 /// Lives in the library, not the CLI, so any binary that links the engine (the
@@ -90,9 +105,12 @@ pub mod image_store;
 /// needing a separate `_boot-vm`-capable helper on disk.
 pub mod internal_boot;
 pub mod log_rotation;
+/// One machine description, resolved the same way by every creation path.
+pub mod machine_spec;
 pub mod network;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
 pub mod pack_export;
+pub mod pack_seed;
 pub mod platform;
 pub mod pool;
 /// Portable live-checkpoint compatibility and one-shot restore support.
@@ -107,10 +125,15 @@ pub mod smolfile;
 pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
+#[cfg(test)]
+pub(crate) mod test_support;
+pub mod usage;
 pub mod util;
 pub mod vm;
+pub mod vm_exit;
 /// Shared machine-workload launch used by every machine-start front-end.
 pub mod workload;
+pub mod workload_log;
 
 /// Compatibility re-exports for smolvm error types.
 ///
@@ -148,3 +171,10 @@ pub use vm::{default_backend, VmBackend, VmHandle};
 
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// This engine build: the version plus the git commit it was built from
+/// (`unknown` for a build without git, such as one from a crates.io
+/// tarball). Recorded on a machine when it starts, and compared, not the
+/// executable's path or inode, when another engine asks to branch it: the
+/// same release installed as two files is one build.
+pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOLVM_GIT_COMMIT"));

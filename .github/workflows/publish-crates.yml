@@ -17,6 +17,7 @@ name: Publish crates to crates.io
 #   smolvm-protocol, smolvm-network  (leaves)
 #   → smolvm-pack, smolvm-smolfile   (need protocol)
 #   → smolvm-registry                (needs pack)
+#   → smolvm-checkpoint              (needs pack; ships the checkpoint format spec)
 # smolvm-cuda / smolvm-cuda-guest are intentionally NOT published.
 
 on:
@@ -61,7 +62,7 @@ jobs:
 
           # Dependency order: a dep must be published (and indexed) before a
           # dependent, so its `version = "x"` requirement resolves on crates.io.
-          crates=(smolvm-protocol smolvm-network smolvm-pack smolvm-smolfile smolvm-registry)
+          crates=(smolvm-protocol smolvm-network smolvm-pack smolvm-smolfile smolvm-registry smolvm-checkpoint)
 
           for c in "${crates[@]}"; do
             name="$(grep -m1 '^name' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"

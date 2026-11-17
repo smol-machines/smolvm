@@ -1,0 +1,1201 @@
+//! Live disk growth shared by engine entry points.
+//!
+//! The caller holds its API/CLI lifecycle guard. This layer additionally
+//! serializes the operation with cross-process checkpoint and branch capture.
+
+use super::{fork, AgentClient, AgentManager};
+use crate::config::{RecordState, VmRecord};
+use crate::db::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget, SmolvmDb};
+use crate::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+use crate::{Error, Result};
+use smolvm_protocol::{ManagedDisk, ONLINE_FILESYSTEM_GROWTH_CAPABILITY};
+use std::time::Duration;
+
+/// Host process identity used to condition a mutation on the observed VMM.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct RuntimeIdentity {
+    /// Host process identifier; reuse is distinguished by its start time.
+    pub pid: i32,
+    /// Platform-native process start timestamp, treated as an opaque value.
+    pub start_time: u64,
+    /// Linux host boot identity; process start times are relative to this boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub boot_id: Option<String>,
+}
+
+impl RuntimeIdentity {
+    /// Observe a live smolvm process, refusing unverifiable identities.
+    pub fn observe(pid: i32) -> Option<Self> {
+        let start_time = crate::process::process_start_time(pid)?;
+        let boot_id = host_boot_id().ok()?;
+        crate::process::is_our_process_strict(pid, Some(start_time)).then_some(Self {
+            pid,
+            start_time,
+            boot_id,
+        })
+    }
+
+    fn validate_boot(&self, actual: Option<&str>) -> Result<()> {
+        if self.boot_id.as_deref() != actual {
+            return Err(Error::agent_conflict("live resize", "host restarted or its boot identity is unavailable; inspect the machine before resizing"));
+        }
+        Ok(())
+    }
+
+    fn validate(&self, actual: Option<(i32, Option<u64>)>) -> Result<()> {
+        if self.pid <= 0 || actual != Some((self.pid, Some(self.start_time))) {
+            return Err(Error::agent_conflict("live resize",
+                "machine restarted or its runtime identity is unavailable; inspect it before resizing"));
+        }
+        Ok(())
+    }
+}
+
+pub(crate) fn host_boot_id() -> Result<Option<String>> {
+    #[cfg(target_os = "linux")]
+    {
+        let id = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .map_err(|error| Error::agent("runtime identity", error.to_string()))?;
+        let id = id.trim();
+        if id.is_empty() {
+            return Err(Error::agent(
+                "runtime identity",
+                "host boot identity is empty",
+            ));
+        }
+        Ok(Some(id.to_owned()))
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        Ok(None)
+    }
+}
+
+/// Check the caller's observed incarnation under the same cross-process lock
+/// as growth, before guest calls, resource budgets or journal changes.
+pub(crate) fn grow_checked(
+    db: &SmolvmDb,
+    name: &str,
+    target: ResizeTarget,
+    expected: Option<&RuntimeIdentity>,
+    operation_id: Option<&str>,
+) -> Result<ResizeOutcome> {
+    let _source_guard = fork::lock_fork_source(name)?;
+    if let Some(expected) = expected {
+        let manager = AgentManager::for_vm(name)?;
+        expected.validate(manager.pid_and_start_time())?;
+        expected.validate_boot(host_boot_id()?.as_deref())?;
+        if !crate::process::is_our_process_strict(expected.pid, Some(expected.start_time)) {
+            return Err(Error::agent_conflict(
+                "live resize",
+                "original machine runtime is no longer running",
+            ));
+        }
+    }
+    let receipt = if let Some(operation_id) = operation_id {
+        let runtime = expected
+            .ok_or_else(|| Error::config("live resize", "operationId requires expectedRuntime"))?;
+        let original = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+        let receipt = db.begin_resize_receipt(
+            name,
+            &ResizeReceipt {
+                operation_id: operation_id.into(),
+                runtime: runtime.clone(),
+                target: target.clone(),
+                original: ResizeGeometry::from(&original),
+                state: ResizeReceiptState::Active,
+            },
+        )?;
+        match &receipt.state {
+            ResizeReceiptState::Rejected { message } => {
+                return Ok(ResizeOutcome::Rejected {
+                    operation_id: operation_id.into(),
+                    runtime: runtime.clone(),
+                    message: message.clone(),
+                })
+            }
+            ResizeReceiptState::Applied => {
+                return db
+                    .get_vm(name)?
+                    .map(|record| ResizeOutcome::Applied(Box::new(record)))
+                    .ok_or_else(|| Error::vm_not_found(name))
+            }
+            ResizeReceiptState::Active => {}
+        }
+        Some(receipt)
+    } else {
+        None
+    };
+    let result = grow_target_locked(db, name, target);
+    match (result, receipt) {
+        (Ok(record), Some(receipt)) => {
+            db.finish_resize_receipt(name, &receipt, ResizeReceiptState::Applied)?;
+            Ok(ResizeOutcome::Applied(Box::new(record)))
+        }
+        (Err(error), Some(receipt)) => {
+            // Every irreversible grow path records an intent before touching
+            // the runtime. Missing intent alone is insufficient: a prior try
+            // could have completed before its reply/receipt was committed.
+            let current = db.get_vm(name)?;
+            let unchanged = current
+                .as_ref()
+                .is_some_and(|r| ResizeGeometry::from(r) == receipt.original);
+            if unchanged
+                && db.pending_resize(name)?.is_none()
+                && RuntimeIdentity::observe(receipt.runtime.pid).as_ref() == Some(&receipt.runtime)
+            {
+                let message: String = error.to_string().chars().take(4096).collect();
+                db.finish_resize_receipt(
+                    name,
+                    &receipt,
+                    ResizeReceiptState::Rejected {
+                        message: message.clone(),
+                    },
+                )?;
+                return Ok(ResizeOutcome::Rejected {
+                    operation_id: receipt.operation_id,
+                    runtime: receipt.runtime,
+                    message,
+                });
+            }
+            Err(error)
+        }
+        (Ok(record), None) => Ok(ResizeOutcome::Applied(Box::new(record))),
+        (Err(error), None) => Err(error),
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub(crate) struct ResizeGeometry {
+    cpus: u8,
+    memory_mb: u32,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+}
+
+impl From<&VmRecord> for ResizeGeometry {
+    fn from(record: &VmRecord) -> Self {
+        Self {
+            cpus: record.cpus,
+            memory_mb: record.mem,
+            storage_gb: record.storage_gb,
+            overlay_gb: record.overlay_gb,
+        }
+    }
+}
+
+pub(crate) enum ResizeOutcome {
+    Applied(Box<VmRecord>),
+    Rejected {
+        operation_id: String,
+        runtime: RuntimeIdentity,
+        message: String,
+    },
+}
+
+fn grow_target_locked(db: &SmolvmDb, name: &str, target: ResizeTarget) -> Result<VmRecord> {
+    match target {
+        ResizeTarget::Cpus(cpus) => grow_cpus_locked(db, name, cpus),
+        ResizeTarget::Memory(memory) => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                grow_memory_locked(db, name, memory)
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                grow_memory(db, name, memory)
+            }
+        }
+        ResizeTarget::Disks { storage, overlay } => grow_disks_locked(db, name, storage, overlay),
+    }
+}
+
+fn begin_resize_intent(
+    db: &SmolvmDb,
+    name: &str,
+    pid: crate::process::Pid,
+    started: Option<u64>,
+    target: ResizeTarget,
+) -> Result<ResizeIntent> {
+    if !crate::process::is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "live resize",
+            "VMM process identity cannot be verified",
+        ));
+    }
+    let runtime = RuntimeIdentity {
+        pid,
+        start_time: started.expect("verified start time"),
+        boot_id: host_boot_id()?,
+    };
+    if let Some(previous) = db.pending_resize(name)? {
+        let different_runtime = previous.pid != runtime.pid
+            || previous.started != runtime.start_time
+            || previous.boot_id != runtime.boot_id;
+        if different_runtime && previous.target == target {
+            let old_is_alive = crate::process::is_alive(previous.pid);
+            let observed_start = crate::process::process_start_time(previous.pid);
+            if previous_runtime_gone(
+                &previous,
+                runtime.boot_id.as_deref(),
+                old_is_alive,
+                observed_start,
+            ) {
+                return db.rebind_resize(name, &previous, &runtime);
+            }
+        }
+    }
+    db.begin_resize(name, pid, runtime.start_time, target)
+}
+
+fn previous_runtime_gone(
+    intent: &ResizeIntent,
+    current_boot: Option<&str>,
+    alive: bool,
+    observed_start: Option<u64>,
+) -> bool {
+    let previous_boot_ended = matches!((intent.boot_id.as_deref(), current_boot), (Some(old), Some(current)) if old != current);
+    previous_boot_ended || !alive || observed_start.is_some_and(|start| start != intent.started)
+}
+
+/// Clear a RAM resize whose runtime is gone once the machine has booted again
+/// with at least its target. The resize raised the record before the guest
+/// took the RAM, and a restarted machine boots from the record, so the target
+/// is met; left in place, the intent refused every other size, branch and
+/// checkpoint. Returns whether it cleared the intent.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn clear_met_memory_intent(
+    db: &SmolvmDb,
+    name: &str,
+    intent: &ResizeIntent,
+    boot_mib: u32,
+) -> Result<bool> {
+    let ResizeTarget::Memory(target) = intent.target else {
+        return Ok(false);
+    };
+    if boot_mib < target
+        || !previous_runtime_gone(
+            intent,
+            host_boot_id()?.as_deref(),
+            crate::process::is_alive(intent.pid),
+            crate::process::process_start_time(intent.pid),
+        )
+    {
+        return Ok(false);
+    }
+    db.finish_resize(name, intent)?;
+    Ok(true)
+}
+
+fn finish_resize_intent(db: &SmolvmDb, name: &str, intent: &ResizeIntent) -> Result<()> {
+    validate_intent_boot(intent, host_boot_id()?.as_deref())?;
+    if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
+        return Err(Error::agent(
+            "live resize",
+            "VMM exited or changed before resize completion; reconciliation required",
+        ));
+    }
+    db.finish_resize(name, intent)
+}
+
+fn validate_intent_boot(intent: &ResizeIntent, actual: Option<&str>) -> Result<()> {
+    if intent.boot_id.as_deref() != actual {
+        return Err(Error::agent_conflict("recover resize", "host restarted or its boot identity is unavailable; refusing to replay the previous boot's resize"));
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+pub(crate) struct MemoryGrowthInfo {
+    boot_mib: u32,
+    base: u64,
+    mapped: u64,
+    plugged: u64,
+    capacity: u64,
+    /// Whether the guest driver took the RAM growth device; `None` from a
+    /// runtime that does not report it.
+    driver: Option<bool>,
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+impl MemoryGrowthInfo {
+    pub(crate) fn parse(reply: &str) -> Result<Self> {
+        let invalid = || Error::agent("RAM resize", "runtime reported invalid RAM growth geometry");
+        let words: Vec<_> = reply.split_whitespace().collect();
+        let (
+            ["OK", "boot_mib", boot, "base", base, "mapped", mapped, "plugged", plugged, "capacity", capacity],
+            driver,
+        ) = (match words.as_slice() {
+            [head @ .., "driver", driver] => (head, Some(*driver)),
+            all => (all, None),
+        })
+        else {
+            return Err(invalid());
+        };
+        let info = Self {
+            boot_mib: boot.parse().map_err(|_| invalid())?,
+            base: base.parse().map_err(|_| invalid())?,
+            mapped: mapped.parse().map_err(|_| invalid())?,
+            plugged: plugged.parse().map_err(|_| invalid())?,
+            capacity: capacity.parse().map_err(|_| invalid())?,
+            driver: match driver {
+                None => None,
+                Some("1") => Some(true),
+                Some("0") => Some(false),
+                Some(_) => return Err(invalid()),
+            },
+        };
+        if info.boot_mib == 0
+            || info.capacity == 0
+            || info.mapped > info.capacity
+            || info.plugged > info.mapped
+            || !info.base.is_multiple_of(128 << 20)
+            || !info.mapped.is_multiple_of(128 << 20)
+            || !info.capacity.is_multiple_of(128 << 20)
+            || !info.plugged.is_multiple_of(2 << 20)
+            || info.base.checked_add(info.capacity).is_none()
+            || u64::from(info.boot_mib)
+                .checked_add(info.capacity >> 20)
+                .is_none_or(|total| total > u64::from(u32::MAX))
+        {
+            return Err(invalid());
+        }
+        Ok(info)
+    }
+
+    pub(crate) fn target_added_mib(&self, total_mib: u32) -> Result<u64> {
+        let target = total_mib
+            .checked_sub(self.boot_mib)
+            .map(u64::from)
+            .ok_or_else(|| Error::config("RAM resize", "RAM cannot shrink below boot memory"))?;
+        let bytes = target << 20;
+        if bytes < self.mapped || bytes > self.capacity || !target.is_multiple_of(128) {
+            return Err(Error::config(
+                "RAM resize",
+                "RAM must grow in 128 MiB steps within the runtime capacity",
+            ));
+        }
+        Ok(target)
+    }
+}
+
+fn unsupported_live_compute(operation: &str) -> Error {
+    Error::config(
+        operation,
+        "live CPU growth requires Linux x86_64 or macOS Apple Silicon; RAM and disk growth are supported separately",
+    )
+}
+
+fn ensure_live_compute_platform(operation: &str) -> Result<()> {
+    if cfg!(any(
+        all(target_os = "linux", target_arch = "x86_64"),
+        all(target_os = "macos", target_arch = "aarch64")
+    )) {
+        Ok(())
+    } else {
+        Err(unsupported_live_compute(operation))
+    }
+}
+
+fn unsupported_live_memory() -> Error {
+    Error::config(
+        "RAM resize",
+        "live RAM growth requires Linux x86_64 or aarch64, or macOS Apple Silicon; disk growth is supported separately",
+    )
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn ensure_live_memory_platform() -> Result<()> {
+    if cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) || cfg!(all(target_os = "macos", target_arch = "aarch64"))
+    {
+        Ok(())
+    } else {
+        Err(unsupported_live_memory())
+    }
+}
+
+/// Whether `extra_bytes` more fits in the measured headroom, keeping a reserve of
+/// 5% of the bound (between 512 MiB and 4 GiB) for everything else on it.
+#[cfg(any(target_os = "linux", target_os = "macos", test))]
+fn growth_fits(stats: &crate::process::HostMemoryStats, extra_bytes: u64) -> bool {
+    let reserve = (stats.total_bytes / 20).clamp(512 << 20, 4096 << 20);
+    extra_bytes == 0 || stats.available_bytes >= extra_bytes.saturating_add(reserve)
+}
+
+/// Live RAM growth. Host budget changes precede guest exposure; the runtime
+/// reports its boot layout and a durable intent allows interrupted retries.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub fn grow_memory(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
+    let _source_guard = fork::lock_fork_source(name)?;
+    grow_memory_locked(db, name, target_mib)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn grow_memory_locked(db: &SmolvmDb, name: &str, target_mib: u32) -> Result<VmRecord> {
+    ensure_live_memory_platform()?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    if record.actual_state() != RecordState::Running {
+        return Err(Error::agent_conflict(
+            "RAM resize",
+            "machine must be running",
+        ));
+    }
+    if target_mib < record.mem {
+        return Err(Error::config("RAM resize", "RAM cannot shrink"));
+    }
+    let manager = AgentManager::for_vm(name)?;
+    let mut client = AgentClient::connect(manager.vsock_socket())?;
+    if !client.supports_capability(smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY)? {
+        return Err(Error::agent(
+            "RAM resize",
+            "running guest lacks RAM growth support; no RAM changed",
+        ));
+    }
+    let socket = fork::control_socket_path(name);
+    let info =
+        MemoryGrowthInfo::parse(&fork::control_socket_cmd(&socket, "PROTOTYPE_MEMORY_INFO")?)?;
+    if info.driver == Some(false) {
+        return Err(Error::agent_conflict(
+            "RAM resize",
+            "the guest did not take its RAM growth device at boot, so added RAM cannot reach it; no RAM changed. Stop the machine, set the size with `machine update --mem`, and start it",
+        ));
+    }
+    if let Some(previous) = db.pending_resize(name)? {
+        clear_met_memory_intent(db, name, &previous, info.boot_mib)?;
+    }
+    let added_mib = info.target_added_mib(target_mib)?;
+    let target_bytes = added_mib << 20;
+    let extra_bytes = target_bytes - info.mapped;
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("RAM resize", "VMM process identity is unavailable"))?;
+    // Check enforcement before recording an intent, including partial retries.
+    let available = crate::process::vmm_growth_memory_stats(pid, started)?;
+    if !growth_fits(&available, extra_bytes) {
+        return Err(Error::agent_conflict(
+            "RAM resize",
+            "insufficient host or VMM parent memory headroom for requested growth",
+        ));
+    }
+    #[cfg(target_os = "linux")]
+    let budget = fork::live_resize_memory_budget(db, name, &record, target_mib)?;
+    let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Memory(target_mib))?;
+    #[cfg(target_os = "linux")]
+    if !crate::process::raise_managed_vmm_memory_budget(name, pid, started, budget)? {
+        // Not SmolVM's own cgroup (a machine started from the CLI runs in the
+        // user's session scope). Its limits are never changed, but growth that
+        // fits under them, and under every ancestor's, needs no change: a desktop
+        // session has none, and refusing there left local machines unable to grow.
+        let enclosing = crate::process::vmm_enclosing_growth_memory_stats(pid, started);
+        if !matches!(
+            enclosing
+                .as_ref()
+                .map(|stats| growth_fits(stats, extra_bytes)),
+            Ok(true)
+        ) {
+            // Refused before anything changed, and every earlier attempt on this
+            // VMM stopped at this same check, so no RAM was registered under the
+            // intent. Clear it: left behind, it refused every later checkpoint,
+            // pause and branch of the machine.
+            db.finish_resize(name, &intent)?;
+            enclosing?;
+            return Err(Error::agent_conflict("RAM resize", "the memory limit of the cgroup the machine runs in leaves no room for the requested growth; its limits were not changed"));
+        }
+    }
+    let reply = fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_MEMORY {added_mib}"))?;
+    if reply.trim() != "OK RAM registered; guest onlining pending" {
+        return Err(Error::agent("RAM resize", format!("RAM growth not confirmed: {reply}; limits may be raised, reconcile before retrying")));
+    }
+    let actual =
+        MemoryGrowthInfo::parse(&fork::control_socket_cmd(&socket, "PROTOTYPE_MEMORY_INFO")?)?;
+    if actual.boot_mib != info.boot_mib || actual.base != info.base || actual.mapped != target_bytes
+    {
+        return Err(Error::agent(
+            "RAM resize",
+            "runtime did not verify the requested RAM geometry",
+        ));
+    }
+    db.update_vm(name, |record| record.mem = target_mib)?
+        .ok_or_else(|| {
+            Error::agent(
+                "RAM resize",
+                "RAM registered but machine record disappeared",
+            )
+        })?;
+    if target_bytes != 0 {
+        client
+            .online_memory(actual.base, target_bytes)
+            .map_err(|error| {
+                Error::agent(
+                    "RAM resize",
+                    format!(
+                        "RAM registered; guest onlining incomplete: {error}; retry the same target"
+                    ),
+                )
+            })?;
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+    loop {
+        let ready =
+            MemoryGrowthInfo::parse(&fork::control_socket_cmd(&socket, "PROTOTYPE_MEMORY_INFO")?)?;
+        if ready
+            == (MemoryGrowthInfo {
+                plugged: target_bytes,
+                ..actual
+            })
+        {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(Error::agent(
+                "RAM resize",
+                "RAM registered but guest did not finish plugging it; retry the same target",
+            ));
+        }
+        std::thread::sleep(Duration::from_millis(25));
+    }
+    finish_resize_intent(db, name, &intent)?;
+    db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
+/// Reject live RAM growth on hosts without a supported hot-add backend.
+pub fn grow_memory(_db: &SmolvmDb, _name: &str, _target_mib: u32) -> Result<VmRecord> {
+    Err(unsupported_live_memory())
+}
+
+fn validate_growth(current: u64, requested: u64) -> Result<u64> {
+    if requested == 0 || requested < current {
+        return Err(Error::config(
+            "live resize",
+            "disk capacity cannot shrink or be zero",
+        ));
+    }
+    requested
+        .checked_mul(1 << 30)
+        .ok_or_else(|| Error::config("live resize", "disk capacity overflows bytes"))
+}
+
+fn cpu_status(reply: &str) -> Result<(u8, u8)> {
+    let words: Vec<_> = reply.split_whitespace().collect();
+    if let ["OK", "created", created, "capacity", capacity] = words.as_slice() {
+        if let (Ok(created), Ok(capacity)) = (created.parse::<u8>(), capacity.parse::<u8>()) {
+            if created > 0 && created <= capacity {
+                return Ok((created, capacity));
+            }
+        }
+    }
+    Err(Error::agent(
+        "CPU resize",
+        format!("runtime cannot report usable CPU growth state: {reply}"),
+    ))
+}
+
+/// Live CPU resize; runtime must have enabled CPU growth at boot.
+/// Preserve created CPU count even if subsequent guest onlining fails.
+pub fn grow_cpus(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
+    let _source_guard = fork::lock_fork_source(name)?;
+    grow_cpus_locked(db, name, target)
+}
+
+fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
+    ensure_live_compute_platform("CPU resize")?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| Error::VmNotFound { name: name.into() })?;
+    if record.actual_state() != RecordState::Running {
+        return Err(Error::agent_conflict(
+            "CPU resize",
+            "machine must be running",
+        ));
+    }
+    if target == 0 {
+        return Err(Error::config("CPU resize", "CPU count cannot be zero"));
+    }
+    if target < record.cpus {
+        return shrink_cpus_locked(db, name, target);
+    }
+    let manager = AgentManager::for_vm(name)?;
+    let mut client = AgentClient::connect(manager.vsock_socket())?;
+    if !client.supports_capability(smolvm_protocol::ONLINE_CPU_GROWTH_CAPABILITY)? {
+        return Err(Error::agent(
+            "CPU resize",
+            "running guest lacks CPU growth support; no CPUs changed",
+        ));
+    }
+    let socket = fork::control_socket_path(name);
+    let (created, capacity) =
+        cpu_status(&fork::control_socket_cmd(&socket, "PROTOTYPE_CPU_STATUS")?)?;
+    if target > capacity {
+        return Err(Error::config(
+            "CPU resize",
+            format!(
+                "target must be between {created} created CPUs and platform capacity {capacity}"
+            ),
+        ));
+    }
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("CPU resize", "VMM process identity is unavailable"))?;
+    let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Cpus(target))?;
+    // An active live CPU limit stays the cap at the new vCPU count.
+    crate::process::set_managed_vmm_cpu_quota(
+        name,
+        pid,
+        started,
+        super::cpu_limit::resize_quota_usec(name, pid, target),
+    )?;
+    let required_slots = target.max(created);
+    let reply =
+        fork::control_socket_cmd(&socket, &format!("PROTOTYPE_GROW_CPUS {required_slots}"))?;
+    if reply.trim() != format!("OK created {required_slots} vCPUs; guest online required") {
+        return Err(Error::agent("CPU resize", format!("CPU creation incomplete: {reply}; quota may already be raised, reconcile before retrying")));
+    }
+    let (actual, _) = cpu_status(&fork::control_socket_cmd(&socket, "PROTOTYPE_CPU_STATUS")?)?;
+    if actual != required_slots {
+        return Err(Error::agent(
+            "CPU resize",
+            "runtime did not verify the requested CPU count",
+        ));
+    }
+    db.update_vm(name, |record| record.cpus = target)?
+        .ok_or_else(|| Error::agent("CPU resize", "CPUs created but machine record disappeared"))?;
+    client.online_cpus(target).map_err(|error| {
+        Error::agent(
+            "CPU resize",
+            format!(
+                "{actual} CPUs created; guest onlining incomplete: {error}; retry the same target"
+            ),
+        )
+    })?;
+    finish_resize_intent(db, name, &intent)?;
+    db.get_vm(name)?
+        .ok_or_else(|| Error::VmNotFound { name: name.into() })
+}
+
+fn shrink_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
+    // HVF must implement CPU_OFF and checkpoint its powered-off state before
+    // this can safely be widened to macOS. Reject before touching the guest.
+    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        return Err(Error::config("CPU shrink", "live CPU shrink requires Linux x86_64 with offline-CPU checkpoint support; no CPUs changed"));
+    }
+    let manager = AgentManager::for_vm(name)?;
+    let socket = fork::control_socket_path(name);
+    if fork::control_socket_cmd(&socket, "CPU_SHRINK_CAPABILITIES")?.trim()
+        != "OK preserved-offline-cpu-slots-v1"
+    {
+        return Err(Error::config(
+            "CPU shrink",
+            "loaded runtime cannot safely restore offlined CPUs; no CPUs changed",
+        ));
+    }
+    let (created, _) = cpu_status(&fork::control_socket_cmd(&socket, "PROTOTYPE_CPU_STATUS")?)?;
+    if target == 0 || target > created {
+        return Err(Error::config(
+            "CPU shrink",
+            "target must retain CPU0 and fit existing CPU slots",
+        ));
+    }
+    let mut client = AgentClient::connect(manager.vsock_socket())?;
+    if !client.supports_capability(smolvm_protocol::OFFLINE_CPU_SHRINK_CAPABILITY)? {
+        return Err(Error::config(
+            "CPU shrink",
+            "running guest lacks CPU shrink support; no CPUs changed",
+        ));
+    }
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("CPU shrink", "VMM process identity unavailable"))?;
+    let intent = begin_resize_intent(db, name, pid, started, ResizeTarget::Cpus(target))?;
+    client.offline_cpus(target)?;
+    // Quota is reduced only after the kernel has successfully offlined the
+    // trailing CPUs and the agent has verified the complete resulting set.
+    // An active live CPU limit stays the cap at the new vCPU count.
+    crate::process::set_managed_vmm_cpu_quota(
+        name,
+        pid,
+        started,
+        super::cpu_limit::resize_quota_usec(name, pid, target),
+    )?;
+    db.update_vm(name, |record| record.cpus = target)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
+    finish_resize_intent(db, name, &intent)?;
+    db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))
+}
+
+/// Grow running disks and their mounted filesystems without restarting the VM.
+/// Check every requested target of a running machine before any of them is
+/// applied, so a request that can be refused up front changes nothing.
+///
+/// These are the static rules the individual grow calls enforce; host memory
+/// headroom and guest capabilities are still checked by each call, before it
+/// changes anything.
+pub fn check_targets(
+    db: &SmolvmDb,
+    name: &str,
+    cpus: Option<u8>,
+    mem_mib: Option<u32>,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<()> {
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    if record.actual_state() != RecordState::Running {
+        return Err(Error::agent_conflict(
+            "live resize",
+            "machine must be running",
+        ));
+    }
+    if let Some(target) = mem_mib {
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        {
+            let _ = target;
+            return Err(unsupported_live_memory());
+        }
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            ensure_live_memory_platform()?;
+            if target < record.mem {
+                return Err(Error::config("RAM resize", "RAM cannot shrink"));
+            }
+        }
+    }
+    if let Some(target) = cpus {
+        if target == 0 {
+            return Err(Error::config("CPU resize", "CPU count cannot be zero"));
+        }
+        ensure_live_compute_platform("CPU resize")?;
+        if target < record.cpus && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+            return Err(Error::config(
+                "CPU shrink",
+                "live CPU shrink requires Linux x86_64 with offline-CPU checkpoint support; no CPUs changed",
+            ));
+        }
+    }
+    if storage_gb.is_some() || overlay_gb.is_some() {
+        if let Some(target) = storage_gb {
+            validate_growth(
+                record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB),
+                target,
+            )?;
+        }
+        if let Some(target) = overlay_gb {
+            validate_growth(
+                record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB),
+                target,
+            )?;
+        }
+        if !db.dependent_clones(name)?.is_empty() {
+            return Err(Error::agent_conflict(
+                "live resize",
+                "cannot modify a disk with dependent branches",
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// After the runtime confirms growth, record the new disk limit even if the
+/// subsequent filesystem operation fails. Retrying the same limit then finishes
+/// the filesystem operation instead of attempting to undo disk growth.
+pub fn grow_disks(
+    db: &SmolvmDb,
+    name: &str,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<VmRecord> {
+    let _source_guard = fork::lock_fork_source(name)?;
+    grow_disks_locked(db, name, storage_gb, overlay_gb)
+}
+
+fn grow_disks_locked(
+    db: &SmolvmDb,
+    name: &str,
+    storage_gb: Option<u64>,
+    overlay_gb: Option<u64>,
+) -> Result<VmRecord> {
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| Error::VmNotFound { name: name.into() })?;
+    if record.actual_state() != RecordState::Running {
+        return Err(Error::agent_conflict(
+            "live resize",
+            "machine must be running",
+        ));
+    }
+    if storage_gb.is_none() && overlay_gb.is_none() {
+        return Err(Error::config(
+            "live resize",
+            "specify storage or overlay capacity",
+        ));
+    }
+    if !db.dependent_clones(name)?.is_empty() {
+        return Err(Error::agent_conflict(
+            "live resize",
+            "cannot modify a disk with dependent branches",
+        ));
+    }
+    let mut requested = Vec::new();
+    for (disk, id, current, target) in [
+        (
+            ManagedDisk::Storage,
+            "storage",
+            record.storage_gb.unwrap_or(DEFAULT_STORAGE_SIZE_GIB),
+            storage_gb,
+        ),
+        (
+            ManagedDisk::Overlay,
+            "overlay",
+            record.overlay_gb.unwrap_or(DEFAULT_OVERLAY_SIZE_GIB),
+            overlay_gb,
+        ),
+    ] {
+        if let Some(target) = target {
+            requested.push((disk, id, target, validate_growth(current, target)?));
+        }
+    }
+    let manager = AgentManager::for_vm(name)?;
+    let mut client = AgentClient::connect(manager.vsock_socket())?;
+    if !client.supports_capability(ONLINE_FILESYSTEM_GROWTH_CAPABILITY)? {
+        return Err(Error::agent(
+            "live resize",
+            "running guest agent lacks online growth support; no disks changed",
+        ));
+    }
+    let socket = fork::control_socket_path(name);
+    let capabilities = fork::control_socket_cmd(&socket, "GROW_DISK_CAPABILITIES")?;
+    if capabilities.trim() != "OK grow-disk-v1" {
+        return Err(Error::agent(
+            "live resize",
+            "running runtime lacks online disk growth support; no disks changed",
+        ));
+    }
+    let (pid, started) = manager
+        .pid_and_start_time()
+        .ok_or_else(|| Error::agent("live resize", "VMM process identity is unavailable"))?;
+    let intent = begin_resize_intent(
+        db,
+        name,
+        pid,
+        started,
+        ResizeTarget::Disks {
+            storage: storage_gb,
+            overlay: overlay_gb,
+        },
+    )?;
+    for (disk, id, target, bytes) in requested {
+        let reply = fork::control_socket_cmd_with_timeout(
+            &socket, &format!("GROW_DISK {id} {bytes}"), Duration::from_secs(120),
+        ).map_err(|error| Error::agent("live resize", format!(
+            "{id} growth outcome is unknown: {error}; reconcile or retry the same target, never shrink to roll back"
+        )))?;
+        if reply.trim() != format!("OK disk {id} capacity {bytes}") {
+            return Err(Error::agent(
+                "live resize",
+                format!("{id} growth not confirmed: {reply}"),
+            ));
+        }
+        db.update_vm(name, |record| match disk {
+            ManagedDisk::Storage => record.storage_gb = Some(target),
+            ManagedDisk::Overlay => record.overlay_gb = Some(target),
+        })?
+        .ok_or_else(|| Error::agent("live resize", "disk grew but machine record disappeared"))?;
+        client.grow_filesystem(disk, bytes).map_err(|error| Error::agent(
+            "live resize", format!("{id} disk is now {target} GiB; filesystem growth incomplete: {error}; retry the same target"),
+        ))?;
+    }
+    finish_resize_intent(db, name, &intent)?;
+    db.get_vm(name)?
+        .ok_or_else(|| Error::config("live resize", "machine record disappeared"))
+}
+
+/// Finish only an intent still belonging to this exact running VMM. The API
+/// caller also holds its lifecycle mutex; the flock protects against other
+/// processes and makes re-reading the intent and choosing its target atomic
+/// with respect to ordinary resize/branch/checkpoint operations.
+pub(crate) fn reconcile_pending(db: &SmolvmDb, name: &str) -> Result<Option<VmRecord>> {
+    let Some(_source_guard) = fork::try_lock_fork_source(name)? else {
+        return Ok(None);
+    };
+    let Some(intent) = db.pending_resize(name)? else {
+        return Ok(None);
+    };
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    if matches!(intent.target, ResizeTarget::Memory(_)) {
+        // A machine that is not running has no control socket to answer.
+        let info =
+            fork::control_socket_cmd(&fork::control_socket_path(name), "PROTOTYPE_MEMORY_INFO")
+                .ok()
+                .and_then(|reply| MemoryGrowthInfo::parse(&reply).ok());
+        if let Some(info) = info {
+            if clear_met_memory_intent(db, name, &intent, info.boot_mib)? {
+                return db.get_vm(name);
+            }
+        }
+    }
+    validate_intent_boot(&intent, host_boot_id()?.as_deref())?;
+    if !crate::process::is_our_process_strict(intent.pid, Some(intent.started)) {
+        return Err(Error::agent_conflict("recover resize", "original VMM is no longer running; refusing to apply its resize to another machine incarnation"));
+    }
+    let manager = AgentManager::for_vm(name)?;
+    if manager.pid_and_start_time() != Some((intent.pid, Some(intent.started))) {
+        return Err(Error::agent_conflict(
+            "recover resize",
+            "machine identity no longer matches pending resize",
+        ));
+    }
+    let record = match intent.target {
+        ResizeTarget::Cpus(target) => grow_cpus_locked(db, name, target)?,
+        ResizeTarget::Memory(target) => {
+            #[cfg(any(target_os = "linux", target_os = "macos"))]
+            {
+                grow_memory_locked(db, name, target)?
+            }
+            #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+            {
+                grow_memory(db, name, target)?
+            }
+        }
+        ResizeTarget::Disks { storage, overlay } => grow_disks_locked(db, name, storage, overlay)?,
+    };
+    Ok(Some(record))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn live_compute_platform_refusal_is_actionable() {
+        let result = ensure_live_compute_platform("CPU resize");
+        if cfg!(any(
+            all(target_os = "linux", target_arch = "x86_64"),
+            all(target_os = "macos", target_arch = "aarch64")
+        )) {
+            assert!(result.is_ok());
+        } else {
+            let error = result.unwrap_err().to_string();
+            assert!(error.contains("CPU resize"));
+            assert!(error.contains("Linux x86_64"));
+            assert!(error.contains("RAM and disk growth are supported separately"));
+        }
+    }
+
+    #[test]
+    fn growth_fits_an_unlimited_session_and_refuses_a_full_limit() {
+        use crate::process::HostMemoryStats;
+        const GIB: u64 = 1 << 30;
+        // a desktop session's cgroup has no limit: the host's headroom is the bound
+        let host = HostMemoryStats {
+            total_bytes: 58 * GIB,
+            available_bytes: 47 * GIB,
+        };
+        assert!(growth_fits(&host, 16 * GIB));
+        assert!(!growth_fits(&host, 45 * GIB), "the reserve stays free");
+        // a 20 GiB limit with 18 GiB in use leaves no room for 4 GiB more
+        let capped = HostMemoryStats {
+            total_bytes: 20 * GIB,
+            available_bytes: 2 * GIB,
+        };
+        assert!(!growth_fits(&capped, 4 * GIB));
+        assert!(growth_fits(&capped, 0), "nothing more asked: fits");
+    }
+
+    #[test]
+    fn live_memory_platform_accepts_linux_and_apple_silicon() {
+        let result = ensure_live_memory_platform();
+        if cfg!(all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        )) || cfg!(all(target_os = "macos", target_arch = "aarch64"))
+        {
+            assert!(result.is_ok());
+        } else {
+            assert!(result
+                .unwrap_err()
+                .to_string()
+                .contains("Linux x86_64 or aarch64"));
+        }
+    }
+
+    #[test]
+    fn replacement_requires_proof_the_previous_runtime_is_gone() {
+        let intent = ResizeIntent {
+            token: "old".into(),
+            pid: 123,
+            started: 45,
+            boot_id: Some("boot-1".into()),
+            target: ResizeTarget::Cpus(4),
+        };
+        assert!(!previous_runtime_gone(
+            &intent,
+            Some("boot-1"),
+            true,
+            Some(45)
+        ));
+        assert!(!previous_runtime_gone(&intent, Some("boot-1"), true, None));
+        assert!(!previous_runtime_gone(&intent, None, true, None));
+        assert!(previous_runtime_gone(&intent, Some("boot-1"), false, None));
+        assert!(previous_runtime_gone(
+            &intent,
+            Some("boot-1"),
+            true,
+            Some(46)
+        ));
+        assert!(previous_runtime_gone(
+            &intent,
+            Some("boot-2"),
+            true,
+            Some(45)
+        ));
+    }
+
+    #[test]
+    fn pending_resize_cannot_cross_host_boots_even_with_identical_pid_and_start() {
+        let mut intent = ResizeIntent {
+            token: "operation".into(),
+            pid: 42,
+            started: 100,
+            boot_id: Some("boot-a".into()),
+            target: ResizeTarget::Cpus(4),
+        };
+        validate_intent_boot(&intent, Some("boot-a")).unwrap();
+        assert!(validate_intent_boot(&intent, Some("boot-b")).is_err());
+        assert!(validate_intent_boot(&intent, None).is_err());
+        intent.boot_id = None;
+        assert!(validate_intent_boot(&intent, Some("boot-a")).is_err());
+        validate_intent_boot(&intent, None).unwrap();
+    }
+
+    #[test]
+    fn runtime_identity_rejects_restarts_pid_reuse_and_missing_identity() {
+        let expected = RuntimeIdentity {
+            pid: 42,
+            start_time: 100,
+            boot_id: None,
+        };
+        expected.validate(Some((42, Some(100)))).unwrap();
+        let boot_bound = RuntimeIdentity {
+            boot_id: Some("boot-a".into()),
+            ..expected.clone()
+        };
+        boot_bound.validate_boot(Some("boot-a")).unwrap();
+        assert!(boot_bound.validate_boot(Some("boot-b")).is_err());
+        assert!(boot_bound.validate_boot(None).is_err());
+        assert!(expected.validate_boot(Some("boot-a")).is_err());
+        for actual in [
+            None,
+            Some((42, None)),
+            Some((43, Some(100))),
+            Some((42, Some(101))),
+        ] {
+            assert!(expected.validate(actual).is_err(), "{actual:?}");
+        }
+        assert!(RuntimeIdentity {
+            pid: 0,
+            start_time: 100,
+            boot_id: None,
+        }
+        .validate(Some((0, Some(100))))
+        .is_err());
+    }
+
+    #[test]
+    fn memory_growth_targets_use_runtime_boot_layout_not_a_stale_record() {
+        let info = MemoryGrowthInfo::parse("OK boot_mib 1024 base 4831838208 mapped 268435456 plugged 134217728 capacity 68719476736\n").unwrap();
+        assert_eq!(info.target_added_mib(1280).unwrap(), 256);
+        assert_eq!(info.target_added_mib(1536).unwrap(), 512);
+        for invalid in [0, 1023, 1024, 1152, 1281, 100000] {
+            assert!(info.target_added_mib(invalid).is_err(), "{invalid}");
+        }
+        for invalid in [
+            "OK mapped 0 plugged 0",
+            "OK boot_mib 0 base 0 mapped 0 plugged 0 capacity 134217728",
+            "OK boot_mib 1024 base 1 mapped 0 plugged 0 capacity 134217728",
+            "OK boot_mib 1024 base 0 mapped 134217728 plugged 268435456 capacity 134217728",
+            "OK boot_mib 1024 base 0 mapped 268435456 plugged 0 capacity 134217728",
+            "OK boot_mib 1024 base 0 mapped 0 plugged 0 capacity 18446744073709551615",
+        ] {
+            assert!(MemoryGrowthInfo::parse(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
+    fn memory_growth_info_reports_whether_the_guest_took_the_device() {
+        let info = |tail: &str| {
+            MemoryGrowthInfo::parse(&format!(
+                "OK boot_mib 4096 base 5905580032 mapped 0 plugged 0 capacity 62277025792{tail}\n"
+            ))
+        };
+        assert_eq!(info("").unwrap().driver, None);
+        assert_eq!(info(" driver 1").unwrap().driver, Some(true));
+        assert_eq!(info(" driver 0").unwrap().driver, Some(false));
+        for invalid in [" driver 2", " driver", " driver 1 extra"] {
+            assert!(info(invalid).is_err(), "{invalid}");
+        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn a_memory_intent_is_cleared_once_a_new_runtime_booted_with_its_target() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("state.db")).unwrap();
+        db.insert_vm(
+            "vm",
+            &crate::config::VmRecord::new("vm".into(), 2, 6144, vec![], vec![], false),
+        )
+        .unwrap();
+        // A runtime that is gone, as after a restart.
+        let gone = 0x3fff_fff0;
+        assert!(!crate::process::is_alive(gone));
+        let intent = db
+            .begin_resize("vm", gone, 45, ResizeTarget::Memory(6144))
+            .unwrap();
+        assert!(!clear_met_memory_intent(&db, "vm", &intent, 4096).unwrap());
+        assert!(db.pending_resize("vm").unwrap().is_some());
+        assert!(clear_met_memory_intent(&db, "vm", &intent, 6144).unwrap());
+        assert!(db.pending_resize("vm").unwrap().is_none());
+
+        // The runtime that recorded it is still running: it may yet finish.
+        let me = std::process::id() as crate::process::Pid;
+        let started = crate::process::process_start_time(me).unwrap();
+        let live = db
+            .begin_resize("vm", me, started, ResizeTarget::Memory(6144))
+            .unwrap();
+        assert!(!clear_met_memory_intent(&db, "vm", &live, 8192).unwrap());
+        db.finish_resize("vm", &live).unwrap();
+
+        // Only RAM: a CPU target is not met by booting.
+        let cpus = db
+            .begin_resize("vm", gone, 45, ResizeTarget::Cpus(4))
+            .unwrap();
+        assert!(!clear_met_memory_intent(&db, "vm", &cpus, 8192).unwrap());
+    }
+
+    #[test]
+    fn cpu_status_requires_valid_created_and_capacity_counts() {
+        assert_eq!(cpu_status("OK created 4 capacity 16\n").unwrap(), (4, 16));
+        for reply in [
+            "OK created 0 capacity 16",
+            "OK created 17 capacity 16",
+            "OK created 4 capacity 256",
+            "OK created 4 capacity 16 extra",
+            "ERR EIO partial",
+        ] {
+            assert!(cpu_status(reply).is_err(), "{reply}");
+        }
+    }
+
+    #[test]
+    fn live_disk_targets_never_shrink_or_overflow() {
+        assert!(validate_growth(2, 1).is_err());
+        assert!(validate_growth(0, 0).is_err());
+        assert!(validate_growth(1, u64::MAX).is_err());
+        assert_eq!(validate_growth(2, 2).unwrap(), 2 << 30);
+        assert_eq!(validate_growth(2, 4).unwrap(), 4 << 30);
+    }
+}

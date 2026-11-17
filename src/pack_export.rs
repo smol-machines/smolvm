@@ -43,6 +43,18 @@ pub struct FromVmExportOptions {
     /// starts with those files. It lives on the storage disk, which container
     /// packs otherwise never carry, so without this a pack silently loses it.
     pub include_workspace: bool,
+    /// Resolver for the export helper's in-VM registry pull. `None` leaves the
+    /// helper on the launch default, which is the host's own resolver.
+    pub dns: Option<std::net::Ipv4Addr>,
+}
+
+/// The resolver a from-VM export helper should pull the base image with.
+///
+/// `pack create --dns` wins; otherwise the machine's own resolver is inherited,
+/// because the export re-pulls the base image in a fresh helper VM and a machine
+/// that needed a specific resolver to pull needs the same one to be packed.
+pub fn export_dns(flag: Option<std::net::Ipv4Addr>, vm: &VmRecord) -> Option<std::net::Ipv4Addr> {
+    flag.or(vm.dns)
 }
 
 /// What the export decided about the machine, for the caller's manifest.
@@ -91,6 +103,27 @@ pub fn export_overlay_owner(vm_name: &str, vm: &VmRecord) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageExportSource {
+    Artifact,
+    LocalArchiveOrDir,
+    StorageOrRegistry { rebase_from_registry: bool },
+}
+
+fn image_export_source(vm: &VmRecord, rebase_from_image: bool) -> Option<ImageExportSource> {
+    let image = vm.image.as_deref()?;
+    let is_local = crate::data::image_source::is_local_ref(image);
+    if vm.packed_layer_source().is_some() && (!rebase_from_image || is_local) {
+        return Some(ImageExportSource::Artifact);
+    }
+    if is_local && !vm.packed_image_on_storage {
+        return Some(ImageExportSource::LocalArchiveOrDir);
+    }
+    Some(ImageExportSource::StorageOrRegistry {
+        rebase_from_registry: rebase_from_image && !is_local,
+    })
+}
+
 /// Collect a stopped machine's pack assets into `collector` and report the
 /// pack mode. The caller has already: loaded the record, verified the machine
 /// is stopped, and collected its base assets (runtime libs, agent rootfs,
@@ -109,7 +142,6 @@ pub fn collect_from_vm_assets(
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
-    let is_artifact_sourced = is_image_based && vm.source_smolmachine.is_some();
 
     if !is_image_based && !overlay_disk.exists() {
         return Err(Error::agent(
@@ -127,81 +159,92 @@ pub fn collect_from_vm_assets(
     let mut image_env: Vec<String> = Vec::new();
     let mut image_user: Option<String> = None;
 
-    if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(
-            collector,
-            vm_name,
-            &overlay_owner,
-            &vm_dir,
-            staging_dir,
-            vm.source_smolmachine.as_deref(),
-            opts.include_workspace,
-        )?;
-    } else if is_image_based {
-        let image = vm.image.clone().unwrap();
-        // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
-        // dir) is flattened on boot and has no registry manifest, so the
-        // in-VM re-pull below cannot source it. Fail with a clear, actionable
-        // message instead of a confusing registry "UNAUTHORIZED" on
-        // `local:<hash>`.
-        if crate::data::image_source::is_local_ref(&image) {
-            // No registry manifest to re-pull, but the base rootfs is still
-            // reachable: an archive was flattened onto the machine's own storage
-            // disk at boot, and a rootfs dir is still the host directory the
-            // machine boots from. Either can be the lower layer.
+    match image_export_source(vm, opts.rebase_from_image) {
+        Some(ImageExportSource::Artifact) => {
+            if opts.rebase_from_image {
+                tracing::info!(
+                    image = %vm.image.as_deref().unwrap_or_default(),
+                    "local image has no registry base to rebase onto; packing from artifact"
+                );
+            }
+            export_flattened_from_artifact_sourced(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                staging_dir,
+                vm.source_smolmachine.as_deref(),
+                opts.include_workspace,
+            )?;
+        }
+        Some(ImageExportSource::LocalArchiveOrDir) => {
+            let image = vm.image.as_deref().unwrap();
             export_flattened_from_local_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                &image,
+                image,
                 opts.include_workspace,
             )?;
-        } else {
+        }
+        Some(ImageExportSource::StorageOrRegistry {
+            rebase_from_registry,
+        }) => {
+            let image = vm.image.as_deref().unwrap();
+            let mut effective_opts = opts.clone();
+            effective_opts.rebase_from_image = rebase_from_registry;
+            if opts.rebase_from_image && !rebase_from_registry {
+                tracing::info!(
+                    image = %image,
+                    "local image has no registry base to rebase onto; packing from storage"
+                );
+            }
             (image_env, image_user) = export_flattened_from_registry_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                &image,
-                opts,
+                image,
+                &effective_opts,
             )?;
         }
-    } else {
-        // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
-        // from the template; a default-size overlay is a qcow2 CoW image and
-        // must be flattened to a raw before it can be a template.
-        let overlay_for_pack = match overlay_fmt {
-            DiskFormat::Raw => overlay_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("overlay-flat.raw");
-                flatten_qcow2_to_raw(&overlay_disk, &flat)?;
-                flat
-            }
-        };
-        println!("Copying overlay disk ({})...", overlay_for_pack.display());
-        collector
-            .add_overlay_template(&overlay_for_pack)
-            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        None => {
+            // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
+            // from the template; a default-size overlay is a qcow2 CoW image and
+            // must be flattened to a raw before it can be a template.
+            let overlay_for_pack = match overlay_fmt {
+                DiskFormat::Raw => overlay_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = staging_dir.join("overlay-flat.raw");
+                    flatten_qcow2_to_raw(&overlay_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying overlay disk ({})...", overlay_for_pack.display());
+            collector
+                .add_overlay_template(&overlay_for_pack)
+                .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
 
-        if !storage_disk.exists() {
-            return Err(Error::agent(
-                "collect storage",
-                format!("storage disk not found at {}", storage_disk.display()),
-            ));
-        }
-        let storage_for_pack = match storage_fmt {
-            DiskFormat::Raw => storage_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("storage-flat.raw");
-                flatten_qcow2_to_raw(&storage_disk, &flat)?;
-                flat
+            if !storage_disk.exists() {
+                return Err(Error::agent(
+                    "collect storage",
+                    format!("storage disk not found at {}", storage_disk.display()),
+                ));
             }
-        };
-        println!("Copying storage disk ({})...", storage_for_pack.display());
-        collector
-            .add_vm_storage_template(&storage_for_pack)
-            .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+            let storage_for_pack = match storage_fmt {
+                DiskFormat::Raw => storage_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = staging_dir.join("storage-flat.raw");
+                    flatten_qcow2_to_raw(&storage_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying storage disk ({})...", storage_for_pack.display());
+            collector
+                .add_vm_storage_template(&storage_for_pack)
+                .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+        }
     }
 
     Ok(FromVmAssets {
@@ -228,7 +271,13 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     if let Some(ref image) = assets.image {
         manifest.image = image.clone();
     }
+    manifest.cpus = vm.cpus;
+    manifest.mem = vm.mem;
     manifest.network = vm.network;
+    manifest.block_private = vm.block_private.clone();
+    manifest.allowed_cidrs = vm.allowed_cidrs.clone();
+    manifest.dns_filter_hosts = vm.dns_filter_hosts.clone();
+    manifest.egress_rules = vm.egress_rules.clone();
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
     // Carry the record's (entrypoint, cmd) through as-is. An empty entrypoint
@@ -245,6 +294,142 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     // resolves it: the machine's own user wins, else the image's USER.
     manifest.user = vm.user.clone().or_else(|| assets.image_user.clone());
     manifest.secret_refs = vm.secret_refs.clone();
+}
+
+/// Validated outbound egress fields extracted from a [`PackManifest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedManifestEgress {
+    /// Private-range exceptions; `Some([])` blocks every private range.
+    pub block_private: Option<Vec<String>>,
+    /// Outbound CIDR allow-list carried with the pack.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Hostnames and patterns permitted by the guest DNS filter.
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Ordered outbound egress rules (`--deny-cidr` / `--allow-udp`).
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+}
+
+impl ValidatedManifestEgress {
+    /// Layer CLI policy over an artifact: replace an explicit allow list as a
+    /// unit, retain inherited restrictions, and put new denies before allows.
+    pub fn with_cli_overrides(
+        self,
+        allowed_cidrs: Option<Vec<String>>,
+        dns_filter_hosts: Option<Vec<String>>,
+        block_private: Option<Vec<String>>,
+        rules: Vec<smolvm_protocol::EgressRule>,
+    ) -> Self {
+        let replaces_allow_list = allowed_cidrs.is_some() || dns_filter_hosts.is_some();
+        let mut egress_rules: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.action == smolvm_protocol::RuleAction::Deny)
+            .cloned()
+            .collect();
+        egress_rules.extend(self.egress_rules);
+        egress_rules.extend(
+            rules
+                .into_iter()
+                .filter(|rule| rule.action != smolvm_protocol::RuleAction::Deny),
+        );
+        Self {
+            allowed_cidrs: if replaces_allow_list {
+                allowed_cidrs
+            } else {
+                self.allowed_cidrs
+            },
+            dns_filter_hosts: if replaces_allow_list {
+                dns_filter_hosts
+            } else {
+                self.dns_filter_hosts
+            },
+            block_private: block_private.or(self.block_private),
+            egress_rules,
+        }
+    }
+}
+
+/// Validate and normalize the outbound egress policy carried by an untrusted
+/// [`PackManifest`], holding its CIDRs, host patterns, and egress rules to the
+/// same rules `machine create` enforces.
+pub fn validated_manifest_egress(
+    manifest: &PackManifest,
+) -> crate::Result<ValidatedManifestEgress> {
+    let block_private = manifest
+        .block_private
+        .as_ref()
+        .map(|cidrs| {
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed block_private", reason))
+        })
+        .transpose()?;
+    let allowed_cidrs = match &manifest.allowed_cidrs {
+        Some(cidrs) => Some(
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed allowed_cidrs", reason))?,
+        ),
+        None => None,
+    };
+    let dns_filter_hosts = match &manifest.dns_filter_hosts {
+        Some(hosts) => Some(
+            hosts
+                .iter()
+                .map(|entry| validate_packed_host_entry(entry))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed dns_filter_hosts", reason))?,
+        ),
+        None => None,
+    };
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&manifest.egress_rules)
+        .map_err(|reason| crate::Error::config("packed egress_rules", reason))?;
+    let egress_rules = manifest
+        .egress_rules
+        .iter()
+        .map(|rule| {
+            let cidr = rule
+                .cidr
+                .as_deref()
+                .map(crate::smolfile::parse_cidr)
+                .transpose()
+                .map_err(|reason| crate::Error::config("packed egress_rules", reason))?;
+            Ok(smolvm_protocol::EgressRule {
+                transport: rule.transport,
+                cidr,
+                ports: rule.ports,
+                action: rule.action,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(ValidatedManifestEgress {
+        block_private,
+        allowed_cidrs,
+        dns_filter_hosts,
+        egress_rules,
+    })
+}
+
+fn validate_packed_host_entry(entry: &str) -> std::result::Result<String, String> {
+    match entry.strip_prefix('=') {
+        Some(exact) if !exact.starts_with("*.") => {
+            smolvm_protocol::host_pattern::encode_strict(exact)
+        }
+        Some(_) => Err(format!(
+            "invalid host pattern {entry:?}: use an exact DNS hostname or *.domain"
+        )),
+        None => smolvm_protocol::host_pattern::encode_strict(entry).map(|encoded| {
+            if entry.starts_with("*.") {
+                encoded
+            } else {
+                entry.trim_end_matches('.').to_ascii_lowercase()
+            }
+        }),
+    }
 }
 
 /// Layer a machine's own env over the image's declared env, as `KEY=VALUE`.
@@ -280,11 +465,112 @@ const EXPORT_HELPER_MIN_STORAGE_GIB: u64 = 64;
 /// extracted layers plus the flattened output built alongside them.
 const EXPORT_HELPER_STORAGE_FACTOR: u64 = 3;
 
+/// Overrides the helper's storage disk, in GiB, for an export the heuristic
+/// below sizes too small. The disk is sparse, so a generous value costs
+/// nothing on the host until it is written.
+const EXPORT_HELPER_STORAGE_ENV: &str = "SMOLVM_EXPORT_HELPER_STORAGE_GIB";
+
+/// Overrides the helper's memory, in MiB.
+const EXPORT_HELPER_MEMORY_ENV: &str = "SMOLVM_EXPORT_HELPER_MEMORY_MIB";
+
+/// What the helper asks for when the host has the memory to spare. Flattening
+/// streams its output to the host rather than buffering it, so this is page
+/// cache and mount bookkeeping, not a working set — and a helper that asks for
+/// more than a laptop or CI runner can seat fails the export outright, which
+/// is worse than running it with a smaller page cache.
+const EXPORT_HELPER_MEMORY_MIB: u64 = 4096;
+
+/// Floor for the helper's memory: below this the guest cannot mount the
+/// overlay and tar the merged tree.
+const EXPORT_HELPER_MIN_MEMORY_MIB: u64 = 1024;
+
+/// How large the export helper's storage disk should be.
+///
+/// The helper holds the image's layers plus the flattened output, so the size
+/// has to follow the image, not the one-size-fits-all default a fresh machine
+/// gets. Neither input alone describes it: a machine that pulled its image
+/// carries it on its own disk (`source_apparent_gib`), while one created from
+/// an artifact carries it in the host layer directory the helper mounts
+/// (`packed_layers_gib`) and can have a small disk of its own. Take whichever
+/// is larger, and keep a floor for machines whose disks are both small.
+/// How much memory the export helper's VM should have.
+///
+/// A fixed 8 GiB is more than a small host has to spare, and a helper that
+/// cannot be admitted fails as a bare readiness timeout naming neither the
+/// memory it asked for nor a way to lower it. Ask for less than the host has
+/// free instead: the helper streams its output, so a smaller VM makes an
+/// export slower, not impossible.
+fn export_helper_memory_mib() -> u32 {
+    let mib = parse_helper_override(std::env::var(EXPORT_HELPER_MEMORY_ENV).ok().as_deref())
+        .unwrap_or_else(|| helper_memory_for(host_available_memory_mib()));
+    mib.try_into().unwrap_or(u32::MAX)
+}
+
+/// The policy above, separated from the host state it reads, so the whole
+/// table can be asserted without a particular machine.
+fn helper_memory_for(available_mib: Option<u64>) -> u64 {
+    let Some(available_mib) = available_mib else {
+        return EXPORT_HELPER_MEMORY_MIB;
+    };
+    // Leave the host at least as much as the helper takes: an export runs
+    // beside whatever asked for it.
+    EXPORT_HELPER_MEMORY_MIB
+        .min(available_mib / 2)
+        .max(EXPORT_HELPER_MIN_MEMORY_MIB)
+}
+
+/// Memory the host can spare right now, in MiB, where that can be read.
+fn host_available_memory_mib() -> Option<u64> {
+    crate::process::host_memory_stats().map(|stats| stats.available_bytes / (1024 * 1024))
+}
+
+fn export_helper_storage_gib(source_apparent_gib: u64, packed_layers_gib: u64) -> u64 {
+    parse_helper_override(std::env::var(EXPORT_HELPER_STORAGE_ENV).ok().as_deref())
+        .unwrap_or_else(|| helper_storage_for(source_apparent_gib, packed_layers_gib))
+}
+
+/// The policy above, separated from the environment it reads, so the whole
+/// table can be asserted without mutating process-global state (which races
+/// with every other test in the binary).
+fn helper_storage_for(source_apparent_gib: u64, packed_layers_gib: u64) -> u64 {
+    source_apparent_gib
+        .max(packed_layers_gib)
+        .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
+        .max(EXPORT_HELPER_MIN_STORAGE_GIB)
+}
+
+/// A usable [`EXPORT_HELPER_STORAGE_ENV`] value. Anything unparsable or zero
+/// is ignored rather than failing the export: the heuristic still produces a
+/// working disk, and refusing to run would be a worse answer than a typo.
+fn parse_helper_override(value: Option<&str>) -> Option<u64> {
+    value?.trim().parse::<u64>().ok().filter(|gib| *gib > 0)
+}
+
+/// Apparent bytes held under `dir`, used to size a helper or pack VM disk for
+/// an image that lives here on the host rather than on a machine's disk.
+/// Unreadable entries are skipped: this only feeds a disk-size heuristic.
+pub fn directory_apparent_bytes(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .flatten()
+        .map(|entry| match entry.file_type() {
+            Ok(kind) if kind.is_dir() => directory_apparent_bytes(&entry.path()),
+            Ok(kind) if kind.is_file() => entry.metadata().map(|m| m.len()).unwrap_or(0),
+            _ => 0,
+        })
+        .sum()
+}
+
 /// A helper VM used to read the source machine's disks and flatten layers.
 /// Stops the VM and removes its scratch data dir on drop.
 struct ExportVm {
     manager: AgentManager,
     data_dir: PathBuf,
+    /// Size of the disk the helper writes the image and flattened output to,
+    /// so a failure that fills it can say so.
+    storage_gib: u64,
 }
 
 impl ExportVm {
@@ -296,6 +582,7 @@ impl ExportVm {
         source_vm_dir: &Path,
         packed_layers_dir: Option<PathBuf>,
         network: bool,
+        dns: Option<std::net::Ipv4Addr>,
     ) -> crate::Result<Self> {
         let (storage_disk, storage_fmt) = resolve_disk_image(source_vm_dir, STORAGE_DISK_FILENAME);
         // A machine that has never been started has no disks yet — attaching
@@ -305,9 +592,12 @@ impl ExportVm {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
-                    "machine '{vm_name}' has no storage disk yet ({}) — it has \
-                     never been started. Start it once so its state exists, or \
-                     pack the image directly with `pack create -I <image>`.",
+                    "machine '{vm_name}' has no storage disk yet ({}): it has \
+                     never been started. Start it once so its state exists, stop \
+                     it, and pack it again:\
+                     \n\n  smolvm machine start --name {vm_name}\
+                     \n  smolvm machine stop --name {vm_name}\
+                     \n\nOr pack the image it was created from directly with `pack create -I <image>`.",
                     storage_disk.display()
                 ),
             ));
@@ -334,13 +624,16 @@ impl ExportVm {
         let source_apparent_gib = disk_virtual_size(&storage_disk, storage_fmt)
             .map(|bytes| bytes.div_ceil(1024 * 1024 * 1024))
             .unwrap_or(0);
-        let helper_storage_gib = source_apparent_gib
-            .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
-            .max(EXPORT_HELPER_MIN_STORAGE_GIB);
+        let packed_layers_gib = packed_layers_dir
+            .as_deref()
+            .map(|dir| directory_apparent_bytes(dir).div_ceil(1024 * 1024 * 1024))
+            .unwrap_or(0);
+        let helper_storage_gib = export_helper_storage_gib(source_apparent_gib, packed_layers_gib);
         tracing::debug!(
             source_apparent_gib,
+            packed_layers_gib,
             helper_storage_gib,
-            "sizing the export helper's disk from the source machine"
+            "sizing the export helper's disk"
         );
 
         println!("Starting agent VM to export machine state...");
@@ -376,15 +669,18 @@ impl ExportVm {
                 return Err(error);
             }
         };
+        let helper_memory_mib = export_helper_memory_mib();
         if let Err(e) = manager.start_with_full_config(
             Vec::new(),
             Vec::new(),
             VmResources {
                 cpus: 4,
-                memory_mib: 8192,
+                memory_mib: helper_memory_mib,
                 network,
                 network_backend: None,
-                dns: None,
+                dns,
+                dns_options: Vec::new(),
+                shm_size: None,
                 gpu: false,
                 cuda: false,
                 gpu_vram_mib: None,
@@ -393,21 +689,62 @@ impl ExportVm {
                 storage_gib: Some(helper_storage_gib),
                 overlay_gib: None,
                 block_io: Default::default(),
+                disk_durability: Default::default(),
+                disks: Vec::new(),
+                cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 allowed_cidrs: None,
+                egress_rules: Vec::new(),
                 network_name: None,
+                guest_subnet: None,
+                switch: None,
             },
             features,
         ) {
             // The Drop cleanup only arms once Self exists — a failed boot must
             // clean its own scratch dir or every failed export leaks one.
             let _ = std::fs::remove_dir_all(&data_dir);
-            return Err(e);
+            // A host that cannot seat the helper reports only that the agent
+            // never became ready, which names neither what was asked for nor
+            // the knobs that lower it.
+            return Err(Error::agent(
+                "pack from VM",
+                format!(
+                    "{e}. The export helper asked for {} MiB of memory and a {} GiB disk. If this host cannot seat that, set {}=<MiB> and/or {}=<GiB> and retry.",
+                    helper_memory_mib,
+                    helper_storage_gib,
+                    EXPORT_HELPER_MEMORY_ENV,
+                    EXPORT_HELPER_STORAGE_ENV,
+                ),
+            ));
         }
-        Ok(Self { manager, data_dir })
+        Ok(Self {
+            manager,
+            data_dir,
+            storage_gib: helper_storage_gib,
+        })
     }
 
     fn connect(&self) -> crate::Result<AgentClient> {
         self.manager.connect()
+    }
+
+    /// Name the disk that filled. The guest reports a full disk as a writeback
+    /// EIO, which on its own says neither which disk ran out nor how to give
+    /// the helper a bigger one — the export's user has no way to see either.
+    fn explain_storage_exhaustion(&self, error: crate::Error) -> crate::Error {
+        let message = error.to_string();
+        if !message.contains("out of space") && !message.contains("No space left") {
+            return error;
+        }
+        Error::agent(
+            "pack from VM",
+            format!(
+                "{message}. The export helper's {} GiB disk filled while it held the image. Set {}=<GiB> to give it a larger one; the disk is sparse, so a generous                  value costs nothing on the host until it is written.",
+                self.storage_gib, EXPORT_HELPER_STORAGE_ENV
+            ),
+        )
     }
 
     /// Mount the source machine's storage disk at `/mnt/source-storage`.
@@ -635,8 +972,23 @@ fn reap_stale_export_scratch_in(root: &Path) {
         let helper_pid = std::fs::read_to_string(dir.join("agent.pid"))
             .ok()
             .and_then(|text| text.lines().next()?.trim().parse().ok());
-        if !helper_pid.is_some_and(process_definitely_gone) {
-            continue;
+        match helper_pid {
+            Some(helper) if process_definitely_gone(helper) => {}
+            // Its creator is gone and nothing else uses an export helper, so
+            // one still running was orphaned when the creator died and keeps
+            // its RAM until stopped here.
+            Some(helper) if helper_runs_from(helper, &dir) => {
+                warn!(path = %dir.display(), helper, "stopping an export helper whose creator is gone");
+                unsafe { libc::kill(helper, libc::SIGKILL) };
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                while !process_definitely_gone(helper) && std::time::Instant::now() < deadline {
+                    std::thread::sleep(std::time::Duration::from_millis(50));
+                }
+                if !process_definitely_gone(helper) {
+                    continue;
+                }
+            }
+            _ => continue,
         }
         match std::fs::remove_dir_all(&dir) {
             Ok(()) => tracing::debug!(
@@ -649,6 +1001,19 @@ fn reap_stale_export_scratch_in(root: &Path) {
             ),
         }
     }
+}
+
+/// Whether `pid` is a VM booted from the scratch directory `dir`: its command
+/// line names a file under it, so a recycled pid is never mistaken for one.
+#[cfg(unix)]
+fn helper_runs_from(pid: crate::process::Pid, dir: &Path) -> bool {
+    let Ok(cmdline) = std::fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let dir = dir.to_string_lossy();
+    cmdline
+        .split(|byte| *byte == 0)
+        .any(|arg| String::from_utf8_lossy(arg).starts_with(&format!("{dir}/")))
 }
 
 // Retain scratch until equivalent nonblocking launch-lock checks are available.
@@ -681,19 +1046,29 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<(Vec<String>, Option<String>)> {
-    let export_vm = ExportVm::start(vm_name, vm_dir, None, opts.rebase_from_image)?;
+    let rebase_from_registry =
+        opts.rebase_from_image && !crate::data::image_source::is_local_ref(image);
+    if opts.rebase_from_image && !rebase_from_registry {
+        tracing::info!(
+            image = %image,
+            "local image has no registry base to rebase onto; packing from storage"
+        );
+    }
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, rebase_from_registry, opts.dns)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
-    let image_info = if opts.rebase_from_image {
+    let image_info = if rebase_from_registry {
         eprintln!("Pulling {} in export VM...", image);
-        client.pull_with_registry_config_and_progress(
-            image,
-            None,
-            opts.proxy.as_deref(),
-            opts.no_proxy.as_deref(),
-            |_, _, _| {},
-        )?
+        client
+            .pull_with_registry_config_and_progress(
+                image,
+                None,
+                opts.proxy.as_deref(),
+                opts.no_proxy.as_deref(),
+                |_, _, _| {},
+            )
+            .map_err(|error| export_vm.explain_storage_exhaustion(error))?
     } else {
         cached_export_image(&mut client, vm_name, image)?
     };
@@ -752,6 +1127,155 @@ mod cached_export_tests {
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
     use std::io::{Read, Write};
+
+    #[test]
+    fn cached_layer_order_excludes_workspace_and_unfinished_extractions() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::create_dir_all(layers.join("unfinished.partial")).unwrap();
+        std::fs::write(layers.join("workspace-seed/workspace.tar"), "workspace").unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("image.tar"), "image").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/image.tar".into()])
+        );
+    }
+
+    #[test]
+    fn cached_layer_order_preserves_manifest_order_and_requires_all_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::write(layers.join("zzz.tar"), "base").unwrap();
+        std::fs::create_dir(layers.join("aaa")).unwrap();
+        // Never guess alphabetical order for a multi-layer image.
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("layer-order"), "zzz\naaa\n").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/zzz.tar".into(), "layers/aaa".into()])
+        );
+        std::fs::remove_file(layers.join("zzz.tar")).unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+    }
+
+    #[test]
+    fn cached_layer_order_rejects_metadata_and_unsafe_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        for id in [
+            "workspace-seed",
+            "..",
+            "../layers/workspace-seed",
+            "evil'command",
+            "unfinished.partial",
+        ] {
+            std::fs::write(layers.join("layer-order"), id).unwrap();
+            assert_eq!(ordered_cached_layer_ids(temp.path()), None, "{id}");
+        }
+    }
+    /// An export helper whose creator died is stopped and its scratch removed;
+    /// a live process that was not booted from the scratch is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_orphaned_export_helper_is_stopped_and_its_scratch_removed() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        // Above any pid_max, so no live process can hold it while tests run in
+        // parallel and recycle pids.
+        let gone: u32 = 2_147_483_000;
+        let scratch = |dir: &std::path::Path, helper: u32| {
+            std::fs::create_dir_all(dir).unwrap();
+            let name = format!("pack-fromvm-{gone}-1");
+            std::fs::write(dir.join("name"), &name).unwrap();
+            std::fs::write(dir.join(super::EXPORT_SCRATCH_MARKER), &name).unwrap();
+            std::fs::write(dir.join("vm.lock"), b"").unwrap();
+            std::fs::write(dir.join("agent.pid"), helper.to_string()).unwrap();
+        };
+
+        let orphan_dir = root.path().join("orphan");
+        // Like a real orphan, the helper is not this process's child: its
+        // creator is gone. Once killed it is a zombie until whoever adopted it
+        // reaps it, and the reaper waits only 5 s for it to go, so this test
+        // process adopts it (it runs alone, so no other test's children are
+        // affected) and reaps exactly it below, instead of relying on an
+        // ancestor that may not reap in time.
+        // SAFETY: prctl with integer arguments.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
+        let launched = std::process::Command::new("sh")
+            .args([
+                "-c",
+                // A loop, so the shell never execs away and its command line
+                // keeps naming the scratch directory.
+                "sh -c 'while :; do sleep 1; done' \"$0\" </dev/null >/dev/null 2>&1 & echo $!",
+                &format!("{}/boot-config.json", orphan_dir.display()),
+            ])
+            .output()
+            .unwrap();
+        let helper: u32 = String::from_utf8_lossy(&launched.stdout)
+            .trim()
+            .parse()
+            .unwrap();
+        scratch(&orphan_dir, helper);
+        let reaper = std::thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: waits for one pid this process adopted.
+            unsafe { libc::waitpid(helper as libc::pid_t, &mut status, 0) };
+        });
+
+        let other_dir = root.path().join("other");
+        let mut unrelated = std::process::Command::new("sleep")
+            .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        scratch(&other_dir, unrelated.id());
+
+        super::reap_stale_export_scratch_in(root.path());
+
+        assert!(
+            !orphan_dir.exists(),
+            "the orphaned helper's scratch is removed"
+        );
+        reaper.join().unwrap();
+        assert!(
+            !std::path::Path::new(&format!("/proc/{helper}")).exists(),
+            "the orphaned helper is stopped"
+        );
+        assert!(
+            other_dir.exists(),
+            "scratch whose recorded pid is someone else's is kept"
+        );
+        assert!(
+            unrelated.try_wait().unwrap().is_none(),
+            "an unrelated process is never killed"
+        );
+        unrelated.kill().unwrap();
+        unrelated.wait().unwrap();
+    }
+
+    /// A never-started machine is refused before any helper boots, naming the
+    /// start that creates its disk and the stop the export needs after it.
+    #[test]
+    fn never_started_machine_hint_names_the_start_and_the_stop() {
+        let vm_dir = tempfile::tempdir().unwrap();
+        let Some(error) = ExportVm::start("x", vm_dir.path(), None, false, None).err() else {
+            panic!("a machine without a storage disk must be refused");
+        };
+        let message = error.to_string();
+        let start = message.find("smolvm machine start --name x");
+        let stop = message.find("smolvm machine stop --name x");
+        assert!(start.is_some() && start < stop, "{message}");
+    }
 
     fn exercise(
         mount_code: i32,
@@ -912,7 +1436,9 @@ fn export_flattened_from_local_image(
         }
     }
 
-    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false)?;
+    // No network: this helper stages layers already on the host, so it never
+    // resolves a name and needs no resolver.
+    let export_vm = ExportVm::start(vm_name, vm_dir, host_dir.clone(), false, None)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -1044,8 +1570,8 @@ fn export_flattened_from_artifact_sourced(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}) and could not be rebuilt: \
-                 the source artifact ({}) is not available. Restore the source \
+                 imported layer cache is incomplete or has no usable layer order ({}) \
+                 and could not be rebuilt from the source artifact ({}). Restore the source \
                  .smolmachine at that path, or start the machine once to \
                  re-extract, then re-run the export.",
                 pack_content_dir.display(),
@@ -1054,7 +1580,8 @@ fn export_flattened_from_artifact_sourced(
         )
     })?;
 
-    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir.clone()), false)?;
+    // No network, as above: the layers are staged from the host's own pack dir.
+    let export_vm = ExportVm::start(vm_name, vm_dir, Some(pack_content_dir.clone()), false, None)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
@@ -1114,8 +1641,18 @@ fn export_flattened_from_artifact_sourced(
 /// when the cache (or its ordering) is gone.
 fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
-    let order_path = layers_dir.join("layer-order");
     let cached_form = |id: &str| -> Option<String> {
+        // Workspace seeds and interrupted extraction directories are metadata,
+        // not image layers; IDs also enter a guest shell command below.
+        if id.is_empty()
+            || matches!(id, "." | ".." | "workspace-seed")
+            || smolvm_pack::extract::is_partial_dir_name(id)
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return None;
+        }
         if layers_dir.join(id).is_dir() {
             Some(format!("layers/{}", id))
         } else if layers_dir.join(format!("{id}.tar")).is_file() {
@@ -1124,7 +1661,8 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
             None
         }
     };
-    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+    let order = cached_layer_order(pack_content_dir);
+    if let Some(contents) = order {
         let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
@@ -1148,6 +1686,22 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
         return None;
     }
     Some(entries)
+}
+
+fn cached_layer_order(pack_content_dir: &Path) -> Option<String> {
+    if let Ok(order) = std::fs::read_to_string(pack_content_dir.join("layers/layer-order")) {
+        return Some(order);
+    }
+    // Older macOS caches recorded order only on their case-sensitive volume.
+    // Lease it while reading the index, then export the retained original tars
+    // from the pack root; the helper's shared-cache mount contract is unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let lease = smolvm_pack::extract::acquire_layers_lease(pack_content_dir, false).ok()?;
+        std::fs::read_to_string(lease.path.join("layer-order")).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source
@@ -1286,13 +1840,24 @@ fn export_workspace_seed(
     Ok(())
 }
 
+/// Flatten a qcow2 disk (and its backing chain) into a sparse raw image on
+/// the host. Only the ranges the chain holds are read and only non-zero data
+/// is written, so a mostly empty 20 GiB disk costs its data, not its size.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()> {
+    println!("Flattening qcow2 overlay to raw...");
+    crate::agent::fork::flatten_to_raw(qcow2_path, dest_raw)
+}
+
 /// Flatten a qcow2 CoW overlay into a standalone raw disk image (bare VMs).
 ///
-/// There is no host-side qcow2 reader (smolvm deliberately takes no qemu-img
-/// dependency), so the conversion runs inside a throwaway agent VM: the source
+/// Elsewhere than Linux and macOS there is no host-side flatten (smolvm
+/// deliberately takes no qemu-img dependency), so the conversion runs inside
+/// a throwaway agent VM: the source
 /// qcow2 is attached read-only (libkrun resolves its backing chain) as
 /// `/dev/vdc` alongside a fresh raw output as `/dev/vdd`, and the guest `dd`s
 /// one into the other.
+#[cfg(not(any(target_os = "linux", target_os = "macos")))]
 fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()> {
     let virtual_size = read_qcow2_virtual_size(qcow2_path)?;
     let dest = std::fs::OpenOptions::new()
@@ -1329,9 +1894,14 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
         VmResources {
             cpus: 2,
             memory_mib: 2048,
+            // No network: this helper only rewrites a disk image, so it has no
+            // resolver to configure.
             network: false,
             network_backend: None,
+            switch: None,
             dns: None,
+            dns_options: Vec::new(),
+            shm_size: None,
             gpu: false,
             cuda: false,
             gpu_vram_mib: None,
@@ -1340,8 +1910,15 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             storage_gib: None,
             overlay_gib: None,
             block_io: Default::default(),
+            disk_durability: Default::default(),
+            disks: Vec::new(),
+            cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             network_name: None,
+            guest_subnet: None,
         },
         features,
     )?;
@@ -1424,6 +2001,7 @@ mod env_merge_tests {
             "darwin/arm64".to_string(),
         );
         seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!((manifest.cpus, manifest.mem), (1, 512));
         assert_eq!(manifest.user.as_deref(), Some("nginx"));
 
         vm.user = Some("501:20".to_string());
@@ -1483,12 +2061,39 @@ mod env_merge_tests {
 
 #[cfg(test)]
 mod from_vm_manifest_tests {
-    use super::{export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
+    use super::{
+        export_dns, export_overlay_owner, image_export_source, seed_manifest_from_vm,
+        validated_manifest_egress, FromVmAssets, ImageExportSource, ValidatedManifestEgress,
+    };
     use crate::config::VmRecord;
     use smolvm_pack::{PackManifest, PackMode};
 
     fn record(name: &str) -> VmRecord {
         VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false)
+    }
+
+    // Issue #1191: `pack create` had no --dns at all and the export helper was
+    // built with dns: None, so a machine that could only pull through a specific
+    // resolver could be created but never packed. The helper re-pulls the base
+    // image, so it needs the same resolver the machine needed.
+    #[test]
+    fn a_from_vm_export_inherits_the_machine_resolver_unless_the_flag_overrides_it() {
+        let mut vm = record("packme");
+        vm.dns = Some(std::net::Ipv4Addr::new(192, 168, 5, 2));
+
+        assert_eq!(
+            export_dns(None, &vm),
+            Some(std::net::Ipv4Addr::new(192, 168, 5, 2))
+        );
+        assert_eq!(
+            export_dns(Some(std::net::Ipv4Addr::new(9, 9, 9, 9)), &vm),
+            Some(std::net::Ipv4Addr::new(9, 9, 9, 9))
+        );
+
+        // A machine with no resolver of its own leaves the helper on the launch
+        // default, which is now the host's resolver rather than 1.1.1.1.
+        let plain = record("plain");
+        assert_eq!(export_dns(None, &plain), None);
     }
 
     fn assets() -> FromVmAssets {
@@ -1565,6 +2170,71 @@ mod from_vm_manifest_tests {
         assert_eq!(m.cmd, vec!["--port", "8080"]);
     }
 
+    /// Issue #1989: packing a networked machine that was scoped with
+    /// `--allow-host`, `--allow-cidr`, or `--deny-cidr` must carry that egress
+    /// policy into the manifest instead of leaving `manifest.network = true`
+    /// with no rules (which silently widened the packed machine to open internet).
+    #[test]
+    fn seed_manifest_from_vm_preserves_egress_allow_list_and_rules() {
+        let mut rec = record("scoped");
+        rec.network = true;
+        rec.block_private = Some(vec![]);
+        rec.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        rec.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "=exact.example.com".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
+        rec.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+
+        let mut m = manifest();
+        seed_manifest_from_vm(&mut m, &rec, &assets());
+
+        assert!(m.network);
+        assert_eq!(m.allowed_cidrs, rec.allowed_cidrs);
+        assert_eq!(m.dns_filter_hosts, rec.dns_filter_hosts);
+        assert_eq!(m.egress_rules, rec.egress_rules);
+        assert_eq!(
+            validated_manifest_egress(&m).unwrap(),
+            ValidatedManifestEgress {
+                block_private: rec.block_private,
+                allowed_cidrs: rec.allowed_cidrs,
+                dns_filter_hosts: rec.dns_filter_hosts,
+                egress_rules: rec.egress_rules,
+            }
+        );
+    }
+
+    #[test]
+    fn validated_manifest_egress_rejects_malformed_cidrs_hosts_and_rules() {
+        let mut bad_cidr = manifest();
+        bad_cidr.allowed_cidrs = Some(vec!["not-a-cidr".to_string()]);
+        assert!(validated_manifest_egress(&bad_cidr).is_err());
+
+        for bad_host in ["", "*", "https://pypi.org", "1.2.3.4", "=*.pypi.org"] {
+            let mut bad = manifest();
+            bad.dns_filter_hosts = Some(vec![bad_host.to_string()]);
+            assert!(
+                validated_manifest_egress(&bad).is_err(),
+                "{bad_host:?} must be rejected"
+            );
+        }
+
+        let mut bad_rule = manifest();
+        bad_rule.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("not-a-cidr".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+        assert!(validated_manifest_egress(&bad_rule).is_err());
+    }
+
     /// A branched or checkpoint-restored machine keeps writing to its source's
     /// overlay. Export used to look up `persistent-<own-name>`, found nothing,
     /// and flattened an empty overlay, silently dropping every exec-made change.
@@ -1587,257 +2257,118 @@ mod from_vm_manifest_tests {
         clone.fork_overlay_owner = Some("shared-owner".to_string());
         assert_eq!(export_overlay_owner("clone", &clone), "shared-owner");
     }
+
+    /// A pack prepared on the machine's storage disk keeps its source image's
+    /// `local:` reference, but stores its layers in `/storage/layers` +
+    /// `/storage/manifests` rather than `/storage/image-archives`.
+    #[test]
+    fn a_local_image_on_storage_exports_from_storage_not_archive() {
+        let mut rec = record("m");
+        rec.image = Some("local:abc123".to_string());
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::LocalArchiveOrDir)
+        );
+
+        rec.source_smolmachine = Some("/tmp/source.smolmachine".to_string());
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::Artifact)
+        );
+        assert_eq!(
+            image_export_source(&rec, true),
+            Some(ImageExportSource::Artifact)
+        );
+
+        rec.packed_image_on_storage = true;
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::StorageOrRegistry {
+                rebase_from_registry: false
+            })
+        );
+        assert_eq!(
+            image_export_source(&rec, true),
+            Some(ImageExportSource::StorageOrRegistry {
+                rebase_from_registry: false
+            })
+        );
+    }
 }
 
 #[cfg(test)]
 mod export_helper_sizing_tests {
-    use super::{EXPORT_HELPER_MIN_STORAGE_GIB, EXPORT_HELPER_STORAGE_FACTOR};
-
-    /// Mirrors the sizing done in `ExportVm::start`, so the policy is asserted
-    /// without booting a VM.
-    fn helper_storage_gib(source_apparent_gib: u64) -> u64 {
-        source_apparent_gib
-            .saturating_mul(EXPORT_HELPER_STORAGE_FACTOR)
-            .max(EXPORT_HELPER_MIN_STORAGE_GIB)
-    }
+    use super::{
+        export_helper_storage_gib, helper_memory_for, helper_storage_for, parse_helper_override,
+        EXPORT_HELPER_MEMORY_MIB, EXPORT_HELPER_MIN_MEMORY_MIB, EXPORT_HELPER_MIN_STORAGE_GIB,
+    };
 
     #[test]
     fn a_big_machine_gets_a_helper_disk_bigger_than_itself() {
-        // The export failure that prompted this: a machine holding ~13 GiB on a
-        // 50 GiB disk. The helper used to get the fixed default and filled up
-        // mid-pull, dying as a bare "connection closed".
-        assert!(
-            helper_storage_gib(50) > 50,
-            "the helper must outsize its source"
-        );
-        assert_eq!(helper_storage_gib(50), 150);
-        // Room for the extracted layers AND the flattened copy built beside them.
-        assert_eq!(helper_storage_gib(100), 300);
+        // The export failure that prompted the sizing: a machine holding
+        // ~13 GiB on a 50 GiB disk, whose helper used to get the fixed default
+        // and filled up mid-pull.
+        assert!(helper_storage_for(50, 0) > 50);
+        assert_eq!(helper_storage_for(50, 0), 150);
+        assert_eq!(helper_storage_for(100, 0), 300);
     }
 
     #[test]
-    fn a_small_or_unreadable_source_still_gets_a_workable_floor() {
-        // A default-sized machine, and the `metadata()` failure path that
-        // reports 0 — neither may produce a helper too small to pull into.
-        assert_eq!(helper_storage_gib(20), EXPORT_HELPER_MIN_STORAGE_GIB);
-        assert_eq!(helper_storage_gib(0), EXPORT_HELPER_MIN_STORAGE_GIB);
-        // The floor has to clear a realistic image pull, not merely be non-zero.
-        assert!(helper_storage_gib(0) >= 64);
+    fn a_small_machine_still_gets_the_floor() {
+        assert_eq!(helper_storage_for(0, 0), EXPORT_HELPER_MIN_STORAGE_GIB);
+        assert_eq!(helper_storage_for(1, 0), EXPORT_HELPER_MIN_STORAGE_GIB);
+    }
+
+    /// A machine created from an artifact keeps its image in the host layer
+    /// directory, not on its own disk, so its disk says nothing about how much
+    /// the helper has to hold. Sizing from the disk alone is what left a small
+    /// machine carrying a large image with a helper that could not fit it.
+    #[test]
+    fn a_small_machine_with_large_packed_layers_is_sized_from_the_layers() {
+        assert_eq!(helper_storage_for(10, 60), 180);
+        assert_eq!(helper_storage_for(60, 10), 180);
     }
 
     #[test]
-    fn an_absurd_source_size_cannot_overflow_the_multiply() {
-        assert_eq!(helper_storage_gib(u64::MAX), u64::MAX);
-    }
-}
-
-#[cfg(test)]
-mod export_scratch_tests {
-    use super::{disk_virtual_size, reap_stale_export_scratch_in};
-    use crate::storage::DiskFormat;
-
-    /// A pid far above any system's maximum, so it is reliably not running.
-    const DEAD_PID: u32 = i32::MAX as u32;
-
-    fn scratch(root: &std::path::Path, dir: &str, name: &str) -> std::path::PathBuf {
-        let path = root.join(dir);
-        std::fs::create_dir_all(&path).unwrap();
-        std::fs::write(path.join("name"), name).unwrap();
-        std::fs::write(path.join(super::EXPORT_SCRATCH_MARKER), name).unwrap();
-        std::fs::write(path.join("agent.pid"), DEAD_PID.to_string()).unwrap();
-        std::fs::write(path.join("vm.lock"), b"").unwrap();
-        std::fs::write(path.join("storage.raw"), b"pretend this is 200 GiB").unwrap();
-        path
+    fn a_huge_source_does_not_overflow_the_size() {
+        assert!(helper_storage_for(u64::MAX, 0) >= EXPORT_HELPER_MIN_STORAGE_GIB);
     }
 
-    /// The whole point: space an export helper abandoned comes back, so a run of
-    /// failed exports cannot quietly consume the host's free space.
+    /// Memory follows the same shape as the disk: ask for the comfortable
+    /// size when the host can spare it, never more than half of what is free,
+    /// and never below what mounting and tarring needs. A host whose memory
+    /// cannot be read keeps the old fixed size rather than guessing low.
     #[test]
-    #[cfg(unix)]
-    fn scratch_from_a_dead_helper_is_reclaimed() {
-        let root = tempfile::tempdir().unwrap();
-        let dead = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-
-        reap_stale_export_scratch_in(root.path());
-
-        assert!(!dead.exists(), "abandoned scratch was left on the host");
-    }
-
-    /// A running export owns its scratch; reaping it mid-export would pull the
-    /// disks out from under a helper that is still reading them.
-    #[test]
-    fn scratch_from_a_live_creator_is_left_alone() {
-        let root = tempfile::tempdir().unwrap();
-        let live = scratch(
-            root.path(),
-            "a",
-            &format!("pack-fromvm-{}-17", std::process::id()),
-        );
-
-        reap_stale_export_scratch_in(root.path());
-
-        assert!(live.exists(), "reaped a live export helper's scratch");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn surviving_helper_retains_scratch_until_it_exits() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        let mut helper = std::process::Command::new("sleep")
-            .arg("60")
-            .spawn()
-            .unwrap();
-        std::fs::write(dir.join("agent.pid"), format!("{}\n0\n", helper.id())).unwrap();
-        reap_stale_export_scratch_in(root.path());
-        let retained = dir.join("storage.raw").exists();
-        helper.kill().unwrap();
-        helper.wait().unwrap();
-        assert!(
-            retained,
-            "creator exited but the helper still held its disks"
-        );
-        reap_stale_export_scratch_in(root.path());
-        assert!(!dir.exists(), "dead helper scratch was not reclaimed");
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scratch_is_retained_while_launch_lock_is_held() {
-        use std::os::fd::AsRawFd;
-        let root = tempfile::tempdir().unwrap();
-        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        let lock = std::fs::File::open(dir.join("vm.lock")).unwrap();
-        assert_eq!(
-            unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
-            0
-        );
-        reap_stale_export_scratch_in(root.path());
-        assert!(dir.exists());
-        // flock belongs to the open file description. Other tests can fork
-        // while this runs, so dropping our fd need not release the lock.
-        // Model that extra reference explicitly and verify both states.
-        let inherited = lock.try_clone().unwrap();
-        drop(lock);
-        reap_stale_export_scratch_in(root.path());
-        assert!(
-            dir.exists(),
-            "a duplicated launch lock still protects scratch"
-        );
-        assert_eq!(
-            unsafe { libc::flock(inherited.as_raw_fd(), libc::LOCK_UN) },
-            0
-        );
-        reap_stale_export_scratch_in(root.path());
-        assert!(!dir.exists());
+    fn helper_memory_follows_what_the_host_can_spare() {
+        assert_eq!(helper_memory_for(None), EXPORT_HELPER_MEMORY_MIB);
+        // Plenty free: the comfortable size, not half of a huge number.
+        assert_eq!(helper_memory_for(Some(64 * 1024)), EXPORT_HELPER_MEMORY_MIB);
+        // The reported failure: a host that cannot seat the comfortable size.
+        assert_eq!(helper_memory_for(Some(4096)), 2048);
+        assert_eq!(helper_memory_for(Some(3000)), 1500);
+        // Very little free still asks for something that can do the work.
+        assert_eq!(helper_memory_for(Some(512)), EXPORT_HELPER_MIN_MEMORY_MIB);
+        assert_eq!(helper_memory_for(Some(0)), EXPORT_HELPER_MIN_MEMORY_MIB);
     }
 
     #[test]
-    fn missing_or_invalid_helper_identity_is_retained() {
-        let root = tempfile::tempdir().unwrap();
-        for (index, contents) in [None, Some(""), Some("invalid"), Some("0"), Some("-1")]
-            .into_iter()
-            .enumerate()
-        {
-            let dir = scratch(
-                root.path(),
-                &index.to_string(),
-                &format!("pack-fromvm-{DEAD_PID}-17"),
-            );
-            match contents {
-                Some(text) => std::fs::write(dir.join("agent.pid"), text).unwrap(),
-                None => std::fs::remove_file(dir.join("agent.pid")).unwrap(),
-            }
-            reap_stale_export_scratch_in(root.path());
-            assert!(dir.exists());
+    fn only_a_usable_override_is_honored() {
+        assert_eq!(parse_helper_override(Some("512")), Some(512));
+        assert_eq!(parse_helper_override(Some("  512  ")), Some(512));
+        // A typo or a zero falls back to the heuristic instead of failing the
+        // export or booting a helper with no disk.
+        assert_eq!(parse_helper_override(Some("0")), None);
+        assert_eq!(parse_helper_override(Some("512G")), None);
+        assert_eq!(parse_helper_override(Some("")), None);
+        assert_eq!(parse_helper_override(None), None);
+    }
+
+    /// Without the variable set, the public entry point is the heuristic.
+    #[test]
+    fn the_default_path_is_the_heuristic() {
+        if std::env::var(super::EXPORT_HELPER_STORAGE_ENV).is_ok() {
+            return;
         }
-    }
-
-    #[test]
-    fn unmarked_prefix_lookalike_is_not_scratch() {
-        let root = tempfile::tempdir().unwrap();
-        let dir = scratch(root.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        std::fs::remove_file(dir.join(super::EXPORT_SCRATCH_MARKER)).unwrap();
-        reap_stale_export_scratch_in(root.path());
-        assert!(dir.exists());
-    }
-
-    #[cfg(unix)]
-    #[test]
-    fn scratch_directory_symlinks_are_not_followed() {
-        let root = tempfile::tempdir().unwrap();
-        let outside = tempfile::tempdir().unwrap();
-        let dir = scratch(outside.path(), "a", &format!("pack-fromvm-{DEAD_PID}-17"));
-        std::os::unix::fs::symlink(&dir, root.path().join("linked")).unwrap();
-        reap_stale_export_scratch_in(root.path());
-        assert!(dir.join("storage.raw").exists());
-        assert!(root.path().join("linked").symlink_metadata().is_ok());
-    }
-
-    /// Everything else in this directory is a real machine. Only the export
-    /// helper's own naming may be treated as disposable.
-    #[test]
-    fn real_machines_are_never_reaped() {
-        let root = tempfile::tempdir().unwrap();
-        let machine = scratch(root.path(), "a", "my-important-machine");
-        let lookalike = scratch(root.path(), "b", "pack-fromvm-not-a-pid");
-        let unnamed = root.path().join("c");
-        std::fs::create_dir_all(&unnamed).unwrap();
-
-        reap_stale_export_scratch_in(root.path());
-
-        assert!(machine.exists(), "deleted a real machine");
-        assert!(
-            lookalike.exists(),
-            "deleted a directory with no parseable pid"
-        );
-        assert!(unnamed.exists(), "deleted a directory with no name file");
-    }
-
-    /// Every export starts by running this, so a malformed one breaks all of
-    /// them — including the space that a line continuation would silently eat.
-    #[test]
-    fn the_source_mount_command_is_well_formed() {
-        assert_eq!(
-            super::source_mount_command(),
-            "mkdir -p /mnt/source-storage && mount -o ro /dev/vdc /mnt/source-storage"
-        );
-    }
-
-    /// A raw disk is sparse, so its apparent length is the size the guest sees.
-    #[test]
-    fn a_raw_disk_measures_its_apparent_length() {
-        let dir = tempfile::tempdir().unwrap();
-        let raw = dir.path().join("storage.raw");
-        let file = std::fs::File::create(&raw).unwrap();
-        file.set_len(64 * 1024 * 1024 * 1024).unwrap();
-
-        assert_eq!(
-            disk_virtual_size(&raw, DiskFormat::Raw),
-            Some(64 * 1024 * 1024 * 1024)
-        );
-    }
-
-    /// The clone case: a copy-on-write overlay is tiny on disk but presents the
-    /// whole backing disk, and sizing the helper from its file length is what
-    /// used to hand a large clone the minimum.
-    #[test]
-    fn a_qcow2_measures_what_it_presents_not_what_it_occupies() {
-        let dir = tempfile::tempdir().unwrap();
-        let qcow2 = dir.path().join("storage.qcow2");
-        let virtual_size: u64 = 220 * 1024 * 1024 * 1024;
-
-        let mut header = [0u8; 32];
-        header[0..4].copy_from_slice(b"QFI\xfb");
-        header[4..8].copy_from_slice(&3u32.to_be_bytes());
-        header[24..32].copy_from_slice(&virtual_size.to_be_bytes());
-        std::fs::write(&qcow2, header).unwrap();
-
-        let occupies = std::fs::metadata(&qcow2).unwrap().len();
-        assert!(occupies < 1024, "fixture should be a tiny file");
-        assert_eq!(
-            disk_virtual_size(&qcow2, DiskFormat::Qcow2),
-            Some(virtual_size)
-        );
+        assert_eq!(export_helper_storage_gib(50, 0), helper_storage_for(50, 0));
     }
 }

@@ -13,8 +13,7 @@ use std::net::UdpSocket;
 /// DNS filter configuration.
 #[derive(Debug, Clone)]
 pub struct DnsFilter {
-    /// Allowed domains (exact match + wildcard subdomains).
-    /// e.g., "api.stripe.com" allows "api.stripe.com" and "foo.api.stripe.com".
+    /// Legacy entries include subdomains; `=` and `*.` entries use opt-in matching.
     allowed: Vec<String>,
     /// Upstream DNS resolver address.
     upstream: String,
@@ -32,13 +31,9 @@ impl DnsFilter {
     /// Check if a domain is allowed by the filter.
     pub fn is_allowed(&self, domain: &str) -> bool {
         let domain = domain.trim_end_matches('.');
-        self.allowed.iter().any(|pattern| {
-            let pattern = pattern.trim_end_matches('.');
-            domain.eq_ignore_ascii_case(pattern)
-                || domain
-                    .to_ascii_lowercase()
-                    .ends_with(&format!(".{}", pattern.to_ascii_lowercase()))
-        })
+        self.allowed
+            .iter()
+            .any(|pattern| smolvm_protocol::host_pattern::matches(domain, pattern))
     }
 
     /// Handle a raw DNS query: filter and resolve or return NXDOMAIN.
@@ -292,6 +287,16 @@ mod tests {
         assert!(filter.is_allowed("api.stripe.com"));
         assert!(filter.is_allowed("dashboard.stripe.com"));
         assert!(!filter.is_allowed("notstripe.com"));
+    }
+
+    #[test]
+    fn test_filter_strict_patterns() {
+        let exact = DnsFilter::new(vec!["=api.stripe.com".into()], "1.1.1.1".into());
+        assert!(exact.is_allowed("api.stripe.com"));
+        assert!(!exact.is_allowed("foo.api.stripe.com"));
+        let wildcard = DnsFilter::new(vec!["*.stripe.com".into()], "1.1.1.1".into());
+        assert!(wildcard.is_allowed("api.stripe.com"));
+        assert!(!wildcard.is_allowed("stripe.com"));
     }
 
     #[test]

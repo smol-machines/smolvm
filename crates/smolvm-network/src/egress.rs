@@ -1,10 +1,9 @@
 //! Outbound egress policy for the virtio-net gateway.
 //!
-//! TSI enforces `allowed_cidrs` + `--allow-host` inside libkrun's socket-intercept
-//! layer; the virtio-net gateway terminates every guest flow itself, so it applies
-//! the same allow-list at the point it opens a host connection
-//! (`TcpRelayTable::create_tcp_socket`). This mirrors libkrun's `vsock/dns_filter.rs`
-//! `EgressPolicy` so both backends behave identically:
+//! The virtio-net gateway terminates every guest flow and applies this policy
+//! before it opens a host connection (`TcpRelayTable::create_tcp_socket`). TSI
+//! is rejected for policy-bearing machines because its libkrun filter has not
+//! enforced the equivalent policy in empirical tests:
 //!
 //! - static `allowed_cidrs` (IPv4 or IPv6) are always permitted;
 //! - `--allow-host` names are matched by the gateway's DNS interception, and the
@@ -14,13 +13,18 @@
 //!
 //! Disallowed destinations are dropped before any host socket is created. DNS
 //! forwarding (gateway-internal) is never gated by this filter.
+//!
+//! A restricted policy's allow list can be replaced while the machine runs
+//! ([`EgressPolicy::replace_allow_list`]), by the host over a socket only it can
+//! reach. A replacement can never lift the policy: an empty list admits nothing.
 
 use std::collections::HashMap;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant};
 
 use crate::dns;
+use smolvm_protocol::{EgressRule, FlowTransport, RuleAction};
 
 /// Learned-IP TTL clamp, matching libkrun's DNS filter.
 const MIN_LEARNED_TTL: u64 = 60;
@@ -85,12 +89,180 @@ impl Cidr {
     }
 }
 
-struct AllowList {
+/// The destinations an allow list admits.
+struct Rules {
     cidrs: Vec<Cidr>,
     /// Normalized allow-host names. `None` = no DNS hostname filtering.
     allowed_hosts: Option<Vec<String>>,
-    /// IPs learned from allowed DNS answers → expiry instant.
-    learned: Mutex<HashMap<IpAddr, Instant>>,
+}
+
+impl Rules {
+    fn build(allowed_cidrs: Option<&[String]>, allowed_hosts: Option<&[String]>) -> Self {
+        let cidrs = allowed_cidrs
+            .unwrap_or(&[])
+            .iter()
+            .filter_map(|spec| {
+                let parsed = Cidr::parse(spec);
+                if parsed.is_none() {
+                    tracing::warn!(cidr = %spec, "ignoring unparseable egress CIDR");
+                }
+                parsed
+            })
+            .collect();
+        let allowed_hosts = allowed_hosts.map(|hosts| {
+            hosts
+                .iter()
+                .filter_map(|h| dns::normalize_hostname(h))
+                .collect()
+        });
+        Self {
+            cidrs,
+            allowed_hosts,
+        }
+    }
+
+    fn hostname_allowed(&self, hostname: &str) -> bool {
+        match &self.allowed_hosts {
+            None => true,
+            Some(hosts) => dns::hostname_allowed(hostname, hosts),
+        }
+    }
+
+    /// Whether addresses learned for `name` may be kept. Unlike a DNS query,
+    /// which a list with no hosts lets through, an answer needs a host to match.
+    fn keeps_learned(&self, name: &str) -> bool {
+        self.allowed_hosts
+            .as_deref()
+            .is_some_and(|hosts| dns::hostname_allowed(name, hosts))
+    }
+}
+
+/// An IP learned from an allowed DNS answer.
+struct Learned {
+    expires_at: Instant,
+    /// The name whose answer admitted it, so revoking the name revokes it.
+    name: Option<String>,
+}
+
+struct AllowList {
+    rules: RwLock<Arc<Rules>>,
+    /// IPs learned from allowed DNS answers.
+    learned: Mutex<HashMap<IpAddr, Learned>>,
+}
+
+impl AllowList {
+    /// The rules in force.
+    fn rules(&self) -> Arc<Rules> {
+        Arc::clone(&self.rules.read().unwrap_or_else(|e| e.into_inner()))
+    }
+}
+
+/// Render an allow list for [`EgressPolicy::replace_allow_list`]: one
+/// `cidr <range>` or `host <name-or-pattern>` per line, hosts as `machine
+/// create` stores them.
+pub fn render_live_policy(cidrs: &[String], hosts: &[String]) -> String {
+    let mut out = String::from("# smolvm egress allow list\n");
+    for cidr in cidrs {
+        out.push_str("cidr ");
+        out.push_str(cidr.trim());
+        out.push('\n');
+    }
+    for host in hosts {
+        out.push_str("host ");
+        out.push_str(host.trim());
+        out.push('\n');
+    }
+    out
+}
+
+pub fn render_live_rules(rules: &[EgressRule]) -> Result<String, String> {
+    let json = serde_json::to_string(rules).map_err(|error| format!("invalid rules: {error}"))?;
+    Ok(format!("rules {json}\n"))
+}
+
+struct LivePolicy {
+    allow_list: Rules,
+    rules: Option<Vec<CompiledRule>>,
+}
+
+/// Parse a rendered allow list. An absent kind of entry means none of it, and a
+/// list with no entries at all admits nothing. An optional `rules <json>` line
+/// (see [`render_live_rules`]) carries a replacement ordered rule list; without
+/// it the rules are left as they are.
+fn parse_live_policy(bytes: &[u8]) -> Result<LivePolicy, String> {
+    let text = std::str::from_utf8(bytes).map_err(|_| "not UTF-8".to_string())?;
+    let mut cidrs = Vec::new();
+    let mut hosts = Vec::new();
+    let mut rules = None;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        match line.split_once(char::is_whitespace) {
+            Some(("cidr", value)) if Cidr::parse(value.trim()).is_some() => {
+                cidrs.push(value.trim().to_string())
+            }
+            Some(("host", value)) if !value.trim().is_empty() => {
+                hosts.push(value.trim().to_string())
+            }
+            Some(("rules", value)) if rules.is_none() => {
+                let parsed: Vec<EgressRule> = serde_json::from_str(value.trim())
+                    .map_err(|error| format!("line {}: invalid rules: {error}", index + 1))?;
+                rules = Some(compile_rules(&parsed)?);
+            }
+            _ => {
+                return Err(format!(
+                    "line {}: expected `cidr <range>`, `host <name>` or `rules <list>`",
+                    index + 1
+                ))
+            }
+        }
+    }
+    let allow_list = if cidrs.is_empty() && hosts.is_empty() {
+        Rules::build(Some(&[]), Some(&[]))
+    } else {
+        Rules::build(
+            (!cidrs.is_empty()).then_some(cidrs.as_slice()),
+            (!hosts.is_empty()).then_some(hosts.as_slice()),
+        )
+    };
+    Ok(LivePolicy { allow_list, rules })
+}
+
+fn compile_rules(rules: &[EgressRule]) -> Result<Vec<CompiledRule>, String> {
+    let mut compiled = Vec::with_capacity(rules.len());
+    for (index, rule) in rules.iter().enumerate() {
+        let cidr = match rule.cidr.as_deref() {
+            Some(spec) => Some(
+                Cidr::parse(spec).ok_or_else(|| format!("egress rule {index}: invalid CIDR"))?,
+            ),
+            None => None,
+        };
+        if let Some(ports) = rule.ports {
+            if ports.start == 0
+                || ports.end < ports.start
+                || rule.transport == Some(FlowTransport::Icmp)
+            {
+                return Err(format!(
+                    "egress rule {index}: invalid port range or transport"
+                ));
+            }
+        }
+        if rule.action == RuleAction::Redirect && rule.transport != Some(FlowTransport::Tcp) {
+            return Err(format!(
+                "egress rule {index}: redirect requires TCP transport"
+            ));
+        }
+        compiled.push(CompiledRule {
+            transport: rule.transport,
+            cidr,
+            ports: rule.ports,
+            action: rule.action,
+            reopens_private: false,
+        });
+    }
+    Ok(compiled)
 }
 
 /// How much of the platform hard-floor applies, chosen once per policy from the
@@ -120,6 +292,10 @@ enum FloorMode {
     /// gateway CGNAT range — so a guest can't steal host credentials, pivot to
     /// the control plane / worker API, or reach co-resident tenants.
     Strict,
+    /// A machine that asked for `--block-private`: the same ranges as
+    /// `Strict`, except that an explicit allow rule (`--allow-private`) may
+    /// re-open one. Cloud metadata stays closed to every rule.
+    Private,
 }
 
 /// Parse an explicit `SMOLVM_EGRESS_FLOOR` value into a mode. Returns `None`
@@ -220,7 +396,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
         FloorMode::Off => false,
         FloorMode::MetadataOnly => is_link_local(ip),
         FloorMode::MetadataAndLoopback => is_link_local(ip) || is_host_loopback(ip),
-        FloorMode::Strict => match ip {
+        FloorMode::Strict | FloorMode::Private => match ip {
             IpAddr::V4(v4) => is_reserved_v4(v4),
             IpAddr::V6(v6) => {
                 v6.is_loopback()
@@ -239,12 +415,68 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
 #[derive(Clone)]
 pub struct EgressPolicy {
     inner: Option<Arc<AllowList>>,
+    rules: Arc<RwLock<Arc<Vec<CompiledRule>>>>,
     /// Hard-floor scope, resolved once from the deployment context at creation.
     floor: FloorMode,
     /// Audit sink for denials. When set, every denied connect/sendto/resolve is
     /// appended here in addition to the runtime's stderr line, so the record
     /// can't be evicted by ordinary connection chatter in the boot log.
     denial_log: Option<Arc<std::path::PathBuf>>,
+    /// The operator's egress watchlist for this VM, when one was provisioned:
+    /// destinations to flag in `signal_log`, never to block.
+    watchlist: Option<Arc<crate::watchlist::WatchlistSource>>,
+    /// Audit sink for signals (watchlist matches and stratum handshakes), kept
+    /// apart from denials so neither evicts the other. Created on the first
+    /// signal only.
+    signal_log: Option<Arc<std::path::PathBuf>>,
+    decision_log: Option<Arc<DecisionLog>>,
+}
+
+/// Append one timestamped line to an audit file, rotating it once past 8 MiB
+/// (`.1` suffix) so a workload repeating an event at packet rate can't fill the
+/// host disk.
+fn append_audit_line(path: &std::path::Path, message: &str) {
+    const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+    if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
+        let _ = std::fs::rename(path, path.with_extension("log.1"));
+    }
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(
+            file,
+            "{}",
+            crate::format_network_log_line(std::time::SystemTime::now(), message)
+        );
+    }
+}
+
+impl std::fmt::Debug for EgressPolicy {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("EgressPolicy")
+            .field("restricted", &self.is_restricted())
+            .finish()
+    }
+}
+
+struct DecisionLog {
+    path: std::path::PathBuf,
+    machine_id: [u8; 16],
+    parent_id: [u8; 16],
+    lock: Mutex<()>,
+}
+
+#[derive(Clone)]
+struct CompiledRule {
+    transport: Option<FlowTransport>,
+    cidr: Option<Cidr>,
+    ports: Option<smolvm_protocol::PortRange>,
+    action: RuleAction,
+    reopens_private: bool,
 }
 
 impl EgressPolicy {
@@ -252,8 +484,12 @@ impl EgressPolicy {
     pub fn unrestricted() -> Self {
         Self {
             inner: None,
+            rules: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             floor: floor_mode(),
             denial_log: None,
+            watchlist: None,
+            signal_log: None,
+            decision_log: None,
         }
     }
 
@@ -265,32 +501,49 @@ impl EgressPolicy {
         if allowed_cidrs.is_none() && allowed_hosts.is_none() {
             return Self::unrestricted();
         }
-        let cidrs = allowed_cidrs
-            .unwrap_or(&[])
-            .iter()
-            .filter_map(|spec| {
-                let parsed = Cidr::parse(spec);
-                if parsed.is_none() {
-                    tracing::warn!(cidr = %spec, "ignoring unparseable egress CIDR");
-                }
-                parsed
-            })
-            .collect();
-        let allowed_hosts = allowed_hosts.map(|hosts| {
-            hosts
-                .iter()
-                .filter_map(|h| dns::normalize_hostname(h))
-                .collect()
-        });
         Self {
             inner: Some(Arc::new(AllowList {
-                cidrs,
-                allowed_hosts,
+                rules: RwLock::new(Arc::new(Rules::build(allowed_cidrs, allowed_hosts))),
                 learned: Mutex::new(HashMap::new()),
             })),
+            rules: Arc::new(RwLock::new(Arc::new(Vec::new()))),
             floor: floor_mode(),
             denial_log: None,
+            watchlist: None,
+            signal_log: None,
+            decision_log: None,
         }
+    }
+
+    /// Replace the allow list of a restricted policy with a rendered one (see
+    /// [`render_live_policy`]), for every clone of this policy at once. Learned
+    /// addresses of names the new list no longer allows are forgotten. When the
+    /// message also carries a `rules <json>` line (see [`render_live_rules`]),
+    /// it replaces the whole ordered rule list, deny rules included, while the
+    /// `--allow-private` exceptions stay; a message without one, sent when the
+    /// rules have not changed, keeps them. An unrestricted policy has no list
+    /// to replace.
+    pub fn replace_allow_list(&self, rendered: &str) -> Result<(), String> {
+        let Some(list) = &self.inner else {
+            return Err("this machine has no allow list to replace".to_string());
+        };
+        let LivePolicy { allow_list, rules } = parse_live_policy(rendered.as_bytes())?;
+        let next = Arc::new(allow_list);
+        if let Some(mut rules) = rules {
+            let mut current = self.rules.write().unwrap_or_else(|e| e.into_inner());
+            rules.extend(current.iter().filter(|rule| rule.reopens_private).cloned());
+            *current = Arc::new(rules);
+        }
+        if let Ok(mut learned) = list.learned.lock() {
+            learned.retain(|_, entry| {
+                entry
+                    .name
+                    .as_deref()
+                    .is_none_or(|name| next.keeps_learned(name))
+            });
+        }
+        *list.rules.write().unwrap_or_else(|e| e.into_inner()) = next;
+        Ok(())
     }
 
     /// Convenience for the CIDR-only case.
@@ -301,6 +554,189 @@ impl EgressPolicy {
         self
     }
 
+    /// Compile an ordered rule list at launch. Invalid rules fail launch rather
+    /// than silently weakening the effective policy.
+    pub fn with_rules(mut self, rules: &[EgressRule]) -> Result<Self, String> {
+        self.rules = Arc::new(RwLock::new(Arc::new(compile_rules(rules)?)));
+        Ok(self)
+    }
+
+    fn compiled_rules(&self) -> Arc<Vec<CompiledRule>> {
+        Arc::clone(&self.rules.read().unwrap_or_else(|e| e.into_inner()))
+    }
+
+    /// Block private, internal and link-local destinations for this machine,
+    /// keeping the public internet open, except the `exceptions` CIDRs, which
+    /// become allow rules after any existing ones. A host already on the strict
+    /// floor keeps it, so exceptions never re-open a fleet node's internal ranges.
+    pub fn with_private_floor(mut self, exceptions: &[String]) -> Result<Self, String> {
+        let mut rules = self.compiled_rules().as_ref().clone();
+        for spec in exceptions {
+            let cidr = Cidr::parse(spec)
+                .ok_or_else(|| format!("--allow-private: invalid CIDR '{spec}'"))?;
+            rules.push(CompiledRule {
+                transport: None,
+                cidr: Some(cidr),
+                ports: None,
+                action: RuleAction::Allow,
+                reopens_private: true,
+            });
+        }
+        self.rules = Arc::new(RwLock::new(Arc::new(rules)));
+        if self.floor != FloorMode::Strict {
+            self.floor = FloorMode::Private;
+        }
+        Ok(self)
+    }
+
+    /// First matching rule after the platform floor. The strict floor is
+    /// absolute; local loopback needs an explicit matching static allow.
+    pub fn rule_action(
+        &self,
+        transport: FlowTransport,
+        ip: IpAddr,
+        port: Option<u16>,
+    ) -> Option<RuleAction> {
+        // An IPv4-mapped IPv6 address reaches the same host as its IPv4 form,
+        // so a V4 rule must match it too or a Deny is bypassed by spelling.
+        let mapped = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        let matches = |rule: &&CompiledRule| {
+            rule.transport.is_none_or(|value| value == transport)
+                && rule.cidr.is_none_or(|cidr| {
+                    cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
+                })
+                && rule.ports.is_none_or(|ports| {
+                    port.is_some_and(|port| (ports.start..=ports.end).contains(&port))
+                })
+        };
+        let rules = self.compiled_rules();
+        let first = rules.iter().find(matches)?;
+        let action = Some(first.action);
+        if !is_floored(ip, self.floor) {
+            return action;
+        }
+        if self.floor == FloorMode::Private {
+            let reopened = first.action == RuleAction::Allow
+                && !is_link_local(ip)
+                && (first.reopens_private
+                    || first.transport != Some(FlowTransport::Udp)
+                    || rules
+                        .iter()
+                        .filter(|rule| rule.reopens_private)
+                        .any(|rule| matches(&rule)));
+            return Some(if reopened {
+                RuleAction::Allow
+            } else {
+                RuleAction::Deny
+            });
+        }
+        if self.floor != FloorMode::Strict
+            && is_host_loopback(ip)
+            && action == Some(RuleAction::Allow)
+        {
+            return action;
+        }
+        Some(RuleAction::Deny)
+    }
+
+    pub fn allows_flow(&self, transport: FlowTransport, ip: IpAddr, port: Option<u16>) -> bool {
+        match self.rule_action(transport, ip, port) {
+            Some(RuleAction::Allow | RuleAction::Redirect) => true,
+            Some(RuleAction::Deny) => false,
+            None => self.allows(ip),
+        }
+    }
+
+    /// Whether `--block-private` alone keeps TCP from `ip`: the address is
+    /// private and no allow rule covers it, so an `--allow-private` range
+    /// would reopen it. False for cloud metadata and on the strict floor,
+    /// which no exception reopens.
+    pub fn private_floor_blocks(&self, ip: IpAddr) -> bool {
+        if self.floor != FloorMode::Private || !is_floored(ip, self.floor) || is_link_local(ip) {
+            return false;
+        }
+        let mapped = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        !self.compiled_rules().iter().any(|rule| {
+            rule.action == RuleAction::Allow
+                && rule
+                    .transport
+                    .is_none_or(|value| value == FlowTransport::Tcp)
+                && rule.cidr.is_none_or(|cidr| {
+                    cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
+                })
+        })
+    }
+
+    /// Attach the structured decision record for a host-minted launch.
+    pub fn with_mediation_audit(
+        mut self,
+        path: std::path::PathBuf,
+        machine_id: [u8; 16],
+        parent_id: [u8; 16],
+    ) -> Self {
+        self.decision_log = Some(Arc::new(DecisionLog {
+            path,
+            machine_id,
+            parent_id,
+            lock: Mutex::new(()),
+        }));
+        self
+    }
+
+    /// Append one host-observed enforcement decision. A caller admitting a
+    /// flow must propagate an I/O error rather than dial without its record.
+    pub fn record_decision(
+        &self,
+        transport: &str,
+        action: &str,
+        destination: &dyn std::fmt::Display,
+        reason: &str,
+    ) -> std::io::Result<()> {
+        let Some(log) = &self.decision_log else {
+            return Ok(());
+        };
+        let _guard = log
+            .lock
+            .lock()
+            .map_err(|_| std::io::Error::other("mediated egress audit lock is poisoned"))?;
+        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
+        if std::fs::metadata(&log.path).is_ok_and(|metadata| metadata.len() >= ROTATE_BYTES) {
+            std::fs::rename(&log.path, log.path.with_extension("jsonl.1"))?;
+        }
+        let hex_id = |bytes: &[u8; 16]| {
+            bytes
+                .iter()
+                .map(|byte| format!("{byte:02x}"))
+                .collect::<String>()
+        };
+        let timestamp_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_millis();
+        let event = serde_json::json!({
+            "timestampMs": timestamp_ms,
+            "machineId": hex_id(&log.machine_id),
+            "parentId": hex_id(&log.parent_id),
+            "transport": transport,
+            "action": action,
+            "destination": destination.to_string(),
+            "reason": reason,
+        });
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&log.path)?;
+        serde_json::to_writer(&mut file, &event)?;
+        file.write_all(b"\n")
+    }
+
     /// Record one denial: a stderr line for anyone tailing the boot log, and —
     /// when a sink is attached — an appended line in the dedicated audit file,
     /// which connection chatter can never evict. Keep the marker text stable:
@@ -309,57 +745,152 @@ impl EgressPolicy {
     /// The sink rotates once past 8 MiB (`.1` suffix) so a workload hammering a
     /// denied destination at packet rate can't fill the host disk.
     pub fn record_denial(&self, operation: &str, dest: &dyn std::fmt::Display) {
-        crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
-        let Some(path) = self.denial_log.as_deref() else {
-            return;
+        let transport = match operation {
+            "connect" => "tcp",
+            "sendto" => "udp",
+            "icmp" => "icmp",
+            "resolve" => "dns",
+            _ => "unknown",
         };
-        const ROTATE_BYTES: u64 = 8 * 1024 * 1024;
-        if std::fs::metadata(path).is_ok_and(|m| m.len() > ROTATE_BYTES) {
-            let _ = std::fs::rename(path, path.with_extension("log.1"));
+        if let Err(error) = self.record_decision(transport, "deny", dest, "local_policy") {
+            tracing::warn!(%error, "could not record mediated egress denial");
         }
-        use std::io::Write;
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(path)
-        {
-            let _ = writeln!(
-                file,
-                "{}",
-                crate::format_network_log_line(
-                    std::time::SystemTime::now(),
-                    &format!("egress policy denied {operation} {dest}"),
-                )
-            );
+        crate::virtio_net_log!("egress policy denied {} {}", operation, dest);
+        if let Some(path) = self.denial_log.as_deref() {
+            append_audit_line(path, &format!("egress policy denied {operation} {dest}"));
         }
+    }
+
+    /// Attach the operator's watchlist and the file signals are appended to.
+    /// `watchlist` is the VM's copy (`EGRESS_WATCHLIST_FILE`); when there is no
+    /// copy only the built-in signals, such as a stratum handshake, are
+    /// recorded, and the signal log is created only when one is.
+    pub fn with_watchlist(
+        mut self,
+        watchlist: std::path::PathBuf,
+        signal_log: std::path::PathBuf,
+    ) -> Self {
+        self.watchlist = crate::watchlist::WatchlistSource::open(watchlist);
+        self.signal_log = Some(Arc::new(signal_log));
+        self
+    }
+
+    /// Whether a watchlist is attached, so callers can skip work when not.
+    pub fn watching(&self) -> bool {
+        self.watchlist.is_some()
+    }
+
+    /// Note a guest DNS question for `name` against the watchlist, returning
+    /// whether a `block` entry refuses it. Otherwise the policy decides.
+    pub fn observe_dns(&self, name: &str) -> bool {
+        let Some(watchlist) = self.watchlist.as_deref() else {
+            return false;
+        };
+        let verdict = watchlist.observe_dns(name);
+        if let Some(label) = &verdict.record {
+            self.record_signal(label, &name);
+        }
+        verdict.block
+    }
+
+    /// Note an outbound destination against the watchlist, like `observe_dns`.
+    pub fn observe_destination(&self, destination: std::net::SocketAddr) -> bool {
+        let Some(watchlist) = self.watchlist.as_deref() else {
+            return false;
+        };
+        let dest = destination.to_string();
+        let verdict = watchlist.observe_ip(destination.ip(), &dest);
+        if let Some(label) = &verdict.record {
+            self.record_signal(label, &dest);
+        }
+        verdict.block
+    }
+
+    /// Note what a guest's opening bytes on an outbound TCP connection to
+    /// `destination` are, returning whether a `block` watchlist entry refuses
+    /// the connection. A stratum handshake is recorded under
+    /// [`STRATUM_SIGNAL`](crate::STRATUM_SIGNAL) with or without a watchlist;
+    /// a TLS server name is matched against the watchlist like a DNS question.
+    pub fn observe_opening(
+        &self,
+        destination: std::net::SocketAddr,
+        opening: &crate::opening::Opening,
+    ) -> bool {
+        match opening {
+            crate::opening::Opening::Stratum(_) => {
+                self.record_signal(crate::STRATUM_SIGNAL, &destination);
+                false
+            }
+            crate::opening::Opening::ServerName(name) => self.observe_dns(name),
+            crate::opening::Opening::Other => false,
+        }
+    }
+
+    /// Record one match. Keep the marker text stable: the host's
+    /// `read_egress_signals` parses `egress watch <label> <dest>`.
+    fn record_signal(&self, label: &str, dest: &dyn std::fmt::Display) {
+        crate::virtio_net_log!("egress watch {} {}", label, dest);
+        if let Some(path) = self.signal_log.as_deref() {
+            append_audit_line(path, &format!("egress watch {label} {dest}"));
+        }
+    }
+
+    /// A policy that admits no destination and resolves no name (beyond the
+    /// gateway's own, which the stack answers itself), for a guest that has a
+    /// network device only to serve published ports.
+    pub fn deny_all() -> Self {
+        Self::new(Some(&[]), Some(&[]))
     }
 
     pub fn from_allowed_cidrs(allowed: Option<&[String]>) -> Self {
         Self::new(allowed, None)
     }
 
+    /// Deny outbound datagrams while retaining this VM's floor and audit sink.
+    /// Full TCP interception uses this for UDP and ICMP so neither protocol can
+    /// bypass the interceptor, and denials remain visible in the VM audit log.
+    pub fn deny_all_datagrams(&self) -> Self {
+        Self {
+            // No CIDR admits anything, and DNS filtering stays as it was off.
+            inner: Some(Arc::new(AllowList {
+                rules: RwLock::new(Arc::new(Rules {
+                    cidrs: Vec::new(),
+                    allowed_hosts: None,
+                })),
+                learned: Mutex::new(HashMap::new()),
+            })),
+            rules: self.rules.clone(),
+            floor: self.floor,
+            denial_log: self.denial_log.clone(),
+            watchlist: self.watchlist.clone(),
+            signal_log: self.signal_log.clone(),
+            decision_log: self.decision_log.clone(),
+        }
+    }
+
     /// Whether any policy is in force (false = allow-all).
     pub fn is_restricted(&self) -> bool {
-        self.inner.is_some()
+        self.inner.is_some() || !self.compiled_rules().is_empty()
     }
 
     /// Whether the gateway should DNS-filter queries (an allow-host list is set).
     pub fn dns_filter_active(&self) -> bool {
         self.inner
             .as_ref()
-            .is_some_and(|list| list.allowed_hosts.is_some())
+            .is_some_and(|list| list.rules().allowed_hosts.is_some())
     }
 
     /// Whether a DNS query for `hostname` should be forwarded upstream. With no
     /// allow-host list, all queries pass (exact + subdomain match otherwise).
     pub fn hostname_allowed(&self, hostname: &str) -> bool {
-        match &self.inner {
+        let allowed = match &self.inner {
             None => true,
-            Some(list) => match &list.allowed_hosts {
-                None => true,
-                Some(hosts) => dns::hostname_allowed(hostname, hosts),
-            },
-        }
+            Some(list) => list.rules().hostname_allowed(hostname),
+        };
+        allowed
+            && self
+                .record_decision("dns", "allow", &hostname, "local_policy")
+                .is_ok()
     }
 
     /// Whether an outbound connection to `ip` (v4 or v6) is permitted.
@@ -380,14 +911,14 @@ impl EgressPolicy {
                 return self
                     .inner
                     .as_ref()
-                    .is_some_and(|list| list.cidrs.iter().any(|cidr| cidr.contains(ip)));
+                    .is_some_and(|list| list.rules().cidrs.iter().any(|cidr| cidr.contains(ip)));
             }
             return false;
         }
         match &self.inner {
             None => true,
             Some(list) => {
-                if list.cidrs.iter().any(|cidr| cidr.contains(ip)) {
+                if list.rules().cidrs.iter().any(|cidr| cidr.contains(ip)) {
                     return true;
                 }
                 list.learned
@@ -395,7 +926,7 @@ impl EgressPolicy {
                     .map(|learned| {
                         learned
                             .get(&ip)
-                            .is_some_and(|expires_at| *expires_at > Instant::now())
+                            .is_some_and(|entry| entry.expires_at > Instant::now())
                     })
                     .unwrap_or(false)
             }
@@ -416,6 +947,23 @@ impl EgressPolicy {
     /// IPs. TTLs are clamped to [60s, 3600s]; expired entries are pruned. No-op
     /// when unrestricted.
     pub fn learn_ip_records(&self, records: &[(IpAddr, u32)]) {
+        self.learn(None, records);
+    }
+
+    /// Learn the A/AAAA records of an allowed DNS `answer`, remembering the
+    /// name asked so revoking that name later revokes these IPs too. An answer
+    /// for a name revoked while the query was in flight is not learned.
+    pub fn learn_dns_answer(&self, answer: &[u8]) {
+        let name = dns::question_name(answer).and_then(|n| dns::normalize_hostname(&n));
+        if let (Some(list), Some(name)) = (&self.inner, name.as_deref()) {
+            if !list.rules().keeps_learned(name) {
+                return;
+            }
+        }
+        self.learn(name, &dns::answer_ip_records(answer));
+    }
+
+    fn learn(&self, name: Option<String>, records: &[(IpAddr, u32)]) {
         let Some(list) = &self.inner else {
             return;
         };
@@ -423,14 +971,18 @@ impl EgressPolicy {
             return;
         };
         let now = Instant::now();
-        learned.retain(|_, expires_at| *expires_at > now);
+        learned.retain(|_, entry| entry.expires_at > now);
         for (ip, ttl) in records {
             let ttl = u64::from(*ttl).clamp(MIN_LEARNED_TTL, MAX_LEARNED_TTL);
             let expires_at = now + Duration::from_secs(ttl);
-            learned
-                .entry(*ip)
-                .and_modify(|existing| *existing = (*existing).max(expires_at))
-                .or_insert(expires_at);
+            let entry = learned.entry(*ip).or_insert(Learned {
+                expires_at,
+                name: name.clone(),
+            });
+            if expires_at >= entry.expires_at {
+                entry.expires_at = expires_at;
+                entry.name = name.clone();
+            }
         }
     }
 }
@@ -438,6 +990,558 @@ impl EgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_replaced_allow_list_grants_and_revokes_for_every_clone() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let gateway_copy = policy.clone();
+        assert!(!gateway_copy.hostname_allowed("pypi.org"));
+
+        policy
+            .replace_allow_list(&render_live_policy(
+                &[],
+                &["api.github.com".into(), "pypi.org".into()],
+            ))
+            .unwrap();
+        assert!(gateway_copy.hostname_allowed("pypi.org"));
+        assert!(gateway_copy.hostname_allowed("api.github.com"));
+
+        policy
+            .replace_allow_list(&render_live_policy(
+                &["8.8.8.0/24".into()],
+                &["pypi.org".into()],
+            ))
+            .unwrap();
+        assert!(!gateway_copy.hostname_allowed("api.github.com"));
+        assert!(gateway_copy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+    }
+
+    #[test]
+    fn an_empty_allow_list_admits_nothing_and_never_lifts_the_policy() {
+        let policy = EgressPolicy::new(Some(&["8.8.8.0/24".into()]), None);
+        policy.replace_allow_list("# nothing allowed\n").unwrap();
+        assert!(policy.is_restricted());
+        assert!(!policy.allows_v4(Ipv4Addr::new(8, 8, 8, 8)));
+        assert!(!policy.hostname_allowed("example.com"));
+    }
+
+    #[test]
+    fn a_bad_allow_list_is_refused_and_the_current_one_kept() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        assert!(policy.replace_allow_list("allow everything\n").is_err());
+        assert!(policy.replace_allow_list("cidr not-a-cidr\n").is_err());
+        assert!(policy.hostname_allowed("api.github.com"));
+        assert!(!policy.hostname_allowed("pypi.org"));
+    }
+
+    #[test]
+    fn revoking_a_host_revokes_the_addresses_learned_for_it() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into(), "pypi.org".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        let pypi = IpAddr::V4(Ipv4Addr::new(151, 101, 0, 223));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        policy.learn(Some("pypi.org".into()), &[(pypi, 300)]);
+        assert!(policy.allows(github));
+
+        policy
+            .replace_allow_list(&render_live_policy(&[], &["pypi.org".into()]))
+            .unwrap();
+        assert!(!policy.allows(github));
+        assert!(policy.allows(pypi));
+    }
+
+    /// A list left with no hosts has no name filter, which passes every name.
+    #[test]
+    fn replacing_the_last_host_revokes_the_addresses_learned_for_it() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        assert!(policy.allows(github));
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        assert!(!policy.allows(github));
+    }
+
+    #[test]
+    fn an_answer_arriving_after_the_last_host_is_removed_is_not_learned() {
+        use crate::dns_cache::tests::{answer, query};
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let late = answer(
+            &query(1, "api.github.com", 1, false),
+            &[(300, [140, 82, 112, 6])],
+        );
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        policy.learn_dns_answer(&late);
+        assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6))));
+    }
+
+    #[test]
+    fn an_unrestricted_policy_has_no_allow_list_to_replace() {
+        let open = EgressPolicy::unrestricted();
+        assert!(open
+            .replace_allow_list(&render_live_policy(&[], &["pypi.org".into()]))
+            .is_err());
+        assert!(!open.is_restricted());
+    }
+
+    #[test]
+    fn ordered_rules_match_transport_cidr_and_port_before_legacy_policy() {
+        use smolvm_protocol::{EgressRule, FlowTransport, PortRange, RuleAction};
+        let policy = EgressPolicy::from_allowed_cidrs(Some(&[]))
+            .with_rules(&[
+                EgressRule {
+                    transport: Some(FlowTransport::Tcp),
+                    cidr: Some("1.1.1.0/24".into()),
+                    ports: Some(PortRange {
+                        start: 443,
+                        end: 443,
+                    }),
+                    action: RuleAction::Deny,
+                },
+                EgressRule {
+                    transport: Some(FlowTransport::Tcp),
+                    cidr: Some("1.1.1.0/24".into()),
+                    ports: Some(PortRange {
+                        start: 400,
+                        end: 500,
+                    }),
+                    action: RuleAction::Allow,
+                },
+                EgressRule {
+                    transport: Some(FlowTransport::Udp),
+                    cidr: Some("1.1.1.1".into()),
+                    ports: Some(PortRange {
+                        start: 123,
+                        end: 123,
+                    }),
+                    action: RuleAction::Allow,
+                },
+            ])
+            .unwrap();
+        let target = "1.1.1.1".parse().unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(443)));
+        assert!(policy.allows_flow(FlowTransport::Tcp, target, Some(444)));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(123)));
+        assert!(policy.allows_flow(FlowTransport::Udp, target, Some(123)));
+        assert!(!policy.allows_flow(FlowTransport::Icmp, target, None));
+    }
+
+    #[test]
+    fn private_floor_keeps_public_open_and_honors_only_explicit_exceptions() {
+        use smolvm_protocol::FlowTransport;
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        let mut policy = EgressPolicy::unrestricted();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy
+            .with_private_floor(&["10.20.0.0/16".to_string(), "169.254.0.0/16".to_string()])
+            .unwrap();
+        let tcp = |addr: &str| policy.allows_flow(FlowTransport::Tcp, ip(addr), Some(443));
+        assert!(tcp("1.1.1.1"));
+        assert!(tcp("10.20.3.4"), "an explicit exception re-opens its range");
+        assert!(!tcp("10.21.0.1"));
+        assert!(!tcp("192.168.1.5"));
+        assert!(!tcp("100.100.100.100"));
+        assert!(!tcp("127.0.0.1"));
+        assert!(!tcp("fd00::1"));
+        assert!(
+            !tcp("169.254.169.254"),
+            "metadata stays closed to every rule"
+        );
+
+        let mut strict = EgressPolicy::unrestricted();
+        strict.floor = FloorMode::Strict;
+        let strict = strict
+            .with_private_floor(&["10.20.0.0/16".to_string()])
+            .unwrap();
+        assert!(!strict.allows_flow(FlowTransport::Tcp, ip("10.20.3.4"), Some(443)));
+        assert!(EgressPolicy::unrestricted()
+            .with_private_floor(&["nope".to_string()])
+            .is_err());
+    }
+
+    #[test]
+    fn v4_deny_rule_also_matches_the_ipv4_mapped_form() {
+        use smolvm_protocol::{EgressRule, FlowTransport, RuleAction};
+        let policy = EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: None,
+                cidr: Some("1.1.1.0/24".into()),
+                ports: None,
+                action: RuleAction::Deny,
+            }])
+            .unwrap();
+        let v4 = "1.1.1.1".parse().unwrap();
+        let mapped = "::ffff:1.1.1.1".parse().unwrap();
+        let other = "::ffff:1.0.0.1".parse().unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Tcp, v4, Some(443)));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, mapped, Some(443)));
+        assert!(policy.allows_flow(FlowTransport::Tcp, other, Some(443)));
+    }
+
+    #[test]
+    fn invalid_rules_fail_launch_and_strict_floor_cannot_be_overridden() {
+        use smolvm_protocol::{EgressRule, FlowTransport, PortRange, RuleAction};
+        let allow = |cidr: &str| EgressRule {
+            transport: Some(FlowTransport::Tcp),
+            cidr: Some(cidr.into()),
+            ports: None,
+            action: RuleAction::Allow,
+        };
+        assert!(EgressPolicy::unrestricted()
+            .with_rules(&[allow("bad-cidr")])
+            .is_err());
+        assert!(EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: Some(FlowTransport::Icmp),
+                cidr: None,
+                ports: Some(PortRange { start: 1, end: 2 }),
+                action: RuleAction::Allow
+            }])
+            .is_err());
+        assert!(EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: None,
+                cidr: None,
+                ports: None,
+                action: RuleAction::Redirect
+            }])
+            .is_err());
+        let mut policy = EgressPolicy::unrestricted()
+            .with_rules(&[allow("127.0.0.1")])
+            .unwrap();
+        policy.floor = FloorMode::Strict;
+        assert!(!policy.allows_flow(FlowTransport::Tcp, "127.0.0.1".parse().unwrap(), Some(80)));
+    }
+
+    #[test]
+    fn intercepted_datagrams_are_denied_without_losing_the_audit_sink() {
+        let original = EgressPolicy::unrestricted()
+            .with_denial_log(std::path::PathBuf::from("/tmp/smolvm-egress-audit-test"));
+        let datagrams = original.deny_all_datagrams();
+        let destination = "1.1.1.1".parse().unwrap();
+        assert!(original.allows(destination));
+        assert!(!datagrams.allows(destination));
+        assert!(Arc::ptr_eq(
+            original.denial_log.as_ref().unwrap(),
+            datagrams.denial_log.as_ref().unwrap(),
+        ));
+    }
+
+    fn udp_allow(cidr: &str, ports: Option<(u16, u16)>) -> EgressRule {
+        EgressRule {
+            transport: Some(FlowTransport::Udp),
+            cidr: Some(cidr.to_string()),
+            ports: ports.map(|(start, end)| smolvm_protocol::PortRange { start, end }),
+            action: RuleAction::Allow,
+        }
+    }
+
+    fn deny_cidr(cidr: &str) -> EgressRule {
+        EgressRule {
+            transport: None,
+            cidr: Some(cidr.to_string()),
+            ports: None,
+            action: RuleAction::Deny,
+        }
+    }
+
+    #[test]
+    fn intercepted_datagrams_honor_udp_allow_rules_and_deny_everything_else() {
+        let mut policy = EgressPolicy::new(Some(&["0.0.0.0/0".to_string()]), None)
+            .with_rules(&[
+                deny_cidr("192.0.2.128/25"),
+                udp_allow("192.0.2.0/24", Some((3478, 3480))),
+                udp_allow("198.51.100.7", None),
+            ])
+            .unwrap();
+        policy.floor = FloorMode::MetadataOnly;
+        let datagrams = policy.deny_all_datagrams();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+
+        assert!(udp("192.0.2.10:3478"));
+        assert!(udp("192.0.2.10:3480"));
+        assert!(!udp("192.0.2.10:3477"), "below the port range");
+        assert!(!udp("192.0.2.10:3481"), "above the port range");
+        assert!(udp("198.51.100.7:9"), "no port range admits every port");
+        assert!(!udp("192.0.2.200:3478"), "the deny CIDR wins");
+        assert!(
+            !udp("203.0.113.5:3478"),
+            "the allow list does not open datagrams"
+        );
+        assert!(!udp("198.51.100.7:53"), "DNS keeps its own path");
+        assert!(!datagrams.allows_flow(
+            FlowTransport::Tcp,
+            "203.0.113.5".parse().unwrap(),
+            Some(443)
+        ));
+        assert!(!datagrams.allows_flow(FlowTransport::Icmp, "192.0.2.10".parse().unwrap(), None));
+        assert!(crate::udp_relay::should_relay_udp(
+            "203.0.113.5:3478".parse().unwrap(),
+            &policy
+        ));
+    }
+
+    #[test]
+    fn udp_allow_rules_never_reopen_the_floor() {
+        let mut policy = EgressPolicy::unrestricted()
+            .with_rules(&[
+                udp_allow("169.254.0.0/16", None),
+                udp_allow("10.0.0.0/8", None),
+            ])
+            .unwrap();
+        policy.floor = FloorMode::Strict;
+        let datagrams = policy.deny_all_datagrams();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+        assert!(!udp("169.254.169.254:123"));
+        assert!(!udp("10.1.2.3:123"));
+
+        policy.floor = FloorMode::MetadataOnly;
+        let datagrams = policy.deny_all_datagrams();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+        assert!(!udp("169.254.169.254:123"), "metadata stays closed");
+        assert!(udp("10.1.2.3:123"));
+    }
+
+    #[test]
+    fn udp_allow_rules_never_reopen_the_private_floor() {
+        for exceptions in [Vec::new(), vec!["10.1.0.0/16".to_string()]] {
+            let mut policy = EgressPolicy::unrestricted()
+                .with_rules(&[udp_allow("0.0.0.0/0", None)])
+                .unwrap();
+            policy.floor = FloorMode::MetadataAndLoopback;
+            let policy = policy.with_private_floor(&exceptions).unwrap();
+            assert_eq!(policy.floor, FloorMode::Private);
+            let excepted = !exceptions.is_empty();
+            for candidate in [policy.clone(), policy.deny_all_datagrams()] {
+                let udp = |destination: &str| {
+                    crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &candidate)
+                };
+                assert_eq!(udp("10.1.2.3:123"), excepted);
+                assert!(!udp("10.2.0.1:123"));
+                assert!(!udp("192.168.1.1:443"));
+                assert!(!udp("100.64.0.1:443"));
+                assert!(!udp("127.0.0.1:123"));
+                assert!(!udp("169.254.169.254:123"));
+                assert!(udp("203.0.113.5:443"));
+            }
+        }
+    }
+
+    #[test]
+    fn private_floor_blocks_only_what_an_exception_would_reopen() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let mut local = EgressPolicy::new(Some(&["100.64.0.9/32".to_string()]), None);
+        local.floor = FloorMode::MetadataAndLoopback;
+        assert!(!local.private_floor_blocks(ip("100.64.0.9")));
+
+        let blocked = local.clone().with_private_floor(&[]).unwrap();
+        // Named on the allow list, yet the floor still refuses it.
+        assert!(!blocked.allows_flow(FlowTransport::Tcp, ip("100.64.0.9"), Some(443)));
+        assert!(blocked.private_floor_blocks(ip("100.64.0.9")));
+        assert!(blocked.private_floor_blocks(ip("192.168.1.1")));
+        assert!(blocked.private_floor_blocks(ip("fd7a:115c:a1e0::1")));
+        assert!(blocked.private_floor_blocks(ip("::ffff:10.0.0.1")));
+        assert!(!blocked.private_floor_blocks(ip("203.0.113.5")));
+        assert!(!blocked.private_floor_blocks(ip("169.254.169.254")));
+
+        let reopened = local
+            .clone()
+            .with_private_floor(&[
+                "100.64.0.0/10".to_string(),
+                "fd7a:115c:a1e0::/48".to_string(),
+            ])
+            .unwrap();
+        assert!(reopened.allows_flow(FlowTransport::Tcp, ip("100.64.0.9"), Some(443)));
+        assert!(!reopened.private_floor_blocks(ip("100.64.0.9")));
+        assert!(!reopened.private_floor_blocks(ip("fd7a:115c:a1e0::1")));
+        assert!(reopened.private_floor_blocks(ip("192.168.1.1")));
+
+        // A UDP rule never reopens a private range for TCP.
+        let mut udp_only = EgressPolicy::unrestricted()
+            .with_rules(&[udp_allow("10.0.0.0/8", None)])
+            .unwrap();
+        udp_only.floor = FloorMode::MetadataAndLoopback;
+        let udp_only = udp_only.with_private_floor(&[]).unwrap();
+        assert!(udp_only.private_floor_blocks(ip("10.1.2.3")));
+
+        // The strict floor is not ours to reopen.
+        let mut strict = EgressPolicy::unrestricted();
+        strict.floor = FloorMode::Strict;
+        let strict = strict.with_private_floor(&[]).unwrap();
+        assert!(!strict.private_floor_blocks(ip("10.1.2.3")));
+    }
+
+    #[test]
+    fn non_udp_allow_rules_keep_reopening_the_private_floor() {
+        let any_transport = EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: RuleAction::Allow,
+        };
+        let tcp_loopback = EgressRule {
+            transport: Some(FlowTransport::Tcp),
+            cidr: Some("127.0.0.0/8".to_string()),
+            ports: Some(smolvm_protocol::PortRange {
+                start: 443,
+                end: 443,
+            }),
+            action: RuleAction::Allow,
+        };
+        let icmp_v6 = EgressRule {
+            transport: Some(FlowTransport::Icmp),
+            cidr: Some("::/0".to_string()),
+            ports: None,
+            action: RuleAction::Allow,
+        };
+        let mut policy = EgressPolicy::unrestricted()
+            .with_rules(&[
+                tcp_loopback,
+                icmp_v6,
+                udp_allow("192.168.0.0/16", None),
+                any_transport,
+            ])
+            .unwrap();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy.with_private_floor(&[]).unwrap();
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+
+        for candidate in [policy.clone(), policy.deny_all_datagrams()] {
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Tcp, ip("10.1.1.1"), Some(443)),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Udp, ip("10.1.1.1"), Some(123)),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Tcp, ip("127.0.0.1"), Some(443)),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Icmp, ip("::1"), None),
+                Some(RuleAction::Allow)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Udp, ip("192.168.1.1"), Some(123)),
+                Some(RuleAction::Deny)
+            );
+            assert_eq!(
+                candidate.rule_action(FlowTransport::Icmp, ip("fe80::1"), None),
+                Some(RuleAction::Deny)
+            );
+        }
+    }
+
+    #[test]
+    fn a_replaced_rule_list_reaches_every_clone_and_keeps_the_private_exceptions() {
+        let allow_list = render_live_policy(&["198.51.100.0/24".to_string()], &[]);
+        let mut policy = EgressPolicy::new(Some(&["198.51.100.0/24".to_string()]), None)
+            .with_rules(&[deny_cidr("192.0.2.128/25")])
+            .unwrap();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy
+            .with_private_floor(&["10.1.0.0/16".to_string()])
+            .unwrap();
+        let datagrams = policy.deny_all_datagrams();
+        let gateway_copy = policy.clone();
+        let udp = |destination: &str| {
+            crate::udp_relay::should_relay_udp(destination.parse().unwrap(), &datagrams)
+        };
+        assert!(!udp("192.0.2.10:3478"));
+        assert!(udp("10.1.2.3:123"));
+
+        policy
+            .replace_allow_list(&format!(
+                "{allow_list}{}",
+                render_live_rules(&[
+                    deny_cidr("192.0.2.128/25"),
+                    udp_allow("192.0.2.0/24", Some((3478, 3478))),
+                ])
+                .unwrap()
+            ))
+            .unwrap();
+        assert!(udp("192.0.2.10:3478"));
+        assert!(!udp("192.0.2.10:3479"));
+        assert!(!udp("192.0.2.200:3478"), "the deny CIDR still wins");
+        assert!(udp("10.1.2.3:123"), "the private exception is kept");
+        assert!(!udp("10.2.0.1:123"));
+        assert!(gateway_copy.allows_flow(
+            FlowTransport::Udp,
+            "192.0.2.10".parse().unwrap(),
+            Some(3478)
+        ));
+
+        policy.replace_allow_list(&allow_list).unwrap();
+        assert!(udp("192.0.2.10:3478"), "no rule line keeps the rules");
+
+        assert!(policy.replace_allow_list("rules not-json\n").is_err());
+        assert!(policy
+            .replace_allow_list(&render_live_rules(&[udp_allow("not-a-cidr", None)]).unwrap())
+            .is_err());
+        assert!(udp("192.0.2.10:3478"), "a refused list keeps the rules");
+        assert!(gateway_copy.allows_v4(Ipv4Addr::new(198, 51, 100, 1)));
+
+        policy
+            .replace_allow_list(&format!("{allow_list}{}", render_live_rules(&[]).unwrap()))
+            .unwrap();
+        assert!(!udp("192.0.2.10:3478"));
+        assert!(udp("10.1.2.3:123"));
+        assert!(policy.is_restricted());
+    }
+
+    #[test]
+    fn udp_allow_rules_admit_only_udp_outside_the_interceptor() {
+        let policy = EgressPolicy::new(Some(&[]), None)
+            .with_rules(&[udp_allow("192.0.2.0/24", Some((443, 443)))])
+            .unwrap();
+        let ip = "192.0.2.10".parse().unwrap();
+        assert!(policy.allows_flow(FlowTransport::Udp, ip, Some(443)));
+        assert!(!policy.allows_flow(FlowTransport::Udp, ip, Some(444)));
+        assert!(!policy.allows_flow(FlowTransport::Tcp, ip, Some(443)));
+        assert!(!policy.allows_flow(FlowTransport::Icmp, ip, None));
+    }
+
+    #[test]
+    fn mediated_decisions_are_structured_and_dns_fails_closed_without_audit() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("decisions.jsonl");
+        let policy =
+            EgressPolicy::unrestricted().with_mediation_audit(path.clone(), [7; 16], [3; 16]);
+        assert!(policy.hostname_allowed("example.com"));
+        policy
+            .record_decision("tcp", "redirect", &"1.1.1.1:443", "broker_decision")
+            .unwrap();
+        let events: Vec<serde_json::Value> = std::fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0]["transport"], "dns");
+        assert_eq!(events[1]["action"], "redirect");
+        assert_eq!(events[1]["machineId"], "07".repeat(16));
+        assert_eq!(events[1]["parentId"], "03".repeat(16));
+
+        let unwritable = EgressPolicy::unrestricted().with_mediation_audit(
+            dir.path().to_path_buf(),
+            [7; 16],
+            [0; 16],
+        );
+        assert!(!unwritable.hostname_allowed("example.com"));
+    }
 
     #[test]
     fn floor_override_parsing() {
@@ -456,6 +1560,16 @@ mod tests {
         // Unrecognized falls through to the inferred default (None).
         assert_eq!(parse_floor_override(""), None);
         assert_eq!(parse_floor_override("yes"), None);
+    }
+
+    #[test]
+    fn deny_all_admits_no_destination_and_resolves_no_name() {
+        let policy = EgressPolicy::deny_all();
+        assert!(policy.is_restricted());
+        assert!(!policy.allows_v4(Ipv4Addr::new(1, 1, 1, 1)));
+        assert!(!policy.allows_v6("2606:4700::1111".parse().unwrap()));
+        assert!(policy.dns_filter_active());
+        assert!(!policy.hostname_allowed("example.com"));
     }
 
     #[test]

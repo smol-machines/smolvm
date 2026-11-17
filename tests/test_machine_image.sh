@@ -58,6 +58,38 @@ test_create_with_image() {
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
 }
 
+# A mirror changes where layers are fetched, but the machine still asks the
+# guest for its original image reference on startup and later execs.
+test_mirrored_image_is_cached_under_original_reference() {
+    local vm_name="mirror-image-test-$$"
+    local cfg_dir
+    cfg_dir=$(mktemp -d)
+    cat > "$cfg_dir/config.toml" <<'TOML'
+[images.registries."smolvm-mirror.invalid"]
+mirror = "mirror.gcr.io"
+TOML
+
+    local result=0
+    $SMOLVM machine create --name "$vm_name" --image smolvm-mirror.invalid/library/alpine:latest --net \
+        --cpus 1 --mem 1024 --storage 3 --overlay 2 2>&1 || result=1
+    if [[ $result -eq 0 ]]; then
+        SMOLVM_CONFIG="$cfg_dir/config.toml" \
+            run_with_timeout 120 "$SMOLVM" machine start --name "$vm_name" 2>&1 || result=1
+    fi
+    if [[ $result -eq 0 ]]; then
+        $SMOLVM machine images --name "$vm_name" --json \
+            | grep -q 'smolvm-mirror.invalid/library/alpine:latest' || result=1
+    fi
+    if [[ $result -eq 0 ]]; then
+        $SMOLVM machine exec --name "$vm_name" -- cat /etc/os-release \
+            | grep -q 'Alpine' || result=1
+    fi
+    $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    rm -rf "$cfg_dir"
+    return "$result"
+}
+
 test_create_with_image_and_env() {
     local vm_name="create-env-test-$$"
 
@@ -376,7 +408,38 @@ test_exec_join_documents_user_behavior() {
 }
 
 
+# cp on an image machine reads and writes the container filesystem its execs
+# run in, both directions.
+test_cp_matches_exec_on_image_machine() {
+    local vm_name="cp-image-test-$$"
+    local dir
+    dir=$(mktemp -d)
+    cleanup_cp_image() {
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+        rm -rf "$dir"
+    }
+
+    $SMOLVM machine create --name "$vm_name" --image alpine:3.20 --net 2>&1 || { cleanup_cp_image; return 1; }
+    run_with_timeout 120 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || { cleanup_cp_image; return 1; }
+
+    local content="to the container $(date +%s)"
+    echo "$content" > "$dir/up.txt"
+    $SMOLVM machine cp "$dir/up.txt" "$vm_name":/root/up.txt 2>&1 || { echo "Upload failed"; cleanup_cp_image; return 1; }
+    local seen
+    seen=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- cat /root/up.txt 2>&1)
+    [[ "$seen" == "$content" ]] || { echo "exec read '$seen', want '$content'"; cleanup_cp_image; return 1; }
+
+    run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- sh -c 'cat /etc/alpine-release > /root/down.txt' 2>&1 || { cleanup_cp_image; return 1; }
+    $SMOLVM machine cp "$vm_name":/root/down.txt "$dir/down.txt" 2>&1 || { echo "Download failed"; cleanup_cp_image; return 1; }
+    [[ "$(cat "$dir/down.txt")" == 3.20* ]] || { echo "cp read '$(cat "$dir/down.txt")' from outside the container"; cleanup_cp_image; return 1; }
+
+    cleanup_cp_image
+}
+
 run_test "Create with --image" test_create_with_image || true
+run_test "Mirrored pull keeps original image reference" test_mirrored_image_is_cached_under_original_reference || true
+run_test "cp: reads and writes the container filesystem exec uses" test_cp_matches_exec_on_image_machine || true
 run_test "Create with --image + env" test_create_with_image_and_env || true
 run_test "Update: settings applied on next start + refuses running VM" test_update_settings_applied_on_start || true
 run_test "Update: env var applied on next start (image-based)" test_update_env_applied_on_start || true

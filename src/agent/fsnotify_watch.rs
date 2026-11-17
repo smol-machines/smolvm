@@ -27,13 +27,21 @@ use crate::agent::AgentClient;
 use crate::data::storage::HostMount;
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 use smolvm_protocol::{fsnotify_mask, FsNotifyEvent};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::Duration;
+use std::time::{Duration, Instant, SystemTime};
 use tracing::{debug, info, warn};
+
+/// Whether host directories are watched at all. Setting SMOL_NO_HOT_RELOAD
+/// disables it (e.g. very large trees, or privacy preference); the launcher
+/// asks too, since a share may only keep negative entries while it is watched.
+pub fn watching_enabled() -> bool {
+    std::env::var_os("SMOL_NO_HOT_RELOAD").is_none()
+}
 
 /// Guest mountpoint root for virtiofs devices. MUST match the agent's
 /// `paths::VIRTIOFS_MOUNT_ROOT` — the agent stages each `-v` device at
@@ -95,9 +103,27 @@ impl FsNotifyWatcher {
         socket_path: PathBuf,
         mounts: impl IntoIterator<Item = (PathBuf, String)>,
     ) -> Option<Self> {
-        // Opt-out escape hatch: setting SMOL_NO_HOT_RELOAD disables host FS
-        // watching entirely (e.g. very large trees, or privacy preference).
-        if std::env::var_os("SMOL_NO_HOT_RELOAD").is_some() {
+        Self::start_with(socket_path, mounts, false)
+    }
+
+    /// [`Self::start_tagged`] for a process forked from a multithreaded parent
+    /// without exec. On macOS the native watcher (FSEvents) uses CoreFoundation,
+    /// which the Objective-C runtime aborts in such a child, so changes are
+    /// polled instead. Elsewhere this is the native watcher.
+    #[doc(hidden)]
+    pub fn start_tagged_after_fork(
+        socket_path: PathBuf,
+        mounts: impl IntoIterator<Item = (PathBuf, String)>,
+    ) -> Option<Self> {
+        Self::start_with(socket_path, mounts, cfg!(target_os = "macos"))
+    }
+
+    fn start_with(
+        socket_path: PathBuf,
+        mounts: impl IntoIterator<Item = (PathBuf, String)>,
+        poll: bool,
+    ) -> Option<Self> {
+        if !watching_enabled() {
             return None;
         }
 
@@ -120,7 +146,7 @@ impl FsNotifyWatcher {
         let stop_thread = stop.clone();
         let handle = std::thread::Builder::new()
             .name("fsnotify-watch".into())
-            .spawn(move || run_watch(socket_path, targets, stop_thread))
+            .spawn(move || run_watch(socket_path, targets, stop_thread, poll))
             .ok()?;
 
         Some(Self {
@@ -140,14 +166,27 @@ impl Drop for FsNotifyWatcher {
 }
 
 /// Watcher thread body: owns the OS watcher + a dedicated agent connection.
-fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>) {
+/// How often the polling watcher (forked children on macOS) rescans.
+const POLL_INTERVAL: Duration = Duration::from_secs(1);
+
+fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>, poll: bool) {
     let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
 
-    let mut watcher = match notify::recommended_watcher(move |res| {
-        // The receiver is dropped only when this thread exits, so a send error
-        // just means we're shutting down.
+    // The receiver is dropped only when this thread exits, so a send error
+    // just means we're shutting down.
+    let handler = move |res| {
         let _ = tx.send(res);
-    }) {
+    };
+    let watcher: notify::Result<Box<dyn Watcher + Send>> = if poll {
+        notify::PollWatcher::new(
+            handler,
+            notify::Config::default().with_poll_interval(POLL_INTERVAL),
+        )
+        .map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+    } else {
+        notify::recommended_watcher(handler).map(|w| Box::new(w) as Box<dyn Watcher + Send>)
+    };
+    let mut watcher = match watcher {
         Ok(w) => w,
         Err(e) => {
             warn!(error = %e, "failed to create host fs watcher; hot-reload propagation disabled");
@@ -172,6 +211,7 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         mounts = targets.len(),
         "host→guest fsnotify propagation active (hot-reload)"
     );
+    let mut announced = Announced::default();
 
     while !stop.load(Ordering::SeqCst) {
         // Block briefly so we notice `stop` without a busy loop.
@@ -183,13 +223,14 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         };
 
         let mut batch = Vec::new();
-        collect_events(&first, &targets, &mut batch);
+        announced.prune();
+        collect_events(&first, &targets, &mut announced, &mut batch);
 
         // Coalesce the rest of the burst (a save fans out into several events).
-        let deadline = std::time::Instant::now() + COALESCE_WINDOW;
-        while let Some(remaining) = deadline.checked_duration_since(std::time::Instant::now()) {
+        let deadline = Instant::now() + COALESCE_WINDOW;
+        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
             match rx.recv_timeout(remaining) {
-                Ok(Ok(ev)) => collect_events(&ev, &targets, &mut batch),
+                Ok(Ok(ev)) => collect_events(&ev, &targets, &mut announced, &mut batch),
                 Ok(Err(_)) => {}
                 Err(_) => break,
             }
@@ -227,8 +268,157 @@ fn connect_to_agent(socket_path: &Path, stop: &AtomicBool) -> Option<AgentClient
     None
 }
 
+/// Maximum depth to inspect for recent file modifications when a directory event fires.
+const MAX_DIR_SCAN_DEPTH: usize = 3;
+
+/// Maximum number of recent child events to emit from a single directory event
+/// to avoid flooding vsock if a large directory is touched.
+const MAX_DIR_SCAN_EVENTS: usize = 64;
+
+/// Time window within which a file's mtime is considered to match the event.
+const RECENT_MTIME_WINDOW: Duration = Duration::from_secs(2);
+/// More files than this remembered at once means an event storm; the memory is
+/// cleared rather than grown, at the cost of a few repeated announcements.
+const ANNOUNCED_MAX: usize = 8192;
+
+/// The host's modification time of a file and, where the host keeps one, its
+/// change time: together they move with any write, truncate, rename, chmod or
+/// chown.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Stamp {
+    mtime: Option<SystemTime>,
+    ctime: Option<(i64, i64)>,
+}
+
+impl Stamp {
+    fn of(meta: &std::fs::Metadata) -> Self {
+        #[cfg(unix)]
+        let ctime = {
+            use std::os::unix::fs::MetadataExt;
+            Some((meta.ctime(), meta.ctime_nsec()))
+        };
+        #[cfg(not(unix))]
+        let ctime = None;
+        Stamp {
+            mtime: meta.modified().ok(),
+            ctime,
+        }
+    }
+}
+
+/// Files already announced to the guest, by guest path, with the host stamp
+/// they carried then. On macOS a burst of writes arrives mostly as events on the
+/// directory, each of which makes the watcher scan for recently modified files,
+/// and the same files turn up scan after scan while the burst lasts. Every
+/// announcement makes the guest kernel expire its cached entry for the file and
+/// look it up again on next use, so during a build or an install the guest paid
+/// two or more extra round trips per file it had itself just written. A file is
+/// announced once per change: again only when its stamp has moved.
+#[derive(Default)]
+struct Announced {
+    files: HashMap<String, (Stamp, Instant)>,
+}
+
+impl Announced {
+    /// Whether `path` carrying `stamp` is news to the guest; records it so.
+    fn is_news(&mut self, path: &str, stamp: Stamp) -> bool {
+        if matches!(self.files.get(path), Some((seen, _)) if *seen == stamp) {
+            return false;
+        }
+        if self.files.len() >= ANNOUNCED_MAX {
+            self.files.clear();
+        }
+        self.files.insert(path.to_string(), (stamp, Instant::now()));
+        true
+    }
+
+    /// Forget files a scan can no longer turn up: one modified before the
+    /// window was announced at least that long ago.
+    fn prune(&mut self) {
+        let now = Instant::now();
+        self.files
+            .retain(|_, (_, at)| now.duration_since(*at) <= RECENT_MTIME_WINDOW);
+    }
+}
+
+/// Directories that should not be traversed during directory rescans.
+fn is_ignored_dir(name: &str) -> bool {
+    matches!(
+        name,
+        ".git"
+            | "node_modules"
+            | "target"
+            | "dist"
+            | "build"
+            | ".next"
+            | ".cache"
+            | ".turbo"
+            | ".venv"
+            | "__pycache__"
+    )
+}
+
+/// Recursively find files within `dir` modified within `threshold`.
+fn find_recent_files(
+    dir: &Path,
+    threshold: Duration,
+    max_depth: usize,
+    results: &mut Vec<(PathBuf, Stamp)>,
+) {
+    if max_depth == 0 || results.len() >= MAX_DIR_SCAN_EVENTS {
+        return;
+    }
+
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return;
+    };
+
+    let now = std::time::SystemTime::now();
+
+    for entry in entries.flatten() {
+        if results.len() >= MAX_DIR_SCAN_EVENTS {
+            break;
+        }
+
+        let Ok(file_type) = entry.file_type() else {
+            continue;
+        };
+
+        let file_name = entry.file_name();
+        let name_str = file_name.to_string_lossy();
+
+        if file_type.is_dir() {
+            if is_ignored_dir(&name_str) {
+                continue;
+            }
+            find_recent_files(&entry.path(), threshold, max_depth - 1, results);
+        } else if file_type.is_file() || file_type.is_symlink() {
+            if let Ok(meta) = entry.metadata() {
+                if let Ok(mtime) = meta.modified() {
+                    let is_recent = if let Ok(elapsed) = now.duration_since(mtime) {
+                        elapsed <= threshold
+                    } else if let Ok(future) = mtime.duration_since(now) {
+                        future <= threshold
+                    } else {
+                        false
+                    };
+
+                    if is_recent {
+                        results.push((entry.path(), Stamp::of(&meta)));
+                    }
+                }
+            }
+        }
+    }
+}
+
 /// Translate one host event into guest-side [`FsNotifyEvent`]s, appended to `out`.
-fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotifyEvent>) {
+fn collect_events(
+    event: &Event,
+    targets: &[WatchTarget],
+    announced: &mut Announced,
+    out: &mut Vec<FsNotifyEvent>,
+) {
     for host_path in &event.paths {
         let Some(t) = matching_target(host_path, targets) else {
             continue;
@@ -236,19 +426,61 @@ fn collect_events(event: &Event, targets: &[WatchTarget], out: &mut Vec<FsNotify
         let Ok(rel) = host_path.strip_prefix(&t.host_source) else {
             continue;
         };
-        // The watched root itself firing (empty rel) carries no useful child.
-        if rel.as_os_str().is_empty() {
-            continue;
-        }
 
         if host_path.exists() {
-            // Create/modify/attrib on an existing path: fire directly on it.
-            // fsnotify_dentry() in the guest propagates to the parent dir's
-            // watchers with the child name, so both file- and dir-watches fire.
-            out.push(FsNotifyEvent {
-                path: join_guest(&t.guest_base, rel),
-                mask: mask_for(&event.kind, host_path),
-            });
+            if host_path.is_dir() {
+                // On macOS, FSEvents often notifies at the directory level rather
+                // than reporting individual file changes. Scan the directory for
+                // files modified within the coalesce window so file-level watchers
+                // in the guest (e.g. Vite HMR, Webpack, Chokidar) receive events
+                // for the actual changed files rather than only an anonymous
+                // directory-level modification.
+                let mut recent_files = Vec::new();
+                find_recent_files(
+                    host_path,
+                    RECENT_MTIME_WINDOW,
+                    MAX_DIR_SCAN_DEPTH,
+                    &mut recent_files,
+                );
+
+                for (child_path, stamp) in recent_files {
+                    if let Ok(child_rel) = child_path.strip_prefix(&t.host_source) {
+                        let path = join_guest(&t.guest_base, child_rel);
+                        if announced.is_news(&path, stamp) {
+                            out.push(FsNotifyEvent {
+                                path,
+                                mask: mask_for(&event.kind, &child_path),
+                            });
+                        }
+                    }
+                }
+
+                // If this is a subdirectory (not the watched root itself), also
+                // fire on the directory itself so directory-level watchers wake.
+                if !rel.as_os_str().is_empty() {
+                    out.push(FsNotifyEvent {
+                        path: join_guest(&t.guest_base, rel),
+                        mask: mask_for(&event.kind, host_path),
+                    });
+                }
+            } else {
+                // Regular file: fire directly on it. fsnotify_dentry() in the
+                // guest propagates to the parent dir's watchers with the child
+                // name, so both file- and dir-watches fire. Remembered with
+                // its stamp so the directory scans that follow the same
+                // change do not announce it a second time.
+                let path = join_guest(&t.guest_base, rel);
+                let news = match std::fs::metadata(host_path) {
+                    Ok(meta) => announced.is_news(&path, Stamp::of(&meta)),
+                    Err(_) => true,
+                };
+                if news {
+                    out.push(FsNotifyEvent {
+                        path,
+                        mask: mask_for(&event.kind, host_path),
+                    });
+                }
+            }
         } else if let Some(parent) = rel.parent() {
             // The guest may still cache the removed path. Send the exact name
             // so the kernel can expire that entry and preserve the filename in
@@ -306,9 +538,18 @@ fn mask_for(kind: &EventKind, path: &Path) -> u32 {
 }
 
 /// Sort + drop duplicate (path, mask) pairs produced within one burst.
+/// One event per path, carrying every mask the batch had for it: the guest
+/// fires all of them from a single write, and expires the entry once.
 fn dedup(batch: &mut Vec<FsNotifyEvent>) {
-    batch.sort_by(|a, b| a.path.cmp(&b.path).then(a.mask.cmp(&b.mask)));
-    batch.dedup_by(|a, b| a.path == b.path && a.mask == b.mask);
+    batch.sort_by(|a, b| a.path.cmp(&b.path));
+    batch.dedup_by(|later, kept| {
+        if later.path == kept.path {
+            kept.mask |= later.mask;
+            true
+        } else {
+            false
+        }
+    });
 }
 
 #[cfg(test)]
@@ -343,7 +584,7 @@ mod tests {
             attrs: Default::default(),
         };
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
         assert_eq!(out.len(), 2);
         assert_eq!(out[0].path, "/run/smolvm/virtiofs/smolvm0/src/gone.js");
         assert_eq!(out[0].mask, fsnotify_mask::FS_DELETE);
@@ -365,7 +606,7 @@ mod tests {
             attrs: Default::default(),
         };
         let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut out);
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
         assert!(out.is_empty());
     }
 
@@ -386,6 +627,84 @@ mod tests {
     }
 
     #[test]
+    fn dedup_merges_the_masks_of_one_path() {
+        let mut batch = vec![
+            FsNotifyEvent {
+                path: "/a".into(),
+                mask: fsnotify_mask::FS_CREATE,
+            },
+            FsNotifyEvent {
+                path: "/b".into(),
+                mask: fsnotify_mask::FS_MODIFY,
+            },
+            FsNotifyEvent {
+                path: "/a".into(),
+                mask: fsnotify_mask::FS_MODIFY,
+            },
+        ];
+        dedup(&mut batch);
+        assert_eq!(batch.len(), 2);
+        assert_eq!(batch[0].path, "/a");
+        assert_eq!(
+            batch[0].mask,
+            fsnotify_mask::FS_CREATE | fsnotify_mask::FS_MODIFY
+        );
+    }
+
+    #[test]
+    fn a_scanned_file_is_announced_once_until_it_changes() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let file = project_dir.join("out.txt");
+        std::fs::write(&file, "one").expect("write");
+        let targets = vec![WatchTarget {
+            host_source: project_dir.clone(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+        let dir_event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![project_dir.clone()],
+            attrs: Default::default(),
+        };
+        let mut announced = Announced::default();
+        let file_path = "/run/smolvm/virtiofs/smolvm0/out.txt";
+
+        let mut first = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut first);
+        assert!(first.iter().any(|e| e.path == file_path), "{first:?}");
+
+        // the same burst, another directory event: the file is not news
+        let mut second = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut second);
+        assert!(second.is_empty(), "{second:?}");
+
+        // nor is a file event for the unchanged file
+        let file_event = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Data(
+                notify::event::DataChange::Content,
+            )),
+            paths: vec![file.clone()],
+            attrs: Default::default(),
+        };
+        let mut third = Vec::new();
+        collect_events(&file_event, &targets, &mut announced, &mut third);
+        assert!(third.is_empty(), "{third:?}");
+
+        // a change moves the stamp, and the file is announced again
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&file, "two").expect("rewrite");
+        let mut fourth = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut fourth);
+        assert!(fourth.iter().any(|e| e.path == file_path), "{fourth:?}");
+
+        // pruning within the window keeps the memory
+        announced.prune();
+        let mut fifth = Vec::new();
+        collect_events(&dir_event, &targets, &mut announced, &mut fifth);
+        assert!(fifth.is_empty(), "{fifth:?}");
+    }
+
+    #[test]
     fn nested_mount_uses_most_specific_target() {
         let targets = vec![
             WatchTarget {
@@ -397,5 +716,102 @@ mod tests {
         let selected = matching_target(Path::new("/host/project/vendor/lib.js"), &targets)
             .expect("nested path should match");
         assert_eq!(selected.guest_base, "/run/smolvm/virtiofs/smolvm1");
+    }
+
+    #[test]
+    fn directory_event_uncovers_recent_child_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let src_dir = project_dir.join("src");
+        std::fs::create_dir_all(&src_dir).expect("create src dir");
+        let app_file = src_dir.join("app.js");
+        std::fs::write(&app_file, "console.log('hello')").expect("write app.js");
+
+        let targets = vec![WatchTarget {
+            host_source: project_dir,
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+
+        let ev = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![src_dir],
+            attrs: Default::default(),
+        };
+
+        let mut out = Vec::new();
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
+
+        // Should contain both the child file event (for Vite/Chokidar) and the directory event
+        assert!(
+            out.iter()
+                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/src/app.js"
+                    && (e.mask & fsnotify_mask::FS_MODIFY) != 0
+                    && (e.mask & fsnotify_mask::FS_ISDIR) == 0),
+            "expected file-level event for app.js without FS_ISDIR, got: {out:?}"
+        );
+        assert!(
+            out.iter()
+                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/src"
+                    && (e.mask & fsnotify_mask::FS_ISDIR) != 0),
+            "expected directory-level event for src with FS_ISDIR, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn root_directory_event_uncovers_recent_top_level_files() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let config_file = project_dir.join("vite.config.ts");
+        std::fs::write(&config_file, "export default {}").expect("write vite.config.ts");
+
+        let targets = vec![WatchTarget {
+            host_source: project_dir.clone(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+
+        let ev = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![project_dir],
+            attrs: Default::default(),
+        };
+
+        let mut out = Vec::new();
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
+
+        assert!(
+            out.iter()
+                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/vite.config.ts"
+                    && (e.mask & fsnotify_mask::FS_MODIFY) != 0),
+            "expected file-level event for top-level vite.config.ts, got: {out:?}"
+        );
+    }
+
+    #[test]
+    fn ignored_directories_are_skipped() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let project_dir = temp_dir.path().to_path_buf();
+        let node_modules_dir = project_dir.join("node_modules").join("dep");
+        std::fs::create_dir_all(&node_modules_dir).expect("create node_modules");
+        let dep_file = node_modules_dir.join("index.js");
+        std::fs::write(&dep_file, "module.exports = {}").expect("write dep index.js");
+
+        let targets = vec![WatchTarget {
+            host_source: project_dir.clone(),
+            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+        }];
+
+        let ev = Event {
+            kind: EventKind::Modify(notify::event::ModifyKind::Any),
+            paths: vec![project_dir],
+            attrs: Default::default(),
+        };
+
+        let mut out = Vec::new();
+        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
+
+        assert!(
+            !out.iter().any(|e| e.path.contains("node_modules")),
+            "expected node_modules files to be ignored, got: {out:?}"
+        );
     }
 }

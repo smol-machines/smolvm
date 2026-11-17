@@ -38,7 +38,7 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
     // machines). Falls back to `None` if the DB read fails.
     let machines = state.list_vm_records().await.ok().map(|vms| {
         let total = vms.len();
-        let running = vms.iter().filter(|(_, r)| r.is_process_alive()).count();
+        let running = vms.iter().filter(|(_, r)| r.process_can_run()).count();
         MachineCountsResponse { total, running }
     });
     let uptime = SERVER_START.get().map(|t| t.elapsed().as_secs());
@@ -48,6 +48,7 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
         version: crate::VERSION,
         machines,
         uptime_seconds: uptime,
+        nested_virt: state.nested_virt_allowed(),
     })
 }
 

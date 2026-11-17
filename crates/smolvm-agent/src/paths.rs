@@ -32,6 +32,11 @@ pub const CRUN_CGROUP_MANAGER: &str = "disabled";
 // backs the bind itself.
 pub const VIRTIOFS_MOUNT_ROOT: &str = "/run/smolvm/virtiofs";
 
+/// Root directory for the clones of host directories that map the directory's
+/// owner to the workload user (see `mount_owner`). Internal staging like the
+/// virtiofs root above, and outside `/mnt` for the same reason.
+pub const IDMAPPED_MOUNT_ROOT: &str = "/run/smolvm/idmapped";
+
 /// Guest path at which the shared workspace is exposed inside containers.
 /// Used both when mounting /storage/workspace as the fallback workspace and
 /// when checking whether a user-provided volume already claims this path.
@@ -128,5 +133,13 @@ mod tests {
         let staging = std::path::Path::new(VIRTIOFS_MOUNT_ROOT);
         assert!(staging.starts_with("/run/smolvm"));
         assert!(!staging.starts_with("/mnt"));
+    }
+
+    #[test]
+    fn owner_mapped_staging_is_not_below_the_user_mount_tree_or_another_staging_root() {
+        let staging = std::path::Path::new(IDMAPPED_MOUNT_ROOT);
+        assert!(staging.starts_with("/run/smolvm"));
+        assert!(!staging.starts_with("/mnt"));
+        assert!(!staging.starts_with(VIRTIOFS_MOUNT_ROOT));
     }
 }

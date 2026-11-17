@@ -50,6 +50,7 @@ loaded and your user is in the `kvm` group.
   `nix-bump-<version>` branch and tries to open a PR. **The bump only reaches
   users once that PR is merged**, so check for an unmerged `nix-bump-*` branch
   if the flake lags the latest release. `./scripts/update-nix-hashes.sh VERSION`
-  refreshes the hashes by hand from a release's `checksums.sha256`.
+  refreshes the hashes by hand from a release's `checksums.sha256`; set
+  `version` first, since it rewrites only the hashes.
 - A submission to the upstream **nixpkgs** collection is planned so
   `nix profile install nixpkgs#smolvm` works without referencing this flake.

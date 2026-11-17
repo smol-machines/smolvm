@@ -411,7 +411,7 @@ fn parse_echo_reply(destination: IpAddr, bytes: &[u8]) -> Option<(u16, Vec<u8>)>
 /// Whether the gateway should relay a guest echo to this destination. Echo
 /// obeys the same egress policy as TCP/UDP (static CIDRs + DNS-learned IPs).
 pub fn should_relay_icmp(destination: IpAddr, egress: &EgressPolicy) -> bool {
-    egress.allows(destination)
+    egress.allows_flow(smolvm_protocol::FlowTransport::Icmp, destination, None)
 }
 
 /// Decode a guest IPv4 ICMP echo *request* captured off the raw socket (a full

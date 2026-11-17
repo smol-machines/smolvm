@@ -392,7 +392,7 @@ impl Packer {
     /// libraries in the compressed assets. It is used for portable checkpoints,
     /// which are consumed by an installed smolvm rather than executed directly.
     pub fn pack_artifact(self, output: impl AsRef<Path>) -> Result<PackedInfo> {
-        self.pack_artifact_inner(output.as_ref(), false)
+        self.pack_artifact_inner(output.as_ref(), false, None)
             .map(|(info, _)| info)
     }
 
@@ -402,14 +402,32 @@ impl Packer {
         self,
         output: impl AsRef<Path>,
     ) -> Result<(PackedInfo, PackedArtifactIdentity)> {
-        self.pack_artifact_inner(output.as_ref(), true)
+        self.pack_artifact_inner(output.as_ref(), true, None)
             .map(|(info, identity)| (info, identity.expect("digest requested")))
+    }
+
+    /// Pack immutable streamed RAM alongside staged checkpoint assets.
+    /// The runtime must confirm complete output before the artifact is published.
+    /// This does not retain a separate mappable prepared-memory backing.
+    pub fn pack_checkpoint_stream(
+        self,
+        output: impl AsRef<Path>,
+        stream: &mut crate::checkpoint_stream::CheckpointStream<'_>,
+    ) -> Result<PackedInfo> {
+        if self.asset_collector.is_none() {
+            return Err(crate::PackError::AssetNotFound(
+                "streamed checkpoint staging".into(),
+            ));
+        }
+        self.pack_artifact_inner(output.as_ref(), false, Some(stream))
+            .map(|(info, _)| info)
     }
 
     fn pack_artifact_inner(
         self,
         output: &Path,
         compute_digest: bool,
+        stream: Option<&mut crate::checkpoint_stream::CheckpointStream<'_>>,
     ) -> Result<(PackedInfo, Option<PackedArtifactIdentity>)> {
         let parent = artifact_parent(output);
         prepare_artifact_parent(parent)?;
@@ -424,7 +442,11 @@ impl Packer {
             digest_error: None,
         });
         let mut artifact = if let Some(collector) = &self.asset_collector {
-            collector.compress_to(artifact, false)?
+            if let Some(stream) = stream {
+                collector.compress_checkpoint_to(artifact, stream)?
+            } else {
+                collector.compress_to(artifact, false)?
+            }
         } else {
             let encoder = zstd::stream::Encoder::new(artifact, 1)?;
             let tar_builder = tar::Builder::new(encoder);

@@ -54,6 +54,9 @@ pub type ExitWatch = watch::Receiver<Option<ExitInfo>>;
 ///
 /// Process addressing follows the Task API: `(container_id, exec_id)`, where
 /// an empty exec_id means the container's init process.
+// async-trait before 0.1.92 marks each boxed future `#[must_use]`, which
+// clippy::double_must_use rejects since Rust 1.99 because the future already is.
+#[allow(clippy::double_must_use)]
 #[async_trait]
 pub trait PodBackend: Send + Sync + 'static {
     /// Boot the sandbox VM for this pod. Called once, from the sandbox

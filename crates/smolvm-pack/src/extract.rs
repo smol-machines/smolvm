@@ -90,8 +90,9 @@ pub(crate) fn lock_file_exclusive(lock_file: &fs::File) -> std::io::Result<()> {
     Ok(())
 }
 
-/// Set a Unix file mode on `path`, ignoring errors. No-op on non-Unix targets
-/// (Windows has no POSIX mode bits).
+/// Set a Unix file mode on `path`, ignoring errors. Windows has no POSIX mode
+/// bits, so there only the owner-write bit applies, as the read-only attribute
+/// tar sets on an entry archived without it.
 #[inline]
 fn set_mode(path: &Path, mode: u32) {
     #[cfg(unix)]
@@ -100,7 +101,11 @@ fn set_mode(path: &Path, mode: u32) {
     }
     #[cfg(not(unix))]
     {
-        let _ = (path, mode);
+        if let Ok(meta) = std::fs::metadata(path) {
+            let mut perms = meta.permissions();
+            perms.set_readonly(mode & 0o200 == 0);
+            let _ = std::fs::set_permissions(path, perms);
+        }
     }
 }
 
@@ -296,6 +301,37 @@ fn packed_agent_mounts_userxattr(version: &str) -> bool {
 /// live in the `user.overlay.*` namespace; the guest then mounts the overlay
 /// with `userxattr`. Read by the agent.
 pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
+
+/// Whether the layers shared from `dir` carry their ownership in the override
+/// xattr, so the virtiofs server must present it. A machine shares the
+/// extraction's `layers/` dir, where the marker sits; the export helper shares
+/// the pack root above it, which only checked its own top level and so read
+/// every host-extracted layer with raw host owners: root as the VMM's uid and
+/// `_apt` as 65534, baked into the exported `.smolmachine`.
+pub fn shares_override_stat_layers(dir: &Path) -> bool {
+    dir.join(OPAQUE_XATTR_MARKER).is_file()
+        || dir.join("layers").join(OPAQUE_XATTR_MARKER).is_file()
+}
+/// Written beside the extraction marker once every staged layer tar has been
+/// unpacked on the host with its ownership recorded in the override xattr.
+/// A cache hit reads this instead of listing (and on macOS mounting) the
+/// layers to learn that nothing is left to upgrade.
+///
+/// The marker speaks for the extraction as a whole and carries no vintage: an
+/// entry unpacked before symlink owners were recorded keeps it. On Linux,
+/// [`HOST_LAYER_SYMLINKS_MARKER`] tracks that vintage instead. On macOS such
+/// a cache is refreshed by removing the extraction and making it again: it is
+/// the machine's own directory, so `machine delete` and a fresh create.
+const HOST_LAYERS_MARKER: &str = ".smolvm-host-layers";
+/// Written beside [`HOST_LAYERS_MARKER`] once every host-extracted layer file
+/// belongs to root on the host. Extractions before it chowned each file to its
+/// archived owner, which the per-VM idmapped mount cannot map; a cache hit
+/// without it repairs the entry once (see [`repair_host_layer_owners`]).
+const HOST_LAYER_OWNERS_MARKER: &str = ".smolvm-host-layer-owners";
+/// Written beside [`HOST_LAYERS_MARKER`] once the layers' symlink owners are
+/// recorded on their directories ([`SYMLINK_OWNERS_XATTR`]). A Linux cache hit
+/// without it records them once (see [`repair_host_layer_symlink_owners`]).
+const HOST_LAYER_SYMLINKS_MARKER: &str = ".smolvm-host-layer-symlinks";
 /// The xattr libkrun's virtiofs server reads ownership and mode from (the
 /// rootless-containers convention, `uid:gid:0mode`). Writing it lets an
 /// unprivileged host hand the guest an image's exact owners, setuid bits and
@@ -359,7 +395,10 @@ fn user_xattrs_supported(dir: &Path) -> bool {
     set_user_xattr(probe.path(), OVERRIDE_STAT_XATTR, b"0:0:0644").is_ok()
 }
 
-/// Set a user xattr on `path` itself (never following a symlink).
+/// Set a user xattr on `path` itself. On Unix that is `lsetxattr` (Linux) /
+/// `setxattr` with `XATTR_NOFOLLOW` (macOS), so a symlink is never followed;
+/// the Windows arm writes an alternate data stream instead, which a reparse
+/// point *would* redirect to its target, so callers must not hand it a link.
 fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
@@ -398,7 +437,16 @@ fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> 
     {
         // NTFS keeps xattrs as alternate data streams, which is where
         // libkrun's Windows server reads the override from.
-        fs::write(format!("{}:{}", path.display(), name), value)
+        //
+        // A stream is addressed as `<file>:<name>`, and `<file>` may not end
+        // in a separator. A tar directory entry is spelled `etc/`, so its
+        // joined path arrives here as `...\etc/`, and `...\etc/:name` is not
+        // a name Windows accepts (os error 123). Rebuilding the path from its
+        // components drops the trailing separator and nothing else.
+        let mut stream = path.components().collect::<PathBuf>().into_os_string();
+        stream.push(":");
+        stream.push(name);
+        fs::write(stream, value)
     }
     #[cfg(not(any(target_os = "macos", target_os = "linux", windows)))]
     {
@@ -416,6 +464,96 @@ fn record_override_stat(path: &Path, uid: u64, gid: u64, mode: u32) -> std::io::
         OVERRIDE_STAT_XATTR,
         format!("{uid}:{gid}:0{mode:o}").as_bytes(),
     )
+}
+
+/// Record a symlink entry's archived owner in the override xattr, on the link
+/// itself, best effort.
+///
+/// `set_user_xattr` is `lsetxattr` (Linux) / `setxattr` with `XATTR_NOFOLLOW`
+/// (macOS), so this never dereferences the link — a dangling link keeps its
+/// own record rather than creating, or re-owning, its target.
+///
+/// The mode is the 0777 that `symlink(2)` always gives a link, not the archived
+/// one: a mode is not settable on a symlink, so this matches what unpacking the
+/// same layer inside the guest produces, and what the guest sees when the
+/// layers are read through virtiofs or through the packed image's own unpack.
+///
+/// Returns whether the link now carries its record. Linux's `user.*` namespace
+/// does not cover symlinks at all (`EPERM`); there the owner goes in the parent
+/// directory's [`SYMLINK_OWNERS_XATTR`] instead. Where the filesystem does
+/// store user xattrs on links (APFS does) the record sits on the link.
+///
+/// Unix only: `set_user_xattr`'s Windows arm writes an alternate data stream,
+/// and on a reparse point that write lands on the *target*, which would give
+/// the target its link's owner whenever the link is extracted after it.
+fn record_symlink_override_stat(path: &Path, uid: u64, gid: u64) -> bool {
+    #[cfg(unix)]
+    {
+        record_override_stat(path, uid, gid, 0o777).is_ok()
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, uid, gid);
+        false
+    }
+}
+
+/// Where Linux keeps the owners of a directory's symlinks, which cannot carry
+/// user xattrs themselves: `name\0uid:gid\0` pairs on the directory. libkrun's
+/// Linux virtiofs server reads it, and presents an unrecorded link as root's,
+/// so only links owned by someone else need an entry.
+const SYMLINK_OWNERS_XATTR: &str = "user.krun.symlink_owners";
+
+/// Symlink owners that could not be recorded on the links, by directory.
+#[derive(Default)]
+struct PendingSymlinkOwners(
+    std::collections::BTreeMap<PathBuf, std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>>,
+);
+
+impl PendingSymlinkOwners {
+    /// Set (or, for root's, clear) the owner of the link at `path`. A later
+    /// entry at the same path replaces an earlier one, as on disk.
+    fn set(&mut self, path: &Path, owner: (u64, u64)) {
+        let (Some(dir), Some(name)) = (path.parent(), path.file_name()) else {
+            return;
+        };
+        let dir = normalize_path(dir);
+        if owner == (0, 0) {
+            if let Some(names) = self.0.get_mut(&dir) {
+                names.remove(name);
+            }
+        } else {
+            self.0
+                .entry(dir)
+                .or_default()
+                .insert(name.to_os_string(), owner);
+        }
+    }
+
+    /// Write each directory's record. Best effort, like the per-link record:
+    /// a directory whose record outgrows the filesystem's xattr space (a few
+    /// hundred non-root links in one ext4 directory) keeps its links root's.
+    fn write(self) {
+        for (dir, names) in self.0 {
+            if names.is_empty() {
+                continue;
+            }
+            let _ = set_user_xattr(&dir, SYMLINK_OWNERS_XATTR, &symlink_owners_record(&names));
+        }
+    }
+}
+
+fn symlink_owners_record(
+    names: &std::collections::BTreeMap<std::ffi::OsString, (u64, u64)>,
+) -> Vec<u8> {
+    let mut record = Vec::new();
+    for (name, (uid, gid)) in names {
+        record.extend_from_slice(name.as_encoded_bytes());
+        record.push(0);
+        record.extend_from_slice(format!("{uid}:{gid}").as_bytes());
+        record.push(0);
+    }
+    record
 }
 
 fn packed_agent_unpacks_staged_layers(version: &str) -> bool {
@@ -830,7 +968,34 @@ fn safe_unpack_with_policy<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
 ) -> std::io::Result<UnpackReport> {
+    safe_unpack_skipping(
+        archive,
+        dest,
+        limits,
+        checkpoint,
+        owner_xattr,
+        true,
+        &[],
+        &[],
+    )
+}
+
+/// [`safe_unpack_with_policy`], leaving out the archive paths in `skip` and
+/// everything under them.
+#[allow(clippy::too_many_arguments)]
+fn safe_unpack_skipping<R: Read>(
+    archive: &mut tar::Archive<R>,
+    dest: &Path,
+    limits: &SafeUnpackLimits,
+    checkpoint: bool,
+    owner_xattr: bool,
+    translate_whiteouts: bool,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+) -> std::io::Result<UnpackReport> {
     let mut report = UnpackReport::default();
+    let mut remaining: std::collections::HashSet<PathBuf> =
+        required.iter().map(|path| normalize_path(path)).collect();
     // Use `normalize_path` (not `canonicalize`) for the containment base so it
     // matches the per-entry `normalized` paths, which are built from this same
     // plain `dest`. On Windows `canonicalize` returns a `\\?\`-verbatim path
@@ -864,11 +1029,29 @@ fn safe_unpack_with_policy<R: Read>(
     // before its children in the tar stream (e.g., Fedora's mode-555
     // /usr/lib64/pm-utils/*.d directories).
     let mut deferred_dir_modes: Vec<(PathBuf, u32)> = Vec::new();
+    let mut symlink_owners = PendingSymlinkOwners::default();
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
         let entry_type = entry.header().entry_type();
         let entry_path = entry.path()?.to_path_buf();
+        if skip
+            .iter()
+            .any(|skip| normalize_path(&entry_path).starts_with(skip))
+        {
+            continue;
+        }
+        let normalized_entry = normalize_path(&entry_path);
+        let required_here = remaining.contains(&normalized_entry);
+        if required_here
+            && entry_type != tar::EntryType::Regular
+            && entry_type != tar::EntryType::GNUSparse
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "required checkpoint asset is not a regular file",
+            ));
+        }
         // RAM is a host runtime input, not a guest filesystem entry. Never
         // restore the exporting VMM's UID onto this shared cache object.
         let host_memory =
@@ -907,7 +1090,11 @@ fn safe_unpack_with_policy<R: Read>(
                 format!("tar archive exceeds max entry count ({max_entries})"),
             ));
         }
-        total_bytes = total_bytes.saturating_add(entry.header().size().unwrap_or(0));
+        // Charge what extraction writes: the bytes the entry stores. For a GNU
+        // sparse entry `size()` is its logical length, holes included, so a
+        // checkpoint of a 64 GiB disk holding 2 GiB was charged 64 GiB and a
+        // large machine's checkpoint was refused outright.
+        total_bytes = total_bytes.saturating_add(entry.header().entry_size().unwrap_or(0));
         if total_bytes > max_total_bytes {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -918,8 +1105,12 @@ fn safe_unpack_with_policy<R: Read>(
         // OCI whiteouts, translated here when the host describes ownership to
         // the guest: overlayfs wants a 0:0 character device (faked through the
         // override xattr on an empty file, since the host cannot mknod) and an
-        // opaque directory wants the `user.overlay.opaque` marker.
-        if owner_xattr {
+        // opaque directory wants the `user.overlay.opaque` marker. A pack's only
+        // layer has nothing under it to hide: smolvm writes it as a merged view
+        // (a from-VM export tars the overlay-mounted tree, an image pack is
+        // pre-merged), so a `.wh.` name in it is a file the machine holds, such
+        // as a container runtime's own overlay data, and is kept as one.
+        if owner_xattr && translate_whiteouts {
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
                 if name == ".wh..wh..opq" {
@@ -1140,6 +1331,14 @@ fn safe_unpack_with_policy<R: Read>(
             entry.header().gid().unwrap_or(0)
         };
 
+        // The owner the host copy gets. When the archived owner travels in the
+        // override xattr, the host copy belongs to root: under the per-VM uid
+        // drop the layers reach the VMM through an idmapped mount that maps
+        // only on-disk id 0, so a file left with its archived owner (42, mode
+        // 0600) could not be opened, nor its xattr read, and the guest saw
+        // 65534 and EACCES even as root.
+        let (host_uid, host_gid) = if owner_xattr { (0, 0) } else { (uid, gid) };
+
         // GNU sparse entries already carry an exact extent map. Let the tar
         // reader seek over those holes directly instead of expanding them and
         // rediscovering zero chunks in `unpack_sparse`. This is especially
@@ -1157,7 +1356,7 @@ fn safe_unpack_with_policy<R: Read>(
             // `Entry::unpack_in` handles the sparse extent stream, while these
             // final assignments retain safe_unpack's permission policy.
             set_mode(&full_path, entry.header().mode().unwrap_or(0o644) & 0o777);
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         // For large ordinary files use a sparse write: ftruncate creates the
         // hole skeleton, then we only pwrite non-zero 64 KiB chunks.  This
         // prevents 10 GiB overlay disks from materialising as dense files on
@@ -1171,7 +1370,7 @@ fn safe_unpack_with_policy<R: Read>(
                     format!("failed to unpack '{}': {}", entry_path.display(), e),
                 ));
             }
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         } else {
             if let Err(e) = entry.unpack_in(dest) {
                 // On macOS, certain entries fail to unpack due to platform
@@ -1202,37 +1401,63 @@ fn safe_unpack_with_policy<R: Read>(
             // Ownership after the mode is in place: chown clears setuid/setgid,
             // and the deferred directory pass below only restores modes, never
             // owners, so doing it here is the single point that applies.
-            set_owner(&full_path, uid, gid);
+            set_owner(&full_path, host_uid, host_gid);
         }
         if host_runtime && is_regular {
             set_mode(&full_path, 0o600);
         }
-        // Hard links share their target's xattr; symlinks cannot carry user
-        // xattrs on Linux and the server reads the host's stat for them anyway.
-        if owner_xattr
-            && entry_type != tar::EntryType::Link
-            && entry_type != tar::EntryType::Symlink
-        {
-            // The archived owner and mode (setuid bits included) go in the
-            // xattr the guest sees; the host copy stays readable so the VMM
-            // serving the files can open them.
-            let is_dir = entry_type == tar::EntryType::Directory;
-            let archived = entry
-                .header()
-                .mode()
-                .unwrap_or(if is_dir { 0o755 } else { 0o644 })
-                & 0o7777;
-            // Setting a user xattr needs write permission on the file, and
-            // the host copy must stay readable for the VMM, so the host mode
-            // always keeps owner read/write (the guest sees the archived one).
-            set_mode(
-                &full_path,
-                (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
-            );
-            record_override_stat(&full_path, uid, gid, archived)?;
+        // Hard links share their target's inode and xattr, so the target's own
+        // record covers them. A symlink is the case the host must describe
+        // itself: it cannot chown a link it does not own (no root), and the
+        // server presents the host's stat when no record exists — so every
+        // symlink in a packed image reached the guest owned by the host user,
+        // `/bin/sh` included, while the regular files beside it were right.
+        if owner_xattr && entry_type != tar::EntryType::Link {
+            if entry_type == tar::EntryType::Symlink {
+                let on_link = record_symlink_override_stat(&full_path, uid, gid);
+                // Only Linux's server reads the directory record.
+                let in_dir = !on_link && cfg!(target_os = "linux");
+                symlink_owners.set(&full_path, if in_dir { (uid, gid) } else { (0, 0) });
+            } else {
+                symlink_owners.set(&full_path, (0, 0));
+                // The archived owner and mode (setuid bits included) go in the
+                // xattr the guest sees; the host copy stays readable so the VMM
+                // serving the files can open them.
+                let is_dir = entry_type == tar::EntryType::Directory;
+                let archived = entry
+                    .header()
+                    .mode()
+                    .unwrap_or(if is_dir { 0o755 } else { 0o644 })
+                    & 0o7777;
+                // Setting a user xattr needs write permission on the file, and
+                // the host copy must stay readable for the VMM, so the host mode
+                // always keeps owner read/write (the guest sees the archived one).
+                set_mode(
+                    &full_path,
+                    (archived & 0o777) | if is_dir { 0o700 } else { 0o600 },
+                );
+                record_override_stat(&full_path, uid, gid, archived)?;
+            }
         }
         report.entries += 1;
+        if required_here {
+            remaining.remove(&normalized_entry);
+            if remaining.is_empty() {
+                break;
+            }
+        }
     }
+
+    if !remaining.is_empty() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint archive is missing required assets",
+        ));
+    }
+
+    // Before the directory modes below: setting a directory's xattr needs
+    // write permission on it, which the extraction still guarantees here.
+    symlink_owners.write();
 
     // Apply deferred directory permissions now that all children are written.
     //
@@ -1351,9 +1576,161 @@ pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
     Ok(base.join("smolvm-pack").join(format!("{:08x}", checksum)))
 }
 
+/// Mark a directory the caller filled with an artifact's complete payload as
+/// extracted, so later restores of the same artifact reuse it as is.
+pub fn mark_extracted(cache_dir: &Path) -> std::io::Result<()> {
+    fs::write(cache_dir.join(EXTRACTION_MARKER), "")?;
+    File::open(cache_dir)?.sync_all()
+}
+
+/// Mark an extraction incomplete before removing it, so a removal interrupted
+/// part-way (a crash, a restart) leaves a tree that is extracted again on its
+/// next use instead of one that still claims to be whole. The marker lives
+/// inside the tree, and `remove_dir_all` may reach it after the files a
+/// restore needs.
+pub fn invalidate_extraction(cache_dir: &Path) -> std::io::Result<()> {
+    match fs::remove_file(cache_dir.join(EXTRACTION_MARKER)) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    // Persist the unlink before the tree goes. Directories are synced through
+    // a handle only on Unix; Windows cannot open one this way.
+    #[cfg(unix)]
+    fs::File::open(cache_dir)?.sync_all()?;
+    Ok(())
+}
+
 /// Check if assets have already been extracted.
+///
+/// An extraction whose checkpoint RAM was still only in the page cache when
+/// the host last restarted is not: the restart may have lost it.
 pub fn is_extracted(cache_dir: &Path) -> bool {
     cache_dir.join(EXTRACTION_MARKER).exists()
+        && !unsynced_before_this_boot(&unsynced_marker_path(cache_dir))
+}
+
+/// Marker beside a shared extraction whose checkpoint RAM is not yet known to
+/// be on disk. It sits beside the tree, like the SHA-256 marker, so the tree
+/// itself stays identical to a private extraction.
+pub fn unsynced_marker_path(cache_dir: &Path) -> PathBuf {
+    cache_dir.with_extension("unsynced")
+}
+
+/// This boot of the host, as the kernel names it; `None` where unknown.
+fn host_boot_id() -> Option<String> {
+    #[cfg(target_os = "linux")]
+    {
+        fs::read_to_string("/proc/sys/kernel/random/boot_id")
+            .ok()
+            .map(|id| id.trim().to_string())
+            .filter(|id| !id.is_empty())
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        None
+    }
+}
+
+/// Record at `marker` that data written in this boot is not yet durable.
+/// The marker itself is durable before this returns, so a crash can never
+/// leave the data without it.
+pub fn mark_unsynced(marker: &Path) -> std::io::Result<()> {
+    let boot = host_boot_id().ok_or_else(|| {
+        std::io::Error::new(std::io::ErrorKind::Unsupported, "host boot id unavailable")
+    })?;
+    write_atomic_marker(marker, format!("{boot}\n").as_bytes())?;
+    if let Some(parent) = marker.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Whether `marker` says its data was left unsynced by an earlier boot, so a
+/// host restart may have lost it. A marker that cannot be read counts as that.
+pub fn unsynced_before_this_boot(marker: &Path) -> bool {
+    match fs::read_to_string(marker) {
+        Ok(recorded) => host_boot_id().is_none_or(|boot| recorded.trim() != boot),
+        Err(error) => error.kind() != std::io::ErrorKind::NotFound,
+    }
+}
+
+/// Clear `marker` once its data is durable, and make the removal durable.
+pub fn clear_unsynced(marker: &Path) -> std::io::Result<()> {
+    match fs::remove_file(marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+    }
+    #[cfg(unix)]
+    if let Some(parent) = marker.parent() {
+        File::open(parent)?.sync_all()?;
+    }
+    Ok(())
+}
+
+/// Write a file's dirty pages back a bounded window at a time.
+///
+/// One fsync of gigabytes queues all of it at once, and every journal commit
+/// on the filesystem (the fsyncs of restores installing meanwhile) then waits
+/// behind it. Window by window, those commits wait for one window at most;
+/// the final fsync only flushes what is left.
+pub fn write_back_paced(file: &File) -> std::io::Result<()> {
+    #[cfg(target_os = "linux")]
+    {
+        const WINDOW: u64 = 64 << 20;
+        let len = file.metadata()?.len();
+        let mut offset = 0;
+        while offset < len {
+            let count = WINDOW.min(len - offset);
+            // SAFETY: a valid open descriptor and an in-bounds byte range.
+            let result = unsafe {
+                libc::sync_file_range(
+                    file.as_raw_fd(),
+                    offset as libc::off64_t,
+                    count as libc::off64_t,
+                    libc::SYNC_FILE_RANGE_WAIT_BEFORE
+                        | libc::SYNC_FILE_RANGE_WRITE
+                        | libc::SYNC_FILE_RANGE_WAIT_AFTER,
+                )
+            };
+            if result != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            offset += count;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = file;
+    Ok(())
+}
+
+/// Whether a shared extraction's checkpoint RAM is still being made durable.
+pub fn memory_sync_pending(cache_dir: &Path) -> bool {
+    unsynced_marker_path(cache_dir).exists()
+}
+
+/// Make a shared extraction's checkpoint RAM durable, then clear its marker.
+/// If the write-back fails the extraction is withdrawn instead, so the next
+/// restore extracts it again rather than trusting what is on disk.
+pub fn sync_extracted_memory(cache_dir: &Path) -> std::io::Result<()> {
+    let synced = File::open(cache_dir.join("checkpoint/memory.bin")).and_then(|file| {
+        write_back_paced(&file)?;
+        file.sync_all()
+    });
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(cache_dir.with_extension("lock"))?;
+    lock_file_exclusive(&lock_file)?;
+    match synced {
+        Ok(()) => clear_unsynced(&unsynced_marker_path(cache_dir)),
+        Err(error) => {
+            let _ = fs::remove_file(cache_dir.join(EXTRACTION_MARKER));
+            Err(error)
+        }
+    }
 }
 
 /// Whether an extraction's `layers/` cache is structurally usable: every id in
@@ -1386,6 +1763,16 @@ pub fn cached_layers_usable(cache_dir: &Path) -> bool {
         .unwrap_or(false)
 }
 
+/// Whether the pack at `sidecar_path` carries image layers that its extracted
+/// entry at `cache_dir` no longer holds. A VM-mode pack carries none, so its
+/// empty `layers/` is never evicted. An unreadable manifest counts as not
+/// evicted: the marker then stands, as before.
+fn layers_evicted(sidecar_path: &Path, cache_dir: &Path) -> bool {
+    crate::packer::read_manifest_from_sidecar(sidecar_path)
+        .is_ok_and(|manifest| !manifest.assets.layers.is_empty())
+        && !cached_layers_usable(cache_dir)
+}
+
 /// Smallest cache the default sizing will ever choose, and the fallback when the
 /// filesystem's capacity can't be read. This was the whole cap before it scaled.
 const PACK_CACHE_MIN_BYTES: u64 = 5 * 1024 * 1024 * 1024;
@@ -1412,8 +1799,15 @@ pub fn pack_cache_max_bytes(cache_root: &Path) -> u64 {
     {
         return n;
     }
+    // A share of the disk, never less than the old fixed default, and never more
+    // than the filesystem itself: on a small root (a 10 GiB CI machine) the floor
+    // would otherwise promise a cache larger than the disk that holds it.
     filesystem_capacity_bytes(cache_root)
-        .map(|total| (total / PACK_CACHE_DISK_FRACTION).max(PACK_CACHE_MIN_BYTES))
+        .map(|total| {
+            (total / PACK_CACHE_DISK_FRACTION)
+                .max(PACK_CACHE_MIN_BYTES)
+                .min(total)
+        })
         .unwrap_or(PACK_CACHE_MIN_BYTES)
 }
 
@@ -1636,9 +2030,148 @@ pub fn extract_sidecar(
     force: bool,
     debug: bool,
 ) -> std::io::Result<()> {
+    extract_sidecar_for_agent(sidecar_path, cache_dir, footer, force, debug, None)
+}
+
+/// Directory, beside the machine data directories, holding one unpacked
+/// template per pack. A leading `_` keeps it out of the sweep that reaps data
+/// directories no machine owns, as for the Linux shared store (`_shared`).
+pub const PACK_TEMPLATES_DIR: &str = "_pack-templates";
+
+/// Extract `sidecar_path` as the private pack directory of one machine.
+///
+/// On macOS the image layers are unpacked file by file into a case-sensitive
+/// sparse disk image, which takes minutes for a pack with hundreds of thousands
+/// of entries, and every machine made from the pack used to repeat it. Here the
+/// pack is unpacked once into a template next to the machine directories, and
+/// each machine gets an APFS clone of it: made in milliseconds, sharing every
+/// block with the template until the machine changes it. The template is never
+/// booted, so it stays detached and unchanged. Templates are capped and evicted
+/// oldest first like the other extraction caches.
+///
+/// Elsewhere, and whenever the clone cannot be made (a volume without clones,
+/// or a template evicted meanwhile), this extracts straight into `cache_dir`.
+pub fn extract_sidecar_for_machine(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+) -> std::io::Result<()> {
+    #[cfg(target_os = "macos")]
+    if let Some(root) = cache_dir
+        .parent()
+        .and_then(Path::parent)
+        .map(|vms| vms.join(PACK_TEMPLATES_DIR))
+    {
+        match extract_via_template(sidecar_path, cache_dir, footer, &root) {
+            Ok(()) => return Ok(()),
+            Err(e) => {
+                eprintln!(
+                    "note: could not reuse the unpacked pack ({e}); unpacking this machine's own copy"
+                );
+                if cache_dir.exists() {
+                    force_detach_layers_volume(cache_dir);
+                    fs::remove_dir_all(cache_dir)?;
+                }
+            }
+        }
+    }
+    extract_sidecar(sidecar_path, cache_dir, footer, false, false)
+}
+
+/// Unpack `sidecar_path` into its template under `root` (once per pack), then
+/// clone the template to `cache_dir`.
+#[cfg(target_os = "macos")]
+fn extract_via_template(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    root: &Path,
+) -> std::io::Result<()> {
+    let template = shared_pack_dir(root, footer.checksum);
+    // Takes the template's lock, extracts only if it is not already complete,
+    // and evicts other templates past the cap without touching this one.
+    extract_sidecar(sidecar_path, &template, footer, false, false)?;
+    // Hold the same lock while cloning, so a concurrent extract or repair of
+    // this template cannot mount or change it mid-clone.
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(template.with_extension("lock"))?;
+    lock_file_exclusive(&lock_file)?;
+    if !is_extracted(&template) {
+        return Err(std::io::Error::other("the template was evicted"));
+    }
+    force_detach_layers_volume(&template);
+    // Marks the template as recently used for the oldest-first eviction.
+    File::open(&template)?.set_modified(std::time::SystemTime::now())?;
+    if cache_dir.exists() {
+        force_detach_layers_volume(cache_dir);
+        fs::remove_dir_all(cache_dir)?;
+    }
+    if let Some(parent) = cache_dir.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    clone_tree(&template, cache_dir)
+}
+
+/// APFS-clone the directory tree `from` to `to`, which must not exist.
+#[cfg(target_os = "macos")]
+fn clone_tree(from: &Path, to: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let c = |p: &Path| {
+        std::ffi::CString::new(p.as_os_str().as_bytes())
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))
+    };
+    let (src, dst) = (c(from)?, c(to)?);
+    // SAFETY: both are valid NUL-terminated paths that outlive the call.
+    if unsafe { libc::clonefile(src.as_ptr(), dst.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// [`extract_sidecar`] for a pack that will boot a different agent than the
+/// one it carries.
+///
+/// The layer decisions here -- whether the host unpacks the image and
+/// describes its ownership through the override xattr, or stages the tars for
+/// the guest -- depend on what the agent that mounts them can do, and the
+/// sidecar's manifest only knows the agent that was packed. A locally baked
+/// image cache (`machine run --oci-cache`) boots the running engine's own
+/// agent instead, so its caller passes that engine's version as
+/// `agent_version`; `None` keeps the manifest's.
+pub fn extract_sidecar_for_agent(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    footer: &PackFooter,
+    force: bool,
+    debug: bool,
+    agent_version: Option<&str>,
+) -> std::io::Result<()> {
     // Private per-machine caches are LRU-capped after extraction; the shared
     // store opts out (see `extract_sidecar_capped`).
-    extract_sidecar_capped(sidecar_path, cache_dir, footer, force, debug, true)
+    extract_sidecar_capped(
+        sidecar_path,
+        cache_dir,
+        footer,
+        force,
+        debug,
+        true,
+        ExtractContext {
+            agent_version,
+            digest_out: None,
+            defer_memory_sync: None,
+        },
+    )
+}
+
+struct ExtractContext<'a> {
+    agent_version: Option<&'a str>,
+    digest_out: Option<&'a mut Option<ArtifactDigestProof>>,
+    /// Set when a new extraction leaves its checkpoint RAM for a later
+    /// write-back instead of syncing it; the marker is written first.
+    defer_memory_sync: Option<&'a mut bool>,
 }
 
 /// Core of [`extract_sidecar`]. `cap_cache` runs the LRU size-cap on
@@ -1659,7 +2192,13 @@ fn extract_sidecar_capped(
     force: bool,
     debug: bool,
     cap_cache: bool,
+    context: ExtractContext<'_>,
 ) -> std::io::Result<()> {
+    let ExtractContext {
+        agent_version,
+        digest_out,
+        defer_memory_sync,
+    } = context;
     if !sidecar_path.exists() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::NotFound,
@@ -1685,11 +2224,46 @@ fn extract_sidecar_capped(
 
     lock_file_exclusive(&lock_file)?;
 
+    // An entry whose image layers were removed after it was marked extracted
+    // (a cache cleaner, or an older engine's size eviction) can't boot, and its
+    // marker would block the re-extract that repairs it. Drop the marker and
+    // extract over the entry in place: the directory stays, because guests may
+    // still hold its other files.
+    if !force && is_extracted(cache_dir) && layers_evicted(sidecar_path, cache_dir) {
+        if debug {
+            eprintln!("debug: extracted entry lost its image layers; re-extracting");
+        }
+        fs::remove_file(cache_dir.join(EXTRACTION_MARKER))?;
+    }
+
+    // RAM left unsynced by an earlier boot may not have survived the restart.
+    // Extract over the entry in place, as for evicted layers above.
+    let unsynced = unsynced_marker_path(cache_dir);
+    if !force && cache_dir.join(EXTRACTION_MARKER).exists() && unsynced_before_this_boot(&unsynced)
+    {
+        if debug {
+            eprintln!("debug: extracted entry was not synced before a host restart; re-extracting");
+        }
+        fs::remove_file(cache_dir.join(EXTRACTION_MARKER))?;
+    }
+
     // Double-check inside the lock: another process may have completed
     // extraction while we were waiting for the lock.
     if !force && is_extracted(cache_dir) {
         if debug {
             eprintln!("debug: assets already extracted (possibly by another process)");
+        }
+        // An entry extracted before this host could unpack layers itself (an
+        // older engine, or a pack whose own agent could not use the result)
+        // still holds staged tars, and would hand them to the guest on every
+        // start. Finish the job here, once, under the same lock.
+        let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
+        repair_host_layer_owners(cache_dir, debug)?;
+        repair_host_layer_symlink_owners(cache_dir)?;
+        if upgraded && cap_cache {
+            if let Some(root) = cache_dir.parent() {
+                evict_cache_to_size_protecting(root, pack_cache_max_bytes(root), Some(cache_dir));
+            }
         }
         // Lock released on drop of lock_file
         return Ok(());
@@ -1702,7 +2276,28 @@ fn extract_sidecar_capped(
         let _ = fs::remove_dir_all(cache_dir);
     }
 
-    let result = extract_sidecar_inner(sidecar_path, cache_dir, footer, debug);
+    // The unsynced marker is durable before any RAM is written, so a crash
+    // can never leave an extraction marker without it. Without deferral, a
+    // stale marker from an earlier attempt must not outlive this extraction.
+    match defer_memory_sync {
+        Some(deferred) => {
+            mark_unsynced(&unsynced)?;
+            *deferred = true;
+        }
+        None => match fs::remove_file(&unsynced) {
+            Ok(()) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        },
+    }
+    let result = extract_sidecar_inner(
+        sidecar_path,
+        cache_dir,
+        footer,
+        debug,
+        agent_version,
+        digest_out,
+    );
 
     // If extraction failed mid-stream, partially extracted files remain on
     // disk without a completion marker. Subsequent retries hit the same
@@ -1877,26 +2472,92 @@ pub fn extract_sidecar_shared(
     footer: &PackFooter,
     debug: bool,
 ) -> std::io::Result<PathBuf> {
+    extract_sidecar_shared_with_options(
+        sidecar_path,
+        shared_root,
+        footer,
+        debug,
+        SharedExtractOptions::default(),
+    )
+}
+
+/// How [`extract_sidecar_shared_with_options`] may shorten a restore.
+#[derive(Default)]
+pub struct SharedExtractOptions {
+    /// SHA-256 already known for the artifact's exact inode, so neither a
+    /// cold extraction nor a warm hit hashes it again.
+    pub digest: Option<ArtifactDigestProof>,
+    /// Return once a checkpoint's RAM is extracted instead of once it is on
+    /// disk. Until the caller completes the write-back with
+    /// [`sync_extracted_memory`], the entry carries a marker naming this boot,
+    /// and after a host restart it is extracted again rather than trusted
+    /// (see [`is_extracted`]). Only for a long-lived process, which is there
+    /// to finish the write-back.
+    pub defer_memory_sync: bool,
+}
+
+/// [`extract_sidecar_shared`] with [`SharedExtractOptions`].
+pub fn extract_sidecar_shared_with_options(
+    sidecar_path: &Path,
+    shared_root: &Path,
+    footer: &PackFooter,
+    debug: bool,
+    options: SharedExtractOptions,
+) -> std::io::Result<PathBuf> {
     let shared_dir = shared_pack_dir(shared_root, footer.checksum);
     let was_extracted = is_extracted(&shared_dir);
+    let checkpoint = cfg!(target_os = "linux")
+        && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
+        && crate::packer::read_manifest_from_sidecar(sidecar_path)
+            .is_ok_and(|m| m.checkpoint.is_some());
+    let defer = checkpoint && options.defer_memory_sync && host_boot_id().is_some();
+    let mut deferred = false;
+    let capture_digest = cfg!(unix) && options.digest.is_none();
+    let mut observed_digest = options.digest;
     // cap_cache=false: never perform blind automatic LRU eviction here. Shared
     // entries are maintained explicitly by `smolvm pack prune`, which treats
     // each machine's `.pack-shared` pointer as a durable lease and therefore
     // cannot delete a pack mounted by a running or stopped VM.
-    extract_sidecar_capped(sidecar_path, &shared_dir, footer, false, debug, false)?;
-    let overlap = cfg!(target_os = "linux")
-        && !was_extracted
-        && std::env::var_os("SMOLVM_DISABLE_CHECKPOINT_WRITEBACK").is_none()
-        && crate::packer::read_manifest_from_sidecar(sidecar_path)
-            .is_ok_and(|m| m.checkpoint.is_some());
-    if overlap {
+    extract_sidecar_capped(
+        sidecar_path,
+        &shared_dir,
+        footer,
+        false,
+        debug,
+        false,
+        ExtractContext {
+            agent_version: None,
+            digest_out: capture_digest.then_some(&mut observed_digest),
+            defer_memory_sync: defer.then_some(&mut deferred),
+        },
+    )?;
+    // With deferral requested, whoever extracted the entry owns its
+    // write-back: this call when it extracted, otherwise the other extractor.
+    let overlap = checkpoint && !was_extracted && !defer;
+    if deferred {
+        ensure_shared_artifact_sha256_with_observed(
+            sidecar_path,
+            &shared_dir,
+            observed_digest.as_mut(),
+        )?;
+    } else if overlap {
         let memory = shared_dir.join("checkpoint/memory.bin");
         overlap_checkpoint_writeback(
             || File::open(&memory)?.sync_all(),
-            || ensure_shared_artifact_sha256(sidecar_path, &shared_dir),
+            || {
+                ensure_shared_artifact_sha256_with_observed(
+                    sidecar_path,
+                    &shared_dir,
+                    observed_digest.as_mut(),
+                )
+            },
         )?;
     } else {
-        ensure_shared_artifact_sha256(sidecar_path, &shared_dir)?;
+        ensure_shared_artifact_sha256_with_observed(
+            sidecar_path,
+            &shared_dir,
+            observed_digest.as_mut(),
+        )?;
     }
     // Lock down the store so a dropped per-VM uid can't read the shared copy
     // directly (it must go through its idmapped mount). Best-effort: traversal
@@ -1943,6 +2604,10 @@ struct ArtifactSourceIdentity {
     inode: Option<(u64, u64, i64, i64)>,
     #[serde(default)]
     locally_produced: bool,
+    /// The digest came from a full read of this inode, during which only the
+    /// service could write it and its identity did not change.
+    #[serde(default)]
+    hashed_while_service_only: bool,
 }
 
 impl ArtifactSourceIdentity {
@@ -1950,6 +2615,18 @@ impl ArtifactSourceIdentity {
         self.inode
             .zip(other.inode)
             .is_some_and(|(a, b)| a.0 == b.0 && a.1 == b.1)
+    }
+
+    /// Whether this record's full-read digest still describes `other`: the
+    /// same inode, unchanged (length, mtime and kernel-maintained ctime).
+    /// The caller must also confirm only the service can write it now.
+    fn covers_hashed(&self, other: &Self) -> bool {
+        self.hashed_while_service_only
+            && self.inode.is_some()
+            && self.inode == other.inode
+            && self.len == other.len
+            && self.modified_secs == other.modified_secs
+            && self.modified_nanos == other.modified_nanos
     }
 
     fn covers_local(&self, other: &Self) -> bool {
@@ -1980,6 +2657,47 @@ fn service_owned_artifact(path: &Path) -> bool {
             && file.mode() & 0o077 == 0
             && parent.is_dir()
             && parent.uid() == 0
+            && parent.mode() & 0o022 == 0
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = path;
+        false
+    }
+}
+
+/// Whether only the service principal can change `path`'s bytes: a regular
+/// file (not a symlink) owned by root or by the uid this process runs as, not
+/// group- or world-writable, in a directory with the same properties.
+///
+/// Then an unchanged identity (inode, length, mtime and the kernel-maintained
+/// ctime) means unchanged bytes: nobody else can write the file, relink it or
+/// replace it. This lets a full verification of the file be reused. Readable
+/// permissions are irrelevant here; only who can write matters.
+pub fn only_service_can_write(path: &Path) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let service = |uid: u32| uid == 0 || uid == unsafe { libc::geteuid() };
+        let Ok(file) = fs::symlink_metadata(path) else {
+            return false;
+        };
+        let Some(parent) = path.parent() else {
+            return false;
+        };
+        let parent = if parent.as_os_str().is_empty() {
+            Path::new(".")
+        } else {
+            parent
+        };
+        let Ok(parent) = fs::metadata(parent) else {
+            return false;
+        };
+        file.is_file()
+            && service(file.uid())
+            && file.mode() & 0o022 == 0
+            && parent.is_dir()
+            && service(parent.uid())
             && parent.mode() & 0o022 == 0
     }
     #[cfg(not(unix))]
@@ -2024,6 +2742,7 @@ fn artifact_metadata_identity(
         #[cfg(not(unix))]
         inode: None,
         locally_produced: false,
+        hashed_while_service_only: false,
     }
 }
 
@@ -2185,6 +2904,288 @@ fn hash_artifact_sha256(sidecar_path: &Path) -> std::io::Result<String> {
     Ok(digest)
 }
 
+/// Checksums of an artifact taken over its bytes as they were received.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReceivedArtifactHashes {
+    /// Bytes seen.
+    pub len: u64,
+    /// Lowercase hex SHA-256 of every byte.
+    pub sha256: String,
+    /// CRC32 of every byte except the trailing pack footer: the range a
+    /// single-file artifact's footer checksum covers. `None` when fewer bytes
+    /// than a footer were seen.
+    pub crc32_before_footer: Option<u32>,
+}
+
+/// Incremental hashing of an artifact while it streams in, so verifying the
+/// footer checksum and naming the artifact by SHA-256 need no second read.
+///
+/// The footer is the last [`crate::format::FOOTER_SIZE`] bytes, which are not
+/// known to be the end until the stream ends, so that many bytes are held back
+/// from the CRC until more arrive.
+pub struct ArtifactStreamHasher {
+    sha256: Context,
+    crc32: crc32fast::Hasher,
+    held: Vec<u8>,
+    len: u64,
+}
+
+impl Default for ArtifactStreamHasher {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl ArtifactStreamHasher {
+    /// Start an empty stream.
+    pub fn new() -> Self {
+        Self {
+            sha256: Context::new(&SHA256),
+            crc32: crc32fast::Hasher::new(),
+            held: Vec::with_capacity(2 * crate::format::FOOTER_SIZE),
+            len: 0,
+        }
+    }
+
+    /// Add the next bytes of the stream.
+    pub fn update(&mut self, bytes: &[u8]) {
+        const HOLD: usize = crate::format::FOOTER_SIZE;
+        self.sha256.update(bytes);
+        self.len += bytes.len() as u64;
+        if self.held.len() + bytes.len() <= HOLD {
+            self.held.extend_from_slice(bytes);
+            return;
+        }
+        // Everything except the last HOLD bytes seen so far is now known not
+        // to be part of the footer.
+        let release = self.held.len() + bytes.len() - HOLD;
+        let from_held = release.min(self.held.len());
+        self.crc32.update(&self.held[..from_held]);
+        let from_bytes = release - from_held;
+        self.crc32.update(&bytes[..from_bytes]);
+        self.held.drain(..from_held);
+        self.held.extend_from_slice(&bytes[from_bytes..]);
+    }
+
+    /// Finish the stream.
+    pub fn finish(self) -> ReceivedArtifactHashes {
+        let mut sha256 = String::with_capacity(64);
+        for byte in self.sha256.finish().as_ref() {
+            write!(&mut sha256, "{byte:02x}").expect("writing to a String cannot fail");
+        }
+        ReceivedArtifactHashes {
+            len: self.len,
+            sha256,
+            crc32_before_footer: (self.held.len() == crate::format::FOOTER_SIZE)
+                .then(|| self.crc32.finalize()),
+        }
+    }
+}
+
+#[test]
+fn stream_hashes_match_whole_file_hashes_for_any_chunking() {
+    use sha2::{Digest, Sha256};
+    let footer = crate::format::FOOTER_SIZE;
+    let bytes: Vec<u8> = (0..10_000_u32)
+        .map(|index| (index * 7 % 251) as u8)
+        .collect();
+    for size in [0, 1, footer - 1, footer, footer + 1, 4096, bytes.len()] {
+        let data = &bytes[..size];
+        let expected_crc = (size >= footer).then(|| crc32fast::hash(&data[..size - footer]));
+        for chunk in [1, 3, footer - 1, footer, footer + 1, 1000, 1 << 20] {
+            let mut hasher = ArtifactStreamHasher::new();
+            for piece in data.chunks(chunk) {
+                hasher.update(piece);
+            }
+            let hashes = hasher.finish();
+            assert_eq!(hashes.len, size as u64);
+            assert_eq!(hashes.sha256, format!("{:x}", Sha256::digest(data)));
+            assert_eq!(
+                hashes.crc32_before_footer, expected_crc,
+                "size {size} chunk {chunk}"
+            );
+        }
+    }
+}
+
+/// Hash the exact compressed bytes consumed by extraction on a bounded worker.
+/// The reader also consumes the trailing manifest and footer before the proof
+/// can be used, so the digest names the entire artifact rather than only the
+/// zstd stream. The worker can finish while checkpoint RAM is being synced.
+struct ExtractDigestWorker {
+    sender: Option<std::sync::mpsc::SyncSender<Vec<u8>>>,
+    worker: Option<std::thread::JoinHandle<String>>,
+}
+
+impl ExtractDigestWorker {
+    fn spawn() -> std::io::Result<Self> {
+        let (sender, receiver) = std::sync::mpsc::sync_channel::<Vec<u8>>(2);
+        let worker = std::thread::Builder::new()
+            .name("extract-sha256".into())
+            .spawn(move || {
+                let mut hasher = Context::new(&SHA256);
+                for bytes in receiver {
+                    hasher.update(&bytes);
+                }
+                let mut digest = String::with_capacity(64);
+                for byte in hasher.finish().as_ref() {
+                    write!(&mut digest, "{byte:02x}").expect("writing to a String cannot fail");
+                }
+                digest
+            })?;
+        Ok(Self {
+            sender: Some(sender),
+            worker: Some(worker),
+        })
+    }
+
+    fn update(&self, bytes: &[u8]) -> bool {
+        bytes.chunks(1024 * 1024).all(|chunk| {
+            self.sender
+                .as_ref()
+                .is_some_and(|sender| sender.send(chunk.to_vec()).is_ok())
+        })
+    }
+
+    fn finish(mut self) -> Option<String> {
+        drop(self.sender.take());
+        self.worker.take()?.join().ok()
+    }
+}
+
+impl Drop for ExtractDigestWorker {
+    fn drop(&mut self) {
+        drop(self.sender.take());
+        if let Some(worker) = self.worker.take() {
+            let _ = worker.join();
+        }
+    }
+}
+
+struct ExtractDigestReader {
+    file: File,
+    before: Option<fs::Metadata>,
+    service_only_before: bool,
+    worker: Option<ExtractDigestWorker>,
+    bytes: u64,
+}
+
+impl ExtractDigestReader {
+    fn open(path: &Path, capture_digest: bool) -> std::io::Result<Self> {
+        let file = File::open(path)?;
+        let before = capture_digest.then(|| file.metadata()).transpose()?;
+        let worker = if capture_digest {
+            ExtractDigestWorker::spawn().ok()
+        } else {
+            None
+        };
+        Ok(Self {
+            file,
+            before,
+            service_only_before: capture_digest && only_service_can_write(path),
+            worker,
+            bytes: 0,
+        })
+    }
+
+    fn finish(mut self) -> std::io::Result<Option<ArtifactDigestProof>> {
+        if self.worker.is_none() {
+            return Ok(None);
+        }
+        std::io::copy(&mut self, &mut std::io::sink())?;
+        let Some(before) = self.before else {
+            return Ok(None);
+        };
+        if self.bytes != before.len() {
+            return Ok(None);
+        }
+        Ok(self.worker.take().map(|worker| ArtifactDigestProof {
+            file: self.file,
+            before,
+            service_only_before: self.service_only_before,
+            worker: Some(worker),
+            known: None,
+        }))
+    }
+}
+
+impl Read for ExtractDigestReader {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.file.read(bytes)?;
+        self.bytes = self.bytes.saturating_add(count as u64);
+        if count > 0
+            && self
+                .worker
+                .as_ref()
+                .is_some_and(|worker| !worker.update(&bytes[..count]))
+        {
+            self.worker.take();
+        }
+        Ok(count)
+    }
+}
+
+/// The SHA-256 of an artifact's exact bytes, bound to the inode they are in.
+///
+/// It comes either from extraction reading the file, or from the service
+/// hashing the bytes as it wrote them ([`ArtifactDigestProof::received`]).
+/// Either way it is only ever used while the pinned descriptor and the path
+/// still name that same, unchanged inode, so it stands in for a full read.
+pub struct ArtifactDigestProof {
+    file: File,
+    before: fs::Metadata,
+    service_only_before: bool,
+    worker: Option<ExtractDigestWorker>,
+    known: Option<String>,
+}
+
+impl ArtifactDigestProof {
+    /// A digest the service computed over the bytes it wrote into `file`.
+    /// `service_only` must say whether nobody but the service could write the
+    /// file from its creation until now.
+    pub fn received(file: File, digest: String, service_only: bool) -> std::io::Result<Self> {
+        if digest.len() != 64
+            || !digest
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "artifact digest must be lowercase hex SHA-256",
+            ));
+        }
+        let before = file.metadata()?;
+        Ok(Self {
+            file,
+            before,
+            service_only_before: service_only,
+            worker: None,
+            known: Some(digest),
+        })
+    }
+
+    fn digest_for(&mut self, path: &Path) -> Option<String> {
+        // An open descriptor pins the inode through extraction and hashing.
+        // A changed descriptor or path cannot provide a cache identity.
+        let after = self.file.metadata().ok()?;
+        let path_after = fs::metadata(path).ok()?;
+        if !same_checkpoint_identity(&self.before, &after)
+            || !same_checkpoint_identity(&self.before, &path_after)
+        {
+            return None;
+        }
+        let digest = match self.known.take() {
+            Some(digest) => digest,
+            None => self.worker.take()?.finish()?,
+        };
+        let after = self.file.metadata().ok()?;
+        let path_after = fs::metadata(path).ok()?;
+        (same_checkpoint_identity(&self.before, &after)
+            && same_checkpoint_identity(&self.before, &path_after))
+        .then_some(digest)
+    }
+}
+
 #[test]
 fn artifact_hash_matches_existing_sha256_across_read_boundaries() {
     use sha2::{Digest, Sha256};
@@ -2237,10 +3238,31 @@ fn ensure_shared_artifact_sha256(
     ensure_shared_artifact_sha256_with_identity(sidecar_path, shared_dir, None)
 }
 
+fn ensure_shared_artifact_sha256_with_observed(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    observed: Option<&mut ArtifactDigestProof>,
+) -> std::io::Result<String> {
+    if cfg!(unix) {
+        ensure_shared_artifact_sha256_with_proofs(sidecar_path, shared_dir, None, observed)
+    } else {
+        ensure_shared_artifact_sha256(sidecar_path, shared_dir)
+    }
+}
+
 fn ensure_shared_artifact_sha256_with_identity(
     sidecar_path: &Path,
     shared_dir: &Path,
     identity: Option<&crate::packer::PackedArtifactIdentity>,
+) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256_with_proofs(sidecar_path, shared_dir, identity, None)
+}
+
+fn ensure_shared_artifact_sha256_with_proofs(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    identity: Option<&crate::packer::PackedArtifactIdentity>,
+    mut observed: Option<&mut ArtifactDigestProof>,
 ) -> std::io::Result<String> {
     let digest_path = shared_artifact_sha256_path(shared_dir);
     let lock_path = digest_path.with_extension("artifact-sha256.lock");
@@ -2252,6 +3274,7 @@ fn ensure_shared_artifact_sha256_with_identity(
     lock_file_exclusive(&lock_file)?;
 
     let source_path = shared_artifact_source_path(shared_dir);
+    let trusted_before = only_service_can_write(sidecar_path);
     let mut source_identity = artifact_source_identity(sidecar_path)?;
     if digest_path.exists() {
         let cached_digest = read_shared_artifact_sha256(shared_dir)?;
@@ -2265,13 +3288,32 @@ fn ensure_shared_artifact_sha256_with_identity(
         {
             return Ok(cached_digest);
         }
+        // A warm create from the same unchanged pack that only the service can
+        // write reuses the digest of its earlier full read, instead of hashing
+        // the whole pack again (and serializing concurrent creates on this lock).
+        if only_service_can_write(sidecar_path)
+            && cached_source
+                .as_ref()
+                .is_some_and(|cached| cached.covers_hashed(&source_identity))
+        {
+            return Ok(cached_digest);
+        }
 
         // The shared extraction directory is historically keyed by the pack's
         // CRC32 footer. If a different artifact ever collides with that key,
         // fail instead of associating its SHA-256 with the already-extracted
         // bytes. A second path to identical content is safe and refreshes the
-        // cheap source fingerprint for later warm creates.
-        let actual_digest = hash_artifact_sha256(sidecar_path)?;
+        // cheap source fingerprint for later warm creates. A digest already
+        // taken over this exact inode's bytes answers that without a re-read.
+        let observed_digest = observed.as_deref_mut().and_then(|observed| {
+            observed
+                .digest_for(sidecar_path)
+                .map(|digest| (digest, observed.service_only_before))
+        });
+        let (actual_digest, full_read_trusted) = match observed_digest {
+            Some((digest, trusted)) => (digest, trusted),
+            None => (hash_artifact_sha256(sidecar_path)?, true),
+        };
         if actual_digest != cached_digest {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
@@ -2288,6 +3330,8 @@ fn ensure_shared_artifact_sha256_with_identity(
             && cached_source.as_ref().is_some_and(|cached| {
                 cached.locally_produced && cached.same_inode(&source_identity)
             });
+        source_identity.hashed_while_service_only = full_read_trusted
+            && hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
         write_atomic_marker(
             &source_path,
             &serde_json::to_vec(&source_identity)
@@ -2299,9 +3343,35 @@ fn ensure_shared_artifact_sha256_with_identity(
     let written_digest = identity.and_then(|identity| identity.digest_for(sidecar_path));
     source_identity.locally_produced =
         written_digest.is_some() && service_owned_artifact(sidecar_path);
-    let digest = match written_digest {
-        Some(digest) => digest.to_owned(),
-        None => hash_artifact_sha256(sidecar_path)?,
+    let observed_digest = if written_digest.is_none() {
+        observed.and_then(|observed| {
+            observed
+                .digest_for(sidecar_path)
+                .map(|digest| (digest, observed.service_only_before))
+        })
+    } else {
+        None
+    };
+    let observed_service_only = observed_digest
+        .as_ref()
+        .is_some_and(|(_, trusted)| *trusted);
+    let digest = match written_digest
+        .map(str::to_owned)
+        .or_else(|| observed_digest.map(|(digest, _)| digest))
+    {
+        Some(digest) => {
+            if observed_service_only {
+                source_identity.hashed_while_service_only =
+                    hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
+            }
+            digest
+        }
+        None => {
+            let digest = hash_artifact_sha256(sidecar_path)?;
+            source_identity.hashed_while_service_only =
+                hashed_while_service_only(sidecar_path, &source_identity, trusted_before)?;
+            digest
+        }
     };
     write_atomic_marker(&digest_path, format!("{digest}\n").as_bytes())?;
     write_atomic_marker(
@@ -2310,6 +3380,24 @@ fn ensure_shared_artifact_sha256_with_identity(
             .map_err(|error| std::io::Error::other(error.to_string()))?,
     )?;
     Ok(digest)
+}
+
+/// Whether a full read of `sidecar_path` just finished with only the service
+/// able to write it throughout, and with its identity unchanged since `before`.
+fn hashed_while_service_only(
+    sidecar_path: &Path,
+    before: &ArtifactSourceIdentity,
+    trusted_before: bool,
+) -> std::io::Result<bool> {
+    if !trusted_before || !only_service_can_write(sidecar_path) {
+        return Ok(false);
+    }
+    let after = artifact_source_identity(sidecar_path)?;
+    Ok(before.inode.is_some()
+        && before.inode == after.inode
+        && before.len == after.len
+        && before.modified_secs == after.modified_secs
+        && before.modified_nanos == after.modified_nanos)
 }
 
 /// Set a directory to `0700` (owner-only) if possible. Best-effort; errors are
@@ -2329,12 +3417,749 @@ fn restrict_to_owner(dir: &Path) {
     let _ = dir;
 }
 
+/// Give root, on the host, every file of a host-extracted layer cache made
+/// before [`HOST_LAYER_OWNERS_MARKER`], once.
+///
+/// Those extractions chowned each file to its archived owner although the
+/// guest reads ownership from the override xattr. Under the per-VM uid drop the
+/// VMM sees the cache through an idmapped mount that maps only on-disk id 0, so
+/// a private file owned by anyone else could not be opened and the guest saw
+/// 65534 and EACCES, in every machine and branch built on the entry. The xattr
+/// already holds the true owner, so giving the host copy to root loses nothing
+/// (host copies never carry setuid bits; the xattr does). Only root can chown,
+/// and only a root extraction could have left another owner behind.
+fn repair_host_layer_owners(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+    if !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        || cache_dir.join(HOST_LAYER_OWNERS_MARKER).exists()
+    {
+        return Ok(());
+    }
+    #[cfg(unix)]
+    if unsafe { libc::geteuid() } == 0 {
+        use std::os::unix::fs::MetadataExt;
+        let mut repaired = 0u64;
+        let mut pending = vec![cache_dir.join("layers")];
+        while let Some(dir) = pending.pop() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(entries) => entries,
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(e) => return Err(e),
+            };
+            for entry in entries {
+                let path = entry?.path();
+                let meta = fs::symlink_metadata(&path)?;
+                if meta.uid() != 0 || meta.gid() != 0 {
+                    set_owner(&path, 0, 0);
+                    repaired += 1;
+                }
+                if meta.is_dir() {
+                    pending.push(path);
+                }
+            }
+        }
+        if debug && repaired > 0 {
+            eprintln!("debug: gave {repaired} host-extracted layer entries back to root");
+        }
+    }
+    let _ = debug;
+    fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")
+}
+
+/// Record the symlink owners of a Linux host-extracted layer cache made before
+/// [`HOST_LAYER_SYMLINKS_MARKER`], once.
+///
+/// Those extractions could not record a link's owner (no user xattrs on Linux
+/// symlinks), so every image symlink reached the guest as the host's: root on
+/// a root host, the VMM's user otherwise. The layer tars stay beside their
+/// unpacked trees, and only their headers are needed, so this seeks past every
+/// file body instead of re-reading the image.
+fn repair_host_layer_symlink_owners(cache_dir: &Path) -> std::io::Result<()> {
+    if !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        || cache_dir.join(HOST_LAYER_SYMLINKS_MARKER).exists()
+    {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let layers = cache_dir.join("layers");
+        for entry in fs::read_dir(&layers)? {
+            let tar = entry?.path();
+            if !tar.extension().is_some_and(|ext| ext == "tar") {
+                continue;
+            }
+            let layer_dir = layers.join(tar.file_stem().unwrap_or_default());
+            if !layer_dir.is_dir() {
+                continue;
+            }
+            let canonical = normalize_path(&layer_dir);
+            let mut owners = PendingSymlinkOwners::default();
+            let mut archive = tar::Archive::new(File::open(&tar)?);
+            for entry in archive.entries_with_seek()? {
+                let entry = entry?;
+                let header = entry.header();
+                let path = normalize_path(&layer_dir.join(entry.path()?));
+                // The same containment the extraction enforced.
+                if !path.starts_with(&canonical) {
+                    continue;
+                }
+                // A later entry at a link's path replaces it, as on disk.
+                let owner = if header.entry_type() == tar::EntryType::Symlink {
+                    (header.uid().unwrap_or(0), header.gid().unwrap_or(0))
+                } else {
+                    (0, 0)
+                };
+                owners.set(&path, owner);
+            }
+            owners.write();
+        }
+    }
+    fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")
+}
+
 /// Inner extraction logic (called under the lock).
+/// Unpack, on the host, the layer tars an earlier extraction left staged for
+/// the guest, when this host can now describe their ownership through the
+/// override xattr and the agent that will boot them honors it.
+///
+/// An extraction is a one-shot: the marker freezes whatever layer decision the
+/// engine of the day made. An entry made before the host could unpack layers
+/// itself therefore keeps handing its tars to the guest, which unpacks the
+/// whole image on every fresh machine -- tens of seconds for a large image,
+/// forever, unless the user clears the cache by hand. This runs on every cache
+/// hit, does nothing once the entry carries [`HOST_LAYERS_MARKER`] or when the
+/// decision still says "guest", and otherwise finishes the extraction the way a
+/// fresh one would. The tars stay in place: a guest that already mounted them
+/// keeps reading them, and the unpack is idempotent per layer, so an
+/// interrupted upgrade simply resumes on the next hit.
+///
+/// Returns whether any layer was unpacked, so the caller knows the entry grew.
+fn upgrade_staged_layers(
+    sidecar_path: &Path,
+    cache_dir: &Path,
+    agent_version: Option<&str>,
+    debug: bool,
+) -> std::io::Result<bool> {
+    if cache_dir.join(HOST_LAYERS_MARKER).exists() || !has_layer_tars(cache_dir) {
+        return Ok(false);
+    }
+    let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
+    let agent = agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
+    if !host_layers_via_override_stat(agent, cache_dir) {
+        return Ok(false);
+    }
+    // The stacking order the guest needs: the manifest's, else the one the
+    // staging extraction recorded against the tars.
+    let layer_order: Vec<String> = match manifest.as_ref() {
+        Some(m) if !m.assets.layers.is_empty() => m
+            .assets
+            .layers
+            .iter()
+            .filter_map(|l| layer_id_from_asset_path(&l.path))
+            .collect(),
+        _ => fs::read_to_string(cache_dir.join("layers").join(LAYER_ORDER_FILE))
+            .map(|s| {
+                s.lines()
+                    .map(str::trim)
+                    .filter(|l| !l.is_empty())
+                    .map(String::from)
+                    .collect()
+            })
+            .unwrap_or_default(),
+    };
+    eprintln!(
+        "Unpacking this image's layers on the host once, so later machines start without \
+         unpacking them themselves..."
+    );
+    if debug {
+        eprintln!(
+            "debug: upgrading staged layers in {} to host-unpacked layers",
+            cache_dir.display()
+        );
+    }
+    post_process_extraction(cache_dir, &layer_order, false, debug, true)?;
+    Ok(true)
+}
+
+/// Unpack the payload of a checkpoint file that carries its history (a
+/// `chunked` payload: `checkpoint.json`, `generations/` and `objects/`) into
+/// `dest`.
+///
+/// The caller must already have verified the file's checksum. Only the
+/// `assets_size` bytes the footer declares are read, and every entry goes
+/// through the same hardened unpacker as any other artifact: paths and link
+/// targets stay inside `dest`, and entry and byte limits apply.
+pub fn unpack_checkpoint_history(
+    sidecar_path: &Path,
+    footer: &PackFooter,
+    dest: &Path,
+) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    let payload = File::open(sidecar_path)?.take(footer.assets_size);
+    let decoder = zstd::stream::Decoder::new(payload)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    safe_unpack_with_policy(
+        &mut archive,
+        dest,
+        &SafeUnpackLimits::from_env(),
+        false,
+        false,
+    )?;
+    Ok(())
+}
+
+/// Extract a checkpoint sidecar's assets into `dest`, leaving out the archive
+/// paths in `skip` and everything under them.
+///
+/// For a restore that installs only some of the assets: a pause checkpoint
+/// also carries the runtime libraries, agent rootfs and storage template, so
+/// the checkpoint can move to another host, but resuming it here uses the
+/// host's own. Unlike [`extract_sidecar`] this writes no cache markers and
+/// does no layer post-processing. When `required` is nonempty, extraction
+/// stops after those files; callers must verify the full sidecar first.
+pub fn extract_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+) -> std::io::Result<()> {
+    fs::create_dir_all(dest)?;
+    let decoder = zstd::stream::Decoder::new(File::open(sidecar_path)?.take(footer.assets_size))
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+    let mut archive = tar::Archive::new(decoder);
+    let skip: Vec<PathBuf> = skip.iter().map(|path| normalize_path(path)).collect();
+    safe_unpack_skipping(
+        &mut archive,
+        dest,
+        &SafeUnpackLimits::from_env(),
+        true,
+        false,
+        true,
+        &skip,
+        required,
+    )?;
+    Ok(())
+}
+
+/// Extract the local resume inputs and verify the complete sidecar in one
+/// sequential read. No extracted input may be installed until this returns.
+pub fn extract_verified_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+) -> std::io::Result<()> {
+    extract_checkpoint_sidecar_checked(sidecar_path, dest, footer, skip, required, false)
+}
+
+/// [`extract_verified_checkpoint_sidecar`] for a checkpoint that may gain or
+/// lose names meanwhile: a resume reads its pause while an export links it, and
+/// an export reads its link while the resume removes the original. Each moves
+/// the change time without changing the checkpoint, so only its bytes, size,
+/// modification time and inode must still be what they were.
+pub fn extract_linked_checkpoint_sidecar(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+) -> std::io::Result<()> {
+    extract_checkpoint_sidecar_checked(sidecar_path, dest, footer, skip, required, true)
+}
+
+fn extract_checkpoint_sidecar_checked(
+    sidecar_path: &Path,
+    dest: &Path,
+    footer: &PackFooter,
+    skip: &[PathBuf],
+    required: &[PathBuf],
+    links_may_change: bool,
+) -> std::io::Result<()> {
+    let mut file = File::open(sidecar_path)?;
+    let before = file.metadata()?;
+    let actual_footer =
+        crate::packer::read_footer_from_file(&mut file).map_err(std::io::Error::other)?;
+    if actual_footer.to_bytes() != footer.to_bytes() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint footer changed before extraction",
+        ));
+    }
+    file.seek(SeekFrom::Start(0))?;
+    #[cfg(target_os = "linux")]
+    unsafe {
+        libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_SEQUENTIAL);
+    }
+    fs::create_dir_all(dest)?;
+    let mut reader = ChecksumReader::new(file);
+    {
+        let assets = (&mut reader).take(footer.assets_size);
+        let decoder = zstd::stream::Decoder::new(assets)
+            .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+        let mut archive = tar::Archive::new(decoder);
+        let skip: Vec<PathBuf> = skip.iter().map(|path| normalize_path(path)).collect();
+        safe_unpack_skipping(
+            &mut archive,
+            dest,
+            &SafeUnpackLimits::from_env(),
+            true,
+            false,
+            true,
+            &skip,
+            required,
+        )?;
+    }
+    let checked_size = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "checkpoint size overflow")
+        })?;
+    let mut remaining = checked_size.checked_sub(reader.bytes).ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint reader passed manifest",
+        )
+    })?;
+    let mut buffer = [0u8; 256 * 1024];
+    while remaining != 0 {
+        let chunk = remaining.min(buffer.len() as u64) as usize;
+        let count = reader.read(&mut buffer[..chunk])?;
+        if count == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::UnexpectedEof,
+                "checkpoint ended before checksum completed",
+            ));
+        }
+        remaining -= count as u64;
+    }
+    let after = reader.inner.metadata()?;
+    let path_after = fs::metadata(sidecar_path)?;
+    let same = |after: &fs::Metadata| {
+        same_checkpoint_identity(&before, after)
+            || (links_may_change && same_checkpoint_across_links(&before, after))
+    };
+    if !same(&after) || !same(&path_after) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint changed during extraction",
+        ));
+    }
+    if reader.hasher.finalize() != footer.checksum {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "checkpoint checksum mismatch",
+        ));
+    }
+    Ok(())
+}
+
+struct ChecksumReader<R> {
+    inner: R,
+    hasher: crc32fast::Hasher,
+    bytes: u64,
+}
+
+impl<R> ChecksumReader<R> {
+    fn new(inner: R) -> Self {
+        Self {
+            inner,
+            hasher: crc32fast::Hasher::new(),
+            bytes: 0,
+        }
+    }
+}
+
+impl<R: Read> Read for ChecksumReader<R> {
+    fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+        let count = self.inner.read(buffer)?;
+        self.hasher.update(&buffer[..count]);
+        self.bytes += count as u64;
+        Ok(count)
+    }
+}
+
+#[cfg(unix)]
+fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+        && before.ctime() == after.ctime()
+        && before.ctime_nsec() == after.ctime_nsec()
+}
+
+/// The same checkpoint after its names changed: adding or removing one moves
+/// its change time even when the count ends where it began (an export links
+/// it and drops the link), and nothing about its contents may differ. Only
+/// root writes a checkpoint's metadata, and the checksum covers every byte.
+#[cfg(unix)]
+fn same_checkpoint_across_links(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    before.dev() == after.dev()
+        && before.ino() == after.ino()
+        && before.len() == after.len()
+        && before.mtime() == after.mtime()
+        && before.mtime_nsec() == after.mtime_nsec()
+}
+
+#[cfg(not(unix))]
+fn same_checkpoint_across_links(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    same_checkpoint_identity(before, after)
+}
+
+#[cfg(not(unix))]
+fn same_checkpoint_identity(before: &fs::Metadata, after: &fs::Metadata) -> bool {
+    before.len() == after.len() && before.modified().ok() == after.modified().ok()
+}
+
+#[cfg(test)]
+mod resume_extract_tests {
+    use super::*;
+
+    /// Adding or removing another name of a checkpoint moves its change time;
+    /// that is accepted across links, while a content change is not.
+    #[cfg(unix)]
+    #[test]
+    fn only_a_link_count_change_is_tolerated_across_links() {
+        use std::os::unix::fs::MetadataExt;
+        let temp = tempfile::tempdir().unwrap();
+        let original = temp.path().join("pause.smolcheckpoint");
+        fs::write(&original, b"saved").unwrap();
+        let linked = temp.path().join("linked.smolcheckpoint");
+        fs::hard_link(&original, &linked).unwrap();
+        let before = fs::metadata(&linked).unwrap();
+
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::remove_file(&original).unwrap();
+        let unlinked = fs::metadata(&linked).unwrap();
+        assert!(
+            !same_checkpoint_identity(&before, &unlinked),
+            "an unlink moves the change time"
+        );
+        assert!(same_checkpoint_across_links(&before, &unlinked));
+
+        // A link added and dropped again leaves the count where it began.
+        let before = unlinked;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::hard_link(&linked, &original).unwrap();
+        fs::remove_file(&original).unwrap();
+        let relinked = fs::metadata(&linked).unwrap();
+        assert_eq!(before.nlink(), relinked.nlink());
+        assert!(!same_checkpoint_identity(&before, &relinked));
+        assert!(same_checkpoint_across_links(&before, &relinked));
+
+        let before = fs::metadata(&linked).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::hard_link(&linked, &original).unwrap();
+        fs::write(&linked, b"other").unwrap();
+        assert!(!same_checkpoint_across_links(
+            &before,
+            &fs::metadata(&linked).unwrap()
+        ));
+    }
+
+    /// A checkpoint sidecar holding `checkpoint/memory.bin` = `memory`.
+    fn sidecar_with_memory(artifact: &Path, memory: &[u8]) -> PackFooter {
+        let encoder = zstd::stream::Encoder::new(File::create(artifact).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        let mut header = tar::Header::new_gnu();
+        header.set_size(memory.len() as u64);
+        header.set_cksum();
+        tar.append_data(&mut header, "checkpoint/memory.bin", memory)
+            .unwrap();
+        tar.into_inner().unwrap().finish().unwrap();
+        let assets_size = fs::metadata(artifact).unwrap().len();
+        let manifest = b"{}";
+        File::options()
+            .append(true)
+            .open(artifact)
+            .unwrap()
+            .write_all(manifest)
+            .unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size,
+            manifest_offset: assets_size,
+            manifest_size: manifest.len() as u64,
+            checksum: crate::assets::crc32_file_range(
+                artifact,
+                0,
+                assets_size + manifest.len() as u64,
+            )
+            .unwrap(),
+        };
+        File::options()
+            .append(true)
+            .open(artifact)
+            .unwrap()
+            .write_all(&footer.to_bytes())
+            .unwrap();
+        footer
+    }
+
+    /// A resume extracts its pause while an off-host export links and unlinks
+    /// the same file: the strict check reads that as a change (the 500 a
+    /// resume right after a pause hit in production), the link-aware one
+    /// verifies the same bytes and accepts it.
+    #[cfg(unix)]
+    #[test]
+    fn a_resume_extracts_its_pause_while_an_export_links_it() {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("pause.smolcheckpoint");
+        let mut memory = vec![0_u8; 32 << 20];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for chunk in memory.chunks_mut(8) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            chunk.copy_from_slice(&seed.to_le_bytes()[..chunk.len()]);
+        }
+        let footer = sidecar_with_memory(&artifact, &memory);
+        let extract = |linked: bool, dest: &Path| {
+            let done = std::sync::Arc::new(AtomicBool::new(false));
+            let exporter = {
+                let (done, artifact) = (done.clone(), artifact.clone());
+                let link = temp.path().join("export.smolcheckpoint");
+                std::thread::spawn(move || {
+                    while !done.load(Ordering::Relaxed) {
+                        fs::hard_link(&artifact, &link).unwrap();
+                        fs::remove_file(&link).unwrap();
+                    }
+                })
+            };
+            let required = ["checkpoint/memory.bin".into()];
+            let result = if linked {
+                extract_linked_checkpoint_sidecar(&artifact, dest, &footer, &[], &required)
+            } else {
+                extract_verified_checkpoint_sidecar(&artifact, dest, &footer, &[], &required)
+            };
+            done.store(true, Ordering::Relaxed);
+            exporter.join().unwrap();
+            result
+        };
+        let strict = extract(false, &temp.path().join("strict")).unwrap_err();
+        assert!(
+            strict.to_string().contains("changed during extraction"),
+            "{strict}"
+        );
+        let resumed = temp.path().join("resumed");
+        extract(true, &resumed).unwrap();
+        assert_eq!(
+            fs::read(resumed.join("checkpoint/memory.bin")).unwrap(),
+            memory
+        );
+    }
+
+    #[test]
+    fn one_pass_extract_checks_unneeded_archive_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("pause.smolcheckpoint");
+        let mut unused = vec![0; 1024 * 1024];
+        let mut seed = 0x1234_5678_9abc_def0u64;
+        for chunk in unused.chunks_mut(8) {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            chunk.copy_from_slice(&seed.to_le_bytes()[..chunk.len()]);
+        }
+        let encoder = zstd::stream::Encoder::new(File::create(&artifact).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("checkpoint/memory.bin", b"memory".as_slice()),
+            ("portable-after.txt", unused.as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        let assets_size = fs::metadata(&artifact).unwrap().len();
+        let manifest = b"{}";
+        File::options()
+            .append(true)
+            .open(&artifact)
+            .unwrap()
+            .write_all(manifest)
+            .unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size,
+            manifest_offset: assets_size,
+            manifest_size: manifest.len() as u64,
+            checksum: crate::assets::crc32_file_range(
+                &artifact,
+                0,
+                assets_size + manifest.len() as u64,
+            )
+            .unwrap(),
+        };
+        File::options()
+            .append(true)
+            .open(&artifact)
+            .unwrap()
+            .write_all(&footer.to_bytes())
+            .unwrap();
+        let restored = temp.path().join("restored");
+        extract_verified_checkpoint_sidecar(
+            &artifact,
+            &restored,
+            &footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            b"memory"
+        );
+        assert!(!restored.join("portable-after.txt").exists());
+
+        let bad_footer = PackFooter {
+            checksum: footer.checksum ^ 1,
+            ..footer
+        };
+        let mut file = File::options()
+            .read(true)
+            .write(true)
+            .open(&artifact)
+            .unwrap();
+        file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
+            .unwrap();
+        file.write_all(&bad_footer.to_bytes()).unwrap();
+        let error = extract_verified_checkpoint_sidecar(
+            &artifact,
+            &temp.path().join("rejected"),
+            &bad_footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+
+        file.seek(SeekFrom::End(-(crate::format::FOOTER_SIZE as i64)))
+            .unwrap();
+        file.write_all(&footer.to_bytes()).unwrap();
+        assert!(footer.assets_size > 512 * 1024);
+        let corrupt_at = footer.assets_size - 32;
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        let mut original = [0];
+        file.read_exact(&mut original).unwrap();
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&[original[0] ^ 0x80]).unwrap();
+        let error = extract_verified_checkpoint_sidecar(
+            &artifact,
+            &temp.path().join("corrupt-unused-tail"),
+            &footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+
+        file.seek(SeekFrom::Start(corrupt_at)).unwrap();
+        file.write_all(&original).unwrap();
+        file.seek(SeekFrom::Start(footer.manifest_offset + 1))
+            .unwrap();
+        file.write_all(b"!").unwrap();
+        let error = extract_verified_checkpoint_sidecar(
+            &artifact,
+            &temp.path().join("corrupt-manifest"),
+            &footer,
+            &[],
+            &["checkpoint/memory.bin".into()],
+        )
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("checksum mismatch"));
+    }
+
+    #[test]
+    fn old_archive_order_still_restores_required_assets() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("old.smolcheckpoint");
+        let encoder = zstd::stream::Encoder::new(File::create(&artifact).unwrap(), 1).unwrap();
+        let mut tar = tar::Builder::new(encoder);
+        for (path, bytes) in [
+            ("agent-rootfs.tar", b"runtime".as_slice()),
+            ("checkpoint/disks/storage/0", b"disk".as_slice()),
+            ("checkpoint/checkpoint.bin", b"state".as_slice()),
+            ("checkpoint/manifest.bin", b"layout".as_slice()),
+            ("checkpoint/memory.bin", b"memory".as_slice()),
+            ("portable-after.txt", b"unused".as_slice()),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(bytes.len() as u64);
+            header.set_cksum();
+            tar.append_data(&mut header, path, bytes).unwrap();
+        }
+        tar.into_inner().unwrap().finish().unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: fs::metadata(&artifact).unwrap().len(),
+            manifest_offset: 0,
+            manifest_size: 0,
+            checksum: 0,
+        };
+        let required = vec![
+            "checkpoint/checkpoint.bin".into(),
+            "checkpoint/manifest.bin".into(),
+            "checkpoint/memory.bin".into(),
+        ];
+        let restored = temp.path().join("restored");
+        extract_checkpoint_sidecar(
+            &artifact,
+            &restored,
+            &footer,
+            &["agent-rootfs.tar".into(), "checkpoint/disks".into()],
+            &required,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            b"memory"
+        );
+        assert!(!restored.join("agent-rootfs.tar").exists());
+        assert!(!restored.join("checkpoint/disks").exists());
+
+        let with_prefix = temp.path().join("with-prefix");
+        extract_checkpoint_sidecar(&artifact, &with_prefix, &footer, &[], &required).unwrap();
+        assert_eq!(
+            fs::read(with_prefix.join("agent-rootfs.tar")).unwrap(),
+            b"runtime"
+        );
+        assert!(!with_prefix.join("portable-after.txt").exists());
+
+        let missing = temp.path().join("missing");
+        assert!(extract_checkpoint_sidecar(
+            &artifact,
+            &missing,
+            &footer,
+            &[],
+            &["checkpoint/not-present.bin".into()],
+        )
+        .is_err());
+    }
+}
+
 fn extract_sidecar_inner(
     sidecar_path: &Path,
     cache_dir: &Path,
     footer: &PackFooter,
     debug: bool,
+    agent_version: Option<&str>,
+    digest_out: Option<&mut Option<ArtifactDigestProof>>,
 ) -> std::io::Result<()> {
     fs::create_dir_all(cache_dir)?;
 
@@ -2346,23 +4171,23 @@ fn extract_sidecar_inner(
         );
     }
 
-    let sidecar_file = File::open(sidecar_path)?;
-    let limited_reader = sidecar_file.take(footer.assets_size);
-
-    let decoder = zstd::stream::Decoder::new(limited_reader)
-        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
-    let mut archive = tar::Archive::new(decoder);
+    let mut sidecar_file = ExtractDigestReader::open(sidecar_path, digest_out.is_some())?;
     let manifest = crate::packer::read_manifest_from_sidecar(sidecar_path).ok();
-    safe_unpack_with_policy(
-        &mut archive,
-        cache_dir,
-        &SafeUnpackLimits::from_env(),
-        manifest
-            .as_ref()
-            .is_some_and(|manifest| manifest.checkpoint.is_some()),
-        false,
-    )?;
+    {
+        let limited_reader = (&mut sidecar_file).take(footer.assets_size);
+        let decoder = zstd::stream::Decoder::new(limited_reader)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        let mut archive = tar::Archive::new(decoder);
+        safe_unpack_with_policy(
+            &mut archive,
+            cache_dir,
+            &SafeUnpackLimits::from_env(),
+            manifest
+                .as_ref()
+                .is_some_and(|manifest| manifest.checkpoint.is_some()),
+            false,
+        )?;
+    }
 
     if debug {
         eprintln!("debug: extracted assets to {}", cache_dir.display());
@@ -2384,7 +4209,10 @@ fn extract_sidecar_inner(
         })
         .unwrap_or_default();
 
-    let pack_version = manifest.as_ref().map(|m| m.smolvm_version.as_str());
+    // What the agent that boots this pack can do decides how its layers are
+    // presented; that is the packed agent unless the caller boots its own.
+    let pack_version =
+        agent_version.or_else(|| manifest.as_ref().map(|m| m.smolvm_version.as_str()));
     let host_layers =
         has_layer_tars(cache_dir) && host_layers_via_override_stat(pack_version, cache_dir);
     let guest_unpacks_layers =
@@ -2422,6 +4250,9 @@ fn extract_sidecar_inner(
         debug,
         host_layers,
     )?;
+    if let Some(slot) = digest_out {
+        *slot = sidecar_file.finish()?;
+    }
     Ok(())
 }
 
@@ -2559,6 +4390,7 @@ fn materialize_tar_dir(
     final_dir: &Path,
     debug: bool,
     owner_xattr: bool,
+    translate_whiteouts: bool,
 ) -> std::io::Result<Option<UnpackReport>> {
     if final_dir.is_dir() {
         return Ok(None);
@@ -2577,12 +4409,15 @@ fn materialize_tar_dir(
     let unpacked = (|| {
         let tar_file = File::open(tar)?;
         let mut archive = tar::Archive::new(tar_file);
-        safe_unpack_with_policy(
+        safe_unpack_skipping(
             &mut archive,
             &staging,
             &SafeUnpackLimits::from_env(),
             false,
             owner_xattr,
+            translate_whiteouts,
+            &[],
+            &[],
         )
     })();
     let report = match unpacked {
@@ -2705,7 +4540,7 @@ fn post_process_extraction(
         if debug && !rootfs_dir.exists() {
             eprintln!("debug: extracting agent-rootfs.tar...");
         }
-        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug, false)?;
+        materialize_tar_dir(&rootfs_tar, &rootfs_dir, debug, false, true)?;
     }
 
     // Extract OCI layer tars to layers/{digest}/ directories.
@@ -2753,11 +4588,13 @@ fn post_process_extraction(
         // A tar's size is a faithful upper bound on the tree it unpacks to.
         let mut pending: Vec<(PathBuf, PathBuf)> = Vec::new();
         let mut needed = 0u64;
+        let mut layer_tars = 0usize;
         for entry in fs::read_dir(&layers_dir)? {
             let path = entry?.path();
             if !path.extension().is_some_and(|ext| ext == "tar") {
                 continue;
             }
+            layer_tars += 1;
             let stem = path.file_stem().unwrap_or_default().to_string_lossy();
             let layer_dir = extract_dir.join(&*stem);
             if !layer_dir.is_dir() {
@@ -2775,7 +4612,9 @@ fn post_process_extraction(
                     layer_dir.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
-            if let Some(report) = materialize_tar_dir(tar, layer_dir, debug, owner_xattr)? {
+            if let Some(report) =
+                materialize_tar_dir(tar, layer_dir, debug, owner_xattr, layer_tars > 1)?
+            {
                 if debug && report.skipped > 0 {
                     eprintln!(
                         "debug: layer {}: {} entries the host could not represent were skipped",
@@ -2788,6 +4627,9 @@ fn post_process_extraction(
 
         if owner_xattr {
             fs::write(extract_dir.join(OPAQUE_XATTR_MARKER), "user\n")?;
+            fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")?;
+            fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")?;
+            fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
         }
         // Record the manifest's layer order so the guest stacks overlayfs
         // lowerdirs correctly (layer dirs are named by digest and don't sort
@@ -2800,6 +4642,11 @@ fn post_process_extraction(
                 .collect();
             if !lines.is_empty() {
                 fs::write(extract_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+                // Re-export stages the retained tars from the pack root, not
+                // the macOS case-sensitive volume. Keep its order there too.
+                if extract_dir != layers_dir {
+                    fs::write(layers_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+                }
             }
         }
     }
@@ -3022,11 +4869,78 @@ pub fn has_active_leases(cache_dir: &Path) -> bool {
     }
 }
 
+/// Move this process's lease on a named machine's layers volume (`mount` is
+/// the path [`acquire_layers_lease`] returned) to the VMM that uses it, so the
+/// lease ends with the VM. A long-lived launcher such as `smolvm serve` would
+/// otherwise keep it live forever, and [`release_unused_machine_layers_volume`]
+/// would never see the volume as free. Standalone packs keep their own leases.
+pub fn hand_machine_layers_lease_to(mount: &Path, pid: i32) {
+    #[cfg(target_os = "macos")]
+    {
+        if mount.file_name().is_none_or(|name| name != CS_MOUNT_DIR) {
+            return;
+        }
+        let Some(cache_dir) = mount.parent() else {
+            return;
+        };
+        if !is_machine_layers_cache(cache_dir) {
+            return;
+        }
+        let Ok(lock) = lock_leases(cache_dir) else {
+            return;
+        };
+        let leases_dir = cache_dir.join(LEASES_DIR);
+        if fs::write(leases_dir.join(pid.to_string()), "").is_ok() {
+            let _ = fs::remove_file(leases_dir.join(std::process::id().to_string()));
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (mount, pid);
+    }
+}
+
+/// Detach a stopped named machine's layers volume once its last fork child is
+/// gone. The caller has checked that the owning VMM is not alive; this keeps
+/// the volume when a live process holds a lease (a start is mid-launch) or a
+/// child still links to it. Holding the lease lock across the check and the
+/// detach keeps a concurrent acquire from mounting in between.
+pub fn release_unused_machine_layers_volume(cache_dir: &Path) {
+    #[cfg(target_os = "macos")]
+    {
+        if !cache_dir.join(LEASES_LOCK).exists() {
+            return;
+        }
+        let Ok(lock) = lock_leases(cache_dir) else {
+            return;
+        };
+        let leases_dir = cache_dir.join(LEASES_DIR);
+        gc_stale_leases(&leases_dir);
+        if count_leases(&leases_dir) == 0 {
+            force_detach_layers_volume(cache_dir);
+        }
+        drop(lock);
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = cache_dir;
+    }
+}
+
 /// Force-detach and clean up all leases for a cache directory.
 ///
 /// Used by `--force-extract` before clearing the cache. NOT used by normal
 /// `pack prune` — prune should check `has_active_leases` first and skip
 /// active caches.
+///
+/// A named machine's volume is also shared by its fork children. Their pack
+/// symlinks pin it until the children are deleted, even if the source stops.
+/// Once those references are gone, stopping/deleting the source reclaims it,
+/// and so does deleting the last child of a stopped source
+/// ([`release_unused_machine_layers_volume`]).
 pub fn force_detach_layers_volume(cache_dir: &Path) {
     // A fork clone's cache dir is a symlink to its golden's — the clone doesn't
     // own the volume or the leases behind it, so detaching through the link
@@ -3042,6 +4956,19 @@ pub fn force_detach_layers_volume(cache_dir: &Path) {
     {
         let mount_point = cache_dir.join(CS_MOUNT_DIR);
         if mount_point.exists() && is_mount_point(&mount_point) {
+            match machine_layers_have_dependents(cache_dir) {
+                Ok(true) => return,
+                Err(error) => {
+                    // An unreadable ownership inventory is not permission to
+                    // tear a filesystem out from under a possible live child.
+                    eprintln!(
+                        "warning: retaining layers volume {}: {error}",
+                        cache_dir.display()
+                    );
+                    return;
+                }
+                Ok(false) => {}
+            }
             let _ = std::process::Command::new("hdiutil")
                 .args(["detach", "-quiet", "-force"])
                 .arg(&mount_point)
@@ -3095,12 +5022,97 @@ fn sum_tar_sizes(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
-    entries
+    let layers: u64 = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "tar"))
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
-        .sum()
+        .sum();
+    // The guest reads the workspace archive from the same mounted volume.
+    let workspace = dir
+        .join(crate::assets::WORKSPACE_SEED_DIR)
+        .join(crate::assets::WORKSPACE_SEED_FILE);
+    layers.saturating_add(fs::metadata(workspace).map(|m| m.len()).unwrap_or(0))
+}
+
+/// Keep the workspace archive beside the layers the guest actually mounts.
+/// On macOS that directory is a separate case-sensitive volume, not `layers/`.
+/// Called on cache hits too, to repair packs extracted before this was copied.
+#[cfg(any(target_os = "macos", test))]
+fn materialize_workspace_seed(cache_dir: &Path, mounted_layers: &Path) -> std::io::Result<()> {
+    use crate::assets::{WORKSPACE_SEED_DIR, WORKSPACE_SEED_FILE};
+
+    let source_dir = cache_dir.join("layers").join(WORKSPACE_SEED_DIR);
+    match fs::symlink_metadata(&source_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "workspace seed directory is not a directory",
+            ))
+        }
+    }
+    let source = source_dir.join(WORKSPACE_SEED_FILE);
+    let metadata = fs::symlink_metadata(&source)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "workspace seed is not a regular file",
+        ));
+    }
+    if cache_dir
+        .join("layers")
+        .join(format!("{WORKSPACE_SEED_DIR}.tar"))
+        .exists()
+    {
+        return Err(std::io::Error::other(
+            "workspace seed conflicts with an image layer",
+        ));
+    }
+    let destination_dir = mounted_layers.join(WORKSPACE_SEED_DIR);
+    match fs::create_dir(&destination_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(&destination_dir)?.is_dir() {
+                return Err(std::io::Error::other(
+                    "mounted workspace seed directory is not a directory",
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let destination = destination_dir.join(WORKSPACE_SEED_FILE);
+    match fs::symlink_metadata(&destination) {
+        // Artifact caches are immutable; an already published archive is reused.
+        Ok(existing) if existing.is_file() && existing.len() == metadata.len() => return Ok(()),
+        Ok(existing) if !existing.is_file() => {
+            return Err(std::io::Error::other(
+                "mounted workspace seed is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    preflight_free_space(mounted_layers, metadata.len(), "the packed workspace")?;
+    let mut input = fs::OpenOptions::new();
+    input.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        input.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut input = input.open(source)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&destination_dir)?;
+    if std::io::copy(&mut input, staged.as_file_mut())? != metadata.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "workspace seed changed during copying",
+        ));
+    }
+    staged.as_file().set_permissions(metadata.permissions())?;
+    staged.as_file().sync_all()?;
+    staged.persist(destination).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Check whether `path` is a mount point by comparing device IDs with parent.
@@ -3214,20 +5226,79 @@ fn detach_if_unused(cache_dir: &Path) {
     }
 }
 
-/// The sibling cache directories that may hold a stranded volume.
-///
-/// Two layouts use this protocol: `<root>/<hash>` (standalone packs) and
-/// `<root>/<hash>/pack` (VM-backed packs). Both are handled by walking up to the
-/// directory that *contains the hashes* and re-applying our own suffix, so we
-/// only ever look at peers of the same shape.
-#[cfg(target_os = "macos")]
+/// Named machines use `<vm-root>/<hash>/pack`; standalone packs use
+/// `<pack-root>/<checksum>`. Named volumes outlive the process that mounts them
+/// and are reclaimed by machine stop/delete, never by process-lease GC.
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn is_machine_layers_cache(cache_dir: &Path) -> bool {
+    cache_dir.file_name().is_some_and(|name| name == "pack")
+}
+
+/// Fork children link their pack directory to the source (possibly through
+/// another child). Keep that immutable volume while any such reference exists.
+/// Stopped children count too: liveness lives in machine records, which this
+/// crate cannot see, so a link is treated as a possible user. Deleting the last
+/// child of a stopped source releases the volume
+/// ([`release_unused_machine_layers_volume`]).
+#[cfg(any(target_os = "macos", all(test, unix)))]
+fn machine_layers_have_dependents(cache_dir: &Path) -> std::io::Result<bool> {
+    if !is_machine_layers_cache(cache_dir) {
+        return Ok(false);
+    }
+    let Some(root) = cache_dir.parent().and_then(Path::parent) else {
+        return Ok(false);
+    };
+    let source = fs::canonicalize(cache_dir)?;
+    for entry in fs::read_dir(root)? {
+        let peer = entry?.path().join("pack");
+        let metadata = match peer.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                continue
+            }
+            Err(error) => {
+                eprintln!(
+                    "warning: ignoring unreadable sibling layers reference {}: {error}",
+                    peer.display()
+                );
+                continue;
+            }
+        };
+        if metadata.file_type().is_symlink() {
+            match fs::canonicalize(&peer) {
+                Ok(target) if target == source => return Ok(true),
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    // A malformed peer or a chain exceeding the OS symlink
+                    // limit must not pin every unrelated machine's volume.
+                    // Valid fork trees retain their direct child reference:
+                    // deleting an ancestor while it has children is refused.
+                    eprintln!(
+                        "warning: ignoring unresolved sibling layers reference {}: {error}",
+                        peer.display()
+                    );
+                }
+            }
+        }
+    }
+    Ok(false)
+}
+
+/// Standalone sibling caches that may hold a stranded process-owned volume.
+/// The start CLI's exit says nothing about a named VMM's liveness. In particular,
+/// walking `<vm-root>/<hash>/pack` peers would detach running sibling machines.
+#[cfg(any(target_os = "macos", all(test, unix)))]
 fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
-    let nested = cache_dir.file_name().is_some_and(|n| n == "pack");
-    let Some(root) = (if nested {
-        cache_dir.parent().and_then(Path::parent)
-    } else {
-        cache_dir.parent()
-    }) else {
+    if is_machine_layers_cache(cache_dir) {
+        return Vec::new();
+    }
+    let Some(root) = cache_dir.parent() else {
         return Vec::new();
     };
     let Ok(entries) = fs::read_dir(root) else {
@@ -3235,14 +5306,8 @@ fn sibling_cache_dirs(cache_dir: &Path) -> Vec<PathBuf> {
     };
     entries
         .filter_map(|e| e.ok())
-        .map(|e| {
-            if nested {
-                e.path().join("pack")
-            } else {
-                e.path()
-            }
-        })
-        .filter(|p| p != cache_dir && p.is_dir())
+        .map(|e| e.path())
+        .filter(|p| p != cache_dir && p.is_dir() && !p.is_symlink())
         .collect()
 }
 
@@ -3312,9 +5377,9 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
     let image_path = cache_dir.join(CS_IMAGE_NAME);
     let mount_point = cache_dir.join(CS_MOUNT_DIR);
 
-    // Already mounted — nothing to do.
+    // Also repair an existing cache while the caller holds the volume lock.
     if mount_point.exists() && is_mount_point(&mount_point) {
-        return Ok(());
+        return materialize_workspace_seed(cache_dir, &mount_point);
     }
 
     // Create the sparse image if it doesn't exist.
@@ -3379,7 +5444,7 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
         )));
     }
 
-    Ok(())
+    materialize_workspace_seed(cache_dir, &mount_point)
 }
 
 /// Marker file indicating libs extraction is complete.
@@ -3782,6 +5847,147 @@ pub fn create_or_copy_storage_disk(
 #[cfg(test)]
 mod tests {
     #[test]
+    fn workspace_seed_is_available_in_the_separate_mounted_layers_directory() {
+        let cache = tempfile::tempdir().unwrap();
+        let mounted = tempfile::tempdir().unwrap();
+        let relative =
+            Path::new(crate::assets::WORKSPACE_SEED_DIR).join(crate::assets::WORKSPACE_SEED_FILE);
+        let source = cache.path().join("layers").join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"workspace archive").unwrap();
+        materialize_workspace_seed(cache.path(), mounted.path()).unwrap();
+        assert_eq!(
+            fs::read(mounted.path().join(&relative)).unwrap(),
+            fs::read(&source).unwrap()
+        );
+        fs::write(mounted.path().join(&relative), b"partial").unwrap();
+        materialize_workspace_seed(cache.path(), mounted.path()).unwrap();
+        assert_eq!(
+            fs::read(mounted.path().join(&relative)).unwrap(),
+            fs::read(source).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_seed_never_follows_a_destination_directory_symlink() {
+        let cache = tempfile::tempdir().unwrap();
+        let mounted = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = cache
+            .path()
+            .join("layers")
+            .join(crate::assets::WORKSPACE_SEED_DIR);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(crate::assets::WORKSPACE_SEED_FILE), b"archive").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            mounted.path().join(crate::assets::WORKSPACE_SEED_DIR),
+        )
+        .unwrap();
+        assert!(materialize_workspace_seed(cache.path(), mounted.path()).is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_extraction_keeps_tar_order_for_reexport() {
+        struct MountedCache(tempfile::TempDir);
+        impl Drop for MountedCache {
+            fn drop(&mut self) {
+                force_detach_layers_volume(self.0.path());
+            }
+        }
+        let cache = MountedCache(tempfile::tempdir().unwrap());
+        let layers = cache.0.path().join("layers");
+        fs::create_dir(&layers).unwrap();
+        fs::write(layers.join("zzz.tar"), tar_of(&[("file", b"base")])).unwrap();
+        fs::write(layers.join("aaa.tar"), tar_of(&[("file", b"top")])).unwrap();
+        post_process_extraction(
+            cache.0.path(),
+            &["zzz".into(), "aaa".into()],
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(layers.join(LAYER_ORDER_FILE)).unwrap(),
+            "zzz\naaa"
+        );
+        let lease = acquire_layers_lease(cache.0.path(), false).unwrap();
+        assert_eq!(
+            fs::read_to_string(lease.path.join(LAYER_ORDER_FILE)).unwrap(),
+            "zzz\naaa"
+        );
+        assert!(layers.join("zzz.tar").is_file());
+        assert!(layers.join("aaa.tar").is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn workspace_seed_reaches_fresh_and_already_mounted_case_sensitive_volumes() {
+        struct MountedCache(tempfile::TempDir);
+        impl Drop for MountedCache {
+            fn drop(&mut self) {
+                force_detach_layers_volume(self.0.path());
+            }
+        }
+        let cache = MountedCache(tempfile::tempdir().unwrap());
+        let relative =
+            Path::new(crate::assets::WORKSPACE_SEED_DIR).join(crate::assets::WORKSPACE_SEED_FILE);
+        let source = cache.0.path().join("layers").join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"workspace archive").unwrap();
+        ensure_cs_volume_mounted(cache.0.path(), false).unwrap();
+        let visible = cache.0.path().join(CS_MOUNT_DIR).join(&relative);
+        assert_eq!(fs::read(&visible).unwrap(), b"workspace archive");
+        fs::remove_file(&visible).unwrap();
+        ensure_cs_volume_mounted(cache.0.path(), false).unwrap();
+        assert_eq!(fs::read(&visible).unwrap(), b"workspace archive");
+        assert_eq!(sum_tar_sizes(&cache.0.path().join("layers")), 17);
+    }
+
+    #[test]
+    fn extraction_digest_covers_consumed_bytes_and_trailing_footer() {
+        use std::io::Read;
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("checkpoint.smolcheckpoint");
+        let mut bytes = vec![0xA5; 1024 * 1024 + 17];
+        bytes.extend_from_slice(b"manifest-and-footer");
+        std::fs::write(&artifact, &bytes).unwrap();
+
+        let mut reader = super::ExtractDigestReader::open(&artifact, true).unwrap();
+        let mut first = [0_u8; 37];
+        reader.read_exact(&mut first).unwrap();
+        assert_eq!(first, bytes[..37]);
+        let mut observed = reader.finish().unwrap().unwrap();
+        assert_eq!(
+            observed.digest_for(&artifact).unwrap(),
+            super::hash_artifact_sha256(&artifact).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn extraction_digest_rejects_a_changed_inode_even_with_restored_mtime() {
+        let temp = tempfile::tempdir().unwrap();
+        let artifact = temp.path().join("checkpoint.smolcheckpoint");
+        std::fs::write(&artifact, b"original-bytes").unwrap();
+        let original_mtime = std::fs::metadata(&artifact).unwrap().modified().unwrap();
+        let reader = super::ExtractDigestReader::open(&artifact, true).unwrap();
+        let mut observed = reader.finish().unwrap().unwrap();
+
+        std::fs::write(&artifact, b"tampered-bytes").unwrap();
+        std::fs::File::open(&artifact)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        assert!(observed.digest_for(&artifact).is_none());
+    }
+
+    #[test]
     fn local_digest_identity_ignores_only_path() {
         let original = super::ArtifactSourceIdentity {
             canonical_path: "capture".into(),
@@ -3790,6 +5996,7 @@ mod tests {
             modified_nanos: Some(20),
             inode: Some((1, 2, 30, 40)),
             locally_produced: true,
+            hashed_while_service_only: false,
         };
         let mut alias = super::ArtifactSourceIdentity {
             canonical_path: "restore".into(),
@@ -3907,7 +6114,7 @@ mod tests {
         let final_dir = dir.path().join("deadbeef");
 
         std::fs::write(&tar_path, truncated).unwrap();
-        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true)
             .expect_err("a truncated archive must not extract successfully");
         assert!(err.to_string().contains("nothing was kept"), "got: {err}");
         assert!(
@@ -3920,7 +6127,7 @@ mod tests {
         );
 
         std::fs::write(&tar_path, &intact).unwrap();
-        let report = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
+        let report = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true)
             .unwrap()
             .expect("a fresh extraction reports what it wrote");
         assert_eq!(report.entries, 2);
@@ -3944,7 +6151,7 @@ mod tests {
 
         let tar_path = dir.path().join("layer.tar");
         std::fs::write(&tar_path, tar_of(&[("usr/fresh", b"ok")])).unwrap();
-        super::materialize_tar_dir(&tar_path, &final_dir, false, false).unwrap();
+        super::materialize_tar_dir(&tar_path, &final_dir, false, false, true).unwrap();
 
         assert!(final_dir.join("usr/fresh").is_file());
         assert!(
@@ -3965,7 +6172,7 @@ mod tests {
         let tar_path = dir.path().join("layer.tar");
         std::fs::write(&tar_path, tar_of(&[("would-overwrite", b"no")])).unwrap();
 
-        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false, false).unwrap();
+        let reused = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true).unwrap();
         assert!(
             reused.is_none(),
             "nothing is extracted over a complete layer"
@@ -4067,7 +6274,7 @@ mod tests {
         std::fs::write(&tar_path, builder.into_inner().unwrap()).unwrap();
 
         let final_dir = mount.join("layer0");
-        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false)
+        let err = super::materialize_tar_dir(&tar_path, &final_dir, false, false, true)
             .expect_err("3 MB of entries cannot fit a 2 MB volume");
         assert!(
             err.raw_os_error() == Some(libc::ENOSPC)
@@ -4091,7 +6298,7 @@ mod tests {
 
         // With room to spare the very same call completes.
         let roomy = dir.path().join("roomy");
-        super::materialize_tar_dir(&tar_path, &roomy, false, false).unwrap();
+        super::materialize_tar_dir(&tar_path, &roomy, false, false, true).unwrap();
         assert!(roomy.join("d63/blob").is_file());
     }
 
@@ -4177,6 +6384,135 @@ mod tests {
         assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
     }
 
+    fn digest_of(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(bytes))
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_received_digest_answers_a_warm_hit_without_reading_the_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let first = temp.path().join("first");
+        fs::write(&first, b"artifact bytes").unwrap();
+        let digest = ensure_shared_artifact_sha256(&first, &shared).unwrap();
+
+        let second = temp.path().join("second");
+        fs::write(&second, b"artifact bytes").unwrap();
+        let mut proof =
+            ArtifactDigestProof::received(File::open(&second).unwrap(), digest.clone(), true)
+                .unwrap();
+        assert_eq!(
+            ensure_shared_artifact_sha256_with_observed(&second, &shared, Some(&mut proof))
+                .unwrap(),
+            digest
+        );
+
+        // A proof is taken at its word for its inode: a wrong digest for the
+        // very same bytes is reported as a collision, so nothing re-read them.
+        let third = temp.path().join("third");
+        fs::write(&third, b"artifact bytes").unwrap();
+        let mut wrong =
+            ArtifactDigestProof::received(File::open(&third).unwrap(), digest_of(b"other"), true)
+                .unwrap();
+        let error = ensure_shared_artifact_sha256_with_observed(&third, &shared, Some(&mut wrong))
+            .unwrap_err();
+        assert!(error.to_string().contains("checksum collision"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_received_digest_is_ignored_once_its_inode_changes() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let first = temp.path().join("first");
+        fs::write(&first, b"artifact bytes").unwrap();
+        let digest = ensure_shared_artifact_sha256(&first, &shared).unwrap();
+
+        let second = temp.path().join("second");
+        fs::write(&second, b"artifact bytes").unwrap();
+        let mut stale =
+            ArtifactDigestProof::received(File::open(&second).unwrap(), digest_of(b"other"), true)
+                .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&second, b"artifact bytes").unwrap();
+        // The proof no longer names these bytes, so they are hashed instead.
+        assert_eq!(
+            ensure_shared_artifact_sha256_with_observed(&second, &shared, Some(&mut stale))
+                .unwrap(),
+            digest
+        );
+    }
+
+    #[test]
+    fn a_received_digest_must_be_a_sha256() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("artifact");
+        fs::write(&path, b"x").unwrap();
+        for digest in ["", "abc", &"A".repeat(64), &"g".repeat(64)] {
+            assert!(
+                ArtifactDigestProof::received(File::open(&path).unwrap(), digest.to_string(), true)
+                    .is_err(),
+                "{digest}"
+            );
+        }
+    }
+
+    #[test]
+    fn an_unreadable_or_foreign_unsynced_marker_means_the_data_may_be_lost() {
+        let temp = tempfile::tempdir().unwrap();
+        let marker = temp.path().join("entry.unsynced");
+        assert!(!unsynced_before_this_boot(&marker));
+        fs::write(&marker, "another-boot\n").unwrap();
+        assert!(unsynced_before_this_boot(&marker));
+        fs::create_dir(temp.path().join("dir.unsynced")).unwrap();
+        assert!(unsynced_before_this_boot(&temp.path().join("dir.unsynced")));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_extraction_left_unsynced_by_an_earlier_boot_is_not_extracted() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("0000abcd");
+        fs::create_dir(&cache).unwrap();
+        fs::write(cache.join(EXTRACTION_MARKER), "").unwrap();
+        let marker = unsynced_marker_path(&cache);
+
+        mark_unsynced(&marker).unwrap();
+        assert!(is_extracted(&cache), "this boot still holds the data");
+        assert!(memory_sync_pending(&cache));
+
+        fs::write(&marker, "another-boot\n").unwrap();
+        assert!(!is_extracted(&cache));
+
+        clear_unsynced(&marker).unwrap();
+        assert!(is_extracted(&cache));
+        assert!(!memory_sync_pending(&cache));
+        clear_unsynced(&marker).unwrap();
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn written_back_memory_clears_its_marker_and_a_failed_write_back_withdraws_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("0000abcd");
+        fs::create_dir_all(cache.join("checkpoint")).unwrap();
+        fs::write(cache.join("checkpoint/memory.bin"), b"ram").unwrap();
+        fs::write(cache.join(EXTRACTION_MARKER), "").unwrap();
+        mark_unsynced(&unsynced_marker_path(&cache)).unwrap();
+        sync_extracted_memory(&cache).unwrap();
+        assert!(!memory_sync_pending(&cache));
+        assert!(is_extracted(&cache));
+
+        fs::remove_file(cache.join("checkpoint/memory.bin")).unwrap();
+        mark_unsynced(&unsynced_marker_path(&cache)).unwrap();
+        assert!(sync_extracted_memory(&cache).is_err());
+        assert!(!is_extracted(&cache));
+    }
+
     #[cfg(unix)]
     #[test]
     fn shared_digest_rejects_same_length_edit_with_restored_mtime() {
@@ -4209,18 +6545,145 @@ mod tests {
         assert!(!identity.covers_local(&identity));
     }
 
+    /// A private pack (only the service can write it) that is unchanged since
+    /// its full read reuses that digest instead of hashing the pack again: a
+    /// warm create from a large pack must not read the whole pack (#1454).
+    #[cfg(unix)]
     #[test]
-    fn an_unchanged_external_artifact_still_requires_digest_verification() {
+    fn an_unchanged_private_artifact_reuses_its_full_read_digest() {
+        use std::os::unix::fs::PermissionsExt;
         let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
         let shared = temp.path().join("shared");
         fs::create_dir(&shared).unwrap();
         let artifact = temp.path().join("download");
         fs::write(&artifact, b"downloaded bytes").unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(only_service_can_write(&artifact));
+        let digest = ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+        // Proof that the second call reads no bytes: a digest the bytes no
+        // longer match is returned as is, because the file cannot have changed.
+        fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
+        assert_eq!(
+            ensure_shared_artifact_sha256(&artifact, &shared).unwrap(),
+            "0".repeat(64)
+        );
+        fs::write(shared_artifact_sha256_path(&shared), format!("{digest}\n")).unwrap();
+        // Any write moves ctime, so the reuse ends and the bytes are read again.
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs::write(&artifact, b"different bytes!").unwrap();
+        assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+    }
+
+    /// A pack someone other than the service can write must be read in full
+    /// every time: its bytes can change without its identity changing.
+    #[cfg(unix)]
+    #[test]
+    fn an_artifact_others_can_write_still_requires_digest_verification() {
+        use std::os::unix::fs::PermissionsExt;
+        for (file_mode, dir_mode) in [(0o666, 0o755), (0o644, 0o777)] {
+            let temp = tempfile::tempdir().unwrap();
+            fs::set_permissions(temp.path(), fs::Permissions::from_mode(dir_mode)).unwrap();
+            let shared = temp.path().join("shared");
+            fs::create_dir(&shared).unwrap();
+            let artifact = temp.path().join("download");
+            fs::write(&artifact, b"downloaded bytes").unwrap();
+            fs::set_permissions(&artifact, fs::Permissions::from_mode(file_mode)).unwrap();
+            assert!(!only_service_can_write(&artifact));
+            ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
+            fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
+            assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+        }
+    }
+
+    /// A digest from a read that happened while others could write the pack
+    /// is never reused, even after the pack becomes private: a writer that
+    /// already held it open can still change it.
+    #[cfg(unix)]
+    #[test]
+    fn a_digest_read_while_others_could_write_is_not_reused_later() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        fs::set_permissions(temp.path(), fs::Permissions::from_mode(0o755)).unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("download");
+        fs::write(&artifact, b"downloaded bytes").unwrap();
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o666)).unwrap();
         ensure_shared_artifact_sha256(&artifact, &shared).unwrap();
-        // A cached digest is not proof of local production, even with an exact
-        // source fingerprint. Re-reading the bytes must catch this mismatch.
+        let recorded: ArtifactSourceIdentity =
+            serde_json::from_slice(&fs::read(shared_artifact_source_path(&shared)).unwrap())
+                .unwrap();
+        assert!(!recorded.hashed_while_service_only);
+        fs::set_permissions(&artifact, fs::Permissions::from_mode(0o644)).unwrap();
         fs::write(shared_artifact_sha256_path(&shared), "0".repeat(64)).unwrap();
         assert!(ensure_shared_artifact_sha256(&artifact, &shared).is_err());
+    }
+
+    /// An entry that lost its image layers after extraction is repaired by the
+    /// next extraction instead of being trusted because of its marker; one
+    /// that still has them, and a pack without layers, are left alone.
+    #[test]
+    fn a_marked_entry_that_lost_its_layers_is_re_extracted() {
+        let temp = tempfile::tempdir().unwrap();
+        let stub = temp.path().join("stub");
+        fs::write(&stub, b"#!/bin/sh\necho stub").unwrap();
+        let mut collector =
+            crate::assets::AssetCollector::new(temp.path().join("staging")).unwrap();
+        // A real tar: other tests may switch on host-side layer unpacking.
+        collector
+            .add_layer("sha256:abc123def456", &make_tar("hello", b"world"))
+            .unwrap();
+        let manifest = crate::format::PackManifest::new(
+            "test:latest".into(),
+            "sha256:test".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let packed = temp.path().join("packed");
+        crate::packer::Packer::new(manifest)
+            .with_stub(&stub)
+            .with_assets(collector)
+            .pack(&packed)
+            .unwrap();
+        let sidecar = packed.with_extension("smolmachine");
+        let footer = crate::packer::read_footer_from_sidecar(&sidecar).unwrap();
+        let root = temp.path().join("shared");
+
+        let entry = extract_sidecar_shared(&sidecar, &root, &footer, false).unwrap();
+        assert!(is_extracted(&entry) && cached_layers_usable(&entry));
+        let untouched = entry.join("untouched");
+        fs::write(&untouched, b"kept").unwrap();
+
+        // A cleaner removes the layers but leaves the marker.
+        for layer in fs::read_dir(entry.join("layers")).unwrap() {
+            let path = layer.unwrap().path();
+            if path.is_dir() {
+                fs::remove_dir_all(path).unwrap();
+            } else {
+                fs::remove_file(path).unwrap();
+            }
+        }
+        assert!(is_extracted(&entry) && !cached_layers_usable(&entry));
+
+        extract_sidecar_shared(&sidecar, &root, &footer, false).unwrap();
+        assert!(is_extracted(&entry) && cached_layers_usable(&entry));
+        assert!(untouched.exists(), "the entry is repaired in place");
+
+        // A healthy entry is a no-op, as before.
+        fs::write(&untouched, b"still kept").unwrap();
+        extract_sidecar_shared(&sidecar, &root, &footer, false).unwrap();
+        assert_eq!(fs::read(&untouched).unwrap(), b"still kept");
+    }
+
+    #[test]
+    fn legacy_digest_identity_is_never_reused_by_the_hashed_path() {
+        let identity: super::ArtifactSourceIdentity = serde_json::from_str(
+            r#"{"canonical_path":"old","len":1,"modified_secs":1,"modified_nanos":0,"inode":[1,2,3,4]}"#,
+        )
+        .unwrap();
+        assert!(!identity.hashed_while_service_only);
+        assert!(!identity.covers_hashed(&identity));
     }
 
     #[cfg(unix)]
@@ -4301,6 +6764,94 @@ mod tests {
     }
 
     /// Build a single-file tar archive in memory with the given name and data.
+    /// Write an old-GNU sparse tar entry for `name` whose data runs are the
+    /// given `(offset, len)` extents, each filled with a byte derived from its
+    /// index, into `out`; returns the logical size.
+    fn write_sparse_tar<W: Write>(
+        out: &mut W,
+        name: &str,
+        extents: &[(u64, u64)],
+        logical: u64,
+    ) -> std::io::Result<()> {
+        let stored: u64 = extents.iter().map(|(_, len)| len).sum();
+        let mut header = tar::Header::new_gnu();
+        header.set_path(name)?;
+        header.set_mode(0o600);
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(stored);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(logical);
+        let slots = gnu.sparse.len();
+        for (&(offset, len), slot) in extents.iter().zip(gnu.sparse.iter_mut()) {
+            slot.set_offset(offset);
+            slot.set_length(len);
+        }
+        gnu.set_is_extended(extents.len() > slots);
+        header.set_cksum();
+        out.write_all(header.as_bytes())?;
+        let rest = &extents[slots.min(extents.len())..];
+        for (index, chunk) in rest.chunks(21).enumerate() {
+            let mut ext = tar::GnuExtSparseHeader::new();
+            for (&(offset, len), slot) in chunk.iter().zip(ext.sparse_mut().iter_mut()) {
+                slot.set_offset(offset);
+                slot.set_length(len);
+            }
+            ext.set_is_extended((index + 1) * 21 < rest.len());
+            out.write_all(ext.as_bytes())?;
+        }
+        for (index, &(_, len)) in extents.iter().enumerate() {
+            out.write_all(&vec![(index % 251) as u8 + 1; len as usize])?;
+        }
+        out.write_all(&vec![0; ((512 - stored % 512) % 512) as usize])?;
+        out.write_all(&[0; 1024])
+    }
+
+    /// Unpack time for a RAM image fragmented into many small data runs.
+    /// `SPARSE_RUNS` sets the number of 4 KiB runs (default 300000).
+    #[test]
+    #[ignore = "benchmark; run explicitly"]
+    fn bench_unpack_fragmented_sparse_memory() {
+        let runs: u64 = std::env::var("SPARSE_RUNS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(300_000);
+        let dir = tempfile::tempdir_in(std::env::var("BENCH_DIR").unwrap_or(".".into())).unwrap();
+        let logical = runs * 12288 + 4096;
+        // Data runs separated by holes, then a terminal empty run marking the
+        // logical end, as the packer writes them.
+        let extents: Vec<(u64, u64)> = (0..runs)
+            .map(|i| (i * 12288, 4096))
+            .chain([(logical, 0)])
+            .collect();
+        let tar_path = dir.path().join("archive.tar");
+        let mut out = std::io::BufWriter::new(File::create(&tar_path).unwrap());
+        write_sparse_tar(&mut out, "checkpoint/memory.bin", &extents, logical).unwrap();
+        drop(out);
+        let dest = dir.path().join("out");
+        fs::create_dir(&dest).unwrap();
+        let started = std::time::Instant::now();
+        let mut archive =
+            tar::Archive::new(std::io::BufReader::new(File::open(&tar_path).unwrap()));
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            true,
+            false,
+        )
+        .unwrap();
+        let elapsed = started.elapsed();
+        let memory = dest.join("checkpoint/memory.bin");
+        assert_eq!(fs::metadata(&memory).unwrap().len(), logical);
+        let synced = std::time::Instant::now();
+        File::open(&memory).unwrap().sync_all().unwrap();
+        eprintln!(
+            "BENCH runs={runs} unpack_ms={} fsync_ms={}",
+            elapsed.as_millis(),
+            synced.elapsed().as_millis()
+        );
+    }
+
     fn make_tar(name: &str, data: &[u8]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -4309,6 +6860,57 @@ mod tests {
         header.set_cksum();
         builder.append_data(&mut header, name, data).unwrap();
         builder.into_inner().unwrap()
+    }
+
+    /// A checkpoint file laid out as payload, then `trailer` (the manifest's
+    /// place), plus the footer describing it.
+    fn checkpoint_file(dir: &Path, tar_bytes: &[u8], trailer: &[u8]) -> (PathBuf, PackFooter) {
+        let payload = zstd::encode_all(tar_bytes, 3).unwrap();
+        let path = dir.join("history.checkpoint");
+        let mut bytes = payload.clone();
+        bytes.extend_from_slice(trailer);
+        fs::write(&path, &bytes).unwrap();
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: payload.len() as u64,
+            manifest_offset: payload.len() as u64,
+            manifest_size: trailer.len() as u64,
+            checksum: 0,
+        };
+        (path, footer)
+    }
+
+    #[test]
+    fn checkpoint_history_unpack_reads_only_the_declared_payload() {
+        let temp = tempfile::tempdir().unwrap();
+        let (path, footer) = checkpoint_file(
+            temp.path(),
+            &make_tar("checkpoint.json", b"{}"),
+            b"{\"not\": \"part of the payload\"}",
+        );
+        let dest = temp.path().join("unpacked");
+        unpack_checkpoint_history(&path, &footer, &dest).unwrap();
+        assert_eq!(fs::read(dest.join("checkpoint.json")).unwrap(), b"{}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_history_unpack_rejects_a_link_out_of_the_directory() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_size(0);
+        header.set_mode(0o777);
+        builder
+            .append_link(&mut header, "objects/escape", "../../outside")
+            .unwrap();
+        let (path, footer) = checkpoint_file(temp.path(), &builder.into_inner().unwrap(), b"{}");
+        let dest = temp.path().join("unpacked");
+        let error = unpack_checkpoint_history(&path, &footer, &dest).unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+        assert!(fs::symlink_metadata(dest.join("objects/escape")).is_err());
     }
 
     #[cfg(unix)]
@@ -4873,6 +7475,45 @@ mod tests {
         assert!(err.to_string().contains("max total size"));
     }
 
+    /// A sparse disk is charged the bytes it stores, not its logical length:
+    /// a large machine's checkpoint (here 64 MiB declared, 4 KiB stored) must
+    /// extract under a ceiling far below its declared size.
+    #[test]
+    fn a_sparse_entry_is_charged_what_it_stores() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let dest = temp_dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        const LOGICAL: u64 = 64 * 1024 * 1024;
+        let data = vec![9u8; 4096];
+        let mut archive_bytes = Vec::new();
+        {
+            let mut header = tar::Header::new_gnu();
+            header.set_path("checkpoint/disks/storage/1").unwrap();
+            header.set_mode(0o644);
+            header.set_mtime(0);
+            let stored = crate::assets::write_sparse_header(
+                &mut archive_bytes,
+                header,
+                LOGICAL,
+                &[(0, 4096)],
+            )
+            .unwrap();
+            assert_eq!(stored, 4096);
+            archive_bytes.extend_from_slice(&data);
+            archive_bytes.extend(std::iter::repeat_n(0u8, 1024 * 2));
+        }
+        let mut archive = tar::Archive::new(archive_bytes.as_slice());
+        let limits = SafeUnpackLimits {
+            max_entries: 1_000,
+            max_total_bytes: 1024 * 1024, // far below the 64 MiB declared size
+            sparse_threshold: SPARSE_WRITE_THRESHOLD,
+        };
+        safe_unpack_with_limits(&mut archive, &dest, &limits).unwrap();
+        let out = dest.join("checkpoint/disks/storage/1");
+        assert_eq!(fs::metadata(&out).unwrap().len(), LOGICAL);
+        assert_eq!(&fs::read(&out).unwrap()[..4096], &data[..]);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn safe_unpack_uses_the_archived_sparse_extent_map() {
@@ -4986,6 +7627,22 @@ mod tests {
 
         fs::write(temp_dir.path().join(EXTRACTION_MARKER), "").unwrap();
         assert!(is_extracted(temp_dir.path()));
+    }
+
+    #[test]
+    fn an_invalidated_extraction_is_extracted_again() {
+        let temp = tempfile::tempdir().unwrap();
+        let dir = temp.path().join("abcd1234");
+        std::fs::create_dir_all(dir.join("checkpoint/disks")).unwrap();
+        std::fs::write(dir.join(EXTRACTION_MARKER), "").unwrap();
+        assert!(is_extracted(&dir));
+
+        // A removal stopped right after this must not leave a tree that still
+        // claims to be whole.
+        invalidate_extraction(&dir).unwrap();
+        assert!(!is_extracted(&dir));
+        assert!(dir.join("checkpoint/disks").is_dir());
+        invalidate_extraction(&dir).unwrap();
     }
 
     #[test]
@@ -5165,6 +7822,90 @@ mod tests {
         assert!(packed_agent_mounts_userxattr("2.0.0"));
     }
 
+    /// A cache entry whose layers were staged for the guest: one layer tar,
+    /// the stacking order beside it, and the completion marker that freezes
+    /// the decision.
+    fn staged_cache_entry(root: &Path, layer_id: &str) -> PathBuf {
+        let cache_dir = root.join("entry");
+        let layers = cache_dir.join("layers");
+        fs::create_dir_all(&layers).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o600);
+        header.set_uid(1000);
+        header.set_gid(1000);
+        header.set_size(1);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "secret", &b"s"[..])
+            .unwrap();
+        fs::write(
+            layers.join(format!("{layer_id}.tar")),
+            builder.into_inner().unwrap(),
+        )
+        .unwrap();
+        fs::write(layers.join(LAYER_ORDER_FILE), layer_id).unwrap();
+        fs::write(cache_dir.join(EXTRACTION_MARKER), "").unwrap();
+        cache_dir
+    }
+
+    /// The upgrade is decided for the agent that will boot the entry: a pack
+    /// that carries an agent unable to mount the override xattr keeps its
+    /// staged tars, and an entry already unpacked on the host is left alone.
+    #[test]
+    fn staged_layers_stay_staged_unless_the_booting_agent_can_use_host_layers() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_dir = staged_cache_entry(root.path(), "aaaa");
+        let no_sidecar = root.path().join("missing.smolmachine");
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some("1.16.0"), false).unwrap());
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, None, false).unwrap());
+        assert!(!cache_dir.join(HOST_LAYERS_MARKER).exists());
+        assert!(cache_dir.join("layers").join("aaaa.tar").is_file());
+        fs::write(cache_dir.join(HOST_LAYERS_MARKER), "").unwrap();
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some("9.0.0"), false).unwrap());
+    }
+
+    /// A cache hit finishes an extraction that an older engine left staged:
+    /// the tars are unpacked on the host with their ownership in the override
+    /// xattr, the entry is marked so the next hit does nothing, and the tars
+    /// stay for any guest already reading them. Linux only: on macOS the
+    /// unpacked layers live in a case-sensitive volume this test would have
+    /// to mount.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_cache_hit_unpacks_staged_layers_on_the_host_for_an_agent_that_can_use_them() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        set_host_layers_probe(|| true);
+        let cache_dir = staged_cache_entry(root.path(), "bbbb");
+        let no_sidecar = root.path().join("missing.smolmachine");
+        let engine = env!("CARGO_PKG_VERSION");
+        assert!(upgrade_staged_layers(&no_sidecar, &cache_dir, Some(engine), false).unwrap());
+        assert!(cache_dir.join(HOST_LAYERS_MARKER).exists());
+        let layers = cache_dir.join("layers");
+        let secret = layers.join("bbbb").join("secret");
+        assert!(secret.is_file());
+        assert_eq!(
+            read_user_xattr(&secret, OVERRIDE_STAT_XATTR).as_deref(),
+            Some("1000:1000:0600")
+        );
+        assert_eq!(
+            fs::read_to_string(layers.join(OPAQUE_XATTR_MARKER))
+                .unwrap()
+                .trim(),
+            "user"
+        );
+        assert_eq!(
+            fs::read_to_string(layers.join(LAYER_ORDER_FILE)).unwrap(),
+            "bbbb"
+        );
+        assert!(layers.join("bbbb.tar").is_file());
+        assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some(engine), false).unwrap());
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     fn read_user_xattr(path: &Path, name: &str) -> Option<String> {
         use std::os::unix::ffi::OsStrExt;
@@ -5192,6 +7933,59 @@ mod tests {
             )
         };
         (n >= 0).then(|| String::from_utf8_lossy(&buf[..n as usize]).into_owned())
+    }
+
+    #[cfg(windows)]
+    fn read_user_xattr(path: &Path, name: &str) -> Option<String> {
+        let mut stream = path.as_os_str().to_os_string();
+        stream.push(":");
+        stream.push(name);
+        fs::read(stream)
+            .ok()
+            .map(|value| String::from_utf8_lossy(&value).into_owned())
+    }
+
+    /// A pack's only layer is a merged view, so its `.wh.` names are files the
+    /// machine held (a container runtime's overlay data, say) and are kept as
+    /// files; over other layers the same name is a whiteout and is translated.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_single_layer_keeps_wh_files_and_a_stacked_layer_translates_them() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let tar_path = root.path().join("layer.tar");
+        let mut builder = tar::Builder::new(File::create(&tar_path).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_mode(0o644);
+        header.set_size(4);
+        header.set_cksum();
+        builder
+            .append_data(
+                &mut header,
+                "var/lib/docker/diff/etc/.wh.gone",
+                &b"kept"[..],
+            )
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        let single = root.path().join("single");
+        super::materialize_tar_dir(&tar_path, &single, false, true, false).unwrap();
+        assert_eq!(
+            fs::read(single.join("var/lib/docker/diff/etc/.wh.gone")).unwrap(),
+            b"kept"
+        );
+
+        let stacked = root.path().join("stacked");
+        super::materialize_tar_dir(&tar_path, &stacked, false, true, true).unwrap();
+        assert!(!stacked.join("var/lib/docker/diff/etc/.wh.gone").exists());
+        assert!(
+            stacked.join("var/lib/docker/diff/etc/gone").exists(),
+            "becomes the whiteout"
+        );
     }
 
     /// Host-side extraction that describes ownership to the guest: every
@@ -5320,7 +8114,7 @@ mod tests {
         assert_eq!(xattr("bin/passwd").as_deref(), Some("0:0:04755"));
         assert!(
             dest.join("bin/ln").is_symlink(),
-            "symlinks are extracted, never stamped"
+            "symlinks are extracted, never mode-stamped"
         );
         assert_eq!(
             xattr("bin/gone").as_deref(),
@@ -5350,6 +8144,365 @@ mod tests {
         assert_eq!(xattr("ro/old").as_deref(), Some("0:0:020000"));
         assert_eq!(host_mode("ro") & 0o700, 0o700);
         assert_eq!(host_mode("ro/readme") & 0o600, 0o600);
+    }
+
+    /// A tar of symlinks in `usr/bin/`: `a` owned 1234, `b` root's, and `x`
+    /// owned 33 until a later regular file replaces it.
+    #[cfg(target_os = "linux")]
+    fn symlink_owner_layer() -> Vec<u8> {
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, uid: u64, link: Option<&str>| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(if kind == tar::EntryType::Directory {
+                0o755
+            } else {
+                0o777
+            });
+            header.set_uid(uid);
+            header.set_gid(uid);
+            header.set_size(0);
+            if let Some(link) = link {
+                header.set_link_name(link).unwrap();
+            }
+            header.set_cksum();
+            builder.append_data(&mut header, path, &b""[..]).unwrap();
+        };
+        add("usr/bin/", tar::EntryType::Directory, 0, None);
+        add("usr/bin/a", tar::EntryType::Symlink, 1234, Some("t"));
+        add("usr/bin/b", tar::EntryType::Symlink, 0, Some("t"));
+        add("usr/bin/x", tar::EntryType::Symlink, 33, Some("t"));
+        add("usr/bin/x", tar::EntryType::Regular, 0, None);
+        builder.into_inner().unwrap()
+    }
+
+    /// Linux symlinks cannot carry user xattrs, so a host extraction records
+    /// their non-root owners on the parent directory for libkrun to present.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_xattr_extraction_records_symlink_owners_on_the_directory() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let layer = symlink_owner_layer();
+        let mut archive = tar::Archive::new(layer.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            read_user_xattr(&dest.join("usr/bin"), SYMLINK_OWNERS_XATTR).as_deref(),
+            Some("a\u{0}1234:1234\u{0}")
+        );
+    }
+
+    /// A Linux cache extracted before symlink owners were recorded gets them
+    /// once from its kept layer tars, then is left alone.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn host_layer_cache_gains_symlink_owners_once() {
+        let cache = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(cache.path()) {
+            return;
+        }
+        let layers = cache.path().join("layers");
+        let tree = layers.join("abcd");
+        fs::create_dir_all(&tree).unwrap();
+        let layer = symlink_owner_layer();
+        fs::write(layers.join("abcd.tar"), &layer).unwrap();
+        // An old extraction: the tree, but no directory record.
+        let mut archive = tar::Archive::new(layer.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &tree,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+        let record = || read_user_xattr(&tree.join("usr/bin"), SYMLINK_OWNERS_XATTR);
+        assert_eq!(record(), None);
+
+        // Not a host-layers cache: untouched.
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record(), None);
+
+        fs::write(cache.path().join(HOST_LAYERS_MARKER), "").unwrap();
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record().as_deref(), Some("a\u{0}1234:1234\u{0}"));
+        assert!(cache.path().join(HOST_LAYER_SYMLINKS_MARKER).exists());
+
+        // Once: a later hit does not rewrite it.
+        set_user_xattr(&tree.join("usr/bin"), SYMLINK_OWNERS_XATTR, b"kept").unwrap();
+        repair_host_layer_symlink_owners(cache.path()).unwrap();
+        assert_eq!(record().as_deref(), Some("kept"));
+    }
+
+    /// A directory entry is spelled with a trailing separator in a tar (`etc/`),
+    /// and its owner record still has to land on the directory. On Windows the
+    /// record is an alternate data stream, and `...\etc/:name` is not a valid
+    /// stream path: every layer holding a directory failed to extract with
+    /// os error 123, so no packed image could run. A stream is also refused on
+    /// a read-only entry (os error 5), which every image's `0555` `proc/` is.
+    #[test]
+    fn owner_xattr_extraction_records_owners_of_directory_entries() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add = |path: &str, kind: tar::EntryType, mode: u32, uid: u64, data: &[u8]| {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            header.set_uid(uid);
+            header.set_gid(uid);
+            header.set_size(data.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, data).unwrap();
+        };
+        add("private/", tar::EntryType::Directory, 0o700, 1000, b"");
+        add("private/secret", tar::EntryType::Regular, 0o600, 1000, b"s");
+        add("etc/", tar::EntryType::Directory, 0o755, 0, b"");
+        add("etc/nested/", tar::EntryType::Directory, 0o755, 0, b"");
+        add("etc/nested/conf", tar::EntryType::Regular, 0o644, 0, b"c");
+        add("proc/", tar::EntryType::Directory, 0o555, 0, b"");
+        add("etc/readonly", tar::EntryType::Regular, 0o444, 0, b"r");
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        let xattr = |rel: &str| read_user_xattr(&dest.join(rel), OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr("private").as_deref(), Some("1000:1000:0700"));
+        assert_eq!(xattr("private/secret").as_deref(), Some("1000:1000:0600"));
+        assert_eq!(xattr("etc").as_deref(), Some("0:0:0755"));
+        assert_eq!(xattr("etc/nested").as_deref(), Some("0:0:0755"));
+        assert_eq!(xattr("etc/nested/conf").as_deref(), Some("0:0:0644"));
+        assert_eq!(xattr("proc").as_deref(), Some("0:0:0555"));
+        assert_eq!(xattr("etc/readonly").as_deref(), Some("0:0:0444"));
+        assert_eq!(fs::read(dest.join("private/secret")).unwrap(), b"s");
+    }
+
+    /// The incident: as root, owner-xattr extraction chowned each host file to
+    /// its archived owner. Under the per-VM uid drop the idmapped mount maps
+    /// only on-disk id 0, so a private `42:0` directory reached the guest as
+    /// 65534 and refused even root. The host copy must belong to root, and the
+    /// archived owner live only in the xattr. Needs root to mean anything.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn owner_xattr_extraction_leaves_host_copies_owned_by_root() {
+        use std::os::unix::fs::MetadataExt;
+        if unsafe { libc::geteuid() } != 0 {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add =
+            |path: &str, kind: tar::EntryType, mode: u32, uid: u64, gid: u64, data: &[u8]| {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_mode(mode);
+                header.set_uid(uid);
+                header.set_gid(gid);
+                header.set_size(data.len() as u64);
+                header.set_cksum();
+                builder.append_data(&mut header, path, data).unwrap();
+            };
+        add("data/", tar::EntryType::Directory, 0o700, 42, 0, b"");
+        add("data/secret", tar::EntryType::Regular, 0o600, 42, 0, b"s");
+        add(
+            "home/app/",
+            tar::EntryType::Directory,
+            0o755,
+            1000,
+            1000,
+            b"",
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        for rel in ["data", "data/secret", "home/app"] {
+            let meta = fs::symlink_metadata(dest.join(rel)).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (0, 0), "{rel} host owner");
+        }
+        let xattr = |rel: &str| read_user_xattr(&dest.join(rel), OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr("data").as_deref(), Some("42:0:0700"));
+        assert_eq!(xattr("data/secret").as_deref(), Some("42:0:0600"));
+        assert_eq!(xattr("home/app").as_deref(), Some("1000:1000:0755"));
+
+        // Without the xattr the host copy keeps the archived owner, as before.
+        let plain = root.path().join("plain");
+        fs::create_dir(&plain).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &plain,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
+        let meta = fs::symlink_metadata(plain.join("data/secret")).unwrap();
+        assert_eq!((meta.uid(), meta.gid()), (42, 0));
+    }
+
+    /// A cache extracted by an engine that chowned host copies to their
+    /// archived owners is repaired once on its next hit: every entry goes back
+    /// to root, the xattr is untouched, and the marker stops a second walk.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_host_layer_cache_with_archived_host_owners_is_repaired_once() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("entry");
+        let dir = cache.join("layers").join("aaaa").join("data");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("secret"), b"s").unwrap();
+        std::os::unix::fs::symlink("secret", dir.join("link")).unwrap();
+        fs::write(cache.join(HOST_LAYERS_MARKER), "").unwrap();
+        let is_root = unsafe { libc::geteuid() } == 0;
+        if is_root {
+            for path in [dir.clone(), dir.join("secret"), dir.join("link")] {
+                set_owner(&path, 42, 7);
+            }
+        }
+
+        repair_host_layer_owners(&cache, false).unwrap();
+        assert!(cache.join(HOST_LAYER_OWNERS_MARKER).exists());
+        if is_root {
+            for path in [dir.clone(), dir.join("secret"), dir.join("link")] {
+                let meta = fs::symlink_metadata(&path).unwrap();
+                assert_eq!((meta.uid(), meta.gid()), (0, 0), "{}", path.display());
+            }
+            // Once marked, the walk does not run again.
+            set_owner(&dir.join("secret"), 42, 7);
+            repair_host_layer_owners(&cache, false).unwrap();
+            assert_eq!(fs::metadata(dir.join("secret")).unwrap().uid(), 42);
+        }
+
+        // An entry that never used host layers is left alone and unmarked.
+        let staged = root.path().join("staged");
+        fs::create_dir_all(staged.join("layers")).unwrap();
+        repair_host_layer_owners(&staged, false).unwrap();
+        assert!(!staged.join(HOST_LAYER_OWNERS_MARKER).exists());
+    }
+
+    /// A symlink entry's archived owner reaches the guest through the override
+    /// xattr, on the link itself. Without it the server presents the host's own
+    /// stat, so an unprivileged host extraction (macOS: no chown) showed every
+    /// symlink in the image owned by the host user — `/bin/sh` as `502:20`
+    /// while the regular file it points at was correctly `0:0`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn owner_xattr_extraction_records_a_symlinks_owner_on_the_link() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut add =
+            |path: &str, kind: tar::EntryType, mode: u32, uid: u64, gid: u64, link: &str| {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(kind);
+                header.set_mode(mode);
+                header.set_uid(uid);
+                header.set_gid(gid);
+                header.set_size(0);
+                if !link.is_empty() {
+                    header.set_link_name(link).unwrap();
+                }
+                header.set_cksum();
+                builder.append_data(&mut header, path, &[][..]).unwrap();
+            };
+        // `bin/sh` points at a file that exists (so a write that followed the
+        // link would land on that file's xattr), `bin/dangling` at one that
+        // does not. Their header mode is deliberately not 0777: a link's mode
+        // is not settable, so the record must say 0777 either way.
+        add("bin/busybox", tar::EntryType::Regular, 0o755, 0, 0, "");
+        add(
+            "bin/sh",
+            tar::EntryType::Symlink,
+            0o755,
+            1001,
+            1001,
+            "busybox",
+        );
+        add(
+            "bin/dangling",
+            tar::EntryType::Symlink,
+            0o644,
+            1001,
+            1001,
+            "missing",
+        );
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        for link in ["bin/sh", "bin/dangling"] {
+            let path = dest.join(link);
+            assert!(path.is_symlink(), "{link} is still a symlink");
+            let xattr = read_user_xattr(&path, OVERRIDE_STAT_XATTR);
+            // APFS stores user xattrs on symlinks, and libkrun's server reads
+            // this one there. The mode is the 0777 a link always reports, not
+            // the archived 0755/0644, matching an in-guest unpack of the same
+            // layer.
+            #[cfg(target_os = "macos")]
+            assert_eq!(xattr.as_deref(), Some("1001:1001:0777"), "{link}");
+            // Linux's user.* namespace does not cover symlinks: the write
+            // fails with EPERM and is ignored, so nothing is recorded and the
+            // host's own stat shows through — exactly the pre-fix behaviour.
+            #[cfg(target_os = "linux")]
+            assert_eq!(xattr, None, "user.* xattrs are not allowed on symlinks");
+        }
+        // The link's record is the link's own: `bin/sh` points at `bin/busybox`,
+        // which keeps the record of its own entry, and a stamp that followed
+        // would have overwritten it with the link's owner.
+        assert_eq!(
+            read_user_xattr(&dest.join("bin/busybox"), OVERRIDE_STAT_XATTR).as_deref(),
+            Some("0:0:0755")
+        );
+        assert!(!dest.join("bin/missing").exists(), "no target was created");
     }
 
     #[cfg(unix)]
@@ -5389,6 +8542,52 @@ mod tests {
         assert!(
             allocated_bytes < 16 * 1024 * 1024,
             "storage disk was densified: {allocated_bytes} bytes allocated for a sparse template"
+        );
+    }
+
+    /// A machine gets a copy-on-write clone of the pack's unpacked template, so
+    /// changing the machine's copy leaves the template as it was.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_machine_gets_its_own_clone_of_the_unpacked_pack() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let vms = temp_dir.path().join("vms");
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 0,
+            manifest_offset: 0,
+            manifest_size: 0,
+            checksum: 0x5eed,
+        };
+        let template = shared_pack_dir(&vms.join(PACK_TEMPLATES_DIR), footer.checksum);
+        fs::create_dir_all(template.join("layers").join("l1")).unwrap();
+        fs::write(template.join(EXTRACTION_MARKER), "").unwrap();
+        fs::write(
+            template.join("layers").join("l1").join("f"),
+            b"from the pack",
+        )
+        .unwrap();
+        let sidecar = temp_dir.path().join("p.smolmachine");
+        fs::write(&sidecar, b"").unwrap();
+
+        let cache_dir = vms.join("0123456789abcdef").join("pack");
+        extract_sidecar_for_machine(&sidecar, &cache_dir, &footer).unwrap();
+        let copy = cache_dir.join("layers").join("l1").join("f");
+        assert_eq!(fs::read(&copy).unwrap(), b"from the pack");
+        assert!(is_extracted(&cache_dir));
+
+        fs::write(&copy, b"changed by the machine").unwrap();
+        assert_eq!(
+            fs::read(template.join("layers").join("l1").join("f")).unwrap(),
+            b"from the pack"
+        );
+        // A second machine starts from the unchanged template.
+        let second = vms.join("fedcba9876543210").join("pack");
+        extract_sidecar_for_machine(&sidecar, &second, &footer).unwrap();
+        assert_eq!(
+            fs::read(second.join("layers").join("l1").join("f")).unwrap(),
+            b"from the pack"
         );
     }
 
@@ -6069,11 +9268,15 @@ mod tests {
         std::env::remove_var("SMOLVM_PACK_CACHE_MAX_BYTES");
 
         let cap = pack_cache_max_bytes(dir.path());
+        let total_fs = filesystem_capacity_bytes(dir.path());
+        // the floor holds wherever the filesystem can hold it; a filesystem smaller
+        // than the floor (a small CI machine root) gets the whole filesystem instead
+        let floor = total_fs.map_or(PACK_CACHE_MIN_BYTES, |t| t.min(PACK_CACHE_MIN_BYTES));
         assert!(
-            cap >= PACK_CACHE_MIN_BYTES,
-            "the cap must never fall below the old fixed default, got {cap}"
+            cap >= floor,
+            "the cap must never fall below the old fixed default (or the whole filesystem when that is smaller), got {cap}"
         );
-        if let Some(total) = filesystem_capacity_bytes(dir.path()) {
+        if let Some(total) = total_fs {
             // A big disk must yield a bigger cache than the old constant did.
             if total / PACK_CACHE_DISK_FRACTION > PACK_CACHE_MIN_BYTES {
                 assert!(
@@ -6211,8 +9414,8 @@ mod tests {
     }
 }
 
-/// Reaping stranded case-sensitive volumes (macOS-only lease protocol).
-#[cfg(all(test, target_os = "macos"))]
+/// Ownership selection is portable; actual volume operations are macOS-only.
+#[cfg(all(test, unix))]
 mod orphan_reap_tests {
     use super::*;
 
@@ -6232,10 +9435,10 @@ mod orphan_reap_tests {
         assert!(!peers.contains(&root.join("aaa")));
     }
 
-    /// VM-backed packs live at `<root>/<hash>/pack` — a peer is another hash's
-    /// `pack` subdir, not the hash directory itself.
+    /// Named machines outlive the CLI that acquired their layers. Its dead PID
+    /// is not evidence that a sibling machine's volume can be detached.
     #[test]
-    fn nested_layout_keeps_the_pack_suffix() {
+    fn machine_layout_is_not_subject_to_process_orphan_reaping() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
         for h in ["aaa", "bbb"] {
@@ -6243,7 +9446,7 @@ mod orphan_reap_tests {
         }
         let peers = sibling_cache_dirs(&root.join("aaa").join("pack"));
 
-        assert_eq!(peers, vec![root.join("bbb").join("pack")]);
+        assert!(peers.is_empty());
     }
 
     /// A hash directory with no `pack` subdir is simply skipped, rather than
@@ -6258,9 +9461,116 @@ mod orphan_reap_tests {
         assert!(sibling_cache_dirs(&root.join("aaa").join("pack")).is_empty());
     }
 
+    #[test]
+    fn standalone_reaper_does_not_follow_cache_aliases() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        fs::create_dir(root.join("aaa")).unwrap();
+        fs::create_dir(root.join("bbb")).unwrap();
+        std::os::unix::fs::symlink(root.join("bbb"), root.join("alias")).unwrap();
+        assert_eq!(
+            sibling_cache_dirs(&root.join("aaa")),
+            vec![root.join("bbb")]
+        );
+    }
+
+    #[test]
+    fn machine_references_include_relative_and_transitive_children() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("unrelated/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("../source/pack", root.join("child/pack")).unwrap();
+        fs::create_dir(root.join("grandchild")).unwrap();
+        std::os::unix::fs::symlink("../child/pack", root.join("grandchild/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        fs::remove_file(root.join("grandchild/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        fs::remove_file(root.join("child/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn unrelated_and_dangling_references_do_not_pin_a_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        for name in ["source/pack", "other/pack", "child", "dangling"] {
+            fs::create_dir_all(root.join(name)).unwrap();
+        }
+        std::os::unix::fs::symlink("../other/pack", root.join("child/pack")).unwrap();
+        std::os::unix::fs::symlink("../missing/pack", root.join("dangling/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn broken_sibling_reference_does_not_pin_unrelated_source() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(root.join("loop")).unwrap();
+        std::os::unix::fs::symlink("pack", root.join("loop/pack")).unwrap();
+        assert!(!machine_layers_have_dependents(&source).unwrap());
+        fs::create_dir(root.join("child")).unwrap();
+        std::os::unix::fs::symlink("../source/pack", root.join("child/pack")).unwrap();
+        assert!(machine_layers_have_dependents(&source).unwrap());
+    }
+
+    #[test]
+    fn long_fork_chain_pins_its_source_without_pinning_unrelated_machines() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let source = root.join("source/pack");
+        let unrelated = root.join("unrelated/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(&unrelated).unwrap();
+        let mut parent = source.clone();
+        // Exceed OS path-resolution limits. The direct child still proves
+        // ownership, regardless of whether deeper descendants resolve.
+        for index in 0..64 {
+            let child = root.join(format!("child-{index}/pack"));
+            fs::create_dir(child.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(&parent, &child).unwrap();
+            parent = child;
+        }
+        assert!(machine_layers_have_dependents(&source).unwrap());
+        assert!(!machine_layers_have_dependents(&unrelated).unwrap());
+    }
+
+    /// The launcher's lease moves to the VMM for named machines only; a
+    /// standalone pack's lease stays with the process that took it.
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn named_machine_lease_moves_to_the_vmm() {
+        let tmp = tempfile::tempdir().unwrap();
+        let own = std::process::id().to_string();
+        let machine = tmp.path().join("vms/aaa/pack");
+        let standalone = tmp.path().join("packs/aaa");
+        for dir in [&machine, &standalone] {
+            fs::create_dir_all(dir.join(LEASES_DIR)).unwrap();
+            fs::write(dir.join(LEASES_DIR).join(&own), "").unwrap();
+            hand_machine_layers_lease_to(&dir.join(CS_MOUNT_DIR), 4242);
+        }
+        assert!(machine.join(LEASES_DIR).join("4242").exists());
+        assert!(!machine.join(LEASES_DIR).join(&own).exists());
+        assert!(standalone.join(LEASES_DIR).join(&own).exists());
+        assert!(!standalone.join(LEASES_DIR).join("4242").exists());
+    }
+
+    #[test]
+    fn unreadable_source_state_still_rejects_detach() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(machine_layers_have_dependents(&tmp.path().join("missing/pack")).is_err());
+    }
+
     /// The reaper must never block: a peer mid-acquire holds its lock, and
     /// waiting on it would stall an unrelated artifact's run.
     #[test]
+    #[cfg(target_os = "macos")]
     fn a_held_lock_is_skipped_not_waited_on() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let dir = tmp.path();
@@ -6278,6 +9588,7 @@ mod orphan_reap_tests {
     /// Reaping is a no-op when nothing is mounted — the common case, and it must
     /// not disturb a peer's directory contents.
     #[test]
+    #[cfg(target_os = "macos")]
     fn unmounted_peers_are_left_alone() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let root = tmp.path();
@@ -6290,6 +9601,94 @@ mod orphan_reap_tests {
         reap_orphan_volumes(&root.join("aaa"));
 
         assert!(peer.exists(), "peer directory must survive");
+    }
+
+    /// Real hdiutil control: dead standalone leases are reclaimed, while the
+    /// same dead CLI lease in a named-machine layout must not be reclaimed.
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates disposable APFS sparse images with hdiutil"]
+    fn native_orphan_sweep_respects_machine_ownership() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let machine = root.join("vms/aaa/pack");
+        let peer = root.join("vms/bbb/pack");
+        let standalone = root.join("packs/aaa");
+        let standalone_peer = root.join("packs/bbb");
+        let paths = [&machine, &peer, &standalone, &standalone_peer];
+        for path in paths {
+            fs::create_dir_all(path.join(LEASES_DIR)).unwrap();
+        }
+        struct Cleanup(Vec<PathBuf>);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                for path in &self.0 {
+                    force_detach_layers_volume(path);
+                }
+            }
+        }
+        let _cleanup = Cleanup(paths.iter().map(|p| p.to_path_buf()).collect());
+        let mut child = std::process::Command::new("/usr/bin/true").spawn().unwrap();
+        let exited_pid = child.id();
+        child.wait().unwrap();
+        for path in [&machine, &standalone] {
+            ensure_cs_volume_mounted(path, false).unwrap();
+            fs::write(path.join(LEASES_DIR).join(exited_pid.to_string()), "").unwrap();
+        }
+        ensure_cs_volume_mounted(&peer, false).unwrap();
+        let lease = acquire_layers_lease(&peer, false).unwrap();
+        assert!(is_mount_point(&lease.path));
+        assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
+        reap_orphan_volumes(&standalone_peer);
+        assert!(!is_mount_point(&standalone.join(CS_MOUNT_DIR)));
+        assert!(is_mount_point(&machine.join(CS_MOUNT_DIR)));
+        drop(lease);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    #[ignore = "creates a disposable APFS sparse image with hdiutil"]
+    fn native_source_volume_is_pinned_by_child_reference() {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = fs::canonicalize(tmp.path()).unwrap();
+        let source = root.join("source/pack");
+        let child = root.join("child/pack");
+        fs::create_dir_all(&source).unwrap();
+        fs::create_dir_all(child.parent().unwrap()).unwrap();
+        struct Cleanup(PathBuf, PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_file(&self.1);
+                force_detach_layers_volume(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(source.clone(), child.clone());
+        ensure_cs_volume_mounted(&source, false).unwrap();
+        fs::write(source.join(CS_MOUNT_DIR).join("marker"), "source").unwrap();
+        std::os::unix::fs::symlink(&source, &child).unwrap();
+        // A broken, unrelated machine must neither release this live source
+        // early nor prevent its eventual detach after the child is removed.
+        fs::create_dir(root.join("broken")).unwrap();
+        std::os::unix::fs::symlink("pack", root.join("broken/pack")).unwrap();
+        force_detach_layers_volume(&source);
+        force_detach_layers_volume(&child);
+        assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
+        assert_eq!(
+            fs::read_to_string(child.join(CS_MOUNT_DIR).join("marker")).unwrap(),
+            "source"
+        );
+        fs::remove_file(&child).unwrap();
+        // Deleting the last child releases a stopped source, unless a live
+        // process holds a lease because the source is mid-start.
+        drop(lock_leases(&source).unwrap());
+        fs::create_dir_all(source.join(LEASES_DIR)).unwrap();
+        let live_lease = source.join(LEASES_DIR).join(std::process::id().to_string());
+        fs::write(&live_lease, "").unwrap();
+        release_unused_machine_layers_volume(&source);
+        assert!(is_mount_point(&source.join(CS_MOUNT_DIR)));
+        fs::remove_file(&live_lease).unwrap();
+        release_unused_machine_layers_volume(&source);
+        assert!(!is_mount_point(&source.join(CS_MOUNT_DIR)));
     }
 }
 

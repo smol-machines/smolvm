@@ -167,6 +167,17 @@ fn process_children(pid: libc::pid_t) -> Vec<libc::pid_t> {
 /// builder cannot capture them to find out why a create failed. `--log` is the
 /// one channel that carries crun's errors without touching container stdio.
 pub fn create_log_path(container_id: &str) -> PathBuf {
+    log_path("create", container_id)
+}
+
+/// Where crun records its own diagnostics for the `crun exec --detach` that
+/// launches a machine's workload, for the same reason as [`create_log_path`]:
+/// the detached workload inherits crun's stdout and stderr.
+pub fn workload_log_path(container_id: &str) -> PathBuf {
+    log_path("workload", container_id)
+}
+
+fn log_path(kind: &str, container_id: &str) -> PathBuf {
     // Part of the id reaches here from a machine name, so it is reduced to
     // characters that cannot walk out of the run directory.
     let stem: String = container_id
@@ -179,16 +190,30 @@ pub fn create_log_path(container_id: &str) -> PathBuf {
             }
         })
         .collect();
-    Path::new(paths::CONTAINERS_RUN_DIR).join(format!("create-{stem}.log"))
+    Path::new(paths::CONTAINERS_RUN_DIR).join(format!("{kind}-{stem}.log"))
 }
 
 /// Read back and remove the diagnostics crun recorded for a failed create.
 /// Empty when crun logged nothing, so callers should fall back to stderr.
 pub fn take_create_log(container_id: &str) -> String {
-    let path = create_log_path(container_id);
-    let text = std::fs::read_to_string(&path).unwrap_or_default();
-    let _ = std::fs::remove_file(&path);
+    take_log(&create_log_path(container_id))
+}
+
+/// Read back and remove the diagnostics crun recorded at `path`.
+pub fn take_log(path: &Path) -> String {
+    let text = std::fs::read_to_string(path).unwrap_or_default();
+    let _ = std::fs::remove_file(path);
     text.trim().to_string()
+}
+
+/// Clear a stale log at `path` so crun can open it fresh. False when that
+/// failed, in which case the caller runs crun without `--log`.
+fn prepare_log(path: &Path) -> bool {
+    std::fs::create_dir_all(paths::CONTAINERS_RUN_DIR).is_ok()
+        && match std::fs::remove_file(path) {
+            Ok(()) => true,
+            Err(e) => e.kind() == std::io::ErrorKind::NotFound,
+        }
 }
 
 /// Best available explanation for a failed create: crun's log, its stderr when
@@ -242,11 +267,7 @@ impl CrunCommand {
         let log_path = create_log_path(container_id);
         // A stale log from an earlier attempt would be misreported as this
         // one's reason, and crun refuses to start if it cannot open the file.
-        let log_ready = std::fs::create_dir_all(paths::CONTAINERS_RUN_DIR).is_ok()
-            && match std::fs::remove_file(&log_path) {
-                Ok(()) => true,
-                Err(e) => e.kind() == std::io::ErrorKind::NotFound,
-            };
+        let log_ready = prepare_log(&log_path);
         let mut c = Self::new();
         if log_ready {
             c.cmd.args(["--log", &log_path.to_string_lossy()]);
@@ -448,7 +469,24 @@ impl CrunCommand {
         workdir: Option<&str>,
         pid_file: Option<&Path>,
     ) -> Self {
+        Self::exec_detached_with_log(container_id, env, command, workdir, pid_file, None)
+    }
+
+    /// [`exec_detached`](Self::exec_detached) with crun's own diagnostics
+    /// written to `log` (see [`workload_log_path`]), so a launch that fails
+    /// can say why without capturing the detached process's stdio.
+    pub fn exec_detached_with_log(
+        container_id: &str,
+        env: &[(String, String)],
+        command: &[String],
+        workdir: Option<&str>,
+        pid_file: Option<&Path>,
+        log: Option<&Path>,
+    ) -> Self {
         let mut c = Self::new();
+        if let Some(log) = log.filter(|log| prepare_log(log)) {
+            c.cmd.arg("--log").arg(log);
+        }
         c.cmd.arg("exec").arg("--detach");
         if let Some(pf) = pid_file {
             // crun writes the detached process's PID here so the caller can
@@ -476,6 +514,48 @@ impl CrunCommand {
     pub fn exec_with_process(container_id: &str, process_file: &Path) -> Self {
         let mut c = Self::new();
         c.cmd.arg("exec").arg("--process").arg(process_file);
+        c.pending_positionals = vec![container_id.to_string()];
+        c
+    }
+
+    /// [`exec_with_process`](Self::exec_with_process) for a TTY exec:
+    /// `crun exec --tty --console-socket <sock> --process <file> <id>`. The
+    /// process file sets `terminal: true`; crun hands the PTY master back over
+    /// the console socket exactly as for [`Self::exec_with_console`].
+    pub fn exec_with_process_console(
+        container_id: &str,
+        process_file: &Path,
+        console_socket: &Path,
+    ) -> Self {
+        let mut c = Self::new();
+        c.cmd.arg("exec").arg("--tty");
+        c.cmd.arg("--console-socket").arg(console_socket);
+        c.cmd.arg("--process").arg(process_file);
+        c.pending_positionals = vec![container_id.to_string()];
+        c.cmd.stdin(Stdio::null());
+        c.cmd.stdout(Stdio::null());
+        c.cmd.stderr(Stdio::piped());
+        c
+    }
+
+    /// [`exec_detached_with_log`](Self::exec_detached_with_log) from a full OCI
+    /// process file, so a detached workload keeps its user's supplementary
+    /// groups too.
+    pub fn exec_detached_with_process(
+        container_id: &str,
+        process_file: &Path,
+        pid_file: Option<&Path>,
+        log: Option<&Path>,
+    ) -> Self {
+        let mut c = Self::new();
+        if let Some(log) = log.filter(|log| prepare_log(log)) {
+            c.cmd.arg("--log").arg(log);
+        }
+        c.cmd.arg("exec").arg("--detach");
+        if let Some(pf) = pid_file {
+            c.cmd.arg("--pid-file").arg(pf);
+        }
+        c.cmd.arg("--process").arg(process_file);
         c.pending_positionals = vec![container_id.to_string()];
         c
     }
@@ -578,6 +658,21 @@ impl CrunCommand {
         self.stdout_piped().stderr_piped()
     }
 
+    /// Send both stdout and stderr to `output` (a workload's log pipe).
+    pub fn output_to(mut self, output: std::os::fd::OwnedFd) -> Self {
+        match output.try_clone() {
+            Ok(stderr) => {
+                self.cmd.stdout(Stdio::from(output));
+                self.cmd.stderr(Stdio::from(stderr));
+            }
+            Err(_) => {
+                self.cmd.stdout(Stdio::from(output));
+                self.cmd.stderr(Stdio::null());
+            }
+        }
+        self
+    }
+
     /// Discard both stdout and stderr.
     pub fn discard_output(mut self) -> Self {
         self.cmd.stdout(Stdio::null());
@@ -610,6 +705,49 @@ impl CrunCommand {
     pub fn status(mut self) -> std::io::Result<std::process::ExitStatus> {
         self.apply_pending();
         self.cmd.status()
+    }
+}
+
+/// Bind crun's binary read-only onto itself, once at boot.
+///
+/// Every crun invocation otherwise copies its own binary into a sealed memfd and
+/// re-executes from it (its CVE-2019-5736 protection), about 2.5 ms per call in
+/// a 1-vCPU guest, and the agent runs crun for every container exec. crun skips
+/// that copy when its binary is on a read-only mount (`is_self_cloned` in
+/// libcrun's cloned_binary.c). The protection is the same: a container process
+/// cannot open a read-only mount for writing, nor remount one in the agent's
+/// mount namespace. On failure crun keeps cloning itself, as before.
+#[cfg(target_os = "linux")]
+pub fn protect_binary() {
+    let path = std::ffi::CString::new(paths::CRUN_PATH).expect("constant path has no NUL");
+    // SAFETY: mount(2) and umount2(2) on a constant, NUL-terminated path.
+    let bound = unsafe {
+        libc::mount(
+            path.as_ptr(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND,
+            std::ptr::null(),
+        )
+    } == 0;
+    if !bound {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not bind crun read-only; it will clone itself on every call");
+        return;
+    }
+    // SAFETY: as above; remounts only the bind created just now.
+    let read_only = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            path.as_ptr(),
+            std::ptr::null(),
+            libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY,
+            std::ptr::null(),
+        )
+    } == 0;
+    if !read_only {
+        tracing::warn!(error = %std::io::Error::last_os_error(), "could not make crun read-only; it will clone itself on every call");
+        // SAFETY: detaches the writable bind created above.
+        unsafe { libc::umount2(path.as_ptr(), libc::MNT_DETACH) };
     }
 }
 

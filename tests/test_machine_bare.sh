@@ -46,6 +46,30 @@ test_machine_status_stopped() {
     [[ $exit_code -ne 0 ]] || [[ "$status" == *"not running"* ]] || [[ "$status" == *"stopped"* ]]
 }
 
+test_machine_stats_reports_cpu_and_memory() {
+    ensure_machine_running
+    $SMOLVM machine exec -- sh -c 'end=$(($(date +%s) + 4)); while [ "$(date +%s)" -lt "$end" ]; do :; done' >/dev/null 2>&1 &
+    local busy=$!
+    sleep 1
+    local stats
+    stats=$($SMOLVM machine stats --json 2>&1)
+    wait "$busy" 2>/dev/null || true
+    echo "$stats" | python3 -c "
+import sys, json
+stats = json.load(sys.stdin)
+assert stats['cpu_percent'] > 50, stats
+memory = stats['memory']
+assert 0 < memory['used_bytes'] < memory['total_bytes'], stats
+" 2>&1 || { echo "$stats"; return 1; }
+}
+
+test_machine_stats_when_stopped() {
+    cleanup_machine
+    local exit_code=0
+    $SMOLVM machine stats 2>&1 || exit_code=$?
+    [[ $exit_code -ne 0 ]]
+}
+
 test_machine_start_stop_cycle() {
     cleanup_machine
 
@@ -289,6 +313,81 @@ test_machine_create_prints_named_start_hint() {
     }
 
     $SMOLVM machine delete --name "$vm_name" -f 2>&1
+    ensure_data_dir_deleted "$vm_name"
+}
+
+# A delete that is refused must change nothing. It used to stop the machine
+# before asking, so a delete refused for want of a terminal (or answered "n")
+# still killed the workload it then kept on disk.
+test_refused_delete_leaves_machine_running() {
+    local vm_name="delete-refused-$$"
+    local output still
+    local rc=0
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+
+    output=$($SMOLVM machine delete --name "$vm_name" 2>&1 </dev/null) || rc=$?
+    still=$($SMOLVM machine exec --name "$vm_name" -- echo still-running 2>&1) || true
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    [[ $rc -ne 0 && "$output" == *"not a terminal"* ]] || {
+        echo "expected a refusal, got (rc=$rc): $output"
+        return 1
+    }
+    [[ "$still" == *"still-running"* ]] || {
+        echo "the refused delete stopped the machine: $output / $still"
+        return 1
+    }
+    ensure_data_dir_deleted "$vm_name"
+}
+
+# exec and cp on a paused machine must name resume. They used to print the
+# start hint of a stopped machine, and `machine start` refuses a paused one.
+test_paused_machine_points_exec_and_cp_at_resume() {
+    local vm_name="paused-hint-$$"
+    local exec_output cp_output
+    local exec_rc=0 cp_rc=0
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" --branchable 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine pause --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+
+    exec_output=$($SMOLVM machine exec --name "$vm_name" -- true 2>&1) || exec_rc=$?
+    cp_output=$($SMOLVM machine cp /etc/hostname "$vm_name":/tmp/x 2>&1) || cp_rc=$?
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    [[ $exec_rc -ne 0 && "$exec_output" == *"machine resume --name $vm_name"* && "$exec_output" != *"machine start"* ]] || {
+        echo "exec on a paused machine should name resume, got (rc=$exec_rc): $exec_output"
+        return 1
+    }
+    [[ $cp_rc -ne 0 && "$cp_output" == *"machine resume --name $vm_name"* && "$cp_output" != *"machine start"* ]] || {
+        echo "cp to a paused machine should name resume, got (rc=$cp_rc): $cp_output"
+        return 1
+    }
+    ensure_data_dir_deleted "$vm_name"
+}
+
+test_started_machine_outlives_boot_helper_cli() {
+    local vm_name="boot-helper-owner-$$"
+    local rc=0
+    "$SMOLVM" machine create --name "$vm_name" 2>&1 || return 1
+    SMOLVM_BOOT_BINARY="$SMOLVM" "$SMOLVM" machine start --name "$vm_name" --branchable 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        # The parent-death watcher polls every 500 ms; the persistent machine
+        # must remain usable after the CLI that started it has exited.
+        sleep 1
+        "$SMOLVM" machine exec --name "$vm_name" -- true 2>&1 || rc=$?
+    fi
+    "$SMOLVM" machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ $rc -eq 0 ]] || return "$rc"
     ensure_data_dir_deleted "$vm_name"
 }
 
@@ -538,6 +637,11 @@ test_docker_in_vm() {
 
     # ── Create ────────────────────────────────────────────────────────────────
     echo "phase: create"
+    # Count the example's init commands rather than hard-coding them, so the
+    # test follows the example when it gains a step.
+    local init_count
+    init_count=$(awk '/^init = \[/{f=1; next} f && /^\]/{exit} f && /^[[:space:]]*"/{n++} END{print n+0}' "$smolfile")
+    [[ "$init_count" -gt 0 ]] || { echo "FAIL: no init commands found in $smolfile"; return 1; }
     local output
     output=$($SMOLVM machine create --name "$vm_name" \
         -s "$smolfile" --net-backend virtio-net 2>&1) || {
@@ -545,8 +649,8 @@ test_docker_in_vm() {
         echo "$output"
         return 1
     }
-    [[ "$output" == *"Init commands: 4"* ]] || {
-        echo "FAIL: expected 4 init commands, got: $output"
+    [[ "$output" == *"Init commands: $init_count"* ]] || {
+        echo "FAIL: expected $init_count init commands, got: $output"
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
@@ -559,8 +663,8 @@ test_docker_in_vm() {
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
         return 1
     }
-    [[ "$output" == *"Running 4 init command"* ]] || {
-        echo "FAIL: expected 4 init commands to run on first start"
+    [[ "$output" == *"Running $init_count init command"* ]] || {
+        echo "FAIL: expected $init_count init commands to run on first start"
         echo "$output"
         $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
@@ -729,6 +833,8 @@ run_test "Machine start" test_machine_start || true
 run_test "Machine stop" test_machine_stop || true
 run_test "Machine status (running)" test_machine_status_running || true
 run_test "Machine status (stopped)" test_machine_status_stopped || true
+run_test "Machine stats: CPU and memory of a busy machine" test_machine_stats_reports_cpu_and_memory || true
+run_test "Machine stats: stopped machine fails" test_machine_stats_when_stopped || true
 run_test "Machine start/stop cycle" test_machine_start_stop_cycle || true
 run_test "Machine exec" test_machine_exec || true
 run_test "Machine exec: echo" test_machine_exec_echo || true
@@ -739,6 +845,9 @@ run_test "SIGTERM during exec does not stall VM" test_sigterm_during_exec_does_n
 run_test "Exec timeout does not stall VM" test_exec_timeout_does_not_stall_vm || true
 run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
+run_test "Refused delete leaves a running machine running" test_refused_delete_leaves_machine_running || true
+run_test "Paused machine points exec and cp at resume" test_paused_machine_points_exec_and_cp_at_resume || true
+run_test "CLI-started machine outlives its boot helper parent" test_started_machine_outlives_boot_helper_cli || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "File upload and download" test_file_upload_download || true
@@ -827,6 +936,74 @@ test_exec_interactive_large_stdin() {
 }
 
 run_test "Exec: 'exec -i' streams 1 MiB of piped stdin (#926)" test_exec_interactive_large_stdin || true
+
+test_exec_interactive_stdin_before_eof() {
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    "$SMOLVM" machine create --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+    "$SMOLVM" machine start --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || return 1
+
+    local exit_code=0
+    # The timeout helper backgrounds Python, so pass the script as an argument.
+    run_with_timeout 90 python3 -c "$(cat <<'PY'
+import os
+import select
+import subprocess
+import sys
+import tempfile
+import time
+
+# Keep stdin open until every reply arrives. File redirection or communicate()
+# would send EOF, making the descriptor readable and hiding buffered-input stalls.
+with tempfile.TemporaryFile() as errors:
+    proc = subprocess.Popen(
+        [sys.argv[1], "machine", "exec", "--name", sys.argv[2], "-i", "--",
+         "sh", "-c", "printf 'ready\\n'; exec cat"],
+        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors, bufsize=0,
+    )
+
+    def receive(expected):
+        actual = bytearray()
+        deadline = time.monotonic() + 10
+        while len(actual) < len(expected):
+            remaining = deadline - time.monotonic()
+            if remaining <= 0 or not select.select([proc.stdout], [], [], remaining)[0]:
+                raise AssertionError(
+                    f"stdin stayed open: received {len(actual)} of {len(expected)} bytes"
+                )
+            chunk = os.read(proc.stdout.fileno(), len(expected) - len(actual))
+            if not chunk:
+                raise AssertionError("exec closed stdout before completing its reply")
+            actual.extend(chunk)
+        assert actual == expected, "stdin round-trip changed the payload"
+
+    try:
+        receive(b"ready\n")
+        # Cross the 4 KiB read boundary while keeping stdin open.
+        payload = b"x" * 4096 + b"\n"
+        pending = memoryview(payload)
+        while pending:
+            pending = pending[os.write(proc.stdin.fileno(), pending):]
+        receive(payload)
+        proc.stdin.close()
+        assert proc.wait(timeout=10) == 0, "exec failed after stdin EOF"
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+        proc.wait()
+        proc.stdin.close()
+        proc.stdout.close()
+        errors.seek(0)
+        sys.stderr.buffer.write(errors.read())
+PY
+)" "$SMOLVM" "$_EXEC_STDIN_MACHINE" || exit_code=$?
+
+    "$SMOLVM" machine stop --name "$_EXEC_STDIN_MACHINE" 2>/dev/null || true
+    "$SMOLVM" machine delete --name "$_EXEC_STDIN_MACHINE" -f 2>/dev/null || true
+    return "$exit_code"
+}
+
+run_test "Exec: interactive stdin round-trips before EOF" test_exec_interactive_stdin_before_eof || true
 
 test_exec_tty_piped_stdin_terminates() {
     # `--tty` runs the child on a PTY. A PTY cannot have one direction

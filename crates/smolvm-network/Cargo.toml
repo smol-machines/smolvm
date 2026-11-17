@@ -1,10 +1,11 @@
 [package]
 name = "smolvm-network"
-version = "1.16.1"
+version = "1.35.0"
 edition = "2021"
 description = "Host-side virtio-net runtime for smolvm"
 license = "Apache-2.0"
 repository = "https://github.com/smol-machines/smolvm"
+readme = "README.md"
 
 [dependencies]
 crossbeam-queue = "0.3"
@@ -12,6 +13,8 @@ getrandom = "0.3"
 humantime = "2"
 libc = "0.2"
 polling = "3"
+serde_json = "1"
+smolvm-protocol = { path = "../smolvm-protocol", version = "1.26.1" }
 smoltcp = { version = "0.13", default-features = false, features = [
     "std",
     "log",
@@ -27,6 +30,7 @@ smoltcp = { version = "0.13", default-features = false, features = [
     # IPv6 link-local (default cap is 2).
     "iface-max-addr-count-3",
 ] }
+sha2 = "0.10"
 socket2 = "0.6"
 tracing = { workspace = true }
 

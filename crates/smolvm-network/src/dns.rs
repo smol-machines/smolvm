@@ -46,6 +46,22 @@ const DNS_MAX_LABEL_LEN: usize = 63;
 /// Mirrors Docker's `host.docker.internal`.
 pub const GATEWAY_HOSTNAME: &str = "host.smolvm.internal";
 
+/// Every name the gateway answers with its own address: its own name, and
+/// the names containers conventionally use for the host
+/// (`host.docker.internal`) and its gateway (`gateway.docker.internal`), so
+/// software that expects them reaches the host unchanged.
+pub const GATEWAY_HOSTNAMES: [&str; 3] = [
+    GATEWAY_HOSTNAME,
+    "host.docker.internal",
+    "gateway.docker.internal",
+];
+
+/// Whether `name` (already normalized: lowercase, no trailing dot) is one of
+/// [`GATEWAY_HOSTNAMES`].
+pub fn is_gateway_hostname(name: &str) -> bool {
+    GATEWAY_HOSTNAMES.contains(&name)
+}
+
 /// TTL for the gateway's self-answer. Short so a stack restart with a
 /// different gateway address is picked up quickly.
 const GATEWAY_TTL_SECS: u32 = 60;
@@ -60,19 +76,14 @@ pub fn normalize_hostname(hostname: &str) -> Option<String> {
     }
 }
 
-/// Whether `hostname` matches the allow-list: exact match, or a subdomain of an
-/// allowed entry (`foo.example.com` matches `example.com`, `notexample.com` does
-/// not). Mirrors libkrun's `is_hostname_allowed`.
+/// Match legacy exact-or-subdomain entries and opt-in `=` / `*.` entries.
 pub fn hostname_allowed(hostname: &str, allowed_hosts: &[String]) -> bool {
     let Some(hostname) = normalize_hostname(hostname) else {
         return false;
     };
-    allowed_hosts.iter().any(|allowed| {
-        hostname == *allowed
-            || hostname
-                .strip_suffix(allowed)
-                .is_some_and(|prefix| prefix.ends_with('.'))
-    })
+    allowed_hosts
+        .iter()
+        .any(|allowed| smolvm_protocol::host_pattern::matches(&hostname, allowed))
 }
 
 /// The question name in a DNS query (first question only). `None` on malformed input.
@@ -164,6 +175,42 @@ pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
     response.extend_from_slice(&GATEWAY_TTL_SECS.to_be_bytes());
     response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
     response.extend_from_slice(&gateway.octets());
+    response
+}
+
+/// A NOERROR answer with `ips` for an A query, and an empty one for any
+/// other type (AAAA: resolvers then use the A records).
+pub fn addresses_response(query: &[u8], ips: &[std::net::IpAddr], ttl: u32) -> Vec<u8> {
+    let mut response = error_response(query, 0);
+    let Some(end) = question_section_end(query) else {
+        return response;
+    };
+    // An A question gets the IPv4 addresses, an AAAA question the IPv6 ones;
+    // anything else, or a name without that family, an empty answer.
+    let qtype = read_u16(query, end - DNS_QUESTION_FIXED_LEN);
+    let rdata: Vec<Vec<u8>> = ips
+        .iter()
+        .filter_map(|ip| match (qtype, ip) {
+            (Some(DNS_TYPE_A), std::net::IpAddr::V4(v4)) => Some(v4.octets().to_vec()),
+            (Some(DNS_TYPE_AAAA), std::net::IpAddr::V6(v6)) => Some(v6.octets().to_vec()),
+            _ => None,
+        })
+        .take(32)
+        .collect();
+    let Some(qtype) = qtype else {
+        return response;
+    };
+    let count = rdata.len() as u16;
+    response[DNS_ANCOUNT_OFFSET..DNS_ANCOUNT_OFFSET + DNS_U16_LEN]
+        .copy_from_slice(&count.to_be_bytes());
+    for data in rdata {
+        response.extend_from_slice(&[DNS_POINTER_TAG, DNS_HEADER_LEN as u8]);
+        response.extend_from_slice(&qtype.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        response.extend_from_slice(&data);
+    }
     response
 }
 
@@ -314,6 +361,12 @@ mod tests {
         assert!(hostname_allowed("a.b.example.com", &allow));
         assert!(!hostname_allowed("notexample.com", &allow));
         assert!(!hostname_allowed("example.com.evil.com", &allow));
+        let exact = vec!["=example.com".to_string()];
+        assert!(hostname_allowed("example.com", &exact));
+        assert!(!hostname_allowed("www.example.com", &exact));
+        let wildcard = vec!["*.example.com".to_string()];
+        assert!(!hostname_allowed("example.com", &wildcard));
+        assert!(hostname_allowed("www.example.com", &wildcard));
     }
 
     #[test]

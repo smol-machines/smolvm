@@ -18,7 +18,7 @@ kill_orphan_smolvm_processes
 # Clean up any leftover test VM directories
 for vm_name in test-vm-resize-happy test-vm-resize-running test-vm-resize-shrink \
     nonexistent-vm-resize-test test-vm-resize-noparams test-vm-resize-storage-only \
-    test-vm-resize-overlay-only; do
+    test-vm-resize-overlay-only test-vm-resize-stopped-bare test-vm-resize-stopped-image; do
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$(vm_data_dir "$vm_name")"
@@ -80,32 +80,73 @@ test_machine_resize_happy_path() {
     [[ "$resize_output" == *"resized successfully"* ]]
 }
 
-test_machine_resize_running_vm_rejected() {
-    # Integration test: Resize rejection - running VM (4.5)
+test_machine_resize_running_vm() {
+    # Live disk growth must preserve the running guest, its files and RAM.
     local vm_name="test-vm-resize-running"
 
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
 
     # Create and start VM
-    $SMOLVM machine create --name "$vm_name" --storage 5 --overlay 2 2>&1 || return 1
+    $SMOLVM machine create --name "$vm_name" --cpus 2 --mem 1024 --storage 1 --overlay 1 2>&1 || return 1
     $SMOLVM machine start --name "$vm_name" 2>&1 || {
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         return 1
     }
 
-    # Attempt resize on running VM - should fail
+    local boot_before boot_after data_dir
+    data_dir=$(vm_data_dir "$vm_name") || return 1
+    boot_before=$($SMOLVM machine exec --name "$vm_name" -- cat /proc/sys/kernel/random/boot_id) || return 1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec \
+        'echo disk-marker >/storage/resize-marker; echo ram-marker >/dev/shm/resize-marker' || return 1
+
     local exit_code=0
     local resize_output
-    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 10 2>&1) || exit_code=$?
+    resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 2 --overlay 2 2>&1) || exit_code=$?
+    echo "$resize_output"
+    # Retrying the same target is safe; a smaller target must be refused.
+    $SMOLVM machine resize --name "$vm_name" --storage 2 --overlay 2 || exit_code=1
+    if $SMOLVM machine resize --name "$vm_name" --storage 1; then
+        echo "Unexpectedly accepted a live disk shrink"
+        exit_code=1
+    fi
+    boot_after=$($SMOLVM machine exec --name "$vm_name" -- cat /proc/sys/kernel/random/boot_id) || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        test "$(cat /storage/resize-marker)" = disk-marker
+        test "$(cat /dev/shm/resize-marker)" = ram-marker
+        test $(df -k /storage | tail -1 | awk "{print \$2}") -gt 1900000
+        test $(df -k / | tail -1 | awk "{print \$2}") -gt 1900000
+    ' || exit_code=1
 
-    # Clean up
+    # Exercise newly available blocks on both disks, not just the advertised
+    # capacity. A non-sparse 1100 MiB file cannot fit on either original disk.
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        for path in /storage/resize-capacity /root/resize-capacity; do
+            dd if=/dev/zero of="$path" bs=1048576 count=1100
+            printf resize-tail >>"$path"
+            test "$(stat -c %s "$path")" = 1153433611
+        done
+        sync
+    ' || exit_code=1
+
+    # A successful live resize must also survive an ordinary stop/start.
+    $SMOLVM machine stop --name "$vm_name" || exit_code=1
+    $SMOLVM machine start --name "$vm_name" || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        test "$(cat /storage/resize-marker)" = disk-marker
+        for path in /storage/resize-capacity /root/resize-capacity; do
+            test "$(stat -c %s "$path")" = 1153433611
+            test "$(tail -c 11 "$path")" = resize-tail
+        done
+    ' || exit_code=1
+
+    # Cleanup must use the path observed while the machine record exists.
+    # `machine data-dir` correctly refuses a deleted machine name.
     $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
-    ensure_data_dir_deleted "$vm_name"
+    [[ ! -e "$data_dir" ]] || return 1
 
-    # Should fail with non-zero exit code
-    [[ $exit_code -ne 0 ]]
+    [[ $exit_code -eq 0 && "$boot_before" == "$boot_after" ]]
 }
 
 test_machine_resize_shrink_rejected() {
@@ -293,13 +334,88 @@ test_machine_resize_overlay_only() {
     [[ "$resize_output" == *"Overlay"* ]] && [[ "$resize_output" == *"resized successfully"* ]]
 }
 
+test_machine_resize_stopped_then_start_bare() {
+    # Growing the disks of a stopped machine must not cost the next start its
+    # storage: both filesystems grow at boot and keep their files.
+    local vm_name="test-vm-resize-stopped-bare"
+    local data_dir exit_code=0
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" --storage 2 --overlay 2 2>&1 || return 1
+    data_dir=$(vm_data_dir "$vm_name") || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec \
+        'echo storage-marker >/storage/resize-marker; echo root-marker >/root/resize-marker; sync' \
+        || exit_code=1
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || exit_code=1
+
+    $SMOLVM machine resize --name "$vm_name" --storage 4 --overlay 4 2>&1 || exit_code=1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        grep -q " /storage ext4 " /proc/mounts
+        test "$(cat /storage/resize-marker)" = storage-marker
+        test "$(cat /root/resize-marker)" = root-marker
+        test $(df -k /storage | tail -1 | awk "{print \$2}") -gt 3800000
+        test $(df -k / | tail -1 | awk "{print \$2}") -gt 3800000
+    ' || exit_code=1
+
+    # The grown filesystems boot again unchanged.
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || exit_code=1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        test "$(cat /storage/resize-marker)" = storage-marker
+        test $(df -k /storage | tail -1 | awk "{print \$2}") -gt 3800000
+    ' || exit_code=1
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ ! -e "$data_dir" ]] || return 1
+    [[ $exit_code -eq 0 ]]
+}
+
+test_machine_resize_stopped_then_start_image() {
+    # An image machine keeps its pulled layers and container changes on the
+    # storage disk; growing it while stopped used to fail the next start with
+    # "pull image: No such file or directory".
+    local vm_name="test-vm-resize-stopped-image"
+    local data_dir exit_code=0
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" --net --image alpine --storage 2 2>&1 || return 1
+    data_dir=$(vm_data_dir "$vm_name") || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec \
+        'echo container-marker >/root/resize-marker; echo workspace-marker >/workspace/resize-marker; sync' \
+        || exit_code=1
+    $SMOLVM machine stop --name "$vm_name" 2>&1 || exit_code=1
+
+    $SMOLVM machine update --name "$vm_name" --storage 4 2>&1 || exit_code=1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || exit_code=1
+    $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+        test "$(cat /root/resize-marker)" = container-marker
+        test "$(cat /workspace/resize-marker)" = workspace-marker
+        test $(df -k /workspace | tail -1 | awk "{print \$2}") -gt 3800000
+    ' || exit_code=1
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ ! -e "$data_dir" ]] || return 1
+    [[ $exit_code -eq 0 ]]
+}
+
 run_test "Resize: happy path" test_machine_resize_happy_path || true
-run_test "Resize: running VM rejected" test_machine_resize_running_vm_rejected || true
+run_test "Resize: running VM grows without rebooting" test_machine_resize_running_vm || true
 run_test "Resize: shrink rejected" test_machine_resize_shrink_rejected || true
 run_test "Resize: non-existent VM rejected" test_machine_resize_nonexistent_vm_rejected || true
 run_test "Resize: default VM" test_machine_resize_default_vm || true
 run_test "Resize: no params rejected" test_machine_resize_no_params_rejected || true
 run_test "Resize: storage only" test_machine_resize_storage_only || true
 run_test "Resize: overlay only" test_machine_resize_overlay_only || true
+run_test "Resize: stopped bare machine grows and keeps files" test_machine_resize_stopped_then_start_bare || true
+run_test "Resize: stopped image machine grows and keeps its image" test_machine_resize_stopped_then_start_image || true
 
 print_summary "Resize Tests"

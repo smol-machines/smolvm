@@ -55,6 +55,10 @@ pub struct BootConfig {
     /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
     #[serde(default)]
     pub expose_docker: bool,
+    /// Publish the TCP ports the guest listens on at the same host port on
+    /// loopback (`--auto-ports`). Only the local CLI's launches set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`),
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]
@@ -77,6 +81,10 @@ pub struct BootConfig {
     /// `packed_layers_dir` is consumed as-is (no idmap mount).
     #[serde(default)]
     pub pack_idmap_source: Option<PathBuf>,
+    /// DAX window for `packed_layers_dir`, chosen by the launcher: the window
+    /// a restored guest booted with, or the fresh-boot size.
+    #[serde(default = "crate::agent::virtiofs::legacy_packed_layers_dax_window")]
+    pub packed_layers_dax_window: u64,
     /// Additional disk images to attach (path, read_only, format). The format
     /// lets the `pack --from-vm` exporter attach a source qcow2 disk read-only.
     #[serde(default)]
@@ -88,4 +96,22 @@ pub struct BootConfig {
     /// virtio-net backend. See `agent::pod_net`.
     #[serde(default)]
     pub pod_netns: Option<PathBuf>,
+    /// Credential policy to enforce for this machine: the boot subprocess runs
+    /// the interceptor beside the network stack and mounts the machine CA.
+    #[serde(default)]
+    pub credentials: Option<crate::credentials::CredentialLaunch>,
+    /// Launch-scoped host interceptor; never copied to the machine record.
+    #[serde(default)]
+    pub external_interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+    /// A versioned per-flow decision is required for external interception.
+    #[serde(default)]
+    pub mediated_egress: bool,
+    /// Host-only identity of a branch source's launch.
+    #[serde(default)]
+    pub mediated_parent_id: [u8; 16],
+    /// File the workload's stdout and stderr are appended to. Set for named
+    /// machines; the boot process listens for the guest's output while the
+    /// machine runs.
+    #[serde(default)]
+    pub workload_log: Option<PathBuf>,
 }

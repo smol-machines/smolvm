@@ -138,6 +138,10 @@ impl LibkrunVm {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation("failed to set VM config"));
             }
+            if krun.configure_live_resize(ctx, config.cpus) < 0 {
+                krun_free_ctx(ctx);
+                return Err(Error::vm_creation("live resize configuration failed"));
+            }
 
             // Set root filesystem via the root virtiofs tag (upstream removed
             // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
@@ -414,19 +418,10 @@ impl LibkrunVm {
     }
 }
 
-/// Raise file descriptor limits (required by libkrun).
+/// Raise the open-file limit: the VMM holds one host socket per guest
+/// connection, so this caps how many a guest can have open at once.
 fn set_rlimits() {
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
+    let _ = crate::process::raise_nofile_limit();
 }
 
 impl VmHandle for LibkrunVm {

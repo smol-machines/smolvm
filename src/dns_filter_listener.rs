@@ -2,6 +2,9 @@
 //!
 //! Starts a Unix socket listener that accepts connections from the guest
 //! DNS proxy and filters DNS queries against a hostname allowlist.
+//!
+//! No longer started by smolvm: `--allow-host` is enforced by the virtio-net
+//! egress policy and the guest proxy is gone. Kept for embedders that call it.
 
 use crate::dns_filter::{handle_connection, DnsFilter};
 use crate::platform::uds::UdsListener;

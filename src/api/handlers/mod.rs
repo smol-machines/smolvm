@@ -1,10 +1,12 @@
 //! HTTP request handlers.
 
 pub mod exec;
+pub mod exec_sessions;
 pub mod files;
 pub mod health;
 pub mod images;
 pub mod machines;
+pub mod mounts;
 pub mod node;
 pub mod p2p;
 pub mod pools;
@@ -22,27 +24,41 @@ use crate::secrets::ResolutionError;
 pub(crate) const MAX_REQ_SECRETS_PER_REQUEST: usize = 64;
 
 /// Resolve a [`MachineEntry`]'s persisted `secret_refs` under
-/// `RecordReplay` scope. In-memory access — no DB hit per request.
+/// `RecordReplay` scope and add its credential placeholders. In-memory
+/// access — no DB hit per request.
 ///
-/// Returns the resolved `(key, value)` tuples ready to extend into an
-/// env vector. Failures map to structured [`ApiError`]s via
+/// Returns the plaintext `(key, value)` tuples ready to extend into an
+/// env vector. A variable bound to a credential yields its placeholder, never
+/// its value. Failures map to structured [`ApiError`]s via
 /// [`classify_resolution_error`] so HTTP status codes are consistent
 /// across exec/run handlers.
 pub(crate) fn record_secret_refs_env(
     entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
-) -> Result<Vec<(String, crate::secrets::Secret)>, ApiError> {
-    let refs = {
+) -> Result<Vec<(String, String)>, ApiError> {
+    let (refs, credential_env) = {
         let guard = entry.lock();
-        guard.secret_refs.clone()
+        let credentials = guard.credentials.as_ref();
+        crate::credentials::workload_env(
+            credentials.map(|c| &c.policy),
+            credentials
+                .map(|c| &c.placeholders)
+                .unwrap_or(&Default::default()),
+            &guard.secret_refs,
+        )
     };
-    if refs.is_empty() {
-        return Ok(Vec::new());
-    }
-    crate::secrets::resolve_refs_to_env_classified(
-        &refs,
-        crate::secrets::ResolutionScope::RecordReplay,
-    )
-    .map_err(classify_resolution_error)
+    let mut env = if refs.is_empty() {
+        Vec::new()
+    } else {
+        crate::secrets::expose_into_env(
+            crate::secrets::resolve_refs_to_env_classified(
+                &refs,
+                crate::secrets::ResolutionScope::RecordReplay,
+            )
+            .map_err(classify_resolution_error)?,
+        )
+    };
+    env.extend(credential_env);
+    Ok(env)
 }
 
 /// Map a classified [`ResolutionError`] to an [`ApiError`] per the
@@ -93,6 +109,38 @@ fn check_env_key_shape(key: &str) -> Result<(), String> {
         return Err("env key must contain only ASCII alphanumeric and underscore".into());
     }
     Ok(())
+}
+
+/// A command's environment and working directory.
+pub(crate) type CommandContext = (Vec<(String, String)>, Option<String>);
+
+/// The environment and working directory of a command started in a machine,
+/// whichever way it starts: exec, a streamed exec, a run, or a terminal.
+///
+/// Each path once assembled this itself and each missed a different part: a
+/// terminal ran with none of it, and API execs never saw the machine's own
+/// environment. Precedence, lowest first: the machine's env, the request's env,
+/// the machine's secrets and credential placeholders, the request's secrets.
+/// The request's workdir wins over the machine's.
+pub(crate) fn machine_command_context(
+    entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
+    record: Option<&crate::config::VmRecord>,
+    request_env: &[crate::api::types::EnvVar],
+    request_secrets: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
+    request_workdir: Option<String>,
+) -> Result<CommandContext, ApiError> {
+    validate_request_secrets(request_secrets)?;
+    validate_request_env(request_env)?;
+    let mut env = record.map(|record| record.env.clone()).unwrap_or_default();
+    use crate::util::layer_env;
+    layer_env(&mut env, crate::api::types::EnvVar::to_tuples(request_env));
+    layer_env(&mut env, record_secret_refs_env(entry)?);
+    layer_env(
+        &mut env,
+        crate::secrets::expose_into_env(resolve_request_secrets(request_secrets)?),
+    );
+    let workdir = request_workdir.or_else(|| record.and_then(|record| record.workdir.clone()));
+    Ok((env, workdir))
 }
 
 /// Validate an incoming `req.secrets` map against:
@@ -220,6 +268,7 @@ mod tests {
         SecretRef {
             from_env: Some(name.to_string()),
             from_file: None,
+            from_keychain: None,
         }
     }
 
@@ -263,6 +312,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("/abs/key".into()),
+                from_keychain: None,
             },
         );
         assert!(
@@ -288,6 +338,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("relative/path".into()),
+                from_keychain: None,
             },
         );
         assert!(matches!(
@@ -322,6 +373,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("/absolute/path".into()),
+                from_keychain: None,
             },
         );
         let err = validate_request_secrets(&refs).unwrap_err();

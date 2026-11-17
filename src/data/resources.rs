@@ -2,10 +2,80 @@
 /// vCPU threads sleep in the hypervisor when idle, so over-provisioning
 /// is low-cost — the host OS time-slices them like any other threads.
 pub const DEFAULT_MICROVM_CPU_COUNT: u8 = 4;
-/// Default agent VM memory in MiB.
+/// Largest default agent VM memory in MiB; see [`default_microvm_memory_mib`]
+/// for the default a new machine gets on this host.
 /// Virtio balloon with free page reporting means this is a ceiling, not a
 /// reservation — the host only consumes what the guest actually uses.
 pub const DEFAULT_MICROVM_MEMORY_MIB: u32 = 8192;
+
+/// Smallest default agent VM memory in MiB, for hosts with very little RAM.
+const MIN_DEFAULT_MICROVM_MEMORY_MIB: u32 = 1024;
+
+/// Memory in MiB a new machine gets when none is asked for: half the host's
+/// RAM, at most [`DEFAULT_MICROVM_MEMORY_MIB`].
+///
+/// The cap is a ceiling, but a busy guest fills it with page cache, so a cap
+/// equal to the host's RAM lets one machine push the rest of the host into
+/// swap. Only new machines take this default: a machine's memory is recorded
+/// when it is created.
+pub fn default_microvm_memory_mib() -> u32 {
+    default_memory_for_host(host_physical_memory_mib())
+}
+
+fn default_memory_for_host(host_mib: Option<u64>) -> u32 {
+    match host_mib {
+        Some(mib) => (mib / 2).clamp(
+            u64::from(MIN_DEFAULT_MICROVM_MEMORY_MIB),
+            u64::from(DEFAULT_MICROVM_MEMORY_MIB),
+        ) as u32,
+        None => DEFAULT_MICROVM_MEMORY_MIB,
+    }
+}
+
+/// The host's physical RAM in MiB, or `None` if it cannot be read.
+pub(crate) fn host_physical_memory_mib() -> Option<u64> {
+    #[cfg(target_os = "macos")]
+    {
+        let mut bytes = 0u64;
+        let mut len = std::mem::size_of::<u64>();
+        // SAFETY: hw.memsize is a u64 and `len` holds its size.
+        let rc = unsafe {
+            libc::sysctlbyname(
+                c"hw.memsize".as_ptr(),
+                (&mut bytes as *mut u64).cast(),
+                &mut len,
+                std::ptr::null_mut(),
+                0,
+            )
+        };
+        (rc == 0 && len == std::mem::size_of::<u64>() && bytes > 0).then_some(bytes >> 20)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // SAFETY: sysconf has no preconditions.
+        let (pages, page_size) = unsafe {
+            (
+                libc::sysconf(libc::_SC_PHYS_PAGES),
+                libc::sysconf(libc::_SC_PAGESIZE),
+            )
+        };
+        (pages > 0 && page_size > 0).then(|| (pages as u64).saturating_mul(page_size as u64) >> 20)
+    }
+    #[cfg(windows)]
+    {
+        use windows_sys::Win32::System::SystemInformation::{GlobalMemoryStatusEx, MEMORYSTATUSEX};
+        // SAFETY: a zeroed MEMORYSTATUSEX with its length set is the documented input.
+        let mut status: MEMORYSTATUSEX = unsafe { std::mem::zeroed() };
+        status.dwLength = std::mem::size_of::<MEMORYSTATUSEX>() as u32;
+        // SAFETY: `status` is a valid, correctly sized out-struct.
+        let ok = unsafe { GlobalMemoryStatusEx(&mut status) } != 0;
+        (ok && status.ullTotalPhys > 0).then_some(status.ullTotalPhys >> 20)
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        None
+    }
+}
 
 /// Default VRAM (host shared memory region) exposed to the guest
 /// virtio-gpu device, in MiB.
@@ -45,6 +115,38 @@ pub enum BlockIoEngine {
     Sync,
     /// Submit queued raw-disk reads through a restricted Linux io_uring.
     Async,
+}
+
+/// When a guest's disk writes must reach the host's physical disk.
+///
+/// `Full`: an `fsync` in the guest returns only once the host has flushed the
+/// write to its physical disk, so a commit survives a host crash. `Deferred`:
+/// a guest `fsync` still writes everything out to the machine's disk files, so
+/// the machine, a restart, a checkpoint and a branch all see it, but it does
+/// not wait for the physical disk; the host kernel writes it back on its own
+/// schedule, and a host crash can lose recent writes. For machines whose state
+/// is disposable (tests, rollouts), that turns fsync-bound work such as
+/// database commits from a disk round trip into a memory copy. The guest sees
+/// the same disk either way, so a checkpoint restores under either setting.
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+    utoipa::ToSchema,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum DiskDurability {
+    /// A guest flush waits for the host's disk.
+    #[default]
+    Full,
+    /// Guest writes reach the host's disk on the host's schedule.
+    Deferred,
 }
 
 /// Resources available to a micro vm.
@@ -88,9 +190,32 @@ pub struct VmResources {
     /// Host block I/O engine. Defaults to the historical synchronous path.
     #[serde(default)]
     pub block_io: BlockIoEngine,
+    /// When guest disk writes must reach the host's disk. Defaults to full.
+    #[serde(default)]
+    pub disk_durability: DiskDurability,
+    /// Host disks attached beyond the managed storage and overlay disks, in
+    /// order, surfacing as `/dev/vdc`, `/dev/vdd`, ... Empty for most machines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disks: Vec<crate::data::disk::AttachedDisk>,
+    /// Shared cache disk: a read-only base under the machine's own
+    /// copy-on-write layer, attached after the managed disks.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_disk: Option<crate::data::disk::CacheDisk>,
+    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`),
+    /// normalized. See `smolvm_protocol::disk_volume`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
+    /// `Some(exceptions)` blocks private, internal and link-local destinations
+    /// (`--block-private`) while the public internet stays open; each exception
+    /// CIDR (`--allow-private`) re-opens its range. Cloud metadata stays closed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
     /// Allowed egress CIDR ranges. None = unrestricted, Some([]) = deny all.
     #[serde(default)]
     pub allowed_cidrs: Option<Vec<String>>,
+    /// Ordered L4 flow rules, evaluated before the legacy CIDR/hostname policy.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Custom DNS resolver for the guest. None = backend default.
     ///
     /// Under TSI this becomes the guest's `/etc/resolv.conf` nameserver (the
@@ -99,12 +224,29 @@ pub struct VmResources {
     /// blocks the default resolver (e.g. 8.8.8.8) still resolve names.
     #[serde(default)]
     pub dns: Option<std::net::Ipv4Addr>,
+    /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
+    /// Empty = none. Validated with `smolvm_protocol::resolv::validate_option`.
+    #[serde(default)]
+    pub dns_options: Vec<String>,
+    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
+    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
+    #[serde(default)]
+    pub shm_size: Option<String>,
     /// Named inter-VM network to join (virtio-net only). Members lease
     /// distinct guest addresses and route IP packets to each other through
     /// the host-side fabric; VMs on different networks (or none) stay fully
     /// isolated from each other.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
+    /// IPv4 subnet the guest link is drawn from (virtio-net only), e.g.
+    /// `10.200.0.0/30`: gateway and resolver take the first host address, the
+    /// guest the second. None = the default `100.96.0.0/30`, which collides
+    /// with Tailscale or carrier NAT running inside the guest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub guest_subnet: Option<String>,
+    /// Container switch the machine joins (virtio-net only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch: Option<crate::data::network::SwitchAttachment>,
 }
 
 /// Minimum memory required for the VM to boot (kernel + agent).
@@ -170,7 +312,7 @@ impl Default for VmResources {
     fn default() -> Self {
         Self {
             cpus: DEFAULT_MICROVM_CPU_COUNT,
-            memory_mib: DEFAULT_MICROVM_MEMORY_MIB,
+            memory_mib: default_microvm_memory_mib(),
             network: false,
             network_backend: None,
             gpu: false,
@@ -181,9 +323,19 @@ impl Default for VmResources {
             storage_gib: None,
             overlay_gib: None,
             block_io: BlockIoEngine::Sync,
+            disk_durability: DiskDurability::Full,
+            disks: Vec::new(),
+            cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             allowed_cidrs: None,
+            egress_rules: Vec::new(),
             dns: None,
+            dns_options: Vec::new(),
+            shm_size: None,
             network_name: None,
+            guest_subnet: None,
+            switch: None,
         }
     }
 }
@@ -271,5 +423,24 @@ mod tests {
     #[test]
     fn validate_gpu_vram_mib_accepts_none() {
         assert_eq!(validate_gpu_vram_mib(None).unwrap(), None);
+    }
+
+    #[test]
+    fn the_default_memory_is_half_the_host_up_to_eight_gib() {
+        let gib = |n: u64| n * 1024;
+        // The 8 GB Mac that held 8.5 GB after a heavy job now caps at 4 GiB.
+        assert_eq!(default_memory_for_host(Some(gib(8))), 4096);
+        assert_eq!(default_memory_for_host(Some(gib(16))), 8192);
+        assert_eq!(default_memory_for_host(Some(gib(64))), 8192);
+        assert_eq!(default_memory_for_host(Some(gib(12))), 6144);
+        assert_eq!(default_memory_for_host(Some(1536)), 1024);
+        assert_eq!(default_memory_for_host(None), DEFAULT_MICROVM_MEMORY_MIB);
+    }
+
+    #[test]
+    fn this_host_gets_a_default_in_range() {
+        let mib = default_microvm_memory_mib();
+        assert!((MIN_DEFAULT_MICROVM_MEMORY_MIB..=DEFAULT_MICROVM_MEMORY_MIB).contains(&mib));
+        assert_eq!(VmResources::default().memory_mib, mib);
     }
 }

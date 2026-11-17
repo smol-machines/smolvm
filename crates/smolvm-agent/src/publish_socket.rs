@@ -616,7 +616,7 @@ mod tests {
 /// agent's own namespace IS the workload's, and the direct connect is right.
 // Same gate as the bridge that calls it.
 #[cfg(target_os = "linux")]
-fn dial_app(guest_path: &str) -> io::Result<std::os::unix::net::UnixStream> {
+pub(crate) fn dial_app(guest_path: &str) -> io::Result<std::os::unix::net::UnixStream> {
     match crate::nsfile::GuestNs::for_workload() {
         crate::nsfile::GuestNs::Container(ns) => ns
             .connect(guest_path)

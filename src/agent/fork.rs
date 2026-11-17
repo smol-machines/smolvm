@@ -3,8 +3,8 @@
 //!
 //! A fork snapshots a running, forkable machine's RAM, device state, and disks,
 //! gives the clone private copy-on-write layers, and lets the caller boot the
-//! clone from that exact boundary. Linux/x86_64 and macOS resume the source
-//! immediately on new private layers; other hosts retain a frozen CoW base.
+//! clone from that exact boundary. Linux and macOS resume the source
+//! immediately on new private layers; Windows retains a frozen CoW base.
 //! The boot itself differs between callers (the CLI uses `start_vm_named`; the
 //! API uses `AgentManager`), so it stays out of here; everything up to and
 //! including the snapshot + disk clone is shared so the two entry points can
@@ -22,9 +22,17 @@ use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
-/// Bound qcow2 ancestry and recursive lifecycle work. Longer chains should be
-/// compacted into a new root rather than accumulating unbounded lookup cost.
-const MAX_FORK_LINEAGE_DEPTH: usize = 32;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+mod compact;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub(crate) use compact::{flatten_standalone, flatten_to_raw};
+
+/// Bound how many generations of ancestors a branch may have. Disk chains no
+/// longer grow with lineage (compaction keeps them under
+/// `MAX_FORK_DISK_CHAIN_DEPTH`), so this only stops a runaway or corrupted
+/// lineage: walking it, deleting it deepest-first and reconciling it at startup
+/// all stay cheap at this depth.
+const MAX_FORK_LINEAGE_DEPTH: usize = 256;
 
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
@@ -65,7 +73,6 @@ impl ForkSourceLock {
         Ok(Self { _file: file })
     }
 
-    #[cfg(any(target_os = "linux", target_os = "macos"))]
     fn try_acquire_at(path: &Path) -> Result<Option<Self>> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)
@@ -95,8 +102,14 @@ pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
     ForkSourceLock::acquire_at(&fork_source_lock_path(source))
 }
 
-#[cfg(any(target_os = "linux", target_os = "macos"))]
-fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
+/// Serialize pause/resume retries before taking the capture's source lock.
+pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
+    validate_vm_name(source, "saved execution")
+        .map_err(|error| Error::config("saved execution", error))?;
+    ForkSourceLock::acquire_at(&saved_execution_lock_path(source))
+}
+
+pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
 }
@@ -109,8 +122,14 @@ fn fork_source_lock_path(source: &str) -> PathBuf {
         .join(format!(".{source}.fork-operation.lock"))
 }
 
+/// The pause/resume lock of [`lock_saved_execution`]: a sibling of the
+/// machine's fork-source lock, for the same reason.
+fn saved_execution_lock_path(source: &str) -> PathBuf {
+    fork_source_lock_path(source).with_extension("pause-operation.lock")
+}
+
 #[cfg(unix)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) };
@@ -122,7 +141,7 @@ fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn lock_file_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{LockFileEx, LOCKFILE_EXCLUSIVE_LOCK};
     use windows_sys::Win32::System::IO::OVERLAPPED;
@@ -205,21 +224,29 @@ fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     if result != 0 {
         Ok(())
     } else {
-        Err(std::io::Error::last_os_error())
+        let error = std::io::Error::last_os_error();
+        if error.raw_os_error() == Some(windows_sys::Win32::Foundation::ERROR_LOCK_VIOLATION as i32)
+        {
+            Err(std::io::Error::new(std::io::ErrorKind::WouldBlock, error))
+        } else {
+            Err(error)
+        }
     }
 }
 
-/// The machine name a fork-source lock file belongs to, or `None` when the path
-/// is not one. The inverse of the name [`fork_source_lock_path`] builds.
+/// The machine name a fork-source or pause-operation lock file belongs to, or
+/// `None` when the path is neither. The inverse of the names
+/// [`fork_source_lock_path`] and [`saved_execution_lock_path`] build.
 fn fork_source_lock_owner(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
+    let file_name = path.file_name()?.to_str()?.strip_prefix('.')?;
     let source = file_name
-        .strip_prefix('.')?
-        .strip_suffix(".fork-operation.lock")?;
+        .strip_suffix(".fork-operation.pause-operation.lock")
+        .or_else(|| file_name.strip_suffix(".fork-operation.lock"))?;
     (!source.is_empty()).then(|| source.to_string())
 }
 
-/// Remove fork-source lock files whose machine no longer exists.
+/// Remove fork-source and pause-operation lock files whose machine no longer
+/// exists.
 ///
 /// [`fork_source_lock_path`] deliberately puts the lock file *beside* the
 /// machine's data directory rather than inside it, so deleting a machine cannot
@@ -230,11 +257,15 @@ fn fork_source_lock_owner(path: &Path) -> Option<String> {
 ///
 /// Sweeping is safe here only because both conditions must hold: the machine's
 /// data directory is gone, *and* the lock can be taken without blocking, which
-/// no in-flight fork or checkpoint would permit. A file failing either check is
-/// left for a later sweep rather than raced against.
+/// no in-flight fork, checkpoint, pause, resume or saved-execution download
+/// would permit. A file failing either check is left for a later sweep rather
+/// than raced against.
 ///
 /// Best-effort by design, like [`crate::agent::prune_orphaned_ready_markers`]:
 /// a lock this process cannot open or unlink is simply left in place.
+///
+/// A paused machine's disk record lives beside its data directory for the
+/// same reason, and is removed here too once that directory is gone.
 pub fn prune_orphaned_fork_source_locks() {
     prune_orphaned_fork_source_locks_in(&crate::agent::vm_cache_root());
 }
@@ -245,10 +276,43 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Some(source) = fork_source_lock_owner(&path) else {
+        // A paused machine's disk record outlives nothing it describes.
+        if let Some(dir) = crate::portable_checkpoint::paused_disks_marker_owner(&path) {
+            if !vms_dir.join(dir).is_dir() {
+                let _ = std::fs::remove_file(&path);
+            }
+            continue;
+        }
+        // So are the layers its pause pinned.
+        if let Some(dir) = crate::portable_checkpoint::paused_layers_owner(&path) {
+            if !vms_dir.join(dir).is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
+        // An export's work directory lives only while the export builds, which
+        // takes minutes: one whose machine is gone, or a day old, was left by
+        // an export that never finished.
+        if let Some(dir) = crate::portable_checkpoint::paused_export_owner(&path) {
+            let stale = entry
+                .metadata()
+                .and_then(|meta| meta.modified())
+                .ok()
+                .and_then(|modified| modified.elapsed().ok())
+                .is_some_and(|age| age > std::time::Duration::from_secs(24 * 60 * 60));
+            if stale || !vms_dir.join(dir).is_dir() {
+                let _ = std::fs::remove_dir_all(&path);
+            }
+            continue;
+        }
+        let owner = fork_source_lock_owner(&path)
+            .map(|source| vms_dir.join(crate::agent::vm_dir_hash(&source)));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        let owner = owner.or_else(|| compact::disk_lock_owner(&path));
+        let Some(owner) = owner else {
             continue;
         };
-        if vms_dir.join(crate::agent::vm_dir_hash(&source)).is_dir() {
+        if owner.is_dir() {
             continue;
         }
         let Ok(file) = std::fs::OpenOptions::new().write(true).open(&path) else {
@@ -280,9 +344,23 @@ pub fn control_socket_cmd_with_timeout(
     cmd: &str,
     timeout: std::time::Duration,
 ) -> Result<String> {
+    #[cfg(not(target_os = "windows"))]
     use crate::platform::uds::UdsStream;
     use std::io::{Read, Write};
 
+    #[cfg(target_os = "windows")]
+    let mut stream = {
+        // libkrun's Windows control listener uses loopback TCP and writes its
+        // assigned port to this path; it is not an AF_UNIX socket.
+        let port = std::fs::read_to_string(sock)
+            .map_err(|e| Error::agent("read control port", e.to_string()))?
+            .trim()
+            .parse::<u16>()
+            .map_err(|e| Error::agent("parse control port", e.to_string()))?;
+        std::net::TcpStream::connect(("127.0.0.1", port))
+            .map_err(|e| Error::agent("connect control socket", e.to_string()))?
+    };
+    #[cfg(not(target_os = "windows"))]
     let mut stream = UdsStream::connect(sock)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
     stream.set_read_timeout(Some(timeout)).ok();
@@ -300,10 +378,49 @@ pub fn control_socket_cmd_with_timeout(
                 }
                 reply.push(byte[0] as char);
             }
+            // A signal landed during the read (SIGCHLD from a VMM child, say): the
+            // read did nothing, so do it again. `write_all` retries this itself;
+            // a byte-wise `read` does not.
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            // A read timeout surfaces as EAGAIN, which says nothing about why.
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) =>
+            {
+                return Err(Error::agent(
+                    "read control socket",
+                    format!(
+                        "no reply to {} within {} s",
+                        verb_of(cmd),
+                        timeout.as_secs()
+                    ),
+                ));
+            }
             Err(e) => return Err(Error::agent("read control socket", e.to_string())),
         }
     }
     Ok(reply)
+}
+
+/// The command word of a control command, without its arguments (paths).
+fn verb_of(cmd: &str) -> &str {
+    cmd.split_whitespace().next().unwrap_or(cmd)
+}
+
+/// How long a branch waits for its source's checkpoint. The capture copies
+/// what the source has written since its last one, so a large or busy machine
+/// on a loaded host can take far longer than the 60 s other commands get: a
+/// capture that was still progressing used to fail at 60 s and fail every
+/// branch waiting on it. Capped below the control plane's 600 s wait for a
+/// branch, so the node answers before its caller gives up.
+pub fn fork_capture_timeout(mem_mib: u32) -> Duration {
+    const BASE_SECS: u64 = 60;
+    const SECS_PER_GIB: u64 = 20;
+    const MAX_SECS: u64 = 540;
+    let gib = u64::from(mem_mib).div_ceil(1024);
+    Duration::from_secs((BASE_SECS + SECS_PER_GIB * gib).min(MAX_SECS))
 }
 
 /// Workload preparation choices inherited by every clone of one golden.
@@ -365,6 +482,12 @@ pub(crate) fn validate_checkpoint_agent(machine: &str) -> Result<()> {
 /// marker and blocks. Keeping the wait in the VM namespace avoids coupling the
 /// host to container logs, PIDs, or workload-specific files.
 pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
+    // A frozen source cannot answer guest-agent requests. Its retained
+    // checkpoint is validated when preparation reuses it below.
+    let status = control_socket_cmd(&control_socket_path(golden), "STATUS")?;
+    if fork_base_already_paused(&status) {
+        return Ok(());
+    }
     let mut client = branch_client(golden, "wait for forkpoint")?;
     match client
         .branchpoint_wait(timeout)
@@ -380,8 +503,9 @@ pub fn wait_for_forkpoint(golden: &str, timeout: Duration) -> Result<()> {
                 "source '{golden}' did not reach a branchpoint within {}s: {f}\n\
                  A batch branch checkpoints the source at a point its workload declares by running \
                  `smolvm-branch-ready` after setup (see README, \"Branch a running machine\"). \
-                 If the workload never calls it, either add the call, raise --ready-timeout, or \
-                 take single `--name` branches, which checkpoint the source wherever it is.",
+                 If the workload never calls it, either add the call, raise --ready-timeout, pass \
+                 --no-wait-ready to checkpoint the source where it is (what the API does by default), \
+                 or take single `--name` branches, which do the same.",
                 timeout.as_secs_f64()
             ),
         )),
@@ -434,14 +558,44 @@ fn fork_base_already_paused(status: &str) -> bool {
     status.trim() == "OK paused"
 }
 
+fn policy_allows_snapshot_reuse(
+    source_policy: ForkSourcePolicy,
+    golden_was_paused: bool,
+    reuse_live_snapshot: bool,
+) -> bool {
+    (golden_was_paused || reuse_live_snapshot)
+        && (source_policy != ForkSourcePolicy::Freeze || golden_was_paused)
+}
+
 /// Linux/KVM and macOS/HVF can atomically checkpoint a fork generation and
 /// resume the source on private RAM and disk layers. Other hosts retain the
 /// established frozen fork-base behavior.
+///
+/// aarch64 Linux joined this once libkrun could stream a retained RAM
+/// generation there; the generation copy itself is host-side and carries no
+/// architecture of its own. Without it a branch left the source frozen, which
+/// is a different machine than the one the caller branched — and a frozen
+/// source cannot be exec'd, only stopped or deleted.
+///
 pub fn fork_continue_enabled() -> bool {
-    cfg!(any(
-        all(target_os = "linux", target_arch = "x86_64"),
-        target_os = "macos"
-    ))
+    cfg!(any(target_os = "linux", target_os = "macos"))
+}
+
+/// How a branch operation leaves its source machine after the checkpoint.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ForkSourcePolicy {
+    /// Resume the source where the host supports it.
+    #[default]
+    PlatformDefault,
+    /// Retain the checkpoint and leave the source paused for repeated branches.
+    Freeze,
+}
+
+impl ForkSourcePolicy {
+    /// Whether this policy requests a running source after capture.
+    pub fn continues(self) -> bool {
+        self == Self::PlatformDefault && fork_continue_enabled()
+    }
 }
 
 #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
@@ -505,65 +659,198 @@ fn branch_admission_value(name: &str, default: u64) -> Result<u64> {
     }
 }
 
+/// What a branch must leave free on the host: a reserve kept for the host and
+/// what each child is charged (a fixed boot overhead plus a share of its guest
+/// RAM). Shared by the fork-time check and `GET /capacity`, so a control plane
+/// that pre-checks a fan-out uses the same numbers this node will enforce.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct BranchAdmissionParams {
+    /// Host memory a branch must leave free (MiB).
+    pub reserve_mib: u64,
+    /// Boot overhead charged per child (MiB).
+    pub child_overhead_mib: u64,
+    /// Share of a child's guest RAM (0..=1) charged per child on top of
+    /// `child_overhead_mib`, for the private pages it dirties after the fork.
+    pub child_growth_fraction: f64,
+}
+
+/// Default [`BranchAdmissionParams::child_growth_fraction`]. A child starts
+/// sharing all of its source's RAM, but test-run children dirty a private set
+/// over minutes; on 2026-11-09 thousands of 16-32 GiB children admitted at
+/// 64 MiB each grew three 755-1511 GiB workers into a global OOM. A quarter of
+/// the guest is what a busy child plausibly makes private while keeping
+/// copy-on-write density at 4x the guest-RAM sum. Only a default on large
+/// serve hosts (see [`branch_admission_defaults`]).
+const DEFAULT_BRANCH_CHILD_GROWTH_FRACTION: f64 = 0.25;
+
+/// Hosts at least this large (MiB) get the host-derived branch reserve and the
+/// per-child growth charge by default when they run `smolvm serve`. Laptops,
+/// dev boxes and CI runners keep the old 5%/4 GiB reserve and 64 MiB per child:
+/// they branch a handful of children and a 2 GiB-per-child charge would refuse
+/// fan-outs that fit there fine.
+const LARGE_SERVE_HOST_MIN_MIB: u64 = 128 * 1024;
+
+/// Set once by `smolvm serve` at startup: this process is a node that admits
+/// branches for a control plane, not a local CLI invocation.
+static SERVE_BRANCH_ADMISSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as `smolvm serve`, so a large host uses the stricter
+/// branch admission defaults.
+pub fn enable_serve_branch_admission() {
+    SERVE_BRANCH_ADMISSION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The default `(reserve_mib, child_growth_fraction)` for a host with
+/// `total_mib` of memory that keeps `host_reserved_mib` out of reach of VMs.
+/// Only `smolvm serve` on a host of at least [`LARGE_SERVE_HOST_MIN_MIB`]
+/// raises the reserve to the host reserve and charges child growth; everywhere
+/// else the old defaults hold. Explicit env vars override both either way.
+fn branch_admission_defaults(
+    total_mib: u64,
+    under_serve: bool,
+    host_reserved_mib: u64,
+) -> (u64, f64) {
+    if under_serve && total_mib >= LARGE_SERVE_HOST_MIN_MIB {
+        (
+            default_branch_reserve_mib(total_mib, host_reserved_mib),
+            DEFAULT_BRANCH_CHILD_GROWTH_FRACTION,
+        )
+    } else {
+        (default_branch_reserve_mib(total_mib, 0), 0.0)
+    }
+}
+
+/// `SMOLVM_BRANCH_CHILD_GROWTH_FRACTION`, clamped to `0..=1`, or `default`
+/// when unset.
+fn branch_child_growth_fraction(configured: Option<&str>, default: f64) -> Result<f64> {
+    let Some(value) = configured else {
+        return Ok(default);
+    };
+    match value.trim().parse::<f64>() {
+        Ok(fraction) if !fraction.is_nan() => Ok(fraction.clamp(0.0, 1.0)),
+        _ => Err(Error::config(
+            "fork memory admission",
+            "SMOLVM_BRANCH_CHILD_GROWTH_FRACTION must be a number from 0 to 1",
+        )),
+    }
+}
+
+/// What admission charges one child (MiB): the fixed boot overhead plus
+/// `growth_fraction` of its guest RAM, rounded up.
+fn branch_child_charge_mib(child_overhead_mib: u64, growth_fraction: f64, guest_mib: u64) -> u64 {
+    let growth_mib = (guest_mib as f64 * growth_fraction).ceil() as u64;
+    child_overhead_mib.saturating_add(growth_mib)
+}
+
+/// The branch admission parameters for a host with `total_mib` of effective
+/// memory, or `None` when admission is turned off with
+/// `SMOLVM_BRANCH_MEMORY_ADMISSION=0`.
+pub fn branch_admission_params(total_mib: u64) -> Result<Option<BranchAdmissionParams>> {
+    if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
+        return Ok(None);
+    }
+    let (default_reserve_mib, default_growth_fraction) = branch_admission_defaults(
+        total_mib,
+        SERVE_BRANCH_ADMISSION.load(std::sync::atomic::Ordering::Relaxed),
+        crate::systemd_scope::configured_host_reserved_memory_mib(total_mib),
+    );
+    let reserve_mib =
+        branch_admission_value("SMOLVM_HOST_MEMORY_RESERVE_MIB", default_reserve_mib)?;
+    // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
+    // Reserve 64 MiB to include thread stacks and transient launch state.
+    let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
+    let child_growth_fraction = branch_child_growth_fraction(
+        std::env::var("SMOLVM_BRANCH_CHILD_GROWTH_FRACTION")
+            .ok()
+            .as_deref(),
+        default_growth_fraction,
+    )?;
+    Ok(Some(BranchAdmissionParams {
+        reserve_mib,
+        child_overhead_mib,
+        child_growth_fraction,
+    }))
+}
+
+/// 5% of the host, at least 512 MiB and at most 4 GiB, never more than half;
+/// raised to `host_reserved_mib`, the memory the host keeps out of reach of
+/// VMs (see [`crate::systemd_scope::host_reserved_memory_mib`]). A fixed 4 GiB
+/// let a 755 GiB host admit branches down to its last 4 GiB, which its own
+/// services and the children's later growth could not live with.
+fn default_branch_reserve_mib(total_mib: u64, host_reserved_mib: u64) -> u64 {
+    (total_mib / 20)
+        .clamp(512, 4096)
+        .min(total_mib / 2)
+        .max(host_reserved_mib)
+}
+
 fn branch_admission_required_mib(
     children: usize,
-    child_overhead_mib: u64,
+    per_child_mib: u64,
     reserve_mib: u64,
     materialized_generation_mib: u64,
 ) -> Option<u64> {
     u64::try_from(children)
         .ok()?
-        .checked_mul(child_overhead_mib)?
+        .checked_mul(per_child_mib)?
         .checked_add(reserve_mib)?
         .checked_add(materialized_generation_mib)
 }
 
 /// Refuse a fan-out before capture if it would consume the host/cgroup's safe
-/// boot headroom. This intentionally reserves only measured VMM boot overhead
-/// plus a fresh shared generation—not every child's configured guest ceiling,
-/// which would erase COW density. Managed per-VM cgroups remain the hard bound
-/// for later workload writes where the service enables them.
+/// headroom. Each child is charged its VMM boot overhead plus a share of its
+/// guest RAM for the private pages it will dirty (not its whole configured
+/// guest, which would erase COW density), on top of what a fresh shared
+/// generation copies—the source's private pages since its last capture. The
+/// VM slice's memory cap and the memory pressure guard bound what children
+/// write beyond that.
 fn admit_branch_memory(
     record: &VmRecord,
     children: usize,
     materializes_shared_generation: bool,
 ) -> Result<()> {
-    if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
-        return Ok(());
-    }
     let Some(memory) = crate::process::host_memory_stats() else {
         return Ok(());
     };
     const MIB: u64 = 1024 * 1024;
     let total_mib = memory.total_bytes / MIB;
     let available_mib = memory.available_bytes / MIB;
-    let default_reserve_mib = (total_mib / 20).clamp(512, 4096).min(total_mib / 2);
-    let reserve_mib =
-        branch_admission_value("SMOLVM_HOST_MEMORY_RESERVE_MIB", default_reserve_mib)?;
-    // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
-    // Reserve 64 MiB to include thread stacks and transient launch state.
-    let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
+    let Some(BranchAdmissionParams {
+        reserve_mib,
+        child_overhead_mib,
+        child_growth_fraction,
+    }) = branch_admission_params(total_mib)?
+    else {
+        return Ok(());
+    };
     let materialized_generation_mib = if materializes_shared_generation {
         record
             .pid
             .and_then(crate::process::process_memory_stats)
-            .and_then(|stats| stats.pss_bytes)
+            .and_then(|stats| stats.anon_bytes.or(stats.pss_bytes))
             .map(|bytes| (bytes.saturating_add(MIB - 1)) / MIB)
             .unwrap_or(u64::from(record.mem))
             .min(u64::from(record.mem))
     } else {
         0
     };
+    // Children inherit the source's guest RAM size.
+    let per_child_mib = branch_child_charge_mib(
+        child_overhead_mib,
+        child_growth_fraction,
+        u64::from(record.mem),
+    );
     let required_mib = branch_admission_required_mib(
         children,
-        child_overhead_mib,
+        per_child_mib,
         reserve_mib,
         materialized_generation_mib,
     )
     .ok_or_else(|| Error::agent("fork memory admission", "memory estimate overflow"))?;
     if available_mib < required_mib {
         return Err(Error::vm_creation(format!(
-            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD"
+            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD/SMOLVM_BRANCH_CHILD_GROWTH_FRACTION"
         )));
     }
     tracing::debug!(
@@ -572,6 +859,8 @@ fn admit_branch_memory(
         required_mib,
         reserve_mib,
         child_overhead_mib,
+        child_growth_fraction,
+        per_child_mib,
         materialized_generation_mib,
         "branch memory admission passed"
     );
@@ -582,7 +871,7 @@ pub(crate) fn retained_snapshot_source_continues(snapshot: &RetainedForkSnapshot
     snapshot.path.join("source-continues-v1").is_file()
 }
 
-fn restart_blocking_dependent_clones_in(
+pub(super) fn restart_blocking_dependent_clones_in(
     db: &SmolvmDb,
     golden: &str,
     snapshot_root: &Path,
@@ -614,6 +903,37 @@ fn restart_blocking_dependent_clones_in(
 /// clone's backing disk; older frozen generations retain the strict guard.
 pub fn restart_blocking_dependent_clones(db: &SmolvmDb, golden: &str) -> Result<Vec<String>> {
     restart_blocking_dependent_clones_in(db, golden, &vm_data_dir(golden).join("s"))
+}
+
+/// The clones that keep a frozen source from stopping: those whose VMM is
+/// alive. A stopped clone maps none of the source's memory and boots from its
+/// own disk overlay, whose backing files a stop leaves in place (retained
+/// checkpoints and referenced generations are kept while any clone exists),
+/// and the launch guard still refuses to run the source again while any clone
+/// depends on it. Refusing the stop anyway left every ancestor of a stopped
+/// clone frozen and holding its vCPUs and memory on its node.
+pub fn stop_blocking_dependent_clones(db: &SmolvmDb, golden: &str) -> Result<Vec<String>> {
+    stop_blocking_dependent_clones_in(db, golden, &vm_data_dir(golden).join("s"))
+}
+
+pub(super) fn stop_blocking_dependent_clones_in(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_root: &Path,
+) -> Result<Vec<String>> {
+    let mut live = Vec::new();
+    for clone in restart_blocking_dependent_clones_in(db, golden, snapshot_root)? {
+        // an unreadable record counts as live: never stop a source on a guess
+        let alive = db
+            .get_vm(&clone)
+            .ok()
+            .flatten()
+            .is_none_or(|record| record.is_process_alive());
+        if alive {
+            live.push(clone);
+        }
+    }
+    Ok(live)
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -828,10 +1148,8 @@ fn prepare_running_disk_generation(
     let mut pivot_lines = Vec::new();
     let mut generation_lines = Vec::new();
     let mut rotations = Vec::new();
-    for (id, raw) in [
-        ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
-        ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
-    ] {
+    let mut compacted = Vec::new();
+    for (id, raw) in FORK_DISK_ROLES {
         let (base, format) = resolve_disk_image(gdir, raw);
         if !base.exists() {
             continue;
@@ -866,6 +1184,9 @@ fn prepare_running_disk_generation(
                 return Err(Error::agent("fork-continue disk base", error.to_string()));
             }
         };
+        if format == DiskFormat::Qcow2 {
+            compacted.push((id, base.clone()));
+        }
         overlays.push((active.clone(), base.clone(), format));
         pivot_lines.push((id, active));
         generation_lines.push((raw, base, format));
@@ -939,11 +1260,82 @@ fn prepare_running_disk_generation(
         rollback_prepared_disk_generation(&overlays, &rotations, &generation_disk_dir);
         return Err(error);
     }
+    for (id, base) in &compacted {
+        if let Err(error) = compact::maybe_start_compaction(gdir, id, base, vm_ids) {
+            tracing::warn!(%error, "could not start merging a branch source's disk chain");
+        }
+    }
     Ok(())
+}
+
+/// Whether the running VM process of a machine was started by a different
+/// smolvm engine build than this one. A worker roll replaces the engine under
+/// running VMs, which keep the one they started with; branching such a VM from
+/// the new engine gave children whose workload died at once (one customer's
+/// batch of 7 on 2026-10-22). The record names the build that started the VM
+/// ([`crate::ENGINE_BUILD`]), and only another build is refused: the same
+/// release installed as two files (a CLI's embedded engine and an SDK's cached
+/// one) is one build. A record from an engine that did not record its build
+/// falls back to comparing the process's executable with the one this engine
+/// boots VMs with ([`super::manager::vm_boot_executable`], run as `_boot-vm`,
+/// which for an embedding SDK is its helper, not the host process); that
+/// fallback is Linux only, and a process or file it cannot read is not refused.
+fn source_runs_another_engine(record: &VmRecord) -> bool {
+    let Some(pid) = record.pid else {
+        return false;
+    };
+    match record.engine_build.as_deref() {
+        Some(build) => build != crate::ENGINE_BUILD,
+        None => process_runs_another_boot_binary(pid),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn process_runs_another_boot_binary(pid: i32) -> bool {
+    match super::manager::vm_boot_executable() {
+        Ok(boot) => process_runs_another_binary(pid, &boot),
+        Err(_) => false,
+    }
+}
+
+/// Whether process `pid` runs a file other than `binary`.
+#[cfg(target_os = "linux")]
+fn process_runs_another_binary(pid: i32, binary: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (
+        std::fs::metadata(format!("/proc/{pid}/exe")),
+        std::fs::metadata(binary),
+    ) {
+        (Ok(vm), Ok(own)) => (vm.dev(), vm.ino()) != (own.dev(), own.ino()),
+        _ => false,
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+fn process_runs_another_boot_binary(_pid: i32) -> bool {
+    false
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
+
+/// The depth at which a live branch is refused: reached only when flattening
+/// a chain past `MAX_FORK_DISK_CHAIN_DEPTH` has failed branch after branch.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HARD_FORK_DISK_CHAIN_DEPTH: usize = 2 * MAX_FORK_DISK_CHAIN_DEPTH;
+
+/// Every block disk a branch carries, as `(block id, role filename)`: the id
+/// libkrun pivots the running device by, and the `.raw` name its image is
+/// resolved from. A disk the machine does not have is skipped by whoever
+/// walks this, so a machine without a cache disk branches as before.
+const FORK_DISK_ROLES: [(&str, &str); 3] = [
+    ("storage", crate::data::storage::STORAGE_DISK_FILENAME),
+    ("overlay", crate::data::storage::OVERLAY_DISK_FILENAME),
+    (
+        crate::agent::launcher::CACHE_BLOCK_ID,
+        crate::data::storage::CACHE_DISK_FILENAME,
+    ),
+];
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn qcow2_backing_depth(path: &Path) -> Result<usize> {
@@ -982,9 +1374,50 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
         depth = depth
             .checked_add(1)
             .ok_or_else(|| Error::agent("inspect fork disk chain", "backing depth overflow"))?;
-        if depth > MAX_FORK_DISK_CHAIN_DEPTH {
-            return Ok(depth);
+        if depth > 4 * MAX_FORK_DISK_CHAIN_DEPTH {
+            return Err(Error::agent(
+                "inspect fork disk chain",
+                "backing chain exceeds inspection limit",
+            ));
         }
+    }
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn disk_chain_depth_at(directory: &Path) -> Result<Option<usize>> {
+    let mut maximum = None;
+    for (_, raw) in FORK_DISK_ROLES {
+        let (disk, format) = resolve_disk_image(directory, raw);
+        if !disk
+            .try_exists()
+            .map_err(|error| Error::agent("inspect fork disk chain", error.to_string()))?
+        {
+            continue;
+        }
+        let depth = match format {
+            crate::data::disk::DiskFormat::Raw => 0,
+            crate::data::disk::DiskFormat::Qcow2 => qcow2_backing_depth(&disk)?,
+        };
+        maximum = Some(maximum.unwrap_or(0).max(depth));
+    }
+    Ok(maximum)
+}
+
+pub(crate) fn disk_chain_depth(name: &str) -> Option<usize> {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        match disk_chain_depth_at(&vm_data_dir(name)) {
+            Ok(depth) => depth,
+            Err(error) => {
+                tracing::debug!(%name, %error, "could not measure disk backing depth");
+                None
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = name;
+        None
     }
 }
 
@@ -1065,7 +1498,7 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
     })?;
     let mut relocated = relocated_top.to_path_buf();
     let mut seen = HashSet::new();
-    for _ in 0..MAX_FORK_DISK_CHAIN_DEPTH {
+    for _ in 0..4 * MAX_FORK_DISK_CHAIN_DEPTH {
         if !seen.insert(source.clone()) {
             return Err(Error::agent(
                 "stage fork disk backing",
@@ -1148,33 +1581,41 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
     Err(Error::agent(
         "stage fork disk backing",
         format!(
-            "{} exceeds the safe backing depth of {MAX_FORK_DISK_CHAIN_DEPTH}",
+            "{} exceeds the backing depth a chain can be inspected to",
             source_top.display()
         ),
     ))
 }
 
+/// Refuse a live branch only when compaction has kept failing. A chain past
+/// `MAX_FORK_DISK_CHAIN_DEPTH` that nothing beneath the active disk could fold
+/// (a machine branched from frozen sources before they were kept short) still
+/// branches: the branch turns the active disk into a generation this machine
+/// owns, and that generation is flattened as soon as the branch commits. Only
+/// a chain twice as deep, which takes that flatten failing many times over,
+/// is refused.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
-    for raw in [
-        crate::data::storage::STORAGE_DISK_FILENAME,
-        crate::data::storage::OVERLAY_DISK_FILENAME,
-    ] {
+    for (_, raw) in FORK_DISK_ROLES {
         let (disk, format) = resolve_disk_image(gdir, raw);
         if !disk.is_file() || format != crate::data::disk::DiskFormat::Qcow2 {
             continue;
         }
         let depth = qcow2_backing_depth(&disk)?;
-        if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
-            return Err(Error::agent(
+        if depth >= HARD_FORK_DISK_CHAIN_DEPTH {
+            // A limit the caller clears by packing the machine, not a fault.
+            return Err(Error::agent_conflict(
                 "fork-continue",
                 format!(
-                    "{} already has {depth} qcow2 backing layers; the safe limit is \
-                     {MAX_FORK_DISK_CHAIN_DEPTH}. Stop and pack this machine into a new root \
-                     before creating another live fork",
+                    "{} already has {depth} qcow2 backing layers and flattening could not \
+                     shorten it; the limit is {HARD_FORK_DISK_CHAIN_DEPTH}. Stop and pack this \
+                     machine into a new root before creating another live fork",
                     disk.display()
                 ),
             ));
+        }
+        if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
+            tracing::warn!(disk = %disk.display(), depth, "branching a deep disk chain; its new generation is flattened once the branch commits");
         }
     }
     Ok(())
@@ -1219,6 +1660,10 @@ fn rollback_uncommitted_disk_generation(gdir: &Path, snapshot_dir: &Path) -> Res
             crate::data::storage::OVERLAY_DISK_FILENAME => {
                 (crate::data::storage::OVERLAY_DISK_FILENAME, "overlay")
             }
+            crate::data::storage::CACHE_DISK_FILENAME => (
+                crate::data::storage::CACHE_DISK_FILENAME,
+                crate::agent::launcher::CACHE_BLOCK_ID,
+            ),
             _ => {
                 return Err(Error::agent(
                     "recover disk generation",
@@ -1468,6 +1913,31 @@ fn fork_lineage_memory_budget(
     })
 }
 
+/// Compute the complete live-growth budget while the caller holds the source
+/// lock. Old generations are conservatively charged at the new guest size;
+/// never omit their allowance when raising a branch source's usable RAM.
+#[cfg(target_os = "linux")]
+pub(crate) fn live_resize_memory_budget(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    target_mib: u32,
+) -> Result<crate::process::VmmMemoryBudget> {
+    let retained = db.retained_fork_snapshot(name)?;
+    let generations = referenced_fork_generation_count(
+        db,
+        name,
+        &vm_data_dir(name).join("s"),
+        retained.as_ref(),
+    )?;
+    let mut target = record.clone();
+    target.mem = target_mib;
+    fork_lineage_memory_budget(
+        &target,
+        generations + u64::from(source_has_private_ram_backing(record)),
+    )
+}
+
 #[cfg(target_os = "linux")]
 fn source_has_private_ram_backing(record: &VmRecord) -> bool {
     record.pid_start_time.is_some() && record.fork_lineage_pid_start_time == record.pid_start_time
@@ -1485,6 +1955,19 @@ fn set_fork_lineage_memory_limit(
     if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
         return Ok(false);
     }
+    let reply = control_socket_cmd_with_timeout(
+        &control_socket_path(golden),
+        "SAVE_STATUS",
+        std::time::Duration::from_secs(2),
+    )?;
+    let pending = checkpoint_memory_units(&reply)?;
+    // The query must not lend a replacement process the previous VM's budget.
+    if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
+        return Ok(false);
+    }
+    let generations = generations
+        .checked_add(pending)
+        .ok_or_else(|| Error::agent("checkpoint memory accounting", "RAM unit count overflow"))?;
     let budget = fork_lineage_memory_budget(record, generations)?;
     let limit = budget.max_bytes;
     let updated =
@@ -1493,6 +1976,21 @@ fn set_fork_lineage_memory_limit(
         tracing::debug!(%golden, generations, memory_max_bytes = limit, "sized live-branch lineage cgroup");
     }
     Ok(updated)
+}
+
+#[cfg(target_os = "linux")]
+fn checkpoint_memory_units(reply: &str) -> Result<u64> {
+    match reply.trim() {
+        "OK memory_released" => Ok(0),
+        "OK preparing" | "OK ready" | "OK finishing" => Ok(1),
+        // Older runtimes cannot release the source lock during streamed packing.
+        // Their existing serialized capture path still owns the reservation.
+        "ERR EINVAL unknown command" | "ERR EINVAL snapshot dir required" => Ok(0),
+        other => Err(Error::agent(
+            "checkpoint memory accounting",
+            format!("runtime ownership is unknown; refusing to resize memory: {other}"),
+        )),
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -1524,6 +2022,7 @@ pub(crate) struct ForkLineageMemoryReservation {
     previous_ram_units: u64,
     source_rebased: bool,
     managed: bool,
+    source_released: bool,
 }
 
 #[cfg(target_os = "linux")]
@@ -1558,6 +2057,13 @@ impl ForkLineageMemoryReservation {
         Ok(())
     }
 
+    /// The runtime owns the pending-memory record while output runs. Future
+    /// branch/resizing operations include it via SAVE_STATUS. Drop must now
+    /// reconcile the current lineage, not the pre-capture generation count.
+    pub(crate) fn allow_concurrent_branches(&mut self) {
+        self.source_released = true;
+    }
+
     fn reserve(
         golden: &str,
         record: &VmRecord,
@@ -1584,6 +2090,7 @@ impl ForkLineageMemoryReservation {
             previous_ram_units,
             source_rebased: false,
             managed,
+            source_released: false,
         })
     }
 
@@ -1596,6 +2103,32 @@ impl ForkLineageMemoryReservation {
 impl Drop for ForkLineageMemoryReservation {
     fn drop(&mut self) {
         if !self.managed {
+            return;
+        }
+        if self.source_released {
+            let result = (|| -> Result<()> {
+                let _lock = lock_fork_source(&self.golden)?;
+                let db = SmolvmDb::open()?;
+                let Some(record) = db.get_vm(&self.golden)? else {
+                    return Ok(());
+                };
+                if record.pid != self.record.pid
+                    || record.pid_start_time != self.record.pid_start_time
+                {
+                    return Ok(());
+                }
+                let retained = db.retained_fork_snapshot(&self.golden)?;
+                reconcile_fork_lineage_memory_limit(
+                    &db,
+                    &self.golden,
+                    &record,
+                    &vm_data_dir(&self.golden).join("s"),
+                    retained.as_ref(),
+                )
+            })();
+            if let Err(error) = result {
+                tracing::warn!(golden = %self.golden, %error, "retaining checkpoint memory allowance until ownership can be reconciled");
+            }
             return;
         }
         // A published commit marker means the new generation really can retain
@@ -1632,10 +2165,24 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
     if record.is_none() {
         return Ok(());
     }
+    #[cfg(target_os = "macos")]
+    if let Err(error) = release_shared_layers_after_child_delete(db, parent) {
+        tracing::warn!(%parent, %error, "could not release shared layers volume");
+    }
     let snapshot_root = vm_data_dir(parent).join("s");
     let retained = db.retained_fork_snapshot(parent)?;
     #[cfg(any(target_os = "linux", target_os = "macos"))]
     gc_unreferenced_fork_generations(db, parent, &snapshot_root, retained.as_ref())?;
+    // The child's disk chain is gone too, so the parent's disk layers only it
+    // read can go, now that the snapshots it pinned have been collected above.
+    let machine_dirs: Vec<PathBuf> = db
+        .list_vms()?
+        .into_iter()
+        .map(|(name, _)| vm_data_dir(&name))
+        .collect();
+    if let Err(error) = compact::collect_unreachable_layers(&vm_data_dir(parent), &machine_dirs) {
+        tracing::warn!(%parent, %error, "could not collect unreachable branch disk layers");
+    }
     #[cfg(target_os = "linux")]
     reconcile_fork_lineage_memory_limit(
         db,
@@ -1650,6 +2197,36 @@ pub fn collect_parent_generations_after_child_delete(db: &SmolvmDb, parent: &str
 #[doc(hidden)]
 #[cfg(not(any(target_os = "linux", target_os = "macos")))]
 pub fn collect_parent_generations_after_child_delete(_db: &SmolvmDb, _parent: &str) -> Result<()> {
+    Ok(())
+}
+
+/// A deleted child linked its `pack` dir to the macOS layers volume of the
+/// machine at the root of its fork chain. Stopping that machine kept the volume
+/// mounted for its children, so once the last one is gone and the owner is not
+/// running, nothing else would unmount it until the owner's next stop/delete.
+#[cfg(target_os = "macos")]
+fn release_shared_layers_after_child_delete(db: &SmolvmDb, parent: &str) -> Result<()> {
+    let mut owner = parent.to_string();
+    let mut seen = HashSet::new();
+    while seen.insert(owner.clone()) {
+        let Some(record) = db.get_vm(&owner)? else {
+            return Ok(());
+        };
+        let layers = crate::agent::machine_layers_cache_dir(&owner);
+        let linked = layers
+            .symlink_metadata()
+            .is_ok_and(|metadata| metadata.file_type().is_symlink());
+        if !linked {
+            if record.source_smolmachine.is_some() && !record.is_process_alive() {
+                smolvm_pack::extract::release_unused_machine_layers_volume(&layers);
+            }
+            return Ok(());
+        }
+        let Some(golden) = record.golden else {
+            return Ok(());
+        };
+        owner = golden;
+    }
     Ok(())
 }
 
@@ -1703,6 +2280,7 @@ fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk
             crate::data::storage::OVERLAY_DISK_FILENAME => {
                 crate::data::storage::OVERLAY_DISK_FILENAME
             }
+            crate::data::storage::CACHE_DISK_FILENAME => crate::data::storage::CACHE_DISK_FILENAME,
             _ => {
                 return Err(Error::agent(
                     "read generation disk manifest",
@@ -1743,6 +2321,35 @@ fn read_generation_fork_disks(snapshot_dir: &Path) -> Result<Option<Vec<ForkDisk
     Ok(Some(disks))
 }
 
+/// How long a guest `sync` may take before a capture or branch gives up.
+///
+/// `sync` sleeps in the kernel until the guest's dirty pages reach its disks,
+/// so the agent cannot kill it or answer early. Its time is the host disk's
+/// time: a second normally, minutes when many machines on the worker are
+/// capturing or restoring at once. Giving up there fails a capture that would
+/// have succeeded, so the limit only catches a guest whose disk is wedged.
+const SYNC_FORK_SOURCE_TIMEOUT: Duration = Duration::from_secs(300);
+
+/// Keep a source's staged mounts on its branch without their host binding.
+///
+/// The branch's cloned storage disk already holds the working copies; keeping
+/// the mounts recorded makes a restart find and keep them instead of pruning
+/// them as stale. What a branch must not do is synchronize them back: the host
+/// directories are the source's, and two descendants writing one tree would
+/// interleave their changes. `staged_mounts_detached_from` names the machine
+/// that still may, through every generation of branches.
+pub(crate) fn detach_staged_mounts(clone_rec: &mut VmRecord, golden: &str, golden_rec: &VmRecord) {
+    if golden_rec.staged_mounts.is_empty() {
+        return;
+    }
+    clone_rec.staged_mounts_detached_from = Some(
+        golden_rec
+            .staged_mounts_detached_from
+            .clone()
+            .unwrap_or_else(|| golden.to_string()),
+    );
+}
+
 /// Flush guest filesystems before capturing a new live checkpoint.
 ///
 /// A branch sees dirty guest page-cache state through the RAM snapshot, but a
@@ -1760,7 +2367,7 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
         vec!["/bin/sync".to_string()],
         Vec::new(),
         None,
-        Some(Duration::from_secs(30)),
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
         None,
     ) {
         Ok((0, _, _)) => Ok(()),
@@ -1773,6 +2380,60 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
         )),
         Err(error) => Err(Error::agent("sync fork source", error.to_string())),
     }
+}
+
+/// Selects one mount point per writable virtio disk from `/proc/mounts`; a disk
+/// mounted twice is trimmed once.
+const WRITABLE_GUEST_DISKS: &str =
+    r#"$1 ~ "^/dev/vd" && $4 ~ /(^|,)rw(,|$)/ && !seen[$1]++ { print $2 }"#;
+
+/// Tell the guest's writable disks which blocks its filesystems no longer use.
+///
+/// A deleted file's blocks stay written in the host's disk image until the
+/// guest discards them, so a checkpoint would save them and the host would keep
+/// the space. A trim punches them out of the image, which the capture then
+/// skips as holes. Best effort: an older agent or a disk without discard just
+/// keeps its blocks.
+pub fn trim_guest_disks(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "awk '{WRITABLE_GUEST_DISKS}' /proc/mounts | \
+                 while read -r mount; do fstrim \"$mount\"; done"
+            ),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
+}
+
+/// Join the guest's scattered free pages into the large blocks free page
+/// hinting can hand over. Best effort: an older agent or a kernel without
+/// compaction just leaves memory as it is.
+pub fn compact_guest_memory(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo 1 > /proc/sys/vm/compact_memory".to_string(),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
 }
 
 /// Release the workload restored in `clone` after its identity and per-fork
@@ -1881,6 +2542,10 @@ pub struct PreparedFork {
     /// caller to log. Empty when the golden has no forwards. When ports were
     /// pinned, `golden_host == clone_host`.
     pub port_remaps: Vec<(u16, u16, u16)>,
+    /// The same for UDP forwards, which are always remapped.
+    pub udp_port_remaps: Vec<(u16, u16, u16)>,
+    /// Whether the source resumed after this checkpoint.
+    pub source_continues: bool,
 }
 
 /// A checkpoint that may be reused by a frozen source or an explicit pool
@@ -1920,6 +2585,8 @@ pub struct ForkSpec<'a> {
     /// Keep the restored workload parked at its inherited forkpoint until a
     /// later assignment explicitly releases it.
     pub hold: bool,
+    /// Labels set on the clone over the ones it inherits from the golden.
+    pub labels: &'a [(String, String)],
 }
 
 /// Freeze a running, forkable `golden`, snapshot it, register `clone` in the DB
@@ -1931,6 +2598,7 @@ pub struct ForkSpec<'a> {
 /// On any failure after the clone record is inserted, the record and its data
 /// directory are cleaned up before returning the error, so a failed fork leaves
 /// no half-registered clone behind.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_fork(
     db: &SmolvmDb,
     golden: &str,
@@ -1939,6 +2607,8 @@ pub fn prepare_fork(
     clone_forkable: bool,
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    labels: &[(String, String)],
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
         db,
@@ -1950,13 +2620,16 @@ pub fn prepare_fork(
             fork_env,
             fork_secrets,
             hold: false,
+            labels,
         }],
+        source_policy,
     )?;
     Ok(prepared.remove(0))
 }
 
 /// Prepare one clean clone that remains parked at the inherited forkpoint.
 /// Held slots are deliberately non-forkable and one-shot.
+#[allow(clippy::too_many_arguments)]
 pub fn prepare_held_fork(
     db: &SmolvmDb,
     golden: &str,
@@ -1964,6 +2637,8 @@ pub fn prepare_held_fork(
     pinned_ports: &[(u16, u16)],
     fork_env: &[(String, String)],
     fork_secrets: &BTreeMap<String, crate::secrets::SecretRef>,
+    labels: &[(String, String)],
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedFork> {
     let mut prepared = prepare_forks(
         db,
@@ -1975,16 +2650,29 @@ pub fn prepare_held_fork(
             fork_env,
             fork_secrets,
             hold: true,
+            labels,
         }],
+        source_policy,
     )?;
     Ok(prepared.remove(0))
+}
+
+/// A clone starts with the golden's labels; a label given at branch time
+/// replaces the inherited value of the same key.
+pub(crate) fn apply_clone_labels(
+    labels: &mut std::collections::BTreeMap<String, String>,
+    overrides: &[(String, String)],
+) {
+    for (key, value) in overrides {
+        labels.insert(key.clone(), value.clone());
+    }
 }
 
 /// Capture one golden generation and prepare every requested clone from it.
 /// Preparation is transactional: if any clone fails, all clone records and
 /// disks created by this call are removed.
 ///
-/// Linux/x86_64 and macOS resume the source after atomically rotating its
+/// Linux and macOS resume the source after atomically rotating its
 /// writable disks; other hosts retain the source in its paused copy-on-write
 /// state. A later direct fork captures current state; explicit pool
 /// replenishment can reuse its retained generation.
@@ -1992,11 +2680,21 @@ pub fn prepare_forks(
     db: &SmolvmDb,
     golden: &str,
     specs: &[ForkSpec<'_>],
+    source_policy: ForkSourcePolicy,
 ) -> Result<Vec<PreparedFork>> {
     let retained = db
         .retained_fork_snapshot(golden)
         .map_err(|error| Error::agent("read retained fork checkpoint", error.to_string()))?;
-    Ok(prepare_forks_reusing(db, golden, specs, retained.as_ref(), true, false)?.forks)
+    Ok(prepare_forks_reusing(
+        db,
+        golden,
+        specs,
+        retained.as_ref(),
+        true,
+        false,
+        source_policy,
+    )?
+    .forks)
 }
 
 /// Prepare a batch, optionally reusing a proven checkpoint that still belongs
@@ -2009,14 +2707,23 @@ pub(crate) fn prepare_forks_reusing(
     retained: Option<&RetainedForkSnapshot>,
     persist_snapshot: bool,
     reuse_live_snapshot: bool,
+    source_policy: ForkSourcePolicy,
 ) -> Result<PreparedForkBatch> {
+    #[cfg(target_os = "windows")]
+    if source_policy != ForkSourcePolicy::Freeze {
+        return Err(Error::config(
+            "branch",
+            "Windows currently requires --freeze-source; source continuation after a branch is not implemented",
+        ));
+    }
     let preparation_started = std::time::Instant::now();
+    db.require_completed_resize(golden)?;
     if specs.is_empty() {
         return Err(Error::config("fork", "at least one clone is required"));
     }
 
     let mut names = HashSet::with_capacity(specs.len());
-    let mut reserved_ports = HashSet::new();
+    let mut reserved_ports = ReservedPorts::default();
     for spec in specs {
         validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
         validate_fork_env(spec.fork_env)?;
@@ -2039,7 +2746,7 @@ pub(crate) fn prepare_forks_reusing(
             ));
         }
         for (host, _) in spec.pinned_ports {
-            if !reserved_ports.insert(*host) {
+            if !reserved_ports.tcp.insert(*host) {
                 return Err(Error::config(
                     "fork",
                     format!("host port {host} is assigned to more than one clone"),
@@ -2048,16 +2755,31 @@ pub(crate) fn prepare_forks_reusing(
         }
     }
 
+    // Reserve every port the engine has already handed out, including the
+    // golden's own. Clone ports are auto-allocated below, and the allocator
+    // only probes whether a port is listening *right now* - which a stopped
+    // machine is not, even though it still owns its port. Without this, a
+    // clone can be given a stopped machine's port and that machine then fails
+    // to bind when it restarts.
+    let recorded = db.list_vms()?;
+    reserve_recorded_host_ports(
+        recorded.iter().map(|(_, record)| record.ports.as_slice()),
+        &mut reserved_ports.tcp,
+    );
+    reserve_recorded_host_ports(
+        recorded
+            .iter()
+            .map(|(_, record)| record.udp_ports.as_slice()),
+        &mut reserved_ports.udp,
+    );
+
     let golden_rec = db
         .get_vm(golden)?
         .ok_or_else(|| Error::vm_not_found(golden))?;
     #[cfg(target_os = "linux")]
     let mut golden_rec = golden_rec;
-    if !golden_rec.staged_mounts.is_empty() {
-        return Err(Error::config(
-            "fork",
-            "staged mounts cannot be branched yet because multiple descendants would synchronize into the same host directory; use a live rw mount or remove the staged mount first",
-        ));
+    for spec in specs {
+        check_pinned_ports_keep_network_backend(golden, &golden_rec, spec.pinned_ports)?;
     }
     let child_depth = db
         .fork_lineage_depth(golden)?
@@ -2075,6 +2797,16 @@ pub(crate) fn prepare_forks_reusing(
         return Err(Error::agent(
             "fork",
             "CUDA fork descendants are not supported yet; create a leaf clone without `forkable`",
+        ));
+    }
+    if source_runs_another_engine(&golden_rec) {
+        // A caller-fixable refusal: a restart puts the source on this engine.
+        return Err(Error::agent_conflict(
+            "fork",
+            format!(
+                "machine '{golden}' was started by a different smolvm engine than this server runs \
+                 (the server was upgraded since); restart it (stop, then start) to branch it"
+            ),
         ));
     }
     let ctl = control_socket_path(golden);
@@ -2098,7 +2830,7 @@ pub(crate) fn prepare_forks_reusing(
     }
     let golden_was_paused = fork_base_already_paused(&status);
     tracing::info!(%golden, phase = "source_ready", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
-    let fork_continue = fork_continue_enabled();
+    let fork_continue = source_policy.continues();
     let userfaultfd_available = kernel_fault_userfaultfd_available();
     let requested_ram_mode = std::env::var("SMOLVM_BRANCH_RAM_MODE").ok();
     let live_ram_mode = fork_continue
@@ -2118,8 +2850,10 @@ pub(crate) fn prepare_forks_reusing(
     if fork_continue && !golden_was_paused {
         recover_uncommitted_generations(db, golden, &gdir, &snapshot_root)?;
     }
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    compact::compact_if_near_limit(&gdir, None)?;
     let reusable = retained.filter(|snapshot| {
-        (golden_was_paused || reuse_live_snapshot)
+        policy_allows_snapshot_reuse(source_policy, golden_was_paused, reuse_live_snapshot)
             && retained_snapshot_is_reusable(
                 &golden_rec,
                 golden_was_paused,
@@ -2265,8 +2999,8 @@ pub(crate) fn prepare_forks_reusing(
 
         let t_snap = std::time::Instant::now();
         tracing::info!(%golden, phase = "memory_reserved", elapsed_ms = preparation_started.elapsed().as_millis() as u64, "fork preparation progress");
-        // Active children map one sparse materialized memfd generation so CPU-
-        // and I/O-heavy work never serializes behind page-by-page delivery.
+        // Active children map one shared immutable generation so CPU- and
+        // I/O-heavy work never serializes behind page-by-page delivery.
         // Held pool slots use the same shared generation because they may run a
         // dense workload as soon as they are leased. The environment override
         // remains an operator and debugging escape hatch.
@@ -2278,7 +3012,11 @@ pub(crate) fn prepare_forks_reusing(
         } else {
             "FORK"
         };
-        let reply = control_socket_cmd(&ctl, &format!("{fork_verb} {}", snapshot_dir.display()));
+        let reply = control_socket_cmd_with_timeout(
+            &ctl,
+            &format!("{fork_verb} {}", snapshot_dir.display()),
+            fork_capture_timeout(golden_rec.mem),
+        );
         if fork_continue && forkpoint_armed {
             if let Err(error) = park_forkpoint_after_capture(golden) {
                 tracing::warn!(%golden, %error, "continued source did not park after capture");
@@ -2334,6 +3072,36 @@ pub(crate) fn prepare_forks_reusing(
             response = %reply,
             "fork: golden RAM checkpoint written"
         );
+        // The generation this branch made is immutable now that the source
+        // runs on its new overlay. A chain still past the limit (nothing below
+        // the old active disk could be folded) is flattened through it before
+        // any clone opens it. A failure leaves a deep but valid chain.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if fork_continue_snapshot(&snapshot_dir) {
+            if let Err(error) =
+                compact::compact_if_deeper_than(&gdir, vm_ids, MAX_FORK_DISK_CHAIN_DEPTH)
+            {
+                tracing::warn!(%golden, %error, "could not flatten a deep disk chain after branching");
+            }
+        }
+        // Clones restore the golden's guest, so they need the packed-layer DAX
+        // window it booted with. Without a record they use the legacy window.
+        if let Some(window) =
+            golden_rec
+                .pid
+                .zip(golden_rec.pid_start_time)
+                .and_then(|(pid, start)| {
+                    super::virtiofs::running_window(
+                        &crate::agent::vm_data_dir(golden),
+                        pid as u32,
+                        start,
+                    )
+                })
+        {
+            if let Err(error) = super::virtiofs::record_snapshot_window(&snapshot_dir, window) {
+                tracing::warn!(%golden, %error, "could not record the snapshot DAX window; clones use the legacy window");
+            }
+        }
         (snapshot_dir, false)
     };
 
@@ -2570,7 +3338,7 @@ fn prepare_clone_from_snapshot(
     golden_dir: &Path,
     snapshot_dir: &Path,
     spec: &ForkSpec<'_>,
-    reserved_ports: &mut HashSet<u16>,
+    reserved_ports: &mut ReservedPorts,
 ) -> Result<PreparedFork> {
     let clone = spec.clone;
     let clone_dir = vm_data_dir(clone);
@@ -2613,6 +3381,9 @@ fn prepare_clone_from_snapshot(
         clone_rec.state = crate::config::RecordState::Created;
         clone_rec.pid = None;
         clone_rec.pid_start_time = None;
+        // The clone is a new machine: report when it was created, not when its
+        // source was, so age-based cleanup never mistakes it for an old one.
+        clone_rec.created_at = crate::util::current_timestamp();
         if !spec.fork_env.is_empty() {
             clone_rec
                 .env
@@ -2622,7 +3393,10 @@ fn prepare_clone_from_snapshot(
         for (key, secret) in spec.fork_secrets {
             clone_rec.secret_refs.insert(key.clone(), secret.clone());
         }
+        apply_clone_labels(&mut clone_rec.labels, spec.labels);
 
+        // Ports the source's run picked for itself stay with that run.
+        clone_rec.allocated_ports.clear();
         let mut port_remaps = Vec::new();
         if !spec.pinned_ports.is_empty() {
             clone_rec.ports = spec.pinned_ports.to_vec();
@@ -2632,7 +3406,7 @@ fn prepare_clone_from_snapshot(
         } else if !clone_rec.ports.is_empty() {
             let mut remapped = Vec::with_capacity(clone_rec.ports.len());
             for (golden_host, guest) in &clone_rec.ports {
-                match alloc_free_host_port_excluding(reserved_ports) {
+                match alloc_free_host_port_excluding(&mut reserved_ports.tcp) {
                     Some(host) => {
                         port_remaps.push((*golden_host, *guest, host));
                         remapped.push((host, *guest));
@@ -2645,6 +3419,25 @@ fn prepare_clone_from_snapshot(
             }
             clone_rec.ports = remapped;
         }
+        // The source keeps its UDP host ports, so a child always gets fresh ones
+        // (branch pins name TCP ports only).
+        let mut udp_port_remaps = Vec::new();
+        if !clone_rec.udp_ports.is_empty() {
+            let mut remapped = Vec::with_capacity(clone_rec.udp_ports.len());
+            for (golden_host, guest) in &clone_rec.udp_ports {
+                match alloc_free_udp_host_port_excluding(&mut reserved_ports.udp) {
+                    Some(host) => {
+                        udp_port_remaps.push((*golden_host, *guest, host));
+                        remapped.push((host, *guest));
+                    }
+                    None => tracing::warn!(
+                        guest,
+                        "could not allocate a host UDP port for fork clone; dropping forward"
+                    ),
+                }
+            }
+            clone_rec.udp_ports = remapped;
+        }
         clone_rec.fork_overlay_owner = Some(
             golden_rec
                 .fork_overlay_owner
@@ -2654,11 +3447,13 @@ fn prepare_clone_from_snapshot(
                 .to_string(),
         );
         clone_rec.golden = Some(golden.to_string());
+        detach_staged_mounts(&mut clone_rec, golden, golden_rec);
         clone_rec.fork_generation = snapshot_generation_id(snapshot_dir).map(str::to_string);
         clone_rec.fork_lineage_pid_start_time = None;
-        // Forkability is explicit per clone. A normal clone remains a cheap
-        // leaf; a forkable clone materializes its restored RAM into fresh
-        // backing files at boot so it can later checkpoint its own state.
+        // Forkability is explicit per clone. Either way the clone is a
+        // copy-on-write view of its source's generation; a forkable clone
+        // additionally gets a control socket, and branching it later captures
+        // only the pages it has written since.
         clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();
@@ -2675,6 +3470,8 @@ fn prepare_clone_from_snapshot(
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
+            udp_port_remaps,
+            source_continues: fork_continue_snapshot(snapshot_dir),
         })
     })();
 
@@ -2687,14 +3484,15 @@ fn prepare_clone_from_snapshot(
 
 /// Give the clone its own disks. The source's block workers were quiesced and
 /// flushed at the checkpoint boundary, so the generation is a consistent
-/// backing even when the source has resumed. On Linux each
+/// backing even when the source has resumed. On Linux and Windows each
 /// disk is a qcow2 copy-on-write overlay over the golden's — filesystem
 /// independent, so the overlay starts near-empty and the fork is O(metadata)
-/// regardless of how much data the golden holds. macOS clonefiles the disks
-/// (APFS CoW). Either way the `.formatted` marker is copied so the clone never
-/// reformats and wipes the inherited filesystem.
+/// regardless of how much data the golden holds. Windows keeps the source
+/// frozen; macOS clonefiles the disks (APFS CoW). Either way the `.formatted`
+/// marker is copied so the clone never reformats and wipes the inherited
+/// filesystem.
 fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Result<()> {
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    #[cfg(target_os = "windows")]
     let _ = snapshot_dir;
     // The golden's actual disks that exist, resolved by file presence (`.qcow2`
     // if the golden is itself a clone, else `.raw`) — the same single source of
@@ -2702,24 +3500,43 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
     // filename (for naming the clone's disk) with the golden's real backing file
     // and its format.
     let fallback_disks = || -> Vec<ForkDisk> {
-        [
-            crate::data::storage::STORAGE_DISK_FILENAME,
-            crate::data::storage::OVERLAY_DISK_FILENAME,
-        ]
-        .into_iter()
-        .map(|raw| {
-            let (src, fmt) = resolve_disk_image(gdir, raw);
-            (raw, src, fmt)
-        })
-        .filter(|(_, src, _)| src.exists())
-        .collect()
+        FORK_DISK_ROLES
+            .into_iter()
+            .map(|(_, raw)| raw)
+            .map(|raw| {
+                let (src, fmt) = resolve_disk_image(gdir, raw);
+                (raw, src, fmt)
+            })
+            .filter(|(_, src, _)| src.exists())
+            .collect()
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let disks = read_generation_fork_disks(snapshot_dir)?.unwrap_or_else(fallback_disks);
+    let (disks, _gc_guards) = match read_generation_fork_disks(snapshot_dir)? {
+        Some(disks) => (disks, Vec::new()),
+        // A frozen source's active disks are the clone's base. Nothing may
+        // replace them while branches read them, so a base whose chain has
+        // grown deep is swapped for a short one before the clone stacks on it.
+        None => {
+            let mut guards = Vec::new();
+            let mut disks = fallback_disks();
+            for (raw, src, format) in &mut disks {
+                if *format != crate::data::disk::DiskFormat::Qcow2 {
+                    continue;
+                }
+                let Some((id, _)) = FORK_DISK_ROLES.iter().find(|(_, role)| role == raw) else {
+                    continue;
+                };
+                let (base, guard) = compact::shallow_clone_base(gdir, id, src)?;
+                *src = base;
+                guards.extend(guard);
+            }
+            (disks, guards)
+        }
+    };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let disks = fallback_disks();
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "windows"))]
     {
         // Each clone disk is a qcow2 CoW overlay over the golden's disk. Build
         // all overlay specs first so libkrun is loaded once for the batch
@@ -2756,8 +3573,24 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
                     clone_dir.join(Path::new(raw).with_extension("qcow2"))
                 }
             };
-            crate::disk_utils::clone_or_copy_file(src, &dst)
-                .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+            // A restored checkpoint's disk names its lower layer relative to
+            // its own directory, so a copy in the clone's directory could not
+            // open it. Layer the clone over it with an absolute path instead.
+            let relative_backing = matches!(format, crate::data::disk::DiskFormat::Qcow2)
+                && qcow2_backing_name(src)?.is_some_and(|backing| backing.is_relative());
+            if relative_backing {
+                let base = src
+                    .canonicalize()
+                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+                crate::agent::create_disk_overlays(&[(
+                    dst,
+                    base,
+                    crate::data::disk::DiskFormat::Qcow2,
+                )])?;
+            } else {
+                crate::disk_utils::clone_or_copy_file(src, &dst)
+                    .map_err(|e| Error::agent("clone disk", format!("{}: {e}", src.display())))?;
+            }
             let marker = Path::new(raw).with_extension("formatted");
             let src_marker = gdir.join(&marker);
             if src_marker.exists() {
@@ -2765,17 +3598,6 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
             }
         }
     }
-    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
-    {
-        // Fork-clone disk overlays rely on libkrun's qcow2 overlay (Linux) or
-        // APFS clonefile (macOS); neither is wired up on Windows.
-        let _ = (&disks, clone_dir);
-        return Err(Error::agent(
-            "clone disk",
-            "live fork is not supported on this platform",
-        ));
-    }
-    #[allow(unreachable_code)]
     Ok(())
 }
 
@@ -2784,6 +3606,113 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
 /// agent's boot; these extra attempts cover a momentarily-busy agent whose
 /// `vm_exec` errors or exits non-zero transiently.
 const REJUVENATE_ATTEMPTS: usize = 3;
+
+/// How long one re-mint may run. The agent enforces it: a VM exec runs in its
+/// own session and the whole group is killed at the deadline.
+///
+/// The script itself takes well under a second, but it writes files and
+/// generates SSH host keys, so on a worker whose disk is saturated (a burst of
+/// restores and captures) it can take tens of seconds. Killing it there turns a
+/// slow restore into a failed one, and on guests whose init cannot page its
+/// code back in, the reaped children reboot the VM. So the limit only catches
+/// a guest that is truly stuck.
+const REJUVENATE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// The re-mint runs as a plain shell, with nothing that outlives it.
+///
+/// It must never leave an orphan behind. An orphan is reparented to the
+/// guest's PID 1, libkrun's `init.krun`, and reaping it wakes init for the
+/// first time since boot. init's code is mapped from a one-shot virtio-fs
+/// entry that is gone once it has been exec'd (and, after a restore, is served
+/// by a different libkrun build), so in a guest whose memory pressure evicted
+/// those pages the wake-up faults with SIGBUS, init dies and the guest
+/// reboots. Wrapping the script in busybox `timeout` did exactly that: its
+/// watcher is a daemonized grandchild that outlives the script, so every
+/// branch and restore of such a guest rebooted a second after it resumed.
+fn rejuvenation_command(script: String) -> Vec<String> {
+    vec!["/bin/sh".into(), "-c".into(), script]
+}
+
+/// Mount the cache a restore put under a cache slot. The guest learns its slot
+/// from `SMOLVM_CACHE_DISK` in PID 1's boot environment, preserved in the
+/// restored RAM, so the host passes nothing. Does nothing for a machine with no
+/// slot or one already mounted, so it is safe on every restore.
+///
+/// The guest's boot partition scan may have cached blocks of the empty slot,
+/// so that device's buffers are flushed before the filesystem is read; the
+/// rest of the page cache is kept. The cache is mounted at
+/// the slot's staging path and guest path, then into the mount namespace of
+/// every container that was running when the checkpoint was taken, through
+/// the agent's own namespace helper so no tool from the image is needed.
+pub const CACHE_SLOT_MOUNT_SCRIPT: &str = r#"set -e
+spec=$(tr '\0' '\n' < /proc/1/environ | sed -n 's/^SMOLVM_CACHE_DISK=//p')
+case "$spec" in *:slot) ;; *) exit 0 ;; esac
+spec=${spec%:slot}
+dev=${spec%%:*}
+staging=/run/smolvm/virtiofs/smolvm_cache
+if grep -q " $staging ext4 " /proc/mounts; then exit 0; fi
+# Block majors are allocated at boot, so read the device's own numbers.
+majmin=$(cat "/sys/class/block/${dev#/dev/}/dev")
+major=${majmin%:*}
+minor=${majmin#*:}
+if [ ! -b "$dev" ]; then mknod "$dev" b "$major" "$minor"; fi
+# Drop only this device's cached blocks: the rest of the page cache is the
+# warm state the checkpoint was restored for.
+blockdev --flushbufs "$dev"
+magic=$(dd if="$dev" bs=1 skip=1080 count=2 2>/dev/null | od -An -tx1 | tr -d ' \n')
+if [ "$magic" != "53ef" ]; then
+  mkfs.ext4 -F -q -O ^has_journal -L smolvm-cache "$dev"
+fi
+mount -t ext4 -o noatime,nosuid,nodev "$dev" "$staging"
+path=${spec#*:}
+mount --bind "$staging" "$path"
+/usr/local/bin/smolvm-agent ns-file mount-cache-all "$path" "$major" "$minor"
+"#;
+
+/// Run [`CACHE_SLOT_MOUNT_SCRIPT`] in a restored machine.
+pub fn mount_cache_slot(name: &str) -> Result<()> {
+    let sock = vm_data_dir(name).join("agent.sock");
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| Error::agent("mount cache slot", format!("agent connect: {e}")))?;
+    match client.vm_exec(
+        rejuvenation_command(CACHE_SLOT_MOUNT_SCRIPT.to_string()),
+        vec![],
+        None,
+        Some(REJUVENATE_TIMEOUT),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, stdout, stderr)) => Err(Error::agent(
+            "mount cache slot",
+            format!(
+                "exited {code}: {} {}",
+                String::from_utf8_lossy(&stdout).trim(),
+                String::from_utf8_lossy(&stderr).trim()
+            ),
+        )),
+        Err(e) => Err(Error::agent("mount cache slot", e.to_string())),
+    }
+}
+
+// Called from the restore identity reset, before the restored marker is
+// published. The inherited container may keep running without another overlay
+// preparation, so the clone hostname must be mapped here as well.
+fn rejuvenation_hosts_script(root: &str, clone: &str) -> String {
+    format!(
+        "HOSTS='{root}/etc/hosts'; \
+         if [ -f \"$HOSTS\" ]; then \
+             if ! /usr/bin/awk -v host='{clone}' \
+                 '$1 !~ /^#/ {{ for (i=2; i<=NF; i++) {{ if ($i ~ /^#/) break; if ($i == host) found=1 }} }} END {{ exit !found }}' \
+                 \"$HOSTS\"; then \
+                 printf '\\n127.0.1.1\\t%s\\n' '{clone}' >> \"$HOSTS\" \
+                     || echo 'rejuvenate-stage=hosts-failed' >&2; \
+             fi; \
+         else \
+             printf '127.0.0.1\\tlocalhost\\n::1\\tlocalhost\\n127.0.1.1\\t%s\\n' '{clone}' > \"$HOSTS\" \
+                 || echo 'rejuvenate-stage=hosts-failed' >&2; \
+         fi"
+    )
+}
 
 /// Build the shell script that re-mints a clone's on-disk identity. Kept as a
 /// pure function of `(clone, seed, host_epoch)` so the security-critical
@@ -2815,6 +3744,7 @@ fn build_rejuvenation_script(
     seed: &str,
     host_epoch: u64,
     record: &VmRecord,
+    keep_machine_id: bool,
 ) -> String {
     // An image machine's identity files live in the workload container's
     // rootfs, NOT the VM rootfs the agent execs in — writing them unprefixed
@@ -2953,6 +3883,21 @@ fn build_rejuvenation_script(
     } else {
         "echo 'rejuvenate-stage=clock-skipped' >&2".to_string()
     };
+    let hosts_block = rejuvenation_hosts_script(&root, clone);
+    // `keep_machine_id` is the one opt-out of the fail-hard identity set: a
+    // same-tenant fan-out may keep the source's machine-id so per-machine caches
+    // keyed by it (Nx names its cache database after it) survive the fork. SSH
+    // host keys and the hostname are never kept.
+    let machine_id_block = if keep_machine_id {
+        "echo 'rejuvenate-stage=machine-id-kept' >&2; ".to_string()
+    } else {
+        format!(
+            "printf '%s\\n' \"$MID\" > {root}/etc/machine-id; \
+             if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
+                 printf '%s\\n' \"$MID\" > {root}/var/lib/dbus/machine-id; \
+             fi; "
+        )
+    };
     format!(
         "set -e; \
          echo 'rejuvenate-stage=overlay' >&2; \
@@ -2967,10 +3912,8 @@ fn build_rejuvenation_script(
          printf '%s' '{s}' > /dev/urandom 2>/dev/null || true; \
          MID=$(printf '%.32s' '{s}'); \
          printf '%s\\n' '{c}' > {root}/etc/hostname; \
-         printf '%s\\n' \"$MID\" > {root}/etc/machine-id; \
-         if [ -f {root}/var/lib/dbus/machine-id ] && [ ! -L {root}/var/lib/dbus/machine-id ]; then \
-             printf '%s\\n' \"$MID\" > {root}/var/lib/dbus/machine-id; \
-         fi; \
+         {hosts_block}; \
+         {machine_id_block}\
          {ssh_block}; \
          rm -rf {root}/var/lib/cloud/instance {root}/var/lib/cloud/instances/* {root}/var/lib/cloud/data/instance-id 2>/dev/null || true; \
          umask 077; \
@@ -2980,6 +3923,8 @@ fn build_rejuvenation_script(
         c = clone,
         s = seed,
         clock_block = clock_block,
+        hosts_block = hosts_block,
+        machine_id_block = machine_id_block,
         runtime_hostname = runtime_hostname,
         restored_container = restored_container,
         state_dir = smolvm_protocol::forkpoint::STATE_DIR,
@@ -3040,12 +3985,20 @@ fn clock_reset_failed(stderr: &[u8]) -> bool {
 /// (no `RNDADDENTROPY`/VMGENID yet) and does not re-address the network
 /// (MAC/IP; safe under the default TSI backend) — both are follow-ups.
 pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
+    rejuvenate_clone_with(clone, record, false)
+}
+
+/// [`rejuvenate_clone`] with the machine-id opt-out: `keep_machine_id` leaves
+/// `/etc/machine-id` (and the dbus copy) as the source's. Everything else
+/// (hostname, SSH host keys, cloud-init state, clock, RNG) is still re-minted
+/// and still fail-closed. Only for clones that stay within the source's tenant.
+pub fn rejuvenate_clone_with(clone: &str, record: &VmRecord, keep_machine_id: bool) -> Result<()> {
     let sock = vm_data_dir(clone).join("agent.sock");
     let seed = host_random_hex(64)?;
 
     let mut last_err = String::from("unknown error");
     for attempt in 1..=REJUVENATE_ATTEMPTS {
-        match rejuvenate_once(&sock, clone, &seed, record) {
+        match rejuvenate_once(&sock, clone, &seed, record, keep_machine_id) {
             Ok(()) => return Ok(()),
             Err(e) => {
                 tracing::warn!(
@@ -3069,6 +4022,46 @@ pub fn rejuvenate_clone(clone: &str, record: &VmRecord) -> Result<()> {
     ))
 }
 
+/// Confirm a restored guest that keeps its identity (a resume, a rewind) can
+/// run a program, before its restore is reported as done. The agent answers
+/// its ping from memory, so a guest whose agent rootfs changed under its frozen
+/// processes looks alive while every program it starts dies with a signal; a
+/// clone finds that out from its re-mint script, this is the same check for a
+/// guest that runs none.
+pub fn probe_restored_guest(name: &str) -> Result<()> {
+    let sock = vm_data_dir(name).join("agent.sock");
+    let failed = |detail: String| {
+        Error::agent(
+            "probe restored guest",
+            format!(
+                "the restored guest cannot run a program ({detail}); its live state was captured \
+                 on an agent rootfs this host does not boot it with, so stop the machine and \
+                 start it cold, or restore the checkpoint again"
+            ),
+        )
+    };
+    let mut client = AgentClient::connect_with_retry(&sock)
+        .map_err(|e| failed(format!("agent connect: {e}")))?;
+    match client.vm_exec(
+        vec!["/bin/true".into()],
+        vec![],
+        None,
+        Some(REJUVENATE_TIMEOUT),
+        None,
+    ) {
+        Ok((0, _, _)) => Ok(()),
+        Ok((code, _, stderr)) => Err(failed(format!(
+            "/bin/true exited {code}{}",
+            if stderr.is_empty() {
+                String::new()
+            } else {
+                format!(": {}", String::from_utf8_lossy(&stderr).trim())
+            }
+        ))),
+        Err(e) => Err(failed(format!("exec: {e}"))),
+    }
+}
+
 /// One attempt: connect to the clone's agent and run the re-mint script. Any
 /// connect error, exec error, or non-zero exit is a failure (fail-closed).
 fn rejuvenate_once(
@@ -3076,6 +4069,7 @@ fn rejuvenate_once(
     clone: &str,
     seed: &str,
     record: &VmRecord,
+    keep_machine_id: bool,
 ) -> std::result::Result<(), String> {
     let mut client =
         AgentClient::connect_with_retry(sock).map_err(|e| format!("agent connect: {e}"))?;
@@ -3083,20 +4077,18 @@ fn rejuvenate_once(
     // keeps the Linux/KVM correction within the exec round-trip of host time
     // instead of reusing an epoch made stale by retries. Other hosts pass zero:
     // their libkrun time-sync pusher already owns CLOCK_REALTIME correction.
-    let script = build_rejuvenation_script(clone, seed, rejuvenation_host_epoch(), record);
+    let script = build_rejuvenation_script(
+        clone,
+        seed,
+        rejuvenation_host_epoch(),
+        record,
+        keep_machine_id,
+    );
     match client.vm_exec(
-        vec![
-            "/usr/bin/timeout".into(),
-            "-k".into(),
-            "1".into(),
-            "7".into(),
-            "/bin/sh".into(),
-            "-c".into(),
-            script,
-        ],
+        rejuvenation_command(script),
         vec![],
         None,
-        Some(std::time::Duration::from_secs(10)),
+        Some(REJUVENATE_TIMEOUT),
         None,
     ) {
         Ok((0, _, stderr)) => {
@@ -3555,13 +4547,101 @@ pub fn fail_closed_on_rejuvenation<F: FnOnce()>(
     }
 }
 
-/// Allocate a currently-free host TCP port by binding to port 0 and reading back
-/// the OS-assigned port. Used to give each clone distinct inbound forwards.
+/// Lowest port handed out to a clone. Linux allocates ephemeral ports from
+/// 32768 upward, so staying below that keeps the kernel from handing the same
+/// number to an unrelated outbound connection.
+const CLONE_PORT_FLOOR: u16 = 20_000;
+/// One past the highest port handed out to a clone.
+const CLONE_PORT_CEILING: u16 = 32_000;
+
+/// Allocate a host TCP port for a clone's inbound forward.
+///
+/// Binding port 0 and reading the assignment back is the obvious way to do
+/// this and the wrong one: that yields an *ephemeral* port, and dropping the
+/// listener returns the number to the kernel's pool. Anything the host dials
+/// between here and the clone's own bind — an image pull, most reliably — can
+/// be given that exact port, and the clone then fails to start with "Address
+/// already in use". Allocating below the ephemeral range instead means only
+/// another deliberate bind can collide, which the free check below catches.
 fn alloc_free_host_port() -> Option<u16> {
-    std::net::TcpListener::bind(("127.0.0.1", 0))
-        .ok()
-        .and_then(|l| l.local_addr().ok())
-        .map(|addr| addr.port())
+    alloc_free_port_where(|port| std::net::TcpListener::bind(("127.0.0.1", port)).is_ok())
+}
+
+fn alloc_free_udp_host_port() -> Option<u16> {
+    alloc_free_port_where(|port| std::net::UdpSocket::bind(("127.0.0.1", port)).is_ok())
+}
+
+fn alloc_free_port_where(free: impl Fn(u16) -> bool) -> Option<u16> {
+    let span = u32::from(CLONE_PORT_CEILING - CLONE_PORT_FLOOR);
+    for _ in 0..256 {
+        let offset = host_random_u16()? % span as u16;
+        let port = CLONE_PORT_FLOOR + offset;
+        // Binding confirms the port is free; dropping it immediately is safe
+        // here because nothing else will be *assigned* this number.
+        if free(port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
+/// Host ports a batch of branches must not hand out, TCP and UDP apart.
+#[derive(Default)]
+struct ReservedPorts {
+    tcp: HashSet<u16>,
+    udp: HashSet<u16>,
+}
+
+/// Two random bytes from the host RNG, for choosing a clone's host port.
+fn host_random_u16() -> Option<u16> {
+    use std::io::Read;
+    let mut bytes = [0u8; 2];
+    std::fs::File::open("/dev/urandom")
+        .and_then(|mut f| f.read_exact(&mut bytes))
+        .ok()?;
+    Some(u16::from_le_bytes(bytes))
+}
+
+#[cfg(test)]
+mod clone_port_tests {
+    use super::*;
+
+    #[test]
+    fn a_clone_port_never_comes_from_the_ephemeral_range() {
+        // The kernel allocates ephemeral ports from 32768 up. A clone port
+        // drawn from there is handed back on close and can be taken by any
+        // outbound connection before the clone binds it.
+        for _ in 0..64 {
+            let port = alloc_free_host_port().expect("a free port");
+            assert!(
+                (CLONE_PORT_FLOOR..CLONE_PORT_CEILING).contains(&port),
+                "{port} is outside the reserved range"
+            );
+        }
+    }
+
+    #[test]
+    fn distinct_clones_are_given_distinct_ports() {
+        let mut reserved = HashSet::new();
+        let ports: Vec<u16> = (0..8)
+            .map(|_| alloc_free_host_port_excluding(&mut reserved).expect("a free port"))
+            .collect();
+        let unique: HashSet<u16> = ports.iter().copied().collect();
+        assert_eq!(unique.len(), ports.len(), "ports repeated: {ports:?}");
+    }
+}
+
+/// Add every recorded host port to `reserved`, whatever state its machine is
+/// in, so the auto-allocator never hands out a port another machine owns.
+fn reserve_recorded_host_ports<'a>(
+    recorded: impl Iterator<Item = &'a [(u16, u16)]>,
+    reserved: &mut HashSet<u16>,
+) {
+    for ports in recorded {
+        for (host, _guest) in ports {
+            reserved.insert(*host);
+        }
+    }
 }
 
 fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
@@ -3574,10 +4654,19 @@ fn alloc_free_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
     None
 }
 
+fn alloc_free_udp_host_port_excluding(reserved: &mut HashSet<u16>) -> Option<u16> {
+    for _ in 0..128 {
+        let port = alloc_free_udp_host_port()?;
+        if reserved.insert(port) {
+            return Some(port);
+        }
+    }
+    None
+}
+
 /// Read `hex_len/2` random bytes from the host RNG, hex-encoded. Used to seed
 /// each clone's RNG with distinct host entropy.
 fn host_random_hex(hex_len: usize) -> Result<String> {
-    use std::io::Read;
     if hex_len == 0 || !hex_len.is_multiple_of(2) {
         return Err(Error::agent(
             "seed clone identity",
@@ -3585,17 +4674,194 @@ fn host_random_hex(hex_len: usize) -> Result<String> {
         ));
     }
     let mut buf = vec![0u8; hex_len / 2];
-    let mut random = std::fs::File::open("/dev/urandom")
-        .map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
-    random
-        .read_exact(&mut buf)
-        .map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
+    getrandom::fill(&mut buf).map_err(|e| Error::agent("seed clone identity", e.to_string()))?;
     Ok(buf.iter().map(|b| format!("{b:02x}")).collect())
+}
+
+/// Refuses pinned ports that would launch a clone on a different network
+/// backend than its golden's. A clone resumes the golden's running guest,
+/// whose network stack was set up for the golden's backend at boot, so a
+/// clone on another backend has no working network at all: no route out, and
+/// inbound connections accepted on the host but never answered. Publishing a
+/// port moves a machine from TSI (or no network) to virtio-net, so only a
+/// golden that already runs on virtio-net, as one with a published port does,
+/// can have its clones pin ports.
+fn check_pinned_ports_keep_network_backend(
+    golden: &str,
+    golden_rec: &VmRecord,
+    pinned_ports: &[(u16, u16)],
+) -> Result<()> {
+    use crate::network::EffectiveNetworkBackend;
+    if pinned_ports.is_empty() {
+        return Ok(());
+    }
+    let golden_backend = golden_rec.launch_network_plan().backend;
+    let mut clone_rec = golden_rec.clone();
+    clone_rec.ports = pinned_ports.to_vec();
+    if clone_rec.launch_network_plan().backend == golden_backend {
+        return Ok(());
+    }
+    let runs = match golden_backend {
+        EffectiveNetworkBackend::None => "has no network",
+        EffectiveNetworkBackend::Tsi => "runs on TSI networking because it publishes no ports",
+        EffectiveNetworkBackend::VirtioNet => "runs on virtio-net networking",
+    };
+    Err(Error::config(
+        "fork",
+        format!(
+            "cannot branch '{golden}' with --port: it {runs}, and a branch keeps the network its source booted with, so the branch could not publish a port and would have no network; publish a port on '{golden}' itself (machine create -p HOST:GUEST) to branch it with ports, or branch without --port"
+        ),
+    ))
 }
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_trim_reaches_each_writable_guest_disk_once() {
+        let mounts = "\
+/dev/vda /storage ext4 rw,noatime 0 0
+/dev/vdb /oldroot/mnt/overlay ext4 rw,noatime 0 0
+/dev/vda /storage/workspace ext4 rw,noatime 0 0
+/dev/vdc /mnt/layers ext4 ro,noatime 0 0
+none / overlay rw,relatime 0 0
+tmpfs /tmp tmpfs rw 0 0
+";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), mounts).unwrap();
+        let output = std::process::Command::new("awk")
+            .arg(super::WRITABLE_GUEST_DISKS)
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "/storage\n/oldroot/mnt/overlay\n"
+        );
+    }
+
+    #[test]
+    fn clone_labels_override_inherited_ones_and_keep_the_rest() {
+        let mut labels = std::collections::BTreeMap::from([
+            ("owner".to_string(), "source".to_string()),
+            ("tier".to_string(), "gold".to_string()),
+        ]);
+        super::apply_clone_labels(
+            &mut labels,
+            &[
+                ("owner".to_string(), "child".to_string()),
+                ("job".to_string(), "7".to_string()),
+            ],
+        );
+        assert_eq!(labels["owner"], "child");
+        assert_eq!(labels["tier"], "gold");
+        assert_eq!(labels["job"], "7");
+        super::apply_clone_labels(&mut labels, &[]);
+        assert_eq!(labels.len(), 3);
+    }
+
     use super::*;
+
+    /// An export work directory left beside a machine that no longer exists is
+    /// swept; one beside a machine that still exists is left to its export.
+    #[test]
+    fn a_left_export_directory_is_swept_once_its_machine_is_gone() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let vms = tempfile::tempdir().unwrap();
+        std::fs::create_dir(vms.path().join("live")).unwrap();
+        let live = vms.path().join(".live.export-abc123");
+        let gone = vms.path().join(".gone.export-def456");
+        for dir in [&live, &gone] {
+            std::fs::create_dir_all(dir.join("pins")).unwrap();
+        }
+        prune_orphaned_fork_source_locks_in(vms.path());
+        assert!(
+            live.exists(),
+            "an export of a live machine is still building"
+        );
+        assert!(!gone.exists());
+    }
+
+    #[test]
+    fn a_branch_keeps_staged_mounts_but_not_their_host_binding() {
+        let mut source = VmRecord::new("src".into(), 1, 512, vec![], vec![], false);
+        source.staged_mounts = vec![(0, "/home/me/project".into(), "/workspace".into())];
+        let mut child = source.clone();
+        detach_staged_mounts(&mut child, "src", &source);
+        assert_eq!(child.staged_mounts, source.staged_mounts);
+        assert_eq!(child.staged_mounts_detached_from.as_deref(), Some("src"));
+        assert!(source.staged_mounts_sync_to_host());
+        assert!(!child.staged_mounts_sync_to_host());
+        // A branch of the branch still names the original owner.
+        let mut grandchild = child.clone();
+        detach_staged_mounts(&mut grandchild, "child", &child);
+        assert_eq!(
+            grandchild.staged_mounts_detached_from.as_deref(),
+            Some("src")
+        );
+        // No staged mounts: nothing to detach.
+        let plain = VmRecord::new("p".into(), 1, 512, vec![], vec![], false);
+        let mut plain_child = plain.clone();
+        detach_staged_mounts(&mut plain_child, "p", &plain);
+        assert!(plain_child.staged_mounts_detached_from.is_none());
+    }
+
+    #[test]
+    fn pinned_ports_need_a_golden_already_on_the_port_capable_backend() {
+        let with_port = VmRecord::new("web".into(), 1, 512, vec![], vec![(18_080, 80)], true);
+        assert!(
+            check_pinned_ports_keep_network_backend("web", &with_port, &[(18_081, 80)]).is_ok()
+        );
+        // A guest port the golden does not publish is fine too: same backend.
+        assert!(
+            check_pinned_ports_keep_network_backend("web", &with_port, &[(18_082, 8080)]).is_ok()
+        );
+
+        let outbound_only = VmRecord::new("tsi".into(), 1, 512, vec![], vec![], true);
+        let err = check_pinned_ports_keep_network_backend("tsi", &outbound_only, &[(18_083, 80)])
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("runs on TSI networking because it publishes no ports"),
+            "{err}"
+        );
+        assert!(err.contains("machine create -p HOST:GUEST"), "{err}");
+
+        let offline = VmRecord::new("offline".into(), 1, 512, vec![], vec![], false);
+        let err = check_pinned_ports_keep_network_backend("offline", &offline, &[(18_084, 80)])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("has no network"), "{err}");
+
+        // Without pinned ports a branch keeps (and remaps) its golden's own forwards.
+        assert!(check_pinned_ports_keep_network_backend("tsi", &outbound_only, &[]).is_ok());
+    }
+
+    #[test]
+    fn a_stopped_machines_port_is_still_reserved_against_clones() {
+        // The allocator's bind probe cannot see a stopped machine's port, so
+        // the reservation has to come from the record, not from the kernel.
+        let running: [(u16, u16); 1] = [(23_996, 80)];
+        let stopped: [(u16, u16); 1] = [(24_100, 8080)];
+        let mut reserved = HashSet::new();
+        reserve_recorded_host_ports(
+            [running.as_slice(), stopped.as_slice()].into_iter(),
+            &mut reserved,
+        );
+        assert!(reserved.contains(&23_996));
+        assert!(reserved.contains(&24_100));
+
+        for _ in 0..64 {
+            let Some(port) = alloc_free_host_port_excluding(&mut reserved) else {
+                break;
+            };
+            assert_ne!(port, 23_996);
+            assert_ne!(port, 24_100);
+        }
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -3667,6 +4933,91 @@ mod tests {
             branch_admission_required_mib(usize::MAX, u64::MAX, 1, 1),
             None
         );
+    }
+
+    #[test]
+    fn branch_reserve_defaults_to_five_percent_within_bounds() {
+        assert_eq!(default_branch_reserve_mib(64 * 1024, 0), 3276);
+        assert_eq!(default_branch_reserve_mib(256 * 1024, 0), 4096);
+        assert_eq!(default_branch_reserve_mib(4 * 1024, 0), 512);
+        assert_eq!(default_branch_reserve_mib(800, 0), 400);
+    }
+
+    #[test]
+    fn branch_reserve_keeps_the_host_reserve_on_big_hosts() {
+        let host = 755 * 1024;
+        let host_reserved = crate::systemd_scope::host_reserved_memory_mib(host, None);
+        assert_eq!(default_branch_reserve_mib(host, host_reserved), 46387);
+        // The host reserve never lowers the old default.
+        assert_eq!(default_branch_reserve_mib(64 * 1024, 1024), 3276);
+        assert_eq!(default_branch_reserve_mib(64 * 1024, 8192), 8192);
+    }
+
+    #[test]
+    fn each_child_is_charged_its_overhead_plus_a_share_of_its_guest() {
+        // A 32 GiB child at the default quarter: 64 + 8192 MiB.
+        assert_eq!(
+            branch_child_charge_mib(64, DEFAULT_BRANCH_CHILD_GROWTH_FRACTION, 32 * 1024),
+            8256
+        );
+        assert_eq!(branch_child_charge_mib(64, 0.0, 32 * 1024), 64);
+        assert_eq!(branch_child_charge_mib(64, 1.0, 1000), 1064);
+        // Rounded up so a tiny share is never free.
+        assert_eq!(branch_child_charge_mib(0, 0.25, 3), 1);
+        // A 755 GiB host at 200 GiB free fits 19 such children above its reserve.
+        let required = |n| branch_admission_required_mib(n, 8256, 46387, 0).unwrap();
+        assert!(required(19) <= 200 * 1024);
+        assert!(required(20) > 200 * 1024);
+    }
+
+    #[test]
+    fn child_growth_fraction_defaults_clamps_and_rejects_junk() {
+        assert_eq!(branch_child_growth_fraction(None, 0.25).unwrap(), 0.25);
+        assert_eq!(branch_child_growth_fraction(None, 0.0).unwrap(), 0.0);
+        // An explicit value wins over either default.
+        assert_eq!(branch_child_growth_fraction(Some("0.5"), 0.0).unwrap(), 0.5);
+        assert_eq!(
+            branch_child_growth_fraction(Some(" 0 "), 0.25).unwrap(),
+            0.0
+        );
+        assert_eq!(branch_child_growth_fraction(Some("3"), 0.25).unwrap(), 1.0);
+        assert_eq!(branch_child_growth_fraction(Some("-1"), 0.25).unwrap(), 0.0);
+        assert!(branch_child_growth_fraction(Some("NaN"), 0.25).is_err());
+        assert!(branch_child_growth_fraction(Some("lots"), 0.25).is_err());
+    }
+
+    #[test]
+    fn only_serve_on_a_large_host_gets_the_stricter_branch_defaults() {
+        let host_reserved = |total| crate::systemd_scope::host_reserved_memory_mib(total, None);
+        // 755 GiB worker under serve: host reserve + quarter-guest growth.
+        let worker = 755 * 1024;
+        assert_eq!(
+            branch_admission_defaults(worker, true, host_reserved(worker)),
+            (46387, 0.25)
+        );
+        // The same host from the CLI keeps the old defaults.
+        assert_eq!(
+            branch_admission_defaults(worker, false, host_reserved(worker)),
+            (4096, 0.0)
+        );
+        // A 64 GiB dev box keeps them even under serve.
+        let dev = 64 * 1024;
+        assert_eq!(
+            branch_admission_defaults(dev, true, host_reserved(dev)),
+            (3276, 0.0)
+        );
+        // 128 GiB is the threshold.
+        let edge = 128 * 1024;
+        assert_eq!(
+            branch_admission_defaults(edge, true, host_reserved(edge)),
+            (8192, 0.25)
+        );
+        assert_eq!(
+            branch_admission_defaults(edge - 1, true, host_reserved(edge - 1)),
+            (4096, 0.0)
+        );
+        // SMOLVM_HOST_RESERVED_MEMORY_MB=0 leaves the old reserve on a worker.
+        assert_eq!(branch_admission_defaults(worker, true, 0), (4096, 0.25));
     }
 
     #[test]
@@ -3749,24 +5100,133 @@ mod tests {
         );
     }
 
+    /// A running record carrying a build id, as every engine now writes.
+    fn running_on_build(pid: u32, build: Option<&str>) -> VmRecord {
+        let mut record = VmRecord::new("golden".into(), 1, 128, vec![], vec![], false);
+        record.pid = Some(pid as i32);
+        record.engine_build = build.map(str::to_string);
+        record
+    }
+
+    /// Spawn a process that runs another binary than this test, waiting past
+    /// the window between spawn() and its exec in which it is still a copy of
+    /// this binary.
+    #[cfg(target_os = "linux")]
+    fn spawn_another_binary() -> std::process::Child {
+        let other = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let own = std::fs::read_link("/proc/self/exe").unwrap();
+        for _ in 0..200 {
+            match std::fs::read_link(format!("/proc/{}/exe", other.id())) {
+                Ok(exe) if exe != own => break,
+                _ => std::thread::sleep(std::time::Duration::from_millis(5)),
+            }
+        }
+        other
+    }
+
+    /// The build that started the source decides, not the file its process
+    /// runs: the same release installed twice (a CLI's embedded engine and an
+    /// SDK's cached copy) is one build, and a source on it is branched from
+    /// the other file; a source started by another build is refused.
+    #[test]
+    fn a_source_is_refused_by_its_recorded_engine_build() {
+        assert!(!source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            Some(crate::ENGINE_BUILD)
+        )));
+        assert!(source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            Some("0.0.0+0000000000000")
+        )));
+        #[cfg(target_os = "linux")]
+        {
+            let mut other = spawn_another_binary();
+            let same_build_other_file = source_runs_another_engine(&running_on_build(
+                other.id(),
+                Some(crate::ENGINE_BUILD),
+            ));
+            let other_build = source_runs_another_engine(&running_on_build(
+                other.id(),
+                Some("0.0.0+0000000000000"),
+            ));
+            let _ = other.kill();
+            let _ = other.wait();
+            assert!(!same_build_other_file);
+            assert!(other_build);
+        }
+        let mut stopped = running_on_build(std::process::id(), Some("0.0.0+0000000000000"));
+        stopped.pid = None;
+        assert!(
+            !source_runs_another_engine(&stopped),
+            "a record without a process is not refused here"
+        );
+    }
+
+    /// A record from an engine that did not record its build falls back to the
+    /// binary: a process running this very binary is this engine's; one running
+    /// any other binary, as a VM left over from before an upgrade does, is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_on_another_engine_binary_is_told_apart() {
+        assert!(!source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            None
+        )));
+        let mut other = spawn_another_binary();
+        let differs = source_runs_another_engine(&running_on_build(other.id(), None));
+        let sleep_bin = std::fs::read_link(format!("/proc/{}/exe", other.id())).unwrap();
+        // An embedding SDK boots VMs with its helper, not the host process: a
+        // VM running that helper is this engine's, whatever the host runs.
+        let helper_is_this_engine = !process_runs_another_binary(other.id() as i32, &sleep_bin);
+        let host_is_not_the_helper =
+            process_runs_another_binary(std::process::id() as i32, &sleep_bin);
+        let _ = other.kill();
+        let _ = other.wait();
+        assert!(differs);
+        assert!(helper_is_this_engine);
+        assert!(host_is_not_the_helper);
+        assert!(
+            !source_runs_another_engine(&running_on_build(i32::MAX as u32, None)),
+            "an unreadable process is not refused"
+        );
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn live_fork_refuses_an_unbounded_disk_chain() {
-        let temp = tempfile::tempdir().unwrap();
-        let raw = temp.path().join("base.raw");
-        std::fs::write(&raw, vec![0_u8; 20]).unwrap();
-        let mut backing = "base.raw".to_string();
-        for index in 0..MAX_FORK_DISK_CHAIN_DEPTH {
-            let name = if index + 1 == MAX_FORK_DISK_CHAIN_DEPTH {
-                crate::data::storage::STORAGE_DISK_FILENAME.replace(".raw", ".qcow2")
-            } else {
-                format!("layer-{index}.qcow2")
-            };
-            write_test_qcow2(&temp.path().join(&name), Some(&backing));
-            backing = name;
-        }
-        let error = ensure_fork_disk_chain_is_bounded(temp.path()).unwrap_err();
-        assert!(error.to_string().contains("safe limit is 32"));
+        let chain_of = |depth: usize| {
+            let temp = tempfile::tempdir().unwrap();
+            let raw = temp.path().join("base.raw");
+            std::fs::write(&raw, vec![0_u8; 20]).unwrap();
+            let mut backing = "base.raw".to_string();
+            for index in 0..depth {
+                let name = if index + 1 == depth {
+                    crate::data::storage::STORAGE_DISK_FILENAME.replace(".raw", ".qcow2")
+                } else {
+                    format!("layer-{index}.qcow2")
+                };
+                write_test_qcow2(&temp.path().join(&name), Some(&backing));
+                backing = name;
+            }
+            temp
+        };
+        // Past the depth compaction keeps chains under, a branch still goes
+        // ahead: the generation it makes is flattened once it commits.
+        let deep = chain_of(MAX_FORK_DISK_CHAIN_DEPTH);
+        ensure_fork_disk_chain_is_bounded(deep.path()).unwrap();
+        let runaway = chain_of(HARD_FORK_DISK_CHAIN_DEPTH);
+        let error = ensure_fork_disk_chain_is_bounded(runaway.path()).unwrap_err();
+        assert!(error.to_string().contains("the limit is 64"), "{error}");
+        assert!(matches!(
+            error,
+            Error::Agent {
+                kind: crate::error::AgentErrorKind::Conflict,
+                ..
+            }
+        ));
     }
 
     #[cfg(target_os = "linux")]
@@ -3857,9 +5317,20 @@ mod tests {
     /// `.<name>.fork-operation.lock` shape makes ambiguous to a naive split.
     #[test]
     fn a_lock_files_owner_round_trips_through_its_path() {
-        for source in ["golden", "worker.one", "a.b.c", "trailing.lock"] {
+        for source in [
+            "golden",
+            "worker.one",
+            "a.b.c",
+            "trailing.lock",
+            "odd.fork-operation",
+            "odd.fork-operation.pause-operation",
+        ] {
             assert_eq!(
                 fork_source_lock_owner(&fork_source_lock_path(source)).as_deref(),
+                Some(source)
+            );
+            assert_eq!(
+                fork_source_lock_owner(&saved_execution_lock_path(source)).as_deref(),
                 Some(source)
             );
         }
@@ -3875,6 +5346,9 @@ mod tests {
     /// machine never takes it.
     #[test]
     fn an_orphaned_lock_is_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".gone.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -3887,11 +5361,63 @@ mod tests {
         );
     }
 
+    /// Pausing a machine takes a second sibling lock, which its deletion must
+    /// not leave behind either.
+    #[test]
+    fn an_orphaned_pause_operation_lock_is_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join(".gone.fork-operation.pause-operation.lock");
+        let alive = dir
+            .path()
+            .join(".alive.fork-operation.pause-operation.lock");
+        std::fs::write(&gone, b"").unwrap();
+        std::fs::write(&alive, b"").unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::agent::vm_dir_hash("alive"))).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(
+            !gone.exists(),
+            "a pause lock whose machine is gone must be removed"
+        );
+        assert!(
+            alive.exists(),
+            "a live machine's pause lock must not be swept"
+        );
+    }
+
+    /// An in-flight pause or resume holds its lock after the machine is gone
+    /// as well, and the sweep must leave it to them.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_pause_operation_lock_is_never_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".busy.fork-operation.pause-operation.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let held = ForkSourceLock::acquire_at(&lock).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(lock.exists(), "an in-flight pause's lock must not be swept");
+        drop(held);
+        prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(!lock.exists(), "once released it is sweepable");
+    }
+
     /// A machine that still exists is still forkable, so its lock must survive.
     /// The data directory is hash-named, so the sweep has to hash the recovered
     /// name rather than look for a directory called after it.
     #[test]
     fn a_live_machines_lock_survives_the_sweep() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".alive.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -3915,6 +5441,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_held_lock_is_never_swept_even_without_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".busy.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -3932,6 +5461,9 @@ mod tests {
     /// runs in the VM cache root, which holds every machine's data directory.
     #[test]
     fn the_sweep_touches_nothing_but_lock_files() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let bystanders = [".hidden", "machine-dir-ish", "name.lock", "_shared"];
         for f in bystanders {
@@ -3943,6 +5475,28 @@ mod tests {
         for f in bystanders {
             assert!(dir.path().join(f).exists(), "{f} must survive the sweep");
         }
+    }
+
+    #[test]
+    fn a_paused_disks_record_is_swept_with_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let live = dir.path().join("0123abcd");
+        std::fs::create_dir(&live).unwrap();
+        let kept = dir.path().join(".0123abcd.paused-disks");
+        let orphan = dir.path().join(".4567ef01.paused-disks");
+        std::fs::write(&kept, b"x").unwrap();
+        std::fs::write(&orphan, b"x").unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(kept.exists(), "a live machine's record must survive");
+        assert!(
+            !orphan.exists(),
+            "a deleted machine's record must be removed"
+        );
     }
 
     #[test]
@@ -4258,6 +5812,33 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn checkpoint_memory_ownership_is_counted_and_unknown_status_fails_closed() {
+        for state in ["preparing", "ready", "finishing"] {
+            assert_eq!(
+                checkpoint_memory_units(&format!("OK {state}\n")).unwrap(),
+                1
+            );
+        }
+        for reply in [
+            "OK memory_released\n",
+            "ERR EINVAL unknown command\n",
+            "ERR EINVAL snapshot dir required\n",
+        ] {
+            assert_eq!(checkpoint_memory_units(reply).unwrap(), 0);
+        }
+        for reply in [
+            "",
+            "OK",
+            "OK durable",
+            "ERR EIO disconnected",
+            "OK finishing\nOK memory_released",
+        ] {
+            assert!(checkpoint_memory_units(reply).is_err());
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn lineage_reclaim_threshold_tracks_growth_and_collection() {
         let record = VmRecord::new("golden".into(), 2, 1024, vec![], vec![], false);
         let base = fork_lineage_memory_budget(&record, 0).unwrap();
@@ -4283,6 +5864,42 @@ mod tests {
         assert!(
             !source_has_private_ram_backing(&record),
             "a restarted VMM must not inherit the previous process's RAM allowance"
+        );
+    }
+
+    #[test]
+    fn a_frozen_source_may_stop_once_its_clones_are_stopped() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let snapshot_root = temp.path().join("s");
+
+        let mut stopped = VmRecord::new("stopped".into(), 1, 128, vec![], vec![], false);
+        stopped.golden = Some("golden".into());
+        stopped.fork_generation = Some("22222222".into());
+        db.insert_vm("stopped", &stopped).unwrap();
+        assert_eq!(
+            restart_blocking_dependent_clones_in(&db, "golden", &snapshot_root).unwrap(),
+            vec!["stopped".to_string()],
+            "the source still may not run again under it"
+        );
+        assert!(
+            stop_blocking_dependent_clones_in(&db, "golden", &snapshot_root)
+                .unwrap()
+                .is_empty(),
+            "a stopped clone maps nothing of the source"
+        );
+
+        // a clone whose VMM is alive (this test process stands in for it)
+        let pid = std::process::id();
+        let mut running = VmRecord::new("running".into(), 1, 128, vec![], vec![], false);
+        running.golden = Some("golden".into());
+        running.fork_generation = Some("22222222".into());
+        running.pid = Some(pid as _);
+        running.pid_start_time = crate::process::process_start_time(pid as _);
+        db.insert_vm("running", &running).unwrap();
+        assert_eq!(
+            stop_blocking_dependent_clones_in(&db, "golden", &snapshot_root).unwrap(),
+            vec!["running".to_string()]
         );
     }
 
@@ -4503,9 +6120,57 @@ mod tests {
     }
 
     #[test]
-    fn rejuvenation_script_regenerates_per_machine_secrets() {
+    fn rejuvenation_runs_a_plain_shell_that_leaves_no_orphan() {
         let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), false);
+        let command = rejuvenation_command(script.clone());
+
+        // Anything that outlives the script is reparented to init.krun, and
+        // reaping it can reboot the guest; the agent enforces the deadline.
+        assert_eq!(command[..2], ["/bin/sh".to_string(), "-c".to_string()]);
+        assert_eq!(command[2], script);
+        assert_eq!(command.len(), 3);
+        assert!(!script.contains("timeout"), "{script}");
+        assert!(!script.contains("nohup"), "{script}");
+        assert!(!script.contains(" & "), "{script}");
+    }
+
+    #[test]
+    fn rejuvenation_script_keeps_machine_id_only_when_asked() {
+        let kept = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            true,
+        );
+        assert!(
+            !kept.contains("/etc/machine-id") && !kept.contains("/var/lib/dbus/machine-id"),
+            "keep_machine_id must leave both machine-id files untouched: {kept}"
+        );
+        assert!(kept.contains("rejuvenate-stage=machine-id-kept"));
+        // Everything else is still re-minted: hostname, SSH host keys, cloud-init.
+        assert!(kept.contains("> /etc/hostname"));
+        assert!(kept.contains(r#""$KG" -A"#));
+        assert!(kept.contains("/var/lib/cloud/instance"));
+
+        let image =
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), true);
+        assert!(
+            !image.contains("machine-id;"),
+            "image clones keep it too: {image}"
+        );
+    }
+
+    #[test]
+    fn rejuvenation_script_regenerates_per_machine_secrets() {
+        let script = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            false,
+        );
 
         // SSH host keys: delete the golden's, then regenerate fresh ones.
         assert!(
@@ -4553,7 +6218,7 @@ mod tests {
     #[test]
     fn rejuvenation_script_leaves_the_inherited_overlay_alone() {
         let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), false);
         // Writing files THROUGH the merged mount is how the workload's rootfs is
         // reached (same as `write_fork_env`); what breaks a live overlayfs is
         // renaming or removing its backing dirs.
@@ -4573,13 +6238,62 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn rejuvenation_maps_clone_hostname_without_replacing_custom_hosts() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        let path = tmp.path().join("etc/hosts");
+        let original = "127.0.0.1 localhost\n10.0.0.9 pinned # keep";
+        std::fs::write(&path, original).unwrap();
+        let script = super::rejuvenation_hosts_script(tmp.path().to_str().unwrap(), "clone-a");
+        for _ in 0..2 {
+            assert!(std::process::Command::new("/bin/sh")
+                .args(["-ec", &script])
+                .status()
+                .unwrap()
+                .success());
+        }
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            format!("{original}\n127.0.1.1\tclone-a\n")
+        );
+        std::fs::write(&path, "10.0.0.9 clone-a # custom\n").unwrap();
+        assert!(std::process::Command::new("/bin/sh")
+            .args(["-ec", &script])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            std::fs::read_to_string(&path).unwrap(),
+            "10.0.0.9 clone-a # custom\n"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn rejuvenation_creates_hosts_when_image_has_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        let script = super::rejuvenation_hosts_script(tmp.path().to_str().unwrap(), "clone-b");
+        assert!(std::process::Command::new("/bin/sh")
+            .args(["-ec", &script])
+            .status()
+            .unwrap()
+            .success());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/hosts")).unwrap(),
+            "127.0.0.1\tlocalhost\n::1\tlocalhost\n127.0.1.1\tclone-b\n"
+        );
+    }
+
     // The regression this guards: identity files written unprefixed land in the
     // VM rootfs, where no workload reads them, so every clone of an image
     // machine kept the golden's SSH host keys.
     #[test]
     fn image_clones_rejuvenate_identity_inside_the_workload_rootfs() {
         let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record());
+            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &image_record(), false);
         let merged = "/storage/overlays/persistent-clone-a/merged";
         assert!(
             script.contains(&format!("{merged}/etc/hostname")),
@@ -4622,8 +6336,13 @@ mod tests {
     // A bare VM has no workload container, so paths stay VM-rootfs relative.
     #[test]
     fn bare_vm_clones_keep_plain_vm_paths() {
-        let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+        let script = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            false,
+        );
         assert!(script.contains("> /etc/hostname"));
         assert!(!script.contains("/storage/overlays"));
         assert!(script.contains(r#""$KG" -A"#));
@@ -4639,8 +6358,13 @@ mod tests {
     // `notBefore` validation break inside every clone.
     #[test]
     fn rejuvenation_script_restamps_the_wall_clock() {
-        let script =
-            build_rejuvenation_script("clone-a", "deadbeef", 1_700_000_000, &bare_vm_record());
+        let script = build_rejuvenation_script(
+            "clone-a",
+            "deadbeef",
+            1_700_000_000,
+            &bare_vm_record(),
+            false,
+        );
         assert!(
             script.contains("date -u -s @1700000000"),
             "script must re-stamp the wall clock from the host epoch: {script}"
@@ -4661,7 +6385,7 @@ mod tests {
         );
         // A zero / unavailable host epoch skips rather than setting the guest to
         // 1970 (which would be worse than a stale-but-plausible inherited clock).
-        let skip = build_rejuvenation_script("clone-a", "deadbeef", 0, &bare_vm_record());
+        let skip = build_rejuvenation_script("clone-a", "deadbeef", 0, &bare_vm_record(), false);
         assert!(skip.contains("rejuvenate-stage=clock-skipped"));
         assert!(!skip.contains("date -u -s @"));
     }
@@ -4720,5 +6444,66 @@ mod tests {
             !torn_down.get(),
             "a successful rejuvenation must not tear the clone down"
         );
+    }
+
+    #[test]
+    fn a_branch_waits_longer_for_a_bigger_source_but_not_past_the_control_plane() {
+        assert_eq!(fork_capture_timeout(0), Duration::from_secs(60));
+        assert_eq!(fork_capture_timeout(2048), Duration::from_secs(100));
+        assert_eq!(fork_capture_timeout(8192), Duration::from_secs(220));
+        assert_eq!(fork_capture_timeout(8193), Duration::from_secs(240));
+        assert_eq!(fork_capture_timeout(65536), Duration::from_secs(540));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_control_command_with_no_reply_says_which_command_timed_out() {
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // Accept and hold the connection without answering, like a VMM
+        // still working on a capture.
+        let held = std::thread::spawn(move || listener.accept().map(|(stream, _)| stream));
+        let error = control_socket_cmd_with_timeout(
+            &sock,
+            "FORK /var/lib/smolvm/vms/x/s/abcd1234",
+            Duration::from_secs(1),
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("no reply to FORK within 1 s"), "{error}");
+        assert!(
+            !error.contains("/var/lib"),
+            "the path stays out of the message: {error}"
+        );
+        drop(held.join());
+    }
+
+    #[test]
+    fn freeze_source_disables_source_resume() {
+        assert!(!ForkSourcePolicy::Freeze.continues());
+        assert_eq!(
+            ForkSourcePolicy::PlatformDefault.continues(),
+            fork_continue_enabled()
+        );
+    }
+
+    #[test]
+    fn freeze_source_captures_again_before_reusing_a_live_checkpoint() {
+        assert!(!policy_allows_snapshot_reuse(
+            ForkSourcePolicy::Freeze,
+            false,
+            true
+        ));
+        assert!(policy_allows_snapshot_reuse(
+            ForkSourcePolicy::Freeze,
+            true,
+            true
+        ));
+        assert!(policy_allows_snapshot_reuse(
+            ForkSourcePolicy::PlatformDefault,
+            false,
+            true
+        ));
     }
 }

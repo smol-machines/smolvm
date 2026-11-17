@@ -7,7 +7,7 @@
 # - smolvm-agent daemon
 # - Required utilities (jq, e2fsprogs, util-linux)
 #
-# Usage: ./scripts/build-agent-rootfs.sh [--arch aarch64|x86_64] [--no-build-agent] [--install] [output-dir]
+# Usage: ./scripts/build-agent-rootfs.sh [--arch aarch64|x86_64] [--no-build-agent] [--no-upgrade] [--crane <path> | --crane-release] [--install] [output-dir]
 
 set -euo pipefail
 
@@ -18,6 +18,9 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 INSTALL_ROOTFS=0
 OVERRIDE_ARCH=""
 NO_BUILD_AGENT=0
+NO_UPGRADE=0
+CRANE_BINARY=""
+CRANE_RELEASE=0
 POSITIONAL_ARGS=()
 while [[ $# -gt 0 ]]; do
     case "$1" in
@@ -29,27 +32,42 @@ while [[ $# -gt 0 ]]; do
             fi
             OVERRIDE_ARCH="$2"; shift 2 ;;
         --no-build-agent) NO_BUILD_AGENT=1; shift ;;
+        --no-upgrade) NO_UPGRADE=1; shift ;;
+        --crane)
+            if [[ -z "${2:-}" ]]; then
+                echo "Error: --crane requires the path of a crane binary"
+                exit 1
+            fi
+            CRANE_BINARY="$2"; shift 2 ;;
+        --crane-release) CRANE_RELEASE=1; shift ;;
         *) POSITIONAL_ARGS+=("$1"); shift ;;
     esac
 done
+if [[ -n "$CRANE_BINARY" && "$CRANE_RELEASE" == "1" ]]; then
+    echo "Error: --crane and --crane-release cannot be used together"
+    exit 1
+fi
 export INSTALL_ROOTFS
 
 OUTPUT_DIR="${POSITIONAL_ARGS[0]:-$PROJECT_ROOT/target/agent-rootfs}"
 
-# Alpine version
-ALPINE_VERSION="3.19"
+# Alpine version, and the branch its packages come from
+ALPINE_VERSION="3.24.3"
+ALPINE_BRANCH="${ALPINE_VERSION%.*}"
 
 # Detect or override architecture
 DETECTED_ARCH="${OVERRIDE_ARCH:-$(uname -m)}"
 case "$DETECTED_ARCH" in
     arm64|aarch64)
         ALPINE_ARCH="aarch64"
-        CRANE_ARCH="arm64"
+        CRANE_GOARCH="arm64"
+        CRANE_RELEASE_ARCH="arm64"
         RUST_TARGET="aarch64-unknown-linux-musl"
         ;;
     x86_64|amd64)
         ALPINE_ARCH="x86_64"
-        CRANE_ARCH="x86_64"
+        CRANE_GOARCH="amd64"
+        CRANE_RELEASE_ARCH="x86_64"
         RUST_TARGET="x86_64-unknown-linux-musl"
         ;;
     *)
@@ -59,17 +77,145 @@ case "$DETECTED_ARCH" in
 esac
 
 ALPINE_MIRROR="https://dl-cdn.alpinelinux.org/alpine"
-ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}.0-${ALPINE_ARCH}.tar.gz"
-ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_VERSION}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
+ALPINE_MINIROOTFS="alpine-minirootfs-${ALPINE_VERSION}-${ALPINE_ARCH}.tar.gz"
+ALPINE_URL="${ALPINE_MIRROR}/v${ALPINE_BRANCH}/releases/${ALPINE_ARCH}/${ALPINE_MINIROOTFS}"
 
-# Crane version
-CRANE_VERSION="0.19.0"
-CRANE_URL="https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_ARCH}.tar.gz"
+# Crane, and the Go it is built with: a crane release can be built with a Go
+# that is several patch releases old.
+CRANE_VERSION="0.22.1"
+GO_VERSION="1.26.10"
+CRANE_PACKAGE="github.com/google/go-containerregistry/cmd/crane@v${CRANE_VERSION}"
+CRANE_RELEASE_URL="https://github.com/google/go-containerregistry/releases/download/v${CRANE_VERSION}/go-containerregistry_Linux_${CRANE_RELEASE_ARCH}.tar.gz"
+
+# crane must run in the Alpine (musl) rootfs: a static executable for the
+# target architecture.
+check_crane_binary() {
+    local binary="$1" info file_arch
+    if [[ ! -f "$binary" ]]; then
+        echo "Error: crane $binary: no such file"
+        return 1
+    fi
+    info="$(file -bL "$binary")"
+    case "$ALPINE_ARCH" in
+        x86_64)  file_arch="x86-64" ;;
+        aarch64) file_arch="aarch64" ;;
+    esac
+    if [[ "$info" != ELF*"$file_arch"* ]]; then
+        echo "Error: crane $binary is not an ELF executable for $ALPINE_ARCH: $info"
+        return 1
+    fi
+    if [[ "$info" == *"dynamically linked"* || "$info" == *interpreter* ]]; then
+        echo "Error: crane $binary is dynamically linked; build it with CGO_ENABLED=0"
+        return 1
+    fi
+}
+
+# A native go is used only if it honours GOTOOLCHAIN (Go 1.21 or later):
+# an older go would build crane with its own standard library.
+check_native_go() {
+    command -v go &> /dev/null || return 1
+    local version major minor
+    version="$(go env GOVERSION 2>/dev/null)" || return 1
+    version="${version#go}"
+    major="${version%%.*}"
+    minor="${version#*.}"
+    minor="${minor%%[!0-9]*}"
+    [[ "$major" =~ ^[0-9]+$ && "$minor" =~ ^[0-9]+$ ]] || return 1
+    (( major > 1 || (major == 1 && minor >= 21) ))
+}
+
+# Build crane into <dir>/crane. GOARCH cross-compiles for the target, so the
+# build always runs at the host's architecture. A cross-compiled `go install`
+# puts the binary in bin/linux_<arch>/, a native one in bin/.
+build_crane() {
+    local out_dir="$1" native_go=0
+    if check_native_go; then
+        native_go=1
+    elif command -v go &> /dev/null; then
+        echo "  Not using native $(go env GOVERSION 2>/dev/null || echo go): Go 1.21 or later is needed"
+    fi
+    if [[ "$native_go" == "1" ]]; then
+        echo "  Building crane with native go (GOTOOLCHAIN=go${GO_VERSION})..."
+        local gopath="$WORK_DIR/gopath"
+        GOTOOLCHAIN="go${GO_VERSION}" GOPATH="$gopath" GOMODCACHE="$(go env GOMODCACHE)" GOBIN='' \
+            CGO_ENABLED=0 GOOS=linux GOARCH="$CRANE_GOARCH" \
+            go install -trimpath -ldflags="-s -w" "$CRANE_PACKAGE"
+        if [[ -f "$gopath/bin/linux_${CRANE_GOARCH}/crane" ]]; then
+            cp "$gopath/bin/linux_${CRANE_GOARCH}/crane" "$out_dir/crane"
+        else
+            cp "$gopath/bin/crane" "$out_dir/crane"
+        fi
+    elif command -v smolvm &> /dev/null; then
+        echo "  Building crane via smolvm (golang:${GO_VERSION}-alpine)..."
+        smolvm machine run --net --mem 2048 -v "$out_dir:/out" --image "golang:${GO_VERSION}-alpine" \
+            -- sh -c "GOTOOLCHAIN=local CGO_ENABLED=0 GOOS=linux GOARCH=$CRANE_GOARCH \
+                go install -trimpath -ldflags='-s -w' $CRANE_PACKAGE \
+                && { cp \"\$(go env GOPATH)/bin/linux_${CRANE_GOARCH}/crane\" /out/crane 2>/dev/null \
+                     || cp \"\$(go env GOPATH)/bin/crane\" /out/crane; }"
+    else
+        echo "Error: building crane needs go >= 1.21 or smolvm to fetch and run the build toolchain; pass --crane-release or --crane <path> to use a prebuilt crane"
+        exit 1
+    fi
+}
+
+# Download the crane release binary for the target into <dir>/crane.
+download_crane() {
+    local out_dir="$1"
+    echo "  Downloading the crane ${CRANE_VERSION} release..."
+    curl -fsSL "$CRANE_RELEASE_URL" | tar -xzf - -C "$out_dir" crane
+}
+
+# Install <binary> into the rootfs as crane.
+install_crane() {
+    local binary="$1"
+    echo "Installing crane..."
+    mkdir -p "$OUTPUT_DIR/usr/local/bin"
+    install -m 0755 "$binary" "$OUTPUT_DIR/usr/local/bin/crane"
+    if command -v sha256sum &> /dev/null; then
+        echo "  crane sha256 $(sha256sum "$binary" | cut -d' ' -f1)"
+    else
+        echo "  crane sha256 $(shasum -a 256 "$binary" | cut -d' ' -f1)"
+    fi
+}
+
+# Remove the work directory. Go makes some of what it writes read-only.
+cleanup() {
+    chmod -R u+w "$WORK_DIR" 2>/dev/null || true
+    rm -rf "$WORK_DIR"
+}
+
+# Temporary files go in a private work directory, removed on any exit.
+WORK_DIR="$(mktemp -d)"
+trap cleanup EXIT
 
 echo "Building agent rootfs..."
 echo "  Alpine: ${ALPINE_VERSION} (${ALPINE_ARCH})"
-echo "  Crane: ${CRANE_VERSION}"
 echo "  Output: ${OUTPUT_DIR}"
+
+# Get crane before the output directory is touched, so a crane that cannot be
+# built, downloaded or used stops the build first.
+if [[ -z "$CRANE_BINARY" ]]; then
+    CRANE_BUILD_DIR="$WORK_DIR/crane"
+    mkdir -p "$CRANE_BUILD_DIR"
+    if [[ "$CRANE_RELEASE" == "1" ]]; then
+        download_crane "$CRANE_BUILD_DIR"
+    else
+        build_crane "$CRANE_BUILD_DIR"
+    fi
+    CRANE_BINARY="$CRANE_BUILD_DIR/crane"
+fi
+check_crane_binary "$CRANE_BINARY" || exit 1
+if [[ "$CRANE_RELEASE" == "1" ]]; then
+    CRANE_ORIGIN="upstream release binary"
+elif [[ -n "${CRANE_BUILD_DIR:-}" ]]; then
+    CRANE_ORIGIN="built with Go ${GO_VERSION}"
+else
+    CRANE_ORIGIN="local ${CRANE_BINARY}"
+    CRANE_VERSION="$("$CRANE_BINARY" version 2>/dev/null)" || CRANE_VERSION=""
+    [[ "$CRANE_VERSION" =~ ^v?[0-9]+\.[0-9]+ ]] || CRANE_VERSION="unknown version"
+    CRANE_VERSION="${CRANE_VERSION#v}"
+fi
+echo "  Crane: ${CRANE_VERSION} (${CRANE_ORIGIN})"
 
 # Create output directory
 rm -rf "$OUTPUT_DIR"
@@ -86,24 +232,16 @@ fi
 echo "Extracting Alpine..."
 tar -xzf "$ALPINE_TAR" -C "$OUTPUT_DIR"
 
-# Download crane
-echo "Downloading crane..."
-CRANE_TAR="/tmp/crane-${CRANE_VERSION}-${CRANE_ARCH}.tar.gz"
-if [ ! -f "$CRANE_TAR" ]; then
-    curl -fsSL -o "$CRANE_TAR" "$CRANE_URL"
-fi
-
-# Extract crane to rootfs
-echo "Installing crane..."
-mkdir -p "$OUTPUT_DIR/usr/local/bin"
-tar -xzf "$CRANE_TAR" -C "$OUTPUT_DIR/usr/local/bin" crane
+install_crane "$CRANE_BINARY"
 
 # Install additional Alpine packages into the rootfs.
 # Strategies:
 #   1. apk.static (Linux only) — runs natively, supports cross-arch via --arch
 #   2. smolvm (any host) — only for native-arch builds (pulls host-arch image)
 echo "Installing additional packages..."
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd"
+# GNU tar replaces busybox tar, which never sets a symlink's owner when it
+# unpacks image layers.
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd tar"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -121,50 +259,56 @@ install_packages_apk_static() {
     echo "  Using apk.static..."
     # Download Alpine's static apk binary — runs natively on Linux,
     # can install packages for any target architecture via --arch.
-    APK_STATIC_MIRROR="${ALPINE_MIRROR}/v${ALPINE_VERSION}/main/${HOST_ARCH}"
+    APK_STATIC_MIRROR="${ALPINE_MIRROR}/v${ALPINE_BRANCH}/main/${HOST_ARCH}"
     APK_STATIC_PKG=$(curl -fsSL "$APK_STATIC_MIRROR/" | grep -o 'apk-tools-static-[^"]*\.apk' | head -1)
     if [[ -z "$APK_STATIC_PKG" ]]; then
         echo "Error: could not find apk-tools-static package at $APK_STATIC_MIRROR"
         exit 1
     fi
-    curl -fsSL -o /tmp/apk-static.apk "${APK_STATIC_MIRROR}/${APK_STATIC_PKG}"
-    mkdir -p /tmp/apk-static
-    tar -xzf /tmp/apk-static.apk -C /tmp/apk-static 2>/dev/null || true
+    curl -fsSL -o "$WORK_DIR/apk-static.apk" "${APK_STATIC_MIRROR}/${APK_STATIC_PKG}"
+    mkdir -p "$WORK_DIR/apk-static"
+    tar -xzf "$WORK_DIR/apk-static.apk" -C "$WORK_DIR/apk-static" 2>/dev/null || true
 
     # Set up apk repositories in the rootfs
     mkdir -p "$OUTPUT_DIR/etc/apk"
-    echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/main" > "$OUTPUT_DIR/etc/apk/repositories"
-    echo "${ALPINE_MIRROR}/v${ALPINE_VERSION}/community" >> "$OUTPUT_DIR/etc/apk/repositories"
+    echo "${ALPINE_MIRROR}/v${ALPINE_BRANCH}/main" > "$OUTPUT_DIR/etc/apk/repositories"
+    echo "${ALPINE_MIRROR}/v${ALPINE_BRANCH}/community" >> "$OUTPUT_DIR/etc/apk/repositories"
 
     # --no-scripts: skip pre/post-install scripts and triggers.
     # When cross-building (e.g. aarch64 rootfs on x86_64 host), those scripts
     # are aarch64 ELF binaries that the host kernel can't exec, causing exit
     # code 127. The minirootfs already ships busybox symlinks, and seatd runs
     # as root in the VM so the 'seat' group creation is not required.
-    local -a APK_STATIC_COMMAND=(/tmp/apk-static/sbin/apk.static)
-    local -a APK_STATIC_OWNERSHIP_ARGS=()
+    local -a APK_STATIC_COMMAND=("$WORK_DIR/apk-static/sbin/apk.static")
+    local -a APK_STATIC_INITDB_ARGS=()
     if [[ "$EUID" != "0" ]]; then
-        # apk reconciles package directory ownership even with --no-chown. In
-        # an ordinary user namespace, uid 0 maps back to the invoking user, so
-        # both file and directory metadata can be installed without spurious
-        # EPERM diagnostics or privileged host writes.
-        if command -v unshare &> /dev/null \
-            && unshare --user --map-root-user true 2>/dev/null; then
-            APK_STATIC_COMMAND=(unshare --user --map-root-user "${APK_STATIC_COMMAND[@]}")
-            APK_STATIC_OWNERSHIP_ARGS=(--no-chown)
-        else
-            echo "Warning: user namespaces are unavailable; apk may report ownership errors and retain invoking-user ownership"
-        fi
+        # apk-tools 3 refuses to create a database as non-root unless
+        # --usermode is given; files keep the invoking user's ownership, as
+        # they would from any non-root build. (A user namespace mapping only
+        # root cannot do better: apk then fails to chown setgid binaries to
+        # their groups, and from apk-tools 3.0.9 --no-chown means --usermode,
+        # which apk refuses as root.)
+        APK_STATIC_INITDB_ARGS=(--usermode)
     fi
     "${APK_STATIC_COMMAND[@]}" \
         --root "$OUTPUT_DIR" \
         --initdb \
+        "${APK_STATIC_INITDB_ARGS[@]}" \
         --no-cache \
         --allow-untrusted \
         --no-scripts \
-        "${APK_STATIC_OWNERSHIP_ARGS[@]}" \
         --arch "$ALPINE_ARCH" \
         add $APK_PACKAGES
+    if [[ "$NO_UPGRADE" != "1" ]]; then
+        # Bring the minirootfs's own packages up to the branch's current versions.
+        "${APK_STATIC_COMMAND[@]}" \
+            --root "$OUTPUT_DIR" \
+            --no-cache \
+            --allow-untrusted \
+            --no-scripts \
+            --arch "$ALPINE_ARCH" \
+            upgrade
+    fi
     echo "Packages installed successfully"
 }
 
@@ -276,8 +420,12 @@ elif [[ "$CROSS_ARCH" == "1" ]]; then
     exit 1
 elif command -v smolvm &> /dev/null; then
     echo "  Using smolvm..."
-    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_VERSION}" \
-        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES"
+    APK_UPGRADE_CMD=""
+    if [[ "$NO_UPGRADE" != "1" ]]; then
+        APK_UPGRADE_CMD=" && apk upgrade --root /rootfs --no-cache"
+    fi
+    smolvm machine run --net -v "$OUTPUT_DIR:/rootfs" --image "alpine:${ALPINE_BRANCH}" \
+        -- sh -c "apk add --root /rootfs --initdb --no-cache $APK_PACKAGES${APK_UPGRADE_CMD}"
     echo "Packages installed successfully"
 else
     echo "Error: smolvm is required to build the agent rootfs on macOS"

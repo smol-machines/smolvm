@@ -8,7 +8,7 @@
 //! - Configuration manifest
 
 use clap::{Args, Subcommand};
-use smolvm::agent::{AgentClient, AgentManager, VmResources};
+use smolvm::agent::{AgentClient, AgentManager, LaunchFeatures, VmResources};
 
 /// Default memory for packed VMs. Same as machine create — memory is elastic
 /// via virtio balloon, so the host only commits what the guest actually uses.
@@ -25,6 +25,20 @@ use smolvm_protocol::AgentResponse;
 use std::path::PathBuf;
 use tracing::{debug, info, warn};
 
+/// Floor for the temporary pack VM's storage disk (GiB). Matches the export
+/// helper's floor: a realistic image pull plus the agent rootfs needs more
+/// than the 20 GiB machine default.
+const PACK_VM_MIN_STORAGE_GIB: u64 = 64;
+
+/// Multiplier on an image's compressed layer total when sizing the pack VM's
+/// storage disk. Extraction inflates gzip'd layers ~3×; the rest is margin —
+/// the disk is sparse, so over-sizing costs nothing on the host.
+const PACK_VM_STORAGE_FACTOR: u64 = 8;
+
+/// Where the pack VM's agent unpacks a local archive shared at `/packed_layers`:
+/// the path a machine's first boot uses.
+const LOCAL_ARCHIVE_ROOTFS: &str = "/storage/image-archives/packed_layers/0000_rootfs";
+
 /// Package and run self-contained VM executables.
 #[derive(Subcommand, Debug)]
 pub enum PackCmd {
@@ -40,6 +54,10 @@ pub enum PackCmd {
     /// Pull a .smolmachine artifact from a registry
     Pull(PackPullCmd),
 
+    /// List pulled .smolmachine artifacts and where they are stored
+    #[command(alias = "ls")]
+    List(PackListCmd),
+
     /// Inspect a .smolmachine artifact in a registry (without downloading)
     Inspect(PackInspectCmd),
 
@@ -54,6 +72,7 @@ impl PackCmd {
             PackCmd::Run(cmd) => cmd.run(),
             PackCmd::Push(cmd) => cmd.run(),
             PackCmd::Pull(cmd) => cmd.run(),
+            PackCmd::List(cmd) => cmd.run(),
             PackCmd::Inspect(cmd) => cmd.run(),
             PackCmd::Prune(cmd) => cmd.run(),
         }
@@ -61,7 +80,7 @@ impl PackCmd {
 }
 
 /// Persist one running machine, including RAM and execution state, as a
-/// portable `.smolcheckpoint` artifact.
+/// portable `.checkpoint` file.
 #[derive(Args, Debug)]
 pub struct CheckpointCmd {
     /// Running machine to checkpoint.
@@ -77,19 +96,36 @@ pub struct CheckpointCmd {
     /// Export a stored checkpoint directory as one portable file.
     #[arg(long, value_name = "CHECKPOINT", conflicts_with = "store")]
     pub export_from: Option<PathBuf>,
+    /// With --export-from: which generation to export — `~N` (N back along
+    /// the history, `~0` is the checkpoint itself), a generation id, or an id
+    /// prefix. Quote `~N` in zsh, e.g. `--at '~1'`. See `machine checkpoint-log`.
+    #[arg(long, value_name = "GENERATION", requires = "export_from")]
+    pub at: Option<String>,
+    /// How many earlier generations to carry: with --store, the new checkpoint
+    /// retains them so any can be restored from it alone; with --export-from,
+    /// the exported file carries them (0 exports one generation in the classic
+    /// layout readable by older runtimes). Unchanged chunks are shared either
+    /// way, so history costs only the differences.
+    #[arg(long, value_name = "N", default_value_t = smolvm::portable_checkpoint::DEFAULT_HISTORY)]
+    pub history: usize,
 
     /// Reuse unchanged chunks here; output becomes a self-contained directory
     /// on the same filesystem (copy the whole directory to move it).
     #[arg(long, value_name = "DIR")]
     pub store: Option<PathBuf>,
 
-    /// Destination `.smolcheckpoint` file (directory with --store).
+    /// Destination `.checkpoint` file (directory with --store).
     #[arg(short = 'o', long, value_name = "PATH")]
     pub output: PathBuf,
 
     /// Directory under which large temporary checkpoint assets are staged.
     #[arg(long = "staging-dir", value_name = "DIR", conflicts_with = "store")]
     pub staging_dir: Option<PathBuf>,
+    /// Keep the machine's host directory mounts in the checkpoint. It then
+    /// restores only on a host where the same paths exist; each is attached
+    /// again at its guest path.
+    #[arg(long = "host-mounts")]
+    pub host_mounts: bool,
 
     /// Path to library directory containing libkrun and libkrunfw.
     #[arg(long, value_name = "DIR", hide = true)]
@@ -107,28 +143,39 @@ impl CheckpointCmd {
     /// Capture and package a live machine at one RAM/disk consistency boundary.
     pub fn run(self) -> smolvm::Result<()> {
         if let Some(source) = self.export_from {
-            let bytes = smolvm::checkpoint_store::export(&source, &self.output)
-                .map_err(|e| smolvm::Error::agent("export checkpoint", e.to_string()))?;
+            let (bytes, carried) = smolvm::portable_checkpoint::export_checkpoint(
+                &source,
+                self.at.as_deref(),
+                self.history,
+                &self.output,
+            )?;
             println!(
-                "Exported checkpoint to {} ({} MiB)",
+                "Exported checkpoint to {} ({} MiB{})",
                 self.output.display(),
-                bytes / (1024 * 1024)
+                bytes / (1024 * 1024),
+                if carried > 0 {
+                    format!(", carrying {carried} earlier generation(s)")
+                } else {
+                    String::new()
+                }
             );
             return Ok(());
         }
         let name = self
             .name
             .ok_or_else(|| smolvm::Error::config("checkpoint", "--name is required"))?;
-        let result = smolvm::portable_checkpoint::capture_to_path(
+        let result = smolvm::portable_checkpoint::capture_to_path_with_history(
             &name,
             &self.output,
             &smolvm::portable_checkpoint::CaptureOptions {
                 prepared_cache_budget_bytes: None,
+                host_mounts: self.host_mounts,
                 store_dir: self.store.clone(),
                 staging_dir: self.staging_dir,
                 lib_dir: self.lib_dir,
                 rootfs_dir: self.rootfs_dir,
             },
+            self.history,
         )?;
         println!(
             "Source resumed after {:.3}s; packaging continued in the background",
@@ -150,6 +197,191 @@ impl CheckpointCmd {
         }
         Ok(())
     }
+}
+
+/// Show the history a checkpoint carries, or every checkpoint a store knows.
+#[derive(Args, Debug)]
+pub struct CheckpointLogCmd {
+    /// A stored checkpoint directory: lists its own generation and every
+    /// earlier one it retains, newest first.
+    #[arg(
+        value_name = "CHECKPOINT",
+        required_unless_present = "store",
+        conflicts_with = "store"
+    )]
+    pub checkpoint: Option<PathBuf>,
+    /// A checkpoint store: lists every checkpoint published into it, oldest
+    /// first, with its parent.
+    #[arg(long, value_name = "DIR")]
+    pub store: Option<PathBuf>,
+    /// Only checkpoints of this machine (with --store).
+    #[arg(long, value_name = "NAME", requires = "store")]
+    pub machine: Option<String>,
+}
+
+impl CheckpointLogCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        if let Some(store) = self.store {
+            let records = smolvm::checkpoint_store::list_lineage(&store).map_err(|e| {
+                smolvm::Error::agent("read checkpoint store lineage", e.to_string())
+            })?;
+            let mut shown = 0;
+            for record in records.iter().filter(|r| {
+                self.machine
+                    .as_deref()
+                    .is_none_or(|m| m == record_machine(r))
+            }) {
+                let present = if std::path::Path::new(&record.path).is_dir() {
+                    ""
+                } else {
+                    "  (directory removed)"
+                };
+                println!(
+                    "{}  {}  {:<20}  parent {}  {}{}",
+                    &record.id[..12],
+                    record.created_at,
+                    record.machine,
+                    record
+                        .parent
+                        .as_deref()
+                        .map_or("-".to_string(), |p| p[..12].to_string()),
+                    record.path,
+                    present
+                );
+                shown += 1;
+            }
+            if shown == 0 {
+                println!("no checkpoints recorded in {}", store.display());
+            }
+            return Ok(());
+        }
+        let checkpoint = self
+            .checkpoint
+            .expect("clap requires a checkpoint or --store");
+        let generations = if checkpoint.is_file() {
+            // Files describe their history in the manifest; no unpacking needed.
+            let manifest = smolvm_pack::packer::read_manifest_from_sidecar(&checkpoint)
+                .map_err(|e| smolvm::Error::agent("read checkpoint manifest", e.to_string()))?;
+            let checkpoint_manifest = manifest.checkpoint.ok_or_else(|| {
+                smolvm::Error::config("checkpoint-log", "not a checkpoint artifact")
+            })?;
+            if checkpoint_manifest.history.is_empty() {
+                match checkpoint_manifest.lineage {
+                    Some(lineage) => vec![smolvm::checkpoint_store::Generation {
+                        id: lineage.id,
+                        parent: lineage.parent,
+                        machine: lineage.machine,
+                        created_at: lineage.created_at,
+                        data_bytes: 0,
+                        retained: false,
+                    }],
+                    None => Vec::new(),
+                }
+            } else {
+                smolvm::checkpoint_store::generations_from_history(&checkpoint_manifest.history)
+            }
+        } else {
+            smolvm::checkpoint_store::lineage_of(&checkpoint)
+                .map_err(|e| smolvm::Error::agent("read checkpoint history", e.to_string()))?
+        };
+        if generations.is_empty() {
+            println!(
+                "{} predates checkpoint history (no lineage recorded)",
+                checkpoint.display()
+            );
+            return Ok(());
+        }
+        for (depth, generation) in generations.iter().enumerate() {
+            let size = if generation.data_bytes > 0 {
+                format!("{} MiB data", generation.data_bytes / (1024 * 1024))
+            } else {
+                String::new()
+            };
+            println!(
+                "~{depth:<3} {}  {}  {:<20}  {size}{}",
+                &generation.id[..12],
+                generation.created_at,
+                generation.machine,
+                if generation.retained {
+                    ""
+                } else {
+                    "  (this checkpoint)"
+                }
+            );
+        }
+        println!(
+            "restore any of them: smolvm machine create --name <new> --from {} --at '~N'",
+            checkpoint.display()
+        );
+        Ok(())
+    }
+}
+
+/// How many restored checkpoints stay ready for a fast revisit.
+#[derive(Args, Debug, Clone, Copy)]
+pub struct RestoreCacheArgs {
+    /// Recently restored checkpoints to keep ready, so jumping back to one
+    /// clones it instead of rebuilding its RAM (0 turns the cache off)
+    #[arg(
+        long = "restore-cache-entries",
+        value_name = "N",
+        default_value_t = 3,
+        value_parser = clap::value_parser!(u8).range(0..=64)
+    )]
+    pub entries: u8,
+
+    /// Space the kept checkpoints may hold together, in GiB; each holds a whole
+    /// checkpoint's RAM and disks
+    #[arg(long = "restore-cache-gib", value_name = "GiB", default_value_t = 16)]
+    pub gib: u64,
+}
+
+impl RestoreCacheArgs {
+    pub fn cache(&self) -> smolvm::portable_checkpoint::RestoreCache {
+        smolvm::portable_checkpoint::RestoreCache {
+            entries: usize::from(self.entries),
+            max_bytes: self.gib.saturating_mul(1024 * 1024 * 1024),
+        }
+    }
+}
+
+/// Prewarm the bounded checkpoint cache without reserving a machine or ports.
+#[derive(Args, Debug)]
+pub struct WarmCheckpointCmd {
+    /// Incremental .smolcheckpoint directory to prepare
+    #[arg(long = "from")]
+    pub checkpoint: PathBuf,
+
+    #[command(flatten)]
+    pub restore_cache: RestoreCacheArgs,
+}
+
+impl WarmCheckpointCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let manifest = smolvm::checkpoint_store::read_manifest(&self.checkpoint)?;
+        let checkpoint = manifest
+            .checkpoint
+            .as_ref()
+            .ok_or_else(|| Error::config("warm checkpoint", "not a live checkpoint"))?;
+        smolvm::portable_checkpoint::validate_compatibility(checkpoint)?;
+        let base = smolvm::agent::restore_base_dir();
+        let parent = base.parent().expect("restore base has parent");
+        std::fs::create_dir_all(parent)?;
+        let staging = tempfile::Builder::new()
+            .prefix(".checkpoint-warm-")
+            .tempdir_in(parent)?;
+        smolvm::portable_checkpoint::materialize_for_restore(
+            &self.checkpoint,
+            &staging.path().join("payload"),
+            self.restore_cache.cache(),
+        )?;
+        println!("Checkpoint preparation completed");
+        Ok(())
+    }
+}
+
+fn record_machine(record: &smolvm::checkpoint_store::LineageRecord) -> &str {
+    &record.machine
 }
 
 /// Reclaim checkpoint cache objects that no retained checkpoint references.
@@ -188,7 +420,9 @@ impl PruneCheckpointStoreCmd {
 ///   smolvm pack create --from-vm myvm -o my-devenv
 #[derive(Args, Debug)]
 pub struct PackCreateCmd {
-    /// Container image to pack (e.g., alpine:latest, python:3.11-slim)
+    /// Container image to pack: a registry reference (alpine:latest, python:3.11-slim), a
+    /// `docker save` archive (./myapp.tar, or `-` to read one from stdin), or an unpacked
+    /// rootfs directory (./rootfs/)
     #[arg(
         long,
         short = 'I',
@@ -215,14 +449,22 @@ pub struct PackCreateCmd {
     pub output: PathBuf,
 
     /// Maximum vCPUs machines from this pack may use [default: 4, or the
-    /// Smolfile value]. A cap on consumption, not a reservation.
+    /// Smolfile/source VM value]. A cap on consumption, not a reservation.
     #[arg(long, value_name = "N")]
     pub cpus: Option<u8>,
 
     /// Maximum memory in MiB machines from this pack may use [default: 8192,
-    /// or the Smolfile value]. Elastic: only touched memory is committed.
+    /// or the Smolfile/source VM value]. Elastic: only touched memory is committed.
     #[arg(long, value_name = "MiB")]
     pub mem: Option<u32>,
+
+    /// Storage disk size in GiB for the temporary pack VM that pulls and
+    /// flattens the image. When omitted, the disk is sized from the image's
+    /// registry manifest (compressed layer total × headroom, floored at
+    /// [`PACK_VM_MIN_STORAGE_GIB`], which is also used when the manifest
+    /// can't be probed); pass this to override the estimate.
+    #[arg(long, value_name = "GiB")]
+    pub storage: Option<u64>,
 
     /// Target OCI platform for multi-arch images (e.g., linux/arm64, linux/amd64)
     ///
@@ -277,11 +519,147 @@ pub struct PackCreateCmd {
     #[arg(long = "staging-dir", value_name = "DIR")]
     pub staging_dir: Option<PathBuf>,
 
+    /// Custom DNS resolver for the VM that builds the pack. Defaults to the
+    /// host's own resolver; use this when that is not the resolver the pull
+    /// needs. For --from-vm, defaults to the machine's own --dns when it has one.
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
     #[command(flatten, next_help_heading = "Network")]
     pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
 }
 
+/// The lock file a pack holds inside its staging directory while it runs.
+const STAGING_LOCK: &str = ".in-use";
+
+/// A pack's staging directory, held for as long as the pack runs. The lock is
+/// declared first so it is released before the directory is removed.
+struct Staging {
+    _lock: std::fs::File,
+    dir: tempfile::TempDir,
+}
+
+/// Create this pack's staging directory under `root`, first removing any left
+/// by a pack that died without cleaning up (killed mid-run, the host restarted).
+/// Nothing else removes those, and each is as large as the image it packed.
+fn create_staging(root: &std::path::Path) -> smolvm::Result<Staging> {
+    sweep_abandoned_staging(
+        root,
+        std::time::Duration::from_secs(60),
+        std::time::Duration::from_secs(24 * 60 * 60),
+    );
+    let dir = tempfile::Builder::new()
+        .prefix("pack-staging-")
+        .tempdir_in(root)
+        .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+    let lock = std::fs::File::create(dir.path().join(STAGING_LOCK))
+        .and_then(|lock| lock.lock().map(|()| lock))
+        .map_err(|e| Error::agent("lock staging directory", e.to_string()))?;
+    Ok(Staging { _lock: lock, dir })
+}
+
+/// Remove the staging directories under `root` that no running pack holds.
+///
+/// A directory belongs to a pack only while that pack holds its lock. One newer
+/// than `settle` is left alone (its pack may not have locked it yet), and one
+/// from before staging carried a lock is removed only once older than `legacy`.
+fn sweep_abandoned_staging(
+    root: &std::path::Path,
+    settle: std::time::Duration,
+    legacy: std::time::Duration,
+) {
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let is_staging = entry
+            .file_name()
+            .to_string_lossy()
+            .starts_with("pack-staging-")
+            && entry.file_type().is_ok_and(|kind| kind.is_dir());
+        if !is_staging {
+            continue;
+        }
+        let age = entry
+            .metadata()
+            .and_then(|meta| meta.modified())
+            .ok()
+            .and_then(|modified| modified.elapsed().ok())
+            .unwrap_or_default();
+        let path = entry.path();
+        let abandoned = match std::fs::File::open(path.join(STAGING_LOCK)) {
+            Ok(lock) => age >= settle && lock.try_lock().is_ok(),
+            Err(_) => age >= legacy,
+        };
+        if abandoned {
+            match std::fs::remove_dir_all(&path) {
+                Ok(()) => {
+                    info!(path = %path.display(), "removed an abandoned pack staging directory")
+                }
+                Err(e) => {
+                    warn!(path = %path.display(), error = %e, "could not remove an abandoned pack staging directory")
+                }
+            }
+        }
+    }
+}
+
 impl PackCreateCmd {
+    /// Storage disk size (GiB) for the temporary pack VM.
+    ///
+    /// `--storage` wins; otherwise the image's registry manifest is probed
+    /// host-side and the disk is sized at `compressed ×
+    /// PACK_VM_STORAGE_FACTOR`, floored at `PACK_VM_MIN_STORAGE_GIB`. The
+    /// factor covers gzip's ~3× expansion on extraction plus margin; the floor
+    /// matches the export helper's. A local source is sized the same way from
+    /// its bytes on the host. When the manifest can't be probed (offline
+    /// registry) the floor is used: the disk is sparse, so over-sizing is free,
+    /// while under-sizing fails the pull mid-way.
+    fn pack_vm_storage_gib(&self, image: &str, oci_platform: Option<&str>) -> u64 {
+        if let Some(gib) = self.storage {
+            return gib;
+        }
+        if let Some(dir) = smolvm::data::image_source::packed_layers_dir_for_ref(image) {
+            return smolvm::pack_export::directory_apparent_bytes(&dir)
+                .div_ceil(smolvm::data::consts::BYTES_PER_GIB)
+                .saturating_mul(PACK_VM_STORAGE_FACTOR)
+                .max(PACK_VM_MIN_STORAGE_GIB);
+        }
+        let rt = match tokio::runtime::Runtime::new() {
+            Ok(rt) => rt,
+            Err(e) => {
+                warn!(error = %e, "cannot create runtime for image size probe; using the storage floor");
+                return PACK_VM_MIN_STORAGE_GIB;
+            }
+        };
+        match rt.block_on(smolvm::image_store::image_compressed_size(
+            image,
+            &smolvm::registry::PullAuth::FromConfig,
+            oci_platform,
+        )) {
+            Ok(compressed_bytes) => {
+                let compressed_gib = compressed_bytes.div_ceil(smolvm::data::consts::BYTES_PER_GIB);
+                let gib = compressed_gib
+                    .saturating_mul(PACK_VM_STORAGE_FACTOR)
+                    .max(PACK_VM_MIN_STORAGE_GIB);
+                info!(
+                    image = %image,
+                    compressed_gib, gib,
+                    "sized pack VM storage from image manifest"
+                );
+                gib
+            }
+            Err(e) => {
+                warn!(
+                    image = %image,
+                    error = %e,
+                    "image size probe failed; using the pack VM storage floor"
+                );
+                PACK_VM_MIN_STORAGE_GIB
+            }
+        }
+    }
+
     /// Resolve the directory under which the staging temp dir is created.
     ///
     /// Precedence: `--staging-dir` → `SMOLVM_PACK_STAGING` → the disk-backed
@@ -349,38 +727,37 @@ impl PackCreateCmd {
             )
         })?;
 
-        // `pack create` pulls directly from an OCI container registry. If a user passes
-        // a local file path, image archive, or rootfs directory, provide a helpful diagnostic
-        // rather than failing on OCI reference character validation.
-        let image_trimmed = image.trim();
-        if image_trimmed.starts_with("./")
-            || image_trimmed.starts_with("../")
-            || image_trimmed.starts_with('/')
-            || image_trimmed.starts_with('~')
-            || image_trimmed.ends_with(".tar")
-            || image_trimmed.ends_with(".tar.gz")
-            || image_trimmed.ends_with(".tar.zst")
-            || image_trimmed.ends_with(".tgz")
-            || std::path::Path::new(image_trimmed).exists()
+        // A local archive or rootfs directory is staged on the host exactly as
+        // `machine create` stages it, shared into the pack VM, and unpacked there
+        // as on a machine's first boot. The manifest names the same `local:` or
+        // `local-dir:` token the machine would carry, which the from-vm export and
+        // `machine create --from` both read as the image's kind.
+        use smolvm::data::image_source::{classify, resolve, ImageSource, ResolvedImage};
+        let source = classify(&image);
+        if let (ImageSource::Archive(_) | ImageSource::Directory(_), Some(platform)) =
+            (&source, pack_config.oci_platform.as_deref())
         {
             return Err(Error::config(
                 "pack create",
                 format!(
-                    "'--image' accepts container registry references (e.g. 'alpine:latest'). \
-                     To create a packed executable from a local image archive or rootfs directory ('{image}'), \
-                     first create the machine with 'smolvm machine create --image {image}' and then pack it \
-                     with 'smolvm pack create --from-vm <name>'."
+                    "--oci-platform {platform} selects among a registry image's platforms, \
+                     and the local image '{image}' carries only the one it was built for."
                 ),
             ));
         }
+        let (image, packed_layers_dir) = match resolve(source)? {
+            ResolvedImage::Registry(reference) => (reference, None),
+            ResolvedImage::Local {
+                reference,
+                packed_layers_dir,
+            } => (reference, Some(packed_layers_dir)),
+        };
 
         info!(image = %image, output = %self.output.display(), "packing image");
 
         // Create temporary staging directory
-        let temp_dir = tempfile::Builder::new()
-            .prefix("pack-staging-")
-            .tempdir_in(self.staging_root()?)
-            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+        let staging = create_staging(&self.staging_root()?)?;
+        let temp_dir = &staging.dir;
         let staging_dir = temp_dir.path().join("staging");
 
         // Start a temporary agent VM with a unique identity so concurrent
@@ -452,25 +829,48 @@ impl PackCreateCmd {
         }
 
         println!("Starting agent VM...");
-        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, None, None)?;
-        manager.start_with_config(
+        // Size the pack VM's storage disk for the image it has to hold. The
+        // default 20 GiB cannot fit a CI-scale image's extracted layers, and
+        // the disk cannot grow after boot — so the registry manifest (the only
+        // pre-pull bound on pull size) sets the floor here.
+        let pack_storage_gib =
+            Some(self.pack_vm_storage_gib(&image, pack_config.oci_platform.as_deref()));
+        let manager = AgentManager::for_vm_with_sizes(&pack_vm_name, pack_storage_gib, None)?;
+        // A local source pulls nothing, so its pack VM has no network.
+        let network = packed_layers_dir.is_none();
+        manager.start_with_full_config(
+            Vec::new(),
             Vec::new(),
             VmResources {
                 cpus: 4,
                 memory_mib: 8192,
-                network: true,
+                network,
                 network_backend: None,
-                dns: None,
+                dns: self.dns,
+                dns_options: Vec::new(),
+                shm_size: None,
                 network_name: None,
+                guest_subnet: None,
+                switch: None,
                 gpu: false,
                 nested_virt: false,
                 cuda: false,
-                storage_gib: None,
+                storage_gib: pack_storage_gib,
                 overlay_gib: None,
                 block_io: Default::default(),
+                disk_durability: Default::default(),
+                disks: Vec::new(),
+                cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 gpu_vram_mib: None,
                 rosetta: false,
                 allowed_cidrs: None,
+                egress_rules: Vec::new(),
+            },
+            LaunchFeatures {
+                packed_layers_dir: packed_layers_dir.clone(),
+                ..Default::default()
             },
         )?;
         let mut guard = PackVmGuard {
@@ -490,10 +890,23 @@ impl PackCreateCmd {
         )?;
         debug!(image_info = ?image_info, "image pulled");
 
-        println!(
-            "Image: {} ({} layers, {} bytes)",
-            image, image_info.layer_count, image_info.size
-        );
+        // The pull above unpacked a local archive onto the pack VM's disk, at the
+        // path a machine's first boot uses, and refused one built for another
+        // architecture; a rootfs directory is read in place from the share.
+        // Either is exported below as the pack's single layer.
+        let local_rootfs = packed_layers_dir.as_ref().map(|_| {
+            if image.starts_with("local-dir:") {
+                "/packed_layers"
+            } else {
+                LOCAL_ARCHIVE_ROOTFS
+            }
+        });
+        if local_rootfs.is_none() {
+            println!(
+                "Image: {} ({} layers, {} bytes)",
+                image, image_info.layer_count, image_info.size
+            );
+        }
 
         // Create asset collector and collect base assets
         let mut collector = AssetCollector::new(staging_dir.clone())
@@ -505,7 +918,7 @@ impl PackCreateCmd {
         // so the packed binary has one lowerdir at runtime. Without this, the
         // overlayfs multi-lowerdir mount fails on virtiofs-backed layers and
         // falls back to a 15-second physical merge on every first exec.
-        if image_info.layer_count <= 1 {
+        if local_rootfs.is_none() && image_info.layer_count <= 1 {
             // Single layer — export directly, no merge needed.
             let layer_digest = &image_info.layers[0];
             let prefix = format!("  Layer 1/1: {}", &layer_digest[..19]);
@@ -518,98 +931,85 @@ impl PackCreateCmd {
                 .map_err(|e| Error::agent("collect layers", e.to_string()))?;
         } else {
             // Multiple layers — merge in the VM so runtime gets a single
-            // lowerdir that always mounts instantly.
-            println!(
-                "Merging {} layers in VM (one-time cost)...",
-                image_info.layer_count
-            );
+            // lowerdir that always mounts instantly. The merge is a read-only
+            // overlay mount whose tar streams straight to the host: no merged
+            // copy and no staged archive on the guest's RAM-sized /tmp, and
+            // whiteouts/opaque markers resolve exactly as the runtime applies
+            // them — a `cp -a` merge resurrected deleted paths.
+            // The agent stacks lowerdirs topmost-first, the same order the
+            // runtime container mount uses; image_info.layers lists them
+            // bottom-up, so reverse. Driven agent-side rather than through
+            // `mount(8)` over VmExec: `mount(8)` rejects a `lowerdir=` value
+            // past ~255 bytes, which any image with four or more layers
+            // exceeds. A single directory is archived as it is.
+            let stack: Vec<String> = match local_rootfs {
+                Some(rootfs) => vec![rootfs.to_string()],
+                None => {
+                    println!(
+                        "Merging {} layers in VM (one-time cost)...",
+                        image_info.layer_count
+                    );
+                    image_info
+                        .layers
+                        .iter()
+                        .rev()
+                        .map(|d| {
+                            let id = d.strip_prefix("sha256:").unwrap_or(d);
+                            format!("/storage/layers/{}", id)
+                        })
+                        .collect()
+                }
+            };
 
-            // Build the merge command: extract each layer in order (bottom
-            // first), then tar the result. Layer order in image_info.layers
-            // is bottom-to-top, which is the correct copy order.
-            let layer_paths: Vec<String> = image_info
-                .layers
-                .iter()
-                .map(|d| {
-                    let id = d.strip_prefix("sha256:").unwrap_or(d);
-                    format!("/storage/layers/{}", id)
-                })
-                .collect();
-
-            // Copy layers bottom-up into /tmp/merged, then tar
-            let mut merge_script = String::from("set -e\nmkdir -p /tmp/merged\n");
-            for (i, layer_path) in layer_paths.iter().enumerate() {
-                // cp -a preserves symlinks, permissions, ownership.
-                // Ignore exit code: cp may fail on device files or sockets
-                // that can't be copied, but the layer content is intact.
-                // Redirect stderr so warnings are visible in the output.
-                merge_script.push_str(&format!(
-                    "echo 'Merging layer {}/{}...'\n\
-                     cp -a {}/. /tmp/merged/ || true\n",
-                    i + 1,
-                    image_info.layer_count,
-                    layer_path
-                ));
-            }
-            // Verify disk space wasn't exhausted during merge
-            merge_script.push_str(
-                "if ! df /tmp/merged | awk 'NR==2{if($4<1024){exit 1}}'; then\n\
-                 echo 'MERGE_FAIL: disk full'; exit 1\nfi\n\
-                 echo 'Creating merged tar...'\n\
-                 tar cf /tmp/merged-layers.tar -C /tmp/merged .\n\
-                 echo 'MERGE_OK'\n",
-            );
-
-            let (exit_code, stdout, stderr) = client.vm_exec(
-                vec!["sh".to_string(), "-c".to_string(), merge_script],
-                vec![],
-                None,
-                None,
-                None,
-            )?;
-
-            // stdout/stderr from vm_exec are now Vec<u8>; convert lossily
-            // for content checks and error messages (merge output is ASCII).
-            let stdout_str = String::from_utf8_lossy(&stdout);
-            let stderr_str = String::from_utf8_lossy(&stderr);
-            if exit_code != 0 || !stdout_str.contains("MERGE_OK") {
-                return Err(Error::agent(
-                    "merge layers",
-                    format!(
-                        "layer merge failed (exit {}): {}",
-                        exit_code,
-                        if stderr_str.is_empty() {
-                            &stdout_str
-                        } else {
-                            &stderr_str
-                        }
-                    ),
-                ));
-            }
-
-            // Download the merged tar — streamed to disk (16 MB chunks,
-            // never holds the full tar in memory).
+            // Stream the merged tar to disk (never buffered whole in memory,
+            // never staged in the guest), then content-address it. Stage in
+            // the layers dir so the final rename is atomic on the same
+            // filesystem.
             print!("  Exporting merged layer...");
             let _ = std::io::Write::flush(&mut std::io::stdout());
-            let merged_hash = hex::encode(Sha256::digest(
-                format!("merged-{}", image_info.digest).as_bytes(),
-            ));
-            let merged_digest = format!("sha256:{}", merged_hash);
-            let merged_file = collector.layer_staging_path(&merged_digest);
-
+            let tmp_file = collector
+                .layer_staging_path(&format!("sha256:{}", "0".repeat(64)))
+                .with_file_name("merged-layers.tmp");
             let total_bytes = client
-                .read_file_to_path_capped(
-                    "/tmp/merged-layers.tar",
-                    &merged_file,
+                .flatten_layers_to_path(
+                    &stack,
+                    &tmp_file,
                     smolvm::agent::pack_export_max_total(),
                     |_| {},
                 )
                 .map_err(|e| Error::agent("export merged layer", e.to_string()))?;
-            println!(" {} MB done", total_bytes / (1024 * 1024));
+            if total_bytes == 0 {
+                let _ = std::fs::remove_file(&tmp_file);
+                return Err(Error::agent(
+                    "export merged layer",
+                    "merged layer tar is empty",
+                ));
+            }
 
+            let mut hasher = Sha256::new();
+            {
+                use std::io::Read;
+                let mut f = std::fs::File::open(&tmp_file)
+                    .map_err(|e| Error::agent("read merged layer", e.to_string()))?;
+                let mut buf = vec![0u8; 4 * 1024 * 1024];
+                loop {
+                    let n = f
+                        .read(&mut buf)
+                        .map_err(|e| Error::agent("hash merged layer", e.to_string()))?;
+                    if n == 0 {
+                        break;
+                    }
+                    hasher.update(&buf[..n]);
+                }
+            }
+            let merged_digest = format!("sha256:{}", hex::encode(hasher.finalize()));
+            let merged_file = collector.layer_staging_path(&merged_digest);
+            std::fs::rename(&tmp_file, &merged_file)
+                .map_err(|e| Error::agent("write merged layer", e.to_string()))?;
             collector
                 .register_layer(&merged_digest)
                 .map_err(|e| Error::agent("register merged layer", e.to_string()))?;
+            println!(" {} MB done", total_bytes / (1024 * 1024));
         }
 
         // Stop agent and clean up temp VM data. Propagates stop errors
@@ -625,6 +1025,10 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.block_private = pack_config.block_private;
+        manifest.allowed_cidrs = pack_config.allowed_cidrs;
+        manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
+        manifest.egress_rules = pack_config.egress_rules;
         manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
@@ -707,13 +1111,23 @@ impl PackCreateCmd {
             );
         }
 
+        // A plain pack carries no credential bindings either (only a live
+        // checkpoint does); a workload that expects its `--credential` env var
+        // would otherwise fail with nothing pointing at the cause.
+        if vm.credential_policy.as_ref().is_some_and(|p| !p.is_empty()) {
+            warn!(
+                "VM '{}' has credential bindings; .smolmachine artifacts do not carry them — \
+                 pass --credential again when creating machines from this artifact, or use \
+                 `machine checkpoint`, which carries the bindings",
+                vm_name
+            );
+        }
+
         println!("Packing VM '{}' snapshot...", vm_name);
 
         // 2. Create temporary staging directory
-        let temp_dir = tempfile::Builder::new()
-            .prefix("pack-staging-")
-            .tempdir_in(self.staging_root()?)
-            .map_err(|e| Error::agent("create temp directory", e.to_string()))?;
+        let staging = create_staging(&self.staging_root()?)?;
+        let temp_dir = &staging.dir;
         let staging_dir = temp_dir.path().join("staging");
 
         let mut collector = AssetCollector::new(staging_dir.clone())
@@ -732,6 +1146,7 @@ impl PackCreateCmd {
             no_proxy: self.proxy_opts.no_proxy(),
             rebase_from_image: self.rebase_from_image,
             include_workspace: self.include_workspace,
+            dns: smolvm::pack_export::export_dns(self.dns, vm),
         };
         let assets = smolvm::pack_export::collect_from_vm_assets(
             &mut collector,
@@ -743,14 +1158,17 @@ impl PackCreateCmd {
 
         // 4. Resolve Smolfile overrides if provided
         //    Precedence: CLI > [artifact] > Smolfile top-level > VmRecord > default
-        let pack_config = crate::cli::smolfile::resolve_pack_config(
-            None, // no image for --from-vm
-            self.entrypoint.clone(),
-            self.cpus,
-            self.mem,
-            self.oci_platform.clone(),
-            self.gpu,
-            self.smolfile.clone(),
+        let pack_config = crate::cli::smolfile::resolve_pack_config_with_defaults(
+            crate::cli::smolfile::PackConfigInputs {
+                cli_image: None, // no image for --from-vm
+                cli_entrypoint: self.entrypoint.clone(),
+                cli_cpus: self.cpus,
+                cli_mem: self.mem,
+                cli_oci_platform: self.oci_platform.clone(),
+                cli_gpu: self.gpu,
+                smolfile_path: self.smolfile.clone(),
+            },
+            (vm.cpus, vm.mem),
         )?;
 
         // 5. Build manifest: shared VM-derived baseline, then local overrides.
@@ -768,7 +1186,23 @@ impl PackCreateCmd {
         // Smolfile > source VM record > default
         if let Some(net) = pack_config.net {
             manifest.network = net;
+            if !net {
+                manifest.block_private = None;
+                manifest.allowed_cidrs = None;
+                manifest.dns_filter_hosts = None;
+                manifest.egress_rules.clear();
+            }
         }
+        let policy = smolvm::pack_export::validated_manifest_egress(&manifest)?.with_cli_overrides(
+            pack_config.allowed_cidrs,
+            pack_config.dns_filter_hosts,
+            pack_config.block_private,
+            pack_config.egress_rules,
+        );
+        manifest.allowed_cidrs = policy.allowed_cidrs;
+        manifest.dns_filter_hosts = policy.dns_filter_hosts;
+        manifest.block_private = policy.block_private;
+        manifest.egress_rules = policy.egress_rules;
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || manifest.gpu;
 
@@ -1204,6 +1638,8 @@ impl PackCreateCmd {
 ///   smolvm pack prune --keep 2     # keep 2 most recent
 ///   smolvm pack prune --all        # remove everything
 ///   smolvm pack prune --dry-run    # show what would be removed
+///   smolvm pack prune --artifact deadbeef          # remove one pack's extraction
+///   smolvm pack prune --artifact ./app.smolmachine # same, named by its file
 #[derive(Args, Debug)]
 pub struct PackPruneCmd {
     /// Number of unused cached entries to keep (default: 5)
@@ -1217,10 +1653,47 @@ pub struct PackPruneCmd {
     /// Show what would be removed without actually removing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Remove only this pack's shared extraction and COW bases (Linux), named
+    /// by its 8-digit checksum (its directory under _shared/) or its
+    /// .smolmachine file. Skipped if a machine still references it.
+    #[arg(long, value_name = "SHA8|PATH", conflicts_with_all = ["keep", "all"])]
+    pub artifact: Option<String>,
+}
+
+/// The cache key of an `--artifact` value: the 8-digit checksum itself, or the
+/// footer checksum of the `.smolmachine` file it names.
+fn artifact_checksum(artifact: &str) -> smolvm::Result<String> {
+    let is_checksum = artifact.len() == 8
+        && artifact
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if is_checksum {
+        return Ok(artifact.to_string());
+    }
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact).map_err(|e| {
+        Error::config(
+            format!("read --artifact '{artifact}' as a .smolmachine file"),
+            e.to_string(),
+        )
+    })?;
+    Ok(format!("{:08x}", footer.checksum))
 }
 
 impl PackPruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        if self.artifact.is_some() {
+            return Err(Error::config(
+                "pack prune --artifact",
+                "shared pack extractions only exist on Linux",
+            ));
+        }
+        let only = self
+            .artifact
+            .as_deref()
+            .map(artifact_checksum)
+            .transpose()?;
         let keep = if self.all { 0 } else { self.keep };
 
         let mut total_freed: u64 = 0;
@@ -1231,10 +1704,15 @@ impl PackPruneCmd {
         // without first deleting unrelated generic pack caches.
         #[cfg(target_os = "linux")]
         {
-            let report = smolvm::artifact_cache::prune_artifact_caches(keep, self.dry_run)
-                .map_err(|error| {
-                    smolvm::Error::agent("prune shared artifact caches", error.to_string())
-                })?;
+            let report = match &only {
+                Some(checksum) => {
+                    smolvm::artifact_cache::prune_artifact_cache(checksum, self.dry_run)
+                }
+                None => smolvm::artifact_cache::prune_artifact_caches(keep, self.dry_run),
+            }
+            .map_err(|error| {
+                smolvm::Error::agent("prune shared artifact caches", error.to_string())
+            })?;
             if report.referenced_entries > 0 {
                 let noun = if report.referenced_entries == 1 {
                     "entry"
@@ -1273,8 +1751,9 @@ impl PackPruneCmd {
             }
         }
 
-        // Clean pack sidecar cache
-        if let Some(base) = dirs::cache_dir() {
+        // Clean pack sidecar cache. --artifact stops at the shared extraction: a
+        // pack's entry here also holds its daemon's disks, and packs share libs.
+        if let Some(base) = dirs::cache_dir().filter(|_| only.is_none()) {
             let pack_cache = base.join("smolvm-pack");
             let (freed, removed) = self.prune_cache_dir(&pack_cache, keep, "pack cache")?;
             total_freed += freed;
@@ -1319,7 +1798,7 @@ impl PackPruneCmd {
         }
 
         // Collect entries with modification time (skip entries we can't stat)
-        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = vec![];
+        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = vec![];
         let read_dir = match std::fs::read_dir(base) {
             Ok(rd) => rd,
             Err(e) => {
@@ -1346,8 +1825,7 @@ impl PackPruneCmd {
             let modified = metadata
                 .modified()
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let size = dir_size(&path);
-            entries.push((path, modified, size));
+            entries.push((path, modified));
         }
 
         // Sort by most recently modified (newest first)
@@ -1363,18 +1841,19 @@ impl PackPruneCmd {
         let mut freed: u64 = 0;
         let mut removed: usize = 0;
 
-        for (path, _, size) in to_remove {
+        for (path, _) in to_remove {
             // Skip caches that have active leases (running VMs or daemons).
             if smolvm_pack::extract::has_active_leases(path) {
                 println!("  skipping in-use cache: {} (active lease)", path.display());
                 continue;
             }
 
+            let size = dir_size(path);
             if self.dry_run {
                 println!(
                     "  would remove: {} ({})",
                     path.display(),
-                    crate::cli::format_bytes(*size)
+                    crate::cli::format_bytes(size)
                 );
             } else {
                 // Detach any mounted case-sensitive volume before removing.
@@ -1487,7 +1966,9 @@ impl PackPullCmd {
             .or(parsed.tag.as_deref())
             .unwrap_or("latest");
 
-        eprintln!("Pulling {}/{}:{}", parsed.registry, repo, tag_or_digest);
+        let separator = if parsed.digest.is_some() { '@' } else { ':' };
+        let qualified = format!("{}/{}{}{}", parsed.registry, repo, separator, tag_or_digest);
+        eprintln!("Pulling {qualified}");
 
         let rt = tokio::runtime::Runtime::new()
             .map_err(|e| Error::agent("create tokio runtime", e.to_string()))?;
@@ -1544,12 +2025,21 @@ impl PackPullCmd {
             eprintln!("Using cached blob ({})", result.digest);
         }
 
+        let into_cache = self.output.is_none();
         let dest = self.output.unwrap_or(result.path);
         eprintln!(
             "Pulled successfully -> {} ({})",
             dest.display(),
             crate::cli::format_bytes(result.size),
         );
+        if into_cache {
+            // The blob path is not meant to be typed: name the artifact by the
+            // reference it was pulled as, which reuses this cached copy. The
+            // registry host stays in: `--image` sends a bare name to Docker Hub.
+            eprintln!(
+                "\nCreate a machine from it:\n  smolvm machine create --name <name> --image {qualified}\nList pulled artifacts: smolvm pack list",
+            );
+        }
 
         // Warn if the artifact targets a different host platform.
         // This is not an error — the user may be inspecting or transferring
@@ -1568,6 +2058,129 @@ impl PackPullCmd {
 
         Ok(())
     }
+}
+
+/// List the .smolmachine artifacts in the local registry cache.
+///
+/// Shows each pulled reference, the blob it resolved to, and the blob's path,
+/// which works anywhere a `.smolmachine` file does. A blob with no reference
+/// came from a portable checkpoint or a pull by an older smolvm.
+///
+/// Examples:
+///   smolvm pack list
+///   smolvm pack list --json
+#[derive(Args, Debug)]
+pub struct PackListCmd {
+    /// Output as JSON
+    #[arg(long)]
+    pub json: bool,
+}
+
+impl PackListCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let cache = smolvm_registry::BlobCache::open_default()
+            .map_err(|e| Error::agent("open blob cache", e.to_string()))?;
+        let artifacts = cache
+            .list_artifacts()
+            .map_err(|e| Error::agent("list blob cache", e.to_string()))?;
+
+        if self.json {
+            let out = serde_json::to_string_pretty(&artifacts)
+                .map_err(|e| Error::agent("serialize artifacts", e.to_string()))?;
+            println!("{out}");
+            return Ok(());
+        }
+        if artifacts.is_empty() {
+            println!("No pulled artifacts. Pull one with: smolvm pack pull <reference>");
+            return Ok(());
+        }
+
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |d| d.as_secs());
+        let mut rows: Vec<[String; 5]> = Vec::new();
+        for artifact in &artifacts {
+            let digest = short_digest(&artifact.digest);
+            let size = crate::cli::format_bytes(artifact.size);
+            let path = artifact.path.display().to_string();
+            if artifact.refs.is_empty() {
+                rows.push(["<none>".into(), digest, size, "-".into(), path]);
+                continue;
+            }
+            for pulled in &artifact.refs {
+                rows.push([
+                    display_reference(pulled),
+                    digest.clone(),
+                    size.clone(),
+                    format_age(now.saturating_sub(pulled.pulled_at)),
+                    path.clone(),
+                ]);
+            }
+        }
+        let header = ["REFERENCE", "DIGEST", "SIZE", "PULLED", "PATH"];
+        let widths: Vec<usize> = (0..4)
+            .map(|i| {
+                rows.iter()
+                    .map(|r| r[i].len())
+                    .chain([header[i].len()])
+                    .max()
+                    .unwrap_or(0)
+            })
+            .collect();
+        let print = |r: [&str; 5]| {
+            println!(
+                "{:w0$}  {:w1$}  {:w2$}  {:w3$}  {}",
+                r[0],
+                r[1],
+                r[2],
+                r[3],
+                r[4],
+                w0 = widths[0],
+                w1 = widths[1],
+                w2 = widths[2],
+                w3 = widths[3],
+            );
+        };
+        print(header);
+        for r in &rows {
+            print([&r[0], &r[1], &r[2], &r[3], &r[4]]);
+        }
+        Ok(())
+    }
+}
+
+/// `registry/repo:tag`, or `registry/repo@sha256:…` for a digest pull.
+fn display_reference(pulled: &smolvm_registry::PulledRef) -> String {
+    let separator = if pulled.reference.starts_with("sha256:") {
+        '@'
+    } else {
+        ':'
+    };
+    format!(
+        "{}/{}{}{}",
+        pulled.registry, pulled.repository, separator, pulled.reference
+    )
+}
+
+/// The first 12 hex characters of a `sha256:` digest, as `docker images` shows.
+fn short_digest(digest: &str) -> String {
+    digest
+        .strip_prefix("sha256:")
+        .unwrap_or(digest)
+        .chars()
+        .take(12)
+        .collect()
+}
+
+/// How long ago, coarsely: `45 seconds ago`, `3 hours ago`, `2 days ago`.
+fn format_age(secs: u64) -> String {
+    let (n, unit) = match secs {
+        0..=59 => (secs, "second"),
+        60..=3599 => (secs / 60, "minute"),
+        3600..=86_399 => (secs / 3600, "hour"),
+        _ => (secs / 86_400, "day"),
+    };
+    format!("{n} {unit}{} ago", if n == 1 { "" } else { "s" })
 }
 
 /// Inspect a .smolmachine artifact in a registry without downloading the full artifact.
@@ -1804,6 +2417,65 @@ fn dir_size(path: &std::path::Path) -> u64 {
 mod tests {
     use super::*;
 
+    #[test]
+    fn pack_list_formats_references_digests_and_ages() {
+        let pulled = |reference: &str| smolvm_registry::PulledRef {
+            registry: "registry.smolmachines.com".into(),
+            repository: "library/pi".into(),
+            reference: reference.into(),
+            digest: String::new(),
+            pulled_at: 0,
+        };
+        assert_eq!(
+            display_reference(&pulled("latest")),
+            "registry.smolmachines.com/library/pi:latest"
+        );
+        assert_eq!(
+            display_reference(&pulled("sha256:abc")),
+            "registry.smolmachines.com/library/pi@sha256:abc"
+        );
+        assert_eq!(short_digest("sha256:7197c078314f9a5a9490"), "7197c078314f");
+        assert_eq!(format_age(1), "1 second ago");
+        assert_eq!(format_age(150), "2 minutes ago");
+        assert_eq!(format_age(3600), "1 hour ago");
+        assert_eq!(format_age(3 * 86_400), "3 days ago");
+    }
+
+    #[test]
+    fn prune_artifact_takes_a_checksum_or_a_smolmachine_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("app.smolmachine");
+        let footer = smolvm_pack::format::PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 0,
+            manifest_offset: 0,
+            manifest_size: 0,
+            checksum: 0x0ead_beef,
+        };
+        std::fs::write(&sidecar, footer.to_bytes()).unwrap();
+
+        assert_eq!(artifact_checksum("cafebabe").unwrap(), "cafebabe");
+        assert_eq!(
+            artifact_checksum(sidecar.to_str().unwrap()).unwrap(),
+            "0eadbeef"
+        );
+        for rejected in ["cafe", "cafebabe0", "CAFEBABE", "../cafebabe"] {
+            assert!(artifact_checksum(rejected).is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn prune_artifact_excludes_keep_and_all() {
+        use clap::Args as _;
+        let parse = |args: &[&str]| {
+            PackPruneCmd::augment_args(clap::Command::new("prune")).try_get_matches_from(args)
+        };
+        assert!(parse(&["prune", "--artifact", "cafebabe", "--dry-run"]).is_ok());
+        assert!(parse(&["prune", "--artifact", "cafebabe", "--all"]).is_err());
+        assert!(parse(&["prune", "--artifact", "cafebabe", "--keep", "1"]).is_err());
+    }
+
     /// Verify that dladdr-based libkrun discovery finds the loaded library.
     ///
     /// This test works because the test binary links against libkrun the same
@@ -1929,16 +2601,16 @@ mod tests {
         );
     }
 
-    #[test]
-    fn pack_create_rejects_local_archive_paths_with_clear_diagnostic() {
-        let cmd = PackCreateCmd {
-            image: Some("./local-image.tar".to_string()),
+    fn pack_create(image: &str) -> PackCreateCmd {
+        PackCreateCmd {
+            image: Some(image.to_string()),
             from_vm: None,
             rebase_from_image: false,
             include_workspace: false,
             output: PathBuf::from("test-output"),
             cpus: Some(2),
             mem: Some(1024),
+            storage: None,
             oci_platform: None,
             entrypoint: None,
             no_sign: false,
@@ -1947,20 +2619,92 @@ mod tests {
             lib_dir: None,
             rootfs_dir: None,
             smolfile: None,
+            dns: None,
             gpu: false,
             staging_dir: None,
             proxy_opts: crate::cli::proxy_opts::ProxyOpts::default(),
-        };
+        }
+    }
 
-        let err = cmd.run().expect_err("local archive path must be rejected");
-        let err_msg = err.to_string();
-        assert!(
-            err_msg.contains("'--image' accepts container registry references"),
-            "Expected registry reference explanation, got: {err_msg}"
+    /// A local image carries one platform, so `--oci-platform` has nothing to
+    /// select. Refused before anything is staged: the archive here does not
+    /// even exist.
+    #[test]
+    fn a_local_image_with_an_oci_platform_is_refused_before_staging() {
+        let rootfs = tempfile::tempdir().unwrap();
+        for image in ["./missing.tar", rootfs.path().to_str().unwrap()] {
+            let mut cmd = pack_create(image);
+            cmd.oci_platform = Some("linux/amd64".to_string());
+            let message = cmd.run().expect_err("must be refused").to_string();
+            assert!(
+                message.contains("--oci-platform") && message.contains(image),
+                "{message}"
+            );
+        }
+    }
+
+    /// The pack VM unpacks a local archive onto its own disk, so the disk grows
+    /// with the source the way it grows with a registry image's layers.
+    #[test]
+    fn the_pack_vm_disk_is_sized_from_a_local_source() {
+        let source = tempfile::tempdir().unwrap();
+        let cmd = pack_create("unused");
+        let reference = format!("local-dir:{}", source.path().display());
+        assert_eq!(
+            cmd.pack_vm_storage_gib(&reference, None),
+            PACK_VM_MIN_STORAGE_GIB
         );
-        assert!(
-            err_msg.contains("pack create --from-vm"),
-            "Expected recommendation to use pack create --from-vm, got: {err_msg}"
+        std::fs::File::create(source.path().join("archive.tar"))
+            .unwrap()
+            .set_len(100 * smolvm::data::consts::BYTES_PER_GIB)
+            .unwrap();
+        assert_eq!(
+            cmd.pack_vm_storage_gib(&reference, None),
+            100 * PACK_VM_STORAGE_FACTOR
         );
+    }
+}
+
+#[cfg(test)]
+mod staging_tests {
+    use super::*;
+    use std::time::Duration;
+
+    // A pack killed mid-run leaves its staging directory behind; the next pack
+    // removes it, but never one a running pack still holds, nor anything else.
+    #[test]
+    fn only_abandoned_staging_directories_are_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let root = tempfile::tempdir().unwrap();
+        let held = create_staging(root.path()).unwrap();
+        let abandoned = root.path().join("pack-staging-abandoned");
+        std::fs::create_dir(&abandoned).unwrap();
+        std::fs::File::create(abandoned.join(STAGING_LOCK)).unwrap();
+        let legacy = root.path().join("pack-staging-legacy");
+        std::fs::create_dir(&legacy).unwrap();
+        let unrelated = root.path().join("vms");
+        std::fs::create_dir(&unrelated).unwrap();
+
+        sweep_abandoned_staging(root.path(), Duration::ZERO, Duration::from_secs(3600));
+
+        assert!(
+            held.dir.path().exists(),
+            "a running pack keeps its directory"
+        );
+        assert!(!abandoned.exists(), "an unheld directory is removed");
+        assert!(
+            legacy.exists(),
+            "a recent directory without a lock is left alone"
+        );
+        assert!(unrelated.exists(), "only staging directories are touched");
+
+        sweep_abandoned_staging(root.path(), Duration::ZERO, Duration::ZERO);
+        assert!(
+            !legacy.exists(),
+            "an old directory without a lock is removed"
+        );
+        assert!(held.dir.path().exists());
     }
 }

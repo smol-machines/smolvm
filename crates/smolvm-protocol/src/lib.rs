@@ -50,15 +50,30 @@ pub struct S3Volume {
     pub session_token: Option<String>,
 }
 
+pub mod auto_ports;
+pub mod binary_stream;
+pub mod credentials;
+pub mod disk_volume;
+pub mod egress_rule;
 pub mod forkpoint;
 pub mod guest_env;
+pub mod host_pattern;
 pub mod image_ref;
+pub mod intercept;
+pub mod mediated_egress;
 pub mod publish_socket;
+pub mod resolv;
 pub mod retry;
 pub mod secrets;
+pub mod sni;
+pub mod workload_target;
 
+pub use credentials::{CredentialBinding, CredentialPolicy};
+pub use egress_rule::{EgressRule, FlowTransport, PortRange, RuleAction};
 pub use image_ref::{image_repo, normalize_image_ref};
+pub use intercept::InterceptEndpoint;
 pub use secrets::{SecretRef, SecretSourceKind};
+pub use workload_target::{WorkloadTarget, WORKLOAD_TARGET_CAPABILITY};
 
 /// Serde helper for encoding `Vec<u8>` as a base64 string in JSON.
 ///
@@ -86,11 +101,100 @@ pub const PROTOCOL_VERSION: u32 = 1;
 
 /// The agent can freeze internal filesystems before acknowledging shutdown.
 pub const QUIESCED_SHUTDOWN_CAPABILITY: &str = "quiesced-shutdown-v1";
+/// Guest supports preparing file access without executing a command from the image.
+pub const PREPARE_FILE_ACCESS_CAPABILITY: &str = "prepare-file-access-v1";
+/// The agent signals a machine's workload and waits for it to exit before it
+/// quiesces storage on shutdown.
+pub const GRACEFUL_WORKLOAD_STOP_CAPABILITY: &str = "graceful-workload-stop-v1";
+/// The agent forwards a detached workload's stdout and stderr to the host over
+/// [`ports::WORKLOAD_LOGS`].
+pub const WORKLOAD_LOGS_CAPABILITY: &str = "workload-logs-v1";
+
+/// Signal a machine's workload is sent when the machine stops, unless the
+/// machine names another one.
+pub const DEFAULT_STOP_SIGNAL: &str = "SIGTERM";
+/// Seconds a stopping machine waits for its workload to exit after the stop
+/// signal before killing it, unless the machine or the stop names another
+/// value.
+pub const DEFAULT_STOP_TIMEOUT_SECS: u64 = 10;
+/// Longest stop timeout a machine or a stop request may ask for.
+pub const MAX_STOP_TIMEOUT_SECS: u64 = 300;
+
+/// Linux signal numbers by name. The guest is always Linux, while the host
+/// that validates a stop signal may be macOS, where many numbers differ, so
+/// neither side may take them from its own libc.
+const LINUX_SIGNALS: &[(&str, i32)] = &[
+    ("HUP", 1),
+    ("INT", 2),
+    ("QUIT", 3),
+    ("ILL", 4),
+    ("TRAP", 5),
+    ("ABRT", 6),
+    ("BUS", 7),
+    ("FPE", 8),
+    ("KILL", 9),
+    ("USR1", 10),
+    ("SEGV", 11),
+    ("USR2", 12),
+    ("PIPE", 13),
+    ("ALRM", 14),
+    ("TERM", 15),
+    ("STKFLT", 16),
+    ("CHLD", 17),
+    ("CONT", 18),
+    ("STOP", 19),
+    ("TSTP", 20),
+    ("TTIN", 21),
+    ("TTOU", 22),
+    ("URG", 23),
+    ("XCPU", 24),
+    ("XFSZ", 25),
+    ("VTALRM", 26),
+    ("PROF", 27),
+    ("WINCH", 28),
+    ("IO", 29),
+    ("PWR", 30),
+    ("SYS", 31),
+];
+
+/// First real-time signal as glibc numbers it, which is what images'
+/// `STOPSIGNAL SIGRTMIN+3` (systemd) means.
+const LINUX_SIGRTMIN: i32 = 34;
+const LINUX_SIGRTMAX: i32 = 64;
+
+/// The Linux number of a stop signal written as a name (`SIGTERM`, `TERM`,
+/// any case), a real-time offset (`SIGRTMIN+3`), or a number (`15`).
+pub fn parse_stop_signal(signal: &str) -> Option<i32> {
+    let signal = signal.trim();
+    if let Ok(number) = signal.parse::<i32>() {
+        return (1..=LINUX_SIGRTMAX).contains(&number).then_some(number);
+    }
+    let upper = signal.to_ascii_uppercase();
+    let name = upper.strip_prefix("SIG").unwrap_or(&upper);
+    if let Some(offset) = name.strip_prefix("RTMIN") {
+        let offset = match offset.strip_prefix('+') {
+            Some(n) => n.parse::<i32>().ok()?,
+            None if offset.is_empty() => 0,
+            None => return None,
+        };
+        let number = LINUX_SIGRTMIN.checked_add(offset)?;
+        return (number <= LINUX_SIGRTMAX).then_some(number);
+    }
+    LINUX_SIGNALS
+        .iter()
+        .find(|(known, _)| *known == name)
+        .map(|(_, number)| *number)
+}
 
 /// virtiofs tag under which the host exposes the Rosetta 2 Linux runtime to the
 /// guest. Shared host↔guest so the launcher's `krun_add_virtiofs` tag and the
 /// guest agent's `mount -t virtiofs` source can't drift apart.
 pub const ROSETTA_TAG: &str = "rosetta";
+
+/// Phrase in a remote-volume error when the storage service answered and
+/// refused the volume (a bad key, a missing bucket). The host matches it to
+/// return the failure to the caller instead of as a server error.
+pub const REMOTE_VOLUME_REFUSED: &str = "refused the volume";
 
 /// Guest mount point for the Rosetta 2 Linux runtime. The ptrace wrapper execs
 /// `<ROSETTA_GUEST_PATH>/rosetta` (the translator), so this path is baked into
@@ -179,7 +283,8 @@ pub mod ports {
     pub const AGENT_CONTROL: u32 = 6000;
     /// SSH agent forwarding (host SSH_AUTH_SOCK bridged to guest).
     pub const SSH_AGENT: u32 = 6001;
-    /// DNS filtering proxy (guest forwards DNS queries to host for filtering).
+    /// Retired guest DNS filtering proxy; reserved so no other service takes
+    /// the port an older guest might still dial.
     pub const DNS_FILTER: u32 = 6002;
     /// Docker socket bridge: the guest listens on this vsock port and proxies
     /// each connection to the in-guest `/var/run/docker.sock`, so the host can
@@ -195,6 +300,14 @@ pub mod ports {
     /// ping remain as fallbacks. A fork clone resumes past the ring, so it never
     /// dials this — clones detect readiness by pinging the restored agent.
     pub const AGENT_READY: u32 = 6004;
+    /// Live port forwarding for machines without virtio-net: the guest listens
+    /// on this port, reads the target guest port as one decimal line, then
+    /// relays the connection to `127.0.0.1:<port>` inside the guest.
+    pub const PORT_FORWARD: u32 = 6005;
+    /// Automatic port publishing: the guest connects OUT to this port and
+    /// sends the set of TCP ports it listens on whenever that set changes
+    /// (see [`crate::auto_ports`]). Outbound, like the readiness doorbell.
+    pub const AUTO_PORTS: u32 = 6006;
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;
@@ -266,16 +379,132 @@ mod shutdown_compat_tests {
     use super::*;
 
     #[test]
+    fn stop_signals_parse_to_linux_numbers_whatever_the_spelling() {
+        for (spelling, number) in [
+            ("SIGTERM", 15),
+            ("TERM", 15),
+            ("sigterm", 15),
+            ("15", 15),
+            ("SIGINT", 2),
+            ("SIGUSR1", 10),
+            ("SIGQUIT", 3),
+            ("SIGKILL", 9),
+            ("SIGRTMIN", 34),
+            ("SIGRTMIN+3", 37),
+            (" SIGHUP ", 1),
+        ] {
+            assert_eq!(parse_stop_signal(spelling), Some(number), "{spelling}");
+        }
+        for bad in [
+            "",
+            "SIGNOPE",
+            "0",
+            "65",
+            "-1",
+            "SIGRTMIN+31",
+            "SIGRTMIN3",
+            "RTMIN+x",
+        ] {
+            assert_eq!(parse_stop_signal(bad), None, "{bad}");
+        }
+    }
+
+    /// `stop_vm_on_exit` is additive: an older host never sends it (off), and
+    /// when off it is omitted from the wire so an older agent sees the exact
+    /// request it always did.
+    #[test]
+    fn run_stop_vm_on_exit_is_off_by_default_and_omitted_when_off() {
+        let run = |stop_vm_on_exit| AgentRequest::Run {
+            image: "alpine".into(),
+            command: vec!["true".into()],
+            env: vec![],
+            workdir: None,
+            user: None,
+            mounts: vec![],
+            timeout_ms: None,
+            interactive: false,
+            tty: false,
+            detached: true,
+            unprivileged: false,
+            persistent_overlay_id: Some("m".into()),
+            stdin_data: None,
+            background: false,
+            s3_volumes: vec![],
+            stop_vm_on_exit,
+            stop_signal: None,
+            stop_timeout_secs: None,
+        };
+        let off = serde_json::to_string(&run(false)).unwrap();
+        assert!(!off.contains("stop_vm_on_exit"), "{off}");
+        assert!(!off.contains("stop_signal"), "{off}");
+        assert!(!off.contains("stop_timeout_secs"), "{off}");
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&off).unwrap(),
+            AgentRequest::Run {
+                stop_vm_on_exit: false,
+                ..
+            }
+        ));
+        let on = serde_json::to_string(&run(true)).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&on).unwrap(),
+            AgentRequest::Run {
+                stop_vm_on_exit: true,
+                ..
+            }
+        ));
+    }
+
+    #[test]
     fn legacy_shutdown_wire_shape_is_unchanged() {
         let wire = r#"{"method":"shutdown"}"#;
         assert!(matches!(
             serde_json::from_str::<AgentRequest>(wire).unwrap(),
-            AgentRequest::Shutdown { progress: false }
+            AgentRequest::Shutdown {
+                progress: false,
+                stop_timeout_secs: None
+            }
         ));
         assert_eq!(
-            serde_json::to_string(&AgentRequest::Shutdown { progress: false }).unwrap(),
+            serde_json::to_string(&AgentRequest::Shutdown {
+                progress: false,
+                stop_timeout_secs: None
+            })
+            .unwrap(),
             wire
         );
+    }
+
+    /// A stop timeout override is additive: omitted when unset, so the wire
+    /// shape older agents know is unchanged, and ignored by agents that
+    /// predate it.
+    #[test]
+    fn shutdown_stop_timeout_is_omitted_when_unset_and_ignored_by_older_agents() {
+        #[derive(Deserialize)]
+        #[serde(tag = "method", rename_all = "snake_case")]
+        enum LegacyRequest {
+            Shutdown {
+                #[serde(default)]
+                progress: bool,
+            },
+        }
+        let wire = serde_json::to_string(&AgentRequest::Shutdown {
+            progress: true,
+            stop_timeout_secs: Some(0),
+        })
+        .unwrap();
+        assert!(wire.contains("\"stop_timeout_secs\":0"), "{wire}");
+        assert!(matches!(
+            serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
+            LegacyRequest::Shutdown { progress: true }
+        ));
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&wire).unwrap(),
+            AgentRequest::Shutdown {
+                progress: true,
+                stop_timeout_secs: Some(0)
+            }
+        ));
     }
 
     #[test]
@@ -285,7 +514,11 @@ mod shutdown_compat_tests {
         enum LegacyRequest {
             Shutdown,
         }
-        let wire = serde_json::to_string(&AgentRequest::Shutdown { progress: true }).unwrap();
+        let wire = serde_json::to_string(&AgentRequest::Shutdown {
+            progress: true,
+            stop_timeout_secs: None,
+        })
+        .unwrap();
         assert!(matches!(
             serde_json::from_str::<LegacyRequest>(&wire).unwrap(),
             LegacyRequest::Shutdown
@@ -295,23 +528,126 @@ mod shutdown_compat_tests {
     #[test]
     fn traced_shutdown_preserves_progress_opt_in() {
         let envelope = Envelope::with_trace_id(
-            AgentRequest::Shutdown { progress: true },
+            AgentRequest::Shutdown {
+                progress: true,
+                stop_timeout_secs: None,
+            },
             Some("shutdown-test".into()),
         );
         let decoded: Envelope<AgentRequest> =
             decode_message(&encode_message(&envelope).unwrap()).unwrap();
         assert!(matches!(
             decoded.body,
-            AgentRequest::Shutdown { progress: true }
+            AgentRequest::Shutdown { progress: true, .. }
         ));
         assert_eq!(decoded.trace_id.as_deref(), Some("shutdown-test"));
     }
+}
+
+/// Agent supports guarded online growth of mounted managed ext4 filesystems.
+pub const ONLINE_FILESYSTEM_GROWTH_CAPABILITY: &str = "online-filesystem-growth-v1";
+
+/// Agent mounts host directories attached to the running machine
+/// (`AttachMount`/`DetachMount`).
+pub const ATTACH_MOUNT_CAPABILITY: &str = "attach-mount-v1";
+
+/// Virtio-fs tag of the live device serving read-write attached mounts.
+pub const ATTACH_TAG_RW: &str = "smolvm_attach_rw";
+/// Virtio-fs tag of the live device serving read-only attached mounts.
+pub const ATTACH_TAG_RO: &str = "smolvm_attach_ro";
+
+/// A host directory attached to the running machine, as the agent reports it.
+///
+/// The agent is the record of what is attached: its state is part of every
+/// checkpoint, so a branch or a restored machine reports exactly the mounts
+/// its guest has, and a cold boot starts with none.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AttachedMount {
+    /// Name of the share on the live device.
+    pub share: String,
+    /// Host directory, as the host attached it (for display only).
+    pub source: String,
+    /// Guest path it is mounted at.
+    pub target: String,
+    /// Served by the read-only live device.
+    pub read_only: bool,
+}
+
+/// Agent can online and verify CPUs after the VMM creates them.
+pub const ONLINE_CPU_GROWTH_CAPABILITY: &str = "online-cpu-growth-v1";
+/// Guest can offline non-boot CPUs and verify the resulting online set.
+pub const OFFLINE_CPU_SHRINK_CAPABILITY: &str = "offline-cpu-shrink-v1";
+
+/// Agent can online and verify a RAM range already added by the VMM.
+pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
+/// The guest kernel keeps time when its machine resumes on a host whose arm64
+/// system counter runs at another rate, so a checkpoint may move between
+/// such hosts.
+pub const COUNTER_RATE_FOLLOW_CAPABILITY: &str = "counter-rate-follow-v1";
+
+/// Managed writable disk, never an arbitrary guest path.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ManagedDisk {
+    /// Persistent workspace and image storage disk.
+    Storage,
+    /// Writable guest root filesystem overlay disk.
+    Overlay,
 }
 
 /// Agent request types (for image management and OCI operations).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Offline trailing CPUs after the host verifies runtime shrink support.
+    OfflineCpus {
+        /// Retained online CPU count, starting at CPU0; must be nonzero.
+        target_count: u8,
+    },
+    /// Online existing guest memory blocks; never create or offline memory.
+    OnlineMemory {
+        /// Guest physical address of the first block.
+        start_address: u64,
+        /// Length of the existing, block-aligned range in bytes.
+        length_bytes: u64,
+    },
+    /// Online CPUs already created by the VMM, without offlining existing CPUs.
+    OnlineCpus {
+        /// Total CPU count, using consecutive CPU IDs starting at zero.
+        target_count: u8,
+    },
+    /// Grow a mounted filesystem after the VMM publishes its new capacity.
+    /// Never formats, repairs, unmounts, or shrinks the filesystem.
+    GrowFilesystem {
+        /// Managed disk whose mounted filesystem should grow.
+        disk: ManagedDisk,
+        /// Exact capacity in bytes already published by the VMM.
+        expected_bytes: u64,
+    },
+    /// Bind a host directory the VMM attached to the running machine onto
+    /// `target`, in the machine root or in every running workload container.
+    /// The host attaches the directory to the live virtio-fs device first; the
+    /// agent only makes it visible at `target`.
+    AttachMount {
+        /// Name the host attached the directory under on the live device.
+        share: String,
+        /// Host directory it came from, kept for listing only.
+        #[serde(default)]
+        source: String,
+        /// Whether it was attached to the read-only live device.
+        read_only: bool,
+        /// Absolute guest path to mount it at.
+        target: String,
+    },
+    /// Unmount an attached mount from `target`, before the host detaches it.
+    DetachMount {
+        /// Absolute guest path it is mounted at.
+        target: String,
+    },
+    /// List the attached mounts, as `Ok` data holding a JSON array of
+    /// [`AttachedMount`].
+    ListAttachedMounts,
     /// Ping to check if agent is alive.
     Ping,
 
@@ -335,6 +671,10 @@ pub enum AgentRequest {
     Pull {
         /// Image reference (e.g., "alpine:latest", "docker.io/library/ubuntu:22.04").
         image: String,
+        /// Cache key exposed to later query/run requests when `image` was
+        /// rewritten to a registry mirror by the host.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cache_as: Option<String>,
         /// OCI platform to pull (e.g., "linux/arm64", "linux/amd64").
         oci_platform: Option<String>,
         /// Optional registry authentication credentials.
@@ -375,6 +715,15 @@ pub enum AgentRequest {
         workload_id: String,
     },
 
+    /// Start the image-independent keepalive container for file I/O without
+    /// executing any binary supplied by the image.
+    PrepareFileAccess {
+        /// Image whose persistent filesystem the file operation targets.
+        image: String,
+        /// Owner of the persistent overlay (which may differ for a fork).
+        workload_id: String,
+    },
+
     /// Clean up overlay rootfs for a workload.
     CleanupOverlay {
         /// Workload ID to clean up.
@@ -397,6 +746,12 @@ pub enum AgentRequest {
     /// occupies. Only the guest's allocator knows what the machine is using.
     MemoryStatus,
 
+    /// Report the guest's pressure stall information: the share of time
+    /// tasks spent waiting for CPU, memory and IO, from
+    /// `/proc/pressure/{cpu,memory,io}`. Only the guest knows this; the host
+    /// sees a VMM process, not the scheduler inside it.
+    PressureStatus,
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     NetworkTest {
@@ -409,6 +764,11 @@ pub enum AgentRequest {
         /// Opt into progress frames while storage is being synchronized.
         #[serde(default, skip_serializing_if = "shutdown_progress_disabled")]
         progress: bool,
+        /// Seconds to wait for the workload to exit after its stop signal,
+        /// overriding the timeout it was launched with; `0` kills it at once.
+        /// Older agents ignore it and do not signal the workload at all.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_timeout_secs: Option<u64>,
     },
 
     /// Export a layer as a tar archive.
@@ -592,6 +952,19 @@ pub enum AgentRequest {
         /// instruction already sees them and its command is never rewritten.
         #[serde(default, skip_serializing_if = "Vec::is_empty")]
         s3_volumes: Vec<S3Volume>,
+        /// Power the machine off once this detached workload exits, whatever its
+        /// exit status: the guest flushes storage exactly as for `machine stop`,
+        /// then powers off. Only honored for detached runs. Older agents ignore it.
+        #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+        stop_vm_on_exit: bool,
+        /// Signal sent to this detached workload when the machine stops
+        /// (`SIGTERM` when unset). Only honored for detached runs.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_signal: Option<String>,
+        /// Seconds to wait for this detached workload to exit after its stop
+        /// signal before it is killed ([`DEFAULT_STOP_TIMEOUT_SECS`] when unset).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_timeout_secs: Option<u64>,
     },
 
     /// Send stdin data to a running interactive command.
@@ -633,6 +1006,9 @@ pub enum AgentRequest {
         /// Owner gid to apply after the write. None = leave as written (root).
         #[serde(default)]
         gid: Option<u32>,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Open a streaming file upload session on this connection.
@@ -657,10 +1033,12 @@ pub enum AgentRequest {
         #[serde(default)]
         gid: Option<u32>,
         /// Expected total size in bytes. Rejected if it exceeds
-        /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent uses this for an
-        /// early-fail check only; the actual size written is the sum
-        /// of chunk byte lengths.
+        /// [`FILE_TRANSFER_MAX_TOTAL`]. The agent finalizes only after
+        /// receiving exactly this many bytes.
         total_size: u64,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Append a chunk to the currently open streaming upload.
@@ -680,6 +1058,22 @@ pub enum AgentRequest {
     FileRead {
         /// Absolute path in the VM filesystem.
         path: String,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
+    },
+
+    /// List the entries of a guest directory.
+    ///
+    /// Kept separate from [`AgentRequest::FileRead`], which streams bytes: a
+    /// listing is small and structured, and a caller that has to discover what
+    /// exists would otherwise guess names and read a 404 for each miss.
+    ListDirectory {
+        /// Absolute directory path in the VM filesystem.
+        path: String,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Stream a tar archive of a guest directory without creating a guest-side
@@ -688,6 +1082,9 @@ pub enum AgentRequest {
     ArchiveDirectory {
         /// Absolute directory path in the VM filesystem.
         path: String,
+        /// Filesystem the path is in. Absent: the agent infers it (older hosts).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
     },
 
     /// Create (without starting) a Kubernetes pod container whose rootfs is a
@@ -778,6 +1175,204 @@ pub enum AgentRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_id: Option<String>,
     },
+
+    /// Start a container the way a Docker engine does: the command runs as the
+    /// container's own init (PID 1) on the image overlay `overlay_id`, and its
+    /// I/O streams on THIS connection: `Started`, then `Stdout`/`Stderr`, then
+    /// `Exited` with the command's exit status. Stdin (when `open_stdin`) and
+    /// PTY resizes arrive as `Stdin`/`Resize` requests. Commands run with
+    /// `Run` on the same overlay join this container while it runs. The host
+    /// closing the connection kills the container.
+    ContainerStart(Box<ContainerStartSpec>),
+
+    /// Send a signal to the init process of the container `ContainerStart`
+    /// started on `overlay_id`.
+    ContainerSignal {
+        /// Overlay the container runs on.
+        overlay_id: String,
+        /// Signal name (`SIGTERM`, `HUP`) or number.
+        signal: String,
+        /// Signal every process of the container, not only its init (how
+        /// `SIGSTOP`/`SIGCONT` pause and resume it).
+        #[serde(default)]
+        all: bool,
+    },
+
+    /// Unpack the tar archive at guest path `archive` into `destination` of
+    /// the container root filesystem on overlay `overlay_id` (built from
+    /// `image`), then remove the archive. Works whether or not the container
+    /// runs.
+    ContainerArchive {
+        /// Image the overlay is built from.
+        image: String,
+        /// Overlay the container's root filesystem lives on.
+        overlay_id: String,
+        /// Guest path of the archive.
+        archive: String,
+        /// Directory in the container to unpack into.
+        destination: String,
+        /// Where the image's layers come from, when not the machine's own
+        /// image (see [`ContainerImageSource`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_source: Option<ContainerImageSource>,
+    },
+
+    /// List the processes of the container `ContainerStart` started on
+    /// `overlay_id`. Replies `Ok` with `{"titles": [...], "processes": [[...]]}`.
+    ContainerTop {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
+    /// Stream what the container on `overlay_id` changed against its image,
+    /// as one image layer: a tar of the overlay's upper directory with
+    /// overlayfs whiteouts turned into OCI `.wh.` markers, and the files the
+    /// engine generates for every container left out (`docker commit`).
+    /// Replies with `DataChunk`s, the last one `done`.
+    ContainerDiff {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
+    /// Replace the extra addresses on the guest's network interface (IPv4
+    /// and IPv6): every listed `address/prefix` is present afterwards, and any address
+    /// added by an earlier call and not listed is removed. The primary address
+    /// the guest booted with is never touched. Lets a running machine join and
+    /// leave networks.
+    SetInterfaceAddresses {
+        /// `a.b.c.d/len` or `ipv6/len` entries.
+        addresses: Vec<String>,
+    },
+
+    /// Move the guest's primary IPv4 address, default route and resolver to
+    /// another network. A machine branched from a base that booted on one
+    /// network takes its own address this way before anything in it runs.
+    SetPrimaryAddress {
+        /// The new primary address, `a.b.c.d/len`.
+        address: String,
+        /// The default gateway on that network.
+        gateway: String,
+        /// The resolver the guest uses.
+        dns: String,
+        /// Resolver options (`ndots:2`, ...).
+        #[serde(default)]
+        dns_options: Vec<String>,
+    },
+}
+
+/// What [`AgentRequest::ContainerStart`] runs, and how.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContainerStartSpec {
+    /// Caller's container id, used for logs and guest paths.
+    pub id: String,
+    /// Image reference (must be pulled first).
+    pub image: String,
+    /// Persistent overlay the container's root filesystem lives on.
+    pub overlay_id: String,
+    /// The command, resolved by the caller (entrypoint + cmd).
+    pub command: Vec<String>,
+    /// The complete environment, resolved by the caller.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Working directory; the image's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// `user[:group]`, by name or number; the image's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Allocate a PTY for the command.
+    #[serde(default)]
+    pub tty: bool,
+    /// Keep the command's stdin open for `Stdin` requests. Without it the
+    /// command reads end of file at once.
+    #[serde(default)]
+    pub open_stdin: bool,
+    /// Container hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Extra `/etc/hosts` lines as `(address, names)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<(String, String)>,
+    /// Mounts, in the order given (parents before children is the caller's job).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<ContainerMount>,
+    /// Mount the root filesystem read-only.
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    /// Size of `/dev/shm` in bytes; the runtime default when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<u64>,
+    /// Where the image's layers come from, when not the machine's own image:
+    /// a container started in a machine booted for another container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<ContainerImageSource>,
+}
+
+/// Where a container's image layers come from when the machine it runs in
+/// was booted for another image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerImageSource {
+    /// The machine's image store, by the image reference (pulled there).
+    Store,
+    /// A local image archive's directory (the one holding `archive.tar`),
+    /// added to the machine's read-only live device as `share`.
+    Attached {
+        /// Share name on the read-only live device.
+        share: String,
+    },
+}
+
+/// One mount of a [`ContainerStartSpec`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerMount {
+    /// The host directory shared at boot under virtiofs `tag`, or one file or
+    /// directory below it (`subpath`), bound at `target`.
+    Share {
+        /// Virtiofs tag of the shared directory.
+        tag: String,
+        /// Path below the shared directory to bind instead of all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        /// Container path.
+        target: String,
+        /// Bind read-only.
+        #[serde(default)]
+        read_only: bool,
+        /// When the shared directory is empty, first fill it with what the
+        /// image has at `target`, as a container engine does for a new volume.
+        #[serde(default)]
+        copy_up: bool,
+    },
+    /// A directory the host added to the machine's live virtio-fs device
+    /// (`share`, on the read-only device when `read_only`) while it runs, or
+    /// one file or directory below it (`subpath`), bound at `target`. For a
+    /// container started in a machine booted for another one.
+    Attached {
+        /// Share name on the live device.
+        share: String,
+        /// Path below the share to bind instead of all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        /// Container path.
+        target: String,
+        /// Bind read-only (from the read-only device).
+        #[serde(default)]
+        read_only: bool,
+        /// When the share is empty, first fill it with what the image has at
+        /// `target`.
+        #[serde(default)]
+        copy_up: bool,
+    },
+    /// A memory-backed filesystem at `target`.
+    Tmpfs {
+        /// Container path.
+        target: String,
+        /// Mount options (`size=64m`, `mode=1777`, `noexec`, ...).
+        #[serde(default)]
+        options: Vec<String>,
+    },
 }
 
 impl AgentRequest {
@@ -794,6 +1389,34 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::OnlineMemory {
+                start_address,
+                length_bytes,
+            } => {
+                format!("OnlineMemory {{ start_address: {start_address}, length_bytes: {length_bytes} }}")
+            }
+            AgentRequest::OnlineCpus { target_count } => {
+                format!("OnlineCpus {{ target_count: {target_count} }}")
+            }
+            AgentRequest::OfflineCpus { target_count } => {
+                format!("OfflineCpus {{ target_count: {target_count} }}")
+            }
+            AgentRequest::GrowFilesystem {
+                disk,
+                expected_bytes,
+            } => {
+                format!("GrowFilesystem {{ disk: {disk:?}, expected_bytes: {expected_bytes} }}")
+            }
+            AgentRequest::AttachMount {
+                share,
+                read_only,
+                target,
+                ..
+            } => format!(
+                "AttachMount {{ share: {share}, read_only: {read_only}, target: {target} }}"
+            ),
+            AgentRequest::DetachMount { target } => format!("DetachMount {{ target: {target} }}"),
+            AgentRequest::ListAttachedMounts => "ListAttachedMounts".into(),
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),
@@ -801,10 +1424,12 @@ impl AgentRequest {
             AgentRequest::ListImages => "ListImages".into(),
             AgentRequest::GarbageCollect { .. } => "GarbageCollect".into(),
             AgentRequest::PrepareOverlay { .. } => "PrepareOverlay".into(),
+            AgentRequest::PrepareFileAccess { .. } => "PrepareFileAccess".into(),
             AgentRequest::CleanupOverlay { .. } => "CleanupOverlay".into(),
             AgentRequest::FormatStorage => "FormatStorage".into(),
             AgentRequest::StorageStatus => "StorageStatus".into(),
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
+            AgentRequest::PressureStatus => "PressureStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
@@ -825,6 +1450,7 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
             AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
             AgentRequest::PodCreate { id, .. } => format!("PodCreate {{ id: {id} }}"),
@@ -844,8 +1470,58 @@ impl AgentRequest {
                 Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
                 None => format!("PodDelete {{ id: {id} }}"),
             },
+            AgentRequest::ContainerStart(spec) => format!(
+                "ContainerStart {{ id: {}, image: {}, tty: {}, mounts: {} }}",
+                spec.id,
+                spec.image,
+                spec.tty,
+                spec.mounts.len()
+            ),
+            AgentRequest::ContainerSignal {
+                overlay_id,
+                signal,
+                all,
+            } => {
+                format!("ContainerSignal {{ overlay: {overlay_id}, signal: {signal}, all: {all} }}")
+            }
+            AgentRequest::ContainerArchive {
+                overlay_id,
+                destination,
+                ..
+            } => {
+                format!("ContainerArchive {{ overlay: {overlay_id}, destination: {destination} }}")
+            }
+            AgentRequest::ContainerTop { overlay_id } => {
+                format!("ContainerTop {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerDiff { overlay_id } => {
+                format!("ContainerDiff {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::SetInterfaceAddresses { addresses } => {
+                format!("SetInterfaceAddresses {{ addresses: {addresses:?} }}")
+            }
+            AgentRequest::SetPrimaryAddress {
+                address, gateway, ..
+            } => format!("SetPrimaryAddress {{ address: {address}, gateway: {gateway} }}"),
         }
     }
+}
+
+/// One entry of a [`AgentRequest::ListDirectory`] result.
+///
+/// Deliberately small: a name, what it is, and a size. A caller discovering a
+/// tree wants to know where to recurse and what is worth downloading, and
+/// anything richer invites the listing being used as a stat cache.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    /// Entry name, not a path: no separators, relative to the directory listed.
+    pub name: String,
+    /// `"file"`, `"dir"`, `"symlink"`, or `"other"` for sockets, devices and
+    /// fifos, which a caller can see but should not try to download.
+    pub kind: String,
+    /// Size in bytes. Zero for anything that is not a regular file.
+    #[serde(default)]
+    pub size: u64,
 }
 
 /// Agent response types.
@@ -1000,6 +1676,9 @@ pub mod error_codes {
     pub const FILE_IO_FAILED: &str = "FILE_IO_FAILED";
     /// Overlay filesystem operation failed.
     pub const OVERLAY_FAILED: &str = "OVERLAY_FAILED";
+    /// A persistent overlay was asked to run an image other than the one it
+    /// was built from.
+    pub const OVERLAY_IMAGE_CONFLICT: &str = "OVERLAY_IMAGE_CONFLICT";
     /// Cleanup operation failed.
     pub const CLEANUP_FAILED: &str = "CLEANUP_FAILED";
     /// Storage format operation failed.
@@ -1104,7 +1783,7 @@ impl AgentResponse {
 }
 
 /// Image information returned by Query/ListImages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageInfo {
     /// Image reference.
     pub reference: String,
@@ -1180,6 +1859,49 @@ impl MemoryStatus {
     pub fn used_bytes(&self) -> u64 {
         self.total_bytes.saturating_sub(self.available_bytes)
     }
+}
+
+/// One resource's pressure stall information, as the guest kernel reports it
+/// in `/proc/pressure/<resource>`.
+///
+/// `some` is the share of wall time during which at least one task was stalled
+/// on the resource; `full` the share during which every runnable task was
+/// (zero for CPU at the system level). The averages are percentages over the
+/// last 10, 60 and 300 seconds; the totals are the stalled time since boot in
+/// microseconds, so a reader sampling them can compute the share over any
+/// window it likes.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureStall {
+    /// `some avg10`, in percent.
+    pub some_avg10: f64,
+    /// `some avg60`, in percent.
+    pub some_avg60: f64,
+    /// `some avg300`, in percent.
+    pub some_avg300: f64,
+    /// `some total`: microseconds with at least one task stalled, since boot.
+    pub some_total_us: u64,
+    /// `full avg10`, in percent.
+    pub full_avg10: f64,
+    /// `full avg60`, in percent.
+    pub full_avg60: f64,
+    /// `full avg300`, in percent.
+    pub full_avg300: f64,
+    /// `full total`: microseconds with every task stalled, since boot.
+    pub full_total_us: u64,
+}
+
+/// The guest's pressure stall information for CPU, memory and IO
+/// (`PressureStatus` reply).
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureStatus {
+    /// Time tasks waited for a CPU.
+    pub cpu: PressureStall,
+    /// Time tasks waited for memory (reclaim, swap, refault).
+    pub memory: PressureStall,
+    /// Time tasks waited for block IO.
+    pub io: PressureStall,
 }
 
 /// Storage status information.
@@ -1346,6 +2068,9 @@ pub struct Envelope<T> {
     /// Trace ID for correlating host API requests to agent operations.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trace_id: Option<String>,
+    /// Binary streaming version understood by the sender. Old peers ignore it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub binary_stream: Option<u8>,
     /// The wrapped message.
     #[serde(flatten)]
     pub body: T,
@@ -1356,13 +2081,18 @@ impl<T> Envelope<T> {
     pub fn new(body: T) -> Self {
         Self {
             trace_id: None,
+            binary_stream: None,
             body,
         }
     }
 
     /// Create an envelope with an optional trace ID.
     pub fn with_trace_id(body: T, trace_id: Option<String>) -> Self {
-        Self { trace_id, body }
+        Self {
+            trace_id,
+            binary_stream: None,
+            body,
+        }
     }
 }
 
@@ -1439,6 +2169,63 @@ impl std::error::Error for DecodeError {}
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn memory_growth_roundtrips_numeric_geometry_only() {
+        let request = super::AgentRequest::OnlineMemory {
+            start_address: 1 << 30,
+            length_bytes: 128 << 20,
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::OnlineMemory {
+                start_address: 1073741824,
+                length_bytes: 134217728
+            }
+        ));
+        for invalid in [
+            r#"{"method":"online_memory","start_address":-1,"length_bytes":4096}"#,
+            r#"{"method":"online_memory","start_address":"/dev/mem","length_bytes":4096}"#,
+        ] {
+            assert!(serde_json::from_str::<super::AgentRequest>(invalid).is_err());
+        }
+    }
+    #[test]
+    fn cpu_growth_roundtrips_a_numeric_count_only() {
+        let req = super::AgentRequest::OnlineCpus { target_count: 4 };
+        let wire = serde_json::to_string(&req).unwrap();
+        assert!(matches!(
+            serde_json::from_str::<super::AgentRequest>(&wire).unwrap(),
+            super::AgentRequest::OnlineCpus { target_count: 4 }
+        ));
+        assert!(serde_json::from_str::<super::AgentRequest>(
+            r#"{"method":"online_cpus","target_count":256}"#
+        )
+        .is_err());
+    }
+    #[test]
+    fn filesystem_growth_uses_only_managed_disk_names() {
+        use super::{AgentRequest, ManagedDisk};
+        let request = AgentRequest::GrowFilesystem {
+            disk: ManagedDisk::Storage,
+            expected_bytes: 2147483648,
+        };
+        let wire = serde_json::to_value(&request).unwrap();
+        assert_eq!(wire["method"], "grow_filesystem");
+        assert_eq!(wire["disk"], "storage");
+        assert!(matches!(
+            serde_json::from_value::<AgentRequest>(wire).unwrap(),
+            AgentRequest::GrowFilesystem {
+                disk: ManagedDisk::Storage,
+                expected_bytes: 2147483648
+            }
+        ));
+        assert!(serde_json::from_str::<AgentRequest>(
+            r#"{"method":"grow_filesystem","disk":"/dev/vdc","expected_bytes":2147483648}"#
+        )
+        .is_err());
+    }
+
     use super::*;
 
     #[test]
@@ -1485,6 +2272,7 @@ mod tests {
     fn test_encode_decode_roundtrip() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
+            cache_as: Some("docker.io/library/alpine:latest".to_string()),
             oci_platform: Some("linux/arm64".to_string()),
             auth: None,
             proxy: None,
@@ -1496,6 +2284,7 @@ mod tests {
 
         let AgentRequest::Pull {
             image,
+            cache_as,
             oci_platform,
             auth,
             proxy,
@@ -1505,6 +2294,10 @@ mod tests {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "alpine:latest");
+        assert_eq!(
+            cache_as,
+            Some("docker.io/library/alpine:latest".to_string())
+        );
         assert_eq!(oci_platform, Some("linux/arm64".to_string()));
         assert!(auth.is_none());
         assert!(proxy.is_none());
@@ -1515,6 +2308,7 @@ mod tests {
     fn test_encode_decode_with_auth() {
         let req = AgentRequest::Pull {
             image: "ghcr.io/owner/repo:latest".to_string(),
+            cache_as: None,
             oci_platform: None,
             auth: Some(RegistryAuth {
                 username: "testuser".to_string(),
@@ -1529,6 +2323,7 @@ mod tests {
 
         let AgentRequest::Pull {
             image,
+            cache_as,
             oci_platform,
             auth,
             proxy: _,
@@ -1538,6 +2333,7 @@ mod tests {
             panic!("expected Pull variant, got {:?}", decoded);
         };
         assert_eq!(image, "ghcr.io/owner/repo:latest");
+        assert!(cache_as.is_none());
         assert!(oci_platform.is_none());
         let auth = auth.expect("auth should be Some");
         assert_eq!(auth.username, "testuser");
@@ -1548,6 +2344,7 @@ mod tests {
     fn test_encode_decode_with_proxy() {
         let req = AgentRequest::Pull {
             image: "alpine:latest".to_string(),
+            cache_as: None,
             oci_platform: None,
             auth: None,
             proxy: Some("http://192.168.127.254:3128".to_string()),
@@ -1597,6 +2394,24 @@ mod tests {
     }
 
     #[test]
+    fn prepare_file_access_wire_only_identifies_the_image_and_overlay() {
+        let request = AgentRequest::PrepareFileAccess {
+            image: "alpine:3.20".into(),
+            workload_id: "fork-overlay-owner".into(),
+        };
+        let wire = serde_json::to_string(&request).unwrap();
+        assert_eq!(
+            wire,
+            r#"{"method":"prepare_file_access","image":"alpine:3.20","workload_id":"fork-overlay-owner"}"#
+        );
+        assert!(matches!(
+            serde_json::from_str::<AgentRequest>(&wire).unwrap(),
+            AgentRequest::PrepareFileAccess { image, workload_id }
+                if image == "alpine:3.20" && workload_id == "fork-overlay-owner"
+        ));
+    }
+
+    #[test]
     fn test_agent_response_serialization() {
         let resp = AgentResponse::Pong {
             version: PROTOCOL_VERSION,
@@ -1633,6 +2448,10 @@ mod tests {
             uid: Some(1000),
             gid: Some(1000),
             total_size: 123_456_789,
+            target: Some(WorkloadTarget::Container {
+                image: "alpine:3.20".into(),
+                overlay_id: "web".into(),
+            }),
         };
         let bytes = encode_message(&req).unwrap();
         let back: AgentRequest = decode_message(&bytes).unwrap();
@@ -1643,15 +2462,45 @@ mod tests {
                 uid,
                 gid,
                 total_size,
+                target,
             } => {
                 assert_eq!(path, "/tmp/target");
                 assert_eq!(mode, Some(0o600));
                 assert_eq!(uid, Some(1000));
                 assert_eq!(gid, Some(1000));
                 assert_eq!(total_size, 123_456_789);
+                assert_eq!(
+                    target,
+                    Some(WorkloadTarget::Container {
+                        image: "alpine:3.20".into(),
+                        overlay_id: "web".into(),
+                    })
+                );
             }
             _ => panic!("wrong variant"),
         }
+    }
+
+    #[test]
+    fn file_requests_without_a_target_match_older_hosts_and_agents() {
+        // An older host sends no target; the agent then infers it.
+        let old: AgentRequest =
+            serde_json::from_str(r#"{"method":"file_read","path":"/etc/hostname"}"#).unwrap();
+        assert!(matches!(old, AgentRequest::FileRead { target: None, .. }));
+        // A request without a target serializes exactly as before, so an
+        // older agent sees no new field.
+        let json = serde_json::to_string(&AgentRequest::ListDirectory {
+            path: "/root".into(),
+            target: None,
+        })
+        .unwrap();
+        assert!(!json.contains("target"), "{json}");
+        let json = serde_json::to_string(&AgentRequest::ListDirectory {
+            path: "/root".into(),
+            target: Some(WorkloadTarget::Vm),
+        })
+        .unwrap();
+        assert!(json.contains(r#""target":{"kind":"vm"}"#), "{json}");
     }
 
     #[test]

@@ -5,26 +5,30 @@ same compressed RAM and disk chunks again:
 
 ```sh
 smolvm machine checkpoint --name worker --store ./checkpoints \
-  --output ./before.smolcheckpoint
+  --output ./before.checkpoint
 
 # Run more work, then retain another point in time.
 smolvm machine checkpoint --name worker --store ./checkpoints \
-  --output ./after.smolcheckpoint
+  --output ./after.checkpoint
 
-smolvm machine create --name rollback --from ./before.smolcheckpoint
+smolvm machine create --name rollback --from ./before.checkpoint
 smolvm machine start --name rollback
 smolvm machine branch --from rollback --name candidate
 ```
 
+Checkpoints are written as `.checkpoint`; the earlier `.smolcheckpoint` name is
+still accepted.
+
 Start the source with `machine start --branchable` before capturing it. Capture
 checks the runtime and guest-agent capabilities before pausing the source.
 Normal portable-checkpoint restrictions still apply, including host-platform,
-CPU and device compatibility. This does not make live state cross-architecture
-or cross-OS portable.
+CPU and device compatibility. A checkpoint can move from an arm64 Mac to arm64
+Linux (see [Moving a running machine from a Mac to Linux](mac-to-linux.md)); it
+cannot change CPU architecture.
 
 ## What is retained
 
-With `--store`, each `.smolcheckpoint` is a **directory**, not a single file.
+With `--store`, each `.checkpoint` is a **directory**, not a single file.
 It contains a complete index and hard links to all compressed objects it needs.
 It does not depend on an earlier checkpoint or on the continued existence of
 the store. Deleting an older checkpoint does not break a newer one.
@@ -42,6 +46,8 @@ This is incremental **storage**, not dirty-page-only capture: RAM is still read
 for each checkpoint, while unchanged chunks are reused instead of compressed
 and written again. Savings depend on how much RAM and disk content changes.
 Capture time is not guaranteed to fall in proportion to the bytes saved.
+On Linux x86_64 with a sparse-stream runtime, empty RAM ranges are omitted
+from the runtime-to-store transfer, and whole empty chunks need no object work.
 
 Stored-checkpoint chunk reuse does not change the live branching limits. A live
 branch lineage and its QCOW2 disk backing chain are each bounded at 32 levels;
@@ -51,6 +57,67 @@ children from one captured generation. Repeated single-child branch operations
 from a continuing source can add backing layers even when the resulting children are
 siblings. Stop and pack the desired state into a new root before continuing
 from a chain at the limit.
+
+## Host mounts
+
+A capture refuses a machine with host mounts unless you pass `--host-mounts`,
+because they bind the artifact to a host where the same paths exist.
+`--host-mounts` records each mount (host path, guest path, read-only) and a
+restore attaches them again at the same guest paths; it refuses on a host where
+a recorded directory is missing. `machine pause` always keeps host mounts: a
+paused machine resumes on the host that paused it.
+
+## History
+
+Every checkpoint records its *lineage*: a unique id, the machine it came from,
+and its **parent** — the checkpoint that machine was last captured to or
+restored from. Repeated captures of one machine form a chain; restoring a
+checkpoint and capturing again forms a branch. A machine remembers its current
+position (`checkpoint_head`); `machine branch` children inherit it.
+
+A stored checkpoint (`--store`) also **retains** its ancestors: it keeps each
+earlier generation's index and hard-links every object those generations
+reference, so any point in its history can be restored from that one directory
+even after the older directories are deleted. Because unchanged chunks are
+shared, the retained history costs only the differences between generations.
+`--history N` sets how many generations to retain, counting the parent
+itself (default 32, `0` for none).
+
+```sh
+smolvm machine checkpoint-log ./after.checkpoint
+# ~0   9f2c1a7b3e4d  2026-09-22T10:12:03Z  worker  4096 MiB  (this checkpoint)
+# ~1   51e0d8c2a9b4  2026-09-22T09:40:11Z  worker  4096 MiB
+# ~2   0c7a44e1fd93  2026-09-22T09:02:56Z  worker  4096 MiB
+
+# Restore two generations back, or by id prefix. Quote ~N so zsh doesn't
+# expand it as a directory-stack entry.
+smolvm machine create --name rollback --from ./after.checkpoint --at '~2'
+smolvm machine create --name rollback --from ./after.checkpoint --at 0c7a44e1
+
+# Export one generation as a single-generation portable file.
+smolvm machine checkpoint --export-from ./after.checkpoint --at '~1' \
+  --output ./before.checkpoint
+
+# Everything ever published into a store, with parents.
+smolvm machine checkpoint-log --store ./checkpoints --machine worker
+```
+
+`--export-from` produces a single file that **carries its history**: the
+retained generations and their shared objects are packed together, so the one
+file can be sent anywhere and restored at any point in it (`--at` works on the
+file exactly as on the directory). `--history N` limits how many generations
+the file carries; `--history 0`, or `--at`, exports one generation in the
+classic layout. Runtimes that predate history refuse a history file with a
+version message rather than misreading it.
+
+```sh
+smolvm machine checkpoint --export-from ./after.checkpoint -o ./history.checkpoint
+smolvm machine checkpoint-log ./history.checkpoint          # read from the manifest
+smolvm machine create --name rollback --from ./history.checkpoint --at '~2'
+```
+
+Checkpoints written before lineage existed have no history; captures of a
+machine restored from one start a new chain.
 
 ## Periodic checkpoints
 
@@ -74,17 +141,20 @@ backup service; export or copy complete checkpoints for host-failure protection.
 
 ## Move a checkpoint
 
-Copy the entire checkpoint directory, including its `objects` directory, or
-export it as a conventional single-file artifact:
+Copy the entire checkpoint directory, including its `objects` and
+`generations` directories, or export it as one file:
 
 ```sh
-smolvm machine checkpoint --export-from ./after.smolcheckpoint \
-  --output ./portable.smolcheckpoint
+smolvm machine checkpoint --export-from ./after.checkpoint \
+  --output ./portable.checkpoint
 ```
 
-Export does not need the original store. Omitting `--store` when capturing a
-machine continues to produce a standalone file directly. Treat all checkpoint
-files as sensitive: they contain the machine's captured memory and disk data.
+Export does not need the original store; [History](#history) says what the file
+carries. Omitting `--store` when capturing a machine continues to produce
+a standalone file directly. Treat all checkpoint files as sensitive: they
+contain the machine's captured memory and disk data, and may contain its
+credential CA's private key. The file and directory layouts are specified in
+[Checkpoint format](../crates/smolvm-checkpoint/FORMAT.md).
 
 ## Reclaim storage
 

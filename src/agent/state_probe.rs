@@ -46,8 +46,8 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
     let pid_alive = record.is_process_alive();
 
     if pid_alive {
-        // A fork base with live clones or a retained checkpoint was
-        // snapshot-frozen by `machine fork`: its guest is paused and never
+        // A fork base with frozen-generation clones or a retained frozen
+        // checkpoint was snapshot-frozen: its guest is paused and never
         // answers a vsock ping. A retained checkpoint remains authoritative
         // between pool fills, when there may be zero dependent clone rows.
         // Report it as Frozen *without* probing — this distinguishes it
@@ -79,7 +79,7 @@ pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
 }
 
 /// Cheap (no vsock probe) check for a snapshot-frozen fork base: its
-/// record says `Running`, its VMM PID is alive, and it has dependent clones
+/// record says `Running`, its VMM PID is alive, and it has frozen-generation clones
 /// or a retained checkpoint bound to that exact process. Such a VM's guest
 /// agent is paused and must not be connected to or probed — doing so blocks
 /// for the full vsock timeout. Callers report it as [`RecordState::Frozen`]
@@ -91,26 +91,36 @@ pub fn is_frozen_fork_base(name: &str, record: &VmRecord) -> bool {
         && has_frozen_fork_state(name, record)
 }
 
-/// True if `name` is a fork base — at least one VM record's disk overlays
-/// are copy-on-write backed by this machine's disks (`golden == Some(name)`).
-/// Such a machine is snapshot-frozen and must not be probed, reaped, or
-/// auto-restarted; it has to outlive its clones. Best-effort: a DB error
+/// True if `name` has a frozen checkpoint or children requiring a frozen source.
+/// Continuing generations pivot the source's disks, so their children alone do
+/// not imply that its current process is paused. Frozen sources must not be
+/// probed, reaped, or auto-restarted. Best-effort: a DB error
 /// resolves to `false` (treat as not-a-fork-base) so a transient failure
 /// can't wedge state resolution.
 fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
     let Ok(db) = SmolvmDb::open() else {
         return false;
     };
+    has_frozen_fork_state_in(
+        &db,
+        name,
+        record,
+        &crate::agent::vm_data_dir(name).join("s"),
+    )
+}
+
+fn has_frozen_fork_state_in(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    snapshot_root: &std::path::Path,
+) -> bool {
     let retained = db
         .retained_fork_snapshot(name)
         .ok()
         .flatten()
         .filter(|snapshot| {
-            crate::agent::fork::retained_snapshot_matches_golden(
-                record,
-                &crate::agent::vm_data_dir(name).join("s"),
-                snapshot,
-            )
+            crate::agent::fork::retained_snapshot_matches_golden(record, snapshot_root, snapshot)
         });
     if retained
         .as_ref()
@@ -118,8 +128,10 @@ fn has_frozen_fork_state(name: &str, record: &VmRecord) -> bool {
     {
         return false;
     }
-    if db
-        .dependent_clones(name)
+    // A retained checkpoint is bound to the source's old PID after restart.
+    // Keep the same generation-aware distinction used to permit that restart:
+    // children of a committed continuing generation do not freeze the new VMM.
+    if crate::agent::fork::restart_blocking_dependent_clones_in(db, name, snapshot_root)
         .map(|clones| !clones.is_empty())
         .unwrap_or(false)
     {
@@ -159,11 +171,21 @@ pub(crate) fn recover_unreachable_machine_in_db(
                     ),
                 ));
             }
-            crate::process::stop_vm_process(
+            crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(&record.name), pid);
+            if let crate::process::VmStop::Held(held) = crate::process::stop_vm_process_bounded(
                 pid,
                 crate::process::VM_SIGTERM_TIMEOUT,
                 crate::process::VM_SIGKILL_TIMEOUT,
-            )?;
+            )? {
+                // Nothing can make the process exit, and it runs no more
+                // code. Finish the teardown and keep its PID in the record,
+                // so a later start is refused while it still holds the disks.
+                tracing::warn!(
+                    "machine '{}' is stopped, but {}",
+                    record.name,
+                    held.explain()
+                );
+            }
         }
     }
 
@@ -177,11 +199,37 @@ pub(crate) fn recover_unreachable_machine_in_db(
 
     // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full
     // in-memory config load; the update is targeted to the one record.
-    db.update_vm(&record.name, |r| {
-        r.state = RecordState::Stopped;
-        r.pid = None;
-        r.pid_start_time = None;
-    })?;
+    db.update_vm(&record.name, VmRecord::mark_process_stopped)?;
+    Ok(())
+}
+
+/// Refuse to start a machine whose previous process the kernel is still
+/// holding after SIGKILL, and forget that process once it is gone.
+///
+/// A stop that ends with a held process leaves the machine `Stopped` with
+/// the PID still recorded. Every start path calls this first:
+/// - the process is still present: an error naming it, on every surface;
+/// - the process is gone (the kernel call returned, or the host rebooted),
+///   or the PID now belongs to something else: the PID is cleared and the
+///   start goes ahead, with no manual step.
+pub fn refuse_start_while_held(db: &SmolvmDb, name: &str) -> crate::Result<()> {
+    let Some(record) = db.get_vm(name)? else {
+        return Ok(());
+    };
+    let (RecordState::Stopped, Some(pid)) = (&record.state, record.pid) else {
+        return Ok(());
+    };
+    if let Some(held) = record.held_process() {
+        return Err(crate::Error::agent("start agent", held.start_refusal()));
+    }
+    if !record.is_process_alive() {
+        db.update_vm(name, |r| {
+            if r.state == RecordState::Stopped && r.pid == Some(pid) {
+                r.pid = None;
+                r.pid_start_time = None;
+            }
+        })?;
+    }
     Ok(())
 }
 
@@ -339,6 +387,100 @@ mod tests {
     }
 
     #[test]
+    fn continuing_source_is_not_frozen_after_restart_with_retained_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let snapshot_root = temp.path().join("s");
+        let snapshot = crate::agent::fork::RetainedForkSnapshot {
+            path: snapshot_root.join("0123abcd"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        std::fs::create_dir_all(&snapshot.path).unwrap();
+        std::fs::write(snapshot.path.join("source-continues-v1"), b"").unwrap();
+        db.set_retained_fork_snapshot("source", &snapshot).unwrap();
+
+        let mut child = VmRecord::new("child".into(), 1, 128, vec![], vec![], false);
+        child.golden = Some("source".into());
+        child.fork_generation = Some("0123abcd".into());
+        db.insert_vm("child", &child).unwrap();
+        for child_state in [RecordState::Running, RecordState::Stopped] {
+            db.update_vm("child", |r| r.state = child_state.clone())
+                .unwrap();
+            // The original process, a new PID, and a reused PID must all
+            // remain eligible for the ordinary running/unreachable probe.
+            for (pid, start) in [(123, 456), (124, 457), (123, 458)] {
+                let mut source = record(RecordState::Running, Some(pid));
+                source.pid_start_time = Some(start);
+                assert!(
+                    !has_frozen_fork_state_in(&db, "source", &source, &snapshot_root),
+                    "source {pid}/{start} with {child_state:?} child was classified frozen"
+                );
+            }
+        }
+        // Retained checkpoints are an optimization. The child's committed
+        // continuing generation also suffices when that hint is absent.
+        db.remove_retained_fork_snapshot("source").unwrap();
+        let mut source = record(RecordState::Running, Some(124));
+        source.pid_start_time = Some(457);
+        assert!(!has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+
+        // Do not relax the guard for children lacking a committed pivot.
+        let mut frozen_child = VmRecord::new("frozen-child".into(), 1, 128, vec![], vec![], false);
+        frozen_child.golden = Some("source".into());
+        frozen_child.fork_generation = Some("deadbeef".into());
+        db.insert_vm("frozen-child", &frozen_child).unwrap();
+        assert!(has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+        db.remove_vm("frozen-child").unwrap();
+        std::fs::remove_file(snapshot.path.join("source-continues-v1")).unwrap();
+        assert!(has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+    }
+
+    #[test]
+    fn retained_frozen_checkpoint_requires_the_current_process_even_without_children() {
+        let temp = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&temp.path().join("test.db")).unwrap();
+        let snapshot_root = temp.path().join("s");
+        let snapshot = crate::agent::fork::RetainedForkSnapshot {
+            path: snapshot_root.join("0123abcd"),
+            golden_pid: 123,
+            golden_pid_start_time: 456,
+        };
+        std::fs::create_dir_all(&snapshot.path).unwrap();
+        db.set_retained_fork_snapshot("source", &snapshot).unwrap();
+        let mut source = record(RecordState::Running, Some(123));
+        source.pid_start_time = Some(456);
+        assert!(has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+        source.pid_start_time = Some(457);
+        assert!(!has_frozen_fork_state_in(
+            &db,
+            "source",
+            &source,
+            &snapshot_root
+        ));
+    }
+
+    #[test]
     fn failed_recovery_preserves_process_state() {
         let dir = tempfile::TempDir::new().unwrap();
         let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
@@ -354,5 +496,121 @@ mod tests {
         assert_eq!(persisted.state, RecordState::Unreachable);
         assert_eq!(persisted.pid, r.pid);
         assert_eq!(persisted.pid_start_time, r.pid_start_time);
+    }
+}
+
+/// A machine whose process the kernel holds after SIGKILL, as the stop,
+/// recovery and start paths see it. The process is a stand-in registered
+/// with `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    fn running_on(db: &SmolvmDb, name: &str, pid: i32, start_time: Option<u64>) -> VmRecord {
+        let mut record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = start_time;
+        db.insert_vm(name, &record).unwrap();
+        record
+    }
+
+    /// What `machine stop` does for a machine whose agent no longer answers.
+    #[test]
+    fn stopping_a_held_machine_records_it_stopped_and_keeps_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "held-stop-keeps-pid";
+        let record = running_on(&db, name, held.pid, Some(fake_held::START_TIME));
+
+        let started = std::time::Instant::now();
+        recover_unreachable_machine_in_db(&record, &db).unwrap();
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+        assert_eq!(stored.pid_start_time, Some(fake_held::START_TIME));
+        // The list shows the record's state: stopped, not running.
+        assert_eq!(resolve_state(name, &stored), RecordState::Stopped);
+        assert!(!stored.process_can_run());
+    }
+
+    #[test]
+    fn a_start_is_refused_while_the_process_is_held() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "held-start-refused";
+        let record = running_on(&db, name, held.pid, Some(fake_held::START_TIME));
+        recover_unreachable_machine_in_db(&record, &db).unwrap();
+
+        let error = refuse_start_while_held(&db, name).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!(
+                "process {} is still present after SIGKILL",
+                held.pid
+            )),
+            "{error}"
+        );
+        assert!(
+            error.contains("refusing a second launch on its disks"),
+            "{error}"
+        );
+        // Refusing changes nothing: the next start is refused the same way.
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, Some(held.pid));
+        assert!(refuse_start_while_held(&db, name).is_err());
+    }
+
+    #[test]
+    fn the_held_pid_is_forgotten_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "held-then-gone";
+        let record = running_on(&db, name, held.pid, Some(fake_held::START_TIME));
+        recover_unreachable_machine_in_db(&record, &db).unwrap();
+        assert!(refuse_start_while_held(&db, name).is_err());
+
+        // The host reboots, or the kernel call returns: the process is gone.
+        held.disappear();
+
+        refuse_start_while_held(&db, name).unwrap();
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    /// After a reboot the old PID can belong to an unrelated process. Its
+    /// start time differs, so it is not taken for the machine's.
+    #[test]
+    fn a_pid_now_owned_by_another_process_does_not_block_the_start() {
+        let (_dir, db) = db();
+        let name = "held-pid-reused";
+        let me = std::process::id() as i32;
+        let other_start = crate::process::process_start_time(me).unwrap() + 1_000_000;
+        running_on(&db, name, me, Some(other_start));
+        db.update_vm(name, |r| r.state = RecordState::Stopped)
+            .unwrap();
+
+        refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
+    }
+
+    #[test]
+    fn a_machine_that_stopped_normally_starts_without_a_check() {
+        let (_dir, db) = db();
+        let name = "stopped-normally";
+        let mut record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Stopped;
+        db.insert_vm(name, &record).unwrap();
+        refuse_start_while_held(&db, name).unwrap();
+        refuse_start_while_held(&db, "no-such-machine").unwrap();
     }
 }

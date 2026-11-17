@@ -169,6 +169,9 @@ pub struct Session {
     dev: File,
     mountpoint: std::ffi::CString,
     stop: Arc<AtomicBool>,
+    /// How long the kernel may trust an entry or its attributes before asking
+    /// again. Matches the filesystem's own cache, so the two expire together.
+    ttl: std::time::Duration,
 }
 
 #[cfg(target_os = "linux")]
@@ -178,7 +181,12 @@ impl Session {
     /// `read_only` maps to `MS_RDONLY`, so the kernel itself rejects writes and
     /// the filesystem never sees them — cheaper and more trustworthy than
     /// checking a flag in every handler.
-    pub fn mount(mountpoint: &str, read_only: bool, allow_other: bool) -> std::io::Result<Self> {
+    pub fn mount(
+        mountpoint: &str,
+        read_only: bool,
+        allow_other: bool,
+        ttl: std::time::Duration,
+    ) -> std::io::Result<Self> {
         std::fs::create_dir_all(mountpoint)?;
 
         // Minimal images have no /dev/fuse; as root we can create it.
@@ -231,16 +239,32 @@ impl Session {
             dev,
             mountpoint: target,
             stop: Arc::new(AtomicBool::new(false)),
+            ttl,
         })
     }
 
-    /// Handle requests until the filesystem is unmounted.
-    pub fn run(&mut self, fs: &dyn Filesystem) {
+    /// Handle requests until the filesystem is unmounted, `workers` at a time.
+    ///
+    /// Every request to an object store waits on the network, so one thread
+    /// would make each waiting request hold up all the others. Several threads
+    /// read the same device, as libfuse's multithreaded loop does: the kernel
+    /// hands each request to exactly one reader, and every reply is one write.
+    pub fn run(&mut self, fs: &dyn Filesystem, workers: usize) {
+        let (dev, stop, ttl) = (&self.dev, &self.stop, self.ttl);
+        std::thread::scope(|scope| {
+            for _ in 0..workers.max(1) {
+                scope.spawn(move || Self::serve(dev, stop, ttl, fs));
+            }
+        });
+    }
+
+    fn serve(dev: &File, stop: &AtomicBool, ttl: std::time::Duration, fs: &dyn Filesystem) {
         // One read must hold a full write payload plus header; the kernel
         // rejects a smaller buffer at INIT time.
         let mut buf = vec![0u8; 1024 * 1024 + 4096];
-        while !self.stop.load(Ordering::Relaxed) {
-            let n = match self.dev.read(&mut buf) {
+        let mut reader = dev;
+        while !stop.load(Ordering::Relaxed) {
+            let n = match reader.read(&mut buf) {
                 Ok(0) => return,
                 Ok(n) => n,
                 Err(e) => match e.raw_os_error() {
@@ -261,7 +285,7 @@ impl Session {
             let gid = u32::from_ne_bytes(buf[28..32].try_into().unwrap());
 
             if opcode == op::INIT {
-                self.reply_init(unique, &buf[40..n]);
+                Self::reply_init(dev, unique, &buf[40..n]);
                 continue;
             }
             // FORGET expects no reply at all; answering it corrupts the stream.
@@ -278,11 +302,11 @@ impl Session {
                 data: &buf[40..n],
             };
             let reply = fs.dispatch(&req);
-            self.send(unique, reply);
+            Self::send(dev, ttl, unique, reply);
         }
     }
 
-    fn reply_init(&mut self, unique: u64, data: &[u8]) {
+    fn reply_init(dev: &File, unique: u64, data: &[u8]) {
         let major = u32::from_ne_bytes(data[0..4].try_into().unwrap_or([0; 4]));
         let minor = u32::from_ne_bytes(data[4..8].try_into().unwrap_or([0; 4]));
         let mut b = Vec::new();
@@ -298,47 +322,47 @@ impl Session {
         b.extend_from_slice(&0u16.to_ne_bytes()); // map_alignment
         b.resize(b.len() + 8 * 4, 0); // reserved
         let _ = major;
-        self.raw_reply(unique, 0, &b);
+        Self::raw_reply(dev, unique, 0, &b);
     }
 
-    fn send(&mut self, unique: u64, reply: Reply) {
+    fn send(dev: &File, ttl: std::time::Duration, unique: u64, reply: Reply) {
         match reply {
-            Reply::Ok => self.raw_reply(unique, 0, &[]),
-            Reply::Error(e) => self.raw_reply(unique, -e, &[]),
+            Reply::Ok => Self::raw_reply(dev, unique, 0, &[]),
+            Reply::Error(e) => Self::raw_reply(dev, unique, -e, &[]),
             Reply::Attr(a) => {
                 let mut b = Vec::new();
-                b.extend_from_slice(&1u64.to_ne_bytes()); // attr_valid secs
-                b.extend_from_slice(&0u32.to_ne_bytes()); // attr_valid nsec
+                b.extend_from_slice(&ttl.as_secs().to_ne_bytes()); // attr_valid secs
+                b.extend_from_slice(&ttl.subsec_nanos().to_ne_bytes()); // attr_valid nsec
                 b.extend_from_slice(&0u32.to_ne_bytes()); // dummy
                 a.encode(&mut b);
-                self.raw_reply(unique, 0, &b);
+                Self::raw_reply(dev, unique, 0, &b);
             }
             Reply::Entry(a) => {
                 let mut b = Vec::new();
-                Self::encode_entry(&mut b, &a);
-                self.raw_reply(unique, 0, &b);
+                Self::encode_entry(&mut b, &a, ttl);
+                Self::raw_reply(dev, unique, 0, &b);
             }
             Reply::Create(a, fh) => {
                 let mut b = Vec::new();
-                Self::encode_entry(&mut b, &a);
+                Self::encode_entry(&mut b, &a, ttl);
                 b.extend_from_slice(&fh.to_ne_bytes());
                 b.extend_from_slice(&0u32.to_ne_bytes()); // open_flags
                 b.extend_from_slice(&0u32.to_ne_bytes()); // padding
-                self.raw_reply(unique, 0, &b);
+                Self::raw_reply(dev, unique, 0, &b);
             }
             Reply::Open(fh) => {
                 let mut b = Vec::new();
                 b.extend_from_slice(&fh.to_ne_bytes());
                 b.extend_from_slice(&0u32.to_ne_bytes()); // open_flags
                 b.extend_from_slice(&0u32.to_ne_bytes()); // padding
-                self.raw_reply(unique, 0, &b);
+                Self::raw_reply(dev, unique, 0, &b);
             }
-            Reply::Data(d) | Reply::Directory(d) => self.raw_reply(unique, 0, &d),
+            Reply::Data(d) | Reply::Directory(d) => Self::raw_reply(dev, unique, 0, &d),
             Reply::Written(n) => {
                 let mut b = Vec::new();
                 b.extend_from_slice(&n.to_ne_bytes());
                 b.extend_from_slice(&0u32.to_ne_bytes());
-                self.raw_reply(unique, 0, &b);
+                Self::raw_reply(dev, unique, 0, &b);
             }
             Reply::StatFs {
                 blocks,
@@ -357,22 +381,22 @@ impl Session {
                 b.extend_from_slice(&4096u32.to_ne_bytes()); // frsize
                 b.extend_from_slice(&0u32.to_ne_bytes()); // padding
                 b.resize(b.len() + 6 * 4, 0); // spare
-                self.raw_reply(unique, 0, &b);
+                Self::raw_reply(dev, unique, 0, &b);
             }
         }
     }
 
-    fn encode_entry(b: &mut Vec<u8>, a: &Attr) {
+    fn encode_entry(b: &mut Vec<u8>, a: &Attr, ttl: std::time::Duration) {
         b.extend_from_slice(&a.ino.to_ne_bytes()); // nodeid
         b.extend_from_slice(&0u64.to_ne_bytes()); // generation
-        b.extend_from_slice(&1u64.to_ne_bytes()); // entry_valid
-        b.extend_from_slice(&1u64.to_ne_bytes()); // attr_valid
-        b.extend_from_slice(&0u32.to_ne_bytes()); // entry_valid_nsec
-        b.extend_from_slice(&0u32.to_ne_bytes()); // attr_valid_nsec
+        b.extend_from_slice(&ttl.as_secs().to_ne_bytes()); // entry_valid
+        b.extend_from_slice(&ttl.as_secs().to_ne_bytes()); // attr_valid
+        b.extend_from_slice(&ttl.subsec_nanos().to_ne_bytes()); // entry_valid_nsec
+        b.extend_from_slice(&ttl.subsec_nanos().to_ne_bytes()); // attr_valid_nsec
         a.encode(b);
     }
 
-    fn raw_reply(&mut self, unique: u64, error: i32, body: &[u8]) {
+    fn raw_reply(dev: &File, unique: u64, error: i32, body: &[u8]) {
         let len = (16 + body.len()) as u32;
         let mut out = Vec::with_capacity(len as usize);
         out.extend_from_slice(&len.to_ne_bytes());
@@ -380,7 +404,9 @@ impl Session {
         out.extend_from_slice(&unique.to_ne_bytes());
         out.extend_from_slice(body);
         // A failed reply means the mount is gone; the read loop will notice.
-        let _ = self.dev.write(&out);
+        // One write per reply keeps concurrent replies from interleaving.
+        let mut writer = dev;
+        let _ = writer.write(&out);
     }
 }
 

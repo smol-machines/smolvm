@@ -52,11 +52,12 @@
 //!   -> relay_wake.wake()
 //! ```
 
+use crate::tcp_relay::FlowSummary;
 use crossbeam_queue::ArrayQueue;
 use polling::{Events, Poller};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::Arc;
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
+use std::time::{Duration, SystemTime};
 
 /// Default queue capacity for guest/host ethernet frames.
 pub const DEFAULT_FRAME_QUEUE_CAPACITY: usize = 1024;
@@ -97,7 +98,14 @@ pub struct NetworkFrameQueues {
     /// `Arc` so the runtime owner can hand a cheap read handle to a flush thread
     /// without exposing the rest of the queue set.
     egress_bytes: Arc<AtomicU64>,
+    /// The poll loop's latest open-flow summary and when it was taken, for a
+    /// flush thread owned by the launcher. Written on a slow cadence only.
+    flow_summary: FlowSummarySlot,
 }
+
+/// Shared slot holding the latest [`FlowSummary`] and the wall-clock time it
+/// was taken; `None` until the poll loop has published one.
+pub type FlowSummarySlot = Arc<Mutex<Option<(SystemTime, FlowSummary)>>>;
 
 impl NetworkFrameQueues {
     /// Create a new shared queue set wrapped in `Arc`.
@@ -114,6 +122,7 @@ impl NetworkFrameQueues {
             relay_wake,
             shutting_down: AtomicBool::new(false),
             egress_bytes: Arc::new(AtomicU64::new(0)),
+            flow_summary: Arc::new(Mutex::new(None)),
         })
     }
 
@@ -132,6 +141,21 @@ impl NetworkFrameQueues {
     /// owned by the launcher (the runtime itself is not `Clone`).
     pub fn egress_counter(&self) -> Arc<AtomicU64> {
         self.egress_bytes.clone()
+    }
+
+    /// Replace the published open-flow summary.
+    pub(crate) fn publish_flow_summary(&self, summary: FlowSummary) {
+        let mut slot = self
+            .flow_summary
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        *slot = Some((SystemTime::now(), summary));
+    }
+
+    /// A cheap, cloneable read handle to the open-flow summary slot, for a
+    /// flush thread owned by the launcher.
+    pub fn flow_summary_slot(&self) -> FlowSummarySlot {
+        self.flow_summary.clone()
     }
 
     /// Mark the runtime as shutting down and wake all waiters.

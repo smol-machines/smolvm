@@ -42,6 +42,13 @@ pub struct MachineSpec {
     /// This is persisted in the VM record so an SDK-created fork base remains
     /// forkable after its creating process exits and a later process reconnects.
     pub forkable: bool,
+    /// Whether the VM outlives the process that starts it. By default an
+    /// embedded machine's boot subprocess watches its parent and exits when
+    /// that parent dies, however it dies (see `LaunchFeatures::watch_parent`);
+    /// a detached machine keeps running and a later process reattaches with
+    /// `connect_machine`. Persisted so a restart by that later process stays
+    /// detached too.
+    pub detached: bool,
     /// Caller metadata, mirroring the CLI's `--label` and surfaced by
     /// `machine ls --json`. smolvm never interprets these.
     ///
@@ -57,47 +64,121 @@ pub struct MachineSpec {
     pub runtime_managed: bool,
     /// S3-compatible volumes the agent mounts inside the guest on every start.
     pub remote_volumes: Vec<crate::remote_volume::RemoteVolume>,
+    /// Credentials the workload uses without seeing them, as the CLI's
+    /// `--credential`: each bound variable holds a placeholder in the guest,
+    /// and the host substitutes the real value only on HTTPS requests to the
+    /// binding's hosts. A value comes from
+    /// [`Runtime::supply_credential_values`](crate::embedded::runtime::Runtime::supply_credential_values),
+    /// else from the embedding process's own variable of the binding's name.
+    /// A policy implies networking.
+    pub credentials: Option<smolvm_protocol::CredentialPolicy>,
 }
 
 impl MachineSpec {
-    /// Convert the embedded-machine spec into the canonical DB record.
-    pub fn to_record(&self) -> VmRecord {
-        let (mounts, staged_mounts) = HostMount::split_storage_tuples(&self.mounts);
-        let mut record = VmRecord::new(
-            self.name.clone(),
-            self.resources.cpus,
-            self.resources.memory_mib,
+    /// This spec as the machine spec every creation path resolves. Every
+    /// field is named, so a new one does not compile until it is carried.
+    pub fn to_create_spec(&self) -> crate::machine_spec::CreateSpec {
+        let MachineSpec {
+            // The machine's name and its source are not options of it.
+            name: _,
+            image: _,
             mounts,
-            self.ports.iter().map(PortMapping::to_tuple).collect(),
-            self.resources.network,
-        );
-        record.staged_mounts = staged_mounts;
-        record.storage_gb = self.resources.storage_gib;
-        record.overlay_gb = self.resources.overlay_gib;
-        record.block_io = self.resources.block_io;
-        record.allowed_cidrs = self.resources.allowed_cidrs.clone();
-        record.dns_filter_hosts = if self.allowed_hosts.is_empty() {
-            None
-        } else {
-            Some(self.allowed_hosts.clone())
-        };
-        record.network_backend = self.resources.network_backend;
-        record.gpu = Some(self.resources.gpu);
-        record.gpu_vram_mib = self.resources.gpu_vram_mib;
-        record.cuda = self.resources.cuda;
-        record.image = self.image.clone();
-        record.labels = self.labels.clone();
-        record.ephemeral = !self.persistent;
-        record.forkable = self.forkable;
-        record.runtime_managed = self.runtime_managed;
-        record.remote_volumes = self.remote_volumes.clone();
-        record
+            ports,
+            resources,
+            command,
+            allowed_hosts,
+            persistent,
+            forkable,
+            detached,
+            labels,
+            runtime_managed,
+            remote_volumes,
+            credentials,
+        } = self.clone();
+        let VmResources {
+            cpus,
+            memory_mib,
+            network,
+            network_backend,
+            gpu,
+            gpu_vram_mib,
+            cuda,
+            nested_virt,
+            rosetta,
+            storage_gib,
+            overlay_gib,
+            block_io,
+            disk_durability,
+            disks,
+            cache_disk,
+            disk_volumes,
+            block_private,
+            allowed_cidrs,
+            egress_rules,
+            dns,
+            dns_options,
+            shm_size,
+            network_name,
+            guest_subnet,
+            switch,
+        } = resources;
+        crate::machine_spec::CreateSpec {
+            cmd: (!command.is_empty()).then_some(command),
+            shm_size,
+            cpus: Some(cpus),
+            mem: Some(memory_mib),
+            storage_gb: storage_gib,
+            overlay_gb: overlay_gib,
+            block_io: Some(block_io),
+            disk_durability: Some(disk_durability),
+            disks,
+            cache_disk,
+            mounts,
+            remote_volumes,
+            disk_volumes,
+            net: network,
+            network_backend,
+            dns,
+            dns_options,
+            network_name,
+            guest_subnet,
+            switch,
+            ports,
+            allowed_cidrs,
+            allowed_hosts: (!allowed_hosts.is_empty()).then_some(allowed_hosts),
+            block_private,
+            egress_rules,
+            // A value comes from `supply_credential_values`, else from the
+            // embedding process's own variable of the binding's name.
+            credentials,
+            gpu,
+            gpu_vram_mib,
+            rosetta,
+            nested_virt,
+            cuda,
+            forkable,
+            ephemeral: !persistent,
+            detached,
+            runtime_managed,
+            labels,
+            ..Default::default()
+        }
+    }
+
+    /// The record this spec creates, by the rules every creation path uses.
+    pub fn to_record(&self) -> Result<VmRecord> {
+        crate::machine_spec::resolve(
+            crate::machine_spec::SpecSource::from_image(self.image.as_deref()),
+            self.to_create_spec(),
+            crate::machine_spec::Caller::Embedded,
+        )?
+        .to_record(&self.name)
     }
 }
 
 /// Create a DB record for a new SDK machine.
 pub fn create_vm(db: &SmolvmDb, spec: &MachineSpec) -> Result<()> {
-    create_vm_with_workload(db, spec, Vec::new(), None, None)
+    create_vm_with_workload(db, spec, Vec::new(), None, None, None)
 }
 
 /// Create a DB record with the image workload configuration supplied by an
@@ -108,31 +189,123 @@ pub(crate) fn create_vm_with_workload(
     env: Vec<(String, String)>,
     workdir: Option<String>,
     user: Option<String>,
+    credentials: Option<&crate::credentials::CredentialPolicy>,
 ) -> Result<()> {
     validate_vm_name(&spec.name, "name")
         .map_err(|reason| Error::config("validate machine name", reason))?;
-    let mut record = spec.to_record();
-    if let Some(cidrs) = &spec.resources.allowed_cidrs {
-        record.allowed_cidrs = Some(
-            cidrs
-                .iter()
-                .map(|cidr| crate::smolfile::parse_cidr(cidr))
-                .collect::<std::result::Result<Vec<_>, _>>()
-                .map_err(|reason| Error::config("validate allowed CIDR", reason))?,
-        );
-    }
-    record.cmd = spec.command.clone();
-    record.env = env;
-    record.workdir = workdir;
-    record.user = user;
-    if db.insert_vm_if_not_exists(&spec.name, &record)? {
+    let create = spec.create_spec_with(env, workdir, user, credentials)?;
+    create_vm_from_spec(db, &spec.name, spec.image.as_deref(), create)
+}
+
+/// Create a DB record for `name` from `spec`: an image machine from `image`,
+/// or a bare VM without one, by the rules every creation path uses.
+pub(crate) fn create_vm_from_spec(
+    db: &SmolvmDb,
+    name: &str,
+    image: Option<&str>,
+    spec: crate::machine_spec::CreateSpec,
+) -> Result<()> {
+    validate_vm_name(name, "name")
+        .map_err(|reason| Error::config("validate machine name", reason))?;
+    let record = crate::machine_spec::resolve(
+        crate::machine_spec::SpecSource::from_image(image),
+        spec,
+        crate::machine_spec::Caller::Embedded,
+    )?
+    .to_record(name)?;
+    if db.insert_vm_if_not_exists(name, &record)? {
         Ok(())
     } else {
         Err(Error::agent_conflict(
             "create machine",
-            format!("machine '{}' already exists", spec.name),
+            format!("machine '{name}' already exists"),
         ))
     }
+}
+
+impl MachineSpec {
+    /// This spec with the workload settings and credential bindings an SDK
+    /// passes beside it, as the machine spec every creation path resolves.
+    /// Values for `credentials` come only from
+    /// [`supply_credential_values`](crate::embedded::runtime::EmbeddedRuntime::supply_credential_values).
+    pub fn create_spec_with(
+        &self,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        user: Option<String>,
+        credentials: Option<&crate::credentials::CredentialPolicy>,
+    ) -> Result<crate::machine_spec::CreateSpec> {
+        let spec = self;
+        let mut create = spec.to_create_spec();
+        create.env = env;
+        create.workdir = workdir;
+        create.user = user;
+        if let Some(policy) = credentials.filter(|p| !p.is_empty()) {
+            // A credential only ever travels over the network the machine has; it
+            // grants none. Refuse rather than create a machine whose requests
+            // could never be made.
+            let has_egress = spec.resources.network
+                || !spec.allowed_hosts.is_empty()
+                || spec
+                    .resources
+                    .allowed_cidrs
+                    .as_ref()
+                    .is_some_and(|cidrs| !cidrs.is_empty());
+            if !has_egress {
+                return Err(Error::config(
+                    "credentials",
+                    "credential bindings need network egress; enable network or allow the hosts",
+                ));
+            }
+            let mut merged = policy.clone();
+            if let Some(from_spec) = create.credentials.take() {
+                merged.credentials.extend(from_spec.credentials);
+            }
+            create.credentials = Some(merged);
+            // Values come only from `supply_credential_values`, never from this
+            // host's environment: an embedder decides what each machine may use.
+            create.credentials_supplied_only = true;
+        }
+        Ok(create)
+    }
+}
+
+/// The guest variables a machine's credentials add to every command and to
+/// its workload: each bound variable's placeholder, plus the variables that
+/// point HTTP clients at the machine CA. None of it is secret.
+pub(crate) fn credential_env(record: &VmRecord) -> Vec<(String, String)> {
+    crate::credentials::workload_env(
+        record.credential_policy.as_ref(),
+        &record.credential_placeholders,
+        &BTreeMap::new(),
+    )
+    .1
+}
+
+/// Replace a stopped machine's outbound network policy. See
+/// [`VmRecord::apply_egress_policy`] for what may change.
+pub fn set_egress_policy(
+    db: &SmolvmDb,
+    name: &str,
+    policy: &crate::data::network::EgressPolicy,
+) -> Result<()> {
+    let record = get_record(db, name)?;
+    let state = record.actual_state();
+    if !matches!(state, RecordState::Stopped | RecordState::Created) {
+        return Err(Error::InvalidState {
+            expected: "stopped".into(),
+            actual: format!("{state:?}"),
+        });
+    }
+    let mut updated = record;
+    updated.apply_egress_policy(policy)?;
+    db.update_vm(name, |r| {
+        r.network = updated.network;
+        r.allowed_cidrs = updated.allowed_cidrs.clone();
+        r.dns_filter_hosts = updated.dns_filter_hosts.clone();
+        r.egress_rules = updated.egress_rules.clone();
+    })?;
+    Ok(())
 }
 
 /// Load a persisted VM record.
@@ -144,19 +317,84 @@ pub fn get_record(db: &SmolvmDb, name: &str) -> Result<VmRecord> {
 /// booted/restarted it. Callers use the status to launch image workloads exactly
 /// once: a reused VM already has its workload, while a restarted VM does not.
 pub(crate) fn start_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
-    let record = get_record(db, name)?;
-    let started = start_vm_from_record(&record)?;
+    start_vm_with_interceptor(db, name, None)
+}
+
+/// Start with a per-launch interceptor binding. The token is never stored in the DB.
+pub(crate) fn start_vm_with_interceptor(
+    db: &SmolvmDb,
+    name: &str,
+    interceptor: Option<smolvm_protocol::InterceptEndpoint>,
+) -> Result<StartedVm> {
+    crate::agent::state_probe::refuse_start_while_held(db, name)?;
+    // A machine with no network cannot pull its registry image in-guest; the
+    // host fetches it instead.
+    let record = crate::image_store::pin_for_start(
+        db,
+        name,
+        get_record(db, name)?,
+        &crate::registry::PullAuth::FromConfig,
+    )?;
+    crate::network::private_floor::log_record_hosts_blocked_by_private_floor(name, &record);
+    // A fresh registry-image machine starts on a shared seed of its image, as
+    // the CLI and API do, so an SDK create skips the in-guest pull.
+    crate::image_seed::seed_first_start(name, &record, false, None, None, None);
+    let started = launch_from_record(
+        &record,
+        LaunchFeatures {
+            external_interceptor: interceptor,
+            ..Default::default()
+        },
+    )?;
     mark_running(db, name, started.handle.child_pid())?;
     Ok(started)
 }
 
-fn start_vm_from_record(record: &VmRecord) -> Result<StartedVm> {
-    launch_from_record(record, LaunchFeatures::default())
+pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<StartedVm> {
+    let record = get_record(db, name)?;
+    let started = launch_from_record(
+        &record,
+        LaunchFeatures {
+            resume_paused: true,
+            // On Linux x86_64, restore with branchable RAM so libkrun can map the
+            // retained checkpoint image directly instead of copying it.
+            #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+            forkable: true,
+            watch_parent: detached.then_some(false),
+            // A same-machine restore keeps its existing owner, rather than
+            // inferring a new UID from the temporary snapshot's directory depth.
+            uid_share_dir: Some(crate::agent::vm_data_dir(name)),
+            ..Default::default()
+        },
+    )?;
+    let pid = started.handle.child_pid();
+    let pid_start_time = pid.and_then(crate::process::process_start_time);
+    db.finish_saved_execution(name, |record| {
+        record.state = RecordState::Running;
+        record.pid = pid;
+        record.pid_start_time = pid_start_time;
+        record.engine_build = Some(crate::ENGINE_BUILD.to_string());
+        record.paused_checkpoint = None;
+    })?
+    .ok_or_else(|| Error::vm_not_found(name))?;
+    Ok(started)
 }
 
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();
+    }
+    // Socket bridges are part of the machine, as on the CLI start path; a
+    // launch that dropped them left the guest path empty.
+    if features.published_sockets.is_empty() {
+        features.published_sockets = record.published_sockets.clone();
+    }
+    // A detached machine stays detached on every launch — a plain start after
+    // a stop, a resume, a fork clone (which copies the golden's record) — not
+    // only the one that created it. A caller that decides explicitly still
+    // wins, as the CLI does for `machine run` versus `--detach`.
+    if features.watch_parent.is_none() && record.detached {
+        features.watch_parent = Some(false);
     }
     if !record.init_completed {
         features
@@ -166,15 +404,14 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
 }
 
 fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result<LaunchFeatures> {
-    let mut features = merge_record_launch_features(record, features).with_packed_layers(
-        &crate::agent::machine_layers_cache_dir(&record.name),
-        record.source_smolmachine.as_deref(),
-    )?;
+    let mut features = merge_record_launch_features(record, features)
+        .with_packed_layers_with_mode(
+            &crate::agent::machine_layers_cache_dir(&record.name),
+            record.packed_layer_source(),
+            record.image.is_none(),
+        )?;
     if features.packed_layers_dir.is_none() {
-        features.packed_layers_dir = record
-            .image
-            .as_deref()
-            .and_then(crate::data::image_source::packed_layers_dir_for_ref);
+        features.packed_layers_dir = record.local_image_layers_dir();
     }
     Ok(features)
 }
@@ -200,6 +437,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     if features.cuda_fork_pool_size.is_none() {
         features.cuda_fork_pool_size = record.cuda_fork_pool_size;
     }
+    // Credential bindings are part of the launch too: without them the guest's
+    // placeholders go out unsubstituted, and a paused machine's snapshot — which
+    // holds the credential CA's virtio-fs device — can no longer be restored.
+    if features.credentials.is_none() {
+        features.credentials =
+            crate::credentials::CredentialLaunch::for_record(&record.name, record);
+    }
     if features.cuda_vram_limit_mib.is_none() {
         features.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
     }
@@ -217,6 +461,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(&record.name)).is_some();
+    if restoring_checkpoint {
+        // Read the restored RAM ahead while the VM boots, as the CLI does, so
+        // the first commands after the restore don't page it in from disk.
+        crate::portable_checkpoint::prefetch_restore_memory(&crate::agent::vm_data_dir(
+            &record.name,
+        ));
+    }
     let freshly_started = manager
         .ensure_running_with_full_config(
             record.host_mounts(),
@@ -251,7 +502,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
     db.update_vm(name, |record| record.forkable = true)?
         .ok_or_else(|| Error::vm_not_found(name))?;
-    let record = get_record(db, name)?;
+    let record = crate::image_store::pin_for_start(
+        db,
+        name,
+        get_record(db, name)?,
+        &crate::registry::PullAuth::FromConfig,
+    )?;
+    crate::image_seed::seed_first_start(name, &record, false, None, None, None);
     let features = LaunchFeatures {
         forkable: true,
         ..LaunchFeatures::default()
@@ -271,6 +528,7 @@ pub fn start_vm_with_netns(
     name: &str,
     netns: std::path::PathBuf,
 ) -> Result<VmHandle> {
+    crate::agent::state_probe::refuse_start_while_held(db, name)?;
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         pod_netns: Some(netns),
@@ -281,23 +539,10 @@ pub fn start_vm_with_netns(
     Ok(started.handle)
 }
 
-/// Fork a running, forkable `golden` into a new `clone` via copy-on-write guest
-/// RAM + disks (same host). Freezes the golden (it stays paused as the shared
-/// base — clones map its RAM `MAP_PRIVATE`, so it must not run again while clones
-/// exist), boots the clone from the golden's snapshot, and returns the clone's
-/// handle. `pinned_ports` are `(host, guest)` inbound forwards for the clone;
-/// empty means the golden's forwards are remapped to freshly-allocated host
-/// ports. Shares `agent::fork` with the CLI/serve fork paths.
-pub fn fork_vm(
-    db: &SmolvmDb,
-    golden: &str,
-    clone: &str,
-    pinned_ports: &[(u16, u16)],
-) -> Result<VmHandle> {
-    fork_vm_with_options(db, golden, clone, pinned_ports, false, false, None)
-}
-
 /// Fork a machine with launch options needed by non-embedded front-ends.
+/// `source_policy` decides whether the source resumes or stays paused as a
+/// reusable branch base.
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn fork_vm_with_options(
     db: &SmolvmDb,
     golden: &str,
@@ -306,8 +551,16 @@ pub(crate) fn fork_vm_with_options(
     clone_forkable: bool,
     share_weights: bool,
     watch_parent: Option<bool>,
+    source_policy: crate::agent::fork::ForkSourcePolicy,
+    keep_machine_id: bool,
 ) -> Result<VmHandle> {
     let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    if get_record(db, golden)?.mediated_egress_required {
+        return Err(Error::config(
+            "fork clone",
+            "this embedded fork path cannot bind a mediated interceptor; use the machine branch API",
+        ));
+    }
     // Freeze + snapshot the source, then register the clone and its CoW disks.
     let prep = crate::agent::fork::prepare_fork(
         db,
@@ -317,9 +570,51 @@ pub(crate) fn fork_vm_with_options(
         clone_forkable,
         &[],
         &std::collections::BTreeMap::new(),
+        &[],
+        source_policy,
     )?;
 
-    boot_prepared_fork(db, clone, prep, share_weights, watch_parent, None)
+    boot_prepared_fork(
+        db,
+        clone,
+        prep,
+        share_weights,
+        watch_parent,
+        None,
+        keep_machine_id,
+    )
+}
+
+/// Branch the frozen `golden` into a new machine `clone` and boot it, after
+/// `adjust` has changed the clone's record (its ports, network attachment,
+/// labels). The golden stays paused as a base for further branches.
+#[cfg(unix)]
+pub(crate) fn fork_vm_adjusted(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    adjust: impl FnOnce(&mut VmRecord),
+) -> Result<VmHandle> {
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    let mut prep = crate::agent::fork::prepare_fork(
+        db,
+        golden,
+        clone,
+        &[],
+        false,
+        &[],
+        &std::collections::BTreeMap::new(),
+        &[],
+        crate::agent::fork::ForkSourcePolicy::Freeze,
+    )?;
+    adjust(&mut prep.clone_record);
+    let record = prep.clone_record.clone();
+    if let Err(error) = db.update_vm(clone, |r| *r = record) {
+        let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
+        return Err(error);
+    }
+    boot_prepared_fork(db, clone, prep, false, None, None, false)
 }
 
 fn boot_prepared_fork(
@@ -329,6 +624,7 @@ fn boot_prepared_fork(
     share_weights: bool,
     watch_parent: Option<bool>,
     retry_gate: Option<&std::sync::Mutex<()>>,
+    keep_machine_id: bool,
 ) -> Result<VmHandle> {
     // Boot the clone from the golden's in-memory snapshot instead of cold-booting.
     let features = LaunchFeatures {
@@ -352,7 +648,11 @@ fn boot_prepared_fork(
             // FAIL-CLOSED: if the reset can't be confirmed, stop the booted clone
             // and roll it back rather than leave it live with the golden's
             // per-machine secrets.
-            if let Err(error) = crate::agent::fork::rejuvenate_clone(clone, &prep.clone_record) {
+            if let Err(error) = crate::agent::fork::rejuvenate_clone_with(
+                clone,
+                &prep.clone_record,
+                keep_machine_id,
+            ) {
                 let _ = handle.stop();
                 return Err(error);
             }
@@ -417,12 +717,29 @@ pub fn fork_vm_batch(
     golden: &str,
     clones: &[(String, Vec<(u16, u16)>)],
     parallel: usize,
+    source_policy: crate::agent::fork::ForkSourcePolicy,
+    keep_machine_id: bool,
 ) -> Result<Vec<(String, VmHandle)>> {
-    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
     if clones.is_empty() {
         return Err(Error::config(
             "fork batch",
             "at least one clone is required",
+        ));
+    }
+    let mut names = std::collections::HashSet::new();
+    for (name, _) in clones {
+        if !names.insert(name) {
+            return Err(Error::config(
+                "fork batch",
+                format!("duplicate clone name '{name}'"),
+            ));
+        }
+    }
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    if get_record(db, golden)?.mediated_egress_required {
+        return Err(Error::config(
+            "fork batch",
+            "this embedded fork path cannot bind a mediated interceptor; use the machine branch API",
         ));
     }
     let empty_secrets = std::collections::BTreeMap::new();
@@ -435,9 +752,10 @@ pub fn fork_vm_batch(
             fork_env: &[],
             fork_secrets: &empty_secrets,
             hold: false,
+            labels: &[],
         })
         .collect();
-    let prepared = crate::agent::fork::prepare_forks(db, golden, &specs)?;
+    let prepared = crate::agent::fork::prepare_forks(db, golden, &specs, source_policy)?;
     let width = parallel.max(1).min(prepared.len());
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),
@@ -467,7 +785,15 @@ pub fn fork_vm_batch(
                         };
                         let clone = prep.clone_record.name.clone();
                         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                            boot_prepared_fork(&db, &clone, prep, false, None, Some(retry_gate))
+                            boot_prepared_fork(
+                                &db,
+                                &clone,
+                                prep,
+                                false,
+                                None,
+                                Some(retry_gate),
+                                keep_machine_id,
+                            )
                         }))
                         .unwrap_or_else(|_| {
                             Err(Error::agent(
@@ -563,7 +889,14 @@ pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
 }
 
 /// Stop a persisted VM and update its DB state.
-pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
+///
+/// `stop_timeout` overrides how long the workload gets to exit after its stop
+/// signal; `None` keeps the timeout it was launched with.
+pub fn stop_vm_with_timeout(
+    db: &SmolvmDb,
+    name: &str,
+    stop_timeout: Option<std::time::Duration>,
+) -> Result<()> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
@@ -572,7 +905,10 @@ pub fn stop_vm(db: &SmolvmDb, name: &str) -> Result<()> {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
         crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
     }
-    manager.stop()?;
+    match stop_timeout {
+        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
+        None => manager.stop()?,
+    }
     // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
     // left it mounted. Unconditional on purpose: the embedded record may carry no
     // source_smolmachine even when a CLI/API `machine create <bundle>` extracted and
@@ -601,12 +937,21 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
             ),
         ));
     }
-    let removed = db.remove_vm(name)?;
-    if removed.is_none() {
+    if db.get_vm(name)?.is_none() {
         return Err(Error::vm_not_found(name));
     }
+    // A stopped or crashed branch source can still own the processes holding
+    // its forked RAM. Stop them while the record and their manifests exist, as
+    // the CLI and API deletes do; removing the data dir first leaks the RAM.
+    crate::agent::cleanup_dead_vm_runtime_in_db(name, db)?;
+    let Some(removed) = db.remove_vm(name)? else {
+        return Err(Error::vm_not_found(name));
+    };
 
     let data_dir = crate::agent::vm_data_dir(name);
+    // Release this machine's per-VM uid (root launches only) before the dir
+    // holding its record is removed.
+    crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
     // Detach the per-machine layers volume before removing the data dir, else on
     // macOS the live mountpoint under it makes remove_dir_all fail with "Resource
     // busy", stranding both the mount and the data dir. Unconditional on purpose:
@@ -621,6 +966,16 @@ pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
                 format!("{}: {}", data_dir.display(), e),
             )
         })?;
+    }
+
+    // With the child gone, its parent may hold a RAM generation, disk layers
+    // and a macOS layers mount that nothing references any more.
+    if let Some(parent) = removed.golden.as_deref() {
+        if let Err(error) =
+            crate::agent::fork::collect_parent_generations_after_child_delete(db, parent)
+        {
+            tracing::warn!(%parent, %error, "could not collect unreferenced fork generation");
+        }
     }
 
     Ok(())
@@ -662,6 +1017,7 @@ pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
         record.state = RecordState::Running;
         record.pid = pid;
         record.pid_start_time = pid_start_time;
+        record.engine_build = Some(crate::ENGINE_BUILD.to_string());
     })?
     .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())
@@ -669,12 +1025,8 @@ pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
 
 /// Mark a machine record as stopped.
 pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
-    db.update_vm(name, |record| {
-        record.state = RecordState::Stopped;
-        record.pid = None;
-        record.pid_start_time = None;
-    })?
-    .ok_or_else(|| Error::vm_not_found(name))?;
+    db.update_vm(name, VmRecord::mark_process_stopped)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())
 }
 
@@ -700,14 +1052,17 @@ mod tests {
     }
 
     fn test_db() -> SmolvmDb {
+        // The clock alone is not unique: macOS reports microseconds, so tests
+        // running in parallel can read the same instant and share one file.
+        static NEXT_DB: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         let unique = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_nanos();
+        let sequence = NEXT_DB.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let path = std::env::temp_dir().join(format!(
-            "smolvm-embedded-control-{}-{}.db",
+            "smolvm-embedded-control-{}-{unique}-{sequence}.db",
             std::process::id(),
-            unique
         ));
         SmolvmDb::open_at(&path).unwrap()
     }
@@ -737,6 +1092,49 @@ mod tests {
         r.state = state;
         r.pid = pid;
         db.insert_vm_if_not_exists(name, &r).unwrap();
+    }
+
+    #[test]
+    fn create_policy_is_validated_before_publication_without_deleting_existing_records() {
+        use crate::data::network::EgressPolicy;
+        use crate::machine_spec::CreateSpec;
+        let db = test_db();
+        let invalid = CreateSpec {
+            egress: Some(EgressPolicy::hosts(["https://invalid.test"])),
+            ..Default::default()
+        };
+        assert!(create_vm_from_spec(&db, "absent", None, invalid.clone()).is_err());
+        assert!(db.get_vm("absent").unwrap().is_none());
+        insert(
+            &db,
+            "existing",
+            false,
+            RecordState::Running,
+            Some(std::process::id() as i32),
+        );
+        let before = serde_json::to_value(db.get_vm("existing").unwrap()).unwrap();
+        assert!(create_vm_from_spec(&db, "existing", None, invalid).is_err());
+        assert_eq!(
+            before,
+            serde_json::to_value(db.get_vm("existing").unwrap()).unwrap()
+        );
+        create_vm_from_spec(
+            &db,
+            "restricted",
+            None,
+            CreateSpec {
+                net: true,
+                egress: Some(EgressPolicy::hosts(["only.test"])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let record = db.get_vm("restricted").unwrap().unwrap();
+        assert_eq!(record.dns_filter_hosts, Some(vec!["=only.test".into()]));
+        assert_eq!(
+            record.launch_network_plan().backend,
+            crate::network::EffectiveNetworkBackend::VirtioNet
+        );
     }
 
     #[test]
@@ -771,17 +1169,134 @@ mod tests {
 
     #[test]
     fn record_ephemeral_follows_persistent_flag() {
-        assert!(test_spec("ephemeral", false).to_record().ephemeral);
-        assert!(!test_spec("persistent", true).to_record().ephemeral);
+        assert!(test_spec("ephemeral", false).to_record().unwrap().ephemeral);
+        assert!(!test_spec("persistent", true).to_record().unwrap().ephemeral);
     }
 
     #[test]
     fn record_carries_durable_forkable_start() {
         let mut spec = test_spec("fork-base", true);
         spec.forkable = true;
-        let record = spec.to_record();
+        let record = spec.to_record().unwrap();
         assert!(record.forkable);
         assert!(record.forkable_on_start());
+    }
+
+    #[test]
+    fn detached_record_disarms_the_parent_death_watchdog_on_every_launch() {
+        let mut spec = test_spec("hostd-owned", true);
+        spec.detached = true;
+        let record = spec.to_record().unwrap();
+        assert!(record.detached);
+
+        // Every launch path that starts from the record — start, resume, a
+        // fork clone — inherits the opt-out without naming it.
+        let features = merge_record_launch_features(&record, LaunchFeatures::default());
+        assert_eq!(features.watch_parent, Some(false));
+
+        // An explicit caller decision is left alone in both directions.
+        let armed = LaunchFeatures {
+            watch_parent: Some(true),
+            ..LaunchFeatures::default()
+        };
+        assert_eq!(
+            merge_record_launch_features(&record, armed).watch_parent,
+            Some(true)
+        );
+
+        // A machine that did not ask keeps the default (armed under an
+        // in-process embedder).
+        let plain = test_spec("owned", true).to_record().unwrap();
+        assert!(!plain.detached);
+        assert_eq!(
+            merge_record_launch_features(&plain, LaunchFeatures::default()).watch_parent,
+            None
+        );
+    }
+
+    #[test]
+    fn record_carries_nested_virtualization() {
+        // Without this, an SDK machine created nested lost VMX on its next start.
+        let mut spec = test_spec("nested", true);
+        spec.resources.nested_virt = true;
+        let record = spec.to_record().unwrap();
+        assert_eq!(record.nested_virt, Some(true));
+        assert!(record.vm_resources().nested_virt);
+        // Off by default, and stored as absent rather than `Some(false)`.
+        let record = test_spec("flat", true).to_record().unwrap();
+        assert_eq!(record.nested_virt, None);
+        assert!(!record.vm_resources().nested_virt);
+    }
+
+    fn notion_policy(hosts: &[&str]) -> smolvm_protocol::CredentialPolicy {
+        smolvm_protocol::CredentialPolicy {
+            credentials: vec![crate::credentials::parse_credential_flag(&format!(
+                "notion=NOTION_API_KEY@{}",
+                hosts.join(",")
+            ))
+            .unwrap()],
+        }
+    }
+
+    #[test]
+    fn a_credentialed_spec_records_its_policy_placeholders_and_network() {
+        let db = test_db();
+        let mut spec = test_spec("creds", true);
+        spec.credentials = Some(notion_policy(&["api.notion.com", "files.notion.com"]));
+        create_vm_with_workload(&db, &spec, vec![("A".into(), "1".into())], None, None, None)
+            .unwrap();
+        let record = get_record(&db, "creds").unwrap();
+
+        assert!(record.network, "a credential policy implies networking");
+        let policy = record.credential_policy.as_ref().expect("policy recorded");
+        assert_eq!(
+            policy.credentials[0].allowed_hosts,
+            vec!["api.notion.com", "files.notion.com"]
+        );
+        assert!(!record.credentials_supplied_by_api);
+        let placeholder = record
+            .credential_placeholders
+            .get("notion")
+            .expect("a placeholder is minted at create")
+            .clone();
+
+        let env = credential_env(&record);
+        assert!(
+            env.contains(&("NOTION_API_KEY".to_string(), placeholder.clone())),
+            "the guest variable holds the placeholder: {env:?}"
+        );
+        assert!(
+            env.iter().all(|(_, value)| !value.contains("secret_")),
+            "no value reaches the guest environment"
+        );
+        assert_eq!(record.env, vec![("A".to_string(), "1".to_string())]);
+    }
+
+    #[test]
+    fn a_credential_for_a_host_outside_the_allow_list_is_refused_at_create() {
+        let db = test_db();
+        let mut spec = test_spec("creds-outside", true);
+        spec.allowed_hosts = vec!["api.github.com".into()];
+        spec.credentials = Some(notion_policy(&["api.notion.com"]));
+        assert!(create_vm_with_workload(&db, &spec, Vec::new(), None, None, None).is_err());
+        assert!(db.get_vm("creds-outside").unwrap().is_none());
+    }
+
+    #[test]
+    fn a_spec_without_credentials_adds_no_guest_variables() {
+        let db = test_db();
+        create_vm_with_workload(
+            &db,
+            &test_spec("plain-env", true),
+            Vec::new(),
+            None,
+            None,
+            None,
+        )
+        .unwrap();
+        let record = get_record(&db, "plain-env").unwrap();
+        assert!(record.credential_policy.is_none());
+        assert!(credential_env(&record).is_empty());
     }
 
     #[test]
@@ -794,7 +1309,7 @@ mod tests {
         spec.resources.cuda = true;
         spec.resources.allowed_cidrs = Some(vec!["10.0.0.0/8".into()]);
         spec.allowed_hosts = vec!["api.example.com".into()];
-        let record = spec.to_record();
+        let record = spec.to_record().unwrap();
         assert_eq!(record.gpu, Some(true));
         assert_eq!(record.gpu_vram_mib, Some(512));
         assert!(record.vm_resources().gpu);
@@ -807,8 +1322,8 @@ mod tests {
         );
 
         // Default (no GPU) records leave gpu off.
-        let plain = test_spec("plain", false).to_record();
-        assert_eq!(plain.gpu, Some(false));
+        let plain = test_spec("plain", false).to_record().unwrap();
+        assert!(!plain.gpu.unwrap_or(false));
         assert!(!plain.vm_resources().gpu);
         assert!(!plain.cuda);
         assert!(!plain.vm_resources().cuda);
@@ -826,6 +1341,7 @@ mod tests {
             vec![("SESSION".into(), "golden".into())],
             Some("/workspace".into()),
             Some("1000:1000".into()),
+            None,
         )
         .unwrap();
         let record = get_record(&db, "workload").unwrap();
@@ -836,17 +1352,96 @@ mod tests {
         assert_eq!(record.workdir.as_deref(), Some("/workspace"));
     }
 
+    fn header_policy() -> crate::credentials::CredentialPolicy {
+        serde_json::from_str(
+            r#"{"credentials":[{"name":"git","allowed_hosts":["github.com","*.github.com"],
+               "set_header":"authorization"}]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn credential_bindings_are_recorded_without_values() {
+        let mut spec = test_spec("credentialed", false);
+        spec.resources.network = true;
+        let db = test_db();
+        create_vm_with_workload(&db, &spec, Vec::new(), None, None, Some(&header_policy()))
+            .unwrap();
+        let record = get_record(&db, "credentialed").unwrap();
+        assert_eq!(record.credential_policy, Some(header_policy()));
+        assert!(record.credential_placeholders.contains_key("git"));
+        // An embedder's bindings take values only from what it supplies.
+        assert!(record.credentials_supplied_by_api);
+        let launch = crate::credentials::CredentialLaunch::for_record("credentialed", &record)
+            .expect("a credentialed record launches the interceptor");
+        assert!(launch.supplied_only);
+    }
+
+    #[test]
+    fn embedded_create_rejects_invalid_published_ports_before_persisting() {
+        let db = test_db();
+        for (name, ports, expected) in [
+            ("zero-host", vec![PortMapping::new(0, 8080)], "port 0"),
+            ("zero-guest", vec![PortMapping::new(8080, 0)], "port 0"),
+            (
+                "duplicate-host",
+                vec![PortMapping::new(8080, 80), PortMapping::new(8080, 81)],
+                "duplicate host port",
+            ),
+        ] {
+            let mut spec = test_spec(name, true);
+            spec.ports = ports;
+            let error = create_vm(&db, &spec).unwrap_err();
+            assert!(error.to_string().contains(expected), "{name}: {error}");
+            assert!(get_record(&db, name).is_err(), "{name} was persisted");
+        }
+
+        let mut spec = test_spec("valid-ports", true);
+        spec.ports = vec![PortMapping::new(8080, 80), PortMapping::new(8081, 80)];
+        create_vm(&db, &spec).unwrap();
+        assert_eq!(get_record(&db, "valid-ports").unwrap().ports.len(), 2);
+    }
+
+    #[test]
+    fn credentials_on_a_machine_without_egress_are_refused() {
+        let spec = test_spec("offline-credentialed", false);
+        assert!(!spec.resources.network);
+        let db = test_db();
+        let err =
+            create_vm_with_workload(&db, &spec, Vec::new(), None, None, Some(&header_policy()))
+                .unwrap_err();
+        assert!(err.to_string().contains("network egress"), "{err}");
+        assert!(get_record(&db, "offline-credentialed").is_err());
+
+        // A hostname allow-list that does not cover a credential host is refused too.
+        let mut scoped = test_spec("scoped-credentialed", false);
+        scoped.allowed_hosts = vec!["example.com".into()];
+        assert!(create_vm_with_workload(
+            &db,
+            &scoped,
+            Vec::new(),
+            None,
+            None,
+            Some(&header_policy())
+        )
+        .is_err());
+    }
+
     #[test]
     fn embedded_launch_restores_persisted_hostname_egress_policy() {
         let mut spec = test_spec("scoped", false);
         spec.image = Some("ghcr.io/acme/service:latest".into());
         spec.allowed_hosts = vec!["api.example.com".into()];
-        let mut record = spec.to_record();
+        let mut record = spec.to_record().unwrap();
 
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
         assert_eq!(
             features.dns_filter_hosts,
-            Some(vec!["api.example.com".into(), "ghcr.io".into()])
+            Some(vec![
+                "api.example.com".into(),
+                "ghcr.io".into(),
+                "githubusercontent.com".into()
+            ])
         );
 
         record.init_completed = true;
@@ -866,7 +1461,7 @@ mod tests {
 
     #[test]
     fn embedded_launch_restores_local_image_device_topology() {
-        let mut record = test_spec("local-image", true).to_record();
+        let mut record = test_spec("local-image", true).to_record().unwrap();
         record.image = Some("local-dir:/srv/prepared-rootfs".into());
 
         let features = record_launch_features(&record, LaunchFeatures::default()).unwrap();
@@ -916,21 +1511,105 @@ mod tests {
     #[test]
     fn embedded_batch_fork_rejects_empty_and_duplicate_groups_before_boot() {
         let db = test_db();
-        assert!(fork_vm_batch(&db, "missing", &[], 4)
-            .err()
-            .expect("empty batch must fail")
-            .to_string()
-            .contains("at least one clone"));
+        assert!(
+            fork_vm_batch(&db, "missing", &[], 4, Default::default(), false)
+                .err()
+                .expect("empty batch must fail")
+                .to_string()
+                .contains("at least one clone")
+        );
 
         let clones = vec![
             ("duplicate".to_string(), Vec::new()),
             ("duplicate".to_string(), Vec::new()),
         ];
-        assert!(fork_vm_batch(&db, "missing", &clones, 4)
-            .err()
-            .expect("duplicate batch must fail")
-            .to_string()
-            .contains("duplicate clone name"));
+        assert!(
+            fork_vm_batch(&db, "missing", &clones, 4, Default::default(), false)
+                .err()
+                .expect("duplicate batch must fail")
+                .to_string()
+                .contains("duplicate clone name")
+        );
         assert!(db.get_vm("duplicate").unwrap().is_none());
+    }
+}
+
+/// The embedded runtime's stop and start around a process the kernel holds
+/// after SIGKILL, stood in for by `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    fn running(db: &SmolvmDb, name: &str, pid: i32) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        db.insert_vm(name, &record).unwrap();
+    }
+
+    #[test]
+    fn embedded_stop_of_a_held_machine_keeps_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "embedded-held-stop";
+        running(&db, name, held.pid);
+
+        mark_stopped(&db, name).unwrap();
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn embedded_stop_of_an_exited_machine_forgets_its_pid() {
+        let (_dir, db) = db();
+        let name = "embedded-exited-stop";
+        // No such process: Linux pids never reach 2^31.
+        running(&db, name, 0x7fff_fff0);
+
+        mark_stopped(&db, name).unwrap();
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    #[test]
+    fn embedded_start_is_refused_while_held_and_allowed_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "embedded-held-start";
+        running(&db, name, held.pid);
+        mark_stopped(&db, name).unwrap();
+
+        for attempt in [
+            start_vm(&db, name).map(|_| ()),
+            start_vm_with_netns(&db, name, std::path::PathBuf::from("/nonexistent/netns"))
+                .map(|_| ()),
+        ] {
+            let error = attempt.unwrap_err().to_string();
+            assert!(error.contains(&held_refusal(held.pid)), "{error}");
+        }
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, Some(held.pid));
+
+        held.disappear();
+
+        // The check every start runs first now passes and forgets the PID.
+        crate::agent::state_probe::refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
+    }
+
+    fn held_refusal(pid: i32) -> String {
+        fake_held::held(pid).start_refusal()
     }
 }

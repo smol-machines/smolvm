@@ -48,6 +48,8 @@ pub enum AgentErrorKind {
     NotFound,
     /// Conflict / resource already exists (maps to 409).
     Conflict,
+    /// Refused by this server's policy (maps to 403).
+    Forbidden,
     /// General error (maps to 500).
     #[default]
     Other,
@@ -78,6 +80,20 @@ pub enum Error {
     /// Hypervisor is not available on this system.
     #[error("hypervisor not available: {0}")]
     HypervisorUnavailable(String),
+
+    /// A stop or delete of the machine cut off an operation still running on
+    /// it, such as a command or a file transfer.
+    #[error("{operation} failed: machine '{name}' was {by} while it ran ({reason})")]
+    Interrupted {
+        /// Machine the operation ran on.
+        name: String,
+        /// What was cut off ("exec", "write file", ...).
+        operation: String,
+        /// What happened to the machine: "stopped" or "deleted".
+        by: String,
+        /// The failure the operation itself saw.
+        reason: String,
+    },
 
     /// VM is in an invalid state for the requested operation.
     #[error("invalid vm state: expected {expected}, got {actual}")]
@@ -221,6 +237,33 @@ pub enum Error {
 }
 
 impl Error {
+    /// A stable code naming what kind of failure this is, the same one the
+    /// SDKs put on `SmolError.code`, for callers that branch on the kind of
+    /// failure instead of matching message text (`smolvm --error-format json`).
+    pub fn code(&self) -> &'static str {
+        match self {
+            Self::VmNotFound { .. }
+            | Self::RootfsNotFound { .. }
+            | Self::DiskNotFound { .. }
+            | Self::MountSourceNotFound { .. } => "NOT_FOUND",
+            Self::Agent { kind, .. } => match kind {
+                AgentErrorKind::NotFound => "NOT_FOUND",
+                AgentErrorKind::Conflict => "CONFLICT",
+                AgentErrorKind::Forbidden => "FORBIDDEN",
+                AgentErrorKind::Other => "SMOLVM_ERROR",
+            },
+            Self::Interrupted { .. } => "INTERRUPTED",
+            Self::InvalidState { .. } => "INVALID_STATE",
+            Self::HypervisorUnavailable(_) => "HYPERVISOR_UNAVAILABLE",
+            Self::KvmUnavailable(_) | Self::KvmPermission(_) => "KVM_UNAVAILABLE",
+            Self::Storage { .. } => "STORAGE_ERROR",
+            Self::Mount { .. } | Self::InvalidMountPath { .. } => "MOUNT_ERROR",
+            Self::Config { .. } => "CONFIG_ERROR",
+            Self::CommandFailed { .. } => "COMMAND_FAILED",
+            _ => "SMOLVM_ERROR",
+        }
+    }
+
     // ========================================================================
     // VM Error Constructors
     // ========================================================================
@@ -347,6 +390,16 @@ impl Error {
         }
     }
 
+    /// Create an agent "forbidden" error (maps to 403): this server's policy
+    /// refuses the operation.
+    pub fn agent_forbidden(operation: impl Into<String>, reason: impl Into<String>) -> Self {
+        Self::Agent {
+            operation: operation.into(),
+            reason: reason.into(),
+            kind: AgentErrorKind::Forbidden,
+        }
+    }
+
     // ========================================================================
     // KVM Error Constructors
     // ========================================================================
@@ -378,6 +431,25 @@ impl Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn codes_name_the_kind_of_failure() {
+        assert_eq!(Error::vm_not_found("m").code(), "NOT_FOUND");
+        assert_eq!(
+            Error::agent_not_found("read file", "no such file").code(),
+            "NOT_FOUND"
+        );
+        assert_eq!(Error::agent_conflict("stop", "busy").code(), "CONFLICT");
+        assert_eq!(Error::config("x", "y").code(), "CONFIG_ERROR");
+        assert_eq!(Error::agent("x", "y").code(), "SMOLVM_ERROR");
+        let cut = Error::Interrupted {
+            name: "m".into(),
+            operation: "exec".into(),
+            by: "stopped".into(),
+            reason: "closed".into(),
+        };
+        assert_eq!(cut.code(), "INTERRUPTED");
+    }
 
     /// Error messages should include context that helps users fix the problem.
     /// These tests verify that error messages contain actionable information.

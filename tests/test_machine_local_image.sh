@@ -26,6 +26,8 @@ kill_orphan_smolvm_processes
 FIXTURE_DIR=""
 ARCHIVE=""
 ROOTFS_DIR=""
+CONFIGURED_ARCHIVE=""
+CONFIGURED_TAG="smolvm-local-image-config-$$"
 
 build_fixtures() {
     FIXTURE_DIR=$(mktemp -d)
@@ -42,12 +44,27 @@ build_fixtures() {
     docker export "$cid" 2>/dev/null | tar -x -C "$ROOTFS_DIR" 2>/dev/null
     docker rm "$cid" >/dev/null 2>&1 || true
 
-    [[ -s "$ARCHIVE" ]] && [[ -d "$ROOTFS_DIR/bin" ]]
+    # An image that sets WORKDIR, ENV and USER, so a run must honor its config.
+    CONFIGURED_ARCHIVE="$FIXTURE_DIR/configured-save.tar"
+    mkdir -p "$FIXTURE_DIR/configured"
+    cat > "$FIXTURE_DIR/configured/Dockerfile" <<'DOCKERFILE'
+FROM alpine:latest
+ENV GREETING=hello-from-image
+RUN adduser -D appuser
+WORKDIR /srv
+RUN printf '#!/bin/sh\necho app-ok\n' > app && chmod +x app
+USER appuser
+DOCKERFILE
+    docker build -q -t "$CONFIGURED_TAG" "$FIXTURE_DIR/configured" >/dev/null 2>&1 || return 1
+    docker save "$CONFIGURED_TAG" -o "$CONFIGURED_ARCHIVE" 2>/dev/null || return 1
+
+    [[ -s "$ARCHIVE" ]] && [[ -d "$ROOTFS_DIR/bin" ]] && [[ -s "$CONFIGURED_ARCHIVE" ]]
 }
 
 cleanup_local_image() {
     $SMOLVM machine stop --name "$PERSIST_VM" 2>/dev/null || true
     $SMOLVM machine delete --name "$PERSIST_VM" -f 2>/dev/null || true
+    docker rmi -f "$CONFIGURED_TAG" >/dev/null 2>&1 || true
     [[ -n "$FIXTURE_DIR" ]] && rm -rf "$FIXTURE_DIR"
 }
 PERSIST_VM="local-image-persist-$$"
@@ -92,6 +109,31 @@ test_ephemeral_from_stdin() {
     # alpine-release is a bare version string like 3.24.0
     echo "$output" | grep -qE '^[0-9]+\.[0-9]+' || {
         echo "FAIL: expected an alpine-release version from stdin archive, got: $output"
+        return 1
+    }
+}
+
+# A run honors the archive's image config: WORKDIR (so a relative command
+# resolves), ENV and USER, as it does for a registry image.
+test_ephemeral_archive_honors_image_config() {
+    local output
+    output=$(run_with_timeout 90 $SMOLVM machine run --image "$CONFIGURED_ARCHIVE" \
+        -- sh -c './app; echo "$(pwd) $GREETING $(id -un)"' 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT booting configured archive"; return 1; }
+    echo "$output" | grep -q "app-ok" && echo "$output" | grep -q "/srv hello-from-image appuser" || {
+        echo "FAIL: expected ./app to run in /srv as appuser with the image env, got: $output"
+        return 1
+    }
+}
+
+# Same, streamed on stdin: the README's `docker save myapp | ... -- ./app`.
+test_ephemeral_stdin_honors_image_config() {
+    local output
+    output=$(run_with_timeout 90 bash -c \
+        "cat '$CONFIGURED_ARCHIVE' | '$SMOLVM' machine run --image - -- ./app" 2>&1)
+    [[ $? -eq 124 ]] && { echo "TIMEOUT booting configured archive from stdin"; return 1; }
+    echo "$output" | grep -q "app-ok" || {
+        echo "FAIL: expected ./app to resolve in the image WORKDIR, got: $output"
         return 1
     }
 }
@@ -189,6 +231,8 @@ test_persistent_create_start_restart() {
 
 run_test "Ephemeral: boot from docker-save archive file (offline)" test_ephemeral_from_archive_file || true
 run_test "Ephemeral: boot from archive on stdin (--image -)" test_ephemeral_from_stdin || true
+run_test "Ephemeral: archive run honors WORKDIR, ENV and USER" test_ephemeral_archive_honors_image_config || true
+run_test "Ephemeral: stdin archive runs a relative command in WORKDIR" test_ephemeral_stdin_honors_image_config || true
 run_test "Ephemeral: boot from unpacked rootfs dir (#398)" test_ephemeral_from_rootfs_dir || true
 run_test "Guard: --image - with -it rejected before boot" test_stdin_guard_rejects_interactive || true
 run_test "Guard: Dockerfile rejected with build-first hint" test_dockerfile_rejected_with_hint || true

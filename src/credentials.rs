@@ -1,0 +1,725 @@
+//! Credential substitution for machines.
+//!
+//! A machine's `[[network.credentials]]` bindings are persisted on its record
+//! together with the placeholders minted for them. At start the host mounts
+//! the machine's public CA into the guest, hands the workload the placeholders
+//! in the bound environment variables, and — inside the boot process, next to
+//! the network stack — runs the interceptor that swaps placeholders for real
+//! values on the way out. See `smolvm-credentials` for the mechanism.
+
+use crate::config::VmRecord;
+use crate::data::storage::HostMount;
+use crate::error::{Error, Result};
+use serde::{Deserialize, Serialize};
+use smolvm_credentials::{
+    CredentialRequest, CredentialResolver, Interceptor, InterceptorConfig, MachineCa, ResolveError,
+};
+pub use smolvm_protocol::credentials::{
+    CredentialBinding, CredentialPolicy, GUEST_CA_DIR, GUEST_TRUST_ENV,
+};
+use smolvm_protocol::SecretRef;
+use std::collections::BTreeMap;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
+
+/// Socket in a running machine's data directory that takes new values for its
+/// bindings, so a rotated credential reaches a machine without a restart.
+pub const CREDENTIALS_SOCKET: &str = "credentials.sock";
+
+/// Largest request the credentials socket reads: every binding's value is at
+/// most a few KiB.
+const MAX_CREDENTIALS_REQUEST_BYTES: u64 = 1024 * 1024;
+
+/// Values handed to a running boot process through [`CREDENTIALS_SOCKET`], by
+/// binding name. A binding with one resolves to it instead of its reference.
+type LiveValues = Arc<Mutex<BTreeMap<String, zeroize::Zeroizing<String>>>>;
+
+/// Name of the directory inside a machine's data dir that holds its
+/// credential CA.
+pub const CA_DIR_NAME: &str = "credentials";
+
+/// Per-machine directory holding the credential CA (`ca.key` + `guest/ca.pem`).
+pub fn ca_dir(machine: &str) -> PathBuf {
+    crate::agent::vm_data_dir(machine).join(CA_DIR_NAME)
+}
+
+/// Validate a policy against the machine's hostname allow-list and mint its
+/// placeholders. Called once, at create.
+pub fn prepare_policy(
+    policy: &CredentialPolicy,
+    allow_hosts: Option<&[String]>,
+) -> Result<BTreeMap<String, String>> {
+    policy
+        .validate(allow_hosts)
+        .map_err(|e| Error::config("credentials", e.to_string()))?;
+    Ok(smolvm_credentials::generate_placeholders(policy))
+}
+
+/// Require every binding to name the variable its value is read from, for a
+/// machine whose values come from this host (the CLI) rather than being
+/// supplied by an embedder or API caller. A binding naming none could never be
+/// resolved and would fail every request to its hosts.
+pub fn require_host_sources(policy: &CredentialPolicy) -> Result<()> {
+    match policy
+        .credentials
+        .iter()
+        .find(|b| b.environment_variable.is_empty())
+    {
+        Some(binding) => Err(Error::config(
+            "credentials",
+            format!(
+                "credential {:?} names no environment_variable to read its value from",
+                binding.name
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Split a workload's secret references from its credential environment. A
+/// variable bound to a credential never carries plaintext into the guest: its
+/// reference feeds the interceptor, and the guest gets the placeholder plus
+/// the variables pointing HTTP clients at the machine CA. Returns the refs to
+/// resolve into the environment and the credential variables to add.
+pub fn workload_env(
+    policy: Option<&CredentialPolicy>,
+    placeholders: &BTreeMap<String, String>,
+    secret_refs: &BTreeMap<String, SecretRef>,
+) -> (BTreeMap<String, SecretRef>, Vec<(String, String)>) {
+    let Some(policy) = policy.filter(|p| !p.is_empty()) else {
+        return (secret_refs.clone(), Vec::new());
+    };
+    let refs = secret_refs
+        .iter()
+        .filter(|(name, _)| {
+            !policy
+                .credentials
+                .iter()
+                .any(|b| &b.environment_variable == *name)
+        })
+        .map(|(name, r)| (name.clone(), r.clone()))
+        .collect();
+    let mut env: Vec<(String, String)> = policy.guest_env(placeholders).collect();
+    env.extend(
+        GUEST_TRUST_ENV
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string())),
+    );
+    (refs, env)
+}
+
+/// Everything the boot process needs to run a machine's interceptor. Carried
+/// in the boot config; holds references, never values.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CredentialLaunch {
+    /// Machine name, passed to the resolver as the requesting identity.
+    pub machine: String,
+    /// Bindings to enforce.
+    pub policy: CredentialPolicy,
+    /// Binding name → placeholder, as persisted on the record.
+    pub placeholders: BTreeMap<String, String>,
+    /// Machine whose CA this lineage shares (the golden for a fork clone).
+    pub ca_owner: String,
+    /// Host directory written by [`MachineCa::save`].
+    pub ca_dir: PathBuf,
+    /// Binding name → where the host resolves its value. A binding whose bound
+    /// variable has a `[secrets]` reference uses it; otherwise the host
+    /// environment variable of the same name (the `dotenvx run -- smolvm …`
+    /// path).
+    pub sources: BTreeMap<String, SecretRef>,
+    /// Values come only from [`supply_values`], never from this host's
+    /// environment (bindings that arrived over the HTTP API).
+    #[serde(default)]
+    pub supplied_only: bool,
+}
+
+impl CredentialLaunch {
+    /// Describe the launch for a record. `None` when the machine has no
+    /// credential policy. Pure: the CA is created by [`Self::ensure_ca`].
+    pub fn for_record(machine: &str, record: &VmRecord) -> Option<Self> {
+        let mut launch = Self::from_parts(
+            machine,
+            record.credential_policy.as_ref()?,
+            &record.credential_placeholders,
+            &record.secret_refs,
+            record.golden.as_deref(),
+        )?;
+        launch.supplied_only = record.credentials_supplied_by_api;
+        Some(launch)
+    }
+
+    /// Describe a launch from its parts — the ephemeral `machine run` path has
+    /// no record yet when it boots. `None` for an empty policy.
+    pub fn from_parts(
+        machine: &str,
+        policy: &CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        secret_refs: &BTreeMap<String, SecretRef>,
+        golden: Option<&str>,
+    ) -> Option<Self> {
+        if policy.is_empty() {
+            return None;
+        }
+        // A fork clone restores guest state that already trusts its golden's
+        // CA and holds the golden's placeholders, so the lineage shares one CA.
+        // The clone still resolves under its own name: revoking one branch
+        // never has to touch its siblings.
+        let ca_owner = golden.unwrap_or(machine);
+        let ca_dir = ca_dir(ca_owner);
+        let sources = policy
+            .credentials
+            .iter()
+            .map(|b| {
+                let source = secret_refs
+                    .get(&b.environment_variable)
+                    .cloned()
+                    .unwrap_or_else(|| crate::secrets::env_ref(b.environment_variable.clone()));
+                (b.name.clone(), source)
+            })
+            .collect();
+        Some(Self {
+            machine: machine.to_string(),
+            policy: policy.clone(),
+            placeholders: placeholders.clone(),
+            ca_owner: ca_owner.to_string(),
+            ca_dir,
+            sources,
+            supplied_only: false,
+        })
+    }
+
+    /// Create the lineage's CA on first use. Called by the launcher before the
+    /// guest CA directory is mounted.
+    pub fn ensure_ca(&self) -> Result<()> {
+        if MachineCa::exists(&self.ca_dir) {
+            return Ok(());
+        }
+        // A wildcard's parent is the subtree the CA may sign in; the name
+        // constraint on it already covers every subdomain.
+        let hosts: Vec<String> = self
+            .policy
+            .credentials
+            .iter()
+            .flat_map(|binding| binding.allowed_hosts.iter())
+            .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
+            .collect::<std::collections::BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        MachineCa::generate(&self.ca_owner, &hosts)
+            .and_then(|ca| ca.save(&self.ca_dir))
+            .map_err(|e| Error::config("credentials", format!("machine CA: {e:#}")))
+    }
+
+    /// Read-only mount exposing only the public CA to the guest.
+    pub fn guest_ca_mount(&self) -> HostMount {
+        HostMount {
+            source: MachineCa::guest_dir(&self.ca_dir),
+            target: PathBuf::from(GUEST_CA_DIR),
+            read_only: true,
+            staged: false,
+            recorded_ownership: false,
+        }
+    }
+
+    /// Start the interceptor for this machine. The returned handle must live
+    /// as long as the VM; dropping it stops substitution. With the machine's
+    /// data directory, it also serves [`CREDENTIALS_SOCKET`] there.
+    pub fn start_interceptor(&self, vm_dir: Option<&Path>) -> Result<Interceptor> {
+        let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
+            .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
+        let live = LiveValues::default();
+        if let Some(dir) = vm_dir {
+            serve_live_values(dir, &self.policy, live.clone());
+        }
+        Interceptor::spawn(
+            InterceptorConfig {
+                machine: self.machine.clone(),
+                policy: self.policy.clone(),
+                placeholders: self.placeholders.clone(),
+                ca,
+                upstream_roots_pem: Vec::new(),
+            },
+            Arc::new(SecretRefResolver {
+                sources: self.sources.clone(),
+                live,
+            }),
+        )
+        .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))
+    }
+}
+
+/// Values handed to this process for its machines' bindings, by machine name
+/// then binding name. Held in memory only: never written to a record, a boot
+/// config or a checkpoint, and gone when the process exits, so whoever supplied
+/// them supplies them again before the next boot.
+type SuppliedValues = BTreeMap<String, zeroize::Zeroizing<String>>;
+
+static SUPPLIED: std::sync::LazyLock<std::sync::Mutex<BTreeMap<String, SuppliedValues>>> =
+    std::sync::LazyLock::new(Default::default);
+
+/// Hold `values` (binding name → value) for `machine`'s next boots, replacing
+/// any held before.
+pub fn supply_values(machine: &str, values: SuppliedValues) {
+    let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    if values.is_empty() {
+        held.remove(machine);
+    } else {
+        held.insert(machine.to_string(), values);
+    }
+}
+
+/// Drop whatever was supplied for `machine`.
+pub fn forget_values(machine: &str) {
+    supply_values(machine, BTreeMap::new());
+}
+
+/// Name of the variable carrying a supplied value into the boot process.
+fn supplied_var(index: usize) -> String {
+    format!("SMOLVM_CREDENTIAL_{index}")
+}
+
+impl CredentialLaunch {
+    /// Point bindings at the values supplied for this machine, and return the
+    /// environment the boot process needs for it: `Some(value)` to set,
+    /// `None` to remove. A supplied value travels in a variable private to the
+    /// boot process, so it never lands in the boot config on disk. A
+    /// `supplied_only` binding with no value is pointed at a variable that is
+    /// removed, so it resolves to nothing rather than to a host variable.
+    pub fn child_env(&mut self) -> Vec<(String, Option<zeroize::Zeroizing<String>>)> {
+        let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
+        // A branch uses its golden's values unless some were supplied for the
+        // branch itself: it restores guest state that already relies on them,
+        // and its own name is new to whoever supplied the golden's.
+        let supplied = held.get(&self.machine).or_else(|| held.get(&self.ca_owner));
+        let mut env = Vec::new();
+        for (index, binding) in self.policy.credentials.iter().enumerate() {
+            let value = supplied
+                .and_then(|values| values.get(&binding.name))
+                .cloned();
+            if value.is_none() && !self.supplied_only {
+                continue;
+            }
+            let var = supplied_var(index);
+            self.sources
+                .insert(binding.name.clone(), crate::secrets::env_ref(var.clone()));
+            env.push((var, value));
+        }
+        env
+    }
+}
+
+/// Serve [`CREDENTIALS_SOCKET`] in `vm_dir`: each connection sends
+/// `{"values":{"<binding>":"<value>",…}}` and gets back `ok` or `error:
+/// <reason>`. The values replace those the machine resolves for the bindings
+/// named, from its next request on; a name that is not a binding changes
+/// nothing.
+fn serve_live_values(vm_dir: &Path, policy: &CredentialPolicy, live: LiveValues) {
+    #[derive(Deserialize)]
+    #[serde(deny_unknown_fields)]
+    struct Request {
+        values: BTreeMap<String, String>,
+    }
+    let bindings: Vec<String> = policy.credentials.iter().map(|b| b.name.clone()).collect();
+    let path = vm_dir.join(CREDENTIALS_SOCKET);
+    let _ = std::fs::remove_file(&path);
+    crate::network::launch::serve_control_socket(
+        path,
+        "credentials-control",
+        MAX_CREDENTIALS_REQUEST_BYTES,
+        move |request| {
+            let request: Request =
+                serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
+            if let Some(unknown) = request.values.keys().find(|k| !bindings.contains(k)) {
+                return Err(format!("no credential binding '{unknown}'"));
+            }
+            let names: Vec<String> = request.values.keys().cloned().collect();
+            live.lock().unwrap_or_else(|e| e.into_inner()).extend(
+                request
+                    .values
+                    .into_iter()
+                    .map(|(name, value)| (name, zeroize::Zeroizing::new(value))),
+            );
+            tracing::info!(bindings = ?names, "credential values replaced");
+            Ok(())
+        },
+    );
+}
+
+/// Resolves each binding from its secret reference on every request, through
+/// the same reader (and audit trail) as every other machine secret, so a
+/// rotated file or variable takes effect on the next request. A value handed
+/// to the running machine through [`CREDENTIALS_SOCKET`] takes precedence.
+struct SecretRefResolver {
+    sources: BTreeMap<String, SecretRef>,
+    live: LiveValues,
+}
+
+impl CredentialResolver for SecretRefResolver {
+    fn resolve(
+        &self,
+        request: &CredentialRequest,
+    ) -> std::result::Result<zeroize::Zeroizing<String>, ResolveError> {
+        if let Some(value) = self
+            .live
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&request.binding)
+        {
+            return Ok(value.clone());
+        }
+        let source = self
+            .sources
+            .get(&request.binding)
+            .ok_or(ResolveError::Unknown)?;
+        crate::secrets::resolve_secret_ref_classified(
+            &request.binding,
+            source,
+            crate::secrets::ResolutionScope::RecordReplay,
+        )
+        .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))
+    }
+}
+
+/// Parse a `--credential NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER]` flag.
+pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBinding, String> {
+    let usage = "expected NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER] \
+        (e.g. notion=NOTION_API_KEY@api.notion.com)";
+    let (name, rest) = spec.split_once('=').ok_or(usage)?;
+    let (env_var, hosts) = rest.split_once('@').ok_or(usage)?;
+    let mut parts = hosts.split(':');
+    let hosts = parts.next().expect("split always yields a first part");
+    let mut body = false;
+    let mut set_header = None;
+    for modifier in parts {
+        match modifier {
+            "" => {
+                return Err(format!(
+                    "credential modifier is empty; use :body or :set-header=HEADER; {usage}"
+                ));
+            }
+            "body" if body => return Err("credential modifier :body appears more than once".into()),
+            "body" => body = true,
+            modifier if modifier.starts_with("set-header=") => {
+                if set_header.is_some() {
+                    return Err(
+                        "credential modifier :set-header=HEADER appears more than once".into(),
+                    );
+                }
+                let header = &modifier["set-header=".len()..];
+                if header.is_empty() {
+                    return Err(
+                        "credential modifier :set-header=HEADER requires a non-empty header name"
+                            .into(),
+                    );
+                }
+                // Header names are case-insensitive; store the lowercase form
+                // the policy requires, as hosts are above.
+                set_header = Some(header.to_ascii_lowercase());
+            }
+            modifier => {
+                return Err(format!(
+                    "unknown credential modifier :{modifier}; expected :body or :set-header=HEADER"
+                ));
+            }
+        }
+    }
+    let allowed_hosts: Vec<String> = hosts
+        .split(',')
+        .map(|h| h.trim().to_ascii_lowercase())
+        .filter(|h| !h.is_empty())
+        .collect();
+    if name.is_empty() || env_var.is_empty() || allowed_hosts.is_empty() {
+        return Err(usage.to_string());
+    }
+    Ok(CredentialBinding {
+        name: name.trim().to_string(),
+        environment_variable: env_var.trim().to_string(),
+        allowed_hosts,
+        injection_location: smolvm_protocol::credentials::InjectionLocation {
+            body,
+            ..Default::default()
+        },
+        methods: smolvm_protocol::credentials::DEFAULT_METHODS
+            .iter()
+            .map(|m| m.to_string())
+            .collect(),
+        set_header,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn credential_flag_parses_name_variable_and_hosts() {
+        let b = parse_credential_flag("notion=NOTION_API_KEY@api.notion.com, Files.Notion.com")
+            .unwrap();
+        assert_eq!(b.name, "notion");
+        assert_eq!(b.environment_variable, "NOTION_API_KEY");
+        assert_eq!(b.allowed_hosts, vec!["api.notion.com", "files.notion.com"]);
+        assert_eq!(b.set_header, None);
+        let b = parse_credential_flag("oauth=REFRESH@auth.example.com:body").unwrap();
+        assert!(b.injection_location.body);
+        assert_eq!(b.allowed_hosts, vec!["auth.example.com"]);
+        assert_eq!(b.set_header, None);
+        assert!(parse_credential_flag("notion=NOTION_API_KEY").is_err());
+        assert!(parse_credential_flag("=X@h").is_err());
+    }
+
+    #[test]
+    fn credential_flag_sets_a_header_from_the_complete_host_value() {
+        let binding = parse_credential_flag(
+            "github=GITHUB_AUTH@github.com,*.github.com:set-header=Authorization",
+        )
+        .unwrap();
+
+        assert_eq!(binding.set_header.as_deref(), Some("authorization"));
+        assert!(!binding.injection_location.body);
+        assert_eq!(binding.environment_variable, "GITHUB_AUTH");
+    }
+
+    #[test]
+    fn credential_flag_accepts_body_and_set_header_in_either_order() {
+        for spec in [
+            "oauth=TOKEN@auth.example.com:body:set-header=authorization",
+            "oauth=TOKEN@auth.example.com:set-header=authorization:body",
+        ] {
+            let binding = parse_credential_flag(spec).unwrap();
+            assert!(binding.injection_location.body);
+            assert_eq!(binding.set_header.as_deref(), Some("authorization"));
+        }
+    }
+
+    #[test]
+    fn credential_flag_rejects_empty_unknown_and_duplicate_modifiers() {
+        let empty = parse_credential_flag("token=TOKEN@api.example.com:").unwrap_err();
+        assert!(empty.contains("modifier is empty"), "{empty}");
+        let empty_header =
+            parse_credential_flag("token=TOKEN@api.example.com:set-header=").unwrap_err();
+        assert!(
+            empty_header.contains("non-empty header name"),
+            "{empty_header}"
+        );
+        let unknown = parse_credential_flag("token=TOKEN@api.example.com:query").unwrap_err();
+        assert!(
+            unknown.contains("unknown credential modifier :query"),
+            "{unknown}"
+        );
+        let duplicate = parse_credential_flag("token=TOKEN@api.example.com:body:body").unwrap_err();
+        assert!(
+            duplicate.contains(":body appears more than once"),
+            "{duplicate}"
+        );
+        let duplicate_header = parse_credential_flag(
+            "token=TOKEN@api.example.com:set-header=authorization:set-header=x-api-key",
+        )
+        .unwrap_err();
+        assert!(
+            duplicate_header.contains(":set-header=HEADER appears more than once"),
+            "{duplicate_header}"
+        );
+    }
+
+    /// A running machine takes a rotated value through its credentials socket
+    /// and resolves it from the next request, over the value it booted with.
+    #[test]
+    fn values_sent_to_a_running_machine_replace_the_ones_it_booted_with() {
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("token");
+        std::fs::write(&path, "booted").unwrap();
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag("github=GH_TOKEN@github.com").unwrap()],
+        };
+        let live = LiveValues::default();
+        serve_live_values(dir.path(), &policy, live.clone());
+        let resolver = SecretRefResolver {
+            sources: [("github".into(), crate::secrets::file_ref(path))].into(),
+            live,
+        };
+        let request = CredentialRequest {
+            machine: "rotate-test".into(),
+            binding: "github".into(),
+            host: "github.com".into(),
+            port: 443,
+            method: "GET".into(),
+            path: "/".into(),
+        };
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "booted");
+
+        let send = |body: &str| {
+            let mut stream =
+                crate::platform::uds::UdsStream::connect(dir.path().join(CREDENTIALS_SOCKET))
+                    .unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply
+        };
+        assert_eq!(send(r#"{"values":{"github":"rotated"}}"#).trim(), "ok");
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "rotated");
+
+        let refused = send(r#"{"values":{"other":"x"}}"#);
+        assert!(
+            refused.contains("no credential binding 'other'"),
+            "{refused}"
+        );
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "rotated");
+    }
+
+    #[test]
+    fn file_backed_credential_uses_the_latest_host_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("refresh-token");
+        let source = crate::secrets::file_ref(path.clone());
+        let resolver = SecretRefResolver {
+            sources: [("refresh".into(), source)].into(),
+            live: LiveValues::default(),
+        };
+        let request = CredentialRequest {
+            machine: "oauth-test".into(),
+            binding: "refresh".into(),
+            host: "auth.example.com".into(),
+            port: 443,
+            method: "POST".into(),
+            path: "/token".into(),
+        };
+        std::fs::write(&path, "first").unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "first");
+        std::fs::write(&path, "second").unwrap();
+        assert_eq!(resolver.resolve(&request).unwrap().as_str(), "second");
+    }
+
+    fn launch(machine: &str, supplied_only: bool) -> CredentialLaunch {
+        let policy = CredentialPolicy {
+            credentials: vec![
+                parse_credential_flag("a=A_KEY@api.a.com").unwrap(),
+                parse_credential_flag("b=B_KEY@api.b.com").unwrap(),
+            ],
+        };
+        let mut launch = CredentialLaunch::from_parts(
+            machine,
+            &policy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            None,
+        )
+        .unwrap();
+        launch.supplied_only = supplied_only;
+        launch
+    }
+
+    #[test]
+    fn supplied_values_reach_only_the_boot_process() {
+        let machine = "cred-test-supplied";
+        supply_values(
+            machine,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("value-a".to_string()),
+            )]
+            .into(),
+        );
+        let mut l = launch(machine, false);
+        let env = l.child_env();
+        // The supplied binding moves to a private variable carrying its value.
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "SMOLVM_CREDENTIAL_0");
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("value-a"));
+        assert_eq!(
+            l.sources["a"].from_env.as_deref(),
+            Some("SMOLVM_CREDENTIAL_0")
+        );
+        // An unsupplied binding of a local machine keeps its host variable.
+        assert_eq!(l.sources["b"].from_env.as_deref(), Some("B_KEY"));
+        // The launch, as written to the boot config, names but never holds it.
+        assert!(!serde_json::to_string(&l).unwrap().contains("value-a"));
+        forget_values(machine);
+        assert!(launch(machine, false).child_env().is_empty());
+    }
+
+    #[test]
+    fn a_branch_uses_its_goldens_values_until_given_its_own() {
+        let golden = "cred-test-golden";
+        let clone = "cred-test-golden-branch";
+        supply_values(
+            golden,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("golden-a".to_string()),
+            )]
+            .into(),
+        );
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag("a=A_KEY@api.a.com").unwrap()],
+        };
+        let mut l = CredentialLaunch::from_parts(
+            clone,
+            &policy,
+            &BTreeMap::new(),
+            &BTreeMap::new(),
+            Some(golden),
+        )
+        .unwrap();
+        l.supplied_only = true;
+        let env = l.child_env();
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("golden-a"));
+        supply_values(
+            clone,
+            [(
+                "a".to_string(),
+                zeroize::Zeroizing::new("branch-a".to_string()),
+            )]
+            .into(),
+        );
+        let env = l.child_env();
+        assert_eq!(env[0].1.as_deref().map(String::as_str), Some("branch-a"));
+        forget_values(golden);
+        forget_values(clone);
+    }
+
+    #[test]
+    fn api_bindings_never_fall_back_to_host_variables() {
+        let machine = "cred-test-api";
+        forget_values(machine);
+        let mut l = launch(machine, true);
+        let env = l.child_env();
+        // Nothing supplied: both bindings point at variables that are removed.
+        assert_eq!(env.len(), 2);
+        assert!(env
+            .iter()
+            .all(|(var, value)| var.starts_with("SMOLVM_CREDENTIAL_") && value.is_none()));
+        assert_eq!(
+            l.sources["a"].from_env.as_deref(),
+            Some("SMOLVM_CREDENTIAL_0")
+        );
+        assert_eq!(
+            l.sources["b"].from_env.as_deref(),
+            Some("SMOLVM_CREDENTIAL_1")
+        );
+    }
+
+    #[test]
+    fn bound_variables_get_placeholders_never_their_secret() {
+        let policy = CredentialPolicy {
+            credentials: vec![parse_credential_flag("n=N_KEY@api.notion.com").unwrap()],
+        };
+        let placeholders = prepare_policy(&policy, Some(&["notion.com".to_string()])).unwrap();
+        let refs: BTreeMap<String, SecretRef> = [
+            ("N_KEY".to_string(), crate::secrets::env_ref("HOST_N_KEY")),
+            ("OTHER".to_string(), crate::secrets::env_ref("HOST_OTHER")),
+        ]
+        .into_iter()
+        .collect();
+        let (refs, env) = workload_env(Some(&policy), &placeholders, &refs);
+        assert_eq!(refs.keys().collect::<Vec<_>>(), vec!["OTHER"]);
+        assert_eq!(env[0], ("N_KEY".to_string(), placeholders["n"].clone()));
+        assert!(env
+            .iter()
+            .any(|(k, v)| k == "SSL_CERT_FILE" && v == "/run/smolvm/ca-bundle.pem"));
+        assert!(env.iter().all(|(_, v)| !v.contains("secret")));
+        assert!(prepare_policy(&policy, Some(&["github.com".to_string()])).is_err());
+    }
+}

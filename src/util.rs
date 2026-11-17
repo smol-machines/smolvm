@@ -98,9 +98,29 @@ pub fn parse_env_spec(spec: &str) -> Option<(String, String)> {
     }
 }
 
+/// Parse `KEY=VALUE` entries that arrived in an API request.
+///
+/// Unlike [`parse_env_list`], every entry must name its value: a bare `KEY`
+/// is an error, never a copy of this process's own variable (the server's
+/// environment is not the caller's to read), and a malformed entry is an
+/// error rather than silently dropped. Errors name the entry by position so a
+/// value is never echoed back.
+pub fn parse_request_env_list(env: &[String]) -> Result<Vec<(String, String)>, String> {
+    env.iter()
+        .enumerate()
+        .map(|(index, spec)| match spec.split_once('=') {
+            Some((key, value)) if !key.is_empty() => Ok((key.to_string(), value.to_string())),
+            _ => Err(format!(
+                "env entry {index} must be KEY=VALUE with a non-empty KEY"
+            )),
+        })
+        .collect()
+}
+
 /// Parse a list of `KEY=VALUE` strings into `(key, value)` tuples.
 ///
-/// Silently skips malformed entries (no `=` or empty key).
+/// Silently skips malformed entries (empty key), and forwards a bare `KEY`
+/// from this process's environment: for the CLI's own `-e`, never API input.
 pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
     env_args.iter().filter_map(|e| parse_env_spec(e)).collect()
 }
@@ -191,6 +211,39 @@ pub fn parse_labels(raw: &[String]) -> crate::Result<std::collections::BTreeMap<
 
 #[cfg(test)]
 mod tests {
+    /// API env entries must carry their value: a bare name must never pull the
+    /// server's own variable into a caller's machine, and a malformed entry is
+    /// refused rather than dropped.
+    #[test]
+    fn request_env_needs_explicit_values_and_never_reads_the_server_env() {
+        std::env::set_var("SMOLVM_TEST_SERVER_ONLY", "server-secret");
+        let env = |specs: &[&str]| {
+            super::parse_request_env_list(&specs.iter().map(|s| s.to_string()).collect::<Vec<_>>())
+        };
+        assert_eq!(
+            env(&["A=1", "B=x=y", "C="]).unwrap(),
+            [
+                ("A".into(), "1".into()),
+                ("B".into(), "x=y".into()),
+                ("C".into(), String::new())
+            ]
+        );
+        let bare = env(&["A=1", "SMOLVM_TEST_SERVER_ONLY"]).unwrap_err();
+        assert!(bare.contains("entry 1"), "{bare}");
+        assert!(!bare.contains("server-secret"));
+        assert!(env(&["=secret"]).unwrap_err().contains("entry 0"));
+        assert!(!env(&["=secret"]).unwrap_err().contains("secret"));
+        assert!(env(&[""]).is_err());
+        // The CLI keeps forwarding a bare name from its own shell.
+        assert_eq!(
+            super::parse_env_list(&["SMOLVM_TEST_SERVER_ONLY".to_string()]),
+            [(
+                "SMOLVM_TEST_SERVER_ONLY".to_string(),
+                "server-secret".to_string()
+            )]
+        );
+    }
+
     #[test]
     fn parses_labels_and_keeps_values_containing_equals() {
         let labels = super::parse_labels(&[
@@ -315,5 +368,42 @@ mod tests {
 
         // Two names differ
         assert_ne!(generate_machine_name(), generate_machine_name());
+    }
+}
+
+/// Add `layer` over `env`: a variable it sets replaces the earlier value
+/// rather than appearing twice.
+pub fn layer_env(env: &mut Vec<(String, String)>, layer: Vec<(String, String)>) {
+    for (name, value) in layer {
+        env.retain(|(existing, _)| existing != &name);
+        env.push((name, value));
+    }
+}
+
+#[cfg(test)]
+mod layer_env_tests {
+    use super::layer_env;
+
+    #[test]
+    fn a_later_layer_replaces_a_variable_instead_of_repeating_it() {
+        let mut env = vec![
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ];
+        layer_env(
+            &mut env,
+            vec![
+                ("B".to_string(), "3".to_string()),
+                ("C".to_string(), "4".to_string()),
+            ],
+        );
+        assert_eq!(
+            env,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "3".to_string()),
+                ("C".to_string(), "4".to_string()),
+            ]
+        );
     }
 }

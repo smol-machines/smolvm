@@ -65,7 +65,7 @@ impl ProxyOpts {
 
 /// Rewrite `raw`'s host to the host machine's primary outbound IP when it is a
 /// loopback address; pass every other URL through untouched.
-fn resolve_loopback_proxy(raw: &str) -> smolvm::Result<String> {
+pub(crate) fn resolve_loopback_proxy(raw: &str) -> smolvm::Result<String> {
     let Some((host, port)) = proxy_authority(raw) else {
         return Ok(raw.to_string());
     };

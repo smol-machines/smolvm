@@ -13,8 +13,19 @@ use reqwest::header::{
 };
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
-use std::sync::Mutex;
-use std::time::{Duration, Instant};
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use crate::token_store;
+
+/// Every manifest type an image pull understands, OCI and Docker. A registry
+/// matches its answer to this list, and `distribution` (the stock self-hosted
+/// registry) given only the OCI types downgrades a Docker-pushed image to the
+/// legacy schema 1 manifest, which has no config and cannot be pulled.
+const IMAGE_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
 
 /// Maximum bytes buffered in memory for a manifest / image-index document.
 /// A hostile or MITM'd registry could otherwise stream a multi-GB (or endless)
@@ -62,9 +73,68 @@ const UPLOAD_MIN_RATE: u64 = 256 * 1024;
 /// multipart backends require.
 const FALLBACK_CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
+/// Use the host's installed roots alongside the bundled public roots. When a
+/// caller explicitly supplies the same bundle used by `--trust-host-certs`,
+/// add its certificates to both registry and auth-service requests as well.
+fn registry_tls(builder: reqwest::ClientBuilder) -> reqwest::ClientBuilder {
+    let path = std::env::var_os("SMOLVM_HOST_CA_BUNDLE");
+    registry_tls_with_bundle(builder, path.as_deref().map(std::path::Path::new))
+}
+
+fn registry_tls_with_bundle(
+    mut builder: reqwest::ClientBuilder,
+    bundle: Option<&std::path::Path>,
+) -> reqwest::ClientBuilder {
+    let roots = native_roots();
+    if !roots.is_empty() {
+        builder = builder.tls_built_in_native_certs(false);
+        for cert in roots {
+            builder = builder.add_root_certificate(cert.clone());
+        }
+    }
+    if let Some(path) = bundle {
+        match std::fs::read(path)
+            .map_err(|e| e.to_string())
+            .and_then(|pem| reqwest::Certificate::from_pem_bundle(&pem).map_err(|e| e.to_string()))
+        {
+            Ok(certs) if !certs.is_empty() => {
+                for cert in certs {
+                    builder = builder.add_root_certificate(cert);
+                }
+            }
+            result => tracing::warn!(
+                path = %path.display(),
+                error = ?result.err(),
+                "cannot load explicit host CA bundle for registry requests"
+            ),
+        }
+    }
+    builder
+}
+
+/// The host's native root certificates, loaded once per process.
+///
+/// reqwest reloads the native store for every client it builds, and on macOS
+/// that goes through the keychain and takes 120 to 150 ms. A `RegistryClient`
+/// builds two clients, so every run that talks to a registry paid for two
+/// loads. Certificates rustls cannot parse are dropped, as reqwest's own loader
+/// does. An empty result leaves reqwest to load the store itself.
+fn native_roots() -> &'static [reqwest::Certificate] {
+    static ROOTS: OnceLock<Vec<reqwest::Certificate>> = OnceLock::new();
+    ROOTS.get_or_init(|| {
+        let mut store = rustls::RootCertStore::empty();
+        rustls_native_certs::load_native_certs()
+            .certs
+            .into_iter()
+            .filter(|cert| store.add(cert.clone()).is_ok())
+            .filter_map(|cert| reqwest::Certificate::from_der(cert.as_ref()).ok())
+            .collect()
+    })
+}
+
 /// The shared HTTP client for every registry request, with the deadlines above.
 fn http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    registry_tls(reqwest::Client::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
@@ -83,7 +153,7 @@ fn http_client() -> reqwest::Client {
 /// the body size (see [`RegistryClient::upload_request`]), which bounds a
 /// stalled transfer without capping a slow-but-progressing one.
 fn upload_http_client() -> reqwest::Client {
-    reqwest::Client::builder()
+    registry_tls(reqwest::Client::builder())
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -659,6 +729,64 @@ impl RegistryClient {
         Ok((resp.bytes_stream(), resumed_at))
     }
 
+    /// Download bytes `start..=end` of a blob.
+    ///
+    /// Returns `None` when the registry ignored the range and answered with the
+    /// whole blob (200), so the caller can fall back to one stream instead of
+    /// reading gigabytes it did not ask for. A 206 whose `Content-Range` starts
+    /// anywhere but `start`, or whose body is not exactly the requested length,
+    /// is an error: writing it at `start` would corrupt the file.
+    pub async fn pull_blob_range(
+        &self,
+        repo: &str,
+        digest: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<bytes::Bytes>> {
+        validate_digest(digest)?;
+        let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
+        let req = self
+            .request(reqwest::Method::GET, &url)
+            .header(RANGE, format!("bytes={start}-{end}"));
+        let resp = self.send_replayable(req).await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(digest.to_string()));
+        }
+        if resp.status() == reqwest::StatusCode::OK {
+            return Ok(None);
+        }
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let served_start = resp
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes "))
+            .and_then(|v| v.split('-').next())
+            .and_then(|v| v.parse::<u64>().ok());
+        if served_start != Some(start) {
+            return Err(RegistryError::ApiError {
+                status: 206,
+                body: format!("asked for bytes from {start}, registry served {served_start:?}"),
+            });
+        }
+        let body = resp.bytes().await?;
+        if body.len() as u64 != end - start + 1 {
+            return Err(RegistryError::DownloadStalled {
+                digest: digest.to_string(),
+                received: body.len() as u64,
+                total: end - start + 1,
+            });
+        }
+        Ok(Some(body))
+    }
+
     /// Download a blob as a byte stream from the beginning.
     ///
     /// Returns the stream after verifying the response status. The caller is
@@ -763,6 +891,48 @@ impl RegistryClient {
         read_body_capped(resp, MAX_MANIFEST_BYTES, "manifest").await
     }
 
+    /// The content digest the registry reports for `reference` (a tag or
+    /// digest), from a HEAD request: one authorized round-trip, no body, and on
+    /// Docker Hub not counted against the pull rate limit. The digest is of the
+    /// document the tag points to, an image index for a multi-arch image.
+    pub async fn head_manifest_digest(&self, repo: &str, reference: &str) -> Result<String> {
+        let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
+        let resp = self
+            .send_replayable(
+                self.request(reqwest::Method::HEAD, &url)
+                    .header(ACCEPT, IMAGE_MANIFEST_ACCEPT),
+            )
+            .await?;
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(format!("{repo}:{reference}")));
+        }
+        if !resp.status().is_success() {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: String::new(),
+            });
+        }
+        let digest = resp
+            .headers()
+            .get("docker-content-digest")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+            .ok_or_else(|| {
+                RegistryError::InvalidManifest(format!(
+                    "{repo}:{reference}: no Docker-Content-Digest in the manifest HEAD response"
+                ))
+            })?;
+        validate_digest(&digest)?;
+        // A digest reference must come back as itself.
+        if reference.starts_with("sha256:") && digest != reference {
+            return Err(RegistryError::DigestMismatch {
+                expected: reference.to_string(),
+                actual: digest,
+            });
+        }
+        Ok(digest)
+    }
+
     /// Fetch a manifest OR image index by reference, returning the raw bytes and
     /// the document's media type. Unlike [`get_manifest`], this accepts (and does
     /// not reject) an image index — the caller decides whether to resolve it to a
@@ -772,9 +942,11 @@ impl RegistryClient {
         let resp = self
             .send_replayable(
                 self.request(reqwest::Method::GET, &url)
-                    // Advertise BOTH so the registry hands back an index as an
-                    // index (not a server-side-selected manifest).
-                    .header(ACCEPT, format!("{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}")),
+                    // Advertise the index types so the registry hands back an
+                    // index as an index (not a server-side-selected manifest),
+                    // and the Docker types so a Docker-pushed image is not
+                    // downgraded to schema 1.
+                    .header(ACCEPT, IMAGE_MANIFEST_ACCEPT),
             )
             .await?;
 
@@ -824,6 +996,26 @@ impl RegistryClient {
     /// single-platform manifest bytes. Shared by `pull` and `inspect` so both
     /// resolve a multi-arch tag identically (a plain manifest passes through).
     pub async fn get_manifest_resolved(&self, repo: &str, reference: &str) -> Result<Vec<u8>> {
+        // The guest is always Linux; only the architecture varies by host.
+        let platform = OciPlatform {
+            os: "linux".to_string(),
+            architecture: OciPlatform::current().architecture,
+            variant: None,
+        };
+        self.get_manifest_resolved_platform(repo, reference, &platform)
+            .await
+    }
+
+    /// Like [`get_manifest_resolved`], but resolves an OCI image index to the
+    /// CALLER's `platform` instead of this host's. Needed when the consumer is
+    /// not the local machine — e.g. `pack create --oci-platform linux/amd64`
+    /// sizing a build VM on an arm64 host.
+    pub async fn get_manifest_resolved_platform(
+        &self,
+        repo: &str,
+        reference: &str,
+        platform: &OciPlatform,
+    ) -> Result<Vec<u8>> {
         let (doc_bytes, content_type) = self.get_manifest_raw(repo, reference).await?;
 
         let is_index = content_type.contains(INDEX_MEDIA_TYPE)
@@ -839,20 +1031,19 @@ impl RegistryClient {
         }
 
         let index: OciIndex = serde_json::from_slice(&doc_bytes)?;
-        // .smolmachine sidecars are cross-platform — libkrun is provided by the
-        // installed CLI, not bundled — so only the GUEST architecture matters, and
-        // the guest is always Linux. An index entry must therefore be keyed
-        // `linux/<arch>`; match it strictly. A wrong/missing `os` is bad index data
-        // and must fail loudly (the error below lists what was published) rather than
-        // be silently tolerated. The host OS is irrelevant to which sidecar to pull.
-        let arch = OciPlatform::current().architecture;
+        // Match the requested platform strictly on os+architecture. A
+        // wrong/missing `os` is bad index data and must fail loudly (the error
+        // below lists what was published) rather than be silently tolerated.
+        // Variants (e.g. arm/v7) are not distinguished, matching the guest's
+        // own platform selection.
+        let want = platform.label();
         let entry = index
             .manifests
             .iter()
             .find(|m| {
                 m.platform
                     .as_ref()
-                    .is_some_and(|p| p.os == "linux" && p.architecture == arch)
+                    .is_some_and(|p| p.os == platform.os && p.architecture == platform.architecture)
             })
             .ok_or_else(|| {
                 let available: Vec<String> = index
@@ -861,7 +1052,7 @@ impl RegistryClient {
                     .filter_map(|m| m.platform.as_ref().map(|p| p.label()))
                     .collect();
                 RegistryError::InvalidManifest(format!(
-                    "no linux/{arch} build available for this machine; the registry has: {}",
+                    "no {want} build available for this machine; the registry has: {}",
                     if available.is_empty() {
                         "(none)".into()
                     } else {
@@ -869,7 +1060,7 @@ impl RegistryClient {
                     }
                 ))
             })?;
-        tracing::info!(arch = %arch, digest = %entry.digest, "selected index entry");
+        tracing::info!(platform = %want, digest = %entry.digest, "selected index entry");
         Ok(self.get_manifest_raw(repo, &entry.digest).await?.0)
     }
 
@@ -1324,6 +1515,35 @@ impl RegistryClient {
             *lc = Some(challenge.clone());
         }
 
+        // Persist pull tokens so the NEXT process can also attach a preemptive
+        // bearer. The in-memory cache above only helps within one process, and
+        // the CLI is a fresh process per command, so without this every
+        // `machine run` pays the full challenge exchange again. Push scopes and
+        // tokens without a server-reported expiry are deliberately not written.
+        if self.base_url.starts_with("https://")
+            && challenge
+                .scope
+                .as_deref()
+                .is_some_and(token_store::scope_is_pull_only)
+        {
+            if let (Some(secs), Ok(now)) = (
+                token_response.expires_in,
+                SystemTime::now().duration_since(UNIX_EPOCH),
+            ) {
+                token_store::save(
+                    &self.base_url,
+                    &self.identity_fingerprint(),
+                    &token_store::PersistedToken {
+                        realm: challenge.realm.clone(),
+                        service: challenge.service.clone(),
+                        scope: challenge.scope.clone(),
+                        token: token.clone(),
+                        expires_at_unix: now.as_secs().saturating_add(secs),
+                    },
+                );
+            }
+        }
+
         Ok(token)
     }
 
@@ -1339,6 +1559,12 @@ impl RegistryClient {
         if self.auth_token.is_some() {
             return None;
         }
+        // A fresh process has no challenge yet. If an earlier process
+        // persisted a still-valid pull token for this registry and identity,
+        // replay it into the in-memory cache first.
+        if self.last_challenge.lock().ok()?.is_none() {
+            self.restore_persisted_token();
+        }
         let challenge = self.last_challenge.lock().ok()?.as_ref()?.clone();
         let cache = self.token_cache.lock().ok()?;
         let key = TokenCacheKey {
@@ -1352,6 +1578,54 @@ impl RegistryClient {
         } else {
             None
         }
+    }
+
+    /// Load the newest still-valid persisted pull token for this registry and
+    /// identity into `token_cache` and `last_challenge`, as if this process had
+    /// already done the challenge exchange. Best-effort: on any miss the normal
+    /// 401 flow runs. A token persisted for a different repository scope is
+    /// harmless, the registry answers 401 and the normal exchange follows,
+    /// which is exactly what would have happened with no preemptive bearer.
+    fn restore_persisted_token(&self) {
+        let Some(entry) = token_store::load_any(&self.base_url, &self.identity_fingerprint())
+        else {
+            return;
+        };
+        let Some(expires_at) = entry.expires_at_instant() else {
+            return;
+        };
+        if let Ok(mut cache) = self.token_cache.lock() {
+            cache.insert(
+                TokenCacheKey {
+                    realm: entry.realm.clone(),
+                    service: entry.service.clone(),
+                    scope: entry.scope.clone(),
+                },
+                CachedToken {
+                    token: entry.token,
+                    expires_at: Some(expires_at),
+                },
+            );
+        }
+        if let Ok(mut lc) = self.last_challenge.lock() {
+            if lc.is_none() {
+                *lc = Some(BearerChallenge {
+                    realm: entry.realm,
+                    service: entry.service,
+                    scope: entry.scope,
+                });
+            }
+        }
+    }
+
+    /// Fingerprint of this client's credentials for the persisted token store,
+    /// so entries are keyed per identity.
+    fn identity_fingerprint(&self) -> String {
+        token_store::identity_fingerprint(
+            self.auth_token.as_deref(),
+            self.identity_token.as_deref(),
+            self.basic_credentials.as_ref(),
+        )
     }
 }
 
@@ -1537,6 +1811,72 @@ struct TokenResponse {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn registry_clients_verify_private_ca_for_registry_and_auth_requests() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio_rustls::rustls::pki_types::PrivateKeyDer;
+
+        let key = rcgen::KeyPair::generate().unwrap();
+        let cert = rcgen::CertificateParams::new(vec!["localhost".to_string()])
+            .unwrap()
+            .self_signed(&key)
+            .unwrap();
+        let temp = tempfile::tempdir().unwrap();
+        let bundle = temp.path().join("roots.pem");
+        std::fs::write(&bundle, cert.pem()).unwrap();
+        let config = tokio_rustls::rustls::ServerConfig::builder_with_provider(
+            std::sync::Arc::new(tokio_rustls::rustls::crypto::ring::default_provider()),
+        )
+        .with_safe_default_protocol_versions()
+        .unwrap()
+        .with_no_client_auth()
+        .with_single_cert(
+            vec![cert.der().clone()],
+            PrivateKeyDer::Pkcs8(key.serialize_der().into()),
+        )
+        .unwrap();
+        let acceptor = tokio_rustls::TlsAcceptor::from(std::sync::Arc::new(config));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!(
+            "https://localhost:{}/v2/",
+            listener.local_addr().unwrap().port()
+        );
+        let server = tokio::spawn(async move {
+            for _ in 0..3 {
+                let (socket, _) = listener.accept().await.unwrap();
+                if let Ok(mut socket) = acceptor.accept(socket).await {
+                    let mut request = [0; 1024];
+                    assert!(socket.read(&mut request).await.unwrap() > 0);
+                    socket
+                        .write_all(
+                            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nOK",
+                        )
+                        .await
+                        .unwrap();
+                }
+            }
+        });
+        let ordinary = registry_tls_with_bundle(reqwest::Client::builder(), None)
+            .no_proxy()
+            .build()
+            .unwrap();
+        assert!(ordinary.get(&url).send().await.is_err());
+        for builder in [
+            reqwest::Client::builder().read_timeout(READ_TIMEOUT),
+            reqwest::Client::builder().connect_timeout(CONNECT_TIMEOUT),
+        ] {
+            let trusted = registry_tls_with_bundle(builder, Some(&bundle))
+                .no_proxy()
+                .build()
+                .unwrap();
+            assert_eq!(
+                trusted.get(&url).send().await.unwrap().status(),
+                reqwest::StatusCode::OK
+            );
+        }
+        server.await.unwrap();
+    }
 
     #[test]
     fn parse_next_link_extracts_rel_next() {
@@ -2194,6 +2534,54 @@ mod http_tests {
     // digest must be rejected (registry tamper / MITM on index→manifest
     // resolution), mirroring the blob-digest check `pull_blob` performs.
     // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn a_docker_image_resolves_to_its_schema_2_manifest() {
+        use wiremock::{Request, Respond};
+        // Answers like `distribution`: schema 2 only to a client that accepts
+        // it, the legacy schema 1 (no config) to one that does not.
+        struct Distribution;
+        impl Respond for Distribution {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let accept = req
+                    .headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if accept.contains("application/vnd.docker.distribution.manifest.v2+json") {
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "content-type",
+                            "application/vnd.docker.distribution.manifest.v2+json",
+                        )
+                        .set_body_string(
+                            r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":1},"layers":[]}"#,
+                        )
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "content-type",
+                            "application/vnd.docker.distribution.manifest.v1+prettyjws",
+                        )
+                        .set_body_string(r#"{"schemaVersion":1,"fsLayers":[],"history":[]}"#)
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acct/app/manifests/dock"))
+            .respond_with(Distribution)
+            .mount(&server)
+            .await;
+        let client = RegistryClient::new(server.uri());
+        let bytes = client
+            .get_manifest_resolved("acct/app", "dock")
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest["schemaVersion"], 2);
+        assert!(manifest["config"]["digest"].is_string());
+    }
+
     #[tokio::test]
     async fn test_manifest_digest_mismatch_rejected() {
         let server = MockServer::start().await;

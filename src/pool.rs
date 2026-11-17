@@ -29,6 +29,9 @@ pub struct ForkPoolRecord {
     pub cuda_device_ordinal: Option<u32>,
     /// Share the golden's immutable CUDA allocations with each worker.
     pub share_weights: bool,
+    /// Keep the source paused while refilling this pool.
+    #[serde(default)]
+    pub freeze_source: bool,
     /// Maximum time to wait for the golden's workload forkpoint.
     pub ready_timeout_secs: u64,
     /// Default time an acquired worker may run without a heartbeat.
@@ -245,6 +248,7 @@ mod tests {
         )
         .unwrap();
         assert!(!pool.auto_admission);
+        assert!(!pool.freeze_source);
         assert_eq!(pool.cuda_device_ordinal, None);
         assert_eq!(pool.admission_device_ordinal(), Some(0));
     }
