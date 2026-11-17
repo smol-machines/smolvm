@@ -139,9 +139,6 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 /// read is sent immediately, without waiting for the buffer to fill.
 const IO_BUFFER_SIZE: usize = 64 * 1024;
 
-/// Default poll timeout in milliseconds for interactive I/O loop.
-const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
-
 /// Timeout for network connectivity test operations.
 /// Used in diagnostics/troubleshooting functions.
 const NETWORK_TEST_TIMEOUT_SECS: u64 = 10;
@@ -6620,17 +6617,7 @@ fn run_interactive_loop_io(
             }
         }
 
-        // Calculate poll timeout: either remaining time until deadline, or 100ms default
-        let poll_timeout_ms = match deadline {
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                // Cap at 100ms to periodically check child exit status
-                remaining
-                    .as_millis()
-                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
-            }
-            None => INTERACTIVE_POLL_TIMEOUT_MS,
-        };
+        let poll_timeout_ms = exit_signal.poll_timeout_ms(deadline);
 
         // Build poll fds array for stdout, stderr, and vsock stream
         let stdout_fd = child_stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
@@ -6921,15 +6908,7 @@ fn run_interactive_loop_pty(
         }
 
         // Poll the PTY master fd for readable data.
-        let poll_timeout_ms = match deadline {
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                remaining
-                    .as_millis()
-                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
-            }
-            None => INTERACTIVE_POLL_TIMEOUT_MS,
-        };
+        let poll_timeout_ms = exit_signal.poll_timeout_ms(deadline);
 
         // Poll PTY master, vsock stream, and child exit signal.
         let stream_fd = stream.as_raw_fd();
