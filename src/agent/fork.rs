@@ -309,6 +309,7 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             .map(|source| vms_dir.join(crate::agent::vm_dir_hash(&source)));
         #[cfg(any(target_os = "linux", target_os = "macos"))]
         let owner = owner.or_else(|| compact::disk_lock_owner(&path));
+        let owner = owner.or_else(|| crate::credentials::bindings_lock_owner(&path));
         let Some(owner) = owner else {
             continue;
         };
@@ -5497,6 +5498,38 @@ tmpfs /tmp tmpfs rw 0 0
             !orphan.exists(),
             "a deleted machine's record must be removed"
         );
+    }
+
+    /// A machine's credential-bindings lock lives beside its data directory
+    /// and goes once the machine is gone and no one holds it.
+    #[test]
+    fn a_credentials_lock_is_swept_with_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let live = crate::agent::vm_dir_hash("alive");
+        std::fs::create_dir(dir.path().join(&live)).unwrap();
+        let kept = dir.path().join(format!("{live}.credentials.lock"));
+        let orphan = dir.path().join(format!(
+            "{}.credentials.lock",
+            crate::agent::vm_dir_hash("gone")
+        ));
+        let busy = dir.path().join(format!(
+            "{}.credentials.lock",
+            crate::agent::vm_dir_hash("busy")
+        ));
+        for lock in [&kept, &orphan, &busy] {
+            std::fs::write(lock, b"").unwrap();
+        }
+        let held = std::fs::OpenOptions::new().write(true).open(&busy).unwrap();
+        lock_file_exclusive(&held).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(kept.exists(), "a live machine's lock must survive");
+        assert!(!orphan.exists(), "a deleted machine's lock must be removed");
+        assert!(busy.exists(), "a held lock must not be swept");
     }
 
     #[test]

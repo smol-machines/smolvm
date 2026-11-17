@@ -142,9 +142,11 @@ On a running machine the change applies from its next request, with no restart:
   `shell`, the API's exec) see; processes already running keep the environment
   they started with. Its value comes from `credential-values` (API and
   embedded machines) or, for a CLI machine, from the binding's secret
-  reference or variable: a binding with a secret reference (a file, the
-  keychain) is resolved by the machine on every request, so rotating it keeps
-  working, and one read from a variable takes the value `machine update` reads.
+  reference (as the record holds it at the change, never one dropped since
+  the machine started) or variable: a binding with a secret reference (a file,
+  the keychain) is resolved by the machine on every request, so rotating it
+  keeps working, and one read from a variable takes the value `machine update`
+  reads.
   A name removed and added again later gets a new placeholder.
 - A value supplied for a binding serves only that binding: after a restart, a
   name bound to another variable, or removed and added again, gets no value
@@ -156,12 +158,19 @@ On a running machine the change applies from its next request, with no restart:
   during the request; retry` instead of being sent with a value it was not
   checked against. Changes to other bindings, or an identical re-send, leave it
   alone. A request body that sends nothing for 60 seconds is answered `408`.
-- A removed binding stops being substituted at once. A new connection to its
-  host is relayed untouched, so its placeholder goes out as a plain string; a
-  request on a connection the interceptor already terminated is refused as an
-  unknown placeholder. The value held for it is dropped, and a secret reference
-  it read (`--secret-file GH_TOKEN=…` feeding `gh=GH_TOKEN@…`) is removed with
-  it, so the secret never reaches the guest's environment as plaintext.
+- A removed binding stops being substituted at once. A host that was never
+  sent its value is relayed untouched from its next connection, so its
+  placeholder goes out as a plain string. A host that was sent its value may
+  have stored it, so for as long as the machine runs the interceptor keeps
+  terminating that host, injects nothing, refuses the old placeholder as
+  unknown, and removes the value from every response; the same holds for the
+  hosts a binding is moved away from. The value held for it is dropped, and a
+  secret reference it read (`--secret-file GH_TOKEN=…` feeding
+  `gh=GH_TOKEN@…`) is removed with it, so the secret never reaches the guest's
+  environment as plaintext. So are the references operator bindings read
+  when an API caller or embedder takes the bindings over. A reference no
+  binding ever read stays: removing an API caller's binding on a variable the
+  operator gave a `--secret-env` only stops withholding it from the guest.
 - A host outside the machine's CA widens the CA: it is re-certified with the
   same key, so processes that loaded the earlier certificate keep trusting the
   hosts it covered, and the guest agent installs the wider one in the machine
@@ -178,6 +187,9 @@ refused with `409`, nothing changed, when:
 
 - it runs on TSI and booted without bindings: libkrun redirects connections to
   an interceptor only through a hook it takes before the VM starts;
+- it is a Kubernetes pod member and booted without bindings: its network
+  interface is bridged to the pod's, past the host relay an interceptor works
+  through;
 - its guest agent predates live trust and the change needs the CA installed
   (first bindings, or a host outside the CA).
 
@@ -203,17 +215,23 @@ embedder replaces bindings of a machine whose values came from this host, no
 binding keeps a host variable, file or value; their placeholders stay.
 
 The machine's boot process, running as the machine's own user, creates and
-widens the CA itself; the server or CLI never writes into the machine's
-directory, and reads the certificate there without following links. It talks
+widens the CA itself; the server or CLI never writes credential state into the
+machine's directory, and reads the certificate there (and the key, when it
+captures a checkpoint) without following links. The lock that serializes
+changes sits beside that directory, in the directory of all machines, which
+the machine's user cannot write. It talks
 to the boot process over `credentials.sock` in the machine's data directory
-(mode `0600`), sending only the bindings, their placeholders and whether values
-are supplied; where values come from, the machine's identity and the CA's
-location are the boot process's own. Values sent to a running machine carry the
+(mode `0600`), sending only the bindings, their placeholders, whether values
+are supplied and, for a machine whose values come from this host, the
+machine's secret references as its record holds them (references, never
+values; a supplied machine is sent none and reads none); the machine's
+identity and the CA's location are the boot process's own. Values sent to a running machine carry the
 binding they were read for, and are refused if that binding has changed. A
 change that fails part-way (the guest cannot take the new CA, the answer is
-lost, or the record cannot be saved) is rolled back to exactly the previous
-bindings, sources and values, keeping values sent since for the bindings it
-restores. Changes to one machine's bindings, and its starts, are serialized
+lost, the record cannot be saved, or the CLI cannot hand the machine the
+values for its new bindings) is rolled back, in the record and in the running
+machine, to exactly the previous bindings, sources and values, keeping values
+sent since for the bindings it restores. Changes to one machine's bindings, and its starts, are serialized
 across processes, and every start enforces the bindings its record holds.
 
 ## Setting a header

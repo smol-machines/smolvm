@@ -17,7 +17,10 @@
 //!
 //! Every response from a credential host is scrubbed of the values its
 //! bindings carry (see [`crate::scrub`]), so a host that reflects a request's
-//! credential cannot hand it to the guest. To keep that check complete,
+//! credential cannot hand it to the guest. A host a binding stops covering
+//! (the binding removed, or moved to other hosts) may still hold a value sent
+//! to it, so for as long as the interceptor runs it keeps terminating that
+//! host and scrubbing the values sent there, without injecting anything. To keep that check complete,
 //! requests ask for an uncompressed whole response: `Accept-Encoding` is set to
 //! `identity` and range requests are dropped. A server that compresses anyway
 //! has a gzip or deflate body decoded before the check; any other encoding is
@@ -40,7 +43,7 @@ use hyper_util::rt::TokioIo;
 use smolvm_protocol::intercept::{
     connect_verdict, preamble_len, InterceptEndpoint, HEADER_LEN, TOKEN_LEN,
 };
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, VecDeque};
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, RwLock};
@@ -67,6 +70,9 @@ const MAX_CACHED_CLIENTS: usize = 64;
 /// Values remembered per binding for scrubbing: a rotated credential's old
 /// value may still be stored upstream.
 const MAX_REMEMBERED_VALUES: usize = 4;
+/// Values kept for scrubbing on hosts their bindings no longer cover, across
+/// every host: the oldest goes first.
+const MAX_RETIRED_VALUES: usize = 64;
 /// Largest compressed body decoded for scrubbing, from a server that ignored
 /// `Accept-Encoding: identity`.
 const ENCODED_LIMIT: usize = 64 * 1024 * 1024;
@@ -177,11 +183,22 @@ struct Remembered {
     values: Vec<zeroize::Zeroizing<String>>,
 }
 
+/// A value a binding resolved to, kept for a host the binding covered and
+/// covers no more: the host may have stored it, and may hand it back.
+struct Retired {
+    /// The host pattern, as the binding named it.
+    host: String,
+    value: zeroize::Zeroizing<String>,
+}
+
 struct State {
     machine: String,
     bindings: RwLock<Arc<Bindings>>,
     /// binding name → values it has resolved to in this process.
     resolved: Mutex<HashMap<String, Remembered>>,
+    /// Values still scrubbed from hosts their bindings stopped covering,
+    /// newest last, at most [`MAX_RETIRED_VALUES`].
+    retired: Mutex<VecDeque<Retired>>,
     ca: RwLock<Arc<MachineCa>>,
     resolver: Arc<dyn CredentialResolver>,
     endpoint: InterceptEndpoint,
@@ -214,6 +231,7 @@ impl Interceptor {
                 Bindings::new(config.policy, &config.placeholders, generations)
             })),
             resolved: Mutex::new(HashMap::new()),
+            retired: Mutex::new(VecDeque::new()),
             ca: RwLock::new(Arc::new(config.ca)),
             resolver,
             endpoint,
@@ -292,7 +310,9 @@ impl InterceptorControl {
     /// the resolver's values must do both under the lock its resolver takes
     /// to read them, so no resolution sees one without the other. A host no
     /// binding allows any more is spliced through untouched on its next
-    /// connection, and a placeholder whose binding is gone is refused.
+    /// connection, and a placeholder whose binding is gone is refused —
+    /// unless a value was sent to it: then it stays terminated, and its
+    /// responses scrubbed of those values, while the interceptor runs.
     pub fn replace_bindings_keeping(
         &self,
         policy: CredentialPolicy,
@@ -300,6 +320,7 @@ impl InterceptorControl {
         kept: &[String],
     ) {
         let mut slot = self.0.bindings.write().unwrap_or_else(|e| e.into_inner());
+        self.0.retire(&slot.policy, &policy);
         let mut generations = fresh_generations(&policy);
         for name in kept {
             let same = slot.policy.binding(name) == policy.binding(name)
@@ -395,6 +416,7 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
             .bindings_for_host(host)
             .next()
             .is_some()
+            || state.has_retired(host)
     };
     match peek {
         Peek::ServerName(host) if intercepted(&host) => {
@@ -470,6 +492,45 @@ async fn terminate(
 }
 
 impl State {
+    /// Keep scrubbing, on every host a binding of `old` covered and its
+    /// namesake in `new` does not, the values that binding resolved to here.
+    fn retire(&self, old: &CredentialPolicy, new: &CredentialPolicy) {
+        let resolved = self.resolved.lock().expect("resolved values");
+        let mut retired = self.retired.lock().expect("retired values");
+        for binding in &old.credentials {
+            let Some(seen) = resolved.get(&binding.name) else {
+                continue;
+            };
+            let successor = new.binding(&binding.name);
+            for host in &binding.allowed_hosts {
+                if successor.is_some_and(|b| b.allowed_hosts.contains(host)) {
+                    continue;
+                }
+                for value in &seen.values {
+                    if retired.iter().any(|r| &r.host == host && r.value == *value) {
+                        continue;
+                    }
+                    if retired.len() == MAX_RETIRED_VALUES {
+                        retired.pop_front();
+                    }
+                    retired.push_back(Retired {
+                        host: host.clone(),
+                        value: value.clone(),
+                    });
+                }
+            }
+        }
+    }
+
+    /// Whether some value is still scrubbed from `host`'s responses.
+    fn has_retired(&self, host: &str) -> bool {
+        self.retired
+            .lock()
+            .expect("retired values")
+            .iter()
+            .any(|r| smolvm_protocol::credentials::host_matches(&r.host, host))
+    }
+
     fn bindings(&self) -> Arc<Bindings> {
         self.bindings
             .read()
@@ -580,6 +641,7 @@ impl State {
                 .await?;
         }
         let resolved = self.resolved.lock().expect("resolved values");
+        let retired = self.retired.lock().expect("retired values");
         let secrets: Vec<Secret<'_>> = bindings
             .policy
             .bindings_for_host(host)
@@ -599,6 +661,17 @@ impl State {
                         placeholder,
                     })
             })
+            // Values sent here under bindings that no longer cover the host
+            // have no placeholder the guest could still use.
+            .chain(
+                retired
+                    .iter()
+                    .filter(|r| smolvm_protocol::credentials::host_matches(&r.host, host))
+                    .map(|r| Secret {
+                        value: r.value.as_bytes(),
+                        placeholder: None,
+                    }),
+            )
             .collect();
         Ok(Scrubber::new(&secrets))
     }
@@ -1731,8 +1804,8 @@ mod tests {
 
     /// Bindings and the CA change under a running interceptor: a kept
     /// binding keeps substituting with its placeholder, a new one substitutes
-    /// on its own host under the new CA, and a removed one's host is spliced
-    /// through untouched from its next connection.
+    /// on its own host under the new CA, and a removed one stops substituting
+    /// from its next request.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn replaced_bindings_take_effect_on_the_next_request() {
         let binding = |name: &str, host: &str| CredentialBinding {
@@ -1802,26 +1875,24 @@ mod tests {
             },
             &[("other".to_string(), other_placeholder.clone())].into(),
         );
-        // Trusting only the upstream's certificate proves the flow was spliced.
+        // A value was sent to the removed binding's host, so the host stays
+        // terminated (to scrub it) and its placeholder is refused there.
         let removed = guest_request(
             &f,
-            &f.upstream.cert_pem,
+            wider_pem.as_bytes(),
             CRED_HOST,
             &request(CRED_HOST, &f.placeholder),
         )
         .await
         .unwrap();
-        assert!(removed.starts_with("HTTP/1.1 200"), "{removed}");
+        assert!(removed.starts_with("HTTP/1.1 403"), "{removed}");
+        assert!(removed.contains("unknown placeholder"), "{removed}");
         let seen = f.upstream.seen.lock().unwrap().clone();
         assert_eq!(
             seen.iter()
                 .map(|(auth, _)| auth.as_str())
                 .collect::<Vec<_>>(),
-            [
-                "Bearer svc-secret".to_string(),
-                "Bearer other-secret".to_string(),
-                format!("Bearer {}", f.placeholder),
-            ]
+            ["Bearer svc-secret", "Bearer other-secret"]
         );
     }
 
@@ -2412,6 +2483,101 @@ mod tests {
             assert!(response.starts_with("HTTP/1.1 200"), "{response}");
             assert!(!response.contains(value), "{value}: {response}");
         }
+    }
+
+    /// A host a binding stops covering, because the binding was removed or
+    /// moved to other hosts, may have stored a value sent to it: its responses
+    /// are still scrubbed of that value. A host no value was ever sent to is
+    /// relayed untouched again.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_a_binding_left_is_still_scrubbed_of_what_it_was_sent() {
+        let echo = |value: &str| {
+            format!(
+                "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: {value}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let moved = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                allowed_hosts: vec![OTHER_HOST.into()],
+                ..svc_policy().credentials[0].clone()
+            }],
+        };
+        for next in [CredentialPolicy::default(), moved] {
+            let f = fixture_with_secret("ghp_retiredsecret4321").await;
+            let sent = format!(
+                "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+                f.placeholder
+            );
+            let first = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &sent)
+                .await
+                .unwrap();
+            assert!(first.starts_with("HTTP/1.1 200"), "{first}");
+            let placeholders = crate::policy::generate_placeholders(&next);
+            f.interceptor
+                .control()
+                .replace_bindings(next.clone(), &placeholders);
+            // The guest stored the value upstream; reading it back finds it gone.
+            let response = guest_request(
+                &f,
+                f.ca_pem.as_bytes(),
+                CRED_HOST,
+                &echo("ghp_retiredsecret4321"),
+            )
+            .await
+            .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(
+                !response.contains("ghp_retiredsecret4321"),
+                "{next:?}: {response}"
+            );
+            assert!(response.contains("[smolvm-redacted]"), "{response}");
+            // Nothing is injected there any more.
+            let refused = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &sent)
+                .await
+                .unwrap();
+            assert!(!refused.starts_with("HTTP/1.1 200"), "{refused}");
+        }
+
+        // A binding that never resolved anything leaves its host to the guest.
+        let f = fixture_with_secret("ghp_neversent00000").await;
+        f.interceptor
+            .control()
+            .replace_bindings(CredentialPolicy::default(), &BTreeMap::new());
+        assert!(
+            guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &echo("x"))
+                .await
+                .is_err(),
+            "relayed untouched: the upstream's own certificate is not the machine CA"
+        );
+    }
+
+    /// The values kept for hosts bindings left are bounded.
+    #[test]
+    fn retired_values_are_bounded() {
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: Vec::new(),
+            },
+            Arc::new(StaticResolver::new()),
+        )
+        .unwrap();
+        let control = interceptor.control();
+        for round in 0..(MAX_RETIRED_VALUES * 2) {
+            let value = zeroize::Zeroizing::new(format!("secret-value-{round:04}"));
+            control.0.remember("svc", u64::MAX, Some(&value));
+            control.replace_bindings(CredentialPolicy::default(), &BTreeMap::new());
+            control.replace_bindings(policy.clone(), &placeholders);
+        }
+        assert_eq!(control.0.retired.lock().unwrap().len(), MAX_RETIRED_VALUES);
+        assert!(control.0.has_retired(CRED_HOST));
+        assert!(!control.0.has_retired(OTHER_HOST));
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

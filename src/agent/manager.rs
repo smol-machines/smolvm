@@ -239,6 +239,11 @@ struct RunningVmConfig {
     /// the machine forkable, so every later fork fails "no memfd-backed RAM".
     #[serde(default)]
     forkable: bool,
+    /// Whether the running VM's network is a Kubernetes pod's: its NIC is
+    /// bridged to the pod's interface, past the host relay that redirects
+    /// HTTPS flows to a credential interceptor.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pod_network: bool,
 }
 
 impl RunningVmConfig {
@@ -351,6 +356,8 @@ struct AgentInner {
     /// a config-change restart preserves forkability instead of relaunching a
     /// forkable golden as a plain VM. Restored from disk on reconnect.
     forkable: bool,
+    /// Whether the running VM was launched on a Kubernetes pod network.
+    pod_network: bool,
     /// If true, the agent has been detached and should not be stopped on drop.
     detached: bool,
     /// True for the most recent launch via a fork snapshot. A clone resumes past
@@ -401,10 +408,21 @@ pub fn running_forkable(name: &str) -> Option<bool> {
 }
 
 fn forkable_in_running_config(path: &Path) -> Option<bool> {
+    running_config_at(path).map(|config| config.forkable)
+}
+
+fn running_config_at(path: &Path) -> Option<RunningVmConfig> {
     let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<RunningVmConfig>(&content)
-        .ok()
-        .map(|config| config.forkable)
+    serde_json::from_str::<RunningVmConfig>(&content).ok()
+}
+
+/// Whether the VM named `name` is running on a Kubernetes pod network, as its
+/// running configuration says. Its guest NIC is bridged to the pod's
+/// interface, so no host relay sees its flows to hand them to a credential
+/// interceptor. False when it is not running.
+pub fn running_on_pod_network(name: &str) -> bool {
+    running_config_at(&vm_data_dir(name).join("agent.config.json"))
+        .is_some_and(|config| config.pod_network)
 }
 
 /// Whether `record`'s machine can be branched as it is now. A running machine is
@@ -1976,6 +1994,7 @@ impl AgentManager {
                 resources: VmResources::default(),
                 config_state: ConfigState::Unknown,
                 forkable: false,
+                pod_network: false,
                 detached: false,
                 is_clone: false,
                 is_cuda_clone: false,
@@ -2499,6 +2518,7 @@ impl AgentManager {
                             inner.ports = config.ports;
                             inner.resources = config.resources;
                             inner.forkable = config.forkable;
+                            inner.pod_network = config.pod_network;
                             inner.config_state = ConfigState::Known;
                         }
                         Err(reason) => {
@@ -2545,6 +2565,7 @@ impl AgentManager {
             // Read from inner: the launch path sets `inner.forkable` before this
             // runs, so the persisted config records how the VM was actually booted.
             forkable: self.inner.lock().forkable,
+            pod_network: self.inner.lock().pod_network,
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
@@ -3645,6 +3666,7 @@ impl AgentManager {
             inner.is_clone = fork_clone;
             inner.is_cuda_clone = cuda_clone;
             inner.forkable = features.forkable;
+            inner.pod_network = features.pod_netns.is_some();
         }
 
         // Per-VM uid isolation: when running privileged (root `serve`), give this
@@ -5963,6 +5985,7 @@ mod tests {
             ports: Vec::new(),
             resources: VmResources::default(),
             forkable: true,
+            pod_network: false,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         let back: RunningVmConfig = serde_json::from_str(&json).unwrap();
@@ -5970,6 +5993,7 @@ mod tests {
             back.forkable,
             "forkable must round-trip through the config file"
         );
+        assert!(!back.pod_network && !json.contains("pod_network"));
 
         // Backward compatibility: a config written before this field existed (drop
         // it from a real serialization) must still load, defaulting to
@@ -5982,6 +6006,30 @@ mod tests {
             !parsed.forkable,
             "a missing forkable field defaults to false"
         );
+    }
+
+    /// A VM launched on a pod network says so in its running configuration,
+    /// which is how a binding change made from another process learns it.
+    #[test]
+    fn running_config_records_a_pod_network() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        let cfg = RunningVmConfig {
+            version: RunningVmConfig::CURRENT_VERSION,
+            mounts: Vec::new(),
+            ports: Vec::new(),
+            resources: VmResources::default(),
+            forkable: false,
+            pod_network: true,
+        };
+        std::fs::write(&path, serde_json::to_string(&cfg).unwrap()).unwrap();
+        assert!(running_config_at(&path).unwrap().pod_network);
+        let plain = RunningVmConfig {
+            pod_network: false,
+            ..cfg
+        };
+        std::fs::write(&path, serde_json::to_string(&plain).unwrap()).unwrap();
+        assert!(!running_config_at(&path).unwrap().pod_network);
     }
 
     /// The three denial shapes the virtio-net runtime emits parse into

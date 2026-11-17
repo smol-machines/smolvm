@@ -167,15 +167,37 @@ impl MachineCa {
     /// Load a CA previously written by [`MachineCa::save`]. `machine` names
     /// it only when the directory predates the recorded name.
     pub fn load(dir: &Path, machine: &str) -> Result<Self> {
-        let name = std::fs::read_to_string(dir.join(CA_NAME_FILE))
-            .map(|name| name.trim().to_string())
-            .unwrap_or_else(|_| machine.to_string());
-        let cert_pem = std::fs::read_to_string(dir.join(GUEST_CA_FILE))
-            .with_context(|| format!("read {}", dir.join(GUEST_CA_FILE).display()))?;
-        let key_pem = Zeroizing::new(
-            std::fs::read_to_string(dir.join(CA_KEY_FILE))
-                .with_context(|| format!("read {}", dir.join(CA_KEY_FILE).display()))?,
-        );
+        Self::load_with(machine, |file| std::fs::read(dir.join(file)))
+    }
+
+    /// [`MachineCa::load`], reading each file of the CA directory (named
+    /// relative to it: `ca.name`, `ca.pem`, `ca.key`) through `read`. A
+    /// process reading a directory another user owns passes a reader that
+    /// refuses links, so the owner cannot make it load some other key.
+    pub fn load_with(
+        machine: &str,
+        read: impl Fn(&str) -> std::io::Result<Vec<u8>>,
+    ) -> Result<Self> {
+        let text = |file: &str| -> Result<Zeroizing<String>> {
+            let bytes = Zeroizing::new(read(file).with_context(|| format!("read {file}"))?);
+            Ok(Zeroizing::new(
+                std::str::from_utf8(&bytes)
+                    .with_context(|| format!("{file} is not text"))?
+                    .to_string(),
+            ))
+        };
+        // Only a directory from before the name was recorded lacks it; one
+        // that cannot be read is refused, never replaced by a guess.
+        let name = match read(CA_NAME_FILE) {
+            Ok(bytes) => std::str::from_utf8(&bytes)
+                .context("ca.name is not text")?
+                .trim()
+                .to_string(),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => machine.to_string(),
+            Err(error) => return Err(error).context("read ca.name"),
+        };
+        let cert_pem = text(GUEST_CA_FILE)?.to_string();
+        let key_pem = text(CA_KEY_FILE)?;
         let key = KeyPair::from_pem(&key_pem).context("parse CA key")?;
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()

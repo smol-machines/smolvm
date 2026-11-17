@@ -1829,7 +1829,13 @@ impl VmRecord {
     /// A secret reference a removed or re-pointed binding fed (`--secret-file
     /// GH_TOKEN=… --credential gh=GH_TOKEN@…`) goes with it: it was never meant
     /// for the guest's environment, and a reference no binding withholds would
-    /// be injected there as plaintext.
+    /// be injected there as plaintext. So do the references operator bindings
+    /// fed when an API caller or embedder takes the bindings over: no binding
+    /// reads this host from then on, and the secret must not be left to reach
+    /// the guest once that caller removes the binding. A reference no binding
+    /// ever read (bindings whose values are supplied never read one) is the
+    /// operator's, for the guest's environment, and stays: removing a supplied
+    /// binding on its variable only stops withholding it.
     ///
     /// Removing every binding leaves no policy. A machine whose network
     /// backend came only from its bindings is pinned to virtio-net, so a
@@ -1906,15 +1912,20 @@ impl VmRecord {
                 .collect();
             next.credential_policy = Some(policy.clone());
         }
-        // A reference that fed a binding which no longer reads that variable
-        // goes with it, never into the guest's environment.
-        for binding in &old_policy.credentials {
-            let still_bound = policy
-                .credentials
-                .iter()
-                .any(|b| b.environment_variable == binding.environment_variable);
-            if !still_bound {
-                next.secret_refs.remove(&binding.environment_variable);
+        // A reference that fed a binding goes with it once no binding reads
+        // it from this host any more, never into the guest's environment.
+        // Only bindings whose values came from this host ever read one.
+        let fed_bindings = !old_policy.is_empty() && !self.credentials_supplied_by_api;
+        if fed_bindings {
+            for binding in &old_policy.credentials {
+                let still_read = !next.credentials_supplied_by_api
+                    && policy
+                        .credentials
+                        .iter()
+                        .any(|b| b.environment_variable == binding.environment_variable);
+                if !still_read {
+                    next.secret_refs.remove(&binding.environment_variable);
+                }
             }
         }
         let before = self.launch_network_plan().backend;
@@ -1992,14 +2003,22 @@ impl VmRecord {
     /// A machine running an interceptor (it booted with bindings, or gained
     /// them live) takes any change. One that booted without needs a network
     /// whose HTTPS flows the host can redirect after boot, which only a
-    /// virtio-net machine with outbound access has.
-    pub fn check_live_credentials(&self, next: &VmRecord) -> Result<()> {
+    /// virtio-net machine with outbound access has, and not a member of a
+    /// Kubernetes pod (`on_pod_network`), whose NIC is bridged to the pod's
+    /// interface past the host's relay.
+    pub fn check_live_credentials(&self, next: &VmRecord, on_pod_network: bool) -> Result<()> {
         use crate::network::launch::EffectiveNetworkBackend;
         if self.credential_policy.is_some() || next.credential_policy.is_none() {
             return Ok(());
         }
         let plan = self.launch_network_plan();
         let reason = match plan.backend {
+            _ if on_pod_network => format!(
+                "machine '{}' is running on a Kubernetes pod network, whose datapath bridges \
+                 the guest's interface to the pod's and bypasses the host relay through which a \
+                 credential interceptor sees its connections",
+                self.name
+            ),
             EffectiveNetworkBackend::None => format!(
                 "machine '{}' is running without a network device, and credential bindings \
                  need one; libkrun fixes a VM's devices when it starts, so a running machine \
@@ -3626,7 +3645,7 @@ mod tests {
         let next = tsi
             .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
             .unwrap();
-        let err = tsi.check_live_credentials(&next).unwrap_err();
+        let err = tsi.check_live_credentials(&next, false).unwrap_err();
         assert!(err.to_string().contains("TSI"), "{err}");
         // (Built by hand: these machines have no egress, which the record
         // refuses before the live check would.)
@@ -3637,7 +3656,7 @@ mod tests {
         };
         let offline = VmRecord::new("offline".into(), 1, 512, vec![], vec![], false);
         let next = with_bindings(&offline);
-        let err = offline.check_live_credentials(&next).unwrap_err();
+        let err = offline.check_live_credentials(&next, false).unwrap_err();
         assert!(
             err.to_string().contains("without a network device"),
             "{err}"
@@ -3645,7 +3664,7 @@ mod tests {
         let mut inbound = VmRecord::new("inbound".into(), 1, 512, vec![], vec![(8080, 80)], false);
         inbound.network_backend = Some(NetworkBackend::VirtioNet);
         let next = with_bindings(&inbound);
-        let err = inbound.check_live_credentials(&next).unwrap_err();
+        let err = inbound.check_live_credentials(&next, false).unwrap_err();
         assert!(err.to_string().contains("inbound-only"), "{err}");
 
         let mut virtio = networked("virtio");
@@ -3653,12 +3672,16 @@ mod tests {
         let next = virtio
             .with_credential_bindings(bindings(&["a=A_KEY@api.a.com"]), Caller::Api)
             .unwrap();
-        virtio.check_live_credentials(&next).unwrap();
+        virtio.check_live_credentials(&next, false).unwrap();
+        // A pod member's NIC bypasses the relay: refused, saying why.
+        let err = virtio.check_live_credentials(&next, true).unwrap_err();
+        assert!(err.to_string().contains("Kubernetes pod network"), "{err}");
         // Once it has an interceptor, any change is live.
         next.check_live_credentials(
             &next
                 .with_credential_bindings(Default::default(), Caller::Api)
                 .unwrap(),
+            false,
         )
         .unwrap();
     }
@@ -3731,6 +3754,70 @@ mod tests {
             .with_credential_bindings(bindings(&["gh=GH_TOKEN@github.com"]), Caller::Cli)
             .unwrap();
         assert!(rescoped.secret_refs.contains_key("GH_TOKEN"));
+        // An API caller taking over the very same binding drops it too: no
+        // binding reads this host any more, and removing the API's binding
+        // later must not hand the operator's secret to the guest.
+        let taken = bound
+            .with_credential_bindings(bindings(&["gh=GH_TOKEN@api.github.com"]), Caller::Api)
+            .unwrap();
+        assert!(taken.credentials_supplied_by_api);
+        assert!(!taken.secret_refs.contains_key("GH_TOKEN"));
+        let removed = taken
+            .with_credential_bindings(Default::default(), Caller::Api)
+            .unwrap();
+        let (refs, _) = crate::credentials::workload_env(
+            removed.credential_policy.as_ref(),
+            &removed.credential_placeholders,
+            &removed.secret_refs,
+        );
+        assert!(!refs.contains_key("GH_TOKEN"), "never exposed as plaintext");
+    }
+
+    /// A supplied binding never reads a secret reference, so removing it
+    /// never deletes one: an operator's `--secret-env` for the same variable
+    /// was only withheld while the binding stood, and is the guest's again.
+    #[test]
+    fn removing_a_supplied_binding_keeps_the_operators_reference() {
+        use crate::machine_spec::Caller;
+        let mut record = networked("operator-env");
+        record
+            .secret_refs
+            .insert("GH_TOKEN".into(), crate::secrets::env_ref("HOST_GH"));
+        let bound = record
+            .with_credential_bindings(bindings(&["gh=GH_TOKEN@api.github.com"]), Caller::Api)
+            .unwrap();
+        assert!(bound.credentials_supplied_by_api);
+        assert!(bound.secret_refs.contains_key("GH_TOKEN"));
+        let (refs, _) = crate::credentials::workload_env(
+            bound.credential_policy.as_ref(),
+            &bound.credential_placeholders,
+            &bound.secret_refs,
+        );
+        assert!(!refs.contains_key("GH_TOKEN"), "withheld while bound");
+        for next in [
+            bound
+                .with_credential_bindings(Default::default(), Caller::Api)
+                .unwrap(),
+            bound
+                .with_credential_bindings(bindings(&["gh=OTHER@api.github.com"]), Caller::Api)
+                .unwrap(),
+            // The operator editing a supplied machine's bindings is no different.
+            bound
+                .with_credential_bindings(bindings(&["gh=OTHER@api.github.com"]), Caller::Cli)
+                .unwrap(),
+        ] {
+            assert_eq!(
+                next.secret_refs.get("GH_TOKEN"),
+                record.secret_refs.get("GH_TOKEN"),
+                "the operator's reference stays"
+            );
+            let (refs, _) = crate::credentials::workload_env(
+                next.credential_policy.as_ref(),
+                &next.credential_placeholders,
+                &next.secret_refs,
+            );
+            assert!(refs.contains_key("GH_TOKEN"), "the guest's again");
+        }
     }
 
     /// Bindings never give a machine network or egress: removing them all

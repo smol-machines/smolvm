@@ -114,9 +114,10 @@ pub use manager::{
     ensure_vm_dir, machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials,
     read_egress_flows, read_egress_signals, read_egress_telemetry, read_guest_pressure,
     read_mediation_machine_id, read_shared_pack_pointer, resolve_disk_image, restore_base_dir,
-    running_forkable, shared_pack_cache_root, shared_pack_pointer_path, vm_cache_root, vm_data_dir,
-    vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState, EgressDenial, EgressFlowSummary,
-    EgressSignal, GuestPressure, PressureStall, EGRESS_TELEMETRY_FILE, SHARED_PACK_POINTER,
+    running_forkable, running_on_pod_network, shared_pack_cache_root, shared_pack_pointer_path,
+    vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState,
+    EgressDenial, EgressFlowSummary, EgressSignal, GuestPressure, PressureStall,
+    EGRESS_TELEMETRY_FILE, SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
