@@ -213,6 +213,80 @@ impl std::fmt::Debug for SmolvmDb {
     }
 }
 
+/// `config` key recording that [`migrate_legacy_credential_networks`] ran.
+const CREDENTIAL_NETWORK_MIGRATION: &str = "migration.credentials-imply-network";
+
+/// Give each machine whose credential bindings were its only source of
+/// egress the network it has always booted with.
+///
+/// Before bindings became replaceable, a binding implied networking: a
+/// machine created over the API (or from a Smolfile) with bindings and no
+/// `network: true` was recorded without network and booted with outbound
+/// virtio-net anyway. Bindings no longer turn networking on, so such a
+/// machine would boot offline and refuse every binding change. It is given
+/// `network = true`, which launches exactly what its bindings used to imply;
+/// a machine with an allow list already had its egress from that list and is
+/// left as it is. Runs once per database; a machine recorded without network
+/// after that (`machine update --no-net`) stays so.
+fn migrate_legacy_credential_networks(conn: &Connection) -> Result<()> {
+    let done: Option<String> = conn
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![CREDENTIAL_NETWORK_MIGRATION],
+            |row| row.get(0),
+        )
+        .optional()
+        .db_err("read credential network migration")?;
+    if done.is_some() {
+        return Ok(());
+    }
+    let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
+        .db_err("begin credential network migration")?;
+    // Another process may have run it meanwhile.
+    let done: Option<String> = tx
+        .query_row(
+            "SELECT value FROM config WHERE key = ?1",
+            params![CREDENTIAL_NETWORK_MIGRATION],
+            |row| row.get(0),
+        )
+        .optional()
+        .db_err("read credential network migration")?;
+    if done.is_none() {
+        let rows: Vec<(String, Vec<u8>)> = {
+            let mut statement = tx
+                .prepare("SELECT name, data FROM vms")
+                .db_err("list machines to migrate")?;
+            let rows = statement
+                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+                .db_err("list machines to migrate")?;
+            rows.collect::<std::result::Result<_, _>>()
+                .db_err("list machines to migrate")?
+        };
+        for (name, data) in rows {
+            // A record this version cannot read is left exactly as it is.
+            let Ok(mut record) = serde_json::from_slice::<VmRecord>(&data) else {
+                continue;
+            };
+            if !record.restore_legacy_credential_network() {
+                continue;
+            }
+            tracing::info!(machine = %name, "machine whose bindings implied networking keeps its network");
+            let json = serde_json::to_vec(&record).db_err("serialize migrated machine")?;
+            tx.execute(
+                "UPDATE vms SET data = ?2 WHERE name = ?1",
+                params![name, json],
+            )
+            .db_err("migrate machine network")?;
+        }
+        tx.execute(
+            "INSERT OR IGNORE INTO config (key, value) VALUES (?1, '1')",
+            params![CREDENTIAL_NETWORK_MIGRATION],
+        )
+        .db_err("record credential network migration")?;
+    }
+    tx.commit().db_err("commit credential network migration")
+}
+
 impl SmolvmDb {
     /// Run a closure with the single writer connection, reopening it if needed.
     /// Serializes all writers in-process so they never collide at the SQLite
@@ -349,6 +423,7 @@ impl SmolvmDb {
                  ON fork_leases(pool_name, state);",
         )
         .db_err("create tables")?;
+        migrate_legacy_credential_networks(&conn)?;
 
         Ok(conn)
     }
@@ -2421,6 +2496,67 @@ mod tests {
         db.insert_vm("saved", &record).unwrap();
         assert!(db.claim_pause_operation("saved", "save-2", true).is_err());
         db.claim_pause_operation("saved", "save-3", true).unwrap();
+    }
+
+    /// A database from before bindings stopped implying networking: a
+    /// machine created over the API with bindings and no `network` booted
+    /// with outbound virtio-net. Opened by this version, it keeps exactly
+    /// that, and can change its bindings; one with an allow list, or none,
+    /// is left alone; and the migration runs once, so a machine later turned
+    /// offline stays offline.
+    #[test]
+    fn machines_whose_bindings_implied_networking_keep_it_after_upgrade() {
+        use crate::network::launch::EffectiveNetworkBackend;
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("old.db");
+        let bindings = smolvm_protocol::CredentialPolicy {
+            credentials: vec![crate::credentials::parse_credential_flag(
+                "gh=GH_TOKEN@api.github.com",
+            )
+            .unwrap()],
+        };
+        // Records as v1.33 wrote them, in a database it made.
+        let mut legacy = VmRecord::new("legacy".into(), 1, 512, vec![], vec![(8080, 80)], false);
+        legacy.credential_policy = Some(bindings.clone());
+        legacy.credentials_supplied_by_api = true;
+        let mut listed = VmRecord::new("listed".into(), 1, 512, vec![], vec![], false);
+        listed.credential_policy = Some(bindings.clone());
+        listed.allowed_cidrs = Some(vec!["140.82.112.0/20".into()]);
+        let plain = VmRecord::new("plain".into(), 1, 512, vec![], vec![], false);
+        {
+            let old = Connection::open(&path).unwrap();
+            old.execute_batch(
+                "CREATE TABLE vms (name TEXT PRIMARY KEY NOT NULL, data BLOB NOT NULL);",
+            )
+            .unwrap();
+            for record in [&legacy, &listed, &plain] {
+                old.execute(
+                    "INSERT INTO vms (name, data) VALUES (?1, ?2)",
+                    params![record.name, serde_json::to_vec(record).unwrap()],
+                )
+                .unwrap();
+            }
+        }
+        let db = SmolvmDb::open_at(&path).unwrap();
+        let migrated = db.get_vm("legacy").unwrap().unwrap();
+        assert!(migrated.network);
+        let plan = migrated.launch_network_plan();
+        assert!(plan.outbound, "egress as its bindings gave it");
+        assert_eq!(plan.backend, EffectiveNetworkBackend::VirtioNet);
+        assert!(migrated.has_own_egress());
+        migrated
+            .with_credential_bindings(Default::default(), crate::machine_spec::Caller::Api)
+            .expect("its bindings can change");
+        let listed_after = db.get_vm("listed").unwrap().unwrap();
+        assert!(!listed_after.network, "the allow list keeps narrowing it");
+        assert_eq!(listed_after.allowed_cidrs, listed.allowed_cidrs);
+        assert!(!db.get_vm("plain").unwrap().unwrap().network);
+
+        // Turned offline afterwards, it stays offline across reopening.
+        db.update_vm("legacy", |r| r.network = false).unwrap();
+        drop(db);
+        let db = SmolvmDb::open_at(&path).unwrap();
+        assert!(!db.get_vm("legacy").unwrap().unwrap().network);
     }
 
     #[test]

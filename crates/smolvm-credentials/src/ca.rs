@@ -41,6 +41,19 @@ pub struct MachineCa {
     key: KeyPair,
 }
 
+/// Refuse a key that is not the certificate's: a CA directory, or an exported
+/// CA, holding some other key (one linked or copied in from elsewhere) must
+/// never be loaded, signed with or exported as the machine's.
+fn key_matches_certificate(key: &KeyPair, cert_der: &[u8]) -> Result<()> {
+    use x509_parser::prelude::{FromDer, X509Certificate};
+    let (_, cert) = X509Certificate::from_der(cert_der).context("parse CA certificate")?;
+    anyhow::ensure!(
+        cert.public_key().raw == key.public_key_der().as_slice(),
+        "the CA key does not belong to the CA certificate"
+    );
+    Ok(())
+}
+
 fn ca_params(machine: &str) -> CertificateParams {
     let mut params = CertificateParams::default();
     params.is_ca = IsCa::Ca(BasicConstraints::Constrained(0));
@@ -222,6 +235,7 @@ impl MachineCa {
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .context("CA certificate missing")??;
+        key_matches_certificate(&key, &cert_der)?;
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
@@ -274,6 +288,7 @@ impl MachineCa {
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .context("exported CA has no certificate")??;
+        key_matches_certificate(&key, &cert_der)?;
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
@@ -365,6 +380,31 @@ fn write_replacing(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CA whose key is not its certificate's is refused, on disk and as
+    /// an exported document.
+    #[test]
+    fn a_key_that_is_not_the_certificates_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        ca.save(dir.path()).unwrap();
+        let other = MachineCa::generate("demo", &["api.example.com".to_string()]).unwrap();
+        let other_dir = tempfile::tempdir().unwrap();
+        other.save(other_dir.path()).unwrap();
+        std::fs::copy(
+            other_dir.path().join(CA_KEY_FILE),
+            dir.path().join(CA_KEY_FILE),
+        )
+        .unwrap();
+        let err = MachineCa::load(dir.path(), "demo").err().expect("refused");
+        assert!(format!("{err:#}").contains("does not belong"), "{err:#}");
+
+        let mut document: serde_json::Value = serde_json::from_str(&ca.export()).unwrap();
+        let other_doc: serde_json::Value = serde_json::from_str(&other.export()).unwrap();
+        document["key"] = other_doc["key"].clone();
+        assert!(MachineCa::import(&document.to_string()).is_err());
+        assert!(MachineCa::import(&ca.export()).is_ok());
+    }
 
     #[test]
     fn save_load_and_issue_round_trip() {

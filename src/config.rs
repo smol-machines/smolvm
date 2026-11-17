@@ -1986,6 +1986,23 @@ impl VmRecord {
         Ok(next)
     }
 
+    /// Give a machine recorded before bindings stopped implying networking
+    /// the network it has always booted with: bindings, no network flag and
+    /// no allow list used to launch outbound virtio-net, which `network =
+    /// true` launches now. Returns whether the record changed. See
+    /// `migrate_legacy_credential_networks` in the database.
+    pub fn restore_legacy_credential_network(&mut self) -> bool {
+        let bound = self
+            .credential_policy
+            .as_ref()
+            .is_some_and(|policy| !policy.is_empty());
+        if !bound || self.has_own_egress() {
+            return false;
+        }
+        self.network = true;
+        true
+    }
+
     /// Whether the machine's own settings give it outbound access: its
     /// network flag or an allow list, never its credential bindings.
     pub fn has_own_egress(&self) -> bool {

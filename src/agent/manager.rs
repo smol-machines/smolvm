@@ -732,6 +732,122 @@ fn published_set(
     mappings
 }
 
+/// How a request to a running machine's credentials socket failed, and so
+/// whether the machine's boot process may have acted on it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LiveCredentialError {
+    /// It never reached the machine's boot process: there is no socket, the
+    /// path is not one (a link, say), the process serving it is not the
+    /// machine's own, or nothing answered the connection. Nothing changed.
+    Unreached(String),
+    /// The boot process answered with a refusal. Nothing changed.
+    Refused(String),
+    /// It was sent and its answer lost: the boot process may have acted on it.
+    Lost(String),
+}
+
+impl LiveCredentialError {
+    /// Whether the boot process certainly did not act on the request.
+    pub fn changed_nothing(&self) -> bool {
+        !matches!(self, Self::Lost(_))
+    }
+
+    /// Why it failed.
+    pub fn reason(&self) -> &str {
+        match self {
+            Self::Unreached(reason) | Self::Refused(reason) | Self::Lost(reason) => reason,
+        }
+    }
+}
+
+impl std::fmt::Display for LiveCredentialError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.reason())
+    }
+}
+
+/// A boot process from before a message's shape answers this to it.
+const MALFORMED_REQUEST: &str = "malformed request";
+
+/// Send `rendered` to running machine `name`'s credentials socket and return
+/// the data of an `ok` answer.
+///
+/// The socket is in the machine's directory, which its own user owns: the
+/// path must be a socket, not a link to another machine's, and the process
+/// that answers must run as the directory's owner (the machine's boot
+/// process), so a process escaped from one machine cannot have a root CLI or
+/// server hand it another machine's bindings or values.
+fn credentials_query(
+    name: &str,
+    rendered: &str,
+) -> std::result::Result<String, LiveCredentialError> {
+    use std::io::{Read, Write};
+    let dir = vm_data_dir(name);
+    let path = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+    let unreached = |reason: String| LiveCredentialError::Unreached(reason);
+    let meta = std::fs::symlink_metadata(&path).map_err(|e| {
+        unreached(format!(
+            "{e}; a machine started before live changes were supported needs a restart"
+        ))
+    })?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if !meta.file_type().is_socket() {
+            return Err(unreached(format!("{} is not a socket", path.display())));
+        }
+    }
+    #[cfg(not(unix))]
+    if meta.file_type().is_symlink() {
+        return Err(unreached(format!("{} is a link", path.display())));
+    }
+    let mut stream =
+        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2))
+            .map_err(|e| unreached(e.to_string()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let owner = std::fs::symlink_metadata(&dir)
+            .map_err(|e| unreached(e.to_string()))?
+            .uid();
+        let peer = stream.peer_uid().map_err(|e| unreached(e.to_string()))?;
+        if peer != owner {
+            return Err(unreached(format!(
+                "{} is served by uid {peer}, not by the machine's own process (uid {owner})",
+                path.display()
+            )));
+        }
+    }
+    let lost = |e: std::io::Error| LiveCredentialError::Lost(e.to_string());
+    stream
+        .set_read_timeout(Some(Duration::from_secs(30)))
+        .map_err(|e| unreached(e.to_string()))?;
+    stream
+        .write_all(rendered.as_bytes())
+        .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
+        .map_err(lost)?;
+    let mut reply = String::new();
+    stream.read_to_string(&mut reply).map_err(lost)?;
+    credentials_reply(&reply)
+}
+
+/// The data of an `ok` answer from a credentials socket, or why not.
+fn credentials_reply(reply: &str) -> std::result::Result<String, LiveCredentialError> {
+    let reply = reply.trim();
+    match reply.split_once('\n') {
+        Some(("ok", data)) => Ok(data.trim().to_string()),
+        None if reply == "ok" => Ok(String::new()),
+        _ => match reply.strip_prefix("error: ") {
+            Some(reason) => Err(LiveCredentialError::Refused(reason.to_string())),
+            // No answer at all: the process may have died after acting.
+            None if reply.is_empty() => Err(LiveCredentialError::Lost(
+                "the machine's boot process closed the connection without answering".into(),
+            )),
+            None => Err(LiveCredentialError::Refused(reply.to_string())),
+        },
+    }
+}
+
 /// Hand running machine `name` new values for its credential bindings, by
 /// binding name: its next request to a bound host uses them. `expect` is the
 /// bindings the values were read for (the record's, under the caller's lock):
@@ -742,25 +858,55 @@ pub fn apply_live_credential_values(
     values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
     expect: &crate::credentials::CredentialPolicy,
 ) -> Result<()> {
+    send_credential_values(values, expect, |request| credentials_query(name, request)).map_err(
+        |reason| {
+            Error::config(
+                "credentials",
+                format!(
+                    "could not hand machine '{name}' its new credential values while it runs: \
+                     {reason}"
+                ),
+            )
+        },
+    )
+}
+
+/// [`apply_live_credential_values`] through `send`. A boot process from
+/// before bindings could change knows values without `expect`, and refuses
+/// a message carrying it: it is sent the values alone, which is safe because
+/// such a process never changes its bindings while it runs.
+fn send_credential_values(
+    values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+    expect: &crate::credentials::CredentialPolicy,
+    mut send: impl FnMut(&str) -> std::result::Result<String, LiveCredentialError>,
+) -> std::result::Result<(), LiveCredentialError> {
     let values: std::collections::BTreeMap<&str, &str> = values
         .iter()
         .map(|(binding, value)| (binding.as_str(), value.as_str()))
         .collect();
-    let expect: std::collections::BTreeMap<&str, &crate::credentials::CredentialBinding> = values
+    let expected: std::collections::BTreeMap<&str, &crate::credentials::CredentialBinding> = values
         .keys()
         .filter_map(|binding| expect.binding(binding).map(|b| (*binding, b)))
         .collect();
     let request = zeroize::Zeroizing::new(
-        serde_json::json!({ "values": values, "expect": expect }).to_string(),
+        serde_json::json!({ "values": values, "expect": expected }).to_string(),
     );
-    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
-        Error::config(
-            "credentials",
-            format!(
-                "could not hand machine '{name}' its new credential values while it runs: {reason}"
-            ),
-        )
-    })
+    match send(&request) {
+        Err(LiveCredentialError::Refused(reason)) if reason == MALFORMED_REQUEST => {
+            let legacy =
+                zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+            send(&legacy).map(|_| ())
+        }
+        other => other.map(|_| ()),
+    }
+}
+
+/// A failed request to a running machine's credentials socket: the error to
+/// report, and whether the boot process certainly did not act on it.
+#[derive(Debug)]
+pub struct LiveCredentialFailure {
+    pub error: Error,
+    pub changed_nothing: bool,
 }
 
 /// Replace running machine `name`'s credential bindings through its
@@ -770,47 +916,45 @@ pub fn apply_live_credential_values(
 pub fn apply_live_credential_policy(
     name: &str,
     message: &crate::credentials::BindingsMessage,
-) -> Result<crate::credentials::BindingsReply> {
+) -> std::result::Result<crate::credentials::BindingsReply, LiveCredentialFailure> {
     let request = serde_json::json!({ "bindings": message }).to_string();
-    let fail = |reason: String| {
-        Error::config(
+    let fail = |reason: String, changed_nothing: bool| LiveCredentialFailure {
+        error: Error::config(
             "credentials",
             format!(
                 "could not change machine '{name}''s credential bindings while it runs: {reason}"
             ),
-        )
+        ),
+        changed_nothing,
     };
-    let reply = send_live_query(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(
-        |reason| {
-            // A boot process from before binding changes knows only values.
-            if reason == "malformed request" {
-                fail(
-                    "this machine was started before live binding changes were supported and \
-                     needs a restart"
-                        .to_string(),
-                )
-            } else {
-                fail(reason)
-            }
-        },
-    )?;
-    serde_json::from_str(&reply).map_err(|e| fail(format!("unreadable answer: {e}")))
+    let reply = credentials_query(name, &request).map_err(|error| match error {
+        // A boot process from before binding changes knows only values.
+        LiveCredentialError::Refused(reason) if reason == MALFORMED_REQUEST => fail(
+            "this machine was started before live binding changes were supported and needs a \
+             restart"
+                .to_string(),
+            true,
+        ),
+        other => fail(other.reason().to_string(), other.changed_nothing()),
+    })?;
+    // It acted, and its answer is unreadable: treat it as taken.
+    serde_json::from_str(&reply).map_err(|e| fail(format!("unreadable answer: {e}"), false))
 }
 
 /// Return running machine `name`'s boot process to exactly the bindings it
 /// had before the last ones it was sent.
-pub fn roll_back_live_credential_policy(name: &str) -> Result<()> {
-    send_live_change(
-        name,
-        crate::credentials::CREDENTIALS_SOCKET,
-        r#"{"rollback":true}"#,
-    )
-    .map_err(|reason| {
-        Error::config(
-            "credentials",
-            format!("could not restore machine '{name}''s credential bindings: {reason}"),
-        )
-    })
+pub fn roll_back_live_credential_policy(
+    name: &str,
+) -> std::result::Result<(), LiveCredentialFailure> {
+    credentials_query(name, r#"{"rollback":true}"#)
+        .map(|_| ())
+        .map_err(|error| LiveCredentialFailure {
+            changed_nothing: error.changed_nothing(),
+            error: Error::config(
+                "credentials",
+                format!("could not restore machine '{name}''s credential bindings: {error}"),
+            ),
+        })
 }
 
 /// Have running machine `name`'s guest trust `pem` as its credential CA,
@@ -869,22 +1013,6 @@ pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
             )
         })?;
     Ok(mapping.0)
-}
-
-/// Send `rendered` to one of running machine `name`'s control sockets and
-/// return what followed its `ok` line.
-fn send_live_query(
-    name: &str,
-    socket: &str,
-    rendered: &str,
-) -> std::result::Result<String, String> {
-    let reply = send_live_request(name, socket, rendered)?;
-    let reply = reply.trim();
-    match reply.split_once('\n') {
-        Some(("ok", data)) => Ok(data.trim().to_string()),
-        None if reply == "ok" => Ok(String::new()),
-        _ => Err(reply.strip_prefix("error: ").unwrap_or(reply).to_string()),
-    }
 }
 
 /// Send `rendered` to one of running machine `name`'s control sockets and
@@ -6063,6 +6191,99 @@ mod tests {
             !parsed.forkable,
             "a missing forkable field defaults to false"
         );
+    }
+
+    /// A boot process from before bindings could change parses its socket
+    /// messages strictly and knows values alone: one carrying `expect` is
+    /// refused as malformed, and the values are sent again without it, in
+    /// the shape it takes.
+    #[test]
+    fn values_reach_a_boot_process_from_before_binding_changes() {
+        #[derive(serde::Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct OldRequest {
+            values: Option<std::collections::BTreeMap<String, String>>,
+        }
+        let old_boot_process = |request: &str| match serde_json::from_str::<OldRequest>(request) {
+            Ok(OldRequest { values: Some(_) }) => Ok(String::new()),
+            _ => Err(LiveCredentialError::Refused(MALFORMED_REQUEST.into())),
+        };
+        let expect = crate::credentials::CredentialPolicy {
+            credentials: vec![
+                crate::credentials::parse_credential_flag("gh=GH_TOKEN@github.com").unwrap(),
+            ],
+        };
+        let values = [("gh".to_string(), zeroize::Zeroizing::new("v".to_string()))].into();
+        let mut sent = Vec::new();
+        send_credential_values(&values, &expect, |request| {
+            sent.push(request.to_string());
+            old_boot_process(request)
+        })
+        .unwrap();
+        assert_eq!(sent.len(), 2);
+        assert!(sent[0].contains("\"expect\""));
+        assert!(!sent[1].contains("\"expect\""));
+
+        // A current one takes the first, and any other refusal is final.
+        let mut sent = 0;
+        send_credential_values(&values, &expect, |_| {
+            sent += 1;
+            Ok(String::new())
+        })
+        .unwrap();
+        assert_eq!(sent, 1);
+        let refused = send_credential_values(&values, &expect, |_| {
+            Err(LiveCredentialError::Refused("changed since".into()))
+        });
+        assert_eq!(
+            refused,
+            Err(LiveCredentialError::Refused("changed since".into()))
+        );
+    }
+
+    /// Answers are classified by what they prove: a refusal changed nothing,
+    /// a closed connection may have come after the process acted.
+    #[test]
+    fn credentials_answers_say_whether_anything_changed() {
+        assert_eq!(credentials_reply("ok\n").unwrap(), "");
+        assert_eq!(credentials_reply("ok\n{\"a\":1}\n").unwrap(), "{\"a\":1}");
+        let refused = credentials_reply("error: malformed request\n").unwrap_err();
+        assert_eq!(
+            refused,
+            LiveCredentialError::Refused(MALFORMED_REQUEST.into())
+        );
+        assert!(refused.changed_nothing());
+        assert!(!credentials_reply("").unwrap_err().changed_nothing());
+    }
+
+    /// The host talks to a machine's credentials socket only if the path is
+    /// a socket, not a link, and its server runs as the machine directory's
+    /// owner.
+    #[cfg(unix)]
+    #[test]
+    fn the_credentials_socket_is_never_reached_through_a_link() {
+        let name = format!(
+            "cred-sock-{}",
+            crate::db::SmolvmDb::create_reservation_token()
+        );
+        let dir = vm_data_dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let other = elsewhere.path().join("other.sock");
+        let _listener = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        std::os::unix::fs::symlink(&other, dir.join(crate::credentials::CREDENTIALS_SOCKET))
+            .unwrap();
+        let refused = credentials_query(&name, "{}").unwrap_err();
+        assert!(refused.changed_nothing());
+        assert!(refused.reason().contains("not a socket"), "{refused}");
+        // No socket at all: unreached, nothing changed.
+        std::fs::remove_file(dir.join(crate::credentials::CREDENTIALS_SOCKET)).unwrap();
+        assert!(matches!(
+            credentials_query(&name, "{}"),
+            Err(LiveCredentialError::Unreached(_))
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A VM launched on a pod network says so in its running configuration,

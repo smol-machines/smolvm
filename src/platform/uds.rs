@@ -124,6 +124,46 @@ impl UdsStream {
 }
 
 #[cfg(unix)]
+impl UdsStream {
+    /// The user id of the process at the other end: the one that was
+    /// listening when this stream connected.
+    #[cfg(any(target_os = "linux", target_os = "android"))]
+    pub fn peer_uid(&self) -> io::Result<u32> {
+        use std::os::unix::io::AsRawFd;
+        // SAFETY: plain data the call fills in.
+        let mut cred: libc::ucred = unsafe { std::mem::zeroed() };
+        let mut len = std::mem::size_of::<libc::ucred>() as libc::socklen_t;
+        // SAFETY: a live socket, and a buffer of the length passed.
+        let rc = unsafe {
+            libc::getsockopt(
+                self.inner.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_PEERCRED,
+                (&mut cred as *mut libc::ucred).cast(),
+                &mut len,
+            )
+        };
+        if rc != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(cred.uid)
+    }
+
+    /// The user id of the process at the other end: the one that was
+    /// listening when this stream connected.
+    #[cfg(not(any(target_os = "linux", target_os = "android")))]
+    pub fn peer_uid(&self) -> io::Result<u32> {
+        use std::os::unix::io::AsRawFd;
+        let (mut uid, mut gid) = (0, 0);
+        // SAFETY: a live socket and two out pointers.
+        if unsafe { libc::getpeereid(self.inner.as_raw_fd(), &mut uid, &mut gid) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        Ok(uid)
+    }
+}
+
+#[cfg(unix)]
 impl std::os::unix::io::AsRawFd for UdsStream {
     fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
         self.inner.as_raw_fd()

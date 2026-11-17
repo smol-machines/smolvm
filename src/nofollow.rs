@@ -8,7 +8,9 @@
 //! reach, a FIFO that hangs the reader, or a device that never ends. Every
 //! component below the base directory is therefore opened without following a
 //! link, directories with `O_DIRECTORY`, files only if they are regular, never
-//! blocking on open, and reads are capped.
+//! blocking on open, and reads are capped. A file read must have one name only
+//! (a hard link to a file elsewhere has two) and belong to this process's user
+//! or the directory's owner, never to anyone else.
 
 use std::path::Path;
 
@@ -28,8 +30,23 @@ pub(crate) fn read(base: &Path, components: &[&str], max: u64) -> std::io::Resul
         libc::O_RDONLY | libc::O_NONBLOCK,
         0,
     )?);
-    if !file.metadata()?.is_file() {
+    let meta = file.metadata()?;
+    if !meta.is_file() {
         return Err(std::io::Error::other("not a regular file"));
+    }
+    {
+        use std::os::unix::fs::MetadataExt;
+        if meta.nlink() != 1 {
+            return Err(std::io::Error::other("a file with more than one name"));
+        }
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let base_owner = std::fs::symlink_metadata(base)?.uid();
+        if meta.uid() != me && meta.uid() != base_owner {
+            return Err(std::io::Error::other(
+                "a file owned by neither this user nor the directory's owner",
+            ));
+        }
     }
     read_capped(&file, max)
 }
@@ -71,25 +88,28 @@ pub(crate) fn write_replacing(
         .split_last()
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
     let dir = unix::open_dirs(base, dirs, true)?;
-    let tmp = format!(".{name}.{}.tmp", std::process::id());
-    let _ = unix::unlink_at(&dir, &tmp);
-    let written = unix::open_at(
-        &dir,
-        &tmp,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
-        mode,
-    )
-    .and_then(|fd| {
-        let mut file = std::fs::File::from(fd);
-        file.write_all(bytes)?;
-        // Its final mode whatever the umask was.
-        // SAFETY: a live descriptor this function owns.
-        if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        Ok(())
-    })
-    .and_then(|()| unix::rename_at(&dir, &tmp, name));
+    // A name no other writer (thread or process) uses; one left by a crash
+    // is skipped, never reused.
+    let (tmp, fd) = unique_temp(name, |tmp| {
+        unix::open_at(
+            &dir,
+            tmp,
+            libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL,
+            mode,
+        )
+    })?;
+    let written = Ok::<_, std::io::Error>(fd)
+        .and_then(|fd| {
+            let mut file = std::fs::File::from(fd);
+            file.write_all(bytes)?;
+            // Its final mode whatever the umask was.
+            // SAFETY: a live descriptor this function owns.
+            if unsafe { libc::fchmod(file.as_raw_fd(), mode as libc::mode_t) } != 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        })
+        .and_then(|()| unix::rename_at(&dir, &tmp, name));
     if written.is_err() {
         let _ = unix::unlink_at(&dir, &tmp);
     }
@@ -112,18 +132,47 @@ pub(crate) fn write_replacing(
         .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?
         .to_string_lossy()
         .into_owned();
-    let tmp = path.with_file_name(format!(".{name}.{}.tmp", std::process::id()));
-    let _ = std::fs::remove_file(&tmp);
-    let written = std::fs::OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .open(&tmp)
+    let (tmp, file) = unique_temp(&name, |tmp| {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(path.with_file_name(tmp))
+    })?;
+    let tmp = path.with_file_name(tmp);
+    let written = Ok::<_, std::io::Error>(file)
         .and_then(|mut file| std::io::Write::write_all(&mut file, bytes))
         .and_then(|()| std::fs::rename(&tmp, &path));
     if written.is_err() {
         let _ = std::fs::remove_file(&tmp);
     }
     written
+}
+
+/// Create a temporary file beside `name` with `create` (which must refuse an
+/// existing file), under a name unique to this call: this process, a counter
+/// and random bytes. Returns the name and what `create` made.
+fn unique_temp<T>(
+    name: &str,
+    mut create: impl FnMut(&str) -> std::io::Result<T>,
+) -> std::io::Result<(String, T)> {
+    static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let mut last = None;
+    for _ in 0..16 {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(std::io::Error::other)?;
+        let tmp = format!(
+            ".{name}.{}.{}.{}.tmp",
+            std::process::id(),
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
+            u64::from_ne_bytes(random)
+        );
+        match create(&tmp) {
+            Ok(made) => return Ok((tmp, made)),
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => last = Some(error),
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| std::io::Error::from(std::io::ErrorKind::AlreadyExists)))
 }
 
 #[cfg(unix)]
@@ -307,6 +356,54 @@ mod tests {
         std::os::unix::fs::symlink(&sub, dir.path().join("linked")).unwrap();
         assert!(read(dir.path(), &["linked", "f"], 16).is_err());
         assert!(read(&dir.path().join("linked"), &["f"], 16).is_err());
+    }
+
+    /// A file with a second name (a hard link to something elsewhere) is not
+    /// read.
+    #[test]
+    fn reads_refuse_hard_linked_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = dir.path().join("elsewhere");
+        std::fs::write(&elsewhere, b"secret").unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::hard_link(&elsewhere, sub.join("linked")).unwrap();
+        let err = read(&sub, &["linked"], 64).unwrap_err();
+        assert!(err.to_string().contains("more than one name"), "{err}");
+    }
+
+    /// Writers in many threads at once never share a temporary file: every
+    /// write lands whole.
+    #[test]
+    fn concurrent_writes_never_collide() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = dir.path().to_path_buf();
+        let threads: Vec<_> = (0..16)
+            .map(|i| {
+                let base = base.clone();
+                std::thread::spawn(move || {
+                    let body = vec![b'a' + (i as u8 % 26); 4096];
+                    for _ in 0..20 {
+                        write_replacing(&base, &["shared"], &body, 0o644).unwrap();
+                    }
+                })
+            })
+            .collect();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let content = std::fs::read(base.join("shared")).unwrap();
+        assert_eq!(content.len(), 4096);
+        assert!(
+            content.iter().all(|b| *b == content[0]),
+            "one writer's whole file"
+        );
+        let leftovers: Vec<_> = std::fs::read_dir(&base)
+            .unwrap()
+            .map(|e| e.unwrap().file_name())
+            .filter(|n| n != "shared")
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
     }
 
     /// A write never goes through a link: a linked directory on the way is

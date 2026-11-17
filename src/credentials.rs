@@ -637,7 +637,7 @@ trait LiveBindings {
         name: &str,
         before: &VmRecord,
         next: &VmRecord,
-    ) -> std::result::Result<Option<String>, BindingsError>;
+    ) -> std::result::Result<LiveOutcome, BindingsError>;
     /// [`roll_back_live_bindings`].
     fn roll_back(&self, name: &str) -> Result<()>;
 }
@@ -651,7 +651,7 @@ impl LiveBindings for BootProcess {
         name: &str,
         before: &VmRecord,
         next: &VmRecord,
-    ) -> std::result::Result<Option<String>, BindingsError> {
+    ) -> std::result::Result<LiveOutcome, BindingsError> {
         apply_live_bindings(name, before, next)
     }
 
@@ -669,6 +669,22 @@ fn check_named_host_bindings(
     named: &std::collections::BTreeSet<String>,
 ) -> Result<()> {
     if next.credentials_supplied_by_api {
+        // A binding named here would never be given a value: this machine
+        // takes its values only from whoever supplies them.
+        if let Some(binding) = named.iter().next() {
+            return Err(Error::config(
+                "credentials",
+                format!(
+                    "machine '{name}' takes its credential values only from the API caller or \
+                     embedder that set its bindings (or the checkpoint it was restored from), \
+                     never from this host, so credential '{binding}' would never get a value; \
+                     supply values with PUT /api/v1/machines/{name}/credential-values, or \
+                     remove its bindings (--remove-credential) first so the machine reads this \
+                     host's values",
+                    name = before.name
+                ),
+            ));
+        }
         return Ok(());
     }
     let was_host_sourced = !before.credentials_supplied_by_api;
@@ -754,10 +770,17 @@ fn set_bindings_with(
             tracing::warn!(machine = name, %error, "could not record that the machine's credential bindings are unsettled");
         }
     };
+    // Whether the running machine's boot process took the change, and so
+    // must be told to undo it if the change fails from here on.
+    let mut sent = false;
     if running {
         match live.apply(name, &record, &next) {
-            Ok(Some(trusted)) => next.credential_ca_trusted = Some(trusted),
-            Ok(None) => {}
+            Ok(outcome) => {
+                sent = outcome.sent;
+                if let Some(trusted) = outcome.trusted {
+                    next.credential_ca_trusted = Some(trusted);
+                }
+            }
             Err(error @ BindingsError::Unsettled(_)) => {
                 mark_unsettled();
                 return Err(error);
@@ -773,7 +796,7 @@ fn set_bindings_with(
                 _ => Error::vm_not_found(name),
             };
             // The record keeps the old bindings, so the running machine must too.
-            if running {
+            if sent {
                 if let Err(undo) = live.roll_back(name) {
                     mark_unsettled();
                     return Err(unsettled(name, &cause, &[undo.to_string()]));
@@ -794,7 +817,7 @@ fn set_bindings_with(
         }) {
             undo.push(format!("the record: {restore}"));
         }
-        if running {
+        if sent {
             if let Err(roll_back) = live.roll_back(name) {
                 undo.push(format!("the running machine: {roll_back}"));
             }
@@ -1005,7 +1028,7 @@ pub fn apply_live_bindings(
     name: &str,
     before: &VmRecord,
     next: &VmRecord,
-) -> std::result::Result<Option<String>, BindingsError> {
+) -> std::result::Result<LiveOutcome, BindingsError> {
     before
         .check_live_credentials(next, crate::agent::running_on_pod_network(name))
         .map_err(BindingsError::Conflict)?;
@@ -1016,7 +1039,7 @@ pub fn apply_live_bindings(
     // does not has no interceptor, so holds no bindings.
     let socket = crate::agent::vm_data_dir(name).join(CREDENTIALS_SOCKET);
     if !reaches_boot_process(before, next, || std::fs::symlink_metadata(&socket).is_ok()) {
-        return Ok(None);
+        return Ok(LiveOutcome::default());
     }
     let policy = next.credential_policy.clone().unwrap_or_default();
     let capable =
@@ -1041,10 +1064,18 @@ pub fn apply_live_bindings(
     };
     let reply = match crate::agent::apply_live_credential_policy(name, &message) {
         Ok(reply) => reply,
+        // Certainly not taken (no socket, a refusal, a boot process from
+        // before binding changes): there is nothing to undo.
+        Err(failure) if failure.changed_nothing => {
+            return Err(BindingsError::Conflict(failure.error))
+        }
         // The boot process may have applied it and only the answer was
-        // lost (a timeout): put back what it had. One that refused it kept
-        // nothing to roll back to, and says so.
-        Err(error) => return Err(undo(error, BindingsError::Conflict)),
+        // lost (a timeout): put back what it had.
+        Err(failure) => return Err(undo(failure.error, BindingsError::Conflict)),
+    };
+    let taken = |trusted: Option<String>| LiveOutcome {
+        trusted,
+        sent: true,
     };
     let pem = rustls_pemfile::certs(&mut reply.ca_pem.as_bytes())
         .next()
@@ -1054,7 +1085,7 @@ pub fn apply_live_bindings(
         // A boot process that never had bindings and is given none has no
         // CA to answer with, and the guest needs none.
         if next.credential_policy.is_none() && reply.ca_pem.is_empty() {
-            return Ok(None);
+            return Ok(taken(None));
         }
         return Err(undo(
             Error::config(
@@ -1066,7 +1097,7 @@ pub fn apply_live_bindings(
     };
     let fingerprint = CredentialLaunch::ca_fingerprint(&pem);
     if !guest_needs_ca(before, &pem) {
-        return Ok(Some(fingerprint));
+        return Ok(taken(Some(fingerprint)));
     }
     let installed = if capable {
         crate::agent::install_live_credential_trust(name, &pem)
@@ -1080,9 +1111,19 @@ pub fn apply_live_bindings(
         ))
     };
     match installed {
-        Ok(()) => Ok(Some(fingerprint)),
+        Ok(()) => Ok(taken(Some(fingerprint))),
         Err(error) => Err(undo(error, BindingsError::Conflict)),
     }
+}
+
+/// What a running machine's boot process did with new bindings.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct LiveOutcome {
+    /// Fingerprint of the CA its guest trusts now, when it was answered.
+    pub trusted: Option<String>,
+    /// The boot process took the bindings: undoing the change must reach
+    /// it. False when nothing was sent (nothing to nothing).
+    pub sent: bool,
 }
 
 /// Whether a change from `before` to `next` must be sent to the running
@@ -1114,15 +1155,15 @@ fn guest_needs_ca(before: &VmRecord, pem: &str) -> bool {
 pub const NOTHING_TO_ROLL_BACK: &str = "there are no replaced bindings to restore";
 
 /// Return running machine `name`'s boot process to the bindings, sources and
-/// values it had before the last bindings it was sent. A boot process with
-/// nothing to undo (it refused them) is already there.
+/// values it had before the last bindings it was sent. Called only after it
+/// took them; one that answers there is nothing to undo is already there.
 fn roll_back_live_bindings(name: &str) -> Result<()> {
     match crate::agent::roll_back_live_credential_policy(name) {
         Ok(()) => Ok(()),
-        Err(error) if error.to_string().contains(NOTHING_TO_ROLL_BACK) => Ok(()),
-        Err(error) => {
-            tracing::warn!(machine = name, %error, "could not restore the previous credential bindings");
-            Err(error)
+        Err(failure) if failure.error.to_string().contains(NOTHING_TO_ROLL_BACK) => Ok(()),
+        Err(failure) => {
+            tracing::warn!(machine = name, error = %failure.error, "could not restore the previous credential bindings");
+            Err(failure.error)
         }
     }
 }
@@ -2533,6 +2574,8 @@ mod tests {
     struct FakeBootProcess {
         calls: Mutex<Vec<&'static str>>,
         undo_fails: bool,
+        /// Behaves like a change from no bindings to none: nothing is sent.
+        sends_nothing: bool,
     }
 
     impl LiveBindings for FakeBootProcess {
@@ -2541,9 +2584,12 @@ mod tests {
             _name: &str,
             _before: &VmRecord,
             _next: &VmRecord,
-        ) -> std::result::Result<Option<String>, BindingsError> {
+        ) -> std::result::Result<LiveOutcome, BindingsError> {
             self.calls.lock().unwrap().push("apply");
-            Ok(Some("new-ca-fingerprint".into()))
+            Ok(LiveOutcome {
+                trusted: Some("new-ca-fingerprint".into()),
+                sent: !self.sends_nothing,
+            })
         }
 
         fn roll_back(&self, _name: &str) -> Result<()> {
@@ -2860,6 +2906,93 @@ mod tests {
             |_, _, _| Ok(()),
         )
         .unwrap();
+        db.remove_vm(&name).unwrap();
+    }
+
+    /// A change from no bindings to none sends nothing to the boot process,
+    /// so a failure after it undoes nothing there and is a plain conflict,
+    /// never reported as unsettled.
+    #[test]
+    fn nothing_sent_means_nothing_to_undo() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, _) = machine_in(&db, "nothing-sent", true);
+        let live = FakeBootProcess {
+            undo_fails: true,
+            sends_nothing: true,
+            ..Default::default()
+        };
+        let failed = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&Default::default()),
+            |_| Ok(CredentialPolicy::default()),
+            &live,
+            |_, _, _| Err(Error::config("credentials", "then failed")),
+        );
+        assert!(
+            matches!(failed, Err(BindingsError::Conflict(_))),
+            "{failed:?}"
+        );
+        assert_eq!(*live.calls.lock().unwrap(), vec!["apply"], "no undo sent");
+        assert!(
+            !db.get_vm(&name)
+                .unwrap()
+                .unwrap()
+                .credential_bindings_unsettled
+        );
+        db.remove_vm(&name).unwrap();
+    }
+
+    /// A binding the CLI names on a machine whose values are supplied would
+    /// never get one: refused, saying where values come from; removing
+    /// bindings there still works.
+    #[test]
+    fn the_cli_cannot_add_a_binding_no_value_would_reach() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, _) = machine_in(&db, "supplied", false);
+        let live = FakeBootProcess::default();
+        put(
+            &db,
+            &name,
+            bindings_of(&["a=A_KEY@api.a.com", "b=B_KEY@api.b.com"]),
+            Caller::Api,
+            &live,
+        )
+        .unwrap();
+        let refused = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["gh".to_string()].into()),
+            |locked| {
+                let mut policy = locked.credential_policy.clone().unwrap_or_default();
+                policy
+                    .credentials
+                    .push(parse_credential_flag("gh=GH_TOKEN@github.com").unwrap());
+                Ok(policy)
+            },
+            &live,
+            |_, _, _| Ok(()),
+        );
+        let Err(BindingsError::Conflict(error)) = refused else {
+            panic!("expected a conflict, got {refused:?}");
+        };
+        assert!(error.to_string().contains("credential-values"), "{error}");
+        assert!(error.to_string().contains("'gh'"), "{error}");
+        let removed = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&Default::default()),
+            |_| Ok(bindings_of(&["a=A_KEY@api.a.com"])),
+            &live,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(removed.credentials_supplied_by_api);
         db.remove_vm(&name).unwrap();
     }
 

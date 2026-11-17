@@ -1490,3 +1490,31 @@ fn the_record_carries_every_resolved_setting() {
     assert_eq!(record.state, crate::config::RecordState::Created);
     assert_eq!(record.labels["a"], "b");
 }
+
+/// A machine created with bindings and no explicit network, from any
+/// front-end (an API body, a Smolfile's `[[network.credentials]]`), is
+/// recorded with the network its bindings need: new records never rely on
+/// bindings implying it.
+#[test]
+fn bindings_without_net_are_recorded_with_a_network() {
+    let credentials = Some(CredentialPolicy {
+        credentials: vec![
+            crate::credentials::parse_credential_flag("gh=GH_TOKEN@api.github.com").unwrap(),
+        ],
+    });
+    for caller in [Caller::Cli, Caller::Api] {
+        let record = resolve(
+            SpecSource::Image(IMAGE),
+            CreateSpec {
+                credentials: credentials.clone(),
+                ..Default::default()
+            },
+            caller,
+        )
+        .unwrap()
+        .to_record("m")
+        .unwrap();
+        assert!(record.network, "{caller:?}");
+        assert!(record.has_own_egress());
+    }
+}

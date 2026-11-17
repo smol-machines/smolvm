@@ -102,6 +102,18 @@ on for the new machine, replacing bindings never turns networking on, and a
 binding never keeps networking that the machine turns off (`machine update
 --no-net` leaves it with no network, bindings or not).
 
+A machine created by an earlier version with bindings and no network flag (over
+the API, or from a Smolfile without `net = true`) booted with outbound
+networking because its bindings implied it. The first time this version opens
+the machine database it records that network on such a machine, once, so it
+boots as it always has and its bindings can change; a machine with an allow
+list keeps it, and one taken offline later stays offline.
+
+`machine update --credential` on a machine whose values are supplied by an API
+caller or embedder (or that was restored from a checkpoint) is refused: no
+value would ever reach the binding from this host. Supply values with
+`PUT /api/v1/machines/{name}/credential-values`, or remove its bindings first.
+
 ```sh
 # HTTP API: the complete set, each binding as in the create body
 curl -X PUT http://127.0.0.1:8080/api/v1/machines/notes/credentials \

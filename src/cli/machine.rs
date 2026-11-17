@@ -3713,6 +3713,35 @@ mod tests {
         assert!(!mixed.changes_only_labels() && !mixed.changes_only_ports());
     }
 
+    /// An update that is refused for any of its other flags (the machine's
+    /// state, a bad resource or env value) changes nothing, its bindings
+    /// included: every check runs before the bindings change.
+    #[test]
+    fn an_update_refused_for_its_other_flags_leaves_the_bindings_alone() {
+        use smolvm::config::{RecordState, VmRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let db = smolvm::db::SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
+        let cases: [(RecordState, &[&'static str]); 4] = [
+            (RecordState::Paused, &["-e", "FOO=bar"]),
+            (RecordState::Failed, &["--cpus", "2"]),
+            (RecordState::Stopped, &["--cpus", "0"]),
+            (RecordState::Stopped, &["-e", "=bad"]),
+        ];
+        for (state, extra) in cases {
+            let mut record = VmRecord::new("l".into(), 1, 512, vec![], vec![], true);
+            record.state = state.clone();
+            db.insert_vm("l", &record).unwrap();
+            let cmd = parse_update(
+                &[&["--credential", "gh=GH_TOKEN@api.github.com"][..], extra].concat(),
+            );
+            assert!(cmd.run_in(&db).is_err(), "{state:?} {extra:?}");
+            let after = db.get_vm("l").unwrap().unwrap();
+            assert_eq!(after.credential_policy, None, "{state:?} {extra:?}");
+            assert_eq!(after.cpus, 1);
+            assert!(after.env.is_empty());
+        }
+    }
+
     #[test]
     fn update_sets_and_removes_labels() {
         let apply = |extra: &[&'static str], labels: &mut _| {
@@ -7352,10 +7381,14 @@ impl UpdateCmd {
     }
 
     pub fn run(self) -> smolvm::Result<()> {
+        let db = smolvm::db::SmolvmDb::open()?;
+        self.run_in(&db)
+    }
+
+    fn run_in(self, db: &smolvm::db::SmolvmDb) -> smolvm::Result<()> {
         use smolvm::config::RecordState;
         use smolvm::data::storage::HostMount;
 
-        let db = smolvm::db::SmolvmDb::open()?;
         let record = db.get_vm(&self.name)?.ok_or_else(|| {
             smolvm::Error::config("update", format!("machine '{}' not found", self.name))
         })?;
@@ -7363,35 +7396,30 @@ impl UpdateCmd {
         let set_labels = smolvm::util::parse_labels(&self.labels)?;
         let state = record.actual_state();
         let (egress, ports, labels, credentials, other) = self.changed_settings();
-        let mut record = record;
-        if credentials {
-            if state == RecordState::Running && (egress || ports || other) {
-                return Err(smolvm::Error::config(
-                    "update",
-                    "a running machine takes credential binding changes on their own; \
-                     run the other changes separately",
-                ));
-            }
-            self.update_credentials(&db)?;
-            if !(egress || ports || other) {
-                return if labels {
-                    self.update_labels(&db, &set_labels)
-                } else {
-                    Ok(())
-                };
-            }
-            record = db.get_vm(&self.name)?.ok_or_else(|| {
-                smolvm::Error::config("update", format!("machine '{}' not found", self.name))
-            })?;
+        if credentials && !(egress || ports || other) {
+            // Bindings change in every state, a running machine's at once.
+            self.update_credentials(db)?;
+            return if labels {
+                self.update_labels(db, &set_labels)
+            } else {
+                Ok(())
+            };
+        }
+        if credentials && state == RecordState::Running {
+            return Err(smolvm::Error::config(
+                "update",
+                "a running machine takes credential binding changes on their own; \
+                 run the other changes separately",
+            ));
         }
         if self.changes_only_labels() {
-            return self.update_labels(&db, &set_labels);
+            return self.update_labels(db, &set_labels);
         }
         if state == RecordState::Running && self.changes_only_egress() {
-            return self.update_running_egress(&db, &record);
+            return self.update_running_egress(db, &record);
         }
         if state == RecordState::Running && self.changes_only_ports() {
-            return self.update_running_ports(&db, &record);
+            return self.update_running_ports(db, &record);
         }
 
         // Must be stopped (same check as resize)
@@ -7500,6 +7528,13 @@ impl UpdateCmd {
             &final_disk_volumes,
             final_mounts.iter().filter_map(|m| m.target.to_str()),
         )?;
+
+        // Every state check and every validation of the other settings has
+        // passed: only now do the bindings change, so a command refused for
+        // any of them changes nothing.
+        if credentials {
+            self.update_credentials(db)?;
+        }
 
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
