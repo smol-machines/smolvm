@@ -274,6 +274,7 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
     manifest.network = vm.network;
+    manifest.block_private = vm.block_private.clone();
     manifest.allowed_cidrs = vm.allowed_cidrs.clone();
     manifest.dns_filter_hosts = vm.dns_filter_hosts.clone();
     manifest.egress_rules = vm.egress_rules.clone();
@@ -298,6 +299,8 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
 /// Validated outbound egress fields extracted from a [`PackManifest`].
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ValidatedManifestEgress {
+    /// Private-range exceptions; `Some([])` blocks every private range.
+    pub block_private: Option<Vec<String>>,
     /// Outbound CIDR allow-list carried with the pack.
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostnames and patterns permitted by the guest DNS filter.
@@ -306,12 +309,62 @@ pub struct ValidatedManifestEgress {
     pub egress_rules: Vec<smolvm_protocol::EgressRule>,
 }
 
+impl ValidatedManifestEgress {
+    /// Layer CLI policy over an artifact: replace an explicit allow list as a
+    /// unit, retain inherited restrictions, and put new denies before allows.
+    pub fn with_cli_overrides(
+        self,
+        allowed_cidrs: Option<Vec<String>>,
+        dns_filter_hosts: Option<Vec<String>>,
+        block_private: Option<Vec<String>>,
+        rules: Vec<smolvm_protocol::EgressRule>,
+    ) -> Self {
+        let replaces_allow_list = allowed_cidrs.is_some() || dns_filter_hosts.is_some();
+        let mut egress_rules: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.action == smolvm_protocol::RuleAction::Deny)
+            .cloned()
+            .collect();
+        egress_rules.extend(self.egress_rules);
+        egress_rules.extend(
+            rules
+                .into_iter()
+                .filter(|rule| rule.action != smolvm_protocol::RuleAction::Deny),
+        );
+        Self {
+            allowed_cidrs: if replaces_allow_list {
+                allowed_cidrs
+            } else {
+                self.allowed_cidrs
+            },
+            dns_filter_hosts: if replaces_allow_list {
+                dns_filter_hosts
+            } else {
+                self.dns_filter_hosts
+            },
+            block_private: block_private.or(self.block_private),
+            egress_rules,
+        }
+    }
+}
+
 /// Validate and normalize the outbound egress policy carried by an untrusted
 /// [`PackManifest`], holding its CIDRs, host patterns, and egress rules to the
 /// same rules `machine create` enforces.
 pub fn validated_manifest_egress(
     manifest: &PackManifest,
 ) -> crate::Result<ValidatedManifestEgress> {
+    let block_private = manifest
+        .block_private
+        .as_ref()
+        .map(|cidrs| {
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed block_private", reason))
+        })
+        .transpose()?;
     let allowed_cidrs = match &manifest.allowed_cidrs {
         Some(cidrs) => Some(
             cidrs
@@ -354,6 +407,7 @@ pub fn validated_manifest_egress(
         })
         .collect::<crate::Result<Vec<_>>>()?;
     Ok(ValidatedManifestEgress {
+        block_private,
         allowed_cidrs,
         dns_filter_hosts,
         egress_rules,
@@ -2124,6 +2178,7 @@ mod from_vm_manifest_tests {
     fn seed_manifest_from_vm_preserves_egress_allow_list_and_rules() {
         let mut rec = record("scoped");
         rec.network = true;
+        rec.block_private = Some(vec![]);
         rec.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
         rec.dns_filter_hosts = Some(vec![
             "pypi.org".to_string(),
@@ -2147,6 +2202,7 @@ mod from_vm_manifest_tests {
         assert_eq!(
             validated_manifest_egress(&m).unwrap(),
             ValidatedManifestEgress {
+                block_private: rec.block_private,
                 allowed_cidrs: rec.allowed_cidrs,
                 dns_filter_hosts: rec.dns_filter_hosts,
                 egress_rules: rec.egress_rules,

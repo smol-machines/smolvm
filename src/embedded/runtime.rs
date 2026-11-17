@@ -1747,8 +1747,8 @@ impl EmbeddedRuntime {
 
     /// Create the stopped machine `name` from a `.smolmachine` artifact,
     /// optionally applying an explicit caller outbound network policy before
-    /// the machine can be started. If applying `egress` fails, the newly
-    /// created machine is deleted before returning the error.
+    /// the machine is published. Invalid policy fails before creation, so no
+    /// unrestricted intermediate record can be started by another process.
     pub fn create_machine_from_pack_with_egress(
         &self,
         name: &str,
@@ -1758,18 +1758,11 @@ impl EmbeddedRuntime {
         self.create_machine_from_pack_with(
             name,
             pack,
-            &crate::machine_spec::CreateSpec::default(),
-        )?;
-        if let Some(policy) = egress {
-            self.with_name_lock(name, || {
-                if let Err(err) = control::set_egress_policy(&self.db, name, policy) {
-                    let _ = control::delete_vm(&self.db, name);
-                    return Err(err);
-                }
-                Ok(())
-            })?;
-        }
-        Ok(())
+            &crate::machine_spec::CreateSpec {
+                egress: egress.cloned(),
+                ..Default::default()
+            },
+        )
     }
 
     /// [`Self::create_machine_from_pack`] with options for the machine. The

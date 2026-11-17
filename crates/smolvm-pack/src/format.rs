@@ -880,6 +880,11 @@ pub struct PackManifest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
 
+    /// Block private destinations, except these explicitly allowed CIDRs.
+    /// `Some([])` blocks all private ranges; `None` leaves the policy unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
+
     /// Ordered outbound egress rules carried with the pack (`--deny-cidr` /
     /// `--allow-udp`), deny rules first.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
@@ -1014,6 +1019,7 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            block_private: None,
             allowed_cidrs: None,
             dns_filter_hosts: None,
             egress_rules: Vec::new(),

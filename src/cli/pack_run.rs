@@ -481,39 +481,25 @@ pub(crate) fn effective_pack_allow_list(
     if let Some(network) = policy.network_override {
         if !network {
             return Ok(smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
                 allowed_cidrs: None,
                 dns_filter_hosts: None,
                 egress_rules: Vec::new(),
             });
         }
         return Ok(smolvm::pack_export::ValidatedManifestEgress {
+            block_private: policy.block_private.clone(),
             allowed_cidrs: policy.allowed_cidrs.clone(),
             dns_filter_hosts: policy.dns_filter_hosts.clone(),
             egress_rules: policy.egress_rules.clone(),
         });
     }
-    let (allowed_cidrs, dns_filter_hosts) =
-        if policy.allowed_cidrs.is_some() || policy.dns_filter_hosts.is_some() {
-            (
-                policy.allowed_cidrs.clone(),
-                policy.dns_filter_hosts.clone(),
-            )
-        } else {
-            (
-                manifest_egress.allowed_cidrs,
-                manifest_egress.dns_filter_hosts,
-            )
-        };
-    let egress_rules = if policy.egress_rules.is_empty() {
-        manifest_egress.egress_rules
-    } else {
-        policy.egress_rules.clone()
-    };
-    Ok(smolvm::pack_export::ValidatedManifestEgress {
-        allowed_cidrs,
-        dns_filter_hosts,
-        egress_rules,
-    })
+    Ok(manifest_egress.with_cli_overrides(
+        policy.allowed_cidrs.clone(),
+        policy.dns_filter_hosts.clone(),
+        policy.block_private.clone(),
+        policy.egress_rules.clone(),
+    ))
 }
 
 fn resolve_pack_allow_list_hosts(
@@ -635,6 +621,7 @@ impl PackRunCmd {
         }
         let ssh_agent_socket = resolve_ssh_agent_socket(self.ssh_agent)?;
         let smolvm::pack_export::ValidatedManifestEgress {
+            block_private: effective_block_private,
             allowed_cidrs: mut effective_allowed_cidrs,
             dns_filter_hosts: effective_dns_filter_hosts,
             egress_rules: effective_egress_rules,
@@ -643,6 +630,7 @@ impl PackRunCmd {
             self.egress.as_ref(),
             self.net,
             manifest.network
+                || effective_block_private.is_some()
                 || effective_allowed_cidrs.is_some()
                 || effective_dns_filter_hosts.is_some()
                 || !effective_egress_rules.is_empty(),
@@ -760,10 +748,7 @@ impl PackRunCmd {
             disks: Vec::new(),
             cache_disk: None,
             disk_volumes: disk_volumes.clone(),
-            block_private: self
-                .egress
-                .as_ref()
-                .and_then(|policy| policy.block_private.clone()),
+            block_private: effective_block_private,
             gpu_vram_mib: None,
             rosetta: false,
             allowed_cidrs: effective_allowed_cidrs,
@@ -1989,12 +1974,14 @@ fn run_from_cache(
         .map_err(|e| Error::config("packed run ports", e))?;
     let port_mappings = ports.clone();
     let smolvm::pack_export::ValidatedManifestEgress {
+        block_private: effective_block_private,
         allowed_cidrs: mut effective_allowed_cidrs,
         dns_filter_hosts: effective_dns_filter_hosts,
         egress_rules: effective_egress_rules,
     } = effective_pack_allow_list(None, manifest)?;
     let network_enabled = args.net
         || manifest.network
+        || effective_block_private.is_some()
         || effective_allowed_cidrs.is_some()
         || effective_dns_filter_hosts.is_some()
         || !effective_egress_rules.is_empty()
@@ -2026,7 +2013,7 @@ fn run_from_cache(
         disks: Vec::new(),
         cache_disk: None,
         disk_volumes: disk_volumes.clone(),
-        block_private: None,
+        block_private: effective_block_private,
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: effective_allowed_cidrs,
@@ -2451,12 +2438,14 @@ fn daemon_start(
         .map_err(|e| Error::config("packed start ports", e))?;
     let port_mappings = ports.clone();
     let smolvm::pack_export::ValidatedManifestEgress {
+        block_private: effective_block_private,
         allowed_cidrs: mut effective_allowed_cidrs,
         dns_filter_hosts: effective_dns_filter_hosts,
         egress_rules: effective_egress_rules,
     } = effective_pack_allow_list(None, &manifest)?;
     let network_enabled = args.net
         || manifest.network
+        || effective_block_private.is_some()
         || effective_allowed_cidrs.is_some()
         || effective_dns_filter_hosts.is_some()
         || !effective_egress_rules.is_empty()
@@ -2488,7 +2477,7 @@ fn daemon_start(
         disks: Vec::new(),
         cache_disk: None,
         disk_volumes: disk_volumes.clone(),
-        block_private: None,
+        block_private: effective_block_private,
         gpu_vram_mib: None,
         rosetta: false,
         allowed_cidrs: effective_allowed_cidrs,
@@ -2959,6 +2948,7 @@ mod tests {
         assert_eq!(
             effective_pack_allow_list(None, &manifest).unwrap(),
             smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
                 allowed_cidrs: Some(vec!["1.1.1.1/32".to_string()]),
                 dns_filter_hosts: Some(vec!["pypi.org".to_string()]),
                 egress_rules: manifest.egress_rules.clone(),
@@ -2971,6 +2961,7 @@ mod tests {
         assert_eq!(
             effective_pack_allow_list(Some(&empty), &manifest).unwrap(),
             smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
                 allowed_cidrs: Some(vec!["1.1.1.1/32".to_string()]),
                 dns_filter_hosts: Some(vec!["pypi.org".to_string()]),
                 egress_rules: manifest.egress_rules.clone(),
@@ -2986,6 +2977,7 @@ mod tests {
         assert_eq!(
             effective_pack_allow_list(Some(&override_hosts), &manifest).unwrap(),
             smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
                 allowed_cidrs: None,
                 dns_filter_hosts: Some(vec!["*.example.com".to_string()]),
                 egress_rules: manifest.egress_rules.clone(),
@@ -3002,6 +2994,7 @@ mod tests {
         assert_eq!(
             effective_pack_allow_list(Some(&disabled), &manifest).unwrap(),
             smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
                 allowed_cidrs: None,
                 dns_filter_hosts: None,
                 egress_rules: Vec::new(),

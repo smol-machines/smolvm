@@ -1025,6 +1025,7 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.block_private = pack_config.block_private;
         manifest.allowed_cidrs = pack_config.allowed_cidrs;
         manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
         manifest.egress_rules = pack_config.egress_rules;
@@ -1186,19 +1187,22 @@ impl PackCreateCmd {
         if let Some(net) = pack_config.net {
             manifest.network = net;
             if !net {
+                manifest.block_private = None;
                 manifest.allowed_cidrs = None;
                 manifest.dns_filter_hosts = None;
                 manifest.egress_rules.clear();
             }
         }
-        if pack_config.allowed_cidrs.is_some()
-            || pack_config.dns_filter_hosts.is_some()
-            || !pack_config.egress_rules.is_empty()
-        {
-            manifest.allowed_cidrs = pack_config.allowed_cidrs;
-            manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
-            manifest.egress_rules = pack_config.egress_rules;
-        }
+        let policy = smolvm::pack_export::validated_manifest_egress(&manifest)?.with_cli_overrides(
+            pack_config.allowed_cidrs,
+            pack_config.dns_filter_hosts,
+            pack_config.block_private,
+            pack_config.egress_rules,
+        );
+        manifest.allowed_cidrs = policy.allowed_cidrs;
+        manifest.dns_filter_hosts = policy.dns_filter_hosts;
+        manifest.block_private = policy.block_private;
+        manifest.egress_rules = policy.egress_rules;
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || manifest.gpu;
 

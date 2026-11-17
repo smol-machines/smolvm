@@ -752,6 +752,7 @@ fn cases() -> Vec<Case> {
         remote_volumes,
         disk_volumes,
         net,
+        egress,
         network_backend,
         dns,
         dns_options,
@@ -1013,6 +1014,11 @@ fn cases() -> Vec<Case> {
             .cli(&["--net"])
             .api(|_| json(serde_json::json!({"network": true})))
             .embedded(|e, _| e.spec.resources.network = true),
+        case!(
+            egress,
+            |s, _| s.egress = Some(crate::data::network::EgressPolicy::hosts(["only.test"])),
+            |r| r.dns_filter_hosts.as_deref() == Some(&["=only.test".to_string()])
+        ),
         case!(
             network_backend,
             |s, _| {
@@ -1565,4 +1571,233 @@ fn the_record_carries_every_resolved_setting() {
     assert_eq!(record.name, "m");
     assert_eq!(record.state, crate::config::RecordState::Created);
     assert_eq!(record.labels["a"], "b");
+}
+
+// Explicit policy must be resolved before any caller publishes a machine.
+#[test]
+fn explicit_egress_replaces_inherited_policy_in_the_first_record() {
+    use crate::data::network::EgressPolicy;
+    let mut manifest = pack_manifest();
+    manifest.network = true;
+    manifest.allowed_cidrs = Some(vec!["198.51.100.1/32".into()]);
+    manifest.dns_filter_hosts = Some(vec!["old.test".into()]);
+    manifest.egress_rules = crate::cli::vm_common::deny_cidr_rules(&["10.0.0.0/8".into()]);
+    for policy in [
+        EgressPolicy::default(),
+        EgressPolicy::allow_all(),
+        EgressPolicy::deny_all(),
+        EgressPolicy::hosts(["only.test", "*.sub.test"]),
+    ] {
+        let spec = CreateSpec {
+            egress: Some(policy.clone()),
+            ..Default::default()
+        };
+        // The bundled CLI receives the canonical spec over stdin.
+        let spec = serde_json::from_slice(&serde_json::to_vec(&spec).unwrap()).unwrap();
+        let record = resolve(SpecSource::Pack(&manifest), spec, Caller::Embedded)
+            .unwrap()
+            .to_record("atomic-policy")
+            .unwrap();
+        let mut expected = resolve(
+            SpecSource::Pack(&manifest),
+            CreateSpec::default(),
+            Caller::Embedded,
+        )
+        .unwrap()
+        .to_record("atomic-policy")
+        .unwrap();
+        expected.apply_egress_policy(&policy).unwrap();
+        assert_eq!(record.network, expected.network);
+        assert_eq!(record.allowed_cidrs, expected.allowed_cidrs);
+        assert_eq!(record.dns_filter_hosts, expected.dns_filter_hosts);
+        assert_eq!(record.egress_rules, expected.egress_rules);
+        assert_eq!(record.launch_network_plan(), expected.launch_network_plan());
+    }
+}
+
+#[test]
+fn explicit_egress_is_replaced_as_a_unit_when_specs_are_overlaid() {
+    use crate::data::network::EgressPolicy;
+    let base = CreateSpec {
+        egress: Some(EgressPolicy::hosts(["old.test"])),
+        ..Default::default()
+    };
+    assert_eq!(
+        base.clone().overlay(CreateSpec::default()).egress,
+        base.egress
+    );
+    let top = CreateSpec {
+        egress: Some(EgressPolicy::default()),
+        ..Default::default()
+    };
+    assert_eq!(base.overlay(top).egress, Some(EgressPolicy::default()));
+}
+
+#[test]
+fn explicit_egress_rejects_invalid_hosts_cidrs_and_unenforceable_backends() {
+    use crate::data::network::EgressPolicy;
+    for policy in [
+        EgressPolicy::hosts(["https://bad.test/path"]),
+        EgressPolicy {
+            network: true,
+            cidrs: vec!["invalid".into()],
+            hosts: vec![],
+        },
+    ] {
+        for src in SOURCES {
+            assert!(refusal(
+                CreateSpec {
+                    egress: Some(policy.clone()),
+                    ..Default::default()
+                },
+                src
+            )
+            .contains("egress policy"));
+        }
+    }
+    let error = refusal(
+        CreateSpec {
+            egress: Some(EgressPolicy::hosts(["only.test"])),
+            network_backend: Some(NetworkBackend::Tsi),
+            ..Default::default()
+        },
+        Src::Pack,
+    );
+    assert!(error.contains("TSI"), "{error}");
+}
+
+#[test]
+fn explicit_egress_preserves_checkpoint_topology_even_without_lineage() {
+    use crate::data::network::EgressPolicy;
+    let mut manifest = checkpoint_manifest();
+    let checkpoint = manifest.checkpoint.as_mut().unwrap();
+    checkpoint.lineage = None;
+    checkpoint.network.as_mut().unwrap().ports.clear();
+    for policy in [EgressPolicy::deny_all(), EgressPolicy::hosts(["only.test"])] {
+        let record = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                egress: Some(policy),
+                ..Default::default()
+            },
+            Caller::Embedded,
+        )
+        .unwrap()
+        .to_record("restored")
+        .unwrap();
+        assert_eq!(
+            record.launch_network_plan().backend,
+            crate::network::EffectiveNetworkBackend::VirtioNet
+        );
+    }
+    let error = resolve(
+        SpecSource::from_manifest(&manifest),
+        CreateSpec {
+            egress: Some(EgressPolicy::default()),
+            ..Default::default()
+        },
+        Caller::Embedded,
+    )
+    .unwrap_err()
+    .to_string();
+    assert!(error.contains("checkpoint's network backend"), "{error}");
+}
+
+#[test]
+fn explicit_egress_cannot_silently_reenable_outbound_access() {
+    use crate::data::network::EgressPolicy;
+    for mut spec in [
+        CreateSpec {
+            block_private: Some(vec![]),
+            ..Default::default()
+        },
+        CreateSpec {
+            guest_subnet: Some("192.168.90.0/24".into()),
+            ..Default::default()
+        },
+        CreateSpec {
+            network_name: Some("private".into()),
+            ..Default::default()
+        },
+        CreateSpec {
+            credentials: Some(policy("GH_TOKEN")),
+            ..Default::default()
+        },
+    ] {
+        spec.egress = Some(EgressPolicy::default());
+        let error = refusal(spec, Src::Pack);
+        assert!(error.contains("require outbound networking"), "{error}");
+    }
+}
+
+#[test]
+fn explicit_egress_keeps_credential_reachability_and_host_source_checks() {
+    use crate::data::network::EgressPolicy;
+    let error = refusal(
+        CreateSpec {
+            credentials: Some(policy("GH_TOKEN")),
+            egress: Some(EgressPolicy::hosts(["unrelated.test"])),
+            ..Default::default()
+        },
+        Src::Pack,
+    );
+    assert!(error.contains("api.github.com"), "{error}");
+    let mut credentials = policy("GH_TOKEN");
+    credentials.credentials[0].environment_variable.clear();
+    let error = refusal(
+        CreateSpec {
+            credentials: Some(credentials),
+            egress: Some(EgressPolicy::hosts(["api.github.com"])),
+            ..Default::default()
+        },
+        Src::Pack,
+    );
+    assert!(
+        error.contains("source") || error.contains("environment"),
+        "{error}"
+    );
+}
+
+#[test]
+fn packed_private_network_restrictions_survive_import_and_cli_overrides() {
+    let mut manifest = pack_manifest();
+    manifest.block_private = Some(vec!["192.168.1.0/24".into()]);
+    manifest.allowed_cidrs = Some(vec!["198.51.100.1/32".into()]);
+    manifest.dns_filter_hosts = Some(vec!["old.test".into()]);
+    manifest.egress_rules = crate::cli::vm_common::deny_cidr_rules(&["10.0.0.0/8".into()]);
+    let extra_rules = crate::cli::vm_common::deny_cidr_rules(&["172.16.0.0/12".into()]);
+    let packed = crate::pack_export::validated_manifest_egress(&manifest)
+        .unwrap()
+        .with_cli_overrides(None, None, None, extra_rules.clone());
+    assert_eq!(packed.allowed_cidrs, manifest.allowed_cidrs);
+    assert_eq!(packed.dns_filter_hosts, manifest.dns_filter_hosts);
+    assert_eq!(packed.block_private, manifest.block_private);
+    assert_eq!(packed.egress_rules.len(), 2);
+    assert_eq!(
+        packed.egress_rules[0].cidr.as_deref(),
+        Some("172.16.0.0/12")
+    );
+    let record = resolve(
+        SpecSource::Pack(&manifest),
+        CreateSpec {
+            egress_rules: extra_rules,
+            ..Default::default()
+        },
+        Caller::Cli,
+    )
+    .unwrap()
+    .to_record("scoped")
+    .unwrap();
+    assert!(record.network);
+    assert_eq!(record.block_private, packed.block_private);
+    assert_eq!(record.allowed_cidrs, packed.allowed_cidrs);
+    assert_eq!(record.dns_filter_hosts, packed.dns_filter_hosts);
+    assert_eq!(record.egress_rules, packed.egress_rules);
+    manifest.block_private = Some(vec!["not-a-cidr".into()]);
+    assert!(resolve(
+        SpecSource::Pack(&manifest),
+        CreateSpec::default(),
+        Caller::Cli
+    )
+    .is_err());
 }

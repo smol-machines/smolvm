@@ -441,6 +441,7 @@ pub fn build_create_spec(
             remote_volumes: Vec::new(),
             disk_volumes: Vec::new(),
             net,
+            egress: None,
             network_backend,
             dns: cli_dns,
             dns_options: Vec::new(),
@@ -576,6 +577,8 @@ pub fn build_create_params(
         remote_volumes: _,
         disk_volumes: _,
         net,
+        // Only the canonical create API carries an explicit replacement.
+        egress: _,
         network_backend,
         dns,
         dns_options,
@@ -701,6 +704,8 @@ pub struct PackConfig {
     /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
     /// Smolfile, fall back to source VM's setting".
     pub net: Option<bool>,
+    /// Block private destinations, except the listed CIDRs.
+    pub block_private: Option<Vec<String>>,
     /// Outbound CIDR allow-list from `[network].allow_cidrs`.
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostnames and patterns from `[network].allow_hosts` / `allow_host_patterns`.
@@ -793,6 +798,7 @@ pub fn resolve_pack_config_with_defaults(
                 workdir: None,
                 user: None,
                 net: None,
+                block_private: None,
                 allowed_cidrs: None,
                 dns_filter_hosts: None,
                 egress_rules: Vec::new(),
@@ -838,7 +844,7 @@ pub fn resolve_pack_config_with_defaults(
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
 
-    let (allowed_cidrs, dns_filter_hosts, egress_rules) = match sf.network.as_ref() {
+    let (block_private, allowed_cidrs, dns_filter_hosts, egress_rules) = match sf.network.as_ref() {
         Some(network) => {
             let cidrs = network
                 .allow_cidrs
@@ -868,13 +874,24 @@ pub fn resolve_pack_config_with_defaults(
                 .collect::<Result<Vec<_>, _>>()
                 .map_err(|e| smolvm::Error::config("smolfile [network] allow_udp", e))?;
             rules.extend(allow_udp);
+            let block_private = (network.block_private || !network.allow_private.is_empty())
+                .then(|| {
+                    network
+                        .allow_private
+                        .iter()
+                        .map(|cidr| parse_cidr(cidr))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| smolvm::Error::config("smolfile [network] allow_private", e))
+                })
+                .transpose()?;
             (
+                block_private,
                 (!cidrs.is_empty()).then_some(cidrs),
                 (!hosts.is_empty()).then_some(hosts),
                 rules,
             )
         }
-        None => (None, None, Vec::new()),
+        None => (None, None, None, Vec::new()),
     };
 
     Ok(PackConfig {
@@ -897,6 +914,8 @@ pub fn resolve_pack_config_with_defaults(
                     || !n.allow_cidrs.is_empty()
                     || !n.deny_cidrs.is_empty()
                     || !n.allow_udp.is_empty()
+                    || n.block_private
+                    || !n.allow_private.is_empty()
                     || !n.credentials.is_empty()
             });
             if network_section_implies_net {
@@ -905,6 +924,7 @@ pub fn resolve_pack_config_with_defaults(
                 sf.net // None if key absent, Some(true/false) if explicit
             }
         },
+        block_private,
         allowed_cidrs,
         dns_filter_hosts,
         egress_rules,
@@ -979,6 +999,8 @@ init = ["echo init"]
 allow_cidrs = ["1.1.1.1/32"]
 allow_host_patterns = ["*.example.com"]
 deny_cidrs = ["10.0.0.0/8"]
+block_private = true
+allow_private = ["192.168.1.0/24"]
 "#,
         )
         .unwrap();
@@ -1007,6 +1029,7 @@ deny_cidrs = ["10.0.0.0/8"]
         assert_eq!(pack_config.allowed_cidrs, params.allowed_cidrs);
         assert_eq!(pack_config.dns_filter_hosts, params.dns_filter_hosts);
         assert_eq!(pack_config.egress_rules, params.egress_rules);
+        assert_eq!(pack_config.block_private, params.block_private);
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -1085,6 +1108,7 @@ deny_cidrs = ["10.0.0.0/8"]
         assert_eq!(
             effective_pack_allow_list(None, &manifest).unwrap(),
             smolvm::pack_export::ValidatedManifestEgress {
+                block_private: params.block_private.clone(),
                 allowed_cidrs: params.allowed_cidrs.clone(),
                 dns_filter_hosts: params.dns_filter_hosts.clone(),
                 egress_rules: params.egress_rules.clone(),
