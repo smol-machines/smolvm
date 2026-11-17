@@ -1404,14 +1404,15 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
 /// Synchronize a foreground run's staged mounts back to the host once its
 /// command has ended. A session that ended because the reader of our output
 /// went away (`run -i ... | head`) closed its connection so the agent would
-/// kill the command; that case synchronizes over a new one, as after any
-/// other exit.
+/// kill the command and waited for its exit acknowledgement; only then may
+/// that case synchronize over a new connection.
 fn sync_staged_mounts_after_run(
     mounts: &[HostMount],
     client: &mut AgentClient,
     manager: &AgentManager,
 ) -> smolvm::Result<()> {
     if client.session_reader_gone() {
+        client.ensure_session_finished()?;
         *client = AgentClient::connect_with_retry(manager.vsock_socket())?;
     }
     smolvm::staged_mount::sync_mounts(mounts, client)

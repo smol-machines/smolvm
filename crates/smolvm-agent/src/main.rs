@@ -6461,6 +6461,14 @@ impl InteractiveFrame {
     }
 }
 
+// A half-close cancels interactive execution while leaving the response
+// channel open for Exited. Linux requires POLLRDHUP to observe it while
+// backpressure temporarily disables POLLIN.
+#[cfg(target_os = "linux")]
+const INTERACTIVE_READ_HANGUP: libc::c_short = libc::POLLRDHUP;
+#[cfg(not(target_os = "linux"))]
+const INTERACTIVE_READ_HANGUP: libc::c_short = 0;
+
 fn run_interactive_loop(
     stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
@@ -6590,11 +6598,12 @@ fn run_interactive_loop_io(
                 fd: stream_fd,
                 // Finish writing a pending frame before reading another one.
                 // This keeps guest memory bounded to a single stdin frame.
-                events: if pending_stdin.is_empty() {
-                    libc::POLLIN
-                } else {
-                    0
-                },
+                events: INTERACTIVE_READ_HANGUP
+                    | if pending_stdin.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -6628,10 +6637,11 @@ fn run_interactive_loop_io(
         // stdin frame waits for the child pipe. Without this check a client
         // disconnect can leave a child that never reads stdin running until
         // its timeout (or forever if there is no timeout).
-        if !pending_stdin.is_empty()
-            && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if poll_fds[2].revents & INTERACTIVE_READ_HANGUP != 0
+            || (!pending_stdin.is_empty()
+                && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
-            debug!("host disconnected with pending stdin");
+            debug!("host disconnected during interactive execution");
             return Ok(kill_child_on_disconnect(child));
         }
 
@@ -6885,11 +6895,12 @@ fn run_interactive_loop_pty(
                 fd: stream_fd,
                 // Finish writing a pending frame before reading another one.
                 // This keeps guest memory bounded to a single stdin frame.
-                events: if pending_stdin.is_empty() {
-                    libc::POLLIN
-                } else {
-                    0
-                },
+                events: INTERACTIVE_READ_HANGUP
+                    | if pending_stdin.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -6912,10 +6923,11 @@ fn run_interactive_loop_pty(
         // POLLHUP/POLLERR are reported even when POLLIN is disabled while a
         // stdin frame waits for the PTY buffer. Without this check a client
         // disconnect can leave a child running until its timeout.
-        if !pending_stdin.is_empty()
-            && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if poll_fds[1].revents & INTERACTIVE_READ_HANGUP != 0
+            || (!pending_stdin.is_empty()
+                && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
-            debug!("host disconnected with pending PTY stdin");
+            debug!("host disconnected during interactive execution");
             return Ok(kill_child_on_disconnect(child));
         }
 
@@ -10500,6 +10512,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn streamed_exec_reaps_child_on_disconnect_with_pending_stdin() {
+        check_disconnect_with_pending_stdin(false);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_exec_reaps_child_on_half_close_with_pending_stdin() {
+        check_disconnect_with_pending_stdin(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_disconnect_with_pending_stdin(half_close: bool) {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -10540,7 +10563,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        drop(client);
+        if half_close {
+            // Keep the response channel open so the host can confirm exit.
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+        } else {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
 
         let (code, elapsed) = guest.join().unwrap();
         assert_eq!(code, 124);

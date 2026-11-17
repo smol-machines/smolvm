@@ -1127,6 +1127,9 @@ pub struct AgentClient {
     /// Set when an interactive session ended because the reader of our output
     /// went away, which closes this connection; see [`Self::session_reader_gone`].
     reader_gone: bool,
+    /// Why command termination could not be confirmed after an output pipe closed.
+    /// Staged files must remain in the VM until a caller can recover them.
+    session_end_error: Option<String>,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1326,6 +1329,7 @@ impl AgentClient {
             binary_stream: Arc::new(AtomicBool::new(false)),
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
+            session_end_error: None,
         }
     }
 }
@@ -1454,6 +1458,7 @@ impl AgentClient {
             binary_stream: Arc::new(AtomicBool::new(false)),
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
+            session_end_error: None,
         })
     }
 
@@ -2412,16 +2417,24 @@ impl AgentClient {
     }
 
     fn shutdown_response_until(&mut self, deadline: Instant) -> Result<AgentResponse> {
+        self.response_until_deadline(deadline, "shutdown ack")
+    }
+
+    fn response_until_deadline(&mut self, deadline: Instant, op: &str) -> Result<AgentResponse> {
         let mut header = [0; 4];
         self.shutdown_read_until(&mut header, deadline)?;
         let len = u32::from_be_bytes(header) as usize;
         if len > MAX_FRAME_SIZE as usize {
-            return Err(Error::agent("shutdown ack", "response frame too large"));
+            return Err(Error::agent(op, "response frame too large"));
         }
         let mut body = vec![0; len];
         self.shutdown_read_until(&mut body, deadline)?;
-        serde_json::from_slice(&body)
-            .map_err(|error| Error::agent("shutdown ack", error.to_string()))
+        let (response, binary) = smolvm_protocol::binary_stream::decode_response(&body)
+            .map_err(|error| Error::agent(op, error.to_string()))?;
+        if binary {
+            self.binary_stream.store(true, Ordering::Release);
+        }
+        Ok(response)
     }
 
     // ========================================================================
@@ -2507,23 +2520,58 @@ impl AgentClient {
         }
     }
 
-    /// End an interactive session whose output reader has gone: close the
-    /// connection so the agent kills the command now instead of streaming its
-    /// output into a closed pipe, and report exit code 141, as `exec --stream`
-    /// does. The client is unusable afterwards: any further request fails, and
-    /// [`Self::session_reader_gone`] says so.
+    /// Stop the command after losing its output reader and wait for the agent
+    /// to acknowledge its exit before a caller synchronizes staged files.
     fn end_session_reader_gone(&mut self) -> i32 {
-        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        self.end_session_reader_gone_with_timeout(Duration::from_secs(5))
+    }
+
+    fn end_session_reader_gone_with_timeout(&mut self, timeout: Duration) -> i32 {
         self.reader_gone = true;
+        let result = (|| -> Result<()> {
+            // EOF on the request half tells the agent to kill and reap the
+            // command. Keep the response half open for its Exited acknowledgement.
+            self.stream.shutdown(std::net::Shutdown::Write)?;
+            self.stream.as_socket().set_nonblocking(true)?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                match self.response_until_deadline(deadline, "interactive exit")? {
+                    AgentResponse::Exited { .. } => return Ok(()),
+                    AgentResponse::Stdout { .. } | AgentResponse::Stderr { .. } => {}
+                    AgentResponse::Error { message, .. } => {
+                        return Err(Error::agent("interactive exit", message))
+                    }
+                    _ => {
+                        return Err(Error::agent(
+                            "interactive exit",
+                            "expected command exit acknowledgement",
+                        ))
+                    }
+                }
+            }
+        })();
+        self.session_end_error = result.err().map(|error| error.to_string());
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
         141
     }
 
-    /// Whether an interactive session on this client ended because the reader
-    /// of our output went away. The connection is closed then, so a caller
-    /// with more to ask of the agent (synchronizing staged mounts after
-    /// `machine run -i`) must connect again.
+    /// Whether an interactive session ended because its output reader went
+    /// away. This connection is closed; call [`Self::ensure_session_finished`]
+    /// before reconnecting to synchronize a staged filesystem.
     pub fn session_reader_gone(&self) -> bool {
         self.reader_gone
+    }
+
+    /// Refuse synchronization when an interrupted command's exit could not be
+    /// confirmed. A timeout or transport error is not evidence that it stopped.
+    pub fn ensure_session_finished(&self) -> Result<()> {
+        if let Some(error) = self.session_end_error.as_ref() {
+            return Err(Error::agent(
+                "interactive exit",
+                format!("guest command termination was not confirmed: {error}"),
+            ));
+        }
+        Ok(())
     }
 
     /// Run an interactive I/O session.
@@ -3816,6 +3864,7 @@ impl AgentClient {
             capabilities: self.capabilities.clone(),
             streaming_output_cap: self.streaming_output_cap,
             reader_gone: self.reader_gone,
+            session_end_error: self.session_end_error.clone(),
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -4284,24 +4333,101 @@ mod relay_output_tests {
     }
 
     #[test]
-    fn ending_a_session_whose_reader_has_gone_disconnects_the_agent() {
+    fn interrupted_session_waits_for_guest_exit_before_returning() {
+        use super::{AgentClient, AgentResponse};
+        use crate::platform::uds::UdsStream;
+        use std::io::Read;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (host, mut guest) = UdsStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (eof_tx, eof_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let agent = std::thread::spawn(move || -> io::Result<()> {
+            assert_eq!(guest.read(&mut [0; 1])?, 0);
+            eof_tx.send(()).unwrap();
+            exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Output may already be queued in either negotiated binary or JSON.
+            smolvm_protocol::binary_stream::write_response(
+                &mut guest,
+                &AgentResponse::Stdout {
+                    data: b"pending output".to_vec(),
+                },
+            )?;
+            guest.write_all(
+                &smolvm_protocol::encode_message(&AgentResponse::Exited {
+                    exit_code: 124,
+                    oom: false,
+                })
+                .unwrap(),
+            )
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let mut client = AgentClient::from_stream(host);
+            let result = client.end_session_reader_gone();
+            client.ensure_session_finished().unwrap();
+            done_tx.send(result).unwrap();
+        });
+        eof_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(50));
+        exit_tx.send(()).unwrap();
+        let result = match premature {
+            Ok(code) => code,
+            Err(_) => done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        };
+        client.join().unwrap();
+        let agent_result = agent.join().unwrap();
+        assert!(
+            premature.is_err(),
+            "returned before the agent confirmed command termination"
+        );
+        agent_result.unwrap();
+        assert_eq!(result, 141);
+    }
+
+    #[test]
+    fn missing_exit_acknowledgement_refuses_staged_synchronization() {
         use super::AgentClient;
         use crate::platform::uds::UdsStream;
         use std::io::Read;
-
-        let (client_stream, mut agent_stream) = UdsStream::pair().unwrap();
-        agent_stream
-            .set_read_timeout(Some(std::time::Duration::from_secs(5)))
-            .unwrap();
-        let mut client = AgentClient::from_stream(client_stream);
+        let (host, mut guest) = UdsStream::pair().unwrap();
+        let agent = std::thread::spawn(move || {
+            assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0);
+            // A lost connection is not an acknowledgement that the command died.
+        });
+        let mut client = AgentClient::from_stream(host);
         assert!(!client.session_reader_gone());
         assert_eq!(client.end_session_reader_gone(), 141);
         assert!(client.session_reader_gone());
-        // The agent sees end of stream at once, so it kills the command,
-        // while the client is still alive.
-        let mut buf = [0; 1];
-        assert_eq!(agent_stream.read(&mut buf).unwrap(), 0);
-        drop(client);
+        assert!(client.ensure_session_finished().is_err());
+        agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_partial_exit_frame_cannot_extend_the_command_termination_deadline() {
+        use super::AgentClient;
+        use crate::platform::uds::UdsStream;
+        use std::io::Read;
+        use std::time::Duration;
+        let (host, mut guest) = UdsStream::pair().unwrap();
+        let agent = std::thread::spawn(move || {
+            assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0);
+            guest.write_all(&100u32.to_be_bytes()).unwrap();
+            guest.write_all(b"{").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = AgentClient::from_stream(host);
+        assert_eq!(
+            client.end_session_reader_gone_with_timeout(Duration::from_millis(20)),
+            141
+        );
+        let error = client.ensure_session_finished().unwrap_err().to_string();
+        assert!(error.contains("deadline"), "{error}");
+        agent.join().unwrap();
     }
 }
 
