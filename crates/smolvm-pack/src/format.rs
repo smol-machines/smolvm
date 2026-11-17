@@ -56,17 +56,14 @@ pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
 /// Magic bytes for libs footer appended to the stub binary.
 pub const LIBS_MAGIC: &[u8; 8] = b"SMOLLIBS";
 
-/// Current format version — the version stamped into newly written packs.
-pub const FORMAT_VERSION: u32 = 1;
+/// Current format version, stamped into newly written packs. Version 4
+/// requires readers to enforce the manifest's outbound network policy;
+/// older engines must reject these packs rather than ignore restrictions.
+pub const FORMAT_VERSION: u32 = 4;
 
-/// Format versions this build can READ. New packs are always WRITTEN at
-/// `FORMAT_VERSION`, but older `.smolmachine` artifacts stay readable: the
-/// on-disk layout (footer, manifest, assets blob) is identical across these
-/// versions — only the version number ever differed. It was reset 3→1 in a
-/// format refactor, which orphaned pre-reset packs behind a strict
-/// `version == FORMAT_VERSION` check. Accepting the older numbers keeps those
-/// artifacts runnable instead of failing with "unsupported version: 3".
-pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3];
+/// Existing versions retain the same byte layout and remain readable.
+/// Version 4 adds required network-policy semantics to the manifest.
+pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3, 4];
 
 /// Whether a pack stamped with `version` can be read by this build.
 pub fn is_supported_read_version(version: u32) -> bool {
@@ -1167,11 +1164,31 @@ mod tests {
     }
 
     #[test]
-    fn test_footer_reads_legacy_v2_v3() {
+    fn new_packs_require_a_policy_aware_reader() {
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 10,
+            manifest_offset: 10,
+            manifest_size: 20,
+            checksum: 0,
+        };
+        let bytes = footer.to_bytes();
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(version, 4);
+        assert!(
+            ![1, 2, 3].contains(&version),
+            "legacy readers must refuse new packs"
+        );
+        assert!(PackFooter::from_bytes(&bytes).is_ok());
+    }
+
+    #[test]
+    fn test_footer_reads_legacy_v1_v2_v3() {
         // Packs written before FORMAT_VERSION was reset 3->1 stamp version 2 or 3
         // but share the identical byte layout, so they must still read. Regression
         // for "read footer: unsupported version: 3" on pre-reset .smolmachine files.
-        for legacy in [2u32, 3u32] {
+        for legacy in [1u32, 2u32, 3u32] {
             let footer = PackFooter {
                 stub_size: 0,
                 assets_offset: 0,
