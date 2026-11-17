@@ -324,10 +324,10 @@ impl KrunFunctions {
     /// checks the actual guest kernel before executing it.
     pub fn ensure_host_network(&self) -> Result<(), String> {
         let abi = self.get_host_network_abi.map(|get| unsafe { get() });
-        if abi == Some(5) {
+        if abi == Some(6) {
             Ok(())
         } else {
-            Err("host networking requires a runtime and guest kernel with host-network ABI 5; update the bundled runtime".into())
+            Err("host networking requires a runtime and guest kernel with host-network ABI 6; update the bundled runtime".into())
         }
     }
 
