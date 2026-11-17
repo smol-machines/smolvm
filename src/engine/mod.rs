@@ -34,7 +34,7 @@ mod containers;
 mod events;
 mod exec;
 mod filters;
-mod image_ops;
+pub(crate) mod image_ops;
 mod images;
 mod logs;
 mod model;

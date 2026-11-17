@@ -438,6 +438,9 @@ pub enum MachineCmd {
     /// Remove unused images and layers to free disk space
     Prune(PruneCmd),
 
+    /// Export a stopped machine's filesystem as an OCI or docker save image archive
+    Export(ExportCmd),
+
     /// Open an interactive shell in a running machine
     #[command(visible_alias = "sh")]
     Shell(ShellCmd),
@@ -507,6 +510,7 @@ impl MachineCmd {
             MachineCmd::Update(cmd) => cmd.run(),
             MachineCmd::Images(cmd) => cmd.run(),
             MachineCmd::Prune(cmd) => cmd.run(),
+            MachineCmd::Export(cmd) => cmd.run(),
             MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
             MachineCmd::Sync(cmd) => cmd.run(),
@@ -2714,6 +2718,50 @@ mod tests {
         };
         assert!(status.name.is_none());
         assert!(parse(&["machine", "delete", "-f"]).is_err());
+    }
+
+    #[test]
+    fn machine_export_parses_formats_workspace_and_rebase_flags() {
+        use clap::Parser;
+        #[derive(Parser)]
+        struct Root {
+            #[command(subcommand)]
+            cmd: super::MachineCmd,
+        }
+        let parse = |args: &[&str]| Root::try_parse_from(args).map(|r| r.cmd);
+
+        let Ok(super::MachineCmd::Export(export)) =
+            parse(&["machine", "export", "--name", "dev", "-o", "dev.tar"])
+        else {
+            panic!("default machine export must parse");
+        };
+        assert_eq!(export.name, "dev");
+        assert_eq!(export.output, std::path::PathBuf::from("dev.tar"));
+        assert_eq!(export.format, smolvm::pack_export::ExportArchiveFormat::Oci);
+        assert!(!export.include_workspace);
+        assert!(!export.rebase);
+
+        let Ok(super::MachineCmd::Export(export_docker)) = parse(&[
+            "machine",
+            "export",
+            "-n",
+            "dev",
+            "--output",
+            "dev-docker.tar",
+            "--format",
+            "docker",
+            "--include-workspace",
+            "--rebase",
+        ]) else {
+            panic!("docker machine export with flags must parse");
+        };
+        assert_eq!(export_docker.name, "dev");
+        assert_eq!(
+            export_docker.format,
+            smolvm::pack_export::ExportArchiveFormat::Docker
+        );
+        assert!(export_docker.include_workspace);
+        assert!(export_docker.rebase);
     }
 
     #[test]
@@ -8726,6 +8774,91 @@ impl MountLsCmd {
                 if m.read_only { " (ro)" } else { "" }
             );
         }
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Export Command
+// ============================================================================
+
+/// Export a stopped machine's filesystem as a standard OCI or `docker save`
+/// image archive, without any of the machine's `VmRecord` env, secret refs,
+/// entrypoint, cmd, user, workdir, mounts, or network configuration.
+#[derive(Args, Debug)]
+pub struct ExportCmd {
+    /// Stopped machine to export
+    #[arg(
+        short = 'n',
+        long,
+        required = true,
+        value_name = "NAME",
+        env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME
+    )]
+    pub name: String,
+
+    /// Output tar archive path
+    #[arg(short = 'o', long, required = true, value_name = "PATH")]
+    pub output: PathBuf,
+
+    /// Archive layout: `oci` (OCI image layout tar) or `docker` (`docker save` tar)
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = smolvm::pack_export::ExportArchiveFormat::Oci,
+        value_name = "FORMAT"
+    )]
+    pub format: smolvm::pack_export::ExportArchiveFormat,
+
+    /// Also include the machine's `/workspace` directory in the exported rootfs
+    #[arg(long = "include-workspace")]
+    pub include_workspace: bool,
+
+    /// Re-pull the base image from the registry instead of reusing cached layers
+    #[arg(long, visible_alias = "rebase-from-image")]
+    pub rebase: bool,
+
+    /// Custom DNS resolver for the export helper VM when `--rebase` pulls from a registry
+    #[arg(long, value_name = "IP", help_heading = "Network")]
+    pub dns: Option<std::net::Ipv4Addr>,
+
+    #[command(flatten, next_help_heading = "Network")]
+    pub proxy_opts: crate::cli::proxy_opts::ProxyOpts,
+}
+
+impl ExportCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let config = smolvm::config::SmolvmConfig::load()?;
+        let vm = config
+            .vms
+            .get(&self.name)
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
+
+        let opts = smolvm::pack_export::FromVmExportOptions {
+            proxy: if self.rebase {
+                self.proxy_opts.resolved_proxy()?
+            } else {
+                None
+            },
+            no_proxy: self.proxy_opts.no_proxy(),
+            rebase_from_image: self.rebase,
+            include_workspace: self.include_workspace,
+            dns: smolvm::pack_export::export_dns(self.dns, vm),
+        };
+
+        let bytes = smolvm::pack_export::export_machine_to_archive(
+            &self.name,
+            vm,
+            &self.output,
+            self.format,
+            &opts,
+        )?;
+        println!(
+            "Exported machine '{}' to {} ({})",
+            self.name,
+            self.output.display(),
+            format_bytes(bytes),
+        );
         Ok(())
     }
 }
