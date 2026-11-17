@@ -404,6 +404,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
             echo "Bundled GPU library: $gpu_lib ($(du -h "$DIST_DIR/lib/$gpu_lib" | cut -f1))"
         fi
     done
+    python3 "$SCRIPT_DIR/check-macos-deployment-target.py" "$DIST_DIR"/lib/*.dylib
 
     # libkrun.dylib links GPU libraries at either their Homebrew build paths or
     # @rpath when it was built against the already-relocated bundled library.
