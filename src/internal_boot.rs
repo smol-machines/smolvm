@@ -128,6 +128,42 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     #[cfg(unix)]
     let _ = AGENT_SOCKET.set(config.vsock_socket.clone());
 
+    // --- Execution timeout / TTL watchdog ----------------------------------
+    // When a timeout / TTL is configured (via CLI --timeout/--ttl or Smolfile ttl),
+    // automatically terminate the VM cleanly after the duration elapses.
+    if let Some(timeout) = config.timeout {
+        let vsock_socket = config.vsock_socket.clone();
+        std::thread::Builder::new()
+            .name("vm-ttl-watchdog".to_string())
+            .spawn(move || {
+                std::thread::sleep(timeout);
+                tracing::info!(
+                    timeout_secs = timeout.as_secs(),
+                    "execution timeout / TTL reached; shutting down VM cleanly"
+                );
+                if let Some(dir) = vsock_socket.parent() {
+                    let exited_at_unix_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as u64)
+                        .unwrap_or(0);
+                    let exit = crate::vm_exit::VmmExit {
+                        pid: std::process::id() as i32,
+                        exited_at_unix_ms,
+                        cause: crate::vm_exit::Cause::Exited,
+                        exit_code: Some(124),
+                        signal: None,
+                        signal_name: None,
+                        core_dumped: false,
+                        cgroup_oom_kills: None,
+                    };
+                    crate::vm_exit::record(dir, &exit);
+                }
+                flush_guest_before_exit(&vsock_socket);
+                crate::process::exit_child(124);
+            })
+            .expect("spawn vm-ttl-watchdog");
+    }
+
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
     // The GPU-debug stdio redirection uses POSIX fd dup2 and is part of the
@@ -1022,6 +1058,9 @@ fn flush_guest_before_exit(socket: &std::path::Path) {
         tracing::warn!(%error, "owner exited; could not shut the guest down cleanly before exiting");
     }
 }
+
+#[cfg(not(unix))]
+fn flush_guest_before_exit(_socket: &std::path::Path) {}
 
 #[cfg(all(test, unix))]
 mod parent_death_tests {

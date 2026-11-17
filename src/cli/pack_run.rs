@@ -290,6 +290,7 @@ pub struct PackRunCmd {
     /// Kill command after duration (e.g., "30s", "5m")
     #[arg(
         long,
+        visible_alias = "ttl",
         value_parser = crate::cli::parsers::parse_duration,
         value_name = "DURATION",
         help_heading = "Execution"
@@ -852,6 +853,7 @@ impl PackRunCmd {
                 external_interceptor: None,
                 mediated_egress: false,
                 mediated_parent_id: [0; 16],
+                timeout: self.timeout,
             };
 
             spawn_packed_boot_vm(
@@ -1619,6 +1621,10 @@ struct PackedStartArgs {
     /// `machine create --dns-option`.
     #[arg(long = "dns-option", value_name = "OPTION", value_parser = crate::cli::machine::parse_dns_option)]
     dns_option: Vec<String>,
+
+    /// Maximum execution time before the machine is automatically stopped (e.g. "30s", "5m", "1h")
+    #[arg(long, visible_alias = "ttl", value_parser = crate::cli::parsers::parse_duration, value_name = "DURATION")]
+    timeout: Option<Duration>,
 }
 
 /// Arguments for the `exec` subcommand (run in existing VM).
@@ -2054,6 +2060,7 @@ fn run_from_cache(
             external_interceptor: None,
             mediated_egress: false,
             mediated_parent_id: [0; 16],
+            timeout: args.timeout,
         };
         spawn_packed_boot_vm(
             &boot_config,
@@ -2462,6 +2469,7 @@ fn daemon_start(
             external_interceptor: None,
             mediated_egress: false,
             mediated_parent_id: [0; 16],
+            timeout: args.timeout,
         };
         spawn_packed_boot_vm(
             &boot_config,

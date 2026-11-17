@@ -44,6 +44,7 @@ user = "app"                          # who the workload runs as: a passwd name 
 stop_on_exit = true                   # stop the machine when the workload exits (default: false)
 stop_signal = "SIGINT"                # sent to the workload when the machine stops (default: SIGTERM)
 stop_timeout = 30                     # seconds it gets to exit before it is killed (default: 10, max: 300)
+ttl = "30m"                           # maximum execution duration before auto-stop (default: none)
 
 # Resources
 cpus = 2                              # vCPUs (default: 4)
@@ -77,6 +78,7 @@ init = ["npm install"]                # replaces the top-level list when set
 env = ["APP_MODE=dev"]                # extends the top-level env
 workdir = "/app"                      # overrides the top-level workdir
 user = "app"                          # overrides the top-level user
+ttl = "15m"                           # overrides the top-level ttl
 
 # Artifact profile (used by `pack create`; `[pack]` is the same table)
 [artifact]

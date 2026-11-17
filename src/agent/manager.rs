@@ -3723,6 +3723,7 @@ impl AgentManager {
                     .parent()
                     .map(crate::workload_log::workload_log_path)
             }),
+            timeout: features.timeout,
         };
         // The operator's egress watchlist, copied beside the vsock socket where
         // the network runtime looks for it (or a stale copy removed when none).

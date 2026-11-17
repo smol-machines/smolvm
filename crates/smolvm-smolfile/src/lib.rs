@@ -372,6 +372,9 @@ pub struct Smolfile {
     /// Seconds the workload gets to exit after its stop signal before it is
     /// killed (10 when unset).
     pub stop_timeout: Option<u64>,
+    /// Maximum execution time before automatic shutdown (e.g. "30s", "5m", "1h").
+    #[serde(default, alias = "timeout")]
+    pub ttl: Option<String>,
     /// Credential forwarding.
     pub auth: Option<AuthConfig>,
     /// Service metadata for deployment.
@@ -472,6 +475,9 @@ pub struct DevConfig {
     /// Port mappings for development (e.g., `["8080:8080"]`).
     #[serde(default)]
     pub ports: Vec<String>,
+    /// Maximum execution time before automatic shutdown for dev profile (e.g. "30s", "5m", "1h").
+    #[serde(default, alias = "timeout")]
+    pub ttl: Option<String>,
 }
 
 /// Health check configuration.
@@ -635,11 +641,13 @@ entrypoint = ["/bin/sh"]
 cmd = ["-c", "echo hello"]
 env = ["FOO=bar"]
 workdir = "/app"
+ttl = "30m"
 
 [dev]
 volumes = ["./src:/app"]
 init = ["echo hello"]
 ports = ["8080:8080"]
+ttl = "10m"
 
 [artifact]
 cpus = 4
@@ -683,10 +691,12 @@ protocol = "http"
         assert_eq!(sf.cmd, vec!["-c", "echo hello"]);
         assert_eq!(sf.env, vec!["FOO=bar"]);
         assert_eq!(sf.workdir.as_deref(), Some("/app"));
+        assert_eq!(sf.ttl.as_deref(), Some("30m"));
 
         let dev = sf.dev.unwrap();
         assert_eq!(dev.volumes, vec!["./src:/app"]);
         assert_eq!(dev.init, vec!["echo hello"]);
+        assert_eq!(dev.ttl.as_deref(), Some("10m"));
 
         let artifact = sf.artifact.unwrap();
         assert_eq!(artifact.cpus, Some(4));

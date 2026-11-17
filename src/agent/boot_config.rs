@@ -114,4 +114,8 @@ pub struct BootConfig {
     /// machine runs.
     #[serde(default)]
     pub workload_log: Option<PathBuf>,
+    /// Optional execution timeout / TTL. When reached, the VM is automatically shut down
+    /// cleanly and exits with code 124.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timeout: Option<std::time::Duration>,
 }

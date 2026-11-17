@@ -102,6 +102,8 @@ pub struct CreateSpec {
     pub stop_signal: Option<String>,
     /// Seconds the workload gets to exit after its stop signal.
     pub stop_timeout_secs: Option<u64>,
+    /// Maximum execution time before automatic shutdown (`--ttl`).
+    pub ttl_secs: Option<u64>,
     /// `/dev/shm` size of the workload (`512m`, `25%`).
     pub shm_size: Option<String>,
 
@@ -257,6 +259,7 @@ impl CreateSpec {
             stop_on_exit,
             stop_signal,
             stop_timeout_secs,
+            ttl_secs,
             shm_size,
             cpus,
             mem,
@@ -326,6 +329,7 @@ impl CreateSpec {
             stop_on_exit: stop_on_exit || self.stop_on_exit,
             stop_signal: stop_signal.or(self.stop_signal),
             stop_timeout_secs: stop_timeout_secs.or(self.stop_timeout_secs),
+            ttl_secs: ttl_secs.or(self.ttl_secs),
             shm_size: shm_size.or(self.shm_size),
             cpus: cpus.or(self.cpus),
             mem: mem.or(self.mem),
@@ -495,6 +499,8 @@ pub struct ResolvedSpec {
     pub stop_signal: Option<String>,
     /// Stop timeout.
     pub stop_timeout_secs: Option<u64>,
+    /// Maximum execution time before automatic shutdown (`--ttl`).
+    pub ttl_secs: Option<u64>,
     /// `/dev/shm` size.
     pub shm_size: Option<String>,
     /// vCPUs.
@@ -841,6 +847,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         stop_on_exit,
         stop_signal,
         stop_timeout_secs,
+        ttl_secs,
         shm_size,
         cpus,
         mem,
@@ -1048,6 +1055,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 stop_on_exit,
                 stop_signal,
                 stop_timeout_secs,
+                ttl_secs,
                 shm_size,
                 cpus: cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
                 mem: mem.unwrap_or_else(default_microvm_memory_mib),
@@ -1131,6 +1139,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 stop_on_exit,
                 stop_signal,
                 stop_timeout_secs,
+                ttl_secs,
                 shm_size,
                 cpus: cpus.unwrap_or(pack.cpus),
                 mem: mem.unwrap_or(pack.mem),
@@ -1437,6 +1446,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 stop_on_exit: stop_on_exit || captured_settings.stop_on_exit,
                 stop_signal: stop_signal.or_else(|| captured_settings.stop_signal.clone()),
                 stop_timeout_secs: stop_timeout_secs.or(captured_settings.stop_timeout_secs),
+                ttl_secs,
                 shm_size: same(
                     "the /dev/shm size",
                     WORKLOAD,
@@ -1642,6 +1652,7 @@ impl ResolvedSpec {
             stop_on_exit,
             stop_signal,
             stop_timeout_secs,
+            ttl_secs,
             shm_size,
             cpus,
             mem,
@@ -1773,6 +1784,7 @@ impl ResolvedSpec {
             stop_on_exit,
             stop_signal,
             stop_timeout_secs,
+            ttl_secs,
             cuda_fork_pool_size,
             cuda_vram_limit_mib,
             cuda_preload_modules: false,

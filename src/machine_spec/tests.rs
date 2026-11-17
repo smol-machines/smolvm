@@ -663,6 +663,7 @@ fn cases() -> Vec<Case> {
         stop_on_exit,
         stop_signal,
         stop_timeout_secs,
+        ttl_secs,
         shm_size,
         cpus,
         mem,
@@ -822,6 +823,13 @@ fn cases() -> Vec<Case> {
         )
         .cli(&["--stop-timeout", "45"])
         .api(|_| json(serde_json::json!({"stopTimeoutSecs": 45}))),
+        case!(
+            ttl_secs,
+            |s, _| s.ttl_secs = Some(300),
+            |r| r.ttl_secs == Some(300)
+        )
+        .cli(&["--ttl", "5m"])
+        .api(|_| json(serde_json::json!({"ttlSecs": 300}))),
         case!(shm_size, |s, _| s.shm_size = Some("1g".into()), |r| r.shm_size.as_deref()
             == Some("1g"))
         .cli(&["--shm-size", "1g"])
