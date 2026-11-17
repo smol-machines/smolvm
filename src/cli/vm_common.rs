@@ -885,6 +885,7 @@ impl CreateVmParams {
             remote_volumes,
             disk_volumes,
             net,
+            egress: None,
             network_backend,
             dns,
             dns_options,
