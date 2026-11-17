@@ -23,6 +23,11 @@ pub enum FilesAction {
         source: PathBuf,
         destination: String,
     },
+    /// Upload a folder into exactly the destination, merging existing directories
+    UploadFolder {
+        source: PathBuf,
+        destination: String,
+    },
     /// Download one file, replacing the local destination atomically
     Download {
         source: String,
@@ -49,7 +54,8 @@ impl FilesCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let guest = match &self.command {
             FilesAction::List { path, .. } => path,
-            FilesAction::Upload { destination, .. } => destination,
+            FilesAction::Upload { destination, .. }
+            | FilesAction::UploadFolder { destination, .. } => destination,
             FilesAction::Download { source, .. } | FilesAction::Archive { source, .. } => source,
         };
         validate_path(guest)?;
@@ -63,6 +69,15 @@ impl FilesCmd {
         client.use_target(smolvm::workload::machine_target(&record))?;
         let archive = matches!(self.command, FilesAction::Archive { .. });
         match self.command {
+            FilesAction::UploadFolder {
+                source,
+                destination,
+            } => {
+                let mut progress = super::ProgressBar::new("Uploading folder", None);
+                let size =
+                    client.upload_directory(&source, &destination, |sent| progress.update(sent))?;
+                progress.finish(size);
+            }
             FilesAction::List { path, json } => {
                 let entries = client.list_directory(&path)?;
                 if json {
@@ -198,6 +213,25 @@ mod tests {
         };
         assert_eq!(source, "/workspace/a:b");
         assert_eq!(destination, PathBuf::from(r"C:\project files\folder.tar"));
+
+        let parsed = Cli::try_parse_from([
+            "files",
+            "--name",
+            "dev",
+            "upload-folder",
+            r"C:\project files\folder",
+            "/workspace/a:b",
+        ])
+        .unwrap();
+        let FilesAction::UploadFolder {
+            source,
+            destination,
+        } = parsed.files.command
+        else {
+            panic!("upload-folder");
+        };
+        assert_eq!(source, PathBuf::from(r"C:\project files\folder"));
+        assert_eq!(destination, "/workspace/a:b");
 
         assert!(validate_path("relative").is_err());
         assert!(validate_path("/workspace/with space ; $(true)").is_ok());
