@@ -519,6 +519,8 @@ pub struct CreateVmParams {
     pub stop_signal: Option<String>,
     /// Seconds the workload gets to exit after its stop signal.
     pub stop_timeout_secs: Option<u64>,
+    /// Maximum execution time before automatic shutdown (`--ttl`).
+    pub ttl_secs: Option<u64>,
     /// Planned number of runnable CUDA fork clones.
     pub cuda_fork_pool_size: Option<u32>,
     /// Explicit logical VRAM limit for each golden/clone CUDA session.
@@ -789,6 +791,7 @@ impl CreateVmParams {
             stop_on_exit,
             stop_signal,
             stop_timeout_secs,
+            ttl_secs,
             cuda_fork_pool_size,
             cuda_vram_limit_mib,
             docker_socket,
@@ -827,6 +830,7 @@ impl CreateVmParams {
             stop_on_exit,
             stop_signal,
             stop_timeout_secs,
+            ttl_secs,
             shm_size,
             cpus: Some(cpus),
             mem: Some(mem),
@@ -879,6 +883,9 @@ impl CreateVmParams {
 pub(crate) fn print_created(record: &VmRecord) {
     println!("Created machine: {}", record.name);
     println!("  CPUs: {}, Memory: {} MiB", record.cpus, record.mem);
+    if let Some(ttl) = record.ttl_secs {
+        println!("  TTL: {}", humantime::format_duration(std::time::Duration::from_secs(ttl)));
+    }
     let mounts = record.mounts.len() + record.staged_mounts.len();
     if mounts > 0 {
         println!("  Mounts: {mounts}");
@@ -1685,6 +1692,8 @@ pub struct StartOptions {
     /// Credentials for the first start's image pull, ahead of the registry
     /// config. Only the image seed builder passes them (over stdin).
     pub registry_auth: Option<smolvm::registry::RegistryAuth>,
+    /// Optional maximum run time before automatic stop (`--ttl` / `--timeout`).
+    pub ttl: Option<std::time::Duration>,
 }
 
 /// Start a named machine that has a config record.
@@ -1720,6 +1729,7 @@ fn start_vm_named_with_db(
         seed_digest_ttl,
         mediated_egress,
         registry_auth,
+        ttl,
     } = options;
 
     // A machine whose previous process the kernel is still holding is not
@@ -1914,9 +1924,15 @@ fn start_vm_named_with_db(
     } else {
         ""
     };
+    let effective_ttl = ttl.or_else(|| record.ttl_secs.map(std::time::Duration::from_secs));
+    let ttl_info = if let Some(d) = effective_ttl {
+        format!(" (TTL: {})", humantime::format_duration(d))
+    } else {
+        String::new()
+    };
     eprintln!(
-        "Starting machine '{}'{}{}{}...",
-        name, mount_info, port_info, auto_info
+        "Starting machine '{}'{}{}{}{}...",
+        name, mount_info, port_info, auto_info, ttl_info
     );
 
     // Resolve SSH agent socket path if enabled
@@ -1955,6 +1971,7 @@ fn start_vm_named_with_db(
         // cold (re)start can open the golden's CoW disk backing behind its
         // 0700 data dir.
         uid_share_dir: record.vm_uid_owner().map(smolvm::agent::vm_data_dir),
+        timeout: effective_ttl,
         ..Default::default()
     }
     .with_packed_layers_with_mode(
@@ -3158,6 +3175,12 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
             Some(record) => {
                 let state = smolvm::agent::state_probe::resolve_state(n, &record);
                 let mut output = format!("Machine '{}': {}\n", label, state);
+                if let Some(ttl) = record.ttl_secs {
+                    output.push_str(&format!(
+                        "  TTL: {}\n",
+                        humantime::format_duration(std::time::Duration::from_secs(ttl))
+                    ));
+                }
                 // Why the VMM ended, when smolvm reaped it.
                 if let Some(exit) = smolvm::vm_exit::read(&smolvm::agent::vm_data_dir(n)) {
                     output.push_str(&format!("  last exit: VMM {}\n", exit.describe()));
@@ -3669,6 +3692,7 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "forkpoint_held": record.forkpoint_held,
         "agent_rootfs_digest": record.agent_rootfs_digest,
         "labels": record.labels,
+        "ttl_secs": record.ttl_secs,
         "restart_policy": record.restart.policy.to_string(),
         "restart_max_retries": record.restart.max_retries,
         "restart_count": record.restart.restart_count,

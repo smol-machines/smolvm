@@ -342,6 +342,8 @@ pub struct LaunchFeatures {
     /// them, so the helper boot would fail configuring virtio-blk. Same trust
     /// domain, same uid, mirroring how a fork clone shares its golden's uid.
     pub uid_share_dir: Option<std::path::PathBuf>,
+    /// Maximum execution time before the VM is automatically shut down cleanly.
+    pub timeout: Option<std::time::Duration>,
 }
 
 /// Whether a shared-pack-store `layers/` dir actually holds image layers — i.e.

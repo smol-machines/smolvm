@@ -1024,6 +1024,10 @@ pub struct CreateMachineRequest {
     #[serde(default)]
     #[schema(example = 30)]
     pub stop_timeout_secs: Option<u64>,
+    /// Maximum execution time before the machine is automatically stopped.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[schema(example = 300)]
+    pub ttl_secs: Option<u64>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,

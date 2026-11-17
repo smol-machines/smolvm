@@ -756,6 +756,10 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_timeout_secs: Option<u64>,
 
+    /// Maximum runtime in seconds before the machine is automatically stopped (`--ttl` / `--timeout`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub ttl_secs: Option<u64>,
+
     /// Planned number of runnable CUDA fork clones. Persisted so every clone
     /// receives the same pre-initialization VRAM policy as its golden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1082,6 +1086,7 @@ impl VmRecord {
             stop_on_exit: false,
             stop_signal: None,
             stop_timeout_secs: None,
+            ttl_secs: None,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
@@ -1192,6 +1197,7 @@ impl VmRecord {
             stop_on_exit: false,
             stop_signal: None,
             stop_timeout_secs: None,
+            ttl_secs: None,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,

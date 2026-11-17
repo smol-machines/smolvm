@@ -594,7 +594,7 @@ pub struct RunCmd {
     pub tty: bool,
 
     /// Kill command after duration (e.g., "30s", "5m", "1h")
-    #[arg(long, value_parser = parse_duration, value_name = "DURATION", help_heading = "Execution")]
+    #[arg(long, visible_alias = "ttl", value_parser = parse_duration, value_name = "DURATION", help_heading = "Execution")]
     pub timeout: Option<Duration>,
 
     /// Set working directory inside container
@@ -1563,6 +1563,9 @@ impl RunCmd {
         params.disks = parse_attached_disks(&self.disk)?;
         params.cache_disk = parse_cache_disk(self.cache_disk.as_deref())?;
         params.allow_system_mounts = self.allow_system_mounts;
+        if let Some(timeout) = self.timeout {
+            params.ttl_secs = Some(timeout.as_secs());
+        }
         if self.auto_graph {
             smolvm::util::enable_cuda_auto_graph_env_specs(&mut params.env);
             params.cuda = true;
@@ -2104,6 +2107,7 @@ impl RunCmd {
             // it must opt out: arming this there would kill the VM the moment the
             // launching CLI returned.
             watch_parent: Some(!self.detach),
+            timeout: self.timeout.or_else(|| params.ttl_secs.map(Duration::from_secs)),
             packed_layers_dir,
             extra_disks: std::env::var("SMOLVM_EXTRA_DISK")
                 .ok()
@@ -2378,6 +2382,7 @@ impl RunCmd {
                                     r.gpu = Some(true);
                                 }
                                 r.gpu_vram_mib = self.gpu_vram_mib.or(r.gpu_vram_mib);
+                                r.ttl_secs = self.timeout.map(|d| d.as_secs()).or(r.ttl_secs);
                                 o
                             }),
                         )
@@ -2729,6 +2734,89 @@ mod tests {
         assert!(cidrs.is_empty());
         assert!(net);
         assert_eq!(hosts.unwrap(), ["=api.example.com", "*.example.com"]);
+    }
+
+    #[test]
+    fn ttl_flags_parse_across_commands_and_aliases() {
+        use clap::Parser;
+        use std::time::Duration;
+        #[derive(Parser)]
+        struct Harness {
+            #[command(subcommand)]
+            cmd: super::MachineCmd,
+        }
+        let parse = |argv: &[&str]| Harness::try_parse_from(argv).map(|h| h.cmd);
+
+        // machine run --ttl and --timeout
+        let Ok(super::MachineCmd::Run(run1)) =
+            parse(&["machine", "run", "--ttl", "30s", "--", "true"])
+        else {
+            panic!("machine run --ttl must parse");
+        };
+        assert_eq!(run1.timeout, Some(Duration::from_secs(30)));
+
+        let Ok(super::MachineCmd::Run(run2)) =
+            parse(&["machine", "run", "--timeout", "30s", "--", "true"])
+        else {
+            panic!("machine run --timeout must parse");
+        };
+        assert_eq!(run2.timeout, Some(Duration::from_secs(30)));
+
+        // machine create --ttl and --timeout
+        let Ok(super::MachineCmd::Create(create1)) =
+            parse(&["machine", "create", "--name", "m", "--ttl", "10m"])
+        else {
+            panic!("machine create --ttl must parse");
+        };
+        assert_eq!(create1.ttl, Some(Duration::from_secs(600)));
+
+        let Ok(super::MachineCmd::Create(create2)) =
+            parse(&["machine", "create", "--name", "m", "--timeout", "10m"])
+        else {
+            panic!("machine create --timeout must parse");
+        };
+        assert_eq!(create2.ttl, Some(Duration::from_secs(600)));
+
+        // machine start --ttl and --timeout
+        let Ok(super::MachineCmd::Start(start1)) =
+            parse(&["machine", "start", "--name", "m", "--ttl", "1h"])
+        else {
+            panic!("machine start --ttl must parse");
+        };
+        assert_eq!(start1.ttl, Some(Duration::from_secs(3600)));
+
+        let Ok(super::MachineCmd::Start(start2)) =
+            parse(&["machine", "start", "--name", "m", "--timeout", "1h"])
+        else {
+            panic!("machine start --timeout must parse");
+        };
+        assert_eq!(start2.ttl, Some(Duration::from_secs(3600)));
+
+        // machine update --ttl, --timeout, --no-ttl, and conflict
+        let Ok(super::MachineCmd::Update(update1)) =
+            parse(&["machine", "update", "--name", "m", "--ttl", "15m"])
+        else {
+            panic!("machine update --ttl must parse");
+        };
+        assert_eq!(update1.ttl, Some(Duration::from_secs(900)));
+        assert!(!update1.no_ttl);
+
+        let Ok(super::MachineCmd::Update(update2)) =
+            parse(&["machine", "update", "--name", "m", "--timeout", "15m"])
+        else {
+            panic!("machine update --timeout must parse");
+        };
+        assert_eq!(update2.ttl, Some(Duration::from_secs(900)));
+
+        let Ok(super::MachineCmd::Update(update3)) =
+            parse(&["machine", "update", "--name", "m", "--no-ttl"])
+        else {
+            panic!("machine update --no-ttl must parse");
+        };
+        assert!(update3.ttl.is_none());
+        assert!(update3.no_ttl);
+
+        assert!(parse(&["machine", "update", "--name", "m", "--ttl", "15m", "--no-ttl"]).is_err());
     }
 
     #[test]
@@ -4899,6 +4987,10 @@ pub struct CreateCmd {
     #[arg(long, value_name = "SECONDS", value_parser = parse_stop_timeout_arg)]
     pub stop_timeout: Option<u64>,
 
+    /// Maximum execution time before the machine is automatically stopped (e.g. "30s", "5m", "1h")
+    #[arg(long, visible_alias = "timeout", value_parser = parse_duration, value_name = "DURATION")]
+    pub ttl: Option<Duration>,
+
     /// Remote guest CUDA Driver-API calls to the host NVIDIA GPU over vsock
     #[arg(long)]
     pub cuda: bool,
@@ -5216,6 +5308,7 @@ impl CreateCmd {
             stop_on_exit,
             stop_signal,
             stop_timeout,
+            ttl,
             cuda,
             auto_graph,
             docker_socket,
@@ -5347,6 +5440,9 @@ impl CreateCmd {
         }
         if stop_timeout.is_some() {
             cli.stop_timeout_secs = *stop_timeout;
+        }
+        if let Some(ttl) = ttl {
+            cli.ttl_secs = Some(ttl.as_secs());
         }
         cli.cuda |= *cuda;
         cli.docker_socket |= *docker_socket;
@@ -5739,6 +5835,10 @@ pub struct StartCmd {
     #[arg(long, requires = "egress_interceptor")]
     pub mediated_egress: bool,
 
+    /// Maximum run time before the machine is automatically stopped (e.g. "30s", "5m", "1h")
+    #[arg(long, visible_alias = "timeout", value_parser = parse_duration, value_name = "DURATION")]
+    pub ttl: Option<Duration>,
+
     #[arg(
         long,
         env = "SMOLVM_INTERCEPTOR_TOKEN",
@@ -5797,6 +5897,7 @@ impl StartCmd {
                 seed_digest_ttl: self.seed_digest_ttl,
                 mediated_egress: self.mediated_egress,
                 registry_auth,
+                ttl: self.ttl,
             },
         ) {
             Ok(()) => Ok(()),
@@ -6864,6 +6965,14 @@ pub struct UpdateCmd {
     /// Remove a label by key (repeatable). A key the machine lacks is ignored.
     #[arg(long = "remove-label", value_name = "KEY")]
     pub remove_labels: Vec<String>,
+
+    /// Set maximum execution time before the machine is automatically stopped (e.g. "30s", "5m", "1h")
+    #[arg(long, visible_alias = "timeout", value_parser = parse_duration, value_name = "DURATION")]
+    pub ttl: Option<Duration>,
+
+    /// Remove the maximum execution time (TTL) limit
+    #[arg(long, conflicts_with = "ttl")]
+    pub no_ttl: bool,
 }
 
 impl UpdateCmd {
@@ -6998,6 +7107,8 @@ impl UpdateCmd {
             shm_size,
             labels,
             remove_labels,
+            ttl,
+            no_ttl,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -7032,7 +7143,9 @@ impl UpdateCmd {
             || disk_durability.is_some()
             || !dns_option.is_empty()
             || *clear_dns_options
-            || shm_size.is_some();
+            || shm_size.is_some()
+            || ttl.is_some()
+            || *no_ttl;
         let labels = !labels.is_empty() || !remove_labels.is_empty();
         (egress, ports, labels, other)
     }
@@ -7557,6 +7670,16 @@ impl UpdateCmd {
             if self.no_rosetta {
                 changes.push("  rosetta: disabled".to_string());
                 r.rosetta = Some(false);
+            }
+
+            // TTL
+            if self.no_ttl && r.ttl_secs.is_some() {
+                changes.push("  ttl: disabled".to_string());
+                r.ttl_secs = None;
+            }
+            if let Some(ttl) = self.ttl {
+                changes.push(format!("  ttl: {}", humantime::format_duration(ttl)));
+                r.ttl_secs = Some(ttl.as_secs());
             }
         })?;
 

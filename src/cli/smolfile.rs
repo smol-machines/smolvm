@@ -215,6 +215,7 @@ pub fn build_create_spec(
         stop_on_exit: sf_stop_on_exit,
         stop_signal: sf_stop_signal,
         stop_timeout: sf_stop_timeout,
+        ttl: sf_ttl,
         auth: sf_auth,
         // Deployment metadata for a control plane, not a machine option.
         service: _,
@@ -406,6 +407,8 @@ pub fn build_create_spec(
     smolvm::workload::validate_stop_settings(sf_stop_signal.as_deref(), sf_stop_timeout)
         .map_err(|e| smolvm::Error::config("smolfile stop settings", e))?;
 
+    let ttl_secs = duration(dev.ttl.as_ref().or(sf_ttl.as_ref()));
+
     Ok(CliSpec {
         image,
         volumes,
@@ -428,6 +431,7 @@ pub fn build_create_spec(
             stop_on_exit: sf_stop_on_exit,
             stop_signal: sf_stop_signal,
             stop_timeout_secs: sf_stop_timeout,
+            ttl_secs,
             shm_size: None,
             cpus,
             mem,
@@ -562,6 +566,7 @@ pub fn build_create_params(
         stop_on_exit,
         stop_signal,
         stop_timeout_secs,
+        ttl_secs,
         shm_size,
         cpus,
         mem,
@@ -658,6 +663,7 @@ pub fn build_create_params(
         stop_on_exit,
         stop_signal,
         stop_timeout_secs,
+        ttl_secs,
         cuda_fork_pool_size,
         cuda_vram_limit_mib,
         docker_socket,
@@ -920,6 +926,7 @@ env = ["GREETING=hello", "EMPTY="]
 workdir = "/srv/app"
 user = "501:20"
 init = ["echo init"]
+ttl = "30m"
 "#,
         )
         .unwrap();
@@ -934,6 +941,7 @@ init = ["echo init"]
         assert_eq!(params.user.as_deref(), Some("501:20"));
         assert_eq!(params.init, vec!["echo init"]);
         assert_eq!(params.network_backend, Some(NetworkBackend::VirtioNet));
+        assert_eq!(params.ttl_secs, Some(1800));
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -951,6 +959,7 @@ init = ["echo init"]
         assert_eq!(created.user, params.user);
         assert_eq!(created.init, params.init);
         assert_eq!(created.network_backend, params.network_backend);
+        assert_eq!(created.ttl_secs, Some(1800));
 
         // Hop 2b: create params -> overrides -> record, the `run` and
         // first-launch paths.
@@ -966,6 +975,7 @@ init = ["echo init"]
         assert_eq!(persisted.user, params.user);
         assert_eq!(persisted.init, params.init);
         assert_eq!(persisted.network_backend, params.network_backend);
+        assert_eq!(persisted.ttl_secs, Some(1800));
 
         // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
         let mut manifest = PackManifest::new(
@@ -1044,6 +1054,37 @@ init = ["echo init"]
                 "net_backend = \"{declared}\" must select {expected:?}"
             );
         }
+    }
+
+    #[test]
+    fn smolfile_ttl_dev_override_and_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let path1 = dir.path().join("Smolfile1");
+        std::fs::write(
+            &path1,
+            r#"
+image = "alpine"
+ttl = "20m"
+
+[dev]
+ttl = "5m"
+"#,
+        )
+        .unwrap();
+        let params1 = build_from_smolfile(path1).unwrap();
+        assert_eq!(params1.ttl_secs, Some(300));
+
+        let path2 = dir.path().join("Smolfile2");
+        std::fs::write(
+            &path2,
+            r#"
+image = "alpine"
+timeout = "45s"
+"#,
+        )
+        .unwrap();
+        let params2 = build_from_smolfile(path2).unwrap();
+        assert_eq!(params2.ttl_secs, Some(45));
     }
 
     #[test]
