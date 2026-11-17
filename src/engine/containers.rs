@@ -1514,7 +1514,10 @@ fn remove_after_failed_start(engine: &Arc<Engine>, c: &Arc<Container>) {
     let _ = c.output.send(Output::End);
     if c.record().host_config.auto_remove {
         let (e, c) = (engine.clone(), c.clone());
+        // Transfer lifetime ownership before the failed start request returns.
+        let activity = engine.activity.hold();
         tokio::spawn(async move {
+            let _activity = activity;
             let _ = remove(&e, &c, true, true).await;
         });
     }

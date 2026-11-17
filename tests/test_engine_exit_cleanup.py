@@ -79,6 +79,41 @@ def check_cleanup(cid, mode):
     print(f"PASS: {mode} finishes delayed cleanup and releases its supervisor", flush=True)
 
 
+def failed_start_cleanup():
+    cid = docker("create", "--rm", "--network", "bridge", "alpine:3.24", "/missing-command")
+    try:
+        config = ROOT / "containers" / cid / "config.json"
+        initial = json.loads(config.read_text())["networks"]
+        owner = ROOT / f"{cid}.lock"
+        with (ROOT / "network.lock").open("a+b") as network:
+            with subprocess.Popen(["docker", "start", cid], stdout=subprocess.PIPE,
+                                  stderr=subprocess.PIPE) as start:
+                # Let before_start allocate the bridge endpoint, then hold the
+                # lock that background removal needs after the command fails.
+                deadline = time.monotonic() + 30
+                while time.monotonic() < deadline:
+                    if json.loads(config.read_text())["networks"] != initial:
+                        break
+                    assert start.poll() is None, (
+                        "start finished before the cleanup lock could be acquired")
+                    time.sleep(0.002)
+                else:
+                    raise AssertionError("before_start did not publish network allocation")
+                fcntl.flock(network, fcntl.LOCK_EX)
+                stdout, stderr = start.communicate(timeout=90)
+                assert start.returncode != 0, (stdout, stderr)
+            eventually(lambda: json.loads(config.read_text())["state"]["status"] == "removing")
+            time.sleep(12)
+            assert owns_lock(owner), "idle exit abandoned cleanup after failed start"
+        eventually(lambda: not config.exists(), timeout=15)
+        eventually(lambda: not owns_lock(owner))
+        print("PASS: failed start cleanup completes before supervisor idle exit", flush=True)
+    finally:
+        subprocess.run(["docker", "rm", "-f", cid], stdout=subprocess.DEVNULL,
+                       stderr=subprocess.DEVNULL, timeout=90)
+
+
 assert Path(docker("info", "--format", "{{.DockerRootDir}}")).resolve() == ROOT
 for mode in ["remove", "retain", "restart"]:
     delayed_cleanup(mode)
+failed_start_cleanup()
