@@ -102,8 +102,15 @@ pub(crate) struct Engine {
 
 impl Engine {
     fn open(config: EngineConfig, owner: Option<String>) -> crate::Result<Arc<Self>> {
+        Self::open_with_db(config, owner, crate::db::SmolvmDb::open()?)
+    }
+
+    fn open_with_db(
+        config: EngineConfig,
+        owner: Option<String>,
+        db: crate::db::SmolvmDb,
+    ) -> crate::Result<Arc<Self>> {
         let store = store::Store::open(&config.root)?;
-        let db = crate::db::SmolvmDb::open()?;
         let images = images::Images::load(&store)?;
         let volumes = volumes::Volumes::load(&store)?;
         let networks = network::Networks::load(&store, &config.socket)?;
@@ -200,4 +207,17 @@ fn bind_socket(path: &Path) -> crate::Result<tokio::net::UnixListener> {
     let listener = tokio::net::UnixListener::bind(path)?;
     std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
     Ok(listener)
+}
+
+#[cfg(test)]
+fn test_engine(root: &Path) -> Arc<Engine> {
+    Engine::open_with_db(
+        EngineConfig {
+            root: root.join("engine"),
+            socket: root.join("api.sock"),
+        },
+        None,
+        crate::db::SmolvmDb::open_at(&root.join("test.db")).unwrap(),
+    )
+    .unwrap()
 }

@@ -1004,13 +1004,13 @@ async fn container_stats(
     let stream = !q.get("stream").is_some_and(|v| v == "0" || v == "false") && !one_shot;
     // Validate the first sample before committing HTTP 200: an old guest or
     // unavailable cgroup must not masquerade as an idle container.
-    let first = super::stats::sample(&c).await?;
+    let first = super::stats::sample(&engine, &c).await?;
     if !stream {
         let mut sample = first;
         if !one_shot && c.is_running() {
             tokio::time::sleep(std::time::Duration::from_secs(1)).await;
             let previous = sample;
-            sample = super::stats::sample(&c).await?;
+            sample = super::stats::sample(&engine, &c).await?;
             sample["precpu_stats"] = previous["cpu_stats"].clone();
             sample["preread"] = previous["read"].clone();
         }
@@ -1029,7 +1029,7 @@ async fn container_stats(
             }
             let next = tokio::select! {
                 _ = tx.closed() => return,
-                sample = super::stats::sample(&c) => sample,
+                sample = super::stats::sample(&engine, &c) => sample,
             };
             let mut sample = match next {
                 Ok(sample) => sample,
