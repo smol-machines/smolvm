@@ -243,10 +243,14 @@ test_events_stream_lifecycle() {
 }
 
 test_filters_and_labels() {
-    local id
-    id=$(run -d --label "role=probe" alpine sleep 300) || return 1
+    local id name="$PREFIX-probe-1"
+    id=$(run -d --name "$name" --label "role=probe" alpine sleep 300) || return 1
     docker ps -q --filter "label=role=probe" | has "${id:0:12}" || return 1
     docker ps -q --filter "label=role=other" | has . && return 1
+    [[ $(docker ps -q --no-trunc --filter "name=^/$name$") == "$id" ]] || return 1
+    [[ $(docker ps -q --no-trunc --filter "name=^$name$") == "$id" ]] || return 1
+    [[ $(docker ps -q --no-trunc --filter "name=^/$PREFIX-probe-[0-9]+$") == "$id" ]] || return 1
+    [[ -z $(docker ps -q --filter "name=^/$name-extra$") ]] || return 1
     docker ps -aq --filter "status=running" --filter "ancestor=alpine" | has "${id:0:12}" || return 1
     docker rm -f "$id" >/dev/null
 }
