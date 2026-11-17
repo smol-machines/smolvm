@@ -14,7 +14,8 @@ name: Publish crates to crates.io
 #
 # Publishes in dependency order (a dependency must be on crates.io before a
 # dependent's `version = "x"` requirement can resolve):
-#   smolvm-protocol, smolvm-network  (leaves)
+#   smolvm-smoltcp, smolvm-protocol (leaves)
+#   → smolvm-network                 (needs the patched stack)
 #   → smolvm-pack, smolvm-smolfile   (need protocol)
 #   → smolvm-registry                (needs pack)
 #   → smolvm-checkpoint              (needs pack; ships the checkpoint format spec)
@@ -62,11 +63,11 @@ jobs:
 
           # Dependency order: a dep must be published (and indexed) before a
           # dependent, so its `version = "x"` requirement resolves on crates.io.
-          crates=(smolvm-protocol smolvm-network smolvm-pack smolvm-smolfile smolvm-registry smolvm-checkpoint)
+          crate_paths=(vendor/smoltcp crates/smolvm-protocol crates/smolvm-network crates/smolvm-pack crates/smolvm-smolfile crates/smolvm-registry crates/smolvm-checkpoint)
 
-          for c in "${crates[@]}"; do
-            name="$(grep -m1 '^name' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
-            ver="$(grep -m1 '^version' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+          for c in "${crate_paths[@]}"; do
+            name="$(grep -m1 '^name' "$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+            ver="$(grep -m1 '^version' "$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
             echo "::group::$name $ver"
 
             if [ "${DRY_RUN:-false}" = "true" ]; then

@@ -1,6 +1,6 @@
 [workspace]
+# The root package is implicit; listing "." overrides the vendor exclusions.
 members = [
-    ".",
     "crates/smolvm-checkpoint",
     "crates/smolvm-agent",
     "crates/smolvm-cuda",
@@ -19,6 +19,7 @@ members = [
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
+exclude = ["vendor/smoltcp"]
 resolver = "2"
 
 [package]

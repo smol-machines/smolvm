@@ -84,6 +84,7 @@ pub mod tcp_reactor;
 pub mod tcp_relay;
 pub mod udp_publish;
 pub mod udp_relay;
+mod host_udp;
 pub mod watchlist;
 
 pub use egress::EgressPolicy;
