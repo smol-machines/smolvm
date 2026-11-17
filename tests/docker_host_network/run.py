@@ -3,7 +3,7 @@
 # Optional compose selects the plugin installed into the private Docker config.
 # Build guest.rs for the guest architecture with rustc --edition=2021
 # --target <arch>-unknown-linux-musl -C linker=rust-lld -o /path/to/probe.
-# Requires KVM or an HVF-entitled engine and ABI-2 host-network firmware.
+# Requires KVM or an HVF-entitled engine and ABI-3 host-network firmware.
 # Uses only a private engine socket, Docker config, and temporary state directory.
 import hashlib, json, os, pathlib, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, traceback
 
@@ -121,6 +121,16 @@ try:
     peer6=create('host',ip='::1');d('start',peer6);_,second_udp6=ready(peer6)
     d('run','--rm','--network','host',image,'udp-connected',udp6,second_udp6)
     check('connected UDP supports alternate destinations, disconnect and reconnect over IPv4, IPv6 and mapped IPv4')
+    for family,ip,use_mapped in [(socket.AF_INET,'127.0.0.1',False),(socket.AF_INET6,'::1',False),(socket.AF_INET,'127.0.0.1',True)]:
+        with socket.socket(family,socket.SOCK_DGRAM) as reserved:
+            reserved.bind((ip,0));port=reserved.getsockname()[1]
+        peer=('[%s]:%d' if family==socket.AF_INET6 else '%s:%d')%(ip,port)
+        if use_mapped:
+            peer=mapped(peer)
+        result.setdefault('udp_error_peers',[]).append(peer)
+        p=d('run','--rm','--network','host',image,'udp-error',peer)
+        assert 'UDP_ERROR_PASS' in p.stdout.decode()
+    check('closed UDP ports report connection refused once over IPv4, IPv6 and mapped IPv4')
     previous_ready=sum(line.startswith('READY ') for line in d('logs',identifier).stdout.decode().splitlines())
     d('exec',identifier,'/probe','write');d('stop','-t','1',identifier)
     no_owned_port(tcp)

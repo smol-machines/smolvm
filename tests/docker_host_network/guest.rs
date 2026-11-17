@@ -124,6 +124,31 @@ fn main() {
             println!("UDP_PASS");
         }
         "udp-connected" => udp_connected(args[2].parse().unwrap(), args[3].parse().unwrap()),
+        "udp-error" => {
+            let peer: std::net::SocketAddr = args[2].parse().unwrap();
+            let socket = UdpSocket::bind(if peer.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            })
+            .unwrap();
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket.connect(peer).unwrap();
+            socket.send(b"closed-port").unwrap();
+            assert_eq!(
+                socket.recv(&mut [0; 8]).unwrap_err().raw_os_error(),
+                Some(111)
+            );
+            assert!(socket.take_error().unwrap().is_none());
+            socket.set_nonblocking(true).unwrap();
+            assert_eq!(
+                socket.recv(&mut [0; 8]).unwrap_err().kind(),
+                std::io::ErrorKind::WouldBlock
+            );
+            println!("UDP_ERROR_PASS");
+        }
         "bind" => match TcpListener::bind(&args[2]) {
             Ok(_socket) => println!("BIND_PASS"),
             Err(error) => {
