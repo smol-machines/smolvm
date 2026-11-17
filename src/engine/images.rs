@@ -437,7 +437,9 @@ impl Images {
             out.push(serde_json::json!({ "Untagged": digest }));
         }
         out.push(serde_json::json!({ "Deleted": image.id }));
-        store.remove_object("images", image.id.trim_start_matches("sha256:"));
+        store
+            .remove_object("images", image.id.trim_start_matches("sha256:"))
+            .map_err(ApiError::from)?;
         self.records.write().remove(&image.id);
         Ok(out)
     }
@@ -741,6 +743,46 @@ pub(crate) async fn finish_pull(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn failed_record_removal_preserves_image_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let images = Images::load(&store).unwrap();
+        let image = ImageRecord {
+            id: format!("sha256:{}", "a".repeat(64)),
+            repo_tags: vec!["retained:latest".into()],
+            repo_digests: Vec::new(),
+            pull_ref: "retained:latest".into(),
+            config: serde_json::json!({}),
+            size: 0,
+            pulled: super::super::util::now_rfc3339(),
+            last_tag_time: String::new(),
+        };
+        images.insert(&store, image).unwrap();
+        let records = dir.path().join("images");
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = images.remove(&store, "retained:latest", false, |_| None);
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(images.resolve("retained:latest").is_some());
+        assert!(Images::load(&store)
+            .unwrap()
+            .resolve("retained:latest")
+            .is_some());
+        images
+            .remove(&store, "retained:latest", false, |_| None)
+            .unwrap();
+        assert!(images.resolve("retained:latest").is_none());
+        assert!(Images::load(&store)
+            .unwrap()
+            .resolve("retained:latest")
+            .is_none());
+    }
 
     #[test]
     fn references_normalize_like_the_docker_cli() {

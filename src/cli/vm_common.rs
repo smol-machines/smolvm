@@ -3737,6 +3737,24 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     });
     let fields = obj.as_object_mut().unwrap();
     fields.insert("network".into(), serde_json::json!(record.network));
+    fields.insert(
+        "shared_folders".into(),
+        serde_json::Value::Array(
+            record
+                .host_mounts()
+                .iter()
+                .map(|mount| {
+                    serde_json::json!({ "host": mount.source, "guest": mount.target,
+            "mode": if mount.staged { "staged" } else if mount.read_only { "ro" } else { "rw" } })
+                })
+                .collect(),
+        ),
+    );
+    fields.insert("port_mappings".into(), serde_json::Value::Array(record.ports.iter().map(|(host, guest)| {
+        serde_json::json!({ "host": host, "guest": guest, "protocol": "tcp" })
+    }).chain(record.udp_ports.iter().map(|(host, guest)| {
+        serde_json::json!({ "host": host, "guest": guest, "protocol": "udp" })
+    })).collect()));
     // The egress allow list, present only when one is set, in the stored form
     // `machine update` accepts back: `=host` exact, `*.domain` wildcard, bare
     // `host` for a name and its subdomains, plus CIDRs. Lets a client read the
@@ -5283,6 +5301,37 @@ mod mount_socket_placeholder_tests {
 mod status_dns_tests {
     use super::machine_status_json;
     use smolvm::config::VmRecord;
+
+    #[test]
+    fn status_preserves_folder_modes_order_and_port_protocols() {
+        let mut record = VmRecord::new(
+            "studio-settings".into(),
+            1,
+            512,
+            vec![("/host/read only".into(), "/data".into(), true)],
+            vec![(8080, 80)],
+            true,
+        );
+        record.staged_mounts = vec![(0, "/host/project".into(), "/project".into())];
+        record.udp_ports = vec![(8080, 53)];
+        let status = machine_status_json("studio-settings", &record);
+        assert_eq!(status["mounts"], 2);
+        assert_eq!(
+            status["shared_folders"],
+            serde_json::json!([
+                {"host":"/host/project", "guest":"/project", "mode":"staged"},
+                {"host":"/host/read only", "guest":"/data", "mode":"ro"},
+            ])
+        );
+        assert_eq!(status["ports"], 2);
+        assert_eq!(
+            status["port_mappings"],
+            serde_json::json!([
+                {"host":8080, "guest":80, "protocol":"tcp"},
+                {"host":8080, "guest":53, "protocol":"udp"},
+            ])
+        );
+    }
 
     // `--dns` and `--dns-option` show up in status JSON only when set, so the
     // object other machines produce is unchanged.

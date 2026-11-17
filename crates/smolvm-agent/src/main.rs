@@ -91,6 +91,7 @@ mod branchpoint;
 mod container;
 mod credentials;
 mod cuda;
+mod directory_write;
 mod dirwatch;
 mod disk_trim;
 mod docker_bridge;
@@ -2377,6 +2378,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut directory_session: Option<directory_write::Session> = None;
 
     loop {
         // Read length header
@@ -2451,6 +2453,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         let _guard = _span.enter();
 
         debug!(method = %request.log_summary(), "received request");
+
+        // A new operation aborts staged uploads, including requests handled by
+        // early streaming branches below. Only upload chunks retain a session.
+        if !matches!(request, AgentRequest::FileWriteChunk { .. }) {
+            write_session = None;
+            directory_session = None;
+        }
 
         // A fork clone resumes this already-initialized agent with fresh
         // virtiofs devices. Repair hidden/stale boot mounts before replying to
@@ -2633,15 +2642,46 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             target,
         } = request
         {
-            // Drop any leftover session now (Drop cleans its tmp file) before
-            // starting a new one. `take()` makes the drop explicit and keeps the
-            // value from looking like a dead store.
-            let _ = write_session.take();
             let (new_session, response) =
                 handle_file_write_begin(path, mode, uid, gid, total_size, target.as_ref());
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
+        }
+        if let AgentRequest::DirectoryWriteBegin { path, target } = request {
+            let response = match directory_write::Session::begin(&path, target.as_ref()) {
+                Ok(session) => {
+                    directory_session = Some(session);
+                    AgentResponse::Ok { data: None }
+                }
+                Err(error) => error,
+            };
+            send_response(stream, &response)?;
+            continue;
+        }
+        if let AgentRequest::FileWriteChunk { ref data, done } = request {
+            if let Some(mut session) = directory_session.take() {
+                let result = session.write(data);
+                let response = match result {
+                    Err(error) => AgentResponse::error(error, error_codes::FILE_IO_FAILED),
+                    Ok(()) if done => {
+                        let client = stream.as_raw_fd();
+                        let result = with_keepalive(stream, FILE_FINALIZE_KEEPALIVE, || {
+                            session.finish(Some(client))
+                        });
+                        match result {
+                            Ok(()) => AgentResponse::Ok { data: None },
+                            Err(error) => AgentResponse::error(error, error_codes::FILE_IO_FAILED),
+                        }
+                    }
+                    Ok(()) => {
+                        directory_session = Some(session);
+                        AgentResponse::Ok { data: None }
+                    }
+                };
+                send_response(stream, &response)?;
+                continue;
+            }
         }
         if let AgentRequest::FileWriteChunk { data, done } = request {
             // The last chunk syncs the staged file and, for a running
@@ -2658,19 +2698,6 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
-        }
-
-        // Any other request mid-session is a protocol error. Drop the
-        // session (Drop cleans the staging file) and proceed — the
-        // operator's new request is honored rather than failed; the
-        // alternative (error out) buys no safety since the drop
-        // already handled cleanup.
-        if write_session.is_some() {
-            debug!(
-                method = %request.log_summary(),
-                "dropping in-flight FileWrite session: non-chunk request arrived"
-            );
-            write_session = None;
         }
 
         // Handle regular request. Pass the stream's fd so long-running
@@ -3068,12 +3095,12 @@ fn handle_request(
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
-        AgentRequest::FileWriteBegin { .. } | AgentRequest::FileWriteChunk { .. } => {
-            AgentResponse::error(
-                "streaming file write must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileWriteBegin { .. }
+        | AgentRequest::DirectoryWriteBegin { .. }
+        | AgentRequest::FileWriteChunk { .. } => AgentResponse::error(
+            "streaming file write must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
@@ -4128,9 +4155,9 @@ fn handle_streaming_file_read(
 
 /// Stream a tar archive of a directory directly over vsock.
 ///
-/// This deliberately runs in the agent namespace: boot-time staged mounts are
-/// visible there even when an image workload is active, and no temporary
-/// archive needs to traverse virtiofs or occupy the guest disk.
+/// Use the selected workload namespace so its mounted folders are visible;
+/// bare machines retain the agent namespace and its boot-time staged mounts.
+/// Neither path writes a temporary archive to the guest disk.
 fn handle_streaming_archive_directory(
     stream: &mut WireStream<impl ReadWrite>,
     path: &str,
@@ -4143,6 +4170,33 @@ fn handle_streaming_archive_directory(
             return Ok(());
         }
     };
+    if let nsfile::GuestNs::Container(namespace) = root.namespace() {
+        let mut archive = match namespace.archive(path) {
+            Ok(archive) => archive,
+            Err(message) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+        send_data_chunks_body(
+            stream,
+            &mut archive,
+            smolvm_protocol::LAYER_CHUNK_SIZE,
+            "failed to read container archive",
+            error_codes::FILE_IO_FAILED,
+        )?;
+        let response = match archive.finish() {
+            Ok(()) => AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+            Err(message) => AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+        };
+        return send_response(stream, &response);
+    }
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a

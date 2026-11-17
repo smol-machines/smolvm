@@ -86,8 +86,15 @@ impl Store {
         write_json(&self.object_path(kind, name), value)
     }
 
-    pub(crate) fn remove_object(&self, kind: &str, name: &str) {
-        let _ = std::fs::remove_file(self.object_path(kind, name));
+    pub(crate) fn remove_object(&self, kind: &str, name: &str) -> crate::Result<()> {
+        match std::fs::remove_file(self.object_path(kind, name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::Error::config(
+                "engine record",
+                format!("remove {kind}/{name}: {e}"),
+            )),
+        }
     }
 
     pub(crate) fn load_objects<T: DeserializeOwned>(&self, kind: &str) -> crate::Result<Vec<T>> {
