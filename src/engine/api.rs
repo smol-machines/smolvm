@@ -1062,11 +1062,7 @@ async fn stats_sample(
     if record.host_config.memory > 0 {
         limit = record.host_config.memory as u64;
     }
-    let system = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        * ncpu;
+    let system = super::stats_clock::system_cpu_usage(ncpu);
     let _ = engine;
     serde_json::json!({
         "read": super::util::now_rfc3339(),
