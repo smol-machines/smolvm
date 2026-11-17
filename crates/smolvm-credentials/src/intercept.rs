@@ -527,12 +527,7 @@ impl State {
 
     /// Note what `binding` resolved to under secret `generation`, or that it
     /// did not resolve.
-    fn remember(
-        &self,
-        binding: &str,
-        generation: u64,
-        value: Option<&zeroize::Zeroizing<String>>,
-    ) {
+    fn remember(&self, binding: &str, generation: u64, value: Option<&zeroize::Zeroizing<String>>) {
         let mut resolved = self.resolved.lock().expect("resolved values");
         let remembered = resolved.entry(binding.to_string()).or_default();
         // Generations only grow, so a resolution that finishes after a newer
@@ -2347,6 +2342,76 @@ mod tests {
             .await
             .unwrap();
         assert!(!response.contains("ghp_storedsecret45678"), "{response}");
+    }
+
+    /// A resolver whose value a test can rotate.
+    struct RotatingResolver(Mutex<String>);
+
+    impl CredentialResolver for RotatingResolver {
+        fn resolve(
+            &self,
+            _request: &CredentialRequest,
+        ) -> std::result::Result<zeroize::Zeroizing<String>, crate::resolver::ResolveError>
+        {
+            Ok(zeroize::Zeroizing::new(self.0.lock().unwrap().clone()))
+        }
+    }
+
+    /// Bindings replaced with a new secret are looked up again before the
+    /// next response from their host is checked, so a value supplied with the
+    /// replacement is scrubbed even from a request that injects nothing, and
+    /// the value before it still is.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_replaced_secret_is_scrubbed_before_any_request_injects_it() {
+        let upstream = start_upstream().await;
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let ca_pem = ca.certificate_pem().to_string();
+        let resolver = Arc::new(RotatingResolver(Mutex::new("ghp_firstsecret1111".into())));
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: policy.clone(),
+                placeholders: placeholders.clone(),
+                ca,
+                upstream_roots_pem: vec![upstream.cert_pem.clone()],
+            },
+            resolver.clone(),
+        )
+        .unwrap();
+        let f = Fixture {
+            upstream,
+            interceptor,
+            placeholder: placeholders["svc"].clone(),
+            ca_pem,
+        };
+        let echo = |value: &str| {
+            format!(
+                "GET /echo HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: {value}\r\nConnection: close\r\n\r\n"
+            )
+        };
+        let first = guest_request(
+            &f,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &echo("ghp_firstsecret1111"),
+        )
+        .await
+        .unwrap();
+        assert!(!first.contains("ghp_firstsecret1111"), "{first}");
+
+        *resolver.0.lock().unwrap() = "ghp_secondsecret2222".into();
+        f.interceptor
+            .control()
+            .replace_bindings(policy, &placeholders);
+        for value in ["ghp_secondsecret2222", "ghp_firstsecret1111"] {
+            let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &echo(value))
+                .await
+                .unwrap();
+            assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+            assert!(!response.contains(value), "{value}: {response}");
+        }
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

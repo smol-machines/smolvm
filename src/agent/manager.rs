@@ -830,7 +830,11 @@ pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
 
 /// Send `rendered` to one of running machine `name`'s control sockets and
 /// return what followed its `ok` line.
-fn send_live_query(name: &str, socket: &str, rendered: &str) -> std::result::Result<String, String> {
+fn send_live_query(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     let reply = send_live_request(name, socket, rendered)?;
     let reply = reply.trim();
     match reply.split_once('\n') {

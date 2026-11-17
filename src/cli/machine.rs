@@ -7364,14 +7364,18 @@ impl UpdateCmd {
                 ));
             }
             self.update_credentials(&db, &record)?;
-            if !(egress || ports || labels || other) {
-                return Ok(());
+            if !(egress || ports || other) {
+                return if labels {
+                    self.update_labels(&db, &set_labels)
+                } else {
+                    Ok(())
+                };
             }
             record = db.get_vm(&self.name)?.ok_or_else(|| {
                 smolvm::Error::config("update", format!("machine '{}' not found", self.name))
             })?;
         }
-        if labels && !egress && !ports && !other {
+        if self.changes_only_labels() {
             return self.update_labels(&db, &set_labels);
         }
         if state == RecordState::Running && self.changes_only_egress() {
