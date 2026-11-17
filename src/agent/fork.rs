@@ -847,6 +847,35 @@ fn branch_admission_required_mib(
         .checked_add(materialized_generation_mib)
 }
 
+/// What the VM slice can still take before it hits `memory.max`, in bytes:
+/// the cap less what the slice holds that reclaim cannot give back (its
+/// charge less its reclaimable page cache, `file` without `shmem`). `None`
+/// when the slice has no finite cap or its files do not parse.
+pub(crate) fn slice_free_bytes(max: &str, current: &str, stat: &str) -> Option<u64> {
+    let max = crate::api::memory_pressure::parse_memory_max(max)?;
+    let current: u64 = current.trim().parse().ok()?;
+    let field = |name: &str| {
+        stat.lines().find_map(|l| {
+            let (k, v) = l.split_once(' ')?;
+            (k == name).then(|| v.trim().parse::<u64>().ok())?
+        })
+    };
+    let reclaimable = field("file")?.saturating_sub(field("shmem").unwrap_or(0));
+    Some(max.saturating_sub(current.saturating_sub(reclaimable)))
+}
+
+/// [`slice_free_bytes`] for the running VM slice; `None` without one (macOS,
+/// a host whose VMs run outside the slice, a slice not created yet).
+fn vm_slice_free_bytes() -> Option<u64> {
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(crate::systemd_scope::VM_SLICE);
+    let read = |n: &str| std::fs::read_to_string(dir.join(n)).ok();
+    slice_free_bytes(
+        &read("memory.max")?,
+        &read("memory.current")?,
+        &read("memory.stat")?,
+    )
+}
+
 /// Refuse a fan-out before capture if it would consume the host/cgroup's safe
 /// headroom. Each child is charged its VMM boot overhead plus a share of its
 /// guest RAM for the private pages it will dirty (not its whole configured
@@ -880,7 +909,15 @@ fn admit_branch_memory(
         child_overhead_mib,
         child_growth_fraction,
     );
-    let available_mib = (memory.available_bytes / MIB).saturating_sub(owed_mib);
+    // The VMs run in the slice, so the slice's cap is where they are killed:
+    // 2026-11-17 x86-metal-worker-0 OOM-killed 27 VMs at its 710 GiB
+    // `memory.max` while host memory was free. The cap already leaves the host
+    // reserve out, so the slice's room counts with the reserve added back.
+    let host_mib = memory.available_bytes / MIB;
+    let available_mib = vm_slice_free_bytes()
+        .map(|b| host_mib.min((b / MIB).saturating_add(reserve_mib)))
+        .unwrap_or(host_mib)
+        .saturating_sub(owed_mib);
     let materialized_generation_mib = if materializes_shared_generation {
         record
             .pid
@@ -5027,6 +5064,35 @@ tmpfs /tmp tmpfs rw 0 0
         let required = |n| branch_admission_required_mib(n, 8256, 46387, 0).unwrap();
         assert!(required(19) <= 200 * 1024);
         assert!(required(20) > 200 * 1024);
+    }
+
+    #[test]
+    fn the_slices_room_is_its_cap_less_what_reclaim_cannot_free() {
+        const GIB: u64 = 1 << 30;
+        // worker-0 at the kill: 710 GiB cap, 709 GiB charged, of which 100 GiB
+        // file pages but 90 GiB of those shmem (guest RAM): 10 GiB reclaimable
+        let stat = format!(
+            "anon {}\nfile {}\nshmem {}\n",
+            600 * GIB,
+            100 * GIB,
+            90 * GIB
+        );
+        let free = slice_free_bytes(
+            &format!("{}\n", 710 * GIB),
+            &format!("{}\n", 709 * GIB),
+            &stat,
+        );
+        assert_eq!(free, Some(11 * GIB));
+        assert_eq!(
+            slice_free_bytes("max\n", "1", &stat),
+            None,
+            "no cap, no bound"
+        );
+        assert_eq!(
+            slice_free_bytes("10", "1", "anon 1\n"),
+            None,
+            "no file line, no guess"
+        );
     }
 
     #[test]
