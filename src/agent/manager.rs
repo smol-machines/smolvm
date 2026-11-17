@@ -840,6 +840,7 @@ fn credentials_query(
 /// a boot process run without the per-VM user drop (`SMOLVM_VM_UID_DROP=off`)
 /// keeps the host's user while its directory may still belong to the uid an
 /// earlier boot dropped to. Any other user is another machine's.
+#[cfg(unix)]
 fn peer_may_serve(peer: u32, owner: u32, me: u32) -> bool {
     peer == owner || peer == me || peer == 0
 }
@@ -6287,6 +6288,7 @@ mod tests {
 
     /// The process answering a machine's credentials socket must be the
     /// machine's own user, the asker's, or root; another machine's is refused.
+    #[cfg(unix)]
     #[test]
     fn only_the_machines_own_or_a_trusted_user_serves_its_socket() {
         // A dropped boot process: the machine's uid owns the directory.
