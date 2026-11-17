@@ -987,6 +987,56 @@ mod cached_export_tests {
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
     use std::io::{Read, Write};
+
+    #[test]
+    fn cached_layer_order_excludes_workspace_and_unfinished_extractions() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::create_dir_all(layers.join("unfinished.partial")).unwrap();
+        std::fs::write(layers.join("workspace-seed/workspace.tar"), "workspace").unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("image.tar"), "image").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/image.tar".into()])
+        );
+    }
+
+    #[test]
+    fn cached_layer_order_preserves_manifest_order_and_requires_all_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::write(layers.join("zzz.tar"), "base").unwrap();
+        std::fs::create_dir(layers.join("aaa")).unwrap();
+        // Never guess alphabetical order for a multi-layer image.
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("layer-order"), "zzz\naaa\n").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/zzz.tar".into(), "layers/aaa".into()])
+        );
+        std::fs::remove_file(layers.join("zzz.tar")).unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+    }
+
+    #[test]
+    fn cached_layer_order_rejects_metadata_and_unsafe_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        for id in [
+            "workspace-seed",
+            "..",
+            "../layers/workspace-seed",
+            "evil'command",
+            "unfinished.partial",
+        ] {
+            std::fs::write(layers.join("layer-order"), id).unwrap();
+            assert_eq!(ordered_cached_layer_ids(temp.path()), None, "{id}");
+        }
+    }
     /// An export helper whose creator died is stopped and its scratch removed;
     /// a live process that was not booted from the scratch is left alone.
     #[cfg(target_os = "linux")]
@@ -1380,8 +1430,8 @@ fn export_flattened_from_artifact_sourced(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}) and could not be rebuilt: \
-                 the source artifact ({}) is not available. Restore the source \
+                 imported layer cache is incomplete or has no usable layer order ({}) \
+                 and could not be rebuilt from the source artifact ({}). Restore the source \
                  .smolmachine at that path, or start the machine once to \
                  re-extract, then re-run the export.",
                 pack_content_dir.display(),
@@ -1451,8 +1501,18 @@ fn export_flattened_from_artifact_sourced(
 /// when the cache (or its ordering) is gone.
 fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
-    let order_path = layers_dir.join("layer-order");
     let cached_form = |id: &str| -> Option<String> {
+        // Workspace seeds and interrupted extraction directories are metadata,
+        // not image layers; IDs also enter a guest shell command below.
+        if id.is_empty()
+            || matches!(id, "." | ".." | "workspace-seed")
+            || smolvm_pack::extract::is_partial_dir_name(id)
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return None;
+        }
         if layers_dir.join(id).is_dir() {
             Some(format!("layers/{}", id))
         } else if layers_dir.join(format!("{id}.tar")).is_file() {
@@ -1461,7 +1521,8 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
             None
         }
     };
-    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+    let order = cached_layer_order(pack_content_dir);
+    if let Some(contents) = order {
         let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
@@ -1485,6 +1546,22 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
         return None;
     }
     Some(entries)
+}
+
+fn cached_layer_order(pack_content_dir: &Path) -> Option<String> {
+    if let Ok(order) = std::fs::read_to_string(pack_content_dir.join("layers/layer-order")) {
+        return Some(order);
+    }
+    // Older macOS caches recorded order only on their case-sensitive volume.
+    // Lease it while reading the index, then export the retained original tars
+    // from the pack root; the helper's shared-cache mount contract is unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let lease = smolvm_pack::extract::acquire_layers_lease(pack_content_dir, false).ok()?;
+        std::fs::read_to_string(lease.path.join("layer-order")).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source

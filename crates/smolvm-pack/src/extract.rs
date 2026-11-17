@@ -4642,6 +4642,11 @@ fn post_process_extraction(
                 .collect();
             if !lines.is_empty() {
                 fs::write(extract_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+                // Re-export stages the retained tars from the pack root, not
+                // the macOS case-sensitive volume. Keep its order there too.
+                if extract_dir != layers_dir {
+                    fs::write(layers_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+                }
             }
         }
     }
@@ -5882,6 +5887,41 @@ mod tests {
         .unwrap();
         assert!(materialize_workspace_seed(cache.path(), mounted.path()).is_err());
         assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_extraction_keeps_tar_order_for_reexport() {
+        struct MountedCache(tempfile::TempDir);
+        impl Drop for MountedCache {
+            fn drop(&mut self) {
+                force_detach_layers_volume(self.0.path());
+            }
+        }
+        let cache = MountedCache(tempfile::tempdir().unwrap());
+        let layers = cache.0.path().join("layers");
+        fs::create_dir(&layers).unwrap();
+        fs::write(layers.join("zzz.tar"), tar_of(&[("file", b"base")])).unwrap();
+        fs::write(layers.join("aaa.tar"), tar_of(&[("file", b"top")])).unwrap();
+        post_process_extraction(
+            cache.0.path(),
+            &["zzz".into(), "aaa".into()],
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(layers.join(LAYER_ORDER_FILE)).unwrap(),
+            "zzz\naaa"
+        );
+        let lease = acquire_layers_lease(cache.0.path(), false).unwrap();
+        assert_eq!(
+            fs::read_to_string(lease.path.join(LAYER_ORDER_FILE)).unwrap(),
+            "zzz\naaa"
+        );
+        assert!(layers.join("zzz.tar").is_file());
+        assert!(layers.join("aaa.tar").is_file());
     }
 
     #[cfg(target_os = "macos")]
