@@ -5431,13 +5431,23 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
 /// Create the case-sensitive sparse image at `image_path`.
 ///
 /// `hdiutil create` formats a new APFS container every time, which takes about
-/// a second, and every machine created from a pack needs its own image. So the
-/// blank image for each size is made once and every machine gets an APFS clone
+/// a second when packed layers need host-side extraction. The blank image
+/// for each size is cached once and each layers volume gets an APFS clone
 /// of it, which attaches as an independent volume. Without a template the
 /// image is created directly, as before.
 #[cfg(target_os = "macos")]
 fn create_cs_image(image_path: &Path, size_arg: &str, debug: bool) -> std::io::Result<()> {
-    if let Some(template) = cs_image_template(size_arg, debug) {
+    create_cs_image_with_cache(image_path, size_arg, debug, cs_template_dir().as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn create_cs_image_with_cache(
+    image_path: &Path,
+    size_arg: &str,
+    debug: bool,
+    cache_dir: Option<&Path>,
+) -> std::io::Result<()> {
+    if let Some(template) = cache_dir.and_then(|dir| cs_image_template(dir, size_arg, debug)) {
         if clone_file(&template, image_path).is_ok() {
             return Ok(());
         }
@@ -5448,27 +5458,36 @@ fn create_cs_image(image_path: &Path, size_arg: &str, debug: bool) -> std::io::R
 
 /// The blank image of `size_arg` in the shared cache, made on first use.
 #[cfg(target_os = "macos")]
-fn cs_image_template(size_arg: &str, debug: bool) -> Option<PathBuf> {
-    let dir = cs_template_dir()?;
+fn cs_image_template(dir: &Path, size_arg: &str, debug: bool) -> Option<PathBuf> {
+    build_cs_image_template(dir, size_arg, |staging| {
+        if debug {
+            eprintln!("debug: creating {size_arg} case-sensitive volume template...");
+        }
+        hdiutil_create_cs_image(staging, size_arg)
+    })
+    .ok()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn build_cs_image_template(
+    dir: &Path,
+    size_arg: &str,
+    build: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
     let template = dir.join(format!("{size_arg}.sparseimage"));
     if template.is_file() {
-        return Some(template);
+        return Ok(template);
     }
-    fs::create_dir_all(&dir).ok()?;
-    // Built under a private name and renamed into place, so a concurrent
-    // creator or a crash never leaves a half-formatted template behind.
-    let staging = dir.join(format!(".{size_arg}.{}.sparseimage", std::process::id()));
-    let _ = fs::remove_file(&staging);
-    if debug {
-        eprintln!("debug: creating {size_arg} case-sensitive volume template...");
-    }
-    let built =
-        hdiutil_create_cs_image(&staging, size_arg).and_then(|()| fs::rename(&staging, &template));
-    if built.is_err() {
-        let _ = fs::remove_file(&staging);
-        return None;
-    }
-    Some(template)
+    fs::create_dir_all(dir)?;
+    // Each request owns its staging directory, including concurrent calls in
+    // the same process. Publish only after hdiutil has finished formatting.
+    let staging = tempfile::Builder::new()
+        .prefix(".cs-template-")
+        .tempdir_in(dir)?;
+    let image = staging.path().join("blank.sparseimage");
+    build(&image)?;
+    fs::rename(&image, &template)?;
+    Ok(template)
 }
 
 /// Where blank images are kept. Tests use a private directory so they never
@@ -8855,20 +8874,75 @@ mod tests {
     }
 
     #[test]
+    fn concurrent_cs_template_builders_never_publish_another_builders_partial_image() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let spawn_builder = |prefix: &'static [u8]| {
+            let directory = directory.path().to_path_buf();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                build_cs_image_template(&directory, "1g", |staging| {
+                    // Hold the opened file, as hdiutil does during formatting.
+                    let mut image = fs::File::create(staging)?;
+                    image.write_all(prefix)?;
+                    ready_tx.send(()).unwrap();
+                    finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    image.write_all(b"-complete")?;
+                    image.sync_all()
+                })
+            });
+            (thread, ready_rx, finish_tx)
+        };
+        let (first, first_ready, finish_first) = spawn_builder(b"first");
+        first_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (second, second_ready, finish_second) = spawn_builder(b"second");
+        second_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!directory.path().join("1g.sparseimage").exists());
+        finish_first.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        let first_contents = fs::read(directory.path().join("1g.sparseimage"));
+        // Always release the other builder before checking the result.
+        finish_second.send(()).unwrap();
+        let second_result = second.join().unwrap();
+        first_result.unwrap();
+        assert_eq!(first_contents.unwrap(), b"first-complete");
+        second_result.unwrap();
+        assert_eq!(
+            fs::read(directory.path().join("1g.sparseimage")).unwrap(),
+            b"second-complete"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
     #[cfg(target_os = "macos")]
     fn case_sensitive_images_cloned_from_one_template_mount_independently() {
+        struct Mount(PathBuf);
+        impl Drop for Mount {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .status();
+            }
+        }
         let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("templates");
         let (first, second) = (
             temp.path().join("a.sparseimage"),
             temp.path().join("b.sparseimage"),
         );
-        if let Err(e) = create_cs_image(&first, "1g", false) {
+        if let Err(e) = create_cs_image_with_cache(&first, "1g", false, Some(&cache)) {
             eprintln!("SKIP: hdiutil unavailable: {}", e);
             return;
         }
-        let template = cs_template_dir().unwrap().join("1g.sparseimage");
-        let before = fs::read(&template).unwrap();
-        create_cs_image(&second, "1g", false).unwrap();
+        let template = cache.join("1g.sparseimage");
+        let before = hash_artifact_sha256(&template).unwrap();
+        create_cs_image_with_cache(&second, "1g", false, Some(&cache)).unwrap();
 
         let mut mounts = Vec::new();
         for (image, name) in [(&first, "ma"), (&second, "mb")] {
@@ -8883,29 +8957,27 @@ mod tests {
                 .unwrap()
                 .success();
             assert!(ok, "attach {}", image.display());
-            mounts.push(mount);
+            mounts.push(Mount(mount));
         }
         // Both clones are attached at once, keep their own files, and are
         // case-sensitive.
-        fs::write(mounts[0].join("lower"), "a").unwrap();
-        fs::write(mounts[0].join("LOWER"), "A").unwrap();
-        fs::write(mounts[1].join("lower"), "b").unwrap();
-        assert_eq!(fs::read_to_string(mounts[0].join("lower")).unwrap(), "a");
-        assert_eq!(fs::read_to_string(mounts[0].join("LOWER")).unwrap(), "A");
-        assert_eq!(fs::read_to_string(mounts[1].join("lower")).unwrap(), "b");
-        assert!(!mounts[1].join("LOWER").exists());
-        for mount in &mounts {
-            let _ = std::process::Command::new("hdiutil")
-                .args(["detach", "-quiet", "-force"])
-                .arg(mount)
-                .status();
+        fs::write(mounts[0].0.join("lower"), "a").unwrap();
+        fs::write(mounts[0].0.join("LOWER"), "A").unwrap();
+        fs::write(mounts[1].0.join("lower"), "b").unwrap();
+        assert_eq!(fs::read_to_string(mounts[0].0.join("lower")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(mounts[0].0.join("LOWER")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(mounts[1].0.join("lower")).unwrap(), "b");
+        assert!(!mounts[1].0.join("LOWER").exists());
+        for mount in mounts {
+            let path = mount.0.clone();
+            drop(mount);
+            assert!(!is_mount_point(&path), "test image must detach");
         }
         assert_eq!(
-            fs::read(&template).unwrap(),
+            hash_artifact_sha256(&template).unwrap(),
             before,
             "the template is never written"
         );
-        let _ = fs::remove_dir_all(cs_template_dir().unwrap());
     }
 
     #[test]
