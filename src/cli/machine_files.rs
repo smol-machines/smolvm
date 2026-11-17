@@ -28,6 +28,11 @@ pub enum FilesAction {
         source: String,
         destination: PathBuf,
     },
+    /// Stream a directory as a tar archive without following symbolic links
+    Archive {
+        source: String,
+        destination: PathBuf,
+    },
 }
 
 fn validate_path(path: &str) -> smolvm::Result<()> {
@@ -45,7 +50,7 @@ impl FilesCmd {
         let guest = match &self.command {
             FilesAction::List { path, .. } => path,
             FilesAction::Upload { destination, .. } => destination,
-            FilesAction::Download { source, .. } => source,
+            FilesAction::Download { source, .. } | FilesAction::Archive { source, .. } => source,
         };
         validate_path(guest)?;
         let db = smolvm::db::SmolvmDb::open()?;
@@ -56,6 +61,7 @@ impl FilesCmd {
         let (manager, mut client) = super::vm_common::ensure_running_and_connect(&Some(self.name))?;
         manager.detach();
         client.use_target(smolvm::workload::machine_target(&record))?;
+        let archive = matches!(self.command, FilesAction::Archive { .. });
         match self.command {
             FilesAction::List { path, json } => {
                 let entries = client.list_directory(&path)?;
@@ -104,8 +110,19 @@ impl FilesCmd {
             FilesAction::Download {
                 source,
                 destination,
+            }
+            | FilesAction::Archive {
+                source,
+                destination,
             } => {
-                let mut progress = super::ProgressBar::new("Downloading file", None);
+                let mut progress = super::ProgressBar::new(
+                    if archive {
+                        "Downloading folder archive"
+                    } else {
+                        "Downloading file"
+                    },
+                    None,
+                );
                 let parent = destination
                     .parent()
                     .filter(|p| !p.as_os_str().is_empty())
@@ -115,8 +132,15 @@ impl FilesCmd {
                     .tempdir_in(parent)
                     .map_err(|e| smolvm::Error::agent("stage download", e.to_string()))?;
                 let payload = staging.path().join("payload");
-                let size = client
-                    .read_file_to_path(&source, &payload, |received| progress.update(received))?;
+                let size = if archive {
+                    client.archive_directory_to_path(&source, &payload, |received| {
+                        progress.update(received)
+                    })?
+                } else {
+                    client.read_file_to_path(&source, &payload, |received| {
+                        progress.update(received)
+                    })?
+                };
                 std::fs::rename(&payload, &destination)
                     .map_err(|e| smolvm::Error::agent("save download", e.to_string()))?;
                 progress.finish(size);
@@ -156,6 +180,25 @@ mod tests {
         };
         assert_eq!(source, PathBuf::from(r"C:\project files\input.txt"));
         assert_eq!(destination, "/workspace/a:b");
+        let parsed = Cli::try_parse_from([
+            "files",
+            "--name",
+            "dev",
+            "archive",
+            "/workspace/a:b",
+            r"C:\project files\folder.tar",
+        ])
+        .unwrap();
+        let FilesAction::Archive {
+            source,
+            destination,
+        } = parsed.files.command
+        else {
+            panic!("archive");
+        };
+        assert_eq!(source, "/workspace/a:b");
+        assert_eq!(destination, PathBuf::from(r"C:\project files\folder.tar"));
+
         assert!(validate_path("relative").is_err());
         assert!(validate_path("/workspace/with space ; $(true)").is_ok());
     }
