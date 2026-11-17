@@ -3994,8 +3994,45 @@ pub fn expand_disks(
     new_storage_gb: Option<u64>,
     new_overlay_gb: Option<u64>,
 ) -> smolvm::Result<Vec<String>> {
-    use smolvm::data::disk::{Overlay, Storage};
-    use smolvm::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
+    plan_disk_growth(name, record, new_storage_gb, new_overlay_gb)?.grow()
+}
+
+/// Disk growth checked and ready: [`DiskGrowth::grow`] only touches the
+/// disk files, so it can run inside a record write once every other check
+/// has passed.
+pub struct DiskGrowth {
+    storage: Option<(std::path::PathBuf, u64, u64)>,
+    overlay: Option<(std::path::PathBuf, u64, u64)>,
+}
+
+impl DiskGrowth {
+    /// Grow the disk files; the changes, for display.
+    pub fn grow(&self) -> smolvm::Result<Vec<String>> {
+        use smolvm::data::disk::{Overlay, Storage};
+        use smolvm::storage::expand_disk;
+        let mut changes = Vec::new();
+        if let Some((path, from, to)) = &self.storage {
+            expand_disk::<Storage>(path, *to)
+                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            changes.push(format!("  storage: {from} GiB → {to} GiB"));
+        }
+        if let Some((path, from, to)) = &self.overlay {
+            expand_disk::<Overlay>(path, *to)
+                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            changes.push(format!("  overlay: {from} GiB → {to} GiB"));
+        }
+        Ok(changes)
+    }
+}
+
+/// Every check [`expand_disks`] makes, and where it would grow which disk.
+pub fn plan_disk_growth(
+    name: &str,
+    record: &smolvm::config::VmRecord,
+    new_storage_gb: Option<u64>,
+    new_overlay_gb: Option<u64>,
+) -> smolvm::Result<DiskGrowth> {
+    use smolvm::storage::{DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 
     // A fork base's disks are the copy-on-write backing for its clones' disks, so
     // growing them corrupts the clones' overlays. Refuse if any clone still
@@ -4044,34 +4081,14 @@ pub fn expand_disks(
 
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
-
-    let mut changes = Vec::new();
-
-    if let Some(storage_gb) = new_storage_gb {
-        if storage_gb > current_storage_gb {
-            let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
-            changes.push(format!(
-                "  storage: {} GiB → {} GiB",
-                current_storage_gb, storage_gb
-            ));
-        }
-    }
-
-    if let Some(overlay_gb) = new_overlay_gb {
-        if overlay_gb > current_overlay_gb {
-            let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
-            changes.push(format!(
-                "  overlay: {} GiB → {} GiB",
-                current_overlay_gb, overlay_gb
-            ));
-        }
-    }
-
-    Ok(changes)
+    Ok(DiskGrowth {
+        storage: new_storage_gb
+            .filter(|gb| *gb > current_storage_gb)
+            .map(|gb| (manager.storage_path().to_path_buf(), current_storage_gb, gb)),
+        overlay: new_overlay_gb
+            .filter(|gb| *gb > current_overlay_gb)
+            .map(|gb| (manager.overlay_path().to_path_buf(), current_overlay_gb, gb)),
+    })
 }
 
 /// Resize running resources through the shared engine and its durable journal.

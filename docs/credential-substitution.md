@@ -192,13 +192,19 @@ On a running machine the change applies from its next request, with no restart:
   when an API caller or embedder takes the bindings over. A reference no
   binding ever read stays: removing an API caller's binding on a variable the
   operator gave a `--secret-env` only stops withholding it from the guest.
-  The values kept for such hosts are bounded (the oldest of 256 goes first);
-  the hosts themselves stay intercepted for as long as the machine runs.
+  The values kept for such hosts are bounded (see the limits below); the hosts
+  themselves stay intercepted for as long as the machine runs. This holds when
+  the change that removed the binding is rolled back too: the first bindings
+  of a machine that booted without any start an interceptor, and if that
+  interceptor resolved a value before the change failed, it keeps running
+  with no binding instead of stopping.
 - A connection the guest opened before a binding covered its host was relayed
   untouched, and nothing on it is checked. A change that binds that host
   resets such a connection before the new bindings take effect, so a value
   injected on a new connection can never be read back on an old one; the
-  guest reconnects. A connection without a server name is reset by any change
+  guest reconnects. New connections to the host wait for the change meanwhile.
+  If such a connection has not closed within 5 seconds, the change is refused
+  (`409`, nothing changed) rather than applied around it; retry it. A connection without a server name is reset by any change
   that binds a new host. Responses are checked for every value bound to their
   host when each part of them arrives, so a value bound while a long poll or
   event stream is open is removed from the rest of it.
@@ -444,6 +450,33 @@ after the restore, before or after its first start.
   not buffered.
 - An upstream can still return a credential in its response body. This is
   substitution, not data-loss prevention.
+
+### What scrubbing does and does not protect against
+
+Responses from a credential host are scrubbed of the values sent to it, so a
+host that echoes or stores a request's credential does not hand it to a
+well-behaved client. Scrubbing is not a confinement boundary against a
+compromised guest. A guest that wants a value back can reach the same server
+without going through interception:
+
+- a TLS connection without a server name, with an IP literal, with a server
+  name no binding covers (or encrypted with ECH), or whose ClientHello does
+  not arrive whole, to the bound host's address;
+- an HTTP/2 connection to another name the server answers for (connection
+  coalescing);
+- QUIC or other UDP to port 443, and plain HTTP on port 80 or any port but
+  443.
+
+These connections are relayed untouched, as any connection to a host no
+binding covers. Choose credentials whose holder may read them back (scoped,
+short-lived, revocable tokens), or keep the guest from talking to the bound
+hosts by other means, when the guest itself is not trusted.
+
+Bounds: the interceptor remembers the last 4 values each binding resolved to
+(so a rotated value is still scrubbed), and keeps scrubbing up to 256 values,
+oldest dropped first, on hosts their bindings stopped covering. The hosts
+themselves are never dropped: once a value was sent to a host, it stays
+intercepted for as long as the machine runs.
 
 ## Comparison with `--secret-env` / `--secret-file`
 

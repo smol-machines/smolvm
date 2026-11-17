@@ -611,7 +611,13 @@ impl TcpRelayTable {
         let Some(slot) = self.late_https_intercept else {
             return;
         };
-        let published = slot.published();
+        self.end_flows_published_by(slot.snapshot());
+    }
+
+    /// [`Self::end_flows_a_published_interceptor_takes`] for one read of the
+    /// late slot.
+    fn end_flows_published_by(&mut self, late: crate::LateSlot) {
+        let published = late.published;
         if published == self.late_published_seen {
             return;
         }
@@ -645,17 +651,29 @@ impl TcpRelayTable {
         }
     }
 
-    /// The interception in force for a flow opened now.
-    fn current_intercept(&self) -> Option<crate::StreamInterception> {
+    /// The interception in force given a read of the late slot.
+    fn intercept_with(&self, late: Option<crate::LateSlot>) -> Option<crate::StreamInterception> {
         self.intercept.or_else(|| {
-            self.late_https_intercept
-                .and_then(|slot| slot.get())
+            late.and_then(|slot| slot.endpoint)
                 .map(crate::StreamInterception::Https)
         })
     }
 
     /// Relay target for a guest-initiated flow that egress already admitted.
+    #[cfg(test)]
     fn outbound_target(&self, destination: SocketAddr) -> RelayTarget {
+        self.outbound_target_with(
+            destination,
+            self.late_https_intercept.map(|slot| slot.snapshot()),
+        )
+    }
+
+    /// [`Self::outbound_target`] given a read of the late slot.
+    fn outbound_target_with(
+        &self,
+        destination: SocketAddr,
+        late: Option<crate::LateSlot>,
+    ) -> RelayTarget {
         // The dedicated rollout ingress is a smolvm-owned service on the
         // gateway, not an outbound origin. Keep it available even when every
         // external TCP flow is delegated to a broker.
@@ -694,7 +712,7 @@ impl TcpRelayTable {
             }
             _ => {}
         }
-        match self.current_intercept() {
+        match self.intercept_with(late) {
             Some(crate::StreamInterception::Https(endpoint))
                 if destination.port() == INTERCEPTED_PORT
                     && !self.gateway_ips.contains(&destination.ip()) =>
@@ -1029,9 +1047,14 @@ impl TcpRelayTable {
             return false;
         }
 
-        // Older direct flows end before this one can reach an interceptor.
-        self.end_flows_a_published_interceptor_takes();
-        let relay_target = self.outbound_target(destination);
+        // Older direct flows end before this one can reach an interceptor:
+        // both decided from one read of the slot, so the interceptor this
+        // flow may go to is never one whose publication was not acted on.
+        let late = self.late_https_intercept.map(|slot| slot.snapshot());
+        if let Some(late) = late {
+            self.end_flows_published_by(late);
+        }
+        let relay_target = self.outbound_target_with(destination, late);
         let (rx_bytes, tx_bytes) = self.next_buffer_bytes();
         let rx_buffer = tcp::SocketBuffer::new(vec![0u8; rx_bytes]);
         let tx_buffer = tcp::SocketBuffer::new(vec![0u8; tx_bytes]);
@@ -2904,6 +2927,33 @@ mod tests {
             table.outbound_target(SocketAddr::new(gateway, 443)),
             RelayTarget::Connect(addr) if addr.ip().is_loopback()
         ));
+    }
+
+    /// A reader of the late slot never sees an interceptor without the
+    /// publication that ends the direct flows before it: both are read and
+    /// written at once.
+    #[test]
+    fn a_published_interceptor_is_never_seen_before_its_publication() {
+        let endpoint = crate::InterceptEndpoint {
+            addr: "127.0.0.1:1".parse().unwrap(),
+            token: [7; smolvm_protocol::intercept::TOKEN_LEN],
+        };
+        for _ in 0..200 {
+            let slot = crate::LateHttpsIntercept::new();
+            let writer = std::thread::spawn(move || slot.set(endpoint));
+            loop {
+                let seen = slot.snapshot();
+                assert!(seen.endpoint.is_none() || seen.published > 0);
+                if seen.endpoint.is_some() {
+                    break;
+                }
+                if writer.is_finished() {
+                    assert!(slot.snapshot().published == 1);
+                    break;
+                }
+            }
+            writer.join().unwrap();
+        }
     }
 
     /// HTTPS flows opened directly before a credential interceptor is

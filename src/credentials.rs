@@ -647,8 +647,9 @@ pub struct OtherSettings<'a> {
     /// the record as the lock finds it, which the bindings are then checked
     /// against, and again in the write. An error refuses the whole change.
     pub apply: &'a dyn Fn(&mut VmRecord, &CredentialPolicy) -> Result<()>,
-    /// Work outside the record (growing disks) once everything is checked
-    /// and before anything is written: an error leaves the record as it was.
+    /// Work outside the record (growing disks), run inside the record's write
+    /// once nothing else can refuse it: an error writes nothing. It must not
+    /// use the database.
     pub prepare: PrepareSettings<'a>,
 }
 
@@ -817,11 +818,6 @@ fn set_bindings_with(
             tracing::warn!(machine = name, %error, "could not record that the machine's credential bindings are unsettled");
         }
     };
-    // Work outside the record, now that everything is checked: a failure
-    // here leaves the record untouched.
-    if let Some(prepare) = prepare {
-        prepare(&next).map_err(BindingsError::Failed)?;
-    }
     // Whether the running machine's boot process took the change, and so
     // must be told to undo it if the change fails from here on.
     let mut sent = false;
@@ -842,12 +838,17 @@ fn set_bindings_with(
     }
     // One write: the other settings and the bindings land together, or,
     // when a setting no longer applies to the record the write finds,
-    // neither does.
+    // neither does. Work outside the record (growing disks) runs inside it,
+    // last, once nothing can refuse the write any more; if it fails, nothing
+    // is written.
     let saved = match db.try_update_vm(name, |r| {
         if let Some(apply) = apply {
             apply(r, &policy)?;
         }
         r.take_credential_bindings(&next);
+        if let Some(prepare) = prepare {
+            prepare(r)?;
+        }
         Ok(())
     }) {
         Ok(Some(saved)) => saved,
@@ -1681,6 +1682,10 @@ impl LiveCredentials {
         };
         match &state.running {
             Some(running) => {
+                // Connections spliced to hosts these bindings intercept end
+                // first, without the resolver's lock held while they do; a
+                // connection that will not end refuses the change whole.
+                let prepared = running.control.prepare_bindings(&message.policy)?;
                 let mut resolver = running.resolver.lock();
                 let previous_resolver = resolver.clone();
                 let mut next = ResolverState::default();
@@ -1700,7 +1705,8 @@ impl LiveCredentials {
                 // Under the resolver's lock: no value is resolved between the
                 // new bindings and their sources and values.
                 running.control.replace_ca(ca);
-                running.control.replace_bindings_keeping(
+                running.control.commit_bindings(
+                    prepared,
                     message.policy.clone(),
                     &message.placeholders,
                     &kept,
@@ -1776,6 +1782,31 @@ impl LiveCredentials {
         let Some(previous) = state.previous.take() else {
             return Err(NOTHING_TO_ROLL_BACK.to_string());
         };
+        // Connections spliced to hosts the restored bindings intercept end
+        // first; if one will not, nothing is restored, and the rollback can
+        // be asked for again.
+        // An interceptor started since that resolved a value is kept, with
+        // no binding (see below).
+        let sent = previous.resolver.is_none()
+            && state
+                .running
+                .as_ref()
+                .is_some_and(|running| running.resolver.resolved_any());
+        let target = match &previous.resolver {
+            Some(_) => Some(previous.policy.clone()),
+            None if sent => Some(CredentialPolicy::default()),
+            None => None,
+        };
+        let prepared = match (target, &state.running) {
+            (Some(target), Some(running)) => match running.control.prepare_bindings(&target) {
+                Ok(prepared) => Some(prepared),
+                Err(reason) => {
+                    state.previous = Some(previous);
+                    return Err(reason);
+                }
+            },
+            _ => None,
+        };
         match previous.resolver {
             Some(mut resolver_state) => {
                 // A value sent since serves a restored binding that has the
@@ -1792,9 +1823,10 @@ impl LiveCredentials {
                         resolver_state.live.insert(name, value);
                     }
                 }
-                if let Some(running) = &state.running {
+                if let (Some(running), Some(prepared)) = (&state.running, prepared) {
                     let mut resolver = running.resolver.lock();
-                    running.control.replace_bindings_keeping(
+                    running.control.commit_bindings(
+                        prepared,
                         previous.policy.clone(),
                         &previous.placeholders,
                         &previous.kept,
@@ -1803,11 +1835,28 @@ impl LiveCredentials {
                 }
             }
             None => {
-                // No interceptor ran before: stop the one started since.
-                if let Some(slot) = self.late {
-                    slot.clear();
+                // No interceptor ran before the one started since. One that
+                // never resolved a value is stopped. One that did may have
+                // sent it to a host that stored it: it keeps running with no
+                // binding, so those hosts stay intercepted and scrubbed of
+                // what was sent there (and inject nothing) for as long as the
+                // machine runs, never relayed directly again.
+                if sent {
+                    if let (Some(running), Some(prepared)) = (&state.running, prepared) {
+                        let empty = CredentialPolicy::default();
+                        let mut resolver = running.resolver.lock();
+                        running
+                            .control
+                            .commit_bindings(prepared, empty, &BTreeMap::new(), &[]);
+                        *resolver = ResolverState::default();
+                    }
+                    tracing::warn!("credential bindings removed; their interceptor keeps running because it already resolved a value");
+                } else {
+                    if let Some(slot) = self.late {
+                        slot.clear();
+                    }
+                    state.running = None;
                 }
-                state.running = None;
             }
         }
         state.policy = previous.policy;
@@ -1832,6 +1881,8 @@ struct ResolverState {
 /// to the running machine through [`CREDENTIALS_SOCKET`] takes precedence.
 struct SecretRefResolver {
     state: Mutex<ResolverState>,
+    /// It has handed the interceptor a value, which may have been sent on.
+    resolved: std::sync::atomic::AtomicBool,
 }
 
 impl SecretRefResolver {
@@ -1841,7 +1892,13 @@ impl SecretRefResolver {
                 sources,
                 live: BTreeMap::new(),
             }),
+            resolved: std::sync::atomic::AtomicBool::new(false),
         }
+    }
+
+    /// Whether it ever handed the interceptor a value.
+    fn resolved_any(&self) -> bool {
+        self.resolved.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ResolverState> {
@@ -1862,6 +1919,8 @@ impl CredentialResolver for SecretRefResolver {
         let source = {
             let state = self.lock();
             if let Some(value) = state.live.get(&request.binding) {
+                self.resolved
+                    .store(true, std::sync::atomic::Ordering::Release);
                 return Ok(value.clone());
             }
             state
@@ -1870,12 +1929,15 @@ impl CredentialResolver for SecretRefResolver {
                 .cloned()
                 .ok_or(ResolveError::Unknown)?
         };
-        crate::secrets::resolve_secret_ref_classified(
+        let value = crate::secrets::resolve_secret_ref_classified(
             &request.binding,
             &source,
             crate::secrets::ResolutionScope::RecordReplay,
         )
-        .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))
+        .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))?;
+        self.resolved
+            .store(true, std::sync::atomic::Ordering::Release);
+        Ok(value)
     }
 }
 
@@ -2579,6 +2641,49 @@ mod tests {
         assert!(live.state.lock().unwrap().running.is_none());
         assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
         assert!(send(dir.path(), r#"{"rollback":true}"#).contains(NOTHING_TO_ROLL_BACK));
+    }
+
+    /// The first bindings of a machine that booted without any start an
+    /// interceptor; if the change then fails (the guest cannot install the
+    /// CA, say) after that interceptor already resolved a value, the
+    /// rollback keeps it running with no binding, still published, instead of
+    /// stopping it: a host the value went to stays intercepted and scrubbed,
+    /// never relayed directly again. One that resolved nothing is stopped.
+    #[test]
+    fn a_rollback_keeps_a_late_interceptor_that_already_resolved_a_value() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("token");
+        std::fs::write(&token, "ghp_resolved").unwrap();
+        let live = serve_unbound(dir.path());
+        let slot = live.late.unwrap();
+        let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+        let refs: BTreeMap<String, SecretRef> =
+            [("GH_TOKEN".to_string(), crate::secrets::file_ref(token))].into();
+        assert!(send(dir.path(), &bindings_message_with(&launch, refs)).starts_with("ok"));
+        assert!(slot.get().is_some());
+        // The interceptor resolves the value for a request to its host...
+        let resolver = resolver_of(&live);
+        assert_eq!(
+            resolver
+                .resolve(&request("gh", "github.com"))
+                .unwrap()
+                .as_str(),
+            "ghp_resolved"
+        );
+        // ...and then the guest refuses the CA: the host rolls back.
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+        assert!(slot.get().is_some(), "still published");
+        let state = live.state.lock().unwrap();
+        assert!(state.running.is_some(), "still running");
+        assert!(state.policy.is_empty());
+        drop(state);
+        let after = resolver_of(&live).lock().clone();
+        assert!(after.sources.is_empty() && after.live.is_empty());
+        assert!(matches!(
+            resolver.resolve(&request("gh", "github.com")),
+            Err(ResolveError::Unknown)
+        ));
+        assert!(send(dir.path(), r#"{"values":{"gh":"x"}}"#).contains("no credential binding 'gh'"));
     }
 
     /// A value is sent tagged with the binding it was read for, and refused
@@ -3357,7 +3462,7 @@ mod tests {
             |_| Ok(bindings_of(&["gh=GH_TOKEN@github.com"])),
             Some(OtherSettings {
                 apply: &apply,
-                prepare: Box::new(|_| Ok(())),
+                prepare: Box::new(|_| panic!("disks never grow for a refused write")),
             }),
             &live,
             |_, _, _| panic!("nothing runs after a refused write"),

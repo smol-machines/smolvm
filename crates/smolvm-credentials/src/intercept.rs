@@ -76,7 +76,11 @@ const MAX_REMEMBERED_VALUES: usize = 4;
 const MAX_RETIRED_VALUES: usize = 256;
 /// Longest a change of bindings waits for a flow it ends (one spliced to a
 /// host the change intercepts) to be gone before it takes effect.
-const SPLICE_END_WAIT: Duration = Duration::from_secs(5);
+const SPLICE_END_WAIT: Duration = if cfg!(test) {
+    Duration::from_millis(500)
+} else {
+    Duration::from_secs(5)
+};
 /// Largest compressed body decoded for scrubbing, from a server that ignored
 /// `Accept-Encoding: identity`.
 const ENCODED_LIMIT: usize = 64 * 1024 * 1024;
@@ -213,6 +217,10 @@ struct Splice {
 }
 
 impl Splice {
+    fn has_ended(&self) -> bool {
+        *self.ended.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     fn end(&self) {
         self.cancel.notify_one();
     }
@@ -225,6 +233,29 @@ impl Splice {
             .wait_timeout_while(ended, limit, |ended| !*ended)
             .unwrap_or_else(|e| e.into_inner());
         *ended
+    }
+}
+
+/// Hosts a change of bindings is about to intercept: new connections to them
+/// wait for it rather than being spliced or seeing the old bindings.
+struct PendingIntercept {
+    /// Host patterns.
+    hosts: Vec<String>,
+    /// Connections with no server name wait too.
+    unnamed: bool,
+}
+
+/// A change of bindings whose spliced connections have ended, ready to be
+/// committed with [`InterceptorControl::commit_bindings`]. Dropped without
+/// that, it changes nothing and lets held connections go on.
+pub struct PreparedBindings {
+    state: Arc<State>,
+}
+
+impl Drop for PreparedBindings {
+    fn drop(&mut self) {
+        *self.state.pending.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        self.state.pending_changed.notify_waiters();
     }
 }
 
@@ -250,6 +281,11 @@ struct State {
     /// bindings change, so no flow is spliced to a host the new bindings
     /// intercept.
     spliced: Mutex<Vec<Arc<Splice>>>,
+    /// Hosts a change of bindings is about to intercept, while it ends the
+    /// connections spliced to them.
+    pending: Mutex<Option<PendingIntercept>>,
+    /// Wakes connections held for a pending change once it is decided.
+    pending_changed: tokio::sync::Notify,
     /// Grows whenever the values a response may need scrubbed of can have
     /// grown: bindings swapped, or a value resolved. A response being
     /// streamed rebuilds its scrubber when it changes.
@@ -288,6 +324,8 @@ impl Interceptor {
             resolved: Mutex::new(HashMap::new()),
             retired: Mutex::new(RetiredSet::default()),
             spliced: Mutex::new(Vec::new()),
+            pending: Mutex::new(None),
+            pending_changed: tokio::sync::Notify::new(),
             secrets_epoch: std::sync::atomic::AtomicU64::new(0),
             ca: RwLock::new(Arc::new(config.ca)),
             resolver,
@@ -350,8 +388,8 @@ impl InterceptorControl {
         &self,
         policy: CredentialPolicy,
         placeholders: &BTreeMap<String, String>,
-    ) {
-        self.replace_bindings_keeping(policy, placeholders, &[]);
+    ) -> std::result::Result<(), String> {
+        self.replace_bindings_keeping(policy, placeholders, &[])
     }
 
     /// Enforce `policy` with `placeholders` from the next request on. The
@@ -381,52 +419,127 @@ impl InterceptorControl {
         policy: CredentialPolicy,
         placeholders: &BTreeMap<String, String>,
         kept: &[String],
-    ) {
-        // A flow deciding to splice holds this: it decides either before the
-        // swap (and is ended here if it must be) or after it.
-        let mut spliced = self.0.spliced.lock().expect("spliced flows");
-        let mut slot = self.0.bindings.write().unwrap_or_else(|e| e.into_inner());
-        self.0.retire(&slot.policy, &policy);
-        spliced.retain(|splice| !*splice.ended.lock().unwrap_or_else(|e| e.into_inner()));
-        let new_host = policy
-            .credentials
-            .iter()
-            .flat_map(|b| b.allowed_hosts.iter())
-            .any(|host| {
-                !slot
-                    .policy
-                    .credentials
+    ) -> std::result::Result<(), String> {
+        let prepared = self.prepare_bindings(&policy)?;
+        self.commit_bindings(prepared, policy, placeholders, kept);
+        Ok(())
+    }
+
+    /// The first half of [`Self::replace_bindings_keeping`]: end every
+    /// connection spliced through untouched to a host `policy` will
+    /// intercept, holding new connections to those hosts until the change is
+    /// committed or dropped. Takes no lock while it waits, so the
+    /// interceptor keeps serving. Refused, changing nothing, if a connection
+    /// has not ended by [`SPLICE_END_WAIT`]: bindings that intercept a host
+    /// never take effect while an unchecked connection to it is open.
+    pub fn prepare_bindings(
+        &self,
+        policy: &CredentialPolicy,
+    ) -> std::result::Result<PreparedBindings, String> {
+        let state = &self.0;
+        let (ending, prepared) = {
+            let mut spliced = state.spliced.lock().expect("spliced flows");
+            let current = state.bindings();
+            let leaving = state.retire_preview(&current.policy, policy);
+            let new_host = policy
+                .credentials
+                .iter()
+                .flat_map(|b| b.allowed_hosts.iter())
+                .any(|host| {
+                    !current
+                        .policy
+                        .credentials
+                        .iter()
+                        .any(|b| b.allowed_hosts.contains(host))
+                });
+            let mut hosts: Vec<String> = policy
+                .credentials
+                .iter()
+                .flat_map(|b| b.allowed_hosts.iter().cloned())
+                .collect();
+            hosts.extend(leaving);
+            let will_intercept = |host: &str| {
+                hosts
                     .iter()
-                    .any(|b| b.allowed_hosts.contains(host))
+                    .any(|pattern| smolvm_protocol::credentials::host_matches(pattern, host))
+                    || state.has_retired(host)
+            };
+            spliced.retain(|splice| !splice.has_ended());
+            let ending: Vec<Arc<Splice>> = spliced
+                .iter()
+                .filter(|splice| match &splice.host {
+                    Some(host) => will_intercept(host),
+                    None => new_host,
+                })
+                .cloned()
+                .collect();
+            // From here until commit or drop, new connections to these hosts
+            // wait: none is spliced, and none sees the old bindings.
+            *state.pending.lock().expect("pending intercept") = Some(PendingIntercept {
+                hosts: hosts.clone(),
+                unnamed: new_host,
             });
-        let ending: Vec<Arc<Splice>> = spliced
-            .iter()
-            .filter(|splice| match &splice.host {
-                Some(host) => {
-                    policy.bindings_for_host(host).next().is_some() || self.0.has_retired(host)
-                }
-                None => new_host,
-            })
-            .cloned()
-            .collect();
+            (
+                ending,
+                PreparedBindings {
+                    state: state.clone(),
+                },
+            )
+        };
         for splice in &ending {
             splice.end();
         }
-        for splice in &ending {
-            if !splice.wait_ended(SPLICE_END_WAIT) {
-                tracing::warn!(machine = %self.0.machine, host = ?splice.host, "a spliced connection to a newly intercepted host did not end in time");
-            }
+        let deadline = std::time::Instant::now() + SPLICE_END_WAIT;
+        let lingering: Vec<Option<String>> = ending
+            .iter()
+            .filter(|splice| {
+                let left = deadline.saturating_duration_since(std::time::Instant::now());
+                !splice.wait_ended(left)
+            })
+            .map(|splice| splice.host.clone())
+            .collect();
+        if !lingering.is_empty() {
+            tracing::warn!(machine = %state.machine, hosts = ?lingering, "connections to hosts these bindings intercept did not end in time; bindings not changed");
+            // Dropping `prepared` lets held connections go on as before.
+            return Err(format!(
+                "connections opened before these bindings to hosts they intercept ({}) did not \
+                 close in time; nothing changed, retry",
+                lingering
+                    .iter()
+                    .map(|host| host.as_deref().unwrap_or("no server name"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
         }
-        let mut generations = fresh_generations(&policy);
-        for name in kept {
-            let same = slot.policy.binding(name) == policy.binding(name)
-                && slot.placeholders.get(name) == placeholders.get(name);
-            if let (true, Some(old)) = (same, slot.generations.get(name)) {
-                generations.insert(name.clone(), *old);
+        Ok(prepared)
+    }
+
+    /// The second half of [`Self::replace_bindings_keeping`]: enforce
+    /// `policy` from the next request on, then let held connections decide.
+    pub fn commit_bindings(
+        &self,
+        prepared: PreparedBindings,
+        policy: CredentialPolicy,
+        placeholders: &BTreeMap<String, String>,
+        kept: &[String],
+    ) {
+        {
+            let _spliced = self.0.spliced.lock().expect("spliced flows");
+            let mut slot = self.0.bindings.write().unwrap_or_else(|e| e.into_inner());
+            self.0.retire(&slot.policy, &policy);
+            let mut generations = fresh_generations(&policy);
+            for name in kept {
+                let same = slot.policy.binding(name) == policy.binding(name)
+                    && slot.placeholders.get(name) == placeholders.get(name);
+                if let (true, Some(old)) = (same, slot.generations.get(name)) {
+                    generations.insert(name.clone(), *old);
+                }
             }
+            *slot = Arc::new(Bindings::new(policy, placeholders, generations));
+            self.0.bump_secrets();
         }
-        *slot = Arc::new(Bindings::new(policy, placeholders, generations));
-        self.0.bump_secrets();
+        // Lets held connections decide, under the new bindings.
+        drop(prepared);
     }
 
     /// Sign leaves with `ca` from the next handshake on.
@@ -513,22 +626,32 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     // Decided under the spliced-flow lock, which a change of bindings holds
     // while it swaps them: a flow spliced now is one that change ends if it
     // intercepts the flow's host.
-    let splice = {
-        let mut spliced = state.spliced.lock().expect("spliced flows");
-        match &host {
-            Some(name) if state.intercepts(name) => None,
-            _ => {
-                spliced.retain(|splice| !*splice.ended.lock().unwrap_or_else(|e| e.into_inner()));
-                let splice = Arc::new(Splice {
-                    host: host.clone(),
-                    cancel: tokio::sync::Notify::new(),
-                    ended: std::sync::Mutex::new(false),
-                    ended_signal: std::sync::Condvar::new(),
-                });
-                spliced.push(splice.clone());
-                Some(SpliceGuard(splice))
+    // A connection to a host a pending change will intercept waits for it.
+    let splice = loop {
+        let notified = state.pending_changed.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        {
+            let mut spliced = state.spliced.lock().expect("spliced flows");
+            if !state.pending_covers(host.as_deref()) {
+                break match &host {
+                    Some(name) if state.intercepts(name) => None,
+                    _ => {
+                        spliced.retain(|splice| !splice.has_ended());
+                        let splice = Arc::new(Splice {
+                            host: host.clone(),
+                            cancel: tokio::sync::Notify::new(),
+                            ended: std::sync::Mutex::new(false),
+                            ended_signal: std::sync::Condvar::new(),
+                        });
+                        spliced.push(splice.clone());
+                        Some(SpliceGuard(splice))
+                    }
+                };
             }
         }
+        // Decided within the wait of the change; checked again either way.
+        let _ = tokio::time::timeout(SPLICE_END_WAIT * 2, notified).await;
     };
     match (splice, host) {
         (Some(guard), _) => passthrough(stream, upstream, buffered, guard).await,
@@ -646,6 +769,39 @@ impl State {
                     retired.values.push_back((host.clone(), value.clone()));
                 }
             }
+        }
+    }
+
+    /// The host patterns [`Self::retire`] would keep intercepted for a change
+    /// from `old` to `new`.
+    fn retire_preview(&self, old: &CredentialPolicy, new: &CredentialPolicy) -> Vec<String> {
+        let resolved = self.resolved.lock().expect("resolved values");
+        old.credentials
+            .iter()
+            .filter(|b| resolved.get(&b.name).is_some_and(|s| !s.values.is_empty()))
+            .flat_map(|binding| {
+                let successor = new.binding(&binding.name);
+                binding
+                    .allowed_hosts
+                    .iter()
+                    .filter(move |host| !successor.is_some_and(|b| b.allowed_hosts.contains(host)))
+                    .cloned()
+            })
+            .collect()
+    }
+
+    /// Whether a connection to `host` (or with no server name) must wait for
+    /// a pending change of bindings.
+    fn pending_covers(&self, host: Option<&str>) -> bool {
+        match self.pending.lock().expect("pending intercept").as_ref() {
+            None => false,
+            Some(pending) => match host {
+                Some(host) => pending
+                    .hosts
+                    .iter()
+                    .any(|pattern| smolvm_protocol::credentials::host_matches(pattern, host)),
+                None => pending.unnamed,
+            },
         }
     }
 
@@ -2083,16 +2239,18 @@ mod tests {
         .unwrap();
         let wider_pem = wider.certificate_pem().to_string();
         control.replace_ca(wider);
-        control.replace_bindings(
-            CredentialPolicy {
-                credentials: vec![binding("svc", CRED_HOST), binding("other", OTHER_HOST)],
-            },
-            &[
-                ("svc".to_string(), f.placeholder.clone()),
-                ("other".to_string(), other_placeholder.clone()),
-            ]
-            .into(),
-        );
+        control
+            .replace_bindings(
+                CredentialPolicy {
+                    credentials: vec![binding("svc", CRED_HOST), binding("other", OTHER_HOST)],
+                },
+                &[
+                    ("svc".to_string(), f.placeholder.clone()),
+                    ("other".to_string(), other_placeholder.clone()),
+                ]
+                .into(),
+            )
+            .unwrap();
         let kept = guest_request(
             &f,
             wider_pem.as_bytes(),
@@ -2112,12 +2270,14 @@ mod tests {
         .unwrap();
         assert!(added.starts_with("HTTP/1.1 200"), "{added}");
 
-        control.replace_bindings(
-            CredentialPolicy {
-                credentials: vec![binding("other", OTHER_HOST)],
-            },
-            &[("other".to_string(), other_placeholder.clone())].into(),
-        );
+        control
+            .replace_bindings(
+                CredentialPolicy {
+                    credentials: vec![binding("other", OTHER_HOST)],
+                },
+                &[("other".to_string(), other_placeholder.clone())].into(),
+            )
+            .unwrap();
         // A value was sent to the removed binding's host, so the host stays
         // terminated (to scrub it) and its placeholder is refused there.
         let removed = guest_request(
@@ -2236,7 +2396,7 @@ mod tests {
             // The same name, now bound elsewhere.
             let mut moved = policy.clone();
             moved.credentials[0].allowed_hosts = vec![OTHER_HOST.into()];
-            control.replace_bindings(moved, placeholders);
+            control.replace_bindings(moved, placeholders).unwrap();
         })
         .await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
@@ -2251,7 +2411,9 @@ mod tests {
 
         // The same binding, but its secret was replaced (not kept).
         let (response, _f) = request_across_a_swap(|control, policy, placeholders| {
-            control.replace_bindings(policy.clone(), placeholders);
+            control
+                .replace_bindings(policy.clone(), placeholders)
+                .unwrap();
         })
         .await;
         assert!(response.starts_with("HTTP/1.1 503"), "{response}");
@@ -2270,7 +2432,9 @@ mod tests {
             more.credentials.push(other);
             let mut placeholders = placeholders.clone();
             placeholders.insert("other".into(), crate::policy::generate_placeholder("other"));
-            control.replace_bindings_keeping(more, &placeholders, &["svc".to_string()]);
+            control
+                .replace_bindings_keeping(more, &placeholders, &["svc".to_string()])
+                .unwrap();
         })
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -2279,7 +2443,9 @@ mod tests {
             "Bearer value-of-the-old-binding"
         );
         let (response, _f) = request_across_a_swap(|control, policy, placeholders| {
-            control.replace_bindings_keeping(policy.clone(), placeholders, &["svc".to_string()]);
+            control
+                .replace_bindings_keeping(policy.clone(), placeholders, &["svc".to_string()])
+                .unwrap();
         })
         .await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
@@ -2718,7 +2884,8 @@ mod tests {
         *resolver.0.lock().unwrap() = "ghp_secondsecret2222".into();
         f.interceptor
             .control()
-            .replace_bindings(policy, &placeholders);
+            .replace_bindings(policy, &placeholders)
+            .unwrap();
         for value in ["ghp_secondsecret2222", "ghp_firstsecret1111"] {
             let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &echo(value))
                 .await
@@ -2758,7 +2925,8 @@ mod tests {
             let placeholders = crate::policy::generate_placeholders(&next);
             f.interceptor
                 .control()
-                .replace_bindings(next.clone(), &placeholders);
+                .replace_bindings(next.clone(), &placeholders)
+                .unwrap();
             // The guest stored the value upstream; reading it back finds it gone.
             let response = guest_request(
                 &f,
@@ -2785,7 +2953,8 @@ mod tests {
         let f = fixture_with_secret("ghp_neversent00000").await;
         f.interceptor
             .control()
-            .replace_bindings(CredentialPolicy::default(), &BTreeMap::new());
+            .replace_bindings(CredentialPolicy::default(), &BTreeMap::new())
+            .unwrap();
         assert!(
             guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &echo("x"))
                 .await
@@ -2826,12 +2995,18 @@ mod tests {
             u64::MAX,
             Some(&zeroize::Zeroizing::new("first-value-0000".into())),
         );
-        control.replace_bindings(moved(OTHER_HOST), &placeholders);
+        control
+            .replace_bindings(moved(OTHER_HOST), &placeholders)
+            .unwrap();
         for round in 0..(MAX_RETIRED_VALUES * 2) {
             let value = zeroize::Zeroizing::new(format!("secret-value-{round:04}"));
             control.0.remember("svc", u64::MAX, Some(&value));
-            control.replace_bindings(CredentialPolicy::default(), &BTreeMap::new());
-            control.replace_bindings(moved(OTHER_HOST), &placeholders);
+            control
+                .replace_bindings(CredentialPolicy::default(), &BTreeMap::new())
+                .unwrap();
+            control
+                .replace_bindings(moved(OTHER_HOST), &placeholders)
+                .unwrap();
         }
         let retired = control.0.retired.lock().unwrap();
         assert_eq!(retired.values.len(), MAX_RETIRED_VALUES);
@@ -2888,6 +3063,7 @@ mod tests {
         let placeholders = crate::policy::generate_placeholders(&other);
         tokio::task::spawn_blocking(move || control.replace_bindings(other, &placeholders))
             .await
+            .unwrap()
             .unwrap();
 
         // The old connection is gone: nothing more comes back on it.
@@ -2918,6 +3094,86 @@ mod tests {
         .await
         .unwrap();
         assert!(fresh.starts_with("HTTP/1.1 200"), "{fresh}");
+    }
+
+    /// A connection to a host a change of bindings is about to intercept
+    /// waits for the change: it is neither spliced nor served under the old
+    /// bindings, and once the change lands it is intercepted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_to_a_host_being_intercepted_waits_for_the_change() {
+        let f = fixture().await;
+        let control = f.interceptor.control();
+        let wider =
+            MachineCa::generate("test-machine", &[CRED_HOST.into(), OTHER_HOST.into()]).unwrap();
+        let wider_pem = wider.certificate_pem().to_string();
+        control.replace_ca(wider);
+        let other = CredentialPolicy {
+            credentials: vec![CredentialBinding {
+                name: "other".into(),
+                allowed_hosts: vec![OTHER_HOST.into()],
+                ..svc_policy().credentials[0].clone()
+            }],
+        };
+        let placeholders = crate::policy::generate_placeholders(&other);
+        let prepared = control.prepare_bindings(&other).unwrap();
+        let request =
+            format!("GET /public HTTP/1.1\r\nHost: {OTHER_HOST}\r\nConnection: close\r\n\r\n");
+        let held = {
+            let f = &f;
+            let pem = wider_pem.clone();
+            async move { guest_request(f, pem.as_bytes(), OTHER_HOST, &request).await }
+        };
+        tokio::pin!(held);
+        assert!(
+            tokio::time::timeout(Duration::from_millis(300), held.as_mut())
+                .await
+                .is_err(),
+            "held while the change is pending"
+        );
+        control.commit_bindings(prepared, other, &placeholders, &[]);
+        let response = held.await.unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "intercepted: {response}"
+        );
+    }
+
+    /// A spliced connection that does not end in time refuses the change
+    /// whole: the bindings stay as they were, and connections are no longer
+    /// held.
+    #[test]
+    fn a_change_waits_for_spliced_connections_or_changes_nothing() {
+        let ca = MachineCa::generate("test-machine", &[CRED_HOST.to_string()]).unwrap();
+        let interceptor = Interceptor::spawn(
+            InterceptorConfig {
+                machine: "test-machine".into(),
+                policy: CredentialPolicy::default(),
+                placeholders: BTreeMap::new(),
+                ca,
+                upstream_roots_pem: Vec::new(),
+            },
+            Arc::new(StaticResolver::new()),
+        )
+        .unwrap();
+        let control = interceptor.control();
+        // A spliced connection whose task never lets go of it.
+        control.0.spliced.lock().unwrap().push(Arc::new(Splice {
+            host: Some(CRED_HOST.into()),
+            cancel: tokio::sync::Notify::new(),
+            ended: std::sync::Mutex::new(false),
+            ended_signal: std::sync::Condvar::new(),
+        }));
+        let policy = svc_policy();
+        let placeholders = crate::policy::generate_placeholders(&policy);
+        let started = std::time::Instant::now();
+        let refused = control.replace_bindings(policy, &placeholders).unwrap_err();
+        assert!(refused.contains(CRED_HOST), "{refused}");
+        assert!(
+            started.elapsed() < SPLICE_END_WAIT * 3,
+            "one deadline for all"
+        );
+        assert!(control.0.bindings().policy.is_empty(), "nothing changed");
+        assert!(!control.0.pending_covers(Some(CRED_HOST)), "nothing held");
     }
 
     /// A value bound while a response streams (a long poll, an event stream)
@@ -2963,6 +3219,7 @@ mod tests {
                     control.replace_bindings(policy, &placeholders)
                 })
                 .await
+                .unwrap()
                 .unwrap();
             }
         );

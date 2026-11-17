@@ -246,45 +246,53 @@ pub struct GuestNetworkConfig {
 /// `TcpRelayTable`): a value the interceptor injects toward a host is never
 /// readable back on an older connection to that host that nothing checks.
 #[derive(Clone, Copy)]
-pub struct LateHttpsIntercept(&'static LateSlot);
+pub struct LateHttpsIntercept(&'static std::sync::RwLock<LateSlot>);
 
-struct LateSlot {
-    endpoint: std::sync::RwLock<Option<InterceptEndpoint>>,
-    /// Grows each time an interceptor is published.
-    published: std::sync::atomic::AtomicU64,
+/// The interceptor in force, and how many times one was published, read and
+/// written together: a reader never sees an interceptor without the
+/// publication that ends the direct flows before it.
+#[derive(Clone, Copy, Default)]
+pub struct LateSlot {
+    /// The interceptor HTTPS flows go to now, if any.
+    pub endpoint: Option<InterceptEndpoint>,
+    /// How many times an interceptor was published.
+    pub published: u64,
 }
 
 impl LateHttpsIntercept {
     /// A new, empty slot. It is never freed: make one per boot process.
     pub fn new() -> Self {
-        Self(Box::leak(Box::new(LateSlot {
-            endpoint: std::sync::RwLock::new(None),
-            published: std::sync::atomic::AtomicU64::new(0),
-        })))
+        Self(Box::leak(Box::new(std::sync::RwLock::new(
+            LateSlot::default(),
+        ))))
     }
 
     /// Redirect HTTPS flows opened from now on to `endpoint`, and end the
     /// ones opened directly before.
     pub fn set(&self, endpoint: InterceptEndpoint) {
-        *self.0.endpoint.write().unwrap_or_else(|e| e.into_inner()) = Some(endpoint);
-        self.0
-            .published
-            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        let mut slot = self.0.write().unwrap_or_else(|e| e.into_inner());
+        slot.published += 1;
+        slot.endpoint = Some(endpoint);
     }
 
     /// Relay HTTPS flows opened from now on directly again.
     pub fn clear(&self) {
-        *self.0.endpoint.write().unwrap_or_else(|e| e.into_inner()) = None;
+        self.0.write().unwrap_or_else(|e| e.into_inner()).endpoint = None;
     }
 
     /// The interceptor HTTPS flows go to, once one was published.
     pub fn get(&self) -> Option<InterceptEndpoint> {
-        *self.0.endpoint.read().unwrap_or_else(|e| e.into_inner())
+        self.snapshot().endpoint
     }
 
     /// How many times an interceptor was published in this slot.
     pub fn published(&self) -> u64 {
-        self.0.published.load(std::sync::atomic::Ordering::Acquire)
+        self.snapshot().published
+    }
+
+    /// The endpoint and the publication count, read at once.
+    pub fn snapshot(&self) -> LateSlot {
+        *self.0.read().unwrap_or_else(|e| e.into_inner())
     }
 }
 

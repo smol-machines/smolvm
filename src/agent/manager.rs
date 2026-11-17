@@ -810,7 +810,7 @@ fn credentials_query(
     // socket bound anywhere but this machine's own path.
     #[cfg(unix)]
     match stream.peer_path() {
-        Ok(Some(bound)) if bound == path => {}
+        Ok(Some(bound)) if same_socket_place(&bound, &path) => {}
         Ok(bound) => {
             return Err(unreached(format!(
                 "{} reached a socket bound at {}, not the machine's own",
@@ -847,6 +847,27 @@ fn credentials_query(
     let mut reply = String::new();
     stream.read_to_string(&mut reply).map_err(lost)?;
     credentials_reply(&reply)
+}
+
+/// Whether a socket bound at `bound` is the one at `ours`: the same name in
+/// the same directory, the directories compared by device and inode so a
+/// differently spelled path (a linked home or cache directory) still
+/// matches. Never by the socket file itself: a link to another machine's
+/// socket shares its inode.
+#[cfg(unix)]
+fn same_socket_place(bound: &Path, ours: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if bound == ours {
+        return true;
+    }
+    let dir_id = |path: &Path| {
+        let meta = std::fs::metadata(path.parent()?).ok()?;
+        Some((meta.dev(), meta.ino()))
+    };
+    bound.file_name().is_some()
+        && bound.file_name() == ours.file_name()
+        && dir_id(bound).is_some()
+        && dir_id(bound) == dir_id(ours)
 }
 
 /// Whether a process running as `peer` may answer for a machine whose data
@@ -6329,6 +6350,25 @@ mod tests {
 
         std::fs::remove_file(&ours).unwrap();
         let listener = std::os::unix::net::UnixListener::bind(&ours).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"ok\n").unwrap();
+        });
+        assert_eq!(credentials_query(&name, "{}").unwrap(), "");
+        server.join().unwrap();
+
+        // Bound through a differently spelled path (a linked directory): the
+        // same place, so it is the machine's own.
+        std::fs::remove_file(&ours).unwrap();
+        let spelled = tempfile::tempdir().unwrap();
+        let link = spelled.path().join("machine");
+        std::os::unix::fs::symlink(&dir, &link).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(
+            link.join(crate::credentials::CREDENTIALS_SOCKET),
+        )
+        .unwrap();
         let server = std::thread::spawn(move || {
             let (mut stream, _) = listener.accept().unwrap();
             let mut request = String::new();

@@ -7872,12 +7872,24 @@ impl UpdateCmd {
         };
 
         let mut changes: Vec<String> = Vec::new();
-        let grow_disks = |record: &smolvm::config::VmRecord| -> smolvm::Result<Vec<String>> {
-            if self.storage.is_some() || self.overlay.is_some() {
-                vm_common::expand_disks(&self.name, record, self.storage, self.overlay)
-            } else {
-                Ok(Vec::new())
+        // Disk growth is checked now (no shrinking, no clones on the disks)
+        // and runs inside the record's write, after every other check there,
+        // so a refused update never grows a disk.
+        let growth = if self.storage.is_some() || self.overlay.is_some() {
+            Some(vm_common::plan_disk_growth(
+                &self.name,
+                &record,
+                self.storage,
+                self.overlay,
+            )?)
+        } else {
+            None
+        };
+        let grow = |changes: &mut Vec<String>| -> smolvm::Result<()> {
+            if let Some(growth) = &growth {
+                changes.extend(growth.grow()?);
             }
+            Ok(())
         };
         if credentials {
             // Bindings and every other setting in one write, under the
@@ -7901,10 +7913,7 @@ impl UpdateCmd {
                 db,
                 Some(smolvm::credentials::OtherSettings {
                     apply: &settings,
-                    prepare: Box::new(|_| {
-                        *grown.borrow_mut() = grow_disks(&record)?;
-                        Ok(())
-                    }),
+                    prepare: Box::new(|_| grow(&mut grown.borrow_mut())),
                 }),
             )?;
             changes.extend(grown.into_inner());
@@ -7912,23 +7921,14 @@ impl UpdateCmd {
         } else {
             // What this update leaves must still reach every bound host:
             // `--no-net` beside bindings is refused unless it removes them.
-            // Checked under the bindings' lock, against the record as the
-            // write finds it, so bindings set meanwhile count.
+            // Checked under the bindings' lock, in the write itself, against
+            // the record it finds, so bindings set meanwhile count; disks
+            // grow only after that check, inside the same write.
             let _bindings = smolvm::credentials::lock_bindings(&self.name)?;
-            let current = db.get_vm(&self.name)?.ok_or_else(|| {
-                smolvm::Error::config("update", format!("machine '{}' not found", self.name))
-            })?;
-            let mut staged = current.clone();
-            apply(&mut staged, egress.as_ref(), &mut Vec::new());
-            staged.check_bindings_reachable()?;
-            // Expand physical disk files before the DB write. If expansion
-            // fails, no DB changes are made — the record stays consistent.
-            changes.extend(grow_disks(&record)?);
-            // Single DB transaction: all settings + disk sizes together,
-            // refused whole if the record it finds would strand a binding.
             db.try_update_vm(&self.name, |r| {
                 apply(r, egress.as_ref(), &mut changes);
-                r.check_bindings_reachable()
+                r.check_bindings_reachable()?;
+                grow(&mut changes)
             })?;
         }
 
