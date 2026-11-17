@@ -1002,91 +1002,51 @@ async fn container_stats(
     let c = container(&engine, &id)?;
     let one_shot = q_bool(&q, "one-shot");
     let stream = !q.get("stream").is_some_and(|v| v == "0" || v == "false") && !one_shot;
+    // Validate the first sample before committing HTTP 200: an old guest or
+    // unavailable cgroup must not masquerade as an idle container.
+    let first = super::stats::sample(&c).await?;
+    if !stream {
+        let mut sample = first;
+        if !one_shot && c.is_running() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let previous = sample;
+            sample = super::stats::sample(&c).await?;
+            sample["precpu_stats"] = previous["cpu_stats"].clone();
+            sample["preread"] = previous["read"].clone();
+        }
+        return Ok(Json(sample).into_response());
+    }
     let (tx, body) = super::stream::json_lines();
     tokio::spawn(async move {
-        let mut prev: Option<serde_json::Value> = None;
-        // A single answer carries a second-old sample as its `precpu_stats`,
-        // so clients can show a CPU rate from it, unless the client asked for
-        // one sample only.
-        if !stream && !one_shot && c.is_running() {
-            prev = Some(stats_sample(&engine, &c).await);
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut previous = first;
+        if tx.send(previous.clone()).await.is_err() {
+            return;
         }
         loop {
-            let sample = stats_sample(&engine, &c).await;
-            let mut out = sample.clone();
-            if let Some(p) = prev.take() {
-                out["precpu_stats"] = p["cpu_stats"].clone();
-                out["preread"] = p["read"].clone();
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
             }
-            if tx.send(out).await.is_err() || !stream {
+            let next = tokio::select! {
+                _ = tx.closed() => return,
+                sample = super::stats::sample(&c) => sample,
+            };
+            let mut sample = match next {
+                Ok(sample) => sample,
+                Err(error) => {
+                    tracing::warn!(container = %c.id(), error = %error.message, "container stats stream ended");
+                    return;
+                }
+            };
+            sample["precpu_stats"] = previous["cpu_stats"].clone();
+            sample["preread"] = previous["read"].clone();
+            if tx.send(sample.clone()).await.is_err() {
                 return;
             }
-            prev = Some(sample);
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            previous = sample;
         }
     });
     Ok(Response::new(body))
-}
-
-async fn stats_sample(
-    engine: &Arc<Engine>,
-    c: &Arc<super::containers::Container>,
-) -> serde_json::Value {
-    let record = c.record();
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1) as u64;
-    let (cpu_ns, rss) = if c.is_running() && record.state.pid > 0 {
-        crate::process::process_stats(record.state.pid as crate::process::Pid)
-            .map(|s| (s.cpu_time_ns, s.rss_bytes))
-            .unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
-    let mut usage = rss;
-    let mut limit = crate::process::host_memory_stats()
-        .map(|m| m.total_bytes)
-        .or_else(|| crate::data::resources::host_physical_memory_mib().map(|mib| mib << 20))
-        .unwrap_or(0);
-    if let Some(socket) = c.socket() {
-        if let Ok(smolvm_protocol::AgentResponse::Ok { data: Some(d) }) =
-            super::runtime::request(&socket, &smolvm_protocol::AgentRequest::MemoryStatus).await
-        {
-            if let Ok(m) = serde_json::from_value::<smolvm_protocol::MemoryStatus>(d) {
-                usage = m.used_bytes();
-                limit = m.total_bytes;
-            }
-        }
-    }
-    if record.host_config.memory > 0 {
-        limit = record.host_config.memory as u64;
-    }
-    let system = super::stats_clock::system_cpu_usage(ncpu);
-    let _ = engine;
-    serde_json::json!({
-        "read": super::util::now_rfc3339(),
-        "preread": super::util::ZERO_TIME,
-        "id": record.id,
-        "name": format!("/{}", record.name),
-        "num_procs": 0,
-        "pids_stats": {"current": 0},
-        "cpu_stats": {
-            "cpu_usage": {"total_usage": cpu_ns, "usage_in_kernelmode": 0, "usage_in_usermode": cpu_ns},
-            "system_cpu_usage": system,
-            "online_cpus": ncpu,
-            "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
-        },
-        "precpu_stats": {
-            "cpu_usage": {"total_usage": 0, "usage_in_kernelmode": 0, "usage_in_usermode": 0},
-            "system_cpu_usage": 0,
-            "online_cpus": ncpu,
-            "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
-        },
-        "memory_stats": {"usage": usage, "limit": limit, "stats": {"rss": rss}},
-        "blkio_stats": {"io_service_bytes_recursive": null},
-        "networks": {"eth0": {"rx_bytes": 0, "rx_packets": 0, "rx_errors": 0, "rx_dropped": 0, "tx_bytes": 0, "tx_packets": 0, "tx_errors": 0, "tx_dropped": 0}},
-    })
 }
 
 async fn container_update(

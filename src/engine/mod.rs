@@ -40,6 +40,7 @@ mod logs;
 mod model;
 mod network;
 mod runtime;
+mod stats;
 mod stats_clock;
 mod store;
 mod stream;

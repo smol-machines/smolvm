@@ -89,6 +89,7 @@ mod attach;
 mod auto_ports;
 mod branchpoint;
 mod container;
+mod container_stats;
 mod credentials;
 mod cuda;
 mod dirwatch;
@@ -3130,6 +3131,7 @@ fn handle_request(
         } => container::handle_container_signal(&overlay_id, &signal, all),
 
         AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
+        AgentRequest::ContainerStats { overlay_id } => container_stats::handle(&overlay_id),
 
         AgentRequest::ContainerArchive {
             image,

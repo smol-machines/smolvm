@@ -1224,6 +1224,13 @@ pub enum AgentRequest {
         overlay_id: String,
     },
 
+    /// Sample the running container's cgroup and network namespace.
+    /// Replies `Ok` with a [`ContainerResourceUsage`].
+    ContainerStats {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
     /// Stream what the container on `overlay_id` changed against its image,
     /// as one image layer: a tar of the overlay's upper directory with
     /// overlayfs whiteouts turned into OCI `.wh.` markers, and the files the
@@ -1306,6 +1313,73 @@ pub struct ContainerStartSpec {
     /// a container started in a machine booted for another container.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub image_source: Option<ContainerImageSource>,
+}
+
+/// Kernel accounting for one running container, including exited children.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerResourceUsage {
+    /// Cumulative CPU time, including exited descendants, in nanoseconds.
+    pub cpu_usage_ns: u64,
+    /// Cumulative user CPU time in nanoseconds.
+    pub cpu_user_ns: u64,
+    /// Cumulative kernel CPU time in nanoseconds.
+    pub cpu_system_ns: u64,
+    /// CPU bandwidth enforcement periods.
+    pub cpu_periods: u64,
+    /// Periods during which the container was throttled.
+    pub cpu_throttled_periods: u64,
+    /// Cumulative CPU throttling duration in nanoseconds.
+    pub cpu_throttled_ns: u64,
+    /// Current cgroup memory charge, including file cache, in bytes.
+    pub memory_bytes: u64,
+    /// Effective memory ceiling, capped by guest RAM, in bytes.
+    pub memory_limit_bytes: u64,
+    /// Inactive file cache subtracted by Docker when displaying memory.
+    pub inactive_file_bytes: u64,
+    /// Anonymous memory charged to the cgroup, in bytes.
+    pub anonymous_bytes: u64,
+    /// File-backed memory charged to the cgroup, in bytes.
+    pub file_bytes: u64,
+    /// Kernel tasks (threads), as Docker's PIDs column reports them.
+    pub pids: u64,
+    /// Cumulative device I/O, including exited descendants.
+    pub block_io: Vec<ContainerBlockIo>,
+    /// Network-namespace counters; containers sharing a namespace share these.
+    pub networks: std::collections::BTreeMap<String, ContainerNetworkUsage>,
+}
+
+/// Block-device accounting for one container cgroup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerBlockIo {
+    /// Kernel block device major number.
+    pub major: u32,
+    /// Kernel block device minor number.
+    pub minor: u32,
+    /// Bytes read from this block device.
+    pub read_bytes: u64,
+    /// Bytes written to this block device.
+    pub write_bytes: u64,
+}
+
+/// Counters for one interface in the container's network namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerNetworkUsage {
+    /// Received bytes.
+    pub rx_bytes: u64,
+    /// Received packets.
+    pub rx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Dropped received packets.
+    pub rx_dropped: u64,
+    /// Transmitted bytes.
+    pub tx_bytes: u64,
+    /// Transmitted packets.
+    pub tx_packets: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+    /// Dropped transmitted packets.
+    pub tx_dropped: u64,
 }
 
 /// Where a container's image layers come from when the machine it runs in
@@ -1493,6 +1567,9 @@ impl AgentRequest {
             }
             AgentRequest::ContainerTop { overlay_id } => {
                 format!("ContainerTop {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerStats { overlay_id } => {
+                format!("ContainerStats {{ overlay: {overlay_id} }}")
             }
             AgentRequest::ContainerDiff { overlay_id } => {
                 format!("ContainerDiff {{ overlay: {overlay_id} }}")
