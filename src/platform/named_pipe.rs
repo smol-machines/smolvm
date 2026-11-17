@@ -558,16 +558,31 @@ mod tests {
     #[tokio::test]
     async fn pipe_acl_is_private_and_anonymous_open_is_denied() {
         use windows_sys::Win32::Security::Authorization::{
-            ConvertSecurityDescriptorToStringSecurityDescriptorW, GetSecurityInfo, SE_KERNEL_OBJECT,
+            ConvertStringSidToSidW, GetExplicitEntriesFromAclW, GetSecurityInfo, GRANT_ACCESS,
+            SE_KERNEL_OBJECT, TRUSTEE_IS_SID,
         };
         use windows_sys::Win32::Security::{
-            ImpersonateAnonymousToken, RevertToSelf, DACL_SECURITY_INFORMATION,
-            OWNER_SECURITY_INFORMATION,
+            EqualSid, GetSecurityDescriptorControl, ImpersonateAnonymousToken, RevertToSelf,
+            DACL_SECURITY_INFORMATION, OWNER_SECURITY_INFORMATION, SE_DACL_PROTECTED,
         };
         use windows_sys::Win32::System::Threading::GetCurrentThread;
+
+        fn sid(value: &str) -> LocalAllocation {
+            let wide: Vec<u16> = value.encode_utf16().chain(Some(0)).collect();
+            let mut ptr = std::ptr::null_mut();
+            // SAFETY: terminated SID string and a valid output pointer.
+            assert_ne!(
+                unsafe { ConvertStringSidToSidW(wide.as_ptr(), &mut ptr) },
+                0
+            );
+            LocalAllocation(ptr)
+        }
+
         let path = path();
         let listener = Listener::bind(&path).unwrap();
         let mut descriptor = std::ptr::null_mut();
+        let mut owner = std::ptr::null_mut();
+        let mut dacl = std::ptr::null_mut();
         let info = DACL_SECURITY_INFORMATION | OWNER_SECURITY_INFORMATION;
         // SAFETY: borrowed live handle, valid output pointer, unused outputs null.
         let result = unsafe {
@@ -575,39 +590,53 @@ mod tests {
                 listener.pending.as_raw_handle(),
                 SE_KERNEL_OBJECT,
                 info,
+                &mut owner,
                 std::ptr::null_mut(),
-                std::ptr::null_mut(),
-                std::ptr::null_mut(),
+                &mut dacl,
                 std::ptr::null_mut(),
                 &mut descriptor,
             )
         };
         assert_eq!(result, 0);
         let _allocation = LocalAllocation(descriptor);
-        let mut text = std::ptr::null_mut();
-        let mut len = 0;
-        // SAFETY: valid descriptor and output pointers; the allocation stays live.
+        assert!(!owner.is_null() && !dacl.is_null());
+        let user = sid(&user_sid().unwrap());
+        let system = sid("S-1-5-18");
+        // Compare identities, not SDDL text: Windows can render the same SID as
+        // a numeric string or an alias such as LA for the local Administrator.
+        assert_ne!(unsafe { EqualSid(owner, user.0) }, 0);
+        let (mut control, mut revision) = (0, 0);
+        // SAFETY: the returned descriptor is live and both outputs are valid.
         assert_ne!(
-            unsafe {
-                ConvertSecurityDescriptorToStringSecurityDescriptorW(
-                    descriptor,
-                    SDDL_REVISION_1,
-                    info,
-                    &mut text,
-                    &mut len,
-                )
-            },
+            unsafe { GetSecurityDescriptorControl(descriptor, &mut control, &mut revision) },
             0
         );
-        let _text = LocalAllocation(text.cast());
-        // SAFETY: returned length includes the trailing null.
-        let sddl =
-            unsafe { String::from_utf16_lossy(std::slice::from_raw_parts(text, len as usize - 1)) };
-        let sid = user_sid().unwrap();
-        assert!(sddl.starts_with(&format!("O:{sid}D:P")), "{sddl}");
-        assert_eq!(sddl.matches("(A;").count(), 2, "{sddl}");
-        assert!(sddl.contains(";;;SY)"), "{sddl}");
-        assert!(sddl.contains(&format!(";;;{sid})")), "{sddl}");
+        assert_ne!(control & SE_DACL_PROTECTED, 0);
+        let (mut count, mut entries) = (0, std::ptr::null_mut());
+        // SAFETY: a live DACL and valid outputs; LocalFree owns the resulting array.
+        assert_eq!(
+            unsafe { GetExplicitEntriesFromAclW(dacl, &mut count, &mut entries) },
+            0
+        );
+        let _entries = LocalAllocation(entries.cast());
+        assert_eq!(count, 2);
+        let (mut found_user, mut found_system) = (false, false);
+        // SAFETY: Windows returned count initialized entries and their SID storage.
+        for entry in unsafe { std::slice::from_raw_parts(entries, count as usize) } {
+            assert_eq!(entry.grfAccessMode, GRANT_ACCESS);
+            assert_eq!(entry.Trustee.TrusteeForm, TRUSTEE_IS_SID);
+            let actual: *mut std::ffi::c_void = entry.Trustee.ptstrName.cast();
+            assert!(!actual.is_null());
+            let is_user = unsafe { EqualSid(actual, user.0) } != 0;
+            let is_system = unsafe { EqualSid(actual, system.0) } != 0;
+            assert!(
+                is_user || is_system,
+                "unexpected principal can access the pipe"
+            );
+            found_user |= is_user;
+            found_system |= is_system;
+        }
+        assert!(found_user && found_system);
         // Do not await or panic while impersonating: always revert on this thread.
         assert_ne!(unsafe { ImpersonateAnonymousToken(GetCurrentThread()) }, 0);
         let opened = ClientOptions::new().open(&path);
