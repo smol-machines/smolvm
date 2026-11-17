@@ -26,18 +26,41 @@ pub fn start(socket_path: &Path, log: &Path) -> io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UdsListener::bind(socket_path)?;
     let writer = Arc::new(Mutex::new(LogWriter::open(log)?));
+    let active_connections = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     std::thread::Builder::new()
         .name("workload-log".into())
         .spawn(move || {
+            const MAX_CONCURRENT_LOG_CONNS: usize = 16;
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
+                        let active = Arc::clone(&active_connections);
+                        if active.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+                            >= MAX_CONCURRENT_LOG_CONNS
+                        {
+                            active.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            tracing::warn!(
+                                "dropping excess workload log connection: concurrent connection limit reached"
+                            );
+                            drop(stream);
+                            continue;
+                        }
                         let writer = Arc::clone(&writer);
                         // A connection lasts until the guest drops it; a
                         // restored or reconnecting guest opens another.
+                        struct ConnGuard(Arc<std::sync::atomic::AtomicUsize>);
+                        impl Drop for ConnGuard {
+                            fn drop(&mut self) {
+                                self.0.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+                            }
+                        }
+                        let guard = ConnGuard(active);
                         let spawned = std::thread::Builder::new()
                             .name("workload-log-conn".into())
-                            .spawn(move || copy_into(stream, &writer));
+                            .spawn(move || {
+                                let _guard = guard;
+                                copy_into(stream, &writer);
+                            });
                         if let Err(e) = spawned {
                             tracing::warn!(error = %e, "could not serve a workload log connection");
                         }
@@ -313,5 +336,27 @@ mod tests {
         std::fs::write(&log, "e\nf\n").unwrap();
         assert_eq!(tail(&log, 2).unwrap(), b"e\nf\n");
         assert!(tail(&dir.path().join("missing.log"), 3).unwrap().is_empty());
+    }
+
+    #[test]
+    fn concurrent_log_connections_are_bounded() {
+        use std::io::Write as _;
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("workload.sock");
+        let log = dir.path().join("workload.log");
+
+        start(&socket, &log).unwrap();
+        std::thread::sleep(Duration::from_millis(50));
+
+        let mut clients = Vec::new();
+        // Open 20 connections; only 16 should be accepted, excess dropped immediately
+        for _ in 0..20 {
+            if let Ok(mut client) = crate::platform::uds::UdsStream::connect(&socket) {
+                let _ = client.write_all(b"test\n");
+                clients.push(client);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        drop(clients);
     }
 }

@@ -1829,23 +1829,50 @@ impl Backend for GpuBackend {
             }
             return Ok(());
         }
-        // Heavily fragmented: gather into one pinned staging buffer and issue a
-        // single DMA, avoiding thousands of tiny per-segment transfers.
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
-        if let Some(stg) = self.ensure_staging(total as usize) {
-            let mut off = 0usize;
-            for &(gpa, len) in segments {
-                let src = self.gpa_to_host(gpa, len)?;
-                unsafe { std::ptr::copy_nonoverlapping(src, stg.add(off), len as usize) };
-                off += len as usize;
+        // Heavily fragmented: gather into one pinned staging buffer and issue
+        // DMA transfers in bounded chunks, avoiding thousands of tiny per-segment transfers.
+        let total: u64 = segments
+            .iter()
+            .try_fold(0u64, |acc, (_, l)| acc.checked_add(*l))
+            .ok_or(CUDA_ERROR_INVALID_VALUE)?;
+        const CHUNK: usize = 32 * 1024 * 1024;
+        let buf_size = (total as usize).min(CHUNK);
+        if let Some(stg) = self.ensure_staging(buf_size) {
+            let mut dptr_off = 0u64;
+            let mut chunk_off = 0usize;
+            for &(mut gpa, mut len) in segments {
+                while len > 0 {
+                    let to_copy = (len as usize).min(CHUNK - chunk_off);
+                    let src = self.gpa_to_host(gpa, to_copy as u64)?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(src, stg.add(chunk_off), to_copy);
+                    }
+                    chunk_off += to_copy;
+                    gpa += to_copy as u64;
+                    len -= to_copy as u64;
+                    if chunk_off == CHUNK {
+                        unsafe {
+                            chk((self.memcpy_htod)(
+                                dptr + dptr_off,
+                                stg as *const c_void,
+                                chunk_off,
+                            ))?;
+                        }
+                        dptr_off += chunk_off as u64;
+                        chunk_off = 0;
+                    }
+                }
             }
-            return unsafe {
-                chk((self.memcpy_htod)(
-                    dptr,
-                    stg as *const c_void,
-                    total as usize,
-                ))
-            };
+            if chunk_off > 0 {
+                unsafe {
+                    chk((self.memcpy_htod)(
+                        dptr + dptr_off,
+                        stg as *const c_void,
+                        chunk_off,
+                    ))?;
+                }
+            }
+            return Ok(());
         }
         // No staging available → fall back to direct per-segment DMA.
         let mut off = 0u64;
@@ -1890,18 +1917,40 @@ impl Backend for GpuBackend {
             }
             return Ok(());
         }
-        // Heavily fragmented: one DMA into pinned staging, then scatter to the
+        // Heavily fragmented: DMA into pinned staging in bounded chunks, then scatter to the
         // guest segments.
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
-        if let Some(stg) = self.ensure_staging(total as usize) {
-            unsafe { chk((self.memcpy_dtoh)(stg as *mut c_void, dptr, total as usize))? };
-            let mut off = 0usize;
-            for &(gpa, len) in segments {
-                let dst = self.gpa_to_host(gpa, len)?;
+        let total: u64 = segments
+            .iter()
+            .try_fold(0u64, |acc, (_, l)| acc.checked_add(*l))
+            .ok_or(CUDA_ERROR_INVALID_VALUE)?;
+        const CHUNK: usize = 32 * 1024 * 1024;
+        let buf_size = (total as usize).min(CHUNK);
+        if let Some(stg) = self.ensure_staging(buf_size) {
+            let mut seg_idx = 0;
+            let mut seg_sub_off = 0u64;
+            let mut dptr_off = 0u64;
+            while dptr_off < total {
+                let chunk_len = ((total - dptr_off) as usize).min(CHUNK);
                 unsafe {
-                    std::ptr::copy_nonoverlapping(stg.add(off) as *const u8, dst, len as usize)
-                };
-                off += len as usize;
+                    chk((self.memcpy_dtoh)(stg as *mut c_void, dptr + dptr_off, chunk_len))?;
+                }
+                let mut copied = 0usize;
+                while copied < chunk_len && seg_idx < segments.len() {
+                    let (gpa, len) = segments[seg_idx];
+                    let rem_in_seg = len - seg_sub_off;
+                    let to_scatter = (rem_in_seg as usize).min(chunk_len - copied);
+                    let dst = self.gpa_to_host(gpa + seg_sub_off, to_scatter as u64)?;
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(stg.add(copied) as *const u8, dst, to_scatter);
+                    }
+                    copied += to_scatter;
+                    seg_sub_off += to_scatter as u64;
+                    if seg_sub_off == len {
+                        seg_idx += 1;
+                        seg_sub_off = 0;
+                    }
+                }
+                dptr_off += chunk_len as u64;
             }
             return Ok(());
         }
@@ -3984,12 +4033,17 @@ impl GpuBackend {
     /// D2H (GPU -> pwrite guest); else H2D (pread guest -> GPU).
     #[cfg(unix)]
     fn gpa_procmem(&mut self, dptr: u64, segments: &[(u64, u64)], to_guest: bool) -> CuResult<()> {
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
+        let total: u64 = segments
+            .iter()
+            .try_fold(0u64, |acc, (_, l)| acc.checked_add(*l))
+            .ok_or(CUDA_ERROR_INVALID_VALUE)?;
         if total == 0 {
             return Ok(());
         }
+        const CHUNK: usize = 32 * 1024 * 1024;
+        let buf_size = (total as usize).min(CHUNK);
         let stg = self
-            .ensure_staging(total as usize)
+            .ensure_staging(buf_size)
             .ok_or(super::CUDA_ERROR_NOT_FOUND)?;
         let memfd = {
             use std::os::unix::io::AsRawFd as _;
@@ -4001,8 +4055,7 @@ impl GpuBackend {
         let dtoh = self.memcpy_dtoh;
         let htod = self.memcpy_htod;
         // Resolve each segment's clone host VA (immutable read of guest_ram).
-        let mut resolved: Vec<(u64, u64, u64)> = Vec::with_capacity(segments.len());
-        let mut off = 0u64;
+        let mut resolved: Vec<(u64, u64)> = Vec::with_capacity(segments.len());
         for &(gpa, len) in segments {
             let hva = self
                 .proc_mem_regions
@@ -4011,41 +4064,74 @@ impl GpuBackend {
                     (gpa >= gs && gpa.checked_add(len)? <= gs + rl).then(|| h + (gpa - gs))
                 })
                 .ok_or(super::CUDA_ERROR_INVALID_HANDLE)?;
-            resolved.push((hva, off, len));
-            off += len;
+            resolved.push((hva, len));
         }
         if to_guest {
-            // D2H: one DMA GPU -> staging, then pwrite each segment into the clone.
-            unsafe { chk(dtoh(stg as *mut c_void, dptr, total as usize))? };
-            for (hva, o, len) in resolved {
-                let r = unsafe {
-                    libc::pwrite(
-                        memfd,
-                        stg.add(o as usize) as *const c_void,
-                        len as usize,
-                        hva as i64,
-                    )
-                };
-                if r < 0 || r as u64 != len {
-                    return Err(super::CUDA_ERROR_INVALID_HANDLE);
+            // D2H: in bounded chunks, DMA GPU -> staging, then pwrite each segment into the clone.
+            let mut seg_idx = 0;
+            let mut seg_sub_off = 0u64;
+            let mut dptr_off = 0u64;
+            while dptr_off < total {
+                let chunk_len = ((total - dptr_off) as usize).min(CHUNK);
+                unsafe { chk(dtoh(stg as *mut c_void, dptr + dptr_off, chunk_len))? };
+                let mut copied = 0usize;
+                while copied < chunk_len && seg_idx < resolved.len() {
+                    let (hva, len) = resolved[seg_idx];
+                    let rem_in_seg = len - seg_sub_off;
+                    let to_write = (rem_in_seg as usize).min(chunk_len - copied);
+                    let r = unsafe {
+                        libc::pwrite(
+                            memfd,
+                            stg.add(copied) as *const c_void,
+                            to_write,
+                            (hva + seg_sub_off) as i64,
+                        )
+                    };
+                    if r < 0 || r as usize != to_write {
+                        return Err(super::CUDA_ERROR_INVALID_HANDLE);
+                    }
+                    copied += to_write;
+                    seg_sub_off += to_write as u64;
+                    if seg_sub_off == len {
+                        seg_idx += 1;
+                        seg_sub_off = 0;
+                    }
                 }
+                dptr_off += chunk_len as u64;
             }
         } else {
-            // H2D: pread each segment from the clone into staging, then one DMA.
-            for (hva, o, len) in resolved {
-                let r = unsafe {
-                    libc::pread(
-                        memfd,
-                        stg.add(o as usize) as *mut c_void,
-                        len as usize,
-                        hva as i64,
-                    )
-                };
-                if r < 0 || r as u64 != len {
-                    return Err(super::CUDA_ERROR_INVALID_HANDLE);
+            // H2D: in bounded chunks, pread each segment from the clone into staging, then DMA -> GPU.
+            let mut seg_idx = 0;
+            let mut seg_sub_off = 0u64;
+            let mut dptr_off = 0u64;
+            while dptr_off < total {
+                let chunk_len = ((total - dptr_off) as usize).min(CHUNK);
+                let mut read_in_chunk = 0usize;
+                while read_in_chunk < chunk_len && seg_idx < resolved.len() {
+                    let (hva, len) = resolved[seg_idx];
+                    let rem_in_seg = len - seg_sub_off;
+                    let to_read = (rem_in_seg as usize).min(chunk_len - read_in_chunk);
+                    let r = unsafe {
+                        libc::pread(
+                            memfd,
+                            stg.add(read_in_chunk) as *mut c_void,
+                            to_read,
+                            (hva + seg_sub_off) as i64,
+                        )
+                    };
+                    if r < 0 || r as usize != to_read {
+                        return Err(super::CUDA_ERROR_INVALID_HANDLE);
+                    }
+                    read_in_chunk += to_read;
+                    seg_sub_off += to_read as u64;
+                    if seg_sub_off == len {
+                        seg_idx += 1;
+                        seg_sub_off = 0;
+                    }
                 }
+                unsafe { chk(htod(dptr + dptr_off, stg as *const c_void, chunk_len))? };
+                dptr_off += chunk_len as u64;
             }
-            unsafe { chk(htod(dptr, stg as *const c_void, total as usize))? };
         }
         Ok(())
     }
@@ -4101,6 +4187,14 @@ impl GpuBackend {
     /// reused across transfers. `None` if the driver lacks `cuMemAllocHost` or the
     /// allocation fails (the caller then DMAs each segment directly).
     fn ensure_staging(&mut self, size: usize) -> Option<*mut u8> {
+        // Enforce a strict bound on pinned host physical memory allocations (32 MiB).
+        // Transfers larger than 32 MiB are processed in bounded loops by the callers.
+        const MAX_STAGING_BYTES: usize = 32 * 1024 * 1024;
+        let size = size.min(MAX_STAGING_BYTES);
+        if size == 0 {
+            return None;
+        }
+
         let (addr, cap) = self.staging;
         if addr != 0 && cap >= size {
             return Some(addr as *mut u8);

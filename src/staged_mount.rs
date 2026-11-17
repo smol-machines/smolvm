@@ -150,6 +150,7 @@ fn apply_archive(archive_path: &Path, destination: &Path) -> Result<()> {
                 "archive changed between validation and extraction",
             ));
         }
+        ensure_safe_parent_chain(destination, &relative)?;
         prepare_entry_destination(destination, &relative, entry_type)?;
         if !entry
             .unpack_in(destination)
@@ -189,6 +190,29 @@ fn prepare_entry_destination(root: &Path, relative: &Path, desired: tar::EntryTy
         || desired.is_symlink()
     {
         remove_path(&path)?;
+    }
+    Ok(())
+}
+
+fn ensure_safe_parent_chain(root: &Path, relative: &Path) -> Result<()> {
+    let mut current = root.to_path_buf();
+    let parent = relative.parent().unwrap_or_else(|| Path::new(""));
+    for component in parent.components() {
+        if let Component::Normal(part) = component {
+            current.push(part);
+            if let Ok(meta) = std::fs::symlink_metadata(&current) {
+                if meta.file_type().is_symlink() {
+                    return Err(Error::agent(
+                        "sync staged mount",
+                        format!(
+                            "path '{}' traverses a symlinked component at '{}'",
+                            relative.display(),
+                            current.display()
+                        ),
+                    ));
+                }
+            }
+        }
     }
     Ok(())
 }
@@ -325,5 +349,74 @@ mod tests {
             std::fs::read(destination.path().join("was-dir")).unwrap(),
             b"file now"
         );
+    }
+
+    #[test]
+    fn apply_archive_rejects_parent_symlink_traversal_and_does_not_delete_sibling() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("mount");
+        let sibling = temp.path().join("outside");
+        std::fs::create_dir_all(&destination).unwrap();
+        std::fs::create_dir_all(&sibling).unwrap();
+        std::fs::write(sibling.join("secret.txt"), b"do not delete").unwrap();
+
+        let archive_path = temp.path().join("evil.tar");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut builder = tar::Builder::new(archive_file);
+
+        // a -> .
+        let mut h1 = tar::Header::new_gnu();
+        h1.set_entry_type(tar::EntryType::Symlink);
+        h1.set_size(0);
+        h1.set_mode(0o777);
+        builder.append_link(&mut h1, "a", ".").unwrap();
+
+        // b -> a/..
+        let mut h2 = tar::Header::new_gnu();
+        h2.set_entry_type(tar::EntryType::Symlink);
+        h2.set_size(0);
+        h2.set_mode(0o777);
+        builder.append_link(&mut h2, "b", "a/..").unwrap();
+
+        // b/outside
+        let mut h3 = tar::Header::new_gnu();
+        h3.set_entry_type(tar::EntryType::Regular);
+        h3.set_size(4);
+        h3.set_mode(0o644);
+        h3.set_cksum();
+        builder.append_data(&mut h3, "b/outside", &b"test"[..]).unwrap();
+
+        builder.finish().unwrap();
+        drop(builder);
+
+        let err = apply_archive(&archive_path, &destination).unwrap_err();
+        assert!(err.to_string().contains("traverses a symlinked component"));
+        // Sibling directory and its contents must NOT be deleted
+        assert!(sibling.join("secret.txt").exists());
+    }
+
+    #[test]
+    fn apply_archive_allows_absolute_symlink_inside_mount() {
+        let temp = tempfile::tempdir().unwrap();
+        let destination = temp.path().join("mount");
+        std::fs::create_dir_all(&destination).unwrap();
+
+        let archive_path = temp.path().join("venv.tar");
+        let archive_file = std::fs::File::create(&archive_path).unwrap();
+        let mut builder = tar::Builder::new(archive_file);
+
+        let mut h = tar::Header::new_gnu();
+        h.set_entry_type(tar::EntryType::Symlink);
+        h.set_size(0);
+        h.set_mode(0o777);
+        builder
+            .append_link(&mut h, "bin/python", "/usr/bin/python3")
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        assert!(apply_archive(&archive_path, &destination).is_ok());
+        let link_target = std::fs::read_link(destination.join("bin/python")).unwrap();
+        assert_eq!(link_target, Path::new("/usr/bin/python3"));
     }
 }

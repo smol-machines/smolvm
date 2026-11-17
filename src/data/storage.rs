@@ -107,6 +107,7 @@ impl HostMount {
     const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
         ("/", false),
         ("/private/var", false),
+        ("/private/var/lib/smolvm", true),
         ("/private/var/run", true),
         ("/private/var/log", true),
         ("/private/etc", true),
@@ -123,6 +124,7 @@ impl HostMount {
     const ILLEGAL_SOURCE_MOUNT_PATH: &[(&str, bool)] = &[
         ("/", false),
         ("/var", false),
+        ("/var/lib/smolvm", true),
         ("/var/run", true),
         ("/var/log", true),
         ("/etc", true),
@@ -279,6 +281,17 @@ impl HostMount {
     }
 
     fn validate_with_system_mounts(mount: &Self, allow_system_mounts: bool) -> Result<()> {
+        if let Some(reason) = Self::sensitive_host_source(&mount.source) {
+            return Err(Error::mount(
+                "validate host path",
+                format!(
+                    "source path on host is a protected {} and cannot be mounted: {}",
+                    reason,
+                    mount.source.display()
+                ),
+            ));
+        }
+
         for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
             let illegal_path = Path::new(illegal_path);
             if mount.source == illegal_path
@@ -367,6 +380,55 @@ impl HostMount {
         // The initial capability is intentionally scoped to Unix `/etc` and
         // `/var/log` semantics. Add Windows trees only with equivalent QA.
         false
+    }
+
+    fn sensitive_host_source(source: &Path) -> Option<&'static str> {
+        let smolvm_var = Path::new("/var/lib/smolvm");
+        if source == smolvm_var || source.starts_with(smolvm_var) {
+            return Some("smolvm state directory (/var/lib/smolvm)");
+        }
+        let smolvm_pvar = Path::new("/private/var/lib/smolvm");
+        if source == smolvm_pvar || source.starts_with(smolvm_pvar) {
+            return Some("smolvm state directory (/private/var/lib/smolvm)");
+        }
+        if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
+            let path = PathBuf::from(explicit);
+            if let Ok(canon) = path.canonicalize() {
+                if source == canon || source.starts_with(&canon) {
+                    return Some("smolvm state directory (SMOLVM_DATA_DIR)");
+                }
+            } else if source == path || source.starts_with(&path) {
+                return Some("smolvm state directory (SMOLVM_DATA_DIR)");
+            }
+        }
+        if let Some(explicit) = std::env::var_os("SMOLVM_STATE_DIR") {
+            let path = PathBuf::from(explicit);
+            if let Ok(canon) = path.canonicalize() {
+                if source == canon || source.starts_with(&canon) {
+                    return Some("smolvm state directory (SMOLVM_STATE_DIR)");
+                }
+            } else if source == path || source.starts_with(&path) {
+                return Some("smolvm state directory (SMOLVM_STATE_DIR)");
+            }
+        }
+        let local_dirs = [
+            dirs::data_dir(),
+            dirs::data_local_dir(),
+            dirs::config_dir(),
+            dirs::cache_dir(),
+        ];
+        for d in local_dirs.into_iter().flatten() {
+            let smol = d.join("smolvm");
+            if let Ok(canon) = smol.canonicalize() {
+                if source == canon || source.starts_with(&canon) {
+                    return Some("smolvm internal directory");
+                }
+            } else if source == smol || source.starts_with(&smol) {
+                return Some("smolvm internal directory");
+            }
+        }
+
+        None
     }
 
     /// Generate a virtiofs mount tag for a given index.
@@ -788,5 +850,23 @@ mod tests {
             err_msg.contains("virtiofs limitation"),
             "Error should explain the virtiofs directory requirement"
         );
+    }
+
+    #[test]
+    fn test_new_mount_rejects_smolvm_data_dir() {
+        let temp = tempfile::tempdir().unwrap();
+        let fake_smolvm = temp.path().join("smolvm");
+        std::fs::create_dir_all(&fake_smolvm).unwrap();
+
+        // Test explicit SMOLVM_DATA_DIR blocking
+        std::env::set_var("SMOLVM_DATA_DIR", &fake_smolvm);
+        let result = HostMount::new(&fake_smolvm, "/guest", true);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(
+            err.contains("smolvm state directory") || err.contains("cannot be mounted"),
+            "{err}"
+        );
+        std::env::remove_var("SMOLVM_DATA_DIR");
     }
 }

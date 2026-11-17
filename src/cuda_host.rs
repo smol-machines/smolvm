@@ -522,6 +522,35 @@ where
     let guest_sd = guest_rd.try_clone()?;
     let mut guest_wr = guest;
     let up = thread::spawn(move || {
+        use std::io::Read;
+        // Security check: inspect the first packet from the guest to prevent
+        // injection of host-internal control preambles (SMVGPVM1, SMVRDIR1, etc.)
+        let mut header = [0u8; 8];
+        let mut n = 0;
+        while n < 8 {
+            match guest_rd.read(&mut header[n..]) {
+                Ok(0) => break,
+                Ok(got) => n += got,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => {
+                    tracing::debug!(error = %e, "cuda-host: guest read error during header check");
+                    daemon_shutdown();
+                    return;
+                }
+            }
+        }
+        if n >= 3 && &header[..3] == b"SMV" {
+            tracing::error!("cuda-host: guest attempted to inject host-internal control preamble; dropping connection");
+            daemon_shutdown();
+            return;
+        }
+        if n > 0 {
+            if let Err(e) = daemon_wr.write_all(&header[..n]) {
+                tracing::debug!(error = %e, "cuda-host: forward initial bytes failed");
+                daemon_shutdown();
+                return;
+            }
+        }
         let _ = std::io::copy(&mut guest_rd, &mut daemon_wr);
         // Guest side ended: unblock the daemon→guest copy below so the proxy
         // thread exits instead of leaking, blocked on a silent daemon.
@@ -592,5 +621,56 @@ mod tests {
         )
         .unwrap();
         assert_eq!(preload[16], 5);
+    }
+
+    #[test]
+    fn pump_rejects_guest_smv_preamble_and_forwards_normal_traffic() {
+        use std::io::{Read as _, Write as _};
+
+        // 1. Guest sends SMV... preamble -> dropped, nothing sent to daemon
+        let (mut guest_client, guest_server) = crate::platform::uds::UdsStream::pair().unwrap();
+        let (daemon_client, mut daemon_server) = crate::platform::uds::UdsStream::pair().unwrap();
+        let daemon_client_wr = daemon_client.try_clone().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let daemon_sd = daemon_client.try_clone().unwrap();
+            pump(guest_server, daemon_client_wr, daemon_client, move || {
+                let _ = daemon_sd.shutdown(std::net::Shutdown::Both);
+            })
+        });
+
+        // Guest writes an SMVGPVM1 preamble
+        guest_client.write_all(b"SMVGPVM1").unwrap();
+        drop(guest_client);
+
+        let _ = handle.join().unwrap();
+
+        // Daemon should receive NO bytes because it was dropped at the proxy filter
+        let mut buf = [0u8; 16];
+        let n = daemon_server.read(&mut buf).unwrap();
+        assert_eq!(n, 0, "daemon should not receive SMV preamble bytes");
+
+        // 2. Guest sends normal CUDA payload -> forwarded successfully
+        let (mut guest_client, guest_server) = crate::platform::uds::UdsStream::pair().unwrap();
+        let (daemon_client, mut daemon_server) = crate::platform::uds::UdsStream::pair().unwrap();
+        let daemon_client_wr = daemon_client.try_clone().unwrap();
+
+        let handle = std::thread::spawn(move || {
+            let daemon_sd = daemon_client.try_clone().unwrap();
+            pump(guest_server, daemon_client_wr, daemon_client, move || {
+                let _ = daemon_sd.shutdown(std::net::Shutdown::Both);
+            })
+        });
+
+        guest_client
+            .write_all(b"\x01\x02\x03\x04\x05\x06\x07\x08")
+            .unwrap();
+        drop(guest_client);
+
+        let _ = handle.join().unwrap();
+
+        let mut buf = [0u8; 8];
+        daemon_server.read_exact(&mut buf).unwrap();
+        assert_eq!(&buf, b"\x01\x02\x03\x04\x05\x06\x07\x08");
     }
 }
