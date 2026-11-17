@@ -1,0 +1,45 @@
+name: Guest OCI runtime
+
+on:
+  pull_request:
+    paths:
+      - patches/crun/**
+      - scripts/build-crun.py
+      - scripts/build-agent-rootfs.sh
+      - tests/test_crun_builder.py
+      - .github/workflows/crun.yml
+  push:
+    branches: [main]
+    paths:
+      - patches/crun/**
+      - scripts/build-crun.py
+      - scripts/build-agent-rootfs.sh
+      - tests/test_crun_builder.py
+      - .github/workflows/crun.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: Linux guest runtime (${{ matrix.arch }})
+    runs-on: smol
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [aarch64, x86_64]
+    steps:
+      - uses: actions/checkout@v6
+      - name: Install build tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y make patch pkg-config python3
+      - name: Check input integrity guards
+        run: python3 -m unittest discover -s tests -p test_crun_builder.py
+      - name: Build and verify runtime
+        run: python3 scripts/build-crun.py ${{ matrix.arch }} "$RUNNER_TEMP/crun-rootfs"
+      - uses: actions/upload-artifact@v7
+        with:
+          name: crun-${{ matrix.arch }}
+          path: ${{ runner.temp }}/crun-rootfs/
