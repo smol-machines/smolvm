@@ -325,6 +325,50 @@ pub struct PortMapping {
     /// Transport forwarded; omitted for TCP.
     #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
     pub protocol: PortProtocol,
+    /// The host address the port listens on; omitted for the default
+    /// publish address (loopback unless `SMOLVM_PUBLISH_ADDR` widens it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<IpAddr>,
+}
+
+/// The host address one published port listens on, as a machine record
+/// keeps it beside its `(host, guest)` port pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ListenAddress {
+    /// The host port.
+    pub host: u16,
+    /// Its transport.
+    #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
+    pub protocol: PortProtocol,
+    /// The address it listens on.
+    pub address: IpAddr,
+}
+
+/// Automatic port publishing (`--auto-ports`): while a machine runs, every
+/// TCP port a process in it listens on is published on the host's loopback at
+/// the same port number, and closed again once nothing listens on it. Only
+/// machines the local CLI starts use it; see `crate::network::auto_ports`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoPorts {
+    /// Guest ports never published automatically, ascending.
+    pub exclude: Vec<u16>,
+}
+
+impl AutoPorts {
+    /// Auto ports with `exclude` left out, sorted and without duplicates so
+    /// two settings that mean the same compare equal.
+    pub fn excluding(exclude: impl IntoIterator<Item = u16>) -> Self {
+        let mut exclude: Vec<u16> = exclude.into_iter().collect();
+        exclude.sort_unstable();
+        exclude.dedup();
+        Self { exclude }
+    }
+
+    /// `self` with `other`'s exclusions added.
+    pub fn merged(self, other: AutoPorts) -> Self {
+        Self::excluding(self.exclude.into_iter().chain(other.exclude))
+    }
 }
 
 /// Maximum concrete mappings permitted for one machine.
@@ -517,7 +561,28 @@ impl PortMapping {
             host,
             guest,
             protocol,
+            listen: None,
         }
+    }
+
+    /// This mapping, listening on `listen` instead of the default address.
+    pub fn listening_on(mut self, listen: Option<IpAddr>) -> Self {
+        self.listen = listen;
+        self
+    }
+
+    /// The listen addresses of `ports` that name one, for a machine record.
+    pub fn listen_addresses(ports: &[Self]) -> Vec<ListenAddress> {
+        ports
+            .iter()
+            .filter_map(|p| {
+                p.listen.map(|address| ListenAddress {
+                    host: p.host,
+                    protocol: p.protocol,
+                    address,
+                })
+            })
+            .collect()
     }
 
     /// Create a TCP port mapping where host and guest ports are the same.
@@ -1049,6 +1114,18 @@ impl EgressPolicy {
             hosts: hosts.into_iter().map(Into::into).collect(),
         }
     }
+}
+
+/// A machine's place on a container switch (see `smolvm_network::switch`):
+/// the switch directory and the machine's endpoint in it. The engine that
+/// owns the switch decides the machine's networks and addresses; the machine
+/// reads them from its endpoint file at every start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwitchAttachment {
+    /// The switch directory.
+    pub dir: std::path::PathBuf,
+    /// The machine's endpoint name.
+    pub endpoint: String,
 }
 
 #[cfg(test)]

@@ -345,7 +345,7 @@ fn crun_state_pid(id: &str) -> Option<u32> {
 /// process, so this is normally a few ms; the deadline caps a container that
 /// exits instantly (nothing to wait for) so Start still returns promptly.
 #[cfg(target_os = "linux")]
-fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
+pub(crate) fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -402,7 +402,7 @@ fn proc_parent_pairs() -> Vec<(u32, u32)> {
 /// `root` plus all its descendants, from a single /proc snapshot. Used for
 /// `PodPids` — with the crun cgroup manager disabled there is no per-container
 /// cgroup.procs file to read, so the process tree under init IS the container.
-fn descendant_pids(root: u32) -> Vec<u32> {
+pub(crate) fn descendant_pids(root: u32) -> Vec<u32> {
     let pairs = proc_parent_pairs();
     let mut pids = vec![root];
     let mut i = 0;
@@ -844,7 +844,7 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
 /// requests handled by the reused I/O pumps.
 #[cfg(target_os = "linux")]
 pub fn handle_pod_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     request: smolvm_protocol::AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (id, exec_id) = match request {
@@ -866,7 +866,7 @@ pub fn handle_pod_start(
 /// Non-Linux stub so `cargo test` on macOS compiles the dispatch.
 #[cfg(not(target_os = "linux"))]
 pub fn handle_pod_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     _request: smolvm_protocol::AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::send_response(
@@ -1360,7 +1360,7 @@ fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, S
 
 #[cfg(target_os = "linux")]
 fn start_init_process(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::ensure_storage_mounted();
@@ -1584,7 +1584,7 @@ fn prepare_exec_process_json(raw: &str) -> Result<String, Box<dyn std::error::Er
 /// and pump its I/O until exit. Same streaming contract as the init path.
 #[cfg(target_os = "linux")]
 fn start_exec_process(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     id: &str,
     exec_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {

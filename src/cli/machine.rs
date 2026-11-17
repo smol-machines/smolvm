@@ -157,6 +157,24 @@ fn resolve_egress_flags(
 /// absolute `from_file` paths. A key that appears more than once — across or
 /// within the two flags — is a hard error, since silently keeping the last
 /// occurrence would mask a typo.
+/// `--auto-ports` and `--auto-ports-exclude` laid over what a Smolfile asked
+/// for: either flag turns auto ports on, and the exclusions add up.
+fn merge_auto_ports_flags(
+    base: Option<smolvm::data::network::AutoPorts>,
+    flag: bool,
+    exclude: &[u16],
+) -> Option<smolvm::data::network::AutoPorts> {
+    use smolvm::data::network::AutoPorts;
+    if !flag && exclude.is_empty() {
+        return base;
+    }
+    let flags = AutoPorts::excluding(exclude.iter().copied());
+    Some(match base {
+        Some(base) => base.merged(flags),
+        None => flags,
+    })
+}
+
 /// Parse `--expose-socket`/`--mount-socket` specs into published-socket configs.
 ///
 /// - `--expose-socket GUEST_PATH[:HOST_PATH]`: expose a guest-listening socket to
@@ -546,7 +564,7 @@ pub struct RunCmd {
             // The one-shot pack runner has no way to apply these, so they are
             // refused by name rather than dropped; `machine create --from`
             // takes every one of them.
-            "block_private", "allow_private", "allow_host_loopback", "nested_virt", "rosetta", "shm_size", "guest_subnet", "network_name", "disk_durability", "disk", "cache_disk", "docker_socket", "expose_socket", "mount_socket", "init"],
+            "block_private", "allow_private", "allow_host_loopback", "nested_virt", "rosetta", "shm_size", "guest_subnet", "network_name", "disk_durability", "disk", "cache_disk", "docker_socket", "auto_ports", "auto_ports_exclude", "expose_socket", "mount_socket", "init"],
         help_heading = "Machine source"
     )]
     pub from: Option<PathBuf>,
@@ -854,6 +872,22 @@ pub struct RunCmd {
     /// (DOCKER_HOST=unix://…). Requires dockerd running in the VM.
     #[arg(long, help_heading = "Network")]
     pub docker_socket: bool,
+
+    /// Publish every TCP port a process in the machine listens on at the same
+    /// port on host loopback while it listens (dev servers, `docker run -p`).
+    /// A host port already in use is skipped; ports below 1024 are not
+    /// published automatically.
+    #[arg(long, help_heading = "Network")]
+    pub auto_ports: bool,
+
+    /// Never publish this guest port automatically (repeatable). Implies
+    /// --auto-ports.
+    #[arg(
+        long = "auto-ports-exclude",
+        value_name = "PORT",
+        help_heading = "Network"
+    )]
+    pub auto_ports_exclude: Vec<u16>,
 
     /// Expose a Unix socket the guest listens on to the host (repeatable). The
     /// host reaches it at the given host path, or `<basename>` in
@@ -1367,6 +1401,23 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
     }
 }
 
+/// Synchronize a foreground run's staged mounts back to the host once its
+/// command has ended. A session that ended because the reader of our output
+/// went away (`run -i ... | head`) closed its connection so the agent would
+/// kill the command and waited for its exit acknowledgement; only then may
+/// that case synchronize over a new connection.
+fn sync_staged_mounts_after_run(
+    mounts: &[HostMount],
+    client: &mut AgentClient,
+    manager: &AgentManager,
+) -> smolvm::Result<()> {
+    if client.session_reader_gone() {
+        client.ensure_session_finished()?;
+        *client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+    }
+    smolvm::staged_mount::sync_mounts(mounts, client)
+}
+
 impl RunCmd {
     pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
@@ -1547,6 +1598,11 @@ impl RunCmd {
         vm_common::prepare_params_credentials(&mut params)?;
         params.published_sockets =
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
+        params.auto_ports = merge_auto_ports_flags(
+            params.auto_ports.take(),
+            self.auto_ports,
+            &self.auto_ports_exclude,
+        );
         // CLI `--secret-env`/`--secret-file` refs merge over any Smolfile
         // `[secrets]` of the same name (CLI wins).
         for (key, r) in
@@ -1924,6 +1980,7 @@ impl RunCmd {
             shm_size: params.shm_size.clone(),
             network_name: params.network_name.clone(),
             guest_subnet: params.guest_subnet.clone(),
+            switch: None,
             // CLI --gpu wins; Smolfile gpu = true also enables it.
             gpu: self.gpu || params.gpu,
             nested_virt: self.nested_virt,
@@ -1991,15 +2048,24 @@ impl RunCmd {
         let seeds_platform = smolvm::image_seed::serves_platform(
             smolvm::vm::rosetta::image_platform(params.oci_platform.as_deref(), params.rosetta),
         );
-        smolvm::image_seed::seed_ephemeral_run_with_trust(
-            &vm_name,
-            seed_image.as_deref().filter(|_| seeds_platform),
-            params.storage_gb,
-            self.seed_digest_ttl,
-            self.proxy_opts.resolved_proxy()?.as_deref(),
-            self.proxy_opts.no_proxy().as_deref(),
-            self.trust_host_certs,
-        );
+        let seed_proxy = self.proxy_opts.resolved_proxy()?;
+        let seed_no_proxy = self.proxy_opts.no_proxy();
+        let interrupted = smolvm::image_seed::interruptible(|| {
+            smolvm::image_seed::seed_ephemeral_run_with_trust(
+                &vm_name,
+                seed_image.as_deref().filter(|_| seeds_platform),
+                params.storage_gb,
+                self.seed_digest_ttl,
+                seed_proxy.as_deref(),
+                seed_no_proxy.as_deref(),
+                self.trust_host_certs,
+            )
+        });
+        if let Some(signal) = interrupted {
+            // The seed build deleted its builder. Remove this run's data too.
+            drop(unstarted_data_dir);
+            smolvm::image_seed::exit_by_signal(signal);
+        }
 
         let manager =
             AgentManager::for_vm_with_sizes(&vm_name, params.storage_gb, params.overlay_gb)
@@ -2031,6 +2097,7 @@ impl RunCmd {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
+            auto_ports: params.auto_ports.clone(),
             dns_filter_hosts: params.dns_filter_hosts.clone(),
             credentials: params.credential_policy.as_ref().and_then(|policy| {
                 smolvm::credentials::CredentialLaunch::from_parts(
@@ -2100,6 +2167,12 @@ impl RunCmd {
                 "Docker socket exposed — once dockerd is running in the VM, reach it with:\n  \
                  DOCKER_HOST=unix://{} docker ps",
                 sock.display()
+            );
+        }
+
+        if params.auto_ports.is_some() {
+            eprintln!(
+                "Auto ports on: a TCP port the machine listens on appears at 127.0.0.1:<same port>"
             );
         }
 
@@ -2402,7 +2475,8 @@ impl RunCmd {
                 };
 
                 if mounts.iter().any(|mount| mount.staged) {
-                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                    if let Err(error) = sync_staged_mounts_after_run(&mounts, &mut client, &manager)
+                    {
                         // Preserve the VM and its ephemeral DB record so the
                         // guest-local copy remains recoverable and sync can be
                         // retried by machine name.
@@ -2553,7 +2627,8 @@ impl RunCmd {
                     exit_code
                 };
                 if mounts.iter().any(|mount| mount.staged) {
-                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                    if let Err(error) = sync_staged_mounts_after_run(&mounts, &mut client, &manager)
+                    {
                         manager.detach();
                         return Err(Error::agent(
                             "sync staged mounts",
@@ -3634,6 +3709,75 @@ mod tests {
         let parsed = parse_attached_disks(&cmd.disk)
             .expect_err("validation runs at create, so absent paths are refused up front");
         assert!(format!("{parsed}").contains("/dev/nvme1n1"));
+    }
+
+    fn parse_update(extra: &[&'static str]) -> UpdateCmd {
+        let argv = [&["machine", "update", "--name", "l"][..], extra].concat();
+        let MachineCmd::Update(cmd) = TestMachineCli::parse_from(argv).command else {
+            panic!("expected machine update command");
+        };
+        cmd
+    }
+
+    #[test]
+    fn update_changes_labels_alone_in_any_state() {
+        assert!(parse_update(&["--label", "kit=git"]).changes_only_labels());
+        assert!(parse_update(&["--remove-label", "kit"]).changes_only_labels());
+        assert!(!parse_update(&["--label", "kit=git", "--cpus", "2"]).changes_only_labels());
+        // A running machine applies an allow-list or port change alone, so a
+        // label beside one must not ride along unapplied.
+        let mixed = parse_update(&["--label", "kit=git", "--allow-host", "pypi.org"]);
+        assert!(!mixed.changes_only_labels() && !mixed.changes_only_egress());
+        let mixed = parse_update(&["--label", "kit=git", "-p", "3000:3000"]);
+        assert!(!mixed.changes_only_labels() && !mixed.changes_only_ports());
+    }
+
+    #[test]
+    fn update_sets_and_removes_labels() {
+        let apply = |extra: &[&'static str], labels: &mut _| {
+            let cmd = parse_update(extra);
+            let set = smolvm::util::parse_labels(&cmd.labels).unwrap();
+            cmd.apply_labels(labels, &set)
+        };
+        let mut labels: std::collections::BTreeMap<String, String> =
+            [("owner", "exo"), ("kit", "git"), ("old", "1")]
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+        let changes = apply(
+            &[
+                "--label",
+                "kit=git,node",
+                "--label",
+                "new=a=b",
+                "--remove-label",
+                "old",
+                "--remove-label",
+                "absent",
+            ],
+            &mut labels,
+        );
+        assert_eq!(
+            labels.into_iter().collect::<Vec<_>>(),
+            [("kit", "git,node"), ("new", "a=b"), ("owner", "exo")]
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+        );
+        assert_eq!(
+            changes,
+            [
+                "  removed label: old",
+                "  label: kit=git,node",
+                "  label: new=a=b"
+            ]
+        );
+
+        // A key removed and set in one update ends up set.
+        let mut labels = std::collections::BTreeMap::new();
+        apply(
+            &["--remove-label", "kit", "--label", "kit=git"],
+            &mut labels,
+        );
+        assert_eq!(labels.get("kit").map(String::as_str), Some("git"));
     }
 
     #[test]
@@ -4788,6 +4932,18 @@ pub struct CreateCmd {
     #[arg(long)]
     pub docker_socket: bool,
 
+    /// Publish every TCP port a process in the machine listens on at the same
+    /// port on host loopback while it listens (dev servers, `docker run -p`).
+    /// A host port already in use is skipped; ports below 1024 are not
+    /// published automatically. Applies when the CLI starts the machine.
+    #[arg(long)]
+    pub auto_ports: bool,
+
+    /// Never publish this guest port automatically (repeatable). Implies
+    /// --auto-ports.
+    #[arg(long = "auto-ports-exclude", value_name = "PORT")]
+    pub auto_ports_exclude: Vec<u16>,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR), resolved at
     /// each launch. Only the reference is persisted, never the value.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -5082,6 +5238,8 @@ impl CreateCmd {
             cuda,
             auto_graph,
             docker_socket,
+            auto_ports,
+            auto_ports_exclude,
             secret_env,
             secret_file,
             secret_keychain,
@@ -5211,6 +5369,8 @@ impl CreateCmd {
         }
         cli.cuda |= *cuda;
         cli.docker_socket |= *docker_socket;
+        cli.auto_ports =
+            merge_auto_ports_flags(cli.auto_ports.take(), *auto_ports, auto_ports_exclude);
         cli.gpu |= *gpu;
         cli.rosetta |= *rosetta;
         if oci_platform.is_some() {
@@ -5506,6 +5666,7 @@ impl CreateCmd {
                 {
                     image.apply(&mut record);
                 }
+                smolvm::portable_checkpoint::mark_image_on_storage(checkpoint, &mut record);
             }
 
             reservation.commit(&record)?;
@@ -6525,6 +6686,7 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --remove-volume ./src:/app
 ///   smolvm machine update --name myvm --net -e DEBUG=1
 ///   smolvm machine update --name myvm --allow-host pypi.org   # while running
+///   smolvm machine update --name myvm --auto-ports
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
@@ -6554,6 +6716,20 @@ pub struct UpdateCmd {
     /// Remove port mapping or one-to-one range
     #[arg(long, value_parser = PortMappingSpec::parse, value_name = "PORT[-END]|HOST[-END]:GUEST[-END]")]
     pub remove_port: Vec<PortMappingSpec>,
+
+    /// Publish every TCP port the guest listens on at the same host port on
+    /// loopback, from the next start
+    #[arg(long)]
+    pub auto_ports: bool,
+
+    /// Stop publishing listening ports automatically, from the next start
+    #[arg(long, conflicts_with_all = ["auto_ports", "auto_ports_exclude"])]
+    pub no_auto_ports: bool,
+
+    /// Replace the guest ports auto ports never publish (repeatable).
+    /// Implies --auto-ports.
+    #[arg(long = "auto-ports-exclude", value_name = "PORT")]
+    pub auto_ports_exclude: Vec<u16>,
 
     /// Set vCPU count
     #[arg(long, value_name = "N")]
@@ -6698,6 +6874,15 @@ pub struct UpdateCmd {
     /// Remove every guest resolv.conf option.
     #[arg(long)]
     pub clear_dns_options: bool,
+
+    /// Set a label, replacing any value the key had (repeatable). Labels are
+    /// host-side metadata, so they alone can change while the machine runs.
+    #[arg(long = "label", value_name = "KEY=VALUE")]
+    pub labels: Vec<String>,
+
+    /// Remove a label by key (repeatable). A key the machine lacks is ignored.
+    #[arg(long = "remove-label", value_name = "KEY")]
+    pub remove_labels: Vec<String>,
 }
 
 impl UpdateCmd {
@@ -6726,16 +6911,72 @@ impl UpdateCmd {
     /// Whether this update changes the allow list and nothing else, one of the
     /// changes a running machine takes.
     fn changes_only_egress(&self) -> bool {
-        let (egress, ports, other) = self.changed_settings();
-        egress && !ports && !other
+        let (egress, ports, labels, other) = self.changed_settings();
+        egress && !ports && !labels && !other
+    }
+
+    fn changes_only_labels(&self) -> bool {
+        let (egress, ports, labels, other) = self.changed_settings();
+        labels && !egress && !ports && !other
+    }
+
+    /// Apply this update's label changes to `labels`: `--remove-label` keys
+    /// first, then the parsed `--label` entries in `set`, so a key removed and
+    /// set at once ends up set. Returns a line per change.
+    fn apply_labels(
+        &self,
+        labels: &mut std::collections::BTreeMap<String, String>,
+        set: &std::collections::BTreeMap<String, String>,
+    ) -> Vec<String> {
+        let mut changes = Vec::new();
+        for key in &self.remove_labels {
+            if labels.remove(key).is_some() && !set.contains_key(key) {
+                changes.push(format!("  removed label: {key}"));
+            }
+        }
+        for (key, value) in set {
+            changes.push(format!("  label: {key}={value}"));
+            labels.insert(key.clone(), value.clone());
+        }
+        changes
+    }
+
+    /// Save a label-only update. Labels never reach the guest, so the
+    /// machine's state does not matter.
+    fn update_labels(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        set: &std::collections::BTreeMap<String, String>,
+    ) -> smolvm::Result<()> {
+        let mut changes = Vec::new();
+        let saved = db.update_vm(&self.name, |r| {
+            changes = self.apply_labels(&mut r.labels, set);
+        })?;
+        if saved.is_none() {
+            return Err(smolvm::Error::config(
+                "update",
+                format!("machine '{}' disappeared during update", self.name),
+            ));
+        }
+        if changes.is_empty() {
+            println!("No changes specified.");
+            return Ok(());
+        }
+        println!("Updated machine '{}':", self.name);
+        for change in &changes {
+            println!("{change}");
+        }
+        Ok(())
     }
 
     fn changes_only_ports(&self) -> bool {
-        let (egress, ports, other) = self.changed_settings();
-        ports && !egress && !other
+        let (egress, ports, labels, other) = self.changed_settings();
+        ports && !egress && !labels && !other
     }
 
-    fn changed_settings(&self) -> (bool, bool, bool) {
+    /// Which kinds of setting this update changes: the allow list, published
+    /// ports, labels, and anything else (which needs a stopped machine).
+    fn changed_settings(&self) -> (bool, bool, bool, bool) {
         let Self {
             name: _,
             volume,
@@ -6743,6 +6984,9 @@ impl UpdateCmd {
             remove_volume,
             port,
             remove_port,
+            auto_ports,
+            no_auto_ports,
+            auto_ports_exclude,
             cpus,
             mem,
             net,
@@ -6771,6 +7015,8 @@ impl UpdateCmd {
             dns_option,
             clear_dns_options,
             shm_size,
+            labels,
+            remove_labels,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -6785,6 +7031,9 @@ impl UpdateCmd {
         let ports = !port.is_empty() || !remove_port.is_empty();
         let other = !volume.is_empty()
             || !remove_volume.is_empty()
+            || *auto_ports
+            || *no_auto_ports
+            || !auto_ports_exclude.is_empty()
             || cpus.is_some()
             || mem.is_some()
             || *no_net
@@ -6803,7 +7052,8 @@ impl UpdateCmd {
             || !dns_option.is_empty()
             || *clear_dns_options
             || shm_size.is_some();
-        (egress, ports, other)
+        let labels = !labels.is_empty() || !remove_labels.is_empty();
+        (egress, ports, labels, other)
     }
 
     fn next_ports(&self, record: &smolvm::config::VmRecord) -> smolvm::Result<Vec<PortMapping>> {
@@ -6954,7 +7204,11 @@ impl UpdateCmd {
             smolvm::Error::config("update", format!("machine '{}' not found", self.name))
         })?;
 
+        let set_labels = smolvm::util::parse_labels(&self.labels)?;
         let state = record.actual_state();
+        if self.changes_only_labels() {
+            return self.update_labels(&db, &set_labels);
+        }
         if state == RecordState::Running && self.changes_only_egress() {
             return self.update_running_egress(&db, &record);
         }
@@ -7132,6 +7386,32 @@ impl UpdateCmd {
                 }
             }
             r.set_port_mappings(&ports);
+            if self.no_auto_ports && r.auto_ports.is_some() {
+                changes.push("  auto ports: disabled".to_string());
+                r.auto_ports = None;
+            }
+            if self.auto_ports || !self.auto_ports_exclude.is_empty() {
+                let next = smolvm::data::network::AutoPorts::excluding(
+                    if self.auto_ports_exclude.is_empty() {
+                        r.auto_ports.take().unwrap_or_default().exclude
+                    } else {
+                        self.auto_ports_exclude.clone()
+                    },
+                );
+                changes.push(if next.exclude.is_empty() {
+                    "  auto ports: enabled".to_string()
+                } else {
+                    format!(
+                        "  auto ports: enabled, excluding {}",
+                        next.exclude
+                            .iter()
+                            .map(u16::to_string)
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    )
+                });
+                r.auto_ports = Some(next);
+            }
 
             // Resources
             if let Some(cpus) = self.cpus {
@@ -7262,6 +7542,8 @@ impl UpdateCmd {
                 changes.push(format!("  workdir: {}", wd));
                 r.workdir = Some(wd.clone());
             }
+
+            changes.extend(self.apply_labels(&mut r.labels, &set_labels));
 
             // Resolver options
             if !self.dns_option.is_empty() {

@@ -123,6 +123,14 @@ impl VmHandle {
         }
     }
 
+    /// Stop a VM whose guest is paused (a frozen branch base): its agent
+    /// cannot answer a shutdown request, so the VMM is ended directly.
+    #[cfg(unix)]
+    pub fn stop_paused(&mut self) -> Result<()> {
+        self.client = None;
+        self.manager.stop_paused()
+    }
+
     /// Let a CLI-started VM outlive the process that launched it.
     pub fn detach(self) {
         self.manager.detach();

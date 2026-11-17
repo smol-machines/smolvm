@@ -1113,6 +1113,7 @@ fn registry_pull_credentials(
 
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
+    binary_stream: Arc<AtomicBool>,
     stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
@@ -1123,6 +1124,12 @@ pub struct AgentClient {
     /// Cumulative output ceiling of a streaming exec on this connection; see
     /// [`MAX_STREAMING_EXEC_OUTPUT`] and [`Self::set_streaming_output_cap`].
     streaming_output_cap: Option<usize>,
+    /// Set when an interactive session ended because the reader of our output
+    /// went away, which closes this connection; see [`Self::session_reader_gone`].
+    reader_gone: bool,
+    /// Why command termination could not be confirmed after an output pipe closed.
+    /// Staged files must remain in the VM until a caller can recover them.
+    session_end_error: Option<String>,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1319,7 +1326,10 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            binary_stream: Arc::new(AtomicBool::new(false)),
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
+            reader_gone: false,
+            session_end_error: None,
         }
     }
 }
@@ -1445,7 +1455,10 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            binary_stream: Arc::new(AtomicBool::new(false)),
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
+            reader_gone: false,
+            session_end_error: None,
         })
     }
 
@@ -1466,7 +1479,16 @@ impl AgentClient {
 
     /// Encode a request wrapped in an Envelope with the current trace_id.
     fn encode_traced(&self, req: &AgentRequest) -> Result<Vec<u8>> {
-        let envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        if self.binary_stream.load(Ordering::Acquire) {
+            if let Some(frame) =
+                smolvm_protocol::binary_stream::encode_request(req, self.trace_id.as_deref())
+                    .map_err(|e| Error::agent("encode binary request", e.to_string()))?
+            {
+                return Ok(frame);
+            }
+        }
+        let mut envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
         encode_message(&envelope).map_err(|e| Error::agent("encode message", e.to_string()))
     }
 
@@ -2395,16 +2417,24 @@ impl AgentClient {
     }
 
     fn shutdown_response_until(&mut self, deadline: Instant) -> Result<AgentResponse> {
+        self.response_until_deadline(deadline, "shutdown ack")
+    }
+
+    fn response_until_deadline(&mut self, deadline: Instant, op: &str) -> Result<AgentResponse> {
         let mut header = [0; 4];
         self.shutdown_read_until(&mut header, deadline)?;
         let len = u32::from_be_bytes(header) as usize;
         if len > MAX_FRAME_SIZE as usize {
-            return Err(Error::agent("shutdown ack", "response frame too large"));
+            return Err(Error::agent(op, "response frame too large"));
         }
         let mut body = vec![0; len];
         self.shutdown_read_until(&mut body, deadline)?;
-        serde_json::from_slice(&body)
-            .map_err(|error| Error::agent("shutdown ack", error.to_string()))
+        let (response, binary) = smolvm_protocol::binary_stream::decode_response(&body)
+            .map_err(|error| Error::agent(op, error.to_string()))?;
+        if binary {
+            self.binary_stream.store(true, Ordering::Release);
+        }
+        Ok(response)
     }
 
     // ========================================================================
@@ -2490,14 +2520,69 @@ impl AgentClient {
         }
     }
 
+    /// Stop the command after losing its output reader and wait for the agent
+    /// to acknowledge its exit before a caller synchronizes staged files.
+    fn end_session_reader_gone(&mut self) -> i32 {
+        self.end_session_reader_gone_with_timeout(Duration::from_secs(5))
+    }
+
+    fn end_session_reader_gone_with_timeout(&mut self, timeout: Duration) -> i32 {
+        self.reader_gone = true;
+        let result = (|| -> Result<()> {
+            // EOF on the request half tells the agent to kill and reap the
+            // command. Keep the response half open for its Exited acknowledgement.
+            self.stream.shutdown(std::net::Shutdown::Write)?;
+            self.stream.as_socket().set_nonblocking(true)?;
+            let deadline = Instant::now() + timeout;
+            loop {
+                match self.response_until_deadline(deadline, "interactive exit")? {
+                    AgentResponse::Exited { .. } => return Ok(()),
+                    AgentResponse::Stdout { .. } | AgentResponse::Stderr { .. } => {}
+                    AgentResponse::Error { message, .. } => {
+                        return Err(Error::agent("interactive exit", message))
+                    }
+                    _ => {
+                        return Err(Error::agent(
+                            "interactive exit",
+                            "expected command exit acknowledgement",
+                        ))
+                    }
+                }
+            }
+        })();
+        self.session_end_error = result.err().map(|error| error.to_string());
+        let _ = self.stream.shutdown(std::net::Shutdown::Both);
+        141
+    }
+
+    /// Whether an interactive session ended because its output reader went
+    /// away. This connection is closed; call [`Self::ensure_session_finished`]
+    /// before reconnecting to synchronize a staged filesystem.
+    pub fn session_reader_gone(&self) -> bool {
+        self.reader_gone
+    }
+
+    /// Refuse synchronization when an interrupted command's exit could not be
+    /// confirmed. A timeout or transport error is not evidence that it stopped.
+    pub fn ensure_session_finished(&self) -> Result<()> {
+        if let Some(error) = self.session_end_error.as_ref() {
+            return Err(Error::agent(
+                "interactive exit",
+                format!("guest command termination was not confirmed: {error}"),
+            ));
+        }
+        Ok(())
+    }
+
     /// Run an interactive I/O session.
     ///
     /// Sends `request`, waits for `Started`, then runs the poll loop
-    /// streaming stdout/stderr and forwarding stdin until `Exited`.
+    /// streaming stdout/stderr and forwarding stdin until `Exited`, or until
+    /// the reader of our output goes away (exit code 141).
     fn interactive_session(&mut self, request: AgentRequest, tty: bool, op: &str) -> Result<i32> {
         use crate::agent::terminal::{
-            check_sigwinch, flush_retry, get_terminal_size, install_sigwinch_handler, poll_io,
-            stdin_is_tty, write_all_retry, NonBlockingStdin, RawModeGuard,
+            check_sigwinch, get_terminal_size, install_sigwinch_handler, poll_io, stdin_is_tty,
+            NonBlockingStdin, RawModeGuard,
         };
         use std::io::{stderr, stdin, stdout, Read};
 
@@ -2567,6 +2652,7 @@ impl AgentClient {
         let mut stdin_buf = [0u8; STDIN_BUF_SIZE];
         let mut stdin_eof = false;
 
+        // `None` when the reader of our output went away before the command exited.
         let exit_code = loop {
             if let Some(e) = writer.take_error() {
                 return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
@@ -2600,15 +2686,17 @@ impl AgentClient {
             if poll_result.socket_ready {
                 match self.receive() {
                     Ok(AgentResponse::Stdout { data }) => {
-                        write_all_retry(&mut stdout(), &data)?;
-                        flush_retry(&mut stdout())?;
+                        if !relay_output(&mut stdout(), &data)? {
+                            break None;
+                        }
                     }
                     Ok(AgentResponse::Stderr { data }) => {
-                        write_all_retry(&mut stderr(), &data)?;
-                        flush_retry(&mut stderr())?;
+                        if !relay_output(&mut stderr(), &data)? {
+                            break None;
+                        }
                     }
                     Ok(AgentResponse::Exited { exit_code, .. }) => {
-                        break exit_code;
+                        break Some(exit_code);
                     }
                     Ok(AgentResponse::Error { message, .. }) => {
                         return Err(Error::agent(op, message));
@@ -2665,6 +2753,13 @@ impl AgentClient {
                     }
                 }
             }
+        };
+
+        let Some(exit_code) = exit_code else {
+            // Stop the writer before closing the connection: its drop puts the
+            // socket's write timeout back, which a closed socket may refuse.
+            drop(writer);
+            return Ok(self.end_session_reader_gone());
         };
 
         Ok(exit_code)
@@ -2834,7 +2929,8 @@ impl AgentClient {
     ///
     /// # Returns
     ///
-    /// The exit code of the command
+    /// The exit code of the command, or 141 when our stdout or stderr reader
+    /// went away; the connection is then closed and the agent kills the command.
     pub fn run_interactive(&mut self, config: RunConfig) -> Result<i32> {
         let timeout_ms = config.timeout.map(|t| t.as_millis() as u64);
         let tty = config.tty;
@@ -3761,11 +3857,14 @@ impl AgentClient {
         // this one. Commands that echo as they read can otherwise fill both
         // socket directions and wait on each other indefinitely.
         let mut writer = AgentClient {
+            binary_stream: self.binary_stream.clone(),
             stream: self.stream.try_clone()?,
             trace_id: self.trace_id.clone(),
             file_target: self.file_target.clone(),
             capabilities: self.capabilities.clone(),
             streaming_output_cap: self.streaming_output_cap,
+            reader_gone: self.reader_gone,
+            session_end_error: self.session_end_error.clone(),
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -4018,8 +4117,11 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let mut resp: AgentResponse = serde_json::from_slice(&buf)
+        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
+        if binary {
+            self.binary_stream.store(true, Ordering::Release);
+        }
         // Rewrite a version-skew error as it enters, so every decode site —
         // the shared match helpers and the many inline `AgentResponse::Error`
         // matches (branchpoint_*, pod_*, …) — reports the skew the same way.
@@ -4179,6 +4281,154 @@ where
     P: FnMut(u64),
 {
     consume_streamed_read_inner(next_response, file_transfer_max_total(), on_progress)
+}
+
+/// Relay a chunk of the command's output to our stdout or stderr. Returns
+/// `Ok(false)` when the reader of our output has gone (`run -i -- yes | head`),
+/// so the session can end with exit code 141, as `exec --stream` does.
+fn relay_output(out: &mut impl std::io::Write, data: &[u8]) -> std::io::Result<bool> {
+    use crate::agent::terminal::{flush_retry, write_all_retry};
+    match write_all_retry(out, data).and_then(|()| flush_retry(out)) {
+        Ok(()) => Ok(true),
+        Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
+#[cfg(test)]
+mod relay_output_tests {
+    use super::relay_output;
+    use std::io::{self, Write};
+
+    struct FailingWriter(io::ErrorKind);
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _buf: &[u8]) -> io::Result<usize> {
+            Err(io::Error::from(self.0))
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            Err(io::Error::from(self.0))
+        }
+    }
+
+    #[test]
+    fn relay_output_writes_and_continues() {
+        let mut out = Vec::new();
+        assert!(relay_output(&mut out, b"y\n").unwrap());
+        assert_eq!(out, b"y\n");
+    }
+
+    #[test]
+    fn relay_output_stops_quietly_when_the_reader_has_gone() {
+        let mut out = FailingWriter(io::ErrorKind::BrokenPipe);
+        assert!(!relay_output(&mut out, b"y\n").unwrap());
+    }
+
+    #[test]
+    fn relay_output_reports_other_write_errors() {
+        let mut out = FailingWriter(io::ErrorKind::PermissionDenied);
+        let err = relay_output(&mut out, b"y\n").unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::PermissionDenied);
+    }
+
+    #[test]
+    fn interrupted_session_waits_for_guest_exit_before_returning() {
+        use super::{AgentClient, AgentResponse};
+        use crate::platform::uds::UdsStream;
+        use std::io::Read;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let (host, mut guest) = UdsStream::pair().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        let (eof_tx, eof_rx) = mpsc::channel();
+        let (exit_tx, exit_rx) = mpsc::channel();
+        let agent = std::thread::spawn(move || -> io::Result<()> {
+            assert_eq!(guest.read(&mut [0; 1])?, 0);
+            eof_tx.send(()).unwrap();
+            exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            // Output may already be queued in either negotiated binary or JSON.
+            smolvm_protocol::binary_stream::write_response(
+                &mut guest,
+                &AgentResponse::Stdout {
+                    data: b"pending output".to_vec(),
+                },
+            )?;
+            guest.write_all(
+                &smolvm_protocol::encode_message(&AgentResponse::Exited {
+                    exit_code: 124,
+                    oom: false,
+                })
+                .unwrap(),
+            )
+        });
+        let (done_tx, done_rx) = mpsc::channel();
+        let client = std::thread::spawn(move || {
+            let mut client = AgentClient::from_stream(host);
+            let result = client.end_session_reader_gone();
+            client.ensure_session_finished().unwrap();
+            done_tx.send(result).unwrap();
+        });
+        eof_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let premature = done_rx.recv_timeout(Duration::from_millis(50));
+        exit_tx.send(()).unwrap();
+        let result = match premature {
+            Ok(code) => code,
+            Err(_) => done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+        };
+        client.join().unwrap();
+        let agent_result = agent.join().unwrap();
+        assert!(
+            premature.is_err(),
+            "returned before the agent confirmed command termination"
+        );
+        agent_result.unwrap();
+        assert_eq!(result, 141);
+    }
+
+    #[test]
+    fn missing_exit_acknowledgement_refuses_staged_synchronization() {
+        use super::AgentClient;
+        use crate::platform::uds::UdsStream;
+        use std::io::Read;
+        let (host, mut guest) = UdsStream::pair().unwrap();
+        let agent = std::thread::spawn(move || {
+            assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0);
+            // A lost connection is not an acknowledgement that the command died.
+        });
+        let mut client = AgentClient::from_stream(host);
+        assert!(!client.session_reader_gone());
+        assert_eq!(client.end_session_reader_gone(), 141);
+        assert!(client.session_reader_gone());
+        assert!(client.ensure_session_finished().is_err());
+        agent.join().unwrap();
+    }
+
+    #[test]
+    fn a_partial_exit_frame_cannot_extend_the_command_termination_deadline() {
+        use super::AgentClient;
+        use crate::platform::uds::UdsStream;
+        use std::io::Read;
+        use std::time::Duration;
+        let (host, mut guest) = UdsStream::pair().unwrap();
+        let agent = std::thread::spawn(move || {
+            assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0);
+            guest.write_all(&100u32.to_be_bytes()).unwrap();
+            guest.write_all(b"{").unwrap();
+            std::thread::sleep(Duration::from_millis(200));
+        });
+        let mut client = AgentClient::from_stream(host);
+        assert_eq!(
+            client.end_session_reader_gone_with_timeout(Duration::from_millis(20)),
+            141
+        );
+        let error = client.ensure_session_finished().unwrap_err().to_string();
+        assert!(error.contains("deadline"), "{error}");
+        agent.join().unwrap();
+    }
 }
 
 #[cfg(test)]
@@ -6263,5 +6513,67 @@ password = "mirror-secret"
         .unwrap();
         assert_eq!(auth.username, "explicit");
         assert_eq!(auth.password, "secret");
+    }
+}
+
+#[cfg(test)]
+mod binary_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn requests_switch_only_after_peer_acknowledges_binary() {
+        for binary in [false, true] {
+            let (stream, mut peer) = UdsStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let server = std::thread::spawn(move || {
+                let read = |peer: &mut UdsStream| {
+                    let mut header = [0; 4];
+                    peer.read_exact(&mut header).unwrap();
+                    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                    peer.read_exact(&mut body).unwrap();
+                    body
+                };
+                let body = read(&mut peer);
+                assert_eq!(body[0], b'{');
+                let envelope: Envelope<AgentRequest> = serde_json::from_slice(&body).unwrap();
+                assert_eq!(envelope.binary_stream, Some(1));
+                let mut response = Envelope::new(AgentResponse::Started);
+                if binary {
+                    response.binary_stream = Some(1);
+                }
+                peer.write_all(&encode_message(&response).unwrap()).unwrap();
+                let body = read(&mut peer);
+                assert_eq!(body[0] == 0, binary);
+                let envelope = smolvm_protocol::binary_stream::decode_request(&body).unwrap();
+                assert_eq!(envelope.trace_id.as_deref(), Some("stream-trace"));
+                assert!(
+                    matches!(envelope.body, AgentRequest::Stdin { data } if data == [0, 255, 10])
+                );
+                let response = AgentResponse::Stdout {
+                    data: vec![0, 255, 10],
+                };
+                let mut frame = Vec::new();
+                if binary {
+                    smolvm_protocol::binary_stream::write_response(&mut frame, &response).unwrap();
+                } else {
+                    frame = encode_message(&response).unwrap();
+                }
+                for byte in frame {
+                    peer.write_all(&[byte]).unwrap();
+                }
+            });
+            let mut client = AgentClient::from_stream(stream);
+            client.set_trace_id("stream-trace".into());
+            client.send_raw(&AgentRequest::Ping).unwrap();
+            assert!(matches!(client.recv_raw().unwrap(), AgentResponse::Started));
+            client.send_stdin(&[0, 255, 10]).unwrap();
+            assert!(
+                matches!(client.recv_raw().unwrap(), AgentResponse::Stdout { data } if data == [0, 255, 10])
+            );
+            server.join().unwrap();
+        }
     }
 }

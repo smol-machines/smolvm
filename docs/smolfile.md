@@ -113,7 +113,7 @@ GCP_CREDS    = { from_file = "/abs/creds.json" }  # absolute host file (at launc
 Credential bindings are `[[network.credentials]]` tables, described in
 [credential substitution](credential-substitution.md). The other accepted keys
 are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
-`block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
+`auto_ports`, `auto_ports_exclude`, `block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
 tables; `machine create --help` describes the flag each one mirrors.
 
 ## User names and numeric IDs
@@ -197,3 +197,8 @@ number; `stop_timeout` is whole seconds, at most 300. The same settings are
 `machine create --stop-signal` and `--stop-timeout`, and `machine stop
 --timeout SECS` overrides the wait for one stop (`0` kills at once).
 `machine delete` does not wait.
+
+If the machine's process is still present after `SIGKILL` because the kernel
+is holding one of its threads, `machine stop` still finishes and names the
+PID, `machine delete --force` removes the machine, and a start is refused
+until that process is gone (the kernel call returns or the host reboots).

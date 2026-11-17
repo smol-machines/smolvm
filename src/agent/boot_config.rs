@@ -55,6 +55,10 @@ pub struct BootConfig {
     /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
     #[serde(default)]
     pub expose_docker: bool,
+    /// Publish the TCP ports the guest listens on at the same host port on
+    /// loopback (`--auto-ports`). Only the local CLI's launches set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`),
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]

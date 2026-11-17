@@ -59,6 +59,41 @@ pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
 }
 
+/// The error for reaching a paused machine: it has no agent to connect to, and
+/// `machine start` refuses it rather than discard its saved execution, so the
+/// command to name is resume.
+fn paused_machine_error(label: &str, record: &VmRecord) -> Option<smolvm::Error> {
+    record.paused_checkpoint.as_ref()?;
+    Some(smolvm::Error::agent(
+        "connect",
+        format!(
+            "machine '{label}' is paused. Resume it with 'smolvm machine resume --name {label}'; if a resume is already in progress, retry once it finishes."
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod paused_machine_error_tests {
+    use super::paused_machine_error;
+    use smolvm::config::VmRecord;
+
+    #[test]
+    fn a_paused_machine_is_pointed_at_resume_not_start() {
+        let mut record = VmRecord::new("worker".to_string(), 1, 256, vec![], vec![], false);
+        assert!(paused_machine_error("worker", &record).is_none());
+
+        record.paused_checkpoint = Some("saved.smolcheckpoint".into());
+        let message = paused_machine_error("worker", &record)
+            .expect("a paused machine gets its own error")
+            .to_string();
+        assert!(
+            message.contains("smolvm machine resume --name worker"),
+            "{message}"
+        );
+        assert!(!message.contains("machine start"), "{message}");
+    }
+}
+
 /// Ensure a VM is running and return a connected client.
 ///
 /// This is the common pattern used by exec commands in the machine subcommand.
@@ -74,6 +109,16 @@ pub fn ensure_running_and_connect(
     };
 
     if manager.try_connect_existing().is_none() {
+        // A paused machine would otherwise get the start hint below, and
+        // `machine start` refuses it.
+        let paused = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&label).ok().flatten())
+            .and_then(|record| paused_machine_error(&label, &record));
+        if let Some(error) = paused {
+            return Err(error);
+        }
+
         // Distinguish "machine not found" from "machine stopped"
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
@@ -525,6 +570,8 @@ pub struct CreateVmParams {
     pub cuda_vram_limit_mib: Option<u64>,
     /// Expose the guest's Docker daemon socket to the host as a Unix socket.
     pub docker_socket: bool,
+    /// Publish the TCP ports the guest listens on (`--auto-ports`).
+    pub auto_ports: Option<smolvm::data::network::AutoPorts>,
     /// Enable GPU acceleration (virtio-gpu with Venus/Vulkan).
     /// Expose host virtualization extensions so the guest can run KVM.
     pub nested_virt: bool,
@@ -790,6 +837,7 @@ impl CreateVmParams {
             cuda_fork_pool_size,
             cuda_vram_limit_mib,
             docker_socket,
+            auto_ports,
             nested_virt,
             gpu,
             gpu_vram_mib,
@@ -837,12 +885,15 @@ impl CreateVmParams {
             remote_volumes,
             disk_volumes,
             net,
+            egress: None,
             network_backend,
             dns,
             dns_options,
             network_name,
             guest_subnet,
+            switch: None,
             ports: port,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts: dns_filter_hosts,
             block_private,
@@ -959,6 +1010,36 @@ pub struct ForkVmOptions<'a> {
     pub labels: &'a [(String, String)],
 }
 
+/// Refuse to boot `name` from the CLI when its credential bindings take values
+/// only from an API or SDK caller, or from the checkpoint it was restored from.
+/// This process never holds such values, so the machine would intercept HTTPS
+/// to the bound hosts without adding a single credential, and the workload
+/// would see only failed requests. An external interceptor brings its own.
+pub(crate) fn require_host_credential_values(
+    name: &str,
+    record: &smolvm::config::VmRecord,
+    external_interceptor: bool,
+) -> smolvm::Result<()> {
+    if external_interceptor || !record.credentials_supplied_by_api {
+        return Ok(());
+    }
+    let Some(policy) = record.credential_policy.as_ref().filter(|p| !p.is_empty()) else {
+        return Ok(());
+    };
+    let bindings: Vec<&str> = policy.credentials.iter().map(|b| b.name.as_str()).collect();
+    Err(smolvm::Error::config(
+        "credentials",
+        format!(
+            "machine '{name}' reads the values of its credential bindings ({}) only from the \
+             API or SDK that created it, or from no one if it was restored from a checkpoint, \
+             so started from the CLI it would intercept HTTPS without adding them; restore it \
+             with `machine create --from <checkpoint> --credential …` naming the same bindings \
+             to read their values from this host",
+            bindings.join(", ")
+        ),
+    ))
+}
+
 pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm::Result<()> {
     let source_policy = if options.freeze_source {
         smolvm::agent::fork::ForkSourcePolicy::Freeze
@@ -978,6 +1059,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
                 "source requires --egress-interceptor and SMOLVM_INTERCEPTOR_TOKEN for each child",
             ));
         }
+        require_host_credential_values(golden, &record, options.external_interceptor.is_some())?;
         if !record.remote_volumes.is_empty() {
             return Err(smolvm::Error::config(
                 "machine fork",
@@ -1131,6 +1213,7 @@ pub fn fork_vm_batch(
                 "source requires --egress-interceptor and SMOLVM_INTERCEPTOR_TOKEN for each child",
             ));
         }
+        require_host_credential_values(golden, &record, external_interceptor.is_some())?;
         if !record.remote_volumes.is_empty() {
             return Err(smolvm::Error::config(
                 "machine fork",
@@ -1685,8 +1768,12 @@ fn start_vm_named_with_db(
         registry_auth,
     } = options;
 
+    // A machine whose previous process the kernel is still holding is not
+    // started; once that process is gone its PID is forgotten here.
+    smolvm::agent::state_probe::refuse_start_while_held(db, name)?;
     // Direct DB lookup — 1 read cycle instead of loading everything
     let mut record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    require_host_credential_values(name, &record, external_interceptor.is_some())?;
     // A durable checkpoint restores the already-running guest and workload just
     // like an in-memory fork snapshot. Capture this before finalization consumes
     // the one-shot payload, so the workload is not launched twice.
@@ -1838,15 +1925,21 @@ fn start_vm_named_with_db(
 
     // A fresh registry-image machine starts on a shared seed of its image, so
     // the guest finds the image already pulled. Best-effort: without a seed the
-    // guest pulls as before.
-    smolvm::image_seed::seed_first_start(
-        name,
-        &record,
-        from_snapshot,
-        seed_digest_ttl,
-        proxy,
-        no_proxy,
-    );
+    // guest pulls as before. A Ctrl-C or SIGTERM during a seed build deletes
+    // the builder machine and ends the command; this machine stays created.
+    let interrupted = smolvm::image_seed::interruptible(|| {
+        smolvm::image_seed::seed_first_start(
+            name,
+            &record,
+            from_snapshot,
+            seed_digest_ttl,
+            proxy,
+            no_proxy,
+        )
+    });
+    if let Some(signal) = interrupted {
+        smolvm::image_seed::exit_by_signal(signal);
+    }
 
     // Start agent VM
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
@@ -1862,7 +1955,15 @@ fn start_vm_named_with_db(
     } else {
         String::new()
     };
-    eprintln!("Starting machine '{}'{}{}...", name, mount_info, port_info);
+    let auto_info = if record.auto_ports.is_some() {
+        " (auto ports on)"
+    } else {
+        ""
+    };
+    eprintln!(
+        "Starting machine '{}'{}{}{}...",
+        name, mount_info, port_info, auto_info
+    );
 
     // Resolve SSH agent socket path if enabled
     let ssh_agent_socket = if record.ssh_agent {
@@ -1885,9 +1986,15 @@ fn start_vm_named_with_db(
     // the pre-extracted layers instead of pulling, with no dependency on the
     // original bundle file. Shared with the API and embedded start paths.
     let mut features = smolvm::agent::LaunchFeatures {
+        // `machine start` leaves the VM running after this CLI exits, even
+        // when a wrapper selects its boot executable with SMOLVM_BOOT_BINARY.
+        watch_parent: Some(false),
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
+        // Only here, the CLI's own start: `smolvm serve` and the SDK runtime
+        // start machines without auto ports, whatever the record asks.
+        auto_ports: record.auto_ports.clone(),
         published_sockets: record.published_sockets.clone(),
         dns_filter_hosts: record.dns_filter_hosts.clone(),
         credentials: smolvm::credentials::CredentialLaunch::for_record(name, &record),
@@ -2346,7 +2453,15 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     cli_recover_if_unreachable("default")?;
 
     eprintln!("Starting machine 'default'...");
-    manager.ensure_running()?;
+    manager.ensure_running_with_full_config(
+        Vec::new(),
+        Vec::new(),
+        smolvm::agent::VmResources::default(),
+        smolvm::agent::LaunchFeatures {
+            watch_parent: Some(false),
+            ..Default::default()
+        },
+    )?;
 
     let mut config = SmolvmConfig::load()?;
     persist_named_running(&mut config, "default", manager.child_pid(), None)?;
@@ -2558,11 +2673,7 @@ pub fn stop_vm_named_with_timeout(
         ));
     }
 
-    config.update_vm(name, |r| {
-        r.state = RecordState::Stopped;
-        r.pid = None;
-        r.pid_start_time = None;
-    });
+    config.update_vm(name, VmRecord::mark_process_stopped);
 
     println!("Stopped machine: {}", name);
     Ok(())
@@ -2659,11 +2770,7 @@ pub fn stop_vm_default(stop_timeout: Option<std::time::Duration>) -> smolvm::Res
                 &smolvm::agent::machine_layers_cache_dir("default"),
             );
         }
-        config.update_vm("default", |r| {
-            r.state = RecordState::Stopped;
-            r.pid = None;
-            r.pid_start_time = None;
-        });
+        config.update_vm("default", VmRecord::mark_process_stopped);
     }
 
     println!("Machine 'default' stopped");
@@ -2826,6 +2933,37 @@ fn ensure_fork_base_delete_is_safe(
     ))
 }
 
+/// Decide whether a delete may go ahead around a process the kernel is
+/// holding after SIGKILL.
+///
+/// Such a process cannot be made to exit, by this or any later delete.
+/// Removing the machine around it leaves that process behind with the
+/// machine's files open, so it needs `--force`: with it the held process is
+/// returned for the caller to name, and without it the machine is recorded
+/// stopped and the delete is refused with the reason.
+fn held_process_delete_gate(
+    db: &SmolvmDb,
+    name: &str,
+    record: &VmRecord,
+    force: bool,
+) -> smolvm::Result<Option<smolvm::process::HeldProcess>> {
+    let Some(held) = record.held_process() else {
+        return Ok(None);
+    };
+    if force {
+        return Ok(Some(held));
+    }
+    db.update_vm(name, VmRecord::mark_process_stopped)?;
+    Err(smolvm::Error::agent(
+        "delete machine",
+        format!(
+            "machine '{name}' is stopped, but {}; pass --force to delete the \
+             machine and leave that process behind",
+            held.explain()
+        ),
+    ))
+}
+
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
     let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
@@ -2911,7 +3049,7 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
                 // The machine is being deleted, so its workload has nothing
                 // to save: kill it at once rather than wait out its timeout.
                 manager.stop_with_timeout(std::time::Duration::ZERO)?;
-                if record.pid.is_some_and(smolvm::process::is_alive) {
+                if record.pid.is_some_and(smolvm::process::can_still_run) {
                     return Err(smolvm::Error::agent(
                         "delete machine",
                         format!("machine '{name}' process is still alive after stop"),
@@ -2932,6 +3070,14 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
             }
             _ => {}
         }
+    }
+
+    if let Some(held) = held_process_delete_gate(&db, name, &record, force)? {
+        eprintln!(
+            "Deleting machine '{name}' and leaving PID {} behind: {}.",
+            held.pid,
+            held.explain()
+        );
     }
 
     // If the machine was created from a .smolmachine, detach its case-sensitive
@@ -3051,6 +3197,11 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
         for (host, guest, state) in published_port_states(&label, &manager) {
             output.push_str(&state.describe(host, guest));
         }
+        if let Some(auto) =
+            smolvm::network::auto_ports::read_state(&smolvm::agent::vm_data_dir(&label))
+        {
+            output.push_str(&describe_auto_ports(&auto));
+        }
         output
     } else if let Some(ref n) = name {
         // Agent not reachable. Report the precise state from the registry
@@ -3078,6 +3229,45 @@ pub fn status_vm(name: &Option<String>) -> smolvm::Result<()> {
     };
 
     write_status_output(&output)
+}
+
+/// `machine status` lines for what auto ports published, marked `auto`.
+fn describe_auto_ports(state: &smolvm::network::auto_ports::AutoPortsState) -> String {
+    let mut lines = String::new();
+    for port in &state.published {
+        lines.push_str(&format!("  port {port} -> {port}: auto\n"));
+    }
+    for skipped in &state.skipped {
+        lines.push_str(&format!(
+            "  port {}: listening, not published automatically ({})\n",
+            skipped.port, skipped.reason
+        ));
+    }
+    lines
+}
+
+/// The `auto_ports` object of a machine's JSON status: its settings, and
+/// while it runs the ports published (each marked `auto`) and the listening
+/// ones left unpublished.
+fn auto_ports_json(
+    name: &str,
+    record: &VmRecord,
+    state: &RecordState,
+) -> Option<serde_json::Value> {
+    let settings = record.auto_ports.as_ref()?;
+    let live = (*state == RecordState::Running)
+        .then(|| smolvm::network::auto_ports::read_state(&smolvm::agent::vm_data_dir(name)))
+        .flatten()
+        .unwrap_or_default();
+    Some(serde_json::json!({
+        "exclude": settings.exclude,
+        "ports": live
+            .published
+            .iter()
+            .map(|port| serde_json::json!({"host": port, "guest": port, "auto": true}))
+            .collect::<Vec<_>>(),
+        "skipped": live.skipped,
+    }))
 }
 
 /// A closed pipe means the reader has enough status output. It is not a VM
@@ -3568,6 +3758,10 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     }
     if !record.dns_options.is_empty() {
         fields.insert("dns_options".into(), serde_json::json!(record.dns_options));
+    }
+    // Present only on a machine with auto ports; see `auto_ports_json`.
+    if let Some(auto) = auto_ports_json(name, record, &actual_state) {
+        fields.insert("auto_ports".into(), auto);
     }
     if let Some(exit) = smolvm::vm_exit::read(&smolvm::agent::vm_data_dir(name)) {
         fields.insert("last_exit".into(), serde_json::json!(exit));
@@ -5048,5 +5242,119 @@ mod status_dns_tests {
             status["dns_options"],
             serde_json::json!(["timeout:1", "use-vc"])
         );
+    }
+}
+
+/// The CLI's start and delete around a process the kernel holds after
+/// SIGKILL, stood in for by `process::fake_held`. `machine stop` reaches such
+/// a machine through `state_probe::recover_unreachable_machine_in_db`, which
+/// is tested with the same stand-in in that module.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use smolvm::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    /// A machine as `machine stop` leaves it when its process is held.
+    fn stopped_with_held_process(db: &SmolvmDb, name: &str, pid: i32) -> VmRecord {
+        let mut record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        db.insert_vm(name, &record).unwrap();
+        smolvm::agent::state_probe::recover_unreachable_machine_in_db(&record, db).unwrap();
+        db.get_vm(name).unwrap().unwrap()
+    }
+
+    #[test]
+    fn cli_stop_of_a_held_machine_leaves_it_stopped_with_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let record = stopped_with_held_process(&db, "cli-held-stop", held.pid);
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        // The update `machine stop` applies last keeps it too.
+        let mut again = record.clone();
+        again.mark_process_stopped();
+        assert_eq!(again.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn cli_start_is_refused_while_the_process_is_held() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "cli-held-start";
+        stopped_with_held_process(&db, name, held.pid);
+
+        let error = start_vm_named_with_db(
+            &db,
+            name,
+            None,
+            None,
+            false,
+            ForkLaunch::default(),
+            StartOptions::default(),
+        )
+        .unwrap_err()
+        .to_string();
+
+        assert!(
+            error.contains(&fake_held::held(held.pid).start_refusal()),
+            "{error}"
+        );
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn cli_delete_of_a_held_machine_needs_force_and_says_why() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "cli-held-delete";
+        let record = stopped_with_held_process(&db, name, held.pid);
+
+        let error = held_process_delete_gate(&db, name, &record, false)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            error.contains(&format!(
+                "process {} is still present after SIGKILL",
+                held.pid
+            )),
+            "{error}"
+        );
+        assert!(error.contains("pass --force"), "{error}");
+        // The refused delete leaves the machine in place, stopped.
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+
+        // With --force the delete goes ahead and names what it leaves.
+        let left = held_process_delete_gate(&db, name, &record, true).unwrap();
+        assert_eq!(left.map(|held| held.pid), Some(held.pid));
+    }
+
+    #[test]
+    fn cli_delete_needs_no_force_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "cli-held-then-gone";
+        let record = stopped_with_held_process(&db, name, held.pid);
+        assert!(held_process_delete_gate(&db, name, &record, false).is_err());
+
+        held.disappear();
+
+        assert_eq!(
+            held_process_delete_gate(&db, name, &record, false).unwrap(),
+            None
+        );
+        smolvm::agent::state_probe::refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
     }
 }

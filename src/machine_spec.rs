@@ -39,9 +39,9 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 
 use crate::config::{PublishedSocketConfig, RecordState, RestartConfig, RestartPolicy, VmRecord};
-use crate::credentials::CredentialPolicy;
+use crate::credentials::{CredentialBinding, CredentialPolicy};
 use crate::data::disk::{AttachedDisk, CacheDisk};
-use crate::data::network::PortMapping;
+use crate::data::network::{AutoPorts, PortMapping};
 use crate::data::resources::{
     default_microvm_memory_mib, BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT,
 };
@@ -134,6 +134,9 @@ pub struct CreateSpec {
     // Network ----------------------------------------------------------------
     /// Outbound networking. Also turned on by any option that needs it.
     pub net: bool,
+    /// Replace inherited outbound policy before the machine is published.
+    /// `None` inherits; `Some` replaces the allow list, including explicit off.
+    pub egress: Option<crate::data::network::EgressPolicy>,
     /// Network backend.
     pub network_backend: Option<NetworkBackend>,
     /// Guest DNS resolver.
@@ -144,8 +147,12 @@ pub struct CreateSpec {
     pub network_name: Option<String>,
     /// Canonical guest link subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch to join (virtio-net only).
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports (TCP and UDP).
     pub ports: Vec<PortMapping>,
+    /// Publish whatever TCP ports the guest listens on, while it does.
+    pub auto_ports: Option<AutoPorts>,
     /// Egress CIDR allow-list (`Some([])` denies everything).
     pub allowed_cidrs: Option<Vec<String>>,
     /// Egress hostname allow-list.
@@ -266,12 +273,15 @@ impl CreateSpec {
             remote_volumes,
             disk_volumes,
             net,
+            egress,
             network_backend,
             dns,
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts,
             block_private,
@@ -333,12 +343,18 @@ impl CreateSpec {
             remote_volumes: list(self.remote_volumes, remote_volumes),
             disk_volumes: list(self.disk_volumes, disk_volumes),
             net: net || self.net,
+            egress: egress.or(self.egress),
             network_backend: network_backend.or(self.network_backend),
             dns: dns.or(self.dns),
             dns_options: replace(self.dns_options, dns_options),
             network_name: network_name.or(self.network_name),
             guest_subnet: guest_subnet.or(self.guest_subnet),
+            switch: switch.or(self.switch),
             ports: list(self.ports, ports),
+            auto_ports: match (self.auto_ports, auto_ports) {
+                (Some(base), Some(top)) => Some(base.merged(top)),
+                (base, top) => top.or(base),
+            },
             allowed_cidrs: opt_list(self.allowed_cidrs, allowed_cidrs),
             allowed_hosts: opt_list(self.allowed_hosts, allowed_hosts),
             block_private: opt_list(self.block_private, block_private),
@@ -435,9 +451,13 @@ pub struct RestoredState {
     pub checkpoint_head: Option<String>,
     /// The captured machine routed egress through a host mediator.
     pub mediated_egress_required: bool,
-    /// The bindings came with the artifact, so their values must be supplied
-    /// by the caller, never read from this host's environment.
+    /// The bindings came with the artifact and the host user did not
+    /// re-authorize them, so their values must be supplied by the caller,
+    /// never read from this host's environment.
     pub credentials_from_artifact: bool,
+    /// The captured machine keeps a `local:` image on its storage disk rather
+    /// than mounting host-backed layers.
+    pub packed_image_on_storage: bool,
 }
 
 /// A [`CreateSpec`] with every rule applied: the machine's settings, ready to
@@ -519,8 +539,12 @@ pub struct ResolvedSpec {
     pub network_name: Option<String>,
     /// Guest subnet.
     pub guest_subnet: Option<String>,
+    /// Container switch.
+    pub switch: Option<crate::data::network::SwitchAttachment>,
     /// Published ports.
     pub ports: Vec<PortMapping>,
+    /// Automatic port publishing.
+    pub auto_ports: Option<AutoPorts>,
     /// CIDR allow-list.
     pub allowed_cidrs: Option<Vec<String>>,
     /// Hostname allow-list.
@@ -567,6 +591,87 @@ pub struct ResolvedSpec {
     pub labels: BTreeMap<String, String>,
     /// State a restored checkpoint already holds.
     pub restored: Option<RestoredState>,
+}
+
+/// Check that `requested` names every binding `captured` holds, each exactly
+/// as captured: same environment variable, hosts, header and injection
+/// location. Methods stay as captured; a flag cannot name them. Anything else
+/// would let the restore read or send a value the checkpoint never bound.
+fn reauthorize_captured_credentials(
+    captured: Option<&CredentialPolicy>,
+    requested: &CredentialPolicy,
+) -> Result<()> {
+    let refuse = |why: String| {
+        Error::config(
+            "create from a checkpoint",
+            format!(
+                "credential bindings on a restore can only re-authorize the checkpoint's own: {why}"
+            ),
+        )
+    };
+    let Some(captured) = captured.filter(|p| !p.is_empty()) else {
+        return Err(refuse("the checkpoint was captured without any".into()));
+    };
+    let hosts = |b: &CredentialBinding| {
+        let mut hosts: Vec<String> = b
+            .allowed_hosts
+            .iter()
+            .map(|h| h.to_ascii_lowercase())
+            .collect();
+        hosts.sort();
+        hosts.dedup();
+        hosts
+    };
+    for want in &requested.credentials {
+        let Some(have) = captured.credentials.iter().find(|b| b.name == want.name) else {
+            return Err(refuse(format!(
+                "the checkpoint has no binding named '{}'",
+                want.name
+            )));
+        };
+        if have.environment_variable != want.environment_variable
+            || hosts(have) != hosts(want)
+            || have.set_header.as_deref().map(str::to_ascii_lowercase)
+                != want.set_header.as_deref().map(str::to_ascii_lowercase)
+            || have.injection_location != want.injection_location
+        {
+            return Err(refuse(format!(
+                "binding '{}' was captured as {}, which this flag does not match",
+                have.name,
+                describe_binding(have)
+            )));
+        }
+    }
+    if let Some(missing) = captured.credentials.iter().find(|have| {
+        !requested
+            .credentials
+            .iter()
+            .any(|want| want.name == have.name)
+    }) {
+        return Err(refuse(format!(
+            "binding '{}' ({}) is not named; name every binding the checkpoint holds",
+            missing.name,
+            describe_binding(missing)
+        )));
+    }
+    Ok(())
+}
+
+/// A binding in `--credential` form.
+fn describe_binding(b: &CredentialBinding) -> String {
+    let mut out = format!(
+        "{}={}@{}",
+        b.name,
+        b.environment_variable,
+        b.allowed_hosts.join(",")
+    );
+    if b.injection_location.body {
+        out.push_str(":body");
+    }
+    if let Some(header) = &b.set_header {
+        out.push_str(&format!(":set-header={header}"));
+    }
+    out
 }
 
 /// Refuse `field` on a live checkpoint restore.
@@ -757,12 +862,15 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         remote_volumes,
         disk_volumes,
         net,
+        egress,
         network_backend,
         dns,
         dns_options,
         network_name,
         guest_subnet,
+        switch,
         ports,
+        auto_ports,
         allowed_cidrs,
         allowed_hosts,
         block_private,
@@ -897,6 +1005,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         || dns.is_some()
         || network_name.is_some()
         || guest_subnet.is_some()
+        || switch.is_some()
         || !egress_rules.is_empty()
         || allowed_cidrs
             .as_ref()
@@ -913,7 +1022,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             ..Default::default()
         };
 
-    let resolved = match source {
+    let mut resolved = match source {
         SpecSource::Bare | SpecSource::Image(_) => {
             if keep_identity {
                 return Err(Error::config(
@@ -966,7 +1075,9 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1000,11 +1111,50 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 ));
             }
             let pack = PackDefaults::of(manifest);
+            let packed_egress = crate::pack_export::validated_manifest_egress(manifest)?;
+            let packed_egress = if caller == Caller::Cli {
+                packed_egress.with_cli_overrides(
+                    allowed_cidrs,
+                    allowed_hosts,
+                    block_private,
+                    egress_rules,
+                )
+            } else {
+                let replaces_allow_list = allowed_cidrs.is_some() || allowed_hosts.is_some();
+                crate::pack_export::ValidatedManifestEgress {
+                    allowed_cidrs: if replaces_allow_list {
+                        allowed_cidrs
+                    } else {
+                        packed_egress.allowed_cidrs
+                    },
+                    dns_filter_hosts: if replaces_allow_list {
+                        allowed_hosts
+                    } else {
+                        packed_egress.dns_filter_hosts
+                    },
+                    block_private: block_private.or(packed_egress.block_private),
+                    egress_rules: if egress_rules.is_empty() {
+                        packed_egress.egress_rules
+                    } else {
+                        egress_rules
+                    },
+                }
+            };
+            let crate::pack_export::ValidatedManifestEgress {
+                allowed_cidrs,
+                dns_filter_hosts: allowed_hosts,
+                block_private,
+                egress_rules,
+            } = packed_egress;
             let (entrypoint, cmd) = if explicit_command {
                 (entrypoint.unwrap_or_default(), cmd.unwrap_or_default())
             } else {
                 (pack.entrypoint, pack.cmd)
             };
+            let has_pack_egress = block_private.is_some()
+                || allowed_cidrs.is_some()
+                || allowed_hosts.is_some()
+                || !egress_rules.is_empty();
             ResolvedSpec {
                 caller,
                 image: pack.image,
@@ -1041,13 +1191,15 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 mounts,
                 remote_volumes,
                 disk_volumes,
-                net: net || implied_net || pack.net,
+                net: net || implied_net || pack.net || has_pack_egress,
                 network_backend,
                 dns,
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
@@ -1145,6 +1297,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 return Err(fixed("a CUDA branch pool", TOPOLOGY));
             }
             let docker_socket = same_flag("the Docker socket", docker_socket, false)?;
+            if auto_ports.is_some() {
+                return Err(fixed(
+                    "auto ports",
+                    "the captured guest agent runs without its listening-port watcher",
+                ));
+            }
             let ssh_agent = same_flag("SSH agent forwarding", ssh_agent, false)?;
 
             // Network. An egress policy asks for networking too.
@@ -1206,13 +1364,28 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .with_rules(&egress_rules)
                 .map_err(|reason| Error::config("restore checkpoint egress rules", reason))?;
             let _ = credentials_supplied_only;
-            if credentials.is_some() {
-                return Err(fixed(
-                    "credential bindings",
-                    "the captured workload holds the placeholders of the bindings it was \
-                     captured with, and new bindings would mint ones it never received",
-                ));
-            }
+            // A checkpoint's bindings never read this host's environment on the
+            // artifact's say-so: one could name any variable and any host. The
+            // host user re-authorizes them by naming each binding exactly as
+            // captured, so the values read and the hosts they go to are the
+            // user's choice; the guest keeps the placeholders it holds.
+            let host_values = match credentials {
+                None => false,
+                Some(requested) if caller == Caller::Cli => {
+                    reauthorize_captured_credentials(
+                        captured_net.credential_policy.as_ref(),
+                        &requested,
+                    )?;
+                    true
+                }
+                Some(_) => {
+                    return Err(fixed(
+                        "credential bindings",
+                        "the captured workload holds the placeholders of the bindings it was \
+                         captured with, and new bindings would mint ones it never received",
+                    ));
+                }
+            };
             let credentials = captured_net.credential_policy.clone();
             if let Some(policy) = &credentials {
                 // The artifact is untrusted: hold its policy to create's rules.
@@ -1226,10 +1399,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 .ports
                 .iter()
                 .map(|port| PortMapping::new(port.host, port.guest))
-                .chain(captured_net.udp_ports.iter().map(|port| PortMapping {
-                    host: port.host,
-                    guest: port.guest,
-                    protocol: crate::data::network::PortProtocol::Udp,
+                .chain(captured_net.udp_ports.iter().map(|port| {
+                    PortMapping::with_protocol(
+                        port.host,
+                        port.guest,
+                        crate::data::network::PortProtocol::Udp,
+                    )
                 }))
                 .collect();
             let ports = if ports.is_empty() {
@@ -1264,6 +1439,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                     target: target.into(),
                     read_only,
                     staged: false,
+                    recorded_ownership: false,
                 })
                 .collect();
 
@@ -1335,14 +1511,17 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 dns_options,
                 network_name,
                 guest_subnet,
+                switch,
                 ports,
+                auto_ports: None,
                 allowed_cidrs,
                 allowed_hosts,
                 block_private,
                 egress_rules,
                 credentials,
-                // Bindings a checkpoint brings never read this host's environment.
-                credentials_supplied_only: true,
+                // Bindings a checkpoint brings read this host's environment
+                // only once the host user has re-authorized them.
+                credentials_supplied_only: !host_values,
                 published_sockets: Vec::new(),
                 gpu,
                 gpu_vram_mib: None,
@@ -1369,14 +1548,45 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                         .as_ref()
                         .map(|lineage| lineage.id.clone()),
                     mediated_egress_required: captured_net.mediated_egress_required,
-                    credentials_from_artifact: captured_net
-                        .credential_policy
-                        .as_ref()
-                        .is_some_and(|policy| !policy.is_empty()),
+                    credentials_from_artifact: !host_values
+                        && captured_net
+                            .credential_policy
+                            .as_ref()
+                            .is_some_and(|policy| !policy.is_empty()),
+                    packed_image_on_storage:
+                        crate::portable_checkpoint::checkpoint_image_on_storage(checkpoint),
                 }),
             }
         }
     };
+
+    // Apply caller policy before any creation path can publish a record.
+    // Reuse stopped-machine normalization and enforcement checks without
+    // minting credential placeholders or touching the database.
+    if let Some(policy) = egress.as_ref() {
+        let mut record = resolved.validation_record();
+        let before = record.launch_network_plan();
+        record.apply_egress_policy(policy)?;
+        let after = record.launch_network_plan();
+        if resolved.restored.is_some() && before.backend != after.backend {
+            return Err(Error::config(
+                "egress policy",
+                "the checkpoint's network backend cannot change; use a deny-all policy \
+                 instead of turning networking off, or recreate the machine",
+            ));
+        }
+        if !policy.network && after.outbound {
+            return Err(Error::config(
+                "egress policy",
+                "inherited network settings require outbound networking; use a deny-all \
+                 policy instead of turning networking off",
+            ));
+        }
+        resolved.net = record.network;
+        resolved.allowed_cidrs = record.allowed_cidrs;
+        resolved.allowed_hosts = record.dns_filter_hosts;
+        resolved.egress_rules = record.egress_rules;
+    }
 
     // Checks on the resolved machine.
     if resolved.cuda_fork_pool_size.is_some() && !resolved.cuda {
@@ -1442,12 +1652,17 @@ impl ResolvedSpec {
             shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 
     /// Record checks that need the whole machine but no new state (the
     /// placeholders minted by [`Self::to_record`]).
     fn unrecorded_record_checks(&self) -> Result<()> {
+        self.validation_record().validate_remote_volumes()
+    }
+
+    fn validation_record(&self) -> VmRecord {
         let mut record = VmRecord::new(
             String::new(),
             self.cpus,
@@ -1464,10 +1679,11 @@ impl ResolvedSpec {
         record.dns_filter_hosts = self.allowed_hosts.clone();
         record.network_name = self.network_name.clone();
         record.guest_subnet = self.guest_subnet.clone();
+        record.switch = self.switch.clone();
         record.network_backend = self.network_backend;
         record.set_port_mappings(&self.ports);
         record.credential_policy = self.credentials.clone();
-        record.validate_remote_volumes()
+        record
     }
 
     /// Whether credential values come from the caller rather than from this
@@ -1526,7 +1742,9 @@ impl ResolvedSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
+            auto_ports,
             allowed_cidrs,
             allowed_hosts,
             block_private,
@@ -1554,7 +1772,9 @@ impl ResolvedSpec {
         } = self.clone();
         let restored = restored.unwrap_or_default();
         let is_restore = self.restored.is_some();
+        let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
+        let listen_addresses = PortMapping::listen_addresses(&ports);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
         let credential_placeholders = match credentials.as_ref() {
             // A restored workload already holds its placeholders.
@@ -1584,9 +1804,12 @@ impl ResolvedSpec {
             block_private,
             mounts,
             staged_mounts,
+            recorded_ownership: recorded_ownership_mounts,
             staged_mounts_detached_from: None,
             ports,
             udp_ports,
+            allocated_ports: Vec::new(),
+            listen_addresses,
             published_sockets,
             network: net,
             gpu: gpu.then_some(true),
@@ -1614,6 +1837,7 @@ impl ResolvedSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
             image,
             entrypoint,
             cmd,
@@ -1635,6 +1859,7 @@ impl ResolvedSpec {
             cuda_vram_limit_mib,
             cuda_preload_modules: false,
             docker_socket,
+            auto_ports,
             dns_filter_hosts: allowed_hosts,
             credential_policy: credentials,
             external_interceptor_required: restored.mediated_egress_required,
@@ -1643,7 +1868,7 @@ impl ResolvedSpec {
             credentials_supplied_by_api,
             ephemeral,
             source_smolmachine: None,
-            packed_image_on_storage: false,
+            packed_image_on_storage: restored.packed_image_on_storage,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,

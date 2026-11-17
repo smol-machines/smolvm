@@ -330,6 +330,7 @@ pub fn docker_config_mount() -> Option<HostMount> {
         target: PathBuf::from("/root/.docker"),
         read_only: true,
         staged: false,
+        recorded_ownership: false,
     })
 }
 
@@ -653,10 +654,13 @@ fn live_egress_refusal(reason: String, with_rules: bool) -> String {
 /// Publish exactly `ports` on a running machine through the ports control
 /// socket its network runtime serves. Returns once the listeners match.
 pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()> {
-    let mappings: Vec<smolvm_network::PortMapping> = ports
-        .iter()
-        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
-        .collect();
+    // A replace names the whole set, so it keeps the ports this run picked
+    // itself: they are not in `ports`, which holds the configured ones.
+    let allocated = crate::db::SmolvmDb::open()?
+        .get_vm(name)?
+        .map(|record| record.live_allocated_ports())
+        .unwrap_or_default();
+    let mappings = published_set(ports, &allocated);
     let rendered = smolvm_network::render_port_mappings(&mappings);
     send_live_change(name, smolvm_network::PORTS_SOCKET, &rendered).map_err(|reason| {
         Error::config(
@@ -664,6 +668,25 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
             format!("could not change machine '{name}''s published ports while it runs: {reason}"),
         )
     })
+}
+
+/// The whole TCP set a running machine publishes: its configured `ports`, then
+/// the `allocated` ones its run picked that the configured set does not already
+/// name by host port.
+fn published_set(
+    ports: &[(u16, u16)],
+    allocated: &[(u16, u16)],
+) -> Vec<smolvm_network::PortMapping> {
+    let mut mappings: Vec<smolvm_network::PortMapping> = ports
+        .iter()
+        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
+        .collect();
+    for &(host, guest) in allocated {
+        if !mappings.iter().any(|mapping| mapping.host == host) {
+            mappings.push(smolvm_network::PortMapping::new(host, guest));
+        }
+    }
+    mappings
 }
 
 /// Hand running machine `name` new values for its credential bindings, by
@@ -688,6 +711,45 @@ pub fn apply_live_credential_values(
 }
 
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    let reply = send_live_request(name, socket, rendered)?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    }
+}
+
+pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
+    let reply = send_live_request(
+        name,
+        smolvm_network::PORTS_SOCKET,
+        &format!("allocate {guest}\n"),
+    )
+    .map_err(|reason| Error::config("atomic port publication", reason))?;
+    let mapping = reply
+        .trim()
+        .strip_prefix("ok ")
+        .and_then(|ports| ports.split_once(':'))
+        .and_then(|(host, returned_guest)| {
+            Some((
+                host.parse::<u16>().ok()?,
+                returned_guest.parse::<u16>().ok()?,
+            ))
+        })
+        .filter(|(host, returned_guest)| *host != 0 && *returned_guest == guest)
+        .ok_or_else(|| {
+            Error::config(
+                "atomic port publication",
+                "machine does not support atomic port allocation",
+            )
+        })?;
+    Ok(mapping.0)
+}
+
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
     let mut stream =
@@ -705,10 +767,7 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     stream
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
-    }
+    Ok(reply)
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
@@ -2982,7 +3041,11 @@ impl AgentManager {
         }
         // The database can retain identity when a PID file is missing.
         if let Some(name) = self.name() {
-            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+            let db = crate::db::SmolvmDb::open()?;
+            // A stopped machine keeps the PID of a process the kernel is
+            // holding: refused while it is present, forgotten once it is gone.
+            super::state_probe::refuse_start_while_held(&db, name)?;
+            if let Some(record) = db.get_vm(name)? {
                 if let Some(pid) = record.pid {
                     refuse_live_launch_pid(pid)?;
                 }
@@ -3128,6 +3191,17 @@ impl AgentManager {
                 }
             }
         }
+
+        // Before anything is locked or spawned: a machine that asked for the
+        // host GPU only gets it when the host's device nodes answer. A VM
+        // process that opens a device whose driver is not responding blocks
+        // in the kernel and can never be stopped.
+        super::host_gpu::resolve_for_boot(
+            self.name().unwrap_or("default"),
+            &mut resources,
+            super::requested_display().is_some(),
+            features.snapshot_dir.is_some(),
+        )?;
 
         if let Some(endpoint) = &features.external_interceptor {
             launcher::validate_external_interceptor(
@@ -3601,6 +3675,7 @@ impl AgentManager {
             // the machine's resources (the embedded SDK/CLI path sets the latter).
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
+            auto_ports: features.auto_ports,
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
@@ -4062,6 +4137,20 @@ impl AgentManager {
                         && process::poll_for_exit(pid, AGENT_STOP_TIMEOUT).is_some()
                         && !process::is_alive(pid));
                 if !exited {
+                    // A process already killed and held by the kernel has no
+                    // guest left to confirm anything and cannot be retried.
+                    if process::held_after_kill(pid).is_some()
+                        && process::poll_for_exit(pid, process::VM_SIGKILL_TIMEOUT).is_none()
+                    {
+                        if let Some(held) = process::held_after_kill(pid) {
+                            tracing::warn!(
+                                "machine '{}' is stopped, but {}",
+                                self.name().unwrap_or("default"),
+                                held.explain()
+                            );
+                            return Ok(());
+                        }
+                    }
                     return Err(Error::agent(
                         "stop agent",
                         format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {error}"),
@@ -4100,8 +4189,25 @@ impl AgentManager {
             // child. On macOS kill(pid, 0) can still see an exited child until
             // it is reaped, so a second liveness probe must not override that
             // confirmed exit (or mistake a recycled PID for this VM).
-            process::stop_vm_process(pid, VM_EXIT_FLUSH_TIMEOUT, process::VM_SIGKILL_TIMEOUT)
-                .is_ok()
+            match process::stop_vm_process_bounded(
+                pid,
+                VM_EXIT_FLUSH_TIMEOUT,
+                process::VM_SIGKILL_TIMEOUT,
+            ) {
+                Ok(process::VmStop::Exited(_)) => true,
+                Ok(process::VmStop::Held(held)) => {
+                    // The kernel will not let the process exit, and waiting
+                    // longer does not change that. It runs no more code, so
+                    // the stop completes around it and says what was left.
+                    tracing::warn!(
+                        "machine '{}' is stopped, but {}",
+                        self.name().unwrap_or("default"),
+                        held.explain()
+                    );
+                    return Ok(());
+                }
+                Err(_) => false,
+            }
         } else {
             false
         };
@@ -4709,6 +4815,11 @@ impl AgentManager {
 }
 
 fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
+    if let Some(held) = process::held_after_kill(pid) {
+        // Its files and published ports stay open until the kernel lets it
+        // go, and a write it had in flight can still land on the disks.
+        return Err(Error::agent("start agent", held.start_refusal()));
+    }
     if process::is_alive(pid) {
         return Err(Error::agent(
             "start agent",
@@ -4896,6 +5007,25 @@ pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A live replace keeps the ports this run picked itself, without
+    /// publishing one twice when the configured set already names its host port.
+    #[test]
+    fn a_live_replace_keeps_the_runs_own_ports() {
+        let set = |ports: &[(u16, u16)], allocated: &[(u16, u16)]| -> Vec<(u16, u16)> {
+            super::published_set(ports, allocated)
+                .iter()
+                .map(|m| (m.host, m.guest))
+                .collect()
+        };
+        assert_eq!(
+            set(&[(8080, 80)], &[(49152, 3000)]),
+            [(8080, 80), (49152, 3000)]
+        );
+        assert_eq!(set(&[], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(49152, 3000)], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(8080, 80)], &[]), [(8080, 80)]);
+    }
+
     #[test]
     fn a_running_configuration_says_whether_the_vm_was_launched_forkable() {
         let dir = tempfile::tempdir().unwrap();
@@ -4941,6 +5071,7 @@ mod tests {
     #[test]
     fn egress_flow_summary_round_trips_through_its_file_and_goes_stale() {
         use super::*;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(EGRESS_FLOWS_FILE);
         let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);

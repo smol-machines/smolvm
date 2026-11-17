@@ -467,6 +467,63 @@ fn effective_network(
     }
 }
 
+/// Effective egress policy (`allowed_cidrs`, `dns_filter_hosts`, `egress_rules`)
+/// for a packed run: an explicit caller egress override replaces the manifest's
+/// corresponding fields; otherwise the manifest's validated egress is preserved.
+pub(crate) fn effective_pack_allow_list(
+    egress: Option<&ResolvedEgressPolicy>,
+    manifest: &smolvm_pack::PackManifest,
+) -> smolvm::Result<smolvm::pack_export::ValidatedManifestEgress> {
+    let manifest_egress = smolvm::pack_export::validated_manifest_egress(manifest)?;
+    let Some(policy) = egress else {
+        return Ok(manifest_egress);
+    };
+    if let Some(network) = policy.network_override {
+        if !network {
+            return Ok(smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
+                egress_rules: Vec::new(),
+            });
+        }
+        return Ok(smolvm::pack_export::ValidatedManifestEgress {
+            block_private: policy.block_private.clone(),
+            allowed_cidrs: policy.allowed_cidrs.clone(),
+            dns_filter_hosts: policy.dns_filter_hosts.clone(),
+            egress_rules: policy.egress_rules.clone(),
+        });
+    }
+    Ok(manifest_egress.with_cli_overrides(
+        policy.allowed_cidrs.clone(),
+        policy.dns_filter_hosts.clone(),
+        policy.block_private.clone(),
+        policy.egress_rules.clone(),
+    ))
+}
+
+fn resolve_pack_allow_list_hosts(
+    allowed_cidrs: &mut Option<Vec<String>>,
+    dns_filter_hosts: Option<&[String]>,
+) {
+    let Some(hosts) = dns_filter_hosts.filter(|h| !h.is_empty()) else {
+        return;
+    };
+    let existing = allowed_cidrs.get_or_insert_with(Vec::new);
+    for entry in hosts {
+        let Some(host) = smolvm_protocol::host_pattern::static_resolution_host(entry) else {
+            continue;
+        };
+        match crate::cli::parsers::resolve_host_to_cidrs(host) {
+            Ok(cidrs) => existing.extend(cidrs),
+            Err(e) => eprintln!(
+                "Warning: could not resolve '{}' for egress policy: {}",
+                host, e
+            ),
+        }
+    }
+}
+
 impl PackRunCmd {
     /// Execute the pack run command.
     pub fn run(self) -> smolvm::Result<()> {
@@ -563,6 +620,28 @@ impl PackRunCmd {
             }
         }
         let ssh_agent_socket = resolve_ssh_agent_socket(self.ssh_agent)?;
+        let smolvm::pack_export::ValidatedManifestEgress {
+            block_private: effective_block_private,
+            allowed_cidrs: mut effective_allowed_cidrs,
+            dns_filter_hosts: effective_dns_filter_hosts,
+            egress_rules: effective_egress_rules,
+        } = effective_pack_allow_list(self.egress.as_ref(), &manifest)?;
+        let network_enabled = effective_network(
+            self.egress.as_ref(),
+            self.net,
+            manifest.network
+                || effective_block_private.is_some()
+                || effective_allowed_cidrs.is_some()
+                || effective_dns_filter_hosts.is_some()
+                || !effective_egress_rules.is_empty(),
+            !self.port.is_empty(),
+        );
+        if network_enabled {
+            resolve_pack_allow_list_hosts(
+                &mut effective_allowed_cidrs,
+                effective_dns_filter_hosts.as_deref(),
+            );
+        }
 
         // 6. Extract assets to cache (locked to prevent concurrent extraction races)
         let cache_dir = extract::get_cache_dir(footer.checksum)
@@ -648,21 +727,17 @@ impl PackRunCmd {
             .map_err(|e| Error::config("pack run ports", e))?;
         let port_mappings = ports.clone();
 
-        let resources = VmResources {
+        let mut resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
-            network: effective_network(
-                self.egress.as_ref(),
-                self.net,
-                manifest.network,
-                !ports.is_empty(),
-            ),
+            network: network_enabled,
             network_backend: self.net_backend,
             dns: self.dns,
             dns_options: self.dns_option.clone(),
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             gpu: manifest.gpu,
             nested_virt: false,
             cuda: cuda_enabled,
@@ -673,27 +748,23 @@ impl PackRunCmd {
             disks: Vec::new(),
             cache_disk: None,
             disk_volumes: disk_volumes.clone(),
-            block_private: self
-                .egress
-                .as_ref()
-                .and_then(|policy| policy.block_private.clone()),
+            block_private: effective_block_private,
             gpu_vram_mib: None,
             rosetta: false,
-            allowed_cidrs: self
-                .egress
-                .as_ref()
-                .and_then(|policy| policy.allowed_cidrs.clone()),
-            egress_rules: self
-                .egress
-                .as_ref()
-                .map(|policy| policy.egress_rules.clone())
-                .unwrap_or_default(),
+            allowed_cidrs: effective_allowed_cidrs,
+            egress_rules: effective_egress_rules,
         };
+        // A packed machine that asked for the host GPU only gets it when the
+        // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+        smolvm::agent::host_gpu::resolve_for_boot(
+            "packed machine",
+            &mut resources,
+            smolvm::agent::requested_display().is_some(),
+            false,
+        )?;
         validate_requested_network_backend(
             &resources,
-            self.egress
-                .as_ref()
-                .and_then(|policy| policy.dns_filter_hosts.as_deref()),
+            effective_dns_filter_hosts.as_deref(),
             ports.len(),
         )?;
 
@@ -739,10 +810,7 @@ impl PackRunCmd {
         let child_pid = {
             let vsock_path_clone = vsock_path.clone();
             let cuda_sock_clone = cuda_sock.clone();
-            let dns_filter_hosts = self
-                .egress
-                .as_ref()
-                .and_then(|policy| policy.dns_filter_hosts.clone());
+            let dns_filter_hosts = effective_dns_filter_hosts;
             smolvm::process::fork_session_leader(move || {
                 // A foreground run's VM ends with the CLI, however the CLI ends:
                 // Ctrl-C reaches only the CLI, since this child leads its own
@@ -827,11 +895,9 @@ impl PackRunCmd {
                 ssh_agent_socket,
                 cuda: false,
                 expose_docker: false,
+                auto_ports: None,
                 published_sockets: Vec::new(),
-                dns_filter_hosts: self
-                    .egress
-                    .as_ref()
-                    .and_then(|policy| policy.dns_filter_hosts.clone()),
+                dns_filter_hosts: effective_dns_filter_hosts,
                 packed_layers_dir: Some(layers_dir.to_path_buf()),
                 packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
                 pack_idmap_source: None,
@@ -1907,16 +1973,36 @@ fn run_from_cache(
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
     let port_mappings = ports.clone();
-    let resources = VmResources {
+    let smolvm::pack_export::ValidatedManifestEgress {
+        block_private: effective_block_private,
+        allowed_cidrs: mut effective_allowed_cidrs,
+        dns_filter_hosts: effective_dns_filter_hosts,
+        egress_rules: effective_egress_rules,
+    } = effective_pack_allow_list(None, manifest)?;
+    let network_enabled = args.net
+        || manifest.network
+        || effective_block_private.is_some()
+        || effective_allowed_cidrs.is_some()
+        || effective_dns_filter_hosts.is_some()
+        || !effective_egress_rules.is_empty()
+        || !ports.is_empty();
+    if network_enabled {
+        resolve_pack_allow_list_hosts(
+            &mut effective_allowed_cidrs,
+            effective_dns_filter_hosts.as_deref(),
+        );
+    }
+    let mut resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !ports.is_empty(),
+        network: network_enabled,
         network_backend: args.net_backend,
         dns: args.dns,
         dns_options: args.dns_option.clone(),
         shm_size: None,
         network_name: None,
         guest_subnet: None,
+        switch: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
@@ -1927,13 +2013,25 @@ fn run_from_cache(
         disks: Vec::new(),
         cache_disk: None,
         disk_volumes: disk_volumes.clone(),
-        block_private: None,
+        block_private: effective_block_private,
         gpu_vram_mib: None,
         rosetta: false,
-        allowed_cidrs: None,
-        egress_rules: Vec::new(),
+        allowed_cidrs: effective_allowed_cidrs,
+        egress_rules: effective_egress_rules,
     };
-    validate_requested_network_backend(&resources, None, ports.len())?;
+    // A packed machine that asked for the host GPU only gets it when the
+    // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+    smolvm::agent::host_gpu::resolve_for_boot(
+        "packed machine",
+        &mut resources,
+        smolvm::agent::requested_display().is_some(),
+        false,
+    )?;
+    validate_requested_network_backend(
+        &resources,
+        effective_dns_filter_hosts.as_deref(),
+        ports.len(),
+    )?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -1950,48 +2048,49 @@ fn run_from_cache(
     #[cfg(target_os = "linux")]
     let cli_pid = std::process::id() as smolvm::process::Pid;
     #[cfg(target_os = "linux")]
-    let child_pid = smolvm::process::fork_session_leader(move || {
-        smolvm::process::exit_when_parent_is_not(cli_pid);
+    let child_pid = {
+        let dns_filter_hosts = effective_dns_filter_hosts;
+        smolvm::process::fork_session_leader(move || {
+            smolvm::process::exit_when_parent_is_not(cli_pid);
 
-        let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("failed to load libkrun: {}", e);
-                smolvm::process::exit_child(1);
+            let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("failed to load libkrun: {}", e);
+                    smolvm::process::exit_child(1);
+                }
+            };
+
+            let config = PackedLaunchConfig {
+                rootfs_path: &rootfs_path,
+                storage_path: &storage_path,
+                vsock_socket: &vsock_path_clone,
+                layers_dir,
+                mounts: &packed_mounts,
+                port_mappings: &port_mappings,
+                resources,
+                overlay_path: overlay_runtime_path.as_deref(),
+                debug,
+                console_log: console_log_path,
+                // CUDA-over-vsock for the persistent/daemon packed paths is not
+                // wired yet; the `run` path starts the host server.
+                cuda_socket: None,
+                ssh_agent_socket: ssh_agent_socket.as_deref(),
+                dns_filter_hosts,
+            };
+
+            // Detach from parent's terminal so libkrun doesn't
+            // steal keystrokes or corrupt terminal state.
+            detach_vm_child_stdio();
+
+            if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
+                let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+                let _ = std::fs::write(&config.console_log, &msg);
             }
-        };
-
-        let config = PackedLaunchConfig {
-            rootfs_path: &rootfs_path,
-            storage_path: &storage_path,
-            vsock_socket: &vsock_path_clone,
-            layers_dir,
-            mounts: &packed_mounts,
-            port_mappings: &port_mappings,
-            resources,
-            overlay_path: overlay_runtime_path.as_deref(),
-            debug,
-            console_log: console_log_path,
-            // CUDA-over-vsock for the persistent/daemon packed paths is not
-            // wired yet; the `run` path starts the host server.
-            cuda_socket: None,
-            ssh_agent_socket: ssh_agent_socket.as_deref(),
-            // Packed binaries carry no egress flags; policy comes only from a
-            // `machine run` hand-off.
-            dns_filter_hosts: None,
-        };
-
-        // Detach from parent's terminal so libkrun doesn't
-        // steal keystrokes or corrupt terminal state.
-        detach_vm_child_stdio();
-
-        if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
-            let _ = std::fs::write(&config.console_log, &msg);
-        }
-        smolvm::process::exit_child(1);
-    })
-    .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+            smolvm::process::exit_child(1);
+        })
+        .map_err(|e| Error::agent("fork VM process", e.to_string()))?
+    };
     #[cfg(target_os = "linux")]
     let _fsnotify_watcher =
         smolvm::agent::FsNotifyWatcher::start_tagged(vsock_path.clone(), watched_mounts);
@@ -2022,8 +2121,9 @@ fn run_from_cache(
             ssh_agent_socket,
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
-            dns_filter_hosts: None,
+            dns_filter_hosts: effective_dns_filter_hosts,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
             packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
             pack_idmap_source: None,
@@ -2337,16 +2437,36 @@ fn daemon_start(
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
     let port_mappings = ports.clone();
-    let resources = VmResources {
+    let smolvm::pack_export::ValidatedManifestEgress {
+        block_private: effective_block_private,
+        allowed_cidrs: mut effective_allowed_cidrs,
+        dns_filter_hosts: effective_dns_filter_hosts,
+        egress_rules: effective_egress_rules,
+    } = effective_pack_allow_list(None, &manifest)?;
+    let network_enabled = args.net
+        || manifest.network
+        || effective_block_private.is_some()
+        || effective_allowed_cidrs.is_some()
+        || effective_dns_filter_hosts.is_some()
+        || !effective_egress_rules.is_empty()
+        || !ports.is_empty();
+    if network_enabled {
+        resolve_pack_allow_list_hosts(
+            &mut effective_allowed_cidrs,
+            effective_dns_filter_hosts.as_deref(),
+        );
+    }
+    let mut resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
-        network: args.net || manifest.network || !ports.is_empty(),
+        network: network_enabled,
         network_backend: args.net_backend,
         dns: args.dns,
         dns_options: args.dns_option.clone(),
         shm_size: None,
         network_name: None,
         guest_subnet: None,
+        switch: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
@@ -2357,13 +2477,25 @@ fn daemon_start(
         disks: Vec::new(),
         cache_disk: None,
         disk_volumes: disk_volumes.clone(),
-        block_private: None,
+        block_private: effective_block_private,
         gpu_vram_mib: None,
         rosetta: false,
-        allowed_cidrs: None,
-        egress_rules: Vec::new(),
+        allowed_cidrs: effective_allowed_cidrs,
+        egress_rules: effective_egress_rules,
     };
-    validate_requested_network_backend(&resources, None, ports.len())?;
+    // A packed machine that asked for the host GPU only gets it when the
+    // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+    smolvm::agent::host_gpu::resolve_for_boot(
+        "packed machine",
+        &mut resources,
+        smolvm::agent::requested_display().is_some(),
+        false,
+    )?;
+    validate_requested_network_backend(
+        &resources,
+        effective_dns_filter_hosts.as_deref(),
+        ports.len(),
+    )?;
 
     let packed_mounts = mounts_to_packed(&mounts);
 
@@ -2420,8 +2552,9 @@ fn daemon_start(
             ssh_agent_socket: ssh_agent_socket.clone(),
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
-            dns_filter_hosts: None,
+            dns_filter_hosts: effective_dns_filter_hosts,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
             packed_layers_dax_window: smolvm::agent::legacy_packed_layers_dax_window(),
             pack_idmap_source: None,
@@ -2442,59 +2575,60 @@ fn daemon_start(
         )?
     };
     #[cfg(target_os = "linux")]
-    let child_pid = smolvm::process::fork_session_leader(move || {
-        let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
-            Ok(k) => k,
-            Err(e) => {
-                eprintln!("failed to load libkrun: {}", e);
-                smolvm::process::exit_child(1);
+    let child_pid = {
+        let dns_filter_hosts = effective_dns_filter_hosts;
+        smolvm::process::fork_session_leader(move || {
+            let krun = match unsafe { KrunFunctions::load(&lib_dir) } {
+                Ok(k) => k,
+                Err(e) => {
+                    eprintln!("failed to load libkrun: {}", e);
+                    smolvm::process::exit_child(1);
+                }
+            };
+
+            let config = PackedLaunchConfig {
+                rootfs_path: &rootfs_path,
+                storage_path: &storage_path,
+                vsock_socket: &vsock_path_clone,
+                layers_dir: &layers_dir,
+                mounts: &packed_mounts,
+                port_mappings: &port_mappings,
+                resources,
+                overlay_path: overlay_daemon_path.as_deref(),
+                debug,
+                console_log: console_log_path,
+                // CUDA-over-vsock for the persistent/daemon packed paths is not
+                // wired yet; the `run` path starts the host server.
+                cuda_socket: None,
+                ssh_agent_socket: ssh_agent_socket.as_deref(),
+                dns_filter_hosts,
+            };
+
+            // Detach from parent's terminal before launching the VM.
+            // Without this, libkrun's threads inherit stdin and steal
+            // keystrokes from the user's shell.
+            detach_vm_child_stdio();
+
+            // The daemon outlives the CLI, so it watches its own mounts, with a
+            // watcher that works in a forked child on macOS (#1192).
+            let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged_after_fork(
+                config.vsock_socket.to_path_buf(),
+                config
+                    .mounts
+                    .iter()
+                    .filter(|mount| !mount.staged)
+                    .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
+            );
+
+            if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
+                let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
+                let _ = std::fs::write(&config.console_log, &msg);
             }
-        };
 
-        let config = PackedLaunchConfig {
-            rootfs_path: &rootfs_path,
-            storage_path: &storage_path,
-            vsock_socket: &vsock_path_clone,
-            layers_dir: &layers_dir,
-            mounts: &packed_mounts,
-            port_mappings: &port_mappings,
-            resources,
-            overlay_path: overlay_daemon_path.as_deref(),
-            debug,
-            console_log: console_log_path,
-            // CUDA-over-vsock for the persistent/daemon packed paths is not
-            // wired yet; the `run` path starts the host server.
-            cuda_socket: None,
-            ssh_agent_socket: ssh_agent_socket.as_deref(),
-            // Packed binaries carry no egress flags; policy comes only from a
-            // `machine run` hand-off.
-            dns_filter_hosts: None,
-        };
-
-        // Detach from parent's terminal before launching the VM.
-        // Without this, libkrun's threads inherit stdin and steal
-        // keystrokes from the user's shell.
-        detach_vm_child_stdio();
-
-        // The daemon outlives the CLI, so it watches its own mounts, with a
-        // watcher that works in a forked child on macOS (#1192).
-        let _fsnotify_watcher = smolvm::agent::FsNotifyWatcher::start_tagged_after_fork(
-            config.vsock_socket.to_path_buf(),
-            config
-                .mounts
-                .iter()
-                .filter(|mount| !mount.staged)
-                .map(|mount| (PathBuf::from(&mount.host_path), mount.tag.clone())),
-        );
-
-        if let Err(e) = launch_agent_vm_dynamic(&krun, &config) {
-            let msg = format!("launch_agent_vm_dynamic failed: {}\n", e);
-            let _ = std::fs::write(&config.console_log, &msg);
-        }
-
-        smolvm::process::exit_child(1);
-    })
-    .map_err(|e| Error::agent("fork VM process", e.to_string()))?;
+            smolvm::process::exit_child(1);
+        })
+        .map_err(|e| Error::agent("fork VM process", e.to_string()))?
+    };
 
     // Capture child start time for PID identity verification
     let child_start_time = {
@@ -2791,6 +2925,81 @@ mod tests {
         assert!(effective_network(None, true, false, false));
         assert!(effective_network(None, false, true, false));
         assert!(effective_network(None, false, false, true));
+    }
+
+    #[test]
+    fn effective_pack_allow_list_preserves_manifest_unless_overridden() {
+        let mut manifest = smolvm_pack::PackManifest::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        manifest.allowed_cidrs = Some(vec!["1.1.1.1/32".to_string()]);
+        manifest.dns_filter_hosts = Some(vec!["pypi.org".to_string()]);
+        manifest.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+
+        // Direct `pack run` (`egress: None`) keeps the manifest's allow-list and rules.
+        assert_eq!(
+            effective_pack_allow_list(None, &manifest).unwrap(),
+            smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
+                allowed_cidrs: Some(vec!["1.1.1.1/32".to_string()]),
+                dns_filter_hosts: Some(vec!["pypi.org".to_string()]),
+                egress_rules: manifest.egress_rules.clone(),
+            }
+        );
+
+        // `machine run` handoff with no egress flags (`ResolvedEgressPolicy::default()`)
+        // also keeps the manifest's allow-list and rules.
+        let empty = ResolvedEgressPolicy::default();
+        assert_eq!(
+            effective_pack_allow_list(Some(&empty), &manifest).unwrap(),
+            smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
+                allowed_cidrs: Some(vec!["1.1.1.1/32".to_string()]),
+                dns_filter_hosts: Some(vec!["pypi.org".to_string()]),
+                egress_rules: manifest.egress_rules.clone(),
+            }
+        );
+
+        // Any explicit caller allow-list replaces the manifest's allow-list as a unit
+        // while keeping the manifest's deny rules unless overridden.
+        let override_hosts = ResolvedEgressPolicy {
+            dns_filter_hosts: Some(vec!["*.example.com".to_string()]),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_pack_allow_list(Some(&override_hosts), &manifest).unwrap(),
+            smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
+                allowed_cidrs: None,
+                dns_filter_hosts: Some(vec!["*.example.com".to_string()]),
+                egress_rules: manifest.egress_rules.clone(),
+            }
+        );
+
+        // Explicitly disabling networking (`network_override: Some(false)`) clears
+        // the manifest's deny rules as well as its allow-list so they do not
+        // re-enable networking at launch.
+        let disabled = ResolvedEgressPolicy {
+            network_override: Some(false),
+            ..Default::default()
+        };
+        assert_eq!(
+            effective_pack_allow_list(Some(&disabled), &manifest).unwrap(),
+            smolvm::pack_export::ValidatedManifestEgress {
+                block_private: None,
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
+                egress_rules: Vec::new(),
+            }
+        );
     }
 
     #[test]

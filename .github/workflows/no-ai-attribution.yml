@@ -8,6 +8,10 @@ on:
     types: [opened, edited, reopened, synchronize]
   push:
     branches: [main]
+  # A PR opened with the workflow token (the Nix flake bump) triggers no
+  # workflow, so its required check would never report. The bump starts this
+  # run on its branch instead; it checks that branch's commits against main.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,4 +27,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Check commits and PR text
-        run: python3 .github/scripts/no-ai-attribution.py ${{ github.event_name == 'pull_request' && 'pr' || 'push' }}
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$EVENT" in
+            pull_request) python3 .github/scripts/no-ai-attribution.py pr ;;
+            push) python3 .github/scripts/no-ai-attribution.py push ;;
+            *) python3 .github/scripts/no-ai-attribution.py range origin/main HEAD ;;
+          esac

@@ -221,8 +221,25 @@ pub fn launch_agent_vm_dynamic(
     // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
     // explanation of each flag's purpose on Linux vs macOS.
-    if config.resources.gpu {
-        let virgl_flags = super::gpu_virgl_flags();
+    //
+    // A display without `--gpu` also needs the virtio-gpu device, set up so
+    // that nothing on the host GPU is touched (see `GpuDevice`).
+    let display = super::requested_display();
+    let mut gpu_device = super::gpu_device(config.resources.gpu, display);
+    if gpu_device == super::GpuDevice::SoftwareDisplay
+        && (krun.set_gpu_options2.is_none()
+            || krun.add_display.is_none()
+            || krun.set_display_backend.is_none())
+    {
+        tracing::warn!(
+            "SMOLVM_DISPLAY is set but this libkrun has no display support; \
+             starting without a display"
+        );
+        gpu_device = super::GpuDevice::None;
+    }
+    if gpu_device != super::GpuDevice::None {
+        super::select_gpu_backend(gpu_device, display.is_some());
+        let virgl_flags = super::virgl_flags_for(gpu_device);
         let vram_mib = config.resources.effective_gpu_vram_mib();
         let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
 
@@ -235,7 +252,9 @@ pub fn launch_agent_vm_dynamic(
                         ret
                     ));
                 }
-                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                if gpu_device == super::GpuDevice::Accelerated {
+                    tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                }
 
                 // Optional virtio-gpu scanout. Venus gives the guest GPU
                 // *rendering*; a scanout gives it a *display*. Without one the
@@ -244,10 +263,7 @@ pub fn launch_agent_vm_dynamic(
                 // compositors fail with "not a KMS device". Opt-in for now:
                 // adding a connector changes guest topology, and existing GPU
                 // workloads (CUDA, headless Vulkan) neither need nor want one.
-                if let Some((w, h)) =
-                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
-                {
-                    super::default_gpu_backend_for_display();
+                if let Some((w, h)) = display {
                     match krun.add_display {
                         Some(add_display) => {
                             let ret = unsafe { add_display(ctx, w, h) };
@@ -722,6 +738,7 @@ pub fn launch_agent_vm_dynamic(
         cuda_socket: config.cuda_socket,
         docker_socket: None,
         port_forward_socket: None,
+        auto_ports_socket: None,
         workload_log_socket: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()
@@ -1154,7 +1171,66 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
         );
     }
 
+    // Confirm unsupported virtualization before replacing the generic EINVAL
+    // hint: permission and resource errors do not establish host incapacity.
+    #[cfg(target_os = "macos")]
+    if -ret == 22 && hypervisor_vm_create_probe() == Some(false) {
+        return format!(
+            "krun_start_enter returned: {ret} (Hypervisor.framework reports \
+             virtualization is unsupported on this host; if this is a virtual \
+             machine, use a host with nested virtualization support)"
+        );
+    }
+
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Whether Hypervisor.framework confirms virtualization support.
+/// `Some(false)` means explicitly unsupported; missing APIs, permissions and
+/// resource failures are inconclusive. A VM already in this process is retained.
+#[cfg(target_os = "macos")]
+fn hypervisor_vm_create_probe() -> Option<bool> {
+    type VmCreate = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+    type VmDestroy = unsafe extern "C" fn() -> u32;
+    let lib = unsafe {
+        libloading::Library::new(
+            "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+        )
+    }
+    .ok()?;
+    let vm_create: libloading::Symbol<VmCreate> = unsafe { lib.get(b"hv_vm_create") }.ok()?;
+    // Resolve cleanup before creating anything. A NULL configuration is the
+    // documented default and needs no retained configuration object to release.
+    let vm_destroy: libloading::Symbol<VmDestroy> = unsafe { lib.get(b"hv_vm_destroy") }.ok()?;
+    probe_hypervisor_vm(
+        || unsafe { vm_create(std::ptr::null_mut()) },
+        || unsafe { vm_destroy() },
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn probe_hypervisor_vm(
+    create: impl FnOnce() -> u32,
+    destroy: impl FnOnce() -> u32,
+) -> Option<bool> {
+    let result = create();
+    // Only destroy the VM this probe created, never an existing caller's VM.
+    if result == 0 && destroy() != 0 {
+        return None;
+    }
+    hv_probe_verdict(result)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn hv_probe_verdict(ret: u32) -> Option<bool> {
+    const HV_SUCCESS: u32 = 0;
+    const HV_BUSY: u32 = 0xfae9_4002;
+    const HV_UNSUPPORTED: u32 = 0xfae9_400f;
+    match ret {
+        HV_SUCCESS | HV_BUSY => Some(true),
+        HV_UNSUPPORTED => Some(false),
+        _ => None,
+    }
 }
 
 pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
@@ -1440,6 +1516,85 @@ mod tests {
         assert!(!entitlement_enabled(
             "<key>com.apple.security.cs.allow-jit</key><true/>"
         ));
+    }
+
+    #[test]
+    fn hv_probe_does_not_misdiagnose_resource_or_permission_failures() {
+        for code in [
+            0xfae9_4001,
+            0xfae9_4003,
+            0xfae9_4005,
+            0xfae9_4007,
+            0xfae9_4008,
+        ] {
+            assert_eq!(hv_probe_verdict(code), None, "error {code:#x}");
+        }
+    }
+
+    #[test]
+    fn hv_probe_cleans_up_only_a_vm_it_created() {
+        for (code, expected) in [
+            (0, Some(true)),
+            (0xfae9_4002, Some(true)),
+            (0xfae9_400f, Some(false)),
+            (0xfae9_4005, None),
+        ] {
+            let mut destroyed = false;
+            assert_eq!(
+                probe_hypervisor_vm(
+                    || code,
+                    || {
+                        destroyed = true;
+                        0
+                    }
+                ),
+                expected
+            );
+            assert_eq!(destroyed, code == 0);
+        }
+        assert_eq!(probe_hypervisor_vm(|| 0, || 0xfae9_4001), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_verdict_is_stable() {
+        let first = hypervisor_vm_create_probe();
+        let second = hypervisor_vm_create_probe();
+        eprintln!("HVF probe verdicts: {first:?}, {second:?}");
+        assert_eq!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_preserves_an_existing_vm() {
+        type Create = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+        type Destroy = unsafe extern "C" fn() -> u32;
+        struct OwnedVm(Destroy);
+        impl Drop for OwnedVm {
+            fn drop(&mut self) {
+                unsafe {
+                    (self.0)();
+                }
+            }
+        }
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+            )
+        }
+        .unwrap();
+        let create: libloading::Symbol<Create> = unsafe { lib.get(b"hv_vm_create") }.unwrap();
+        let destroy: libloading::Symbol<Destroy> = unsafe { lib.get(b"hv_vm_destroy") }.unwrap();
+        let result = unsafe { create(std::ptr::null_mut()) };
+        if result != 0 {
+            eprintln!("SKIP: test binary cannot create a VM: {result:#x}");
+            return;
+        }
+        let owned = OwnedVm(*destroy);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
+        assert_eq!(unsafe { create(std::ptr::null_mut()) }, 0xfae9_4002);
+        drop(owned);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
     }
 
     #[test]

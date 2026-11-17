@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "engine-*"]
   workflow_call:
 
 env:
@@ -33,6 +33,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - name: Test Docker response-shape validation
+        run: python3 -m unittest discover -s tests -p test_engine_conformance_unit.py
 
   secrets-guards:
     name: Secrets invariants

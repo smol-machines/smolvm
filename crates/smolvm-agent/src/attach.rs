@@ -59,6 +59,13 @@ pub fn available() -> bool {
     DEVICES_MOUNTED.get().copied().unwrap_or(false)
 }
 
+/// Where a share of a live device is in the machine, when the devices are
+/// mounted.
+pub fn share_path(read_only: bool, share: &str) -> Option<PathBuf> {
+    let valid = !share.is_empty() && share.chars().all(|c| c.is_ascii_alphanumeric());
+    (available() && valid).then(|| device_dir(read_only).join(share))
+}
+
 fn device_dir(read_only: bool) -> PathBuf {
     Path::new(ATTACH_ROOT).join(if read_only { "ro" } else { "rw" })
 }
