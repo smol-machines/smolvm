@@ -283,6 +283,11 @@ impl ServeStartCmd {
             tracing::info!("verbose logging enabled");
         }
 
+        // A node admitting branches for a control plane: on a large host, keep
+        // the host reserve and charge each child for its growth (local CLI use
+        // and small hosts keep the old, looser defaults).
+        smolvm::agent::fork::enable_serve_branch_admission();
+
         // Per-VM resource isolation + lossless-restart placement. Two paths:
         //
         // - systemd host: adopt each VM into its OWN `smolvm-vm-<id>.scope` after
@@ -301,6 +306,42 @@ impl ServeStartCmd {
         if smolvm::systemd_scope::is_available() {
             std::env::set_var("SMOLVM_VM_USE_SCOPE", "1");
             tracing::info!("per-VM systemd transient scopes enabled (lossless serve restart)");
+            // VMs run in their own slice so they can never starve this API; on
+            // big hosts a few CPUs are kept free of VMs altogether.
+            match smolvm::systemd_scope::configure_vm_slice() {
+                Ok(reserved) => tracing::info!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    reserved_cpus = reserved,
+                    "VM slice ready"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not limit the VM slice's CPUs; VMs may use every CPU")
+                }
+            }
+            // Host services keep a memory reserve no VM can take: an OOM then
+            // kills a VM inside the slice instead of wedging the host.
+            match smolvm::systemd_scope::configure_vm_slice_memory() {
+                Ok(cap) if cap.limits.raised_to_current => tracing::warn!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    host_total_mib = cap.host_total_mib,
+                    reserved_mib = cap.reserved_mib,
+                    memory_high_bytes = cap.limits.high_bytes,
+                    memory_max_bytes = cap.limits.max_bytes,
+                    "VM slice memory cap raised to what running VMs already hold; the full reserve applies on a later serve start"
+                ),
+                Ok(cap) => tracing::info!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    host_total_mib = cap.host_total_mib,
+                    reserved_mib = cap.reserved_mib,
+                    memory_high_bytes = cap.limits.high_bytes,
+                    memory_max_bytes = cap.limits.max_bytes,
+                    "VM slice memory cap"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not cap the VM slice's memory; VMs may use all host memory"
+                ),
+            }
         } else if let Some(root) = smolvm::process::setup_cgroup_delegation_root() {
             tracing::info!(cgroup_root = %root.display(), "per-VM cgroup resource caps enabled");
             std::env::set_var("SMOLVM_CGROUP_ROOT", &root);
@@ -504,6 +545,10 @@ impl ServeStartCmd {
         let reclaimed = state.reclaim_dangling_vm_dirs();
         if reclaimed > 0 {
             println!("Reclaimed {reclaimed} dangling VM data dir(es)");
+        }
+        let swept = smolvm::portable_checkpoint::sweep_abandoned_checkpoint_scratch();
+        if swept > 0 {
+            println!("Removed {swept} abandoned checkpoint scratch dir(s)");
         }
         // A previous run may have stopped while restored checkpoint RAM was
         // still being written back; finish that in the background.

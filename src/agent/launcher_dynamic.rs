@@ -221,8 +221,25 @@ pub fn launch_agent_vm_dynamic(
     // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
     // explanation of each flag's purpose on Linux vs macOS.
-    if config.resources.gpu {
-        let virgl_flags = super::gpu_virgl_flags();
+    //
+    // A display without `--gpu` also needs the virtio-gpu device, set up so
+    // that nothing on the host GPU is touched (see `GpuDevice`).
+    let display = super::requested_display();
+    let mut gpu_device = super::gpu_device(config.resources.gpu, display);
+    if gpu_device == super::GpuDevice::SoftwareDisplay
+        && (krun.set_gpu_options2.is_none()
+            || krun.add_display.is_none()
+            || krun.set_display_backend.is_none())
+    {
+        tracing::warn!(
+            "SMOLVM_DISPLAY is set but this libkrun has no display support; \
+             starting without a display"
+        );
+        gpu_device = super::GpuDevice::None;
+    }
+    if gpu_device != super::GpuDevice::None {
+        super::select_gpu_backend(gpu_device, display.is_some());
+        let virgl_flags = super::virgl_flags_for(gpu_device);
         let vram_mib = config.resources.effective_gpu_vram_mib();
         let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
 
@@ -235,7 +252,9 @@ pub fn launch_agent_vm_dynamic(
                         ret
                     ));
                 }
-                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                if gpu_device == super::GpuDevice::Accelerated {
+                    tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                }
 
                 // Optional virtio-gpu scanout. Venus gives the guest GPU
                 // *rendering*; a scanout gives it a *display*. Without one the
@@ -244,10 +263,7 @@ pub fn launch_agent_vm_dynamic(
                 // compositors fail with "not a KMS device". Opt-in for now:
                 // adding a connector changes guest topology, and existing GPU
                 // workloads (CUDA, headless Vulkan) neither need nor want one.
-                if let Some((w, h)) =
-                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
-                {
-                    super::default_gpu_backend_for_display();
+                if let Some((w, h)) = display {
                     match krun.add_display {
                         Some(add_display) => {
                             let ret = unsafe { add_display(ctx, w, h) };
@@ -416,6 +432,12 @@ pub fn launch_agent_vm_dynamic(
                 free_ctx_on_err!("krun_set_port_map failed");
             }
 
+            crate::agent::launcher::start_tsi_dns_forwarder(
+                ctx,
+                krun.set_dns_forwarder,
+                config.resources.dns,
+            );
+
             tracing::info!("network backend: tsi");
             None
         }
@@ -450,6 +472,8 @@ pub fn launch_agent_vm_dynamic(
             )
             .addr
             .unwrap_or(guest_network.upstream_dns);
+            guest_network.upstream_resolvers =
+                crate::data::network::dns_forwarder_upstreams(config.resources.dns);
             let mut guest_mac = guest_network.guest_mac;
             let port_mappings: Vec<VirtioPortMapping> = config
                 .port_mappings
@@ -714,6 +738,7 @@ pub fn launch_agent_vm_dynamic(
         cuda_socket: config.cuda_socket,
         docker_socket: None,
         port_forward_socket: None,
+        auto_ports_socket: None,
         workload_log_socket: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()
@@ -869,6 +894,7 @@ pub fn launch_agent_vm_dynamic(
         &config.resources.dns_options,
         None,
     ));
+    env_strings.extend(crate::agent::guest_idle_poll_env());
     env_strings.extend(crate::agent::guest_workload_env(
         config.resources.shm_size.as_deref(),
     ));
@@ -943,17 +969,36 @@ pub fn launch_agent_vm_dynamic(
         );
 
         let dax_window = super::virtiofs::user_mount_dax_window(Path::new(&mount.guest_path));
+        // A watched share keeps missing names for a second (see the mount
+        // loop in `launcher.rs`); needs krun_add_virtiofs4.
+        let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
         // SAFETY: ctx is valid, tag and host_path are valid C strings
-        if unsafe {
-            add_virtiofs3(
-                ctx,
-                tag.as_ptr(),
-                host_path.as_ptr(),
-                dax_window,
-                mount.read_only,
-            )
-        } < 0
-        {
+        let mut added = -libc::EINVAL;
+        if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
+            added = unsafe {
+                add_virtiofs4(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                    super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
+                )
+            };
+        }
+        // EINVAL also means a libkrun that does not know the flag: attach as before.
+        if added == -libc::EINVAL {
+            added = unsafe {
+                add_virtiofs3(
+                    ctx,
+                    tag.as_ptr(),
+                    host_path.as_ptr(),
+                    dax_window,
+                    mount.read_only,
+                )
+            };
+        }
+        if added < 0 {
             free_ctx_on_err!(format!(
                 "krun_add_virtiofs failed for '{}' - requested mount cannot be attached",
                 mount.tag
@@ -1290,22 +1335,10 @@ fn create_unix_stream_pair() -> std::io::Result<(RawFd, RawFd)> {
     Ok((fds[0], fds[1]))
 }
 
-/// Raise file descriptor limits (required by libkrun).
+/// Raise the open-file limit: the VMM holds one host socket per guest
+/// connection, so this caps how many a guest can have open at once.
 fn raise_fd_limits() {
-    // rlimit is a unix concept; no-op on Windows. The function stays callable
-    // on all platforms so its (unconditional) call sites need no gating.
-    #[cfg(unix)]
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
+    let _ = crate::process::raise_nofile_limit();
 }
 
 #[cfg(test)]

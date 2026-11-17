@@ -4,7 +4,7 @@ on:
   push:
     branches: [main]
   pull_request:
-    branches: [main]
+    branches: [main, "engine-*"]
   workflow_call:
 
 env:
@@ -33,6 +33,8 @@ jobs:
         with:
           components: rustfmt
       - run: cargo fmt --all -- --check
+      - name: Test Docker response-shape validation
+        run: python3 -m unittest discover -s tests -p test_engine_conformance_unit.py
 
   secrets-guards:
     name: Secrets invariants
@@ -74,9 +76,8 @@ jobs:
   audit:
     name: Cargo Audit
     runs-on: smol
-    # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. Honors
-    # .cargo/audit.toml, which ignores documented unmaintained-transitive notices
-    # so a real vulnerability stands out instead of hiding in warning noise.
+    # Scans Cargo.lock for RustSec advisories — no engine/libkrun needed. No
+    # ignore list: an advisory is fixed by upgrading past it.
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable

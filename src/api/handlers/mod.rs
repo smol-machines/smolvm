@@ -1,6 +1,7 @@
 //! HTTP request handlers.
 
 pub mod exec;
+pub mod exec_sessions;
 pub mod files;
 pub mod health;
 pub mod images;

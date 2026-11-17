@@ -8,7 +8,7 @@ use crate::cli::parsers::parse_cidr;
 use crate::cli::vm_common::CreateVmParams;
 use smolvm::data::network::PortMappingSpec;
 use smolvm::data::resources::{
-    BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+    default_microvm_memory_mib, BlockIoEngine, DiskDurability, DEFAULT_MICROVM_CPU_COUNT,
 };
 use smolvm::network::NetworkBackend;
 use std::path::PathBuf;
@@ -83,10 +83,23 @@ fn dev_or_top<T>(dev: Vec<T>, top: Vec<T>) -> Vec<T> {
     }
 }
 
-/// Build `CreateVmParams` by merging CLI flags with an optional Smolfile.
+/// A machine spec from CLI flags merged over an optional Smolfile, before a
+/// source or engine defaults apply. Volume specs stay unparsed: how they parse
+/// depends on `--allow-system-mounts`, which the command applies.
+pub struct CliSpec {
+    /// Image from `--image` or the Smolfile.
+    pub image: Option<String>,
+    /// `-v` specs, Smolfile first.
+    pub volumes: Vec<String>,
+    /// Everything else. Unset options stay unset so a pack or checkpoint can
+    /// supply them.
+    pub spec: smolvm::machine_spec::CreateSpec,
+}
+
+/// Merge CLI flags with an optional Smolfile into a [`CliSpec`].
 ///
 /// CLI flags override Smolfile values. For Vec fields, CLI values are appended
-/// to Smolfile values. For scalar fields, non-default CLI values take priority.
+/// to Smolfile values. For scalar fields, a set CLI value takes priority.
 ///
 /// Merge precedence:
 ///   image:      CLI > Smolfile > None (bare Alpine)
@@ -95,8 +108,7 @@ fn dev_or_top<T>(dev: Vec<T>, top: Vec<T>) -> Vec<T> {
 ///   env:        Smolfile + CLI extends
 ///   init:       Smolfile + CLI extends
 #[allow(clippy::too_many_arguments)]
-pub fn build_create_params(
-    name: String,
+pub fn build_create_spec(
     cli_image: Option<String>,
     cli_entrypoint: Option<String>,
     cli_cmd: Vec<String>,
@@ -118,85 +130,98 @@ pub fn build_create_params(
     cli_block_io: Option<BlockIoEngine>,
     cli_allow_cidr: Vec<String>,
     // Labels come only from the CLI today; a Smolfile has no `labels` key yet.
-    // Threaded explicitly so `--label` is not silently dropped when a Smolfile
-    // is also supplied.
     cli_labels: std::collections::BTreeMap<String, String>,
-) -> smolvm::Result<CreateVmParams> {
+) -> smolvm::Result<CliSpec> {
+    use smolvm::machine_spec::CreateSpec;
     let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
+    let env_pairs = |env: Vec<String>| -> Vec<(String, String)> {
+        smolvm::util::parse_env_list(
+            &env.into_iter()
+                .map(|e| e.trim().to_string())
+                .collect::<Vec<_>>(),
+        )
+    };
 
-    let sf = match smolfile_path {
-        Some(path) => load(&path)?,
-        None => {
-            let ports = PortMappingSpec::expand_all(&cli_port)
-                .map_err(|e| smolvm::Error::config("CLI ports", e))?;
-            let net = cli_net
-                || !cli_allow_cidr.is_empty()
-                || cli_dns.is_some()
-                || cli_network_name.is_some();
-            return Ok(CreateVmParams {
-                disks: Vec::new(),
-                cache_disk: None,
-                secret_refs: Default::default(),
-                name,
-                labels: cli_labels,
-                image: cli_image,
-                entrypoint: cli_entrypoint_override(cli_entrypoint).unwrap_or_default(),
-                cmd: cli_cmd,
-                cpus: cli_cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
-                mem: cli_mem.unwrap_or(DEFAULT_MICROVM_MEMORY_MIB),
-                volume: cli_volume,
-                allow_system_mounts: false,
-                port: ports,
+    let Some(path) = smolfile_path else {
+        let ports = PortMappingSpec::expand_all(&cli_port)
+            .map_err(|e| smolvm::Error::config("CLI ports", e))?;
+        let net = cli_net
+            || !cli_allow_cidr.is_empty()
+            || cli_dns.is_some()
+            || cli_network_name.is_some();
+        return Ok(CliSpec {
+            image: cli_image,
+            volumes: cli_volume,
+            spec: CreateSpec {
+                entrypoint: cli_entrypoint_override(cli_entrypoint),
+                cmd: cli_list_override(cli_cmd),
+                env: env_pairs(cli_env),
+                workdir: cli_workdir,
+                user: cli_user,
+                init: cli_init,
+                cpus: cli_cpus,
+                mem: cli_mem,
+                storage_gb: cli_storage_gb,
+                overlay_gb: cli_overlay_gb,
+                block_io: cli_block_io,
                 net,
                 network_backend: cli_network_backend,
                 dns: cli_dns,
-                dns_options: Vec::new(),
-                shm_size: None,
                 network_name: cli_network_name,
-                guest_subnet: None,
-                init: cli_init,
-                env: cli_env,
-                workdir: cli_workdir,
-                user: cli_user,
-                storage_gb: cli_storage_gb,
-                overlay_gb: cli_overlay_gb,
-                block_io: cli_block_io.unwrap_or_default(),
-                disk_durability: DiskDurability::default(),
+                ports,
                 allowed_cidrs: cidrs_to_option(cli_allow_cidr),
-                block_private: None,
-                egress_rules: Vec::new(),
-                restart_policy: None,
-                restart_max_retries: None,
-                restart_max_backoff_secs: None,
-                health_cmd: None,
-                health_interval_secs: None,
-                health_timeout_secs: None,
-                health_retries: None,
-                health_startup_grace_secs: None,
-                ssh_agent: false,
-                cuda: false,
-                forkable: false,
-                stop_on_exit: false,
-                stop_signal: None,
-                stop_timeout_secs: None,
-                cuda_fork_pool_size: None,
-                cuda_vram_limit_mib: None,
-                docker_socket: false,
-                gpu: false,
-                nested_virt: false,
-                gpu_vram_mib: None,
-                rosetta: false,
-                dns_filter_hosts: None,
-                credential_policy: None,
-                credential_placeholders: Default::default(),
-                published_sockets: Vec::new(),
-                source_smolmachine: None,
-            });
-        }
+                labels: cli_labels,
+                ..CreateSpec::default()
+            },
+        });
     };
-    let auto_graph = sf.auto_graph.unwrap_or(false);
-    let cuda = sf.cuda.unwrap_or(false) || auto_graph;
-    let fork = sf.fork.unwrap_or_default();
+    // Destructured without `..`: a new Smolfile key fails to compile here
+    // until it reaches the spec or is named as not a machine option.
+    let Smolfile {
+        image: sf_image,
+        entrypoint: sf_entrypoint,
+        cmd: sf_cmd,
+        env: sf_env,
+        secrets: sf_secrets,
+        workdir: sf_workdir,
+        user: sf_user,
+        cpus: sf_cpus,
+        memory: sf_memory,
+        net: sf_net,
+        net_backend: sf_net_backend,
+        gpu: sf_gpu,
+        gpu_vram: sf_gpu_vram,
+        rosetta: sf_rosetta,
+        cuda: sf_cuda,
+        auto_graph: sf_auto_graph,
+        docker_socket: sf_docker_socket,
+        auto_ports: sf_auto_ports,
+        auto_ports_exclude: sf_auto_ports_exclude,
+        storage: sf_storage,
+        overlay: sf_overlay,
+        block_io: sf_block_io,
+        disk_durability: sf_disk_durability,
+        ports: sf_ports,
+        volumes: sf_volumes,
+        init: sf_init,
+        // Pack-time overrides (`pack create`), not machine options.
+        artifact: _,
+        pack: _,
+        dev: sf_dev,
+        network: sf_network,
+        fork: sf_fork,
+        health: sf_health,
+        restart: sf_restart,
+        stop_on_exit: sf_stop_on_exit,
+        stop_signal: sf_stop_signal,
+        stop_timeout: sf_stop_timeout,
+        auth: sf_auth,
+        // Deployment metadata for a control plane, not a machine option.
+        service: _,
+    } = load(&path)?;
+    let auto_graph = sf_auto_graph.unwrap_or(false);
+    let cuda = sf_cuda.unwrap_or(false) || auto_graph;
+    let fork = sf_fork.unwrap_or_default();
     if fork.pool_size == Some(0) {
         return Err(smolvm::Error::config(
             "smolfile [fork] pool_size",
@@ -224,19 +249,20 @@ pub fn build_create_params(
     let forkable = fork.enabled.unwrap_or(false) || fork.pool_size.is_some();
 
     // Image: CLI > Smolfile > None
-    let image = cli_image.or(sf.image);
+    let image = cli_image.or(sf_image);
 
     // Entrypoint: CLI > Smolfile
-    let entrypoint = cli_entrypoint_override(cli_entrypoint).unwrap_or(sf.entrypoint);
+    let non_empty = |v: Vec<String>| (!v.is_empty()).then_some(v);
+    let entrypoint = cli_entrypoint_override(cli_entrypoint).or_else(|| non_empty(sf_entrypoint));
 
     // Cmd: CLI > Smolfile (full replacement, not append)
-    let cmd = cli_list_override(cli_cmd).unwrap_or(sf.cmd);
+    let cmd = cli_list_override(cli_cmd).or_else(|| non_empty(sf_cmd));
 
     // Resolve [dev] fields, falling back to top-level
-    let dev = sf.dev.unwrap_or_default();
+    let dev = sf_dev.unwrap_or_default();
 
     // Ports: [dev].ports > top-level ports, then CLI extends
-    let sf_ports = dev_or_top(dev.ports, sf.ports);
+    let sf_ports = dev_or_top(dev.ports, sf_ports);
     let mut port_specs: Vec<PortMappingSpec> = sf_ports
         .iter()
         .map(|s| PortMappingSpec::parse(s))
@@ -247,77 +273,56 @@ pub fn build_create_params(
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
 
     // Volumes: [dev].volumes > top-level volumes, then CLI extends
-    let sf_volumes = dev_or_top(dev.volumes, sf.volumes);
-    let mut volumes = sf_volumes;
+    let mut volumes = dev_or_top(dev.volumes, sf_volumes);
     volumes.extend(cli_volume);
 
     // Env: top-level env + [dev].env + CLI extends (whitespace trimmed)
-    let mut env: Vec<String> = sf.env.into_iter().map(|e| e.trim().to_string()).collect();
-    env.extend(dev.env.into_iter().map(|e| e.trim().to_string()));
-    env.extend(cli_env.into_iter().map(|e| e.trim().to_string()));
+    let mut env: Vec<String> = sf_env;
+    env.extend(dev.env);
+    env.extend(cli_env);
+    let mut env = env_pairs(env);
     if auto_graph {
-        smolvm::util::enable_cuda_auto_graph_env_specs(&mut env);
+        smolvm::util::enable_cuda_auto_graph_env(&mut env);
     }
 
     // Init: [dev].init > top-level init, then CLI extends
-    let sf_init = dev_or_top(dev.init, sf.init);
-    let mut init = sf_init;
+    let mut init = dev_or_top(dev.init, sf_init);
     init.extend(cli_init);
 
-    // Workdir: CLI > [dev].workdir > top-level workdir
-    let dev_workdir = dev.workdir;
-    let dev_user = dev.user;
+    // Resource caps: CLI > Smolfile, left unset otherwise so the source (a
+    // pack's manifest) or the engine default applies.
+    let cpus = cli_cpus.or(sf_cpus);
+    let mem = cli_mem.or(sf_memory);
 
-    // Resource caps: CLI > Smolfile > default. The flags are Option so an
-    // explicit value that happens to equal the default still wins; the old
-    // "CLI differs from default" sentinel silently dropped `--cpus 4` against
-    // a Smolfile that said otherwise.
-    let cpus = cli_cpus.or(sf.cpus).unwrap_or(DEFAULT_MICROVM_CPU_COUNT);
-    let mem = cli_mem.or(sf.memory).unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
-
-    let net = if cli_net {
-        true
-    } else {
-        sf.net.unwrap_or(false)
-    };
+    let net = cli_net || sf_net.unwrap_or(false);
 
     // CLI wins over the Smolfile, like every other scalar here.
     let network_backend = match cli_network_backend {
         Some(backend) => Some(backend),
-        None => sf
-            .net_backend
+        None => sf_net_backend
             .as_deref()
             .map(parse_net_backend)
             .transpose()?,
     };
 
-    let gpu = sf.gpu.unwrap_or(false);
-    let rosetta = sf.rosetta.unwrap_or(false);
-
-    let workdir = cli_workdir.or(dev_workdir).or(sf.workdir);
-    let user = cli_user.or(dev_user).or(sf.user);
+    // Workdir/user: CLI > [dev] > top-level
+    let workdir = cli_workdir.or(dev.workdir).or(sf_workdir);
+    let user = cli_user.or(dev.user).or(sf_user);
 
     // Scalars: CLI overrides Smolfile
-    let storage_gb = cli_storage_gb.or(sf.storage);
-    let overlay_gb = cli_overlay_gb.or(sf.overlay);
+    let storage_gb = cli_storage_gb.or(sf_storage);
+    let overlay_gb = cli_overlay_gb.or(sf_overlay);
     let block_io = match cli_block_io {
-        Some(engine) => engine,
-        None => sf
-            .block_io
-            .as_deref()
-            .map(parse_block_io)
-            .transpose()?
-            .unwrap_or_default(),
+        Some(engine) => Some(engine),
+        None => sf_block_io.as_deref().map(parse_block_io).transpose()?,
     };
-    let disk_durability = sf
-        .disk_durability
+    let disk_durability = sf_disk_durability
         .as_deref()
         .map(parse_disk_durability)
-        .transpose()?
-        .unwrap_or_default();
+        .transpose()?;
 
     // Merge network policy: [network] section, then CLI extends
-    let network = sf.network.unwrap_or_default();
+    let network = sf_network.unwrap_or_default();
 
     // Preserve original hostnames for DNS filtering.
     // Do NOT resolve these to CIDRs here — CDN-backed hosts rotate IPs and the
@@ -332,32 +337,26 @@ pub fn build_create_params(
     }
 
     // Parse [network].allow_cidrs — these are explicit stable CIDRs, stored as-is.
-    let mut allowed_cidrs_vec: Vec<String> = Vec::new();
-    let sf_cidrs: Vec<String> = network
+    let mut allowed_cidrs_vec: Vec<String> = network
         .allow_cidrs
         .iter()
         .map(|s| parse_cidr(s))
         .collect::<Result<Vec<_>, _>>()
         .map_err(|e| smolvm::Error::config("smolfile [network] allow_cidrs", e))?;
-    allowed_cidrs_vec.extend(sf_cidrs);
 
     // CLI extends
     allowed_cidrs_vec.extend(cli_allow_cidr);
 
     // --allow-cidr / --allow-host / [network] / --dns implies --net
-    let net = if !allowed_cidrs_vec.is_empty()
+    let net = net
+        || !allowed_cidrs_vec.is_empty()
         || !sf_allow_hosts.is_empty()
         || !network.credentials.is_empty()
-        || cli_dns.is_some()
-    {
-        true
-    } else {
-        net
-    };
+        || cli_dns.is_some();
     let allowed_cidrs = cidrs_to_option(allowed_cidrs_vec);
-    let sf_block_private = (network.block_private || !network.allow_private.is_empty())
+    let block_private = (network.block_private || !network.allow_private.is_empty())
         .then(|| network.allow_private.clone());
-    let net = net || sf_block_private.is_some();
+    let net = net || block_private.is_some();
 
     // [network].deny_cidrs become Deny rules ahead of any allow.
     let sf_deny_cidrs: Vec<String> = network
@@ -379,8 +378,7 @@ pub fn build_create_params(
     egress_rules.extend(sf_allow_udp);
 
     // Restart policy from [restart] section
-    let restart_policy = sf
-        .restart
+    let restart_policy = sf_restart
         .as_ref()
         .and_then(|r| r.policy.as_deref())
         .map(|p| {
@@ -388,71 +386,266 @@ pub fn build_create_params(
                 .map_err(|e| smolvm::Error::config("smolfile [restart] policy", e))
         })
         .transpose()?;
-    let restart_max_retries = sf.restart.as_ref().and_then(|r| r.max_retries);
-    let restart_max_backoff_secs = sf
-        .restart
+    let restart_max_retries = sf_restart.as_ref().and_then(|r| r.max_retries);
+    let restart_max_backoff_secs = sf_restart
         .as_ref()
         .and_then(|r| r.max_backoff.as_ref())
         .and_then(|s| parse_duration_secs(s));
 
     // Health check from [health] section
-    let health_cmd = sf
-        .health
-        .as_ref()
+    let health = sf_health.as_ref();
+    let health_cmd = health
         .filter(|h| !h.exec.is_empty())
         .map(|h| h.exec.clone());
-    let health_interval_secs = sf
-        .health
-        .as_ref()
-        .and_then(|h| h.interval.as_ref())
-        .and_then(|s| parse_duration_secs(s));
-    let health_timeout_secs = sf
-        .health
-        .as_ref()
-        .and_then(|h| h.timeout.as_ref())
-        .and_then(|s| parse_duration_secs(s));
-    let health_retries = sf.health.as_ref().and_then(|h| h.retries);
-    let health_startup_grace_secs = sf
-        .health
-        .as_ref()
-        .and_then(|h| h.startup_grace.as_ref())
-        .and_then(|s| parse_duration_secs(s));
+    let duration = |value: Option<&String>| value.and_then(|s| parse_duration_secs(s));
+    let health_interval_secs = duration(health.and_then(|h| h.interval.as_ref()));
+    let health_timeout_secs = duration(health.and_then(|h| h.timeout.as_ref()));
+    let health_retries = health.and_then(|h| h.retries);
+    let health_startup_grace_secs = duration(health.and_then(|h| h.startup_grace.as_ref()));
 
-    smolvm::workload::validate_stop_settings(sf.stop_signal.as_deref(), sf.stop_timeout)
+    smolvm::workload::validate_stop_settings(sf_stop_signal.as_deref(), sf_stop_timeout)
         .map_err(|e| smolvm::Error::config("smolfile stop settings", e))?;
 
-    Ok(CreateVmParams {
-        disks: Vec::new(),
-        cache_disk: None,
-        nested_virt: false,
-        labels: cli_labels,
-        secret_refs: sf.secrets,
-        name,
+    Ok(CliSpec {
         image,
+        volumes,
+        spec: CreateSpec {
+            entrypoint,
+            cmd,
+            env,
+            workdir,
+            user,
+            init,
+            secret_refs: sf_secrets,
+            restart_policy,
+            restart_max_retries,
+            restart_max_backoff_secs,
+            health_cmd,
+            health_interval_secs,
+            health_timeout_secs,
+            health_retries,
+            health_startup_grace_secs,
+            stop_on_exit: sf_stop_on_exit,
+            stop_signal: sf_stop_signal,
+            stop_timeout_secs: sf_stop_timeout,
+            shm_size: None,
+            cpus,
+            mem,
+            storage_gb,
+            overlay_gb,
+            block_io,
+            disk_durability,
+            disks: Vec::new(),
+            cache_disk: None,
+            mounts: Vec::new(),
+            remote_volumes: Vec::new(),
+            disk_volumes: Vec::new(),
+            net,
+            egress: None,
+            network_backend,
+            dns: cli_dns,
+            dns_options: Vec::new(),
+            network_name: cli_network_name,
+            guest_subnet: None,
+            switch: None,
+            ports,
+            // An exclude list asks for auto ports unless they are turned off.
+            auto_ports: match sf_auto_ports {
+                Some(true) => true,
+                Some(false) => false,
+                None => !sf_auto_ports_exclude.is_empty(),
+            }
+            .then(|| smolvm::data::network::AutoPorts::excluding(sf_auto_ports_exclude)),
+            allowed_cidrs,
+            allowed_hosts: (!sf_allow_hosts.is_empty()).then_some(sf_allow_hosts),
+            block_private,
+            egress_rules,
+            credentials: (!network.credentials.is_empty()).then_some(
+                smolvm::credentials::CredentialPolicy {
+                    credentials: network.credentials,
+                },
+            ),
+            credentials_supplied_only: false,
+            published_sockets: Vec::new(),
+            gpu: sf_gpu.unwrap_or(false),
+            gpu_vram_mib: sf_gpu_vram,
+            rosetta: sf_rosetta.unwrap_or(false),
+            // A flag only: `[artifact].oci_platform` is what a pack is built for.
+            oci_platform: None,
+            nested_virt: false,
+            cuda,
+            docker_socket: sf_docker_socket.unwrap_or(false),
+            ssh_agent: sf_auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
+            forkable,
+            cuda_fork_pool_size: fork.pool_size,
+            cuda_vram_limit_mib: fork.cuda_vram_limit_mib,
+            keep_identity: false,
+            ephemeral: false,
+            detached: false,
+            runtime_managed: false,
+            labels: cli_labels,
+        },
+    })
+}
+
+/// Build `CreateVmParams` (the `machine run` launch parameters) by merging CLI
+/// flags with an optional Smolfile, then applying engine defaults: the same
+/// merge [`build_create_spec`] does for `machine create`.
+#[allow(clippy::too_many_arguments)]
+pub fn build_create_params(
+    name: String,
+    cli_image: Option<String>,
+    cli_entrypoint: Option<String>,
+    cli_cmd: Vec<String>,
+    cli_cpus: Option<u8>,
+    cli_mem: Option<u32>,
+    cli_volume: Vec<String>,
+    cli_port: Vec<PortMappingSpec>,
+    cli_net: bool,
+    cli_network_backend: Option<NetworkBackend>,
+    cli_dns: Option<std::net::Ipv4Addr>,
+    cli_network_name: Option<String>,
+    cli_init: Vec<String>,
+    cli_env: Vec<String>,
+    cli_workdir: Option<String>,
+    cli_user: Option<String>,
+    smolfile_path: Option<PathBuf>,
+    cli_storage_gb: Option<u64>,
+    cli_overlay_gb: Option<u64>,
+    cli_block_io: Option<BlockIoEngine>,
+    cli_allow_cidr: Vec<String>,
+    cli_labels: std::collections::BTreeMap<String, String>,
+) -> smolvm::Result<CreateVmParams> {
+    let CliSpec {
+        image,
+        volumes,
+        spec,
+    } = build_create_spec(
+        cli_image,
+        cli_entrypoint,
+        cli_cmd,
+        cli_cpus,
+        cli_mem,
+        cli_volume,
+        cli_port,
+        cli_net,
+        cli_network_backend,
+        cli_dns,
+        cli_network_name,
+        cli_init,
+        cli_env,
+        cli_workdir,
+        cli_user,
+        smolfile_path,
+        cli_storage_gb,
+        cli_overlay_gb,
+        cli_block_io,
+        cli_allow_cidr,
+        cli_labels,
+    )?;
+    // Destructured without `..`: `machine run` decides what each option means.
+    let smolvm::machine_spec::CreateSpec {
         entrypoint,
         cmd,
+        env,
+        workdir,
+        user,
+        init,
+        secret_refs,
+        restart_policy,
+        restart_max_retries,
+        restart_max_backoff_secs,
+        health_cmd,
+        health_interval_secs,
+        health_timeout_secs,
+        health_retries,
+        health_startup_grace_secs,
+        stop_on_exit,
+        stop_signal,
+        stop_timeout_secs,
+        shm_size,
         cpus,
         mem,
+        storage_gb,
+        overlay_gb,
+        block_io,
+        disk_durability,
+        disks,
+        cache_disk,
+        // Parsed volumes are empty here; the raw specs travel in `volume`.
+        mounts: _,
+        remote_volumes: _,
+        disk_volumes: _,
+        net,
+        // Only the canonical create API carries an explicit replacement.
+        egress: _,
+        network_backend,
+        dns,
+        dns_options,
+        network_name,
+        guest_subnet,
+        // Only an engine puts machines on a container switch.
+        switch: _,
+        ports,
+        auto_ports,
+        allowed_cidrs,
+        allowed_hosts,
+        block_private,
+        egress_rules,
+        credentials,
+        // `machine run` reads credential values from this host.
+        credentials_supplied_only: _,
+        published_sockets,
+        gpu,
+        gpu_vram_mib,
+        rosetta,
+        oci_platform,
+        nested_virt,
+        cuda,
+        docker_socket,
+        ssh_agent,
+        forkable,
+        cuda_fork_pool_size,
+        cuda_vram_limit_mib,
+        // Restore and embedder lifecycle options; `machine run` sets none.
+        keep_identity: _,
+        ephemeral: _,
+        detached: _,
+        runtime_managed: _,
+        labels,
+    } = spec;
+    Ok(CreateVmParams {
+        disks,
+        cache_disk,
+        nested_virt,
+        labels,
+        secret_refs,
+        name,
+        image,
+        entrypoint: entrypoint.unwrap_or_default(),
+        cmd: cmd.unwrap_or_default(),
+        cpus: cpus.unwrap_or(DEFAULT_MICROVM_CPU_COUNT),
+        mem: mem.unwrap_or_else(default_microvm_memory_mib),
         volume: volumes,
         allow_system_mounts: false,
         port: ports,
         net,
         network_backend,
-        dns: cli_dns,
-        dns_options: Vec::new(),
-        shm_size: None,
-        network_name: cli_network_name,
-        guest_subnet: None,
+        dns,
+        dns_options,
+        shm_size,
+        network_name,
+        guest_subnet,
         init,
-        env,
+        env: env.into_iter().map(|(k, v)| format!("{k}={v}")).collect(),
         workdir,
         user,
         storage_gb,
         overlay_gb,
-        block_io,
-        disk_durability,
+        block_io: block_io.unwrap_or_default(),
+        disk_durability: disk_durability.unwrap_or_default(),
         allowed_cidrs,
-        block_private: sf_block_private,
+        block_private,
         egress_rules,
         restart_policy,
         restart_max_retries,
@@ -462,30 +655,24 @@ pub fn build_create_params(
         health_timeout_secs,
         health_retries,
         health_startup_grace_secs,
-        ssh_agent: sf.auth.as_ref().and_then(|a| a.ssh_agent).unwrap_or(false),
+        ssh_agent,
         cuda,
         forkable,
-        stop_on_exit: sf.stop_on_exit,
-        stop_signal: sf.stop_signal.clone(),
-        stop_timeout_secs: sf.stop_timeout,
-        cuda_fork_pool_size: fork.pool_size,
-        cuda_vram_limit_mib: fork.cuda_vram_limit_mib,
-        docker_socket: sf.docker_socket.unwrap_or(false),
+        stop_on_exit,
+        stop_signal,
+        stop_timeout_secs,
+        cuda_fork_pool_size,
+        cuda_vram_limit_mib,
+        docker_socket,
+        auto_ports,
         gpu,
-        gpu_vram_mib: sf.gpu_vram,
+        gpu_vram_mib,
         rosetta,
-        dns_filter_hosts: if sf_allow_hosts.is_empty() {
-            None
-        } else {
-            Some(sf_allow_hosts)
-        },
-        credential_policy: (!network.credentials.is_empty()).then_some(
-            smolvm::credentials::CredentialPolicy {
-                credentials: network.credentials,
-            },
-        ),
+        oci_platform,
+        dns_filter_hosts: allowed_hosts,
+        credential_policy: credentials,
         credential_placeholders: Default::default(),
-        published_sockets: Vec::new(),
+        published_sockets,
         source_smolmachine: None,
     })
 }
@@ -517,6 +704,14 @@ pub struct PackConfig {
     /// so `--from-vm` can distinguish "Smolfile says net = false" from "no
     /// Smolfile, fall back to source VM's setting".
     pub net: Option<bool>,
+    /// Block private destinations, except the listed CIDRs.
+    pub block_private: Option<Vec<String>>,
+    /// Outbound CIDR allow-list from `[network].allow_cidrs`.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Hostnames and patterns from `[network].allow_hosts` / `allow_host_patterns`.
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Ordered egress rules from `[network].deny_cidrs` / `allow_udp`.
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
     /// Whether GPU acceleration is enabled in the packed VM.
     pub gpu: bool,
     /// Secrets carried into the pack manifest as references. They are resolved
@@ -603,6 +798,10 @@ pub fn resolve_pack_config_with_defaults(
                 workdir: None,
                 user: None,
                 net: None,
+                block_private: None,
+                allowed_cidrs: None,
+                dns_filter_hosts: None,
+                egress_rules: Vec::new(),
                 gpu: cli_gpu,
                 secret_refs: Default::default(),
             });
@@ -645,6 +844,56 @@ pub fn resolve_pack_config_with_defaults(
     // oci_platform: CLI > [artifact]
     let oci_platform = cli_oci_platform.or(artifact.oci_platform);
 
+    let (block_private, allowed_cidrs, dns_filter_hosts, egress_rules) = match sf.network.as_ref() {
+        Some(network) => {
+            let cidrs = network
+                .allow_cidrs
+                .iter()
+                .map(|s| parse_cidr(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| smolvm::Error::config("smolfile [network] allow_cidrs", e))?;
+            let mut hosts = network.allow_hosts.clone();
+            for pattern in &network.allow_host_patterns {
+                hosts.push(
+                    smolvm_protocol::host_pattern::encode_strict(pattern).map_err(|e| {
+                        smolvm::Error::config("smolfile [network] allow_host_patterns", e)
+                    })?,
+                );
+            }
+            let deny_cidrs = network
+                .deny_cidrs
+                .iter()
+                .map(|s| parse_cidr(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| smolvm::Error::config("smolfile [network] deny_cidrs", e))?;
+            let mut rules = crate::cli::vm_common::deny_cidr_rules(&deny_cidrs);
+            let allow_udp = network
+                .allow_udp
+                .iter()
+                .map(|s| smolvm::smolfile::parse_allow_udp(s))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(|e| smolvm::Error::config("smolfile [network] allow_udp", e))?;
+            rules.extend(allow_udp);
+            let block_private = (network.block_private || !network.allow_private.is_empty())
+                .then(|| {
+                    network
+                        .allow_private
+                        .iter()
+                        .map(|cidr| parse_cidr(cidr))
+                        .collect::<Result<Vec<_>, _>>()
+                        .map_err(|e| smolvm::Error::config("smolfile [network] allow_private", e))
+                })
+                .transpose()?;
+            (
+                block_private,
+                (!cidrs.is_empty()).then_some(cidrs),
+                (!hosts.is_empty()).then_some(hosts),
+                rules,
+            )
+        }
+        None => (None, None, None, Vec::new()),
+    };
+
     Ok(PackConfig {
         image,
         entrypoint,
@@ -655,7 +904,7 @@ pub fn resolve_pack_config_with_defaults(
         env: sf.env.into_iter().map(|e| e.trim().to_string()).collect(),
         workdir: sf.workdir,
         user: sf.user,
-        // [network] host entries / allow_cidrs implies net = true,
+        // [network] host entries / allow_cidrs / deny_cidrs / allow_udp implies net = true,
         // matching the same logic in build_create_params().
         // Preserve the tri-state: None = unspecified, Some = explicit.
         net: {
@@ -663,6 +912,10 @@ pub fn resolve_pack_config_with_defaults(
                 !n.allow_hosts.is_empty()
                     || !n.allow_host_patterns.is_empty()
                     || !n.allow_cidrs.is_empty()
+                    || !n.deny_cidrs.is_empty()
+                    || !n.allow_udp.is_empty()
+                    || n.block_private
+                    || !n.allow_private.is_empty()
                     || !n.credentials.is_empty()
             });
             if network_section_implies_net {
@@ -671,6 +924,10 @@ pub fn resolve_pack_config_with_defaults(
                 sf.net // None if key absent, Some(true/false) if explicit
             }
         },
+        block_private,
+        allowed_cidrs,
+        dns_filter_hosts,
+        egress_rules,
         // CLI --gpu wins; Smolfile gpu = true also enables it.
         gpu: cli_gpu || sf.gpu.unwrap_or(false),
         secret_refs: sf.secrets,
@@ -717,6 +974,7 @@ mod tests {
     /// manifest). Add a line per hop when adding a launch setting.
     #[test]
     fn every_launch_setting_survives_every_hop() {
+        use crate::cli::pack_run::{effective_pack_allow_list, resolve_packed_launch};
         use crate::cli::vm_common::{apply_overrides, build_vm_record, DefaultVmOverrides};
         use smolvm::config::VmRecord;
         use smolvm::pack_export::{seed_manifest_from_vm, FromVmAssets};
@@ -736,10 +994,17 @@ env = ["GREETING=hello", "EMPTY="]
 workdir = "/srv/app"
 user = "501:20"
 init = ["echo init"]
+
+[network]
+allow_cidrs = ["1.1.1.1/32"]
+allow_host_patterns = ["*.example.com"]
+deny_cidrs = ["10.0.0.0/8"]
+block_private = true
+allow_private = ["192.168.1.0/24"]
 "#,
         )
         .unwrap();
-        let params = build_from_smolfile(path).unwrap();
+        let params = build_from_smolfile(path.clone()).unwrap();
 
         // Hop 1: Smolfile -> create params.
         assert_eq!(params.image.as_deref(), Some("library/alpine:latest"));
@@ -750,6 +1015,21 @@ init = ["echo init"]
         assert_eq!(params.user.as_deref(), Some("501:20"));
         assert_eq!(params.init, vec!["echo init"]);
         assert_eq!(params.network_backend, Some(NetworkBackend::VirtioNet));
+        assert_eq!(params.allowed_cidrs, Some(vec!["1.1.1.1/32".to_string()]));
+        assert_eq!(
+            params.dns_filter_hosts,
+            Some(vec!["*.example.com".to_string()])
+        );
+        assert_eq!(params.egress_rules.len(), 1);
+        assert_eq!(params.egress_rules[0].cidr.as_deref(), Some("10.0.0.0/8"));
+
+        // Hop 1b: Smolfile -> pack config, the `pack create --smolfile` path.
+        let pack_config =
+            resolve_pack_config(None, None, None, None, None, false, Some(path)).unwrap();
+        assert_eq!(pack_config.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(pack_config.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(pack_config.egress_rules, params.egress_rules);
+        assert_eq!(pack_config.block_private, params.block_private);
 
         // Hop 2a: create params -> record, the `machine create` path.
         let created = build_vm_record(&params).unwrap();
@@ -767,10 +1047,14 @@ init = ["echo init"]
         assert_eq!(created.user, params.user);
         assert_eq!(created.init, params.init);
         assert_eq!(created.network_backend, params.network_backend);
+        assert_eq!(created.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(created.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(created.egress_rules, params.egress_rules);
 
         // Hop 2b: create params -> overrides -> record, the `run` and
         // first-launch paths.
-        let overrides = DefaultVmOverrides::from_create_params(&params, vec![], vec![], vec![]);
+        let overrides =
+            DefaultVmOverrides::from_create_params(&params, vec![], vec![], vec![]).unwrap();
         let mut persisted = VmRecord::new("parity".to_string(), 1, 512, vec![], vec![], true);
         apply_overrides(&mut persisted, &overrides);
         assert_eq!(persisted.image, params.image);
@@ -781,6 +1065,9 @@ init = ["echo init"]
         assert_eq!(persisted.user, params.user);
         assert_eq!(persisted.init, params.init);
         assert_eq!(persisted.network_backend, params.network_backend);
+        assert_eq!(persisted.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(persisted.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(persisted.egress_rules, params.egress_rules);
 
         // Hop 3: record -> pack manifest, the `pack create --from-vm` path.
         let mut manifest = PackManifest::new(
@@ -802,12 +1089,14 @@ init = ["echo init"]
         assert!(manifest.env.contains(&"GREETING=hello".to_string()));
         assert_eq!(manifest.workdir, params.workdir);
         assert_eq!(manifest.user, params.user);
+        assert_eq!(manifest.allowed_cidrs, params.allowed_cidrs);
+        assert_eq!(manifest.dns_filter_hosts, params.dns_filter_hosts);
+        assert_eq!(manifest.egress_rules, params.egress_rules);
 
         // Hop 4: pack manifest -> what a packed machine launches with, the
         // `pack run` and standalone-binary paths. The manifest fills every
         // setting the command line leaves out, and the command line wins for
         // each one it gives.
-        use crate::cli::pack_run::resolve_packed_launch;
         let no_secrets = std::collections::BTreeMap::new();
         let launch = resolve_packed_launch(&manifest, &[], &[], &no_secrets, None, None).unwrap();
         assert_eq!(launch.command, vec!["/bin/sh", "-c", "sleep infinity"]);
@@ -816,6 +1105,15 @@ init = ["echo init"]
             .contains(&("GREETING".to_string(), "hello".to_string())));
         assert_eq!(launch.workdir, params.workdir);
         assert_eq!(launch.user, params.user);
+        assert_eq!(
+            effective_pack_allow_list(None, &manifest).unwrap(),
+            smolvm::pack_export::ValidatedManifestEgress {
+                block_private: params.block_private.clone(),
+                allowed_cidrs: params.allowed_cidrs.clone(),
+                dns_filter_hosts: params.dns_filter_hosts.clone(),
+                egress_rules: params.egress_rules.clone(),
+            }
+        );
         let overridden = resolve_packed_launch(
             &manifest,
             &["id".to_string()],
@@ -1206,6 +1504,31 @@ init = ["echo init"]
     }
 
     #[test]
+    fn auto_ports_smolfile_reaches_the_record() {
+        let dir = tempfile::tempdir().unwrap();
+        let cases = [
+            ("auto_ports = true\n", Some(vec![])),
+            (
+                "auto_ports_exclude = [6379, 5432, 6379]\n",
+                Some(vec![5432, 6379]),
+            ),
+            ("auto_ports = false\nauto_ports_exclude = [5432]\n", None),
+            ("net = true\n", None),
+        ];
+        for (contents, expected) in cases {
+            let path = dir.path().join("Smolfile");
+            std::fs::write(&path, contents).unwrap();
+            let params = build_from_smolfile(path).unwrap();
+            let record = crate::cli::vm_common::build_vm_record(&params).unwrap();
+            assert_eq!(
+                record.auto_ports.map(|auto| auto.exclude),
+                expected,
+                "{contents:?}"
+            );
+        }
+    }
+
+    #[test]
     fn fork_pool_requires_cuda() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("Smolfile");
@@ -1229,7 +1552,9 @@ init = ["echo init"]
 #[cfg(test)]
 mod resource_cap_precedence_tests {
     use super::*;
-    use smolvm::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+    use smolvm::data::resources::{
+        default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB,
+    };
 
     fn smolfile(contents: &str) -> (tempfile::TempDir, PathBuf) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -1318,7 +1643,7 @@ mod resource_cap_precedence_tests {
         for p in [with_smolfile, without] {
             assert_eq!(
                 (p.cpus, p.mem),
-                (DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB)
+                (DEFAULT_MICROVM_CPU_COUNT, default_microvm_memory_mib())
             );
         }
     }
@@ -1562,5 +1887,31 @@ mod cli_entrypoint_tests {
         .expect("resolves");
 
         assert_eq!(cfg.entrypoint, vec!["/app/run"]);
+    }
+
+    #[test]
+    fn smolfile_deny_cidrs_and_allow_udp_reach_pack_config() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "image = \"alpine\"\n[network]\ndeny_cidrs = [\"10.0.0.0/8\"]\nallow_udp = [\"1.1.1.1/32:53\"]\n",
+        )
+        .expect("write");
+
+        let cfg =
+            resolve_pack_config(None, None, None, None, None, false, Some(path)).expect("resolves");
+        assert_eq!(cfg.net, Some(true));
+        assert_eq!(cfg.egress_rules.len(), 2);
+        assert_eq!(cfg.egress_rules[0].cidr.as_deref(), Some("10.0.0.0/8"));
+        assert_eq!(
+            cfg.egress_rules[0].action,
+            smolvm_protocol::RuleAction::Deny
+        );
+        assert_eq!(cfg.egress_rules[1].cidr.as_deref(), Some("1.1.1.1/32"));
+        assert_eq!(
+            cfg.egress_rules[1].action,
+            smolvm_protocol::RuleAction::Allow
+        );
     }
 }

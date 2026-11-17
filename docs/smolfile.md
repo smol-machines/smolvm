@@ -26,7 +26,7 @@ smolvm machine create --name myvm -s Smolfile   # or --smolfile <PATH>
 smolvm machine start --name myvm
 ```
 
-Port mappings accept a single port (`"8080"`), an explicit mapping (`"8080:80"`), or equal-length one-to-one ranges (`"5173-5180:5173-5180"`). A machine can publish at most 64 concrete mappings.
+Port mappings accept a single port (`"8080"`), an explicit mapping (`"8080:80"`), or equal-length one-to-one ranges (`"5173-5180:5173-5180"`). A machine can publish at most 4096 concrete mappings.
 
 Unknown keys are rejected rather than ignored, so a typo fails at create time
 instead of silently doing nothing.
@@ -47,7 +47,7 @@ stop_timeout = 30                     # seconds it gets to exit before it is kil
 
 # Resources
 cpus = 2                              # vCPUs (default: 4)
-memory = 1024                         # MiB (default: 8192, elastic via balloon)
+memory = 1024                         # MiB (default: half the host's RAM, at most 8192; elastic via balloon)
 net = true                            # outbound networking (default: false)
 gpu = true                            # GPU acceleration, Vulkan via virtio-gpu (default: false)
 gpu_vram = 4096                       # GPU shared-memory region in MiB (default: 4096, ignored unless gpu = true)
@@ -113,7 +113,7 @@ GCP_CREDS    = { from_file = "/abs/creds.json" }  # absolute host file (at launc
 Credential bindings are `[[network.credentials]]` tables, described in
 [credential substitution](credential-substitution.md). The other accepted keys
 are `net_backend`, `rosetta`, `cuda`, `auto_graph`, `docker_socket`,
-`block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
+`auto_ports`, `auto_ports_exclude`, `block_io`, `disk_durability` and the `[branch]` (or `[fork]`) and `[service]`
 tables; `machine create --help` describes the flag each one mirrors.
 
 ## User names and numeric IDs
@@ -145,7 +145,7 @@ volumes:    [dev].volumes, else top-level volumes, then + CLI -v
 ports:      [dev].ports, else top-level ports, then + CLI -p
 init:       [dev].init, else top-level init, then + CLI --init
 workdir:    CLI -w > [dev].workdir > top-level workdir
-cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, 8192 MiB)
+cpus/mem:   CLI flag > Smolfile > defaults (4 CPU, half the host's RAM up to 8192 MiB)
 ```
 
 For `pack create`:
@@ -197,3 +197,8 @@ number; `stop_timeout` is whole seconds, at most 300. The same settings are
 `machine create --stop-signal` and `--stop-timeout`, and `machine stop
 --timeout SECS` overrides the wait for one stop (`0` kills at once).
 `machine delete` does not wait.
+
+If the machine's process is still present after `SIGKILL` because the kernel
+is holding one of its threads, `machine stop` still finishes and names the
+PID, `machine delete --force` removes the machine, and a start is refused
+until that process is gone (the kernel call returns or the host reboots).

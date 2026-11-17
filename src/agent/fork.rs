@@ -106,9 +106,7 @@ pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
 pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
     validate_vm_name(source, "saved execution")
         .map_err(|error| Error::config("saved execution", error))?;
-    ForkSourceLock::acquire_at(
-        &fork_source_lock_path(source).with_extension("pause-operation.lock"),
-    )
+    ForkSourceLock::acquire_at(&saved_execution_lock_path(source))
 }
 
 pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
@@ -122,6 +120,12 @@ fn fork_source_lock_path(source: &str) -> PathBuf {
         .parent()
         .expect("a VM data directory always has a parent")
         .join(format!(".{source}.fork-operation.lock"))
+}
+
+/// The pause/resume lock of [`lock_saved_execution`]: a sibling of the
+/// machine's fork-source lock, for the same reason.
+fn saved_execution_lock_path(source: &str) -> PathBuf {
+    fork_source_lock_path(source).with_extension("pause-operation.lock")
 }
 
 #[cfg(unix)]
@@ -230,17 +234,19 @@ fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     }
 }
 
-/// The machine name a fork-source lock file belongs to, or `None` when the path
-/// is not one. The inverse of the name [`fork_source_lock_path`] builds.
+/// The machine name a fork-source or pause-operation lock file belongs to, or
+/// `None` when the path is neither. The inverse of the names
+/// [`fork_source_lock_path`] and [`saved_execution_lock_path`] build.
 fn fork_source_lock_owner(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
+    let file_name = path.file_name()?.to_str()?.strip_prefix('.')?;
     let source = file_name
-        .strip_prefix('.')?
-        .strip_suffix(".fork-operation.lock")?;
+        .strip_suffix(".fork-operation.pause-operation.lock")
+        .or_else(|| file_name.strip_suffix(".fork-operation.lock"))?;
     (!source.is_empty()).then(|| source.to_string())
 }
 
-/// Remove fork-source lock files whose machine no longer exists.
+/// Remove fork-source and pause-operation lock files whose machine no longer
+/// exists.
 ///
 /// [`fork_source_lock_path`] deliberately puts the lock file *beside* the
 /// machine's data directory rather than inside it, so deleting a machine cannot
@@ -251,8 +257,9 @@ fn fork_source_lock_owner(path: &Path) -> Option<String> {
 ///
 /// Sweeping is safe here only because both conditions must hold: the machine's
 /// data directory is gone, *and* the lock can be taken without blocking, which
-/// no in-flight fork or checkpoint would permit. A file failing either check is
-/// left for a later sweep rather than raced against.
+/// no in-flight fork, checkpoint, pause, resume or saved-execution download
+/// would permit. A file failing either check is left for a later sweep rather
+/// than raced against.
 ///
 /// Best-effort by design, like [`crate::agent::prune_orphaned_ready_markers`]:
 /// a lock this process cannot open or unlink is simply left in place.
@@ -653,15 +660,87 @@ fn branch_admission_value(name: &str, default: u64) -> Result<u64> {
 }
 
 /// What a branch must leave free on the host: a reserve kept for the host and
-/// the boot overhead charged per child. Shared by the fork-time check and
-/// `GET /capacity`, so a control plane that pre-checks a fan-out uses the same
-/// numbers this node will enforce.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// what each child is charged (a fixed boot overhead plus a share of its guest
+/// RAM). Shared by the fork-time check and `GET /capacity`, so a control plane
+/// that pre-checks a fan-out uses the same numbers this node will enforce.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct BranchAdmissionParams {
     /// Host memory a branch must leave free (MiB).
     pub reserve_mib: u64,
     /// Boot overhead charged per child (MiB).
     pub child_overhead_mib: u64,
+    /// Share of a child's guest RAM (0..=1) charged per child on top of
+    /// `child_overhead_mib`, for the private pages it dirties after the fork.
+    pub child_growth_fraction: f64,
+}
+
+/// Default [`BranchAdmissionParams::child_growth_fraction`]. A child starts
+/// sharing all of its source's RAM, but test-run children dirty a private set
+/// over minutes; on 2026-11-09 thousands of 16-32 GiB children admitted at
+/// 64 MiB each grew three 755-1511 GiB workers into a global OOM. A quarter of
+/// the guest is what a busy child plausibly makes private while keeping
+/// copy-on-write density at 4x the guest-RAM sum. Only a default on large
+/// serve hosts (see [`branch_admission_defaults`]).
+const DEFAULT_BRANCH_CHILD_GROWTH_FRACTION: f64 = 0.25;
+
+/// Hosts at least this large (MiB) get the host-derived branch reserve and the
+/// per-child growth charge by default when they run `smolvm serve`. Laptops,
+/// dev boxes and CI runners keep the old 5%/4 GiB reserve and 64 MiB per child:
+/// they branch a handful of children and a 2 GiB-per-child charge would refuse
+/// fan-outs that fit there fine.
+const LARGE_SERVE_HOST_MIN_MIB: u64 = 128 * 1024;
+
+/// Set once by `smolvm serve` at startup: this process is a node that admits
+/// branches for a control plane, not a local CLI invocation.
+static SERVE_BRANCH_ADMISSION: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Mark this process as `smolvm serve`, so a large host uses the stricter
+/// branch admission defaults.
+pub fn enable_serve_branch_admission() {
+    SERVE_BRANCH_ADMISSION.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The default `(reserve_mib, child_growth_fraction)` for a host with
+/// `total_mib` of memory that keeps `host_reserved_mib` out of reach of VMs.
+/// Only `smolvm serve` on a host of at least [`LARGE_SERVE_HOST_MIN_MIB`]
+/// raises the reserve to the host reserve and charges child growth; everywhere
+/// else the old defaults hold. Explicit env vars override both either way.
+fn branch_admission_defaults(
+    total_mib: u64,
+    under_serve: bool,
+    host_reserved_mib: u64,
+) -> (u64, f64) {
+    if under_serve && total_mib >= LARGE_SERVE_HOST_MIN_MIB {
+        (
+            default_branch_reserve_mib(total_mib, host_reserved_mib),
+            DEFAULT_BRANCH_CHILD_GROWTH_FRACTION,
+        )
+    } else {
+        (default_branch_reserve_mib(total_mib, 0), 0.0)
+    }
+}
+
+/// `SMOLVM_BRANCH_CHILD_GROWTH_FRACTION`, clamped to `0..=1`, or `default`
+/// when unset.
+fn branch_child_growth_fraction(configured: Option<&str>, default: f64) -> Result<f64> {
+    let Some(value) = configured else {
+        return Ok(default);
+    };
+    match value.trim().parse::<f64>() {
+        Ok(fraction) if !fraction.is_nan() => Ok(fraction.clamp(0.0, 1.0)),
+        _ => Err(Error::config(
+            "fork memory admission",
+            "SMOLVM_BRANCH_CHILD_GROWTH_FRACTION must be a number from 0 to 1",
+        )),
+    }
+}
+
+/// What admission charges one child (MiB): the fixed boot overhead plus
+/// `growth_fraction` of its guest RAM, rounded up.
+fn branch_child_charge_mib(child_overhead_mib: u64, growth_fraction: f64, guest_mib: u64) -> u64 {
+    let growth_mib = (guest_mib as f64 * growth_fraction).ceil() as u64;
+    child_overhead_mib.saturating_add(growth_mib)
 }
 
 /// The branch admission parameters for a host with `total_mib` of effective
@@ -671,43 +750,61 @@ pub fn branch_admission_params(total_mib: u64) -> Result<Option<BranchAdmissionP
     if std::env::var("SMOLVM_BRANCH_MEMORY_ADMISSION").as_deref() == Ok("0") {
         return Ok(None);
     }
-    let reserve_mib = branch_admission_value(
-        "SMOLVM_HOST_MEMORY_RESERVE_MIB",
-        default_branch_reserve_mib(total_mib),
-    )?;
+    let (default_reserve_mib, default_growth_fraction) = branch_admission_defaults(
+        total_mib,
+        SERVE_BRANCH_ADMISSION.load(std::sync::atomic::Ordering::Relaxed),
+        crate::systemd_scope::configured_host_reserved_memory_mib(total_mib),
+    );
+    let reserve_mib =
+        branch_admission_value("SMOLVM_HOST_MEMORY_RESERVE_MIB", default_reserve_mib)?;
     // H100 and ordinary Linux QA put a booted, idle VMM at roughly 39–42 MiB.
     // Reserve 64 MiB to include thread stacks and transient launch state.
     let child_overhead_mib = branch_admission_value("SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD", 64)?;
+    let child_growth_fraction = branch_child_growth_fraction(
+        std::env::var("SMOLVM_BRANCH_CHILD_GROWTH_FRACTION")
+            .ok()
+            .as_deref(),
+        default_growth_fraction,
+    )?;
     Ok(Some(BranchAdmissionParams {
         reserve_mib,
         child_overhead_mib,
+        child_growth_fraction,
     }))
 }
 
-/// 5% of the host, at least 512 MiB and at most 4 GiB, never more than half.
-fn default_branch_reserve_mib(total_mib: u64) -> u64 {
-    (total_mib / 20).clamp(512, 4096).min(total_mib / 2)
+/// 5% of the host, at least 512 MiB and at most 4 GiB, never more than half;
+/// raised to `host_reserved_mib`, the memory the host keeps out of reach of
+/// VMs (see [`crate::systemd_scope::host_reserved_memory_mib`]). A fixed 4 GiB
+/// let a 755 GiB host admit branches down to its last 4 GiB, which its own
+/// services and the children's later growth could not live with.
+fn default_branch_reserve_mib(total_mib: u64, host_reserved_mib: u64) -> u64 {
+    (total_mib / 20)
+        .clamp(512, 4096)
+        .min(total_mib / 2)
+        .max(host_reserved_mib)
 }
 
 fn branch_admission_required_mib(
     children: usize,
-    child_overhead_mib: u64,
+    per_child_mib: u64,
     reserve_mib: u64,
     materialized_generation_mib: u64,
 ) -> Option<u64> {
     u64::try_from(children)
         .ok()?
-        .checked_mul(child_overhead_mib)?
+        .checked_mul(per_child_mib)?
         .checked_add(reserve_mib)?
         .checked_add(materialized_generation_mib)
 }
 
 /// Refuse a fan-out before capture if it would consume the host/cgroup's safe
-/// boot headroom. This intentionally reserves only measured VMM boot overhead
-/// plus what a fresh shared generation copies—the source's private pages since
-/// its last capture, not its whole RAM and not every child's configured guest
-/// ceiling, which would erase COW density. Managed per-VM cgroups remain the
-/// hard bound for later workload writes where the service enables them.
+/// headroom. Each child is charged its VMM boot overhead plus a share of its
+/// guest RAM for the private pages it will dirty (not its whole configured
+/// guest, which would erase COW density), on top of what a fresh shared
+/// generation copies—the source's private pages since its last capture. The
+/// VM slice's memory cap and the memory pressure guard bound what children
+/// write beyond that.
 fn admit_branch_memory(
     record: &VmRecord,
     children: usize,
@@ -722,6 +819,7 @@ fn admit_branch_memory(
     let Some(BranchAdmissionParams {
         reserve_mib,
         child_overhead_mib,
+        child_growth_fraction,
     }) = branch_admission_params(total_mib)?
     else {
         return Ok(());
@@ -737,16 +835,22 @@ fn admit_branch_memory(
     } else {
         0
     };
+    // Children inherit the source's guest RAM size.
+    let per_child_mib = branch_child_charge_mib(
+        child_overhead_mib,
+        child_growth_fraction,
+        u64::from(record.mem),
+    );
     let required_mib = branch_admission_required_mib(
         children,
-        child_overhead_mib,
+        per_child_mib,
         reserve_mib,
         materialized_generation_mib,
     )
     .ok_or_else(|| Error::agent("fork memory admission", "memory estimate overflow"))?;
     if available_mib < required_mib {
         return Err(Error::vm_creation(format!(
-            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD"
+            "branch needs at least {required_mib} MiB of effective host headroom for {children} children, but only {available_mib} MiB is available; reduce the batch, free memory, or tune SMOLVM_HOST_MEMORY_RESERVE_MIB/SMOLVM_BRANCH_ADMISSION_MIB_PER_CHILD/SMOLVM_BRANCH_CHILD_GROWTH_FRACTION"
         )));
     }
     tracing::debug!(
@@ -755,6 +859,8 @@ fn admit_branch_memory(
         required_mib,
         reserve_mib,
         child_overhead_mib,
+        child_growth_fraction,
+        per_child_mib,
         materialized_generation_mib,
         "branch memory admission passed"
     );
@@ -1162,15 +1268,30 @@ fn prepare_running_disk_generation(
     Ok(())
 }
 
-/// Whether the VM process `pid` runs a different smolvm binary than this engine
-/// boots VMs with. A worker roll replaces the binary under running VMs, which
-/// keep the one they started with; branching such a VM from the new engine gave
-/// children whose workload died at once (one customer's batch of 7 on
-/// 2026-10-22). VMs boot as [`super::manager::vm_boot_executable`] run as
-/// `_boot-vm`, which for an embedding SDK is its helper, not the host process.
-/// Linux only; a process or file that cannot be read is not refused.
+/// Whether the running VM process of a machine was started by a different
+/// smolvm engine build than this one. A worker roll replaces the engine under
+/// running VMs, which keep the one they started with; branching such a VM from
+/// the new engine gave children whose workload died at once (one customer's
+/// batch of 7 on 2026-10-22). The record names the build that started the VM
+/// ([`crate::ENGINE_BUILD`]), and only another build is refused: the same
+/// release installed as two files (a CLI's embedded engine and an SDK's cached
+/// one) is one build. A record from an engine that did not record its build
+/// falls back to comparing the process's executable with the one this engine
+/// boots VMs with ([`super::manager::vm_boot_executable`], run as `_boot-vm`,
+/// which for an embedding SDK is its helper, not the host process); that
+/// fallback is Linux only, and a process or file it cannot read is not refused.
+fn source_runs_another_engine(record: &VmRecord) -> bool {
+    let Some(pid) = record.pid else {
+        return false;
+    };
+    match record.engine_build.as_deref() {
+        Some(build) => build != crate::ENGINE_BUILD,
+        None => process_runs_another_boot_binary(pid),
+    }
+}
+
 #[cfg(target_os = "linux")]
-fn source_runs_another_engine(pid: i32) -> bool {
+fn process_runs_another_boot_binary(pid: i32) -> bool {
     match super::manager::vm_boot_executable() {
         Ok(boot) => process_runs_another_binary(pid, &boot),
         Err(_) => false,
@@ -1191,12 +1312,17 @@ fn process_runs_another_binary(pid: i32, binary: &Path) -> bool {
 }
 
 #[cfg(not(target_os = "linux"))]
-fn source_runs_another_engine(_pid: i32) -> bool {
+fn process_runs_another_boot_binary(_pid: i32) -> bool {
     false
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 const MAX_FORK_DISK_CHAIN_DEPTH: usize = 32;
+
+/// The depth at which a live branch is refused: reached only when flattening
+/// a chain past `MAX_FORK_DISK_CHAIN_DEPTH` has failed branch after branch.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+const HARD_FORK_DISK_CHAIN_DEPTH: usize = 2 * MAX_FORK_DISK_CHAIN_DEPTH;
 
 /// Every block disk a branch carries, as `(block id, role filename)`: the id
 /// libkrun pivots the running device by, and the `.raw` name its image is
@@ -1372,7 +1498,7 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
     })?;
     let mut relocated = relocated_top.to_path_buf();
     let mut seen = HashSet::new();
-    for _ in 0..MAX_FORK_DISK_CHAIN_DEPTH {
+    for _ in 0..4 * MAX_FORK_DISK_CHAIN_DEPTH {
         if !seen.insert(source.clone()) {
             return Err(Error::agent(
                 "stage fork disk backing",
@@ -1455,12 +1581,19 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
     Err(Error::agent(
         "stage fork disk backing",
         format!(
-            "{} exceeds the safe backing depth of {MAX_FORK_DISK_CHAIN_DEPTH}",
+            "{} exceeds the backing depth a chain can be inspected to",
             source_top.display()
         ),
     ))
 }
 
+/// Refuse a live branch only when compaction has kept failing. A chain past
+/// `MAX_FORK_DISK_CHAIN_DEPTH` that nothing beneath the active disk could fold
+/// (a machine branched from frozen sources before they were kept short) still
+/// branches: the branch turns the active disk into a generation this machine
+/// owns, and that generation is flattened as soon as the branch commits. Only
+/// a chain twice as deep, which takes that flatten failing many times over,
+/// is refused.
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
     for (_, raw) in FORK_DISK_ROLES {
@@ -1469,17 +1602,20 @@ fn ensure_fork_disk_chain_is_bounded(gdir: &Path) -> Result<()> {
             continue;
         }
         let depth = qcow2_backing_depth(&disk)?;
-        if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
+        if depth >= HARD_FORK_DISK_CHAIN_DEPTH {
             // A limit the caller clears by packing the machine, not a fault.
             return Err(Error::agent_conflict(
                 "fork-continue",
                 format!(
-                    "{} already has {depth} qcow2 backing layers; the safe limit is \
-                     {MAX_FORK_DISK_CHAIN_DEPTH}. Stop and pack this machine into a new root \
-                     before creating another live fork",
+                    "{} already has {depth} qcow2 backing layers and flattening could not \
+                     shorten it; the limit is {HARD_FORK_DISK_CHAIN_DEPTH}. Stop and pack this \
+                     machine into a new root before creating another live fork",
                     disk.display()
                 ),
             ));
+        }
+        if depth >= MAX_FORK_DISK_CHAIN_DEPTH {
+            tracing::warn!(disk = %disk.display(), depth, "branching a deep disk chain; its new generation is flattened once the branch commits");
         }
     }
     Ok(())
@@ -2246,6 +2382,39 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
     }
 }
 
+/// Selects one mount point per writable virtio disk from `/proc/mounts`; a disk
+/// mounted twice is trimmed once.
+const WRITABLE_GUEST_DISKS: &str =
+    r#"$1 ~ "^/dev/vd" && $4 ~ /(^|,)rw(,|$)/ && !seen[$1]++ { print $2 }"#;
+
+/// Tell the guest's writable disks which blocks its filesystems no longer use.
+///
+/// A deleted file's blocks stay written in the host's disk image until the
+/// guest discards them, so a checkpoint would save them and the host would keep
+/// the space. A trim punches them out of the image, which the capture then
+/// skips as holes. Best effort: an older agent or a disk without discard just
+/// keeps its blocks.
+pub fn trim_guest_disks(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "awk '{WRITABLE_GUEST_DISKS}' /proc/mounts | \
+                 while read -r mount; do fstrim \"$mount\"; done"
+            ),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
+}
+
 /// Join the guest's scattered free pages into the large blocks free page
 /// hinting can hand over. Best effort: an older agent or a kernel without
 /// compaction just leaves memory as it is.
@@ -2630,7 +2799,7 @@ pub(crate) fn prepare_forks_reusing(
             "CUDA fork descendants are not supported yet; create a leaf clone without `forkable`",
         ));
     }
-    if golden_rec.pid.is_some_and(source_runs_another_engine) {
+    if source_runs_another_engine(&golden_rec) {
         // A caller-fixable refusal: a restart puts the source on this engine.
         return Err(Error::agent_conflict(
             "fork",
@@ -2903,6 +3072,18 @@ pub(crate) fn prepare_forks_reusing(
             response = %reply,
             "fork: golden RAM checkpoint written"
         );
+        // The generation this branch made is immutable now that the source
+        // runs on its new overlay. A chain still past the limit (nothing below
+        // the old active disk could be folded) is flattened through it before
+        // any clone opens it. A failure leaves a deep but valid chain.
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        if fork_continue_snapshot(&snapshot_dir) {
+            if let Err(error) =
+                compact::compact_if_deeper_than(&gdir, vm_ids, MAX_FORK_DISK_CHAIN_DEPTH)
+            {
+                tracing::warn!(%golden, %error, "could not flatten a deep disk chain after branching");
+            }
+        }
         // Clones restore the golden's guest, so they need the packed-layer DAX
         // window it booted with. Without a record they use the legacy window.
         if let Some(window) =
@@ -3214,6 +3395,8 @@ fn prepare_clone_from_snapshot(
         }
         apply_clone_labels(&mut clone_rec.labels, spec.labels);
 
+        // Ports the source's run picked for itself stay with that run.
+        clone_rec.allocated_ports.clear();
         let mut port_remaps = Vec::new();
         if !spec.pinned_ports.is_empty() {
             clone_rec.ports = spec.pinned_ports.to_vec();
@@ -3328,7 +3511,28 @@ fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Resul
             .collect()
     };
     #[cfg(any(target_os = "linux", target_os = "macos"))]
-    let disks = read_generation_fork_disks(snapshot_dir)?.unwrap_or_else(fallback_disks);
+    let (disks, _gc_guards) = match read_generation_fork_disks(snapshot_dir)? {
+        Some(disks) => (disks, Vec::new()),
+        // A frozen source's active disks are the clone's base. Nothing may
+        // replace them while branches read them, so a base whose chain has
+        // grown deep is swapped for a short one before the clone stacks on it.
+        None => {
+            let mut guards = Vec::new();
+            let mut disks = fallback_disks();
+            for (raw, src, format) in &mut disks {
+                if *format != crate::data::disk::DiskFormat::Qcow2 {
+                    continue;
+                }
+                let Some((id, _)) = FORK_DISK_ROLES.iter().find(|(_, role)| role == raw) else {
+                    continue;
+                };
+                let (base, guard) = compact::shallow_clone_base(gdir, id, src)?;
+                *src = base;
+                guards.extend(guard);
+            }
+            (disks, guards)
+        }
+    };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
     let disks = fallback_disks();
 
@@ -4512,6 +4716,31 @@ fn check_pinned_ports_keep_network_backend(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_trim_reaches_each_writable_guest_disk_once() {
+        let mounts = "\
+/dev/vda /storage ext4 rw,noatime 0 0
+/dev/vdb /oldroot/mnt/overlay ext4 rw,noatime 0 0
+/dev/vda /storage/workspace ext4 rw,noatime 0 0
+/dev/vdc /mnt/layers ext4 ro,noatime 0 0
+none / overlay rw,relatime 0 0
+tmpfs /tmp tmpfs rw 0 0
+";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), mounts).unwrap();
+        let output = std::process::Command::new("awk")
+            .arg(super::WRITABLE_GUEST_DISKS)
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "/storage\n/oldroot/mnt/overlay\n"
+        );
+    }
+
     #[test]
     fn clone_labels_override_inherited_ones_and_keep_the_rest() {
         let mut labels = std::collections::BTreeMap::from([
@@ -4538,6 +4767,9 @@ mod tests {
     /// swept; one beside a machine that still exists is left to its export.
     #[test]
     fn a_left_export_directory_is_swept_once_its_machine_is_gone() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let vms = tempfile::tempdir().unwrap();
         std::fs::create_dir(vms.path().join("live")).unwrap();
         let live = vms.path().join(".live.export-abc123");
@@ -4705,10 +4937,87 @@ mod tests {
 
     #[test]
     fn branch_reserve_defaults_to_five_percent_within_bounds() {
-        assert_eq!(default_branch_reserve_mib(64 * 1024), 3276);
-        assert_eq!(default_branch_reserve_mib(256 * 1024), 4096);
-        assert_eq!(default_branch_reserve_mib(4 * 1024), 512);
-        assert_eq!(default_branch_reserve_mib(800), 400);
+        assert_eq!(default_branch_reserve_mib(64 * 1024, 0), 3276);
+        assert_eq!(default_branch_reserve_mib(256 * 1024, 0), 4096);
+        assert_eq!(default_branch_reserve_mib(4 * 1024, 0), 512);
+        assert_eq!(default_branch_reserve_mib(800, 0), 400);
+    }
+
+    #[test]
+    fn branch_reserve_keeps_the_host_reserve_on_big_hosts() {
+        let host = 755 * 1024;
+        let host_reserved = crate::systemd_scope::host_reserved_memory_mib(host, None);
+        assert_eq!(default_branch_reserve_mib(host, host_reserved), 46387);
+        // The host reserve never lowers the old default.
+        assert_eq!(default_branch_reserve_mib(64 * 1024, 1024), 3276);
+        assert_eq!(default_branch_reserve_mib(64 * 1024, 8192), 8192);
+    }
+
+    #[test]
+    fn each_child_is_charged_its_overhead_plus_a_share_of_its_guest() {
+        // A 32 GiB child at the default quarter: 64 + 8192 MiB.
+        assert_eq!(
+            branch_child_charge_mib(64, DEFAULT_BRANCH_CHILD_GROWTH_FRACTION, 32 * 1024),
+            8256
+        );
+        assert_eq!(branch_child_charge_mib(64, 0.0, 32 * 1024), 64);
+        assert_eq!(branch_child_charge_mib(64, 1.0, 1000), 1064);
+        // Rounded up so a tiny share is never free.
+        assert_eq!(branch_child_charge_mib(0, 0.25, 3), 1);
+        // A 755 GiB host at 200 GiB free fits 19 such children above its reserve.
+        let required = |n| branch_admission_required_mib(n, 8256, 46387, 0).unwrap();
+        assert!(required(19) <= 200 * 1024);
+        assert!(required(20) > 200 * 1024);
+    }
+
+    #[test]
+    fn child_growth_fraction_defaults_clamps_and_rejects_junk() {
+        assert_eq!(branch_child_growth_fraction(None, 0.25).unwrap(), 0.25);
+        assert_eq!(branch_child_growth_fraction(None, 0.0).unwrap(), 0.0);
+        // An explicit value wins over either default.
+        assert_eq!(branch_child_growth_fraction(Some("0.5"), 0.0).unwrap(), 0.5);
+        assert_eq!(
+            branch_child_growth_fraction(Some(" 0 "), 0.25).unwrap(),
+            0.0
+        );
+        assert_eq!(branch_child_growth_fraction(Some("3"), 0.25).unwrap(), 1.0);
+        assert_eq!(branch_child_growth_fraction(Some("-1"), 0.25).unwrap(), 0.0);
+        assert!(branch_child_growth_fraction(Some("NaN"), 0.25).is_err());
+        assert!(branch_child_growth_fraction(Some("lots"), 0.25).is_err());
+    }
+
+    #[test]
+    fn only_serve_on_a_large_host_gets_the_stricter_branch_defaults() {
+        let host_reserved = |total| crate::systemd_scope::host_reserved_memory_mib(total, None);
+        // 755 GiB worker under serve: host reserve + quarter-guest growth.
+        let worker = 755 * 1024;
+        assert_eq!(
+            branch_admission_defaults(worker, true, host_reserved(worker)),
+            (46387, 0.25)
+        );
+        // The same host from the CLI keeps the old defaults.
+        assert_eq!(
+            branch_admission_defaults(worker, false, host_reserved(worker)),
+            (4096, 0.0)
+        );
+        // A 64 GiB dev box keeps them even under serve.
+        let dev = 64 * 1024;
+        assert_eq!(
+            branch_admission_defaults(dev, true, host_reserved(dev)),
+            (3276, 0.0)
+        );
+        // 128 GiB is the threshold.
+        let edge = 128 * 1024;
+        assert_eq!(
+            branch_admission_defaults(edge, true, host_reserved(edge)),
+            (8192, 0.25)
+        );
+        assert_eq!(
+            branch_admission_defaults(edge - 1, true, host_reserved(edge - 1)),
+            (4096, 0.0)
+        );
+        // SMOLVM_HOST_RESERVED_MEMORY_MB=0 leaves the old reserve on a worker.
+        assert_eq!(branch_admission_defaults(worker, true, 0), (4096, 0.25));
     }
 
     #[test]
@@ -4791,18 +5100,23 @@ mod tests {
         );
     }
 
-    /// A process running this very binary is this engine's; one running any other
-    /// binary, as a VM left over from before an upgrade does, is not.
+    /// A running record carrying a build id, as every engine now writes.
+    fn running_on_build(pid: u32, build: Option<&str>) -> VmRecord {
+        let mut record = VmRecord::new("golden".into(), 1, 128, vec![], vec![], false);
+        record.pid = Some(pid as i32);
+        record.engine_build = build.map(str::to_string);
+        record
+    }
+
+    /// Spawn a process that runs another binary than this test, waiting past
+    /// the window between spawn() and its exec in which it is still a copy of
+    /// this binary.
     #[cfg(target_os = "linux")]
-    #[test]
-    fn a_source_on_another_engine_binary_is_told_apart() {
-        assert!(!source_runs_another_engine(std::process::id() as i32));
-        let mut other = std::process::Command::new("sleep")
+    fn spawn_another_binary() -> std::process::Child {
+        let other = std::process::Command::new("sleep")
             .arg("30")
             .spawn()
             .unwrap();
-        // spawn() returns once the child exists, which can be before its exec: until then
-        // it is still a copy of this binary, and the check below read "same engine"
         let own = std::fs::read_link("/proc/self/exe").unwrap();
         for _ in 0..200 {
             match std::fs::read_link(format!("/proc/{}/exe", other.id())) {
@@ -4810,7 +5124,59 @@ mod tests {
                 _ => std::thread::sleep(std::time::Duration::from_millis(5)),
             }
         }
-        let differs = source_runs_another_engine(other.id() as i32);
+        other
+    }
+
+    /// The build that started the source decides, not the file its process
+    /// runs: the same release installed twice (a CLI's embedded engine and an
+    /// SDK's cached copy) is one build, and a source on it is branched from
+    /// the other file; a source started by another build is refused.
+    #[test]
+    fn a_source_is_refused_by_its_recorded_engine_build() {
+        assert!(!source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            Some(crate::ENGINE_BUILD)
+        )));
+        assert!(source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            Some("0.0.0+0000000000000")
+        )));
+        #[cfg(target_os = "linux")]
+        {
+            let mut other = spawn_another_binary();
+            let same_build_other_file = source_runs_another_engine(&running_on_build(
+                other.id(),
+                Some(crate::ENGINE_BUILD),
+            ));
+            let other_build = source_runs_another_engine(&running_on_build(
+                other.id(),
+                Some("0.0.0+0000000000000"),
+            ));
+            let _ = other.kill();
+            let _ = other.wait();
+            assert!(!same_build_other_file);
+            assert!(other_build);
+        }
+        let mut stopped = running_on_build(std::process::id(), Some("0.0.0+0000000000000"));
+        stopped.pid = None;
+        assert!(
+            !source_runs_another_engine(&stopped),
+            "a record without a process is not refused here"
+        );
+    }
+
+    /// A record from an engine that did not record its build falls back to the
+    /// binary: a process running this very binary is this engine's; one running
+    /// any other binary, as a VM left over from before an upgrade does, is not.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_source_on_another_engine_binary_is_told_apart() {
+        assert!(!source_runs_another_engine(&running_on_build(
+            std::process::id(),
+            None
+        )));
+        let mut other = spawn_another_binary();
+        let differs = source_runs_another_engine(&running_on_build(other.id(), None));
         let sleep_bin = std::fs::read_link(format!("/proc/{}/exe", other.id())).unwrap();
         // An embedding SDK boots VMs with its helper, not the host process: a
         // VM running that helper is this engine's, whatever the host runs.
@@ -4823,7 +5189,7 @@ mod tests {
         assert!(helper_is_this_engine);
         assert!(host_is_not_the_helper);
         assert!(
-            !source_runs_another_engine(i32::MAX),
+            !source_runs_another_engine(&running_on_build(i32::MAX as u32, None)),
             "an unreadable process is not refused"
         );
     }
@@ -4831,21 +5197,29 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn live_fork_refuses_an_unbounded_disk_chain() {
-        let temp = tempfile::tempdir().unwrap();
-        let raw = temp.path().join("base.raw");
-        std::fs::write(&raw, vec![0_u8; 20]).unwrap();
-        let mut backing = "base.raw".to_string();
-        for index in 0..MAX_FORK_DISK_CHAIN_DEPTH {
-            let name = if index + 1 == MAX_FORK_DISK_CHAIN_DEPTH {
-                crate::data::storage::STORAGE_DISK_FILENAME.replace(".raw", ".qcow2")
-            } else {
-                format!("layer-{index}.qcow2")
-            };
-            write_test_qcow2(&temp.path().join(&name), Some(&backing));
-            backing = name;
-        }
-        let error = ensure_fork_disk_chain_is_bounded(temp.path()).unwrap_err();
-        assert!(error.to_string().contains("safe limit is 32"));
+        let chain_of = |depth: usize| {
+            let temp = tempfile::tempdir().unwrap();
+            let raw = temp.path().join("base.raw");
+            std::fs::write(&raw, vec![0_u8; 20]).unwrap();
+            let mut backing = "base.raw".to_string();
+            for index in 0..depth {
+                let name = if index + 1 == depth {
+                    crate::data::storage::STORAGE_DISK_FILENAME.replace(".raw", ".qcow2")
+                } else {
+                    format!("layer-{index}.qcow2")
+                };
+                write_test_qcow2(&temp.path().join(&name), Some(&backing));
+                backing = name;
+            }
+            temp
+        };
+        // Past the depth compaction keeps chains under, a branch still goes
+        // ahead: the generation it makes is flattened once it commits.
+        let deep = chain_of(MAX_FORK_DISK_CHAIN_DEPTH);
+        ensure_fork_disk_chain_is_bounded(deep.path()).unwrap();
+        let runaway = chain_of(HARD_FORK_DISK_CHAIN_DEPTH);
+        let error = ensure_fork_disk_chain_is_bounded(runaway.path()).unwrap_err();
+        assert!(error.to_string().contains("the limit is 64"), "{error}");
         assert!(matches!(
             error,
             Error::Agent {
@@ -4943,9 +5317,20 @@ mod tests {
     /// `.<name>.fork-operation.lock` shape makes ambiguous to a naive split.
     #[test]
     fn a_lock_files_owner_round_trips_through_its_path() {
-        for source in ["golden", "worker.one", "a.b.c", "trailing.lock"] {
+        for source in [
+            "golden",
+            "worker.one",
+            "a.b.c",
+            "trailing.lock",
+            "odd.fork-operation",
+            "odd.fork-operation.pause-operation",
+        ] {
             assert_eq!(
                 fork_source_lock_owner(&fork_source_lock_path(source)).as_deref(),
+                Some(source)
+            );
+            assert_eq!(
+                fork_source_lock_owner(&saved_execution_lock_path(source)).as_deref(),
                 Some(source)
             );
         }
@@ -4961,6 +5346,9 @@ mod tests {
     /// machine never takes it.
     #[test]
     fn an_orphaned_lock_is_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".gone.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -4973,11 +5361,63 @@ mod tests {
         );
     }
 
+    /// Pausing a machine takes a second sibling lock, which its deletion must
+    /// not leave behind either.
+    #[test]
+    fn an_orphaned_pause_operation_lock_is_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join(".gone.fork-operation.pause-operation.lock");
+        let alive = dir
+            .path()
+            .join(".alive.fork-operation.pause-operation.lock");
+        std::fs::write(&gone, b"").unwrap();
+        std::fs::write(&alive, b"").unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::agent::vm_dir_hash("alive"))).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(
+            !gone.exists(),
+            "a pause lock whose machine is gone must be removed"
+        );
+        assert!(
+            alive.exists(),
+            "a live machine's pause lock must not be swept"
+        );
+    }
+
+    /// An in-flight pause or resume holds its lock after the machine is gone
+    /// as well, and the sweep must leave it to them.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_pause_operation_lock_is_never_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".busy.fork-operation.pause-operation.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let held = ForkSourceLock::acquire_at(&lock).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(lock.exists(), "an in-flight pause's lock must not be swept");
+        drop(held);
+        prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(!lock.exists(), "once released it is sweepable");
+    }
+
     /// A machine that still exists is still forkable, so its lock must survive.
     /// The data directory is hash-named, so the sweep has to hash the recovered
     /// name rather than look for a directory called after it.
     #[test]
     fn a_live_machines_lock_survives_the_sweep() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".alive.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -5001,6 +5441,9 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn a_held_lock_is_never_swept_even_without_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let lock = dir.path().join(".busy.fork-operation.lock");
         std::fs::write(&lock, b"").unwrap();
@@ -5018,6 +5461,9 @@ mod tests {
     /// runs in the VM cache root, which holds every machine's data directory.
     #[test]
     fn the_sweep_touches_nothing_but_lock_files() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let bystanders = [".hidden", "machine-dir-ish", "name.lock", "_shared"];
         for f in bystanders {
@@ -5033,6 +5479,9 @@ mod tests {
 
     #[test]
     fn a_paused_disks_record_is_swept_with_its_machine() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let live = dir.path().join("0123abcd");
         std::fs::create_dir(&live).unwrap();

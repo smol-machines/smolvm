@@ -47,12 +47,11 @@ use crate::api::types::{
     ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
     ResourceSpec, SetCpuLimitRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
 };
-use crate::config::{RecordState, RestartConfig, VmRecord};
+use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
-    is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
-    VM_SIGTERM_TIMEOUT,
+    is_alive, is_our_process_strict, process_start_time, VM_SIGKILL_TIMEOUT, VM_SIGTERM_TIMEOUT,
 };
 use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
@@ -127,8 +126,8 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
             .cache_disk
             .as_ref()
             .map(crate::api::state::cache_disk_spec),
-        branchable: record.forkable_on_start(),
-        forkable: record.forkable_on_start(),
+        branchable: crate::agent::branchable_now(record, &actual_state),
+        forkable: crate::agent::branchable_now(record, &actual_state),
         parent_machine: record.golden.clone(),
         cuda_branch_pool_size: record.cuda_fork_pool_size,
         cuda_fork_pool_size: record.cuda_fork_pool_size,
@@ -145,6 +144,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // Set on the running VMM only, so a stopped machine has none.
         cpu_limit_millicpus: crate::agent::cpu_limit::read_active_cpu_limit(name, pid),
         egress_flows: crate::agent::read_egress_flows(name, actual_state == RecordState::Running),
+        pressure: crate::agent::read_guest_pressure(name, actual_state == RecordState::Running),
         // Per-launch identity: stale once the process is gone, so only
         // reported while it runs.
         mediation_machine_id: pid
@@ -1574,33 +1574,89 @@ async fn upload_checkpoint_file(
                 let file = file.clone();
                 let progress = progress.clone();
                 async move {
-                    let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
-                        file, start, length, progress,
-                    ));
-                    let response = client
-                        .put(url)
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONTENT_LENGTH, length)
-                        .body(body)
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            ApiError::internal(format!(
-                                "upload checkpoint part {index} to object store: {}",
-                                error.without_url()
-                            ))
-                        })?;
-                    if !response.status().is_success() {
-                        return Err(ApiError::internal(format!(
-                            "object store refused checkpoint part {index}: {}",
-                            response.status()
-                        )));
-                    }
-                    Ok(())
+                    put_checkpoint_part(
+                        &client,
+                        url,
+                        file,
+                        (index, start, length),
+                        progress,
+                        PART_RETRY_BACKOFF,
+                    )
+                    .await
                 }
             });
     futures_util::future::try_join_all(uploads).await?;
     Ok(size)
+}
+
+/// Tries per checkpoint part. Each part is a whole PUT to its own pre-signed
+/// URL, so sending it again replaces the object and is safe to repeat. Object
+/// stores answer a small share of PUTs with 503 or 429 and expect the client
+/// to retry. Without retries, one refused part threw away minutes of upload
+/// work and failed the whole publish.
+const PART_UPLOAD_ATTEMPTS: u32 = 5;
+
+/// First wait before retrying a part; it doubles on each later try.
+const PART_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Whether the object store's answer to a part is worth sending again.
+fn retryable_part_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// PUT one part of a checkpoint artifact, retrying transient failures.
+async fn put_checkpoint_part(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    file: Arc<std::fs::File>,
+    (index, start, length): (usize, u64, u64),
+    progress: crate::api::progress::Progress,
+    backoff: Duration,
+) -> Result<(), ApiError> {
+    let mut wait = backoff;
+    for attempt in 1..=PART_UPLOAD_ATTEMPTS {
+        let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
+            file.clone(),
+            start,
+            length,
+            progress.clone(),
+        ));
+        let failure = match client
+            .put(url.clone())
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, length)
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) if retryable_part_status(response.status()) => format!(
+                "object store refused checkpoint part {index}: {}",
+                response.status()
+            ),
+            Ok(response) => {
+                return Err(ApiError::internal(format!(
+                    "object store refused checkpoint part {index}: {}",
+                    response.status()
+                )))
+            }
+            Err(error) => format!(
+                "upload checkpoint part {index} to object store: {}",
+                error.without_url()
+            ),
+        };
+        if attempt == PART_UPLOAD_ATTEMPTS {
+            return Err(ApiError::internal(format!(
+                "{failure} (after {attempt} attempts)"
+            )));
+        }
+        tracing::warn!(part = index, attempt, error = %failure, "retrying checkpoint part upload");
+        tokio::time::sleep(wait).await;
+        wait *= 2;
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// Create a machine by streaming a `.checkpoint` into this node.
@@ -1629,25 +1685,6 @@ pub struct RestoreCheckpointQuery {
     /// checkpoint of a machine with one: the base it was captured over, which
     /// this node fetches from `sourceUrl` when it does not have it yet.
     pub cache_disk: Option<String>,
-}
-
-fn checkpoint_host_ports(
-    captured: &[PortSpec],
-    requested: &[PortSpec],
-) -> Result<Vec<PortSpec>, ApiError> {
-    if requested.is_empty() {
-        return Ok(captured.to_vec());
-    }
-    let mut old_guests: Vec<_> = captured.iter().map(|port| port.guest).collect();
-    let mut new_guests: Vec<_> = requested.iter().map(|port| port.guest).collect();
-    old_guests.sort_unstable();
-    new_guests.sort_unstable();
-    if old_guests != new_guests {
-        return Err(ApiError::BadRequest(
-            "checkpoint port overrides must preserve the captured guest ports".into(),
-        ));
-    }
-    Ok(requested.to_vec())
 }
 
 /// Object-store hosts a checkpoint may be fetched from.
@@ -1686,7 +1723,126 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
 
 #[cfg(test)]
 mod checkpoint_upload_tests {
-    use super::{checked_upload_urls, checkpoint_part_stream, upload_part_ranges};
+    use super::{
+        checked_upload_urls, checkpoint_part_stream, put_checkpoint_part, upload_part_ranges,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serve PUTs on loopback, answering the first `refusals` with `status` and
+    /// later ones with 200 after checking the body. Returns the URL and a
+    /// count of requests seen.
+    async fn flaky_store(
+        refusals: usize,
+        status: u16,
+        expect: Vec<u8>,
+    ) -> (reqwest::Url, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let expect = expect.clone();
+                let mut raw = Vec::new();
+                let mut buf = [0_u8; 65536];
+                let head_end = loop {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..read]);
+                    if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                while raw.len() - head_end < expect.len() {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                }
+                assert_eq!(
+                    &raw[head_end..],
+                    &expect[..],
+                    "attempt {n} sent the whole part"
+                );
+                let code = if n < refusals { status } else { 200 };
+                let reply =
+                    format!("HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}/part").parse().unwrap(), seen)
+    }
+
+    fn part_file(content: &[u8]) -> (tempfile::TempDir, Arc<std::fs::File>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        std::fs::write(&path, content).unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        (dir, file)
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_refuses_once_is_sent_again() {
+        let content: Vec<u8> = (0..300_000_u32).map(|i| (i % 253) as u8).collect();
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(2, 503, content[1000..201_000].to_vec()).await;
+        put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (14, 1000, 200_000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_rejects_outright_is_not_retried() {
+        let content = vec![7_u8; 1000];
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(usize::MAX, 403, content.clone()).await;
+        let error = put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (0, 0, 1000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("403"), "{error:?}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_keeps_refusing_fails_after_the_last_attempt() {
+        let content = vec![9_u8; 1000];
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(usize::MAX, 503, content.clone()).await;
+        let error = put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (3, 0, 1000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("after 5 attempts"),
+            "{error:?}"
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 5);
+    }
 
     /// Parts read at once from one descriptor reassemble the file exactly, even
     /// after its name is gone, as when a resume consumes a paused checkpoint.
@@ -2402,7 +2558,7 @@ pub async fn restore_portable_checkpoint(
 /// Used by `start_machine` to register a machine in ApiState after boot
 /// or during registry repair. Centralizes the record→entry conversion
 /// so the two branches don't drift.
-fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
+pub(crate) fn machine_entry_from_record(record: &VmRecord, manager: AgentManager) -> MachineEntry {
     let mounts = record.host_mounts().iter().map(MountSpec::from).collect();
     let ports = record.port_mappings().iter().map(PortSpec::from).collect();
     MachineEntry {
@@ -2451,9 +2607,10 @@ async fn reconcile_confirmed_stopped_machine(
 
     state
         .update_vm(name, move |record| {
-            record.state = RecordState::Stopped;
-            record.pid = None;
-            record.pid_start_time = None;
+            // Keeps the PID of a process the kernel is holding after SIGKILL,
+            // as the CLI and the embedded runtime do, so a later start is
+            // refused while that process has the machine's disks open.
+            record.mark_process_stopped();
             if explicitly_stopped {
                 // An explicit stop must suppress the restart supervisor even when
                 // the process had already exited before this request arrived.
@@ -2466,6 +2623,33 @@ async fn reconcile_confirmed_stopped_machine(
                 "machine '{name}' disappeared from database while reconciling its stopped state"
             ))
         })
+}
+
+/// The machine's recorded process, when it is this machine's and the kernel is
+/// holding it after SIGKILL.
+fn held_machine_process(
+    pid: Option<i32>,
+    pid_start_time: Option<u64>,
+) -> Option<crate::process::HeldProcess> {
+    let pid = pid?;
+    if !crate::process::is_our_process(pid, pid_start_time) {
+        return None;
+    }
+    crate::process::held_after_kill(pid)
+}
+
+/// Refuse an API start while the kernel still holds the machine's previous
+/// process, with the text the CLI and the embedded runtime use, and forget
+/// that process once it is gone.
+async fn refuse_start_while_held(state: &Arc<ApiState>, name: &str) -> Result<(), ApiError> {
+    let db = state.db().clone();
+    let machine = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::refuse_start_while_held(&db, &machine)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(|error| ApiError::Conflict(error.to_string()))
 }
 
 /// How long to wait for a SIGKILLed VM process to exit before a delete gives up.
@@ -2508,6 +2692,12 @@ fn shutdown_machine_process(
             sweep_machine_scope(name);
             return true;
         }
+        // A process already killed and held by the kernel has no guest left
+        // to acknowledge anything, and no later request can stop it either.
+        if let Some(held) = held_machine_process(pid, pid_start_time) {
+            tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+            return true;
+        }
         tracing::warn!(
             name,
             "guest shutdown was not acknowledged; preserving the live VM and its disks"
@@ -2533,7 +2723,15 @@ fn shutdown_machine_process(
                 Duration::ZERO
             };
             crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(name), pid);
-            let _ = stop_vm_process(pid, sigterm, VM_SIGKILL_TIMEOUT);
+            if let Ok(crate::process::VmStop::Held(held)) =
+                crate::process::stop_vm_process_bounded(pid, sigterm, VM_SIGKILL_TIMEOUT)
+            {
+                // The kernel will not let the process exit and it runs no
+                // more code. Report the machine stopped instead of failing
+                // every later stop and delete until the host reboots.
+                tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+                return true;
+            }
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }
@@ -2543,6 +2741,10 @@ fn shutdown_machine_process(
         // killing the systemd transient scope — its cgroup owns every process the
         // VM spawned — then wait briefly for the SIGKILL to land. Only give up if
         // STILL alive.
+        if let Some(held) = held_machine_process(Some(pid), pid_start_time) {
+            tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+            return true;
+        }
         if is_alive(pid) {
             let _ = crate::systemd_scope::kill_scope(name);
             let deadline = std::time::Instant::now() + KILLED_VM_EXIT_TIMEOUT;
@@ -2812,113 +3014,24 @@ async fn create_machine_to_end(
     let name = req.name.clone().unwrap_or_else(generate_machine_name);
     validate_vm_name(&name, "machine name").map_err(ApiError::BadRequest)?;
 
-    // Split remote volumes (`s3://` sources) from host mounts,
-    // mirroring the CLI's -v handling, then validate the host mount paths.
-    let mut remote_volumes = Vec::new();
-    let mut host_mount_specs: Vec<crate::api::types::MountSpec> = Vec::new();
-    for m in &req.mounts {
-        if crate::remote_volume::is_remote_source(&m.source) {
-            remote_volumes.push(
-                crate::remote_volume::from_parts(&m.source, &m.target, m.readonly)
-                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
-            );
-        } else {
-            host_mount_specs.push(m.clone());
+    // Fetch a cache disk base this node lacks before any other work, so a bad
+    // base is a 400 and not a half-made machine.
+    let cache_disk = match req.cache_disk.as_ref() {
+        Some(spec) => {
+            fetch_cache_base(&state, spec).await?;
+            Some(state.resolve_cache_disk(spec)?)
         }
-    }
-    let host_mounts: Vec<HostMount> = host_mount_specs
-        .iter()
-        .map(|m| HostMount::try_from(m).map_err(|e| ApiError::BadRequest(e.to_string())))
-        .collect::<Result<_, _>>()?;
-    // Reject duplicate guest targets, matching the CLI (HostMount::parse) so an
-    // ambiguous same-target mount is a clean 400 rather than a silent shadow.
-    HostMount::ensure_unique_targets(&host_mounts)
-        .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    {
-        let mut seen = std::collections::HashSet::new();
-        for target in remote_volumes
-            .iter()
-            .map(|v| v.target.as_str())
-            .chain(host_mount_specs.iter().map(|m| m.target.as_str()))
-        {
-            if !seen.insert(target) {
-                return Err(ApiError::BadRequest(format!(
-                    "duplicate mount target: {target} is specified more than once"
-                )));
-            }
-        }
-    }
-    // Disk volumes take the same lone guest paths as the CLI's `-v PATH`, and
-    // must not share a target with a mount.
-    let (not_guest_paths, disk_volumes) =
-        crate::data::storage::split_disk_volume_specs(&req.disk_volumes)
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    if let Some(spec) = not_guest_paths.first() {
-        return Err(ApiError::BadRequest(format!(
-            "diskVolumes: {spec} is not an absolute guest path"
-        )));
-    }
-    crate::data::storage::ensure_disk_volumes_distinct(
-        &disk_volumes,
-        remote_volumes
-            .iter()
-            .map(|v| v.target.as_str())
-            .chain(host_mount_specs.iter().map(|m| m.target.as_str())),
-    )
-    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-
-    // Validate published ports, matching the CLI (which rejects these before
-    // launch): port 0 is invalid for forwarding, and each host port may be
-    // mapped only once — two guest ports on one host port can't both bind, so
-    // reject it as a clean 400 rather than an ambiguous mid-boot bind failure.
-    for p in &req.ports {
-        if p.host == 0 || p.guest == 0 {
-            return Err(ApiError::BadRequest(
-                "port 0 is not valid for VM port forwarding".to_string(),
-            ));
-        }
-    }
-    let port_mappings: Vec<PortMapping> = req.ports.iter().map(PortMapping::from).collect();
-    PortMapping::check_duplicates(&port_mappings).map_err(ApiError::BadRequest)?;
-
-    // Validate and normalize egress CIDRs, matching the CLI's --allow-cidr
-    // parser. Without this a malformed entry is silently dropped at launch
-    // (EgressPolicy::new filter_maps unparseable CIDRs, logging only a warn to
-    // the discarded boot log), leaving egress MORE restrictive than requested
-    // with no error. Normalizing (bare IP -> /32) keeps the stored policy
-    // identical to what the CLI persists.
-    let mut normalized_cidrs = match &req.allowed_cidrs {
-        Some(cidrs) => Some(
-            cidrs
-                .iter()
-                .map(|c| crate::smolfile::parse_cidr(c))
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(ApiError::BadRequest)?,
-        ),
         None => None,
     };
-    smolvm_network::EgressPolicy::unrestricted()
-        .with_rules(&req.egress_rules)
-        .map_err(ApiError::BadRequest)?;
+    let spec = create_spec_from_request(&req, cache_disk)?;
 
     // SHA-256 taken while a restored checkpoint was received, handed to the
     // shared extraction so it does not hash the artifact again.
     let mut received_digest: Option<smolvm_pack::extract::ArtifactDigestProof> = None;
-    // If --from is set, read manifest and extract sidecar
-    let (
-        image,
-        source_smolmachine,
-        entrypoint,
-        cmd,
-        env,
-        workdir,
-        manifest_cpus,
-        manifest_mem,
-        manifest_net,
-        manifest_secret_refs,
-        vm_seed,
-        manifest_checkpoint,
-    ) = if let Some(ref sidecar_path) = req.from {
+    let mut source_smolmachine: Option<String> = None;
+    let mut vm_seed: Option<VmModeSeed> = None;
+    // If `from` is set, verify the artifact and read its manifest.
+    let manifest = if let Some(ref sidecar_path) = req.from {
         let path = std::path::Path::new(sidecar_path);
         if !path.exists() {
             return Err(ApiError::BadRequest(format!(
@@ -2952,11 +3065,6 @@ async fn create_machine_to_end(
         }).await.map_err(|e| ApiError::internal(format!("checkpoint verification task: {e}")))??;
         let manifest = smolvm_pack::packer::read_manifest_from_sidecar(path)
             .map_err(|e| ApiError::internal(format!("read .smolmachine: {}", e)))?;
-        let checkpoint = manifest.checkpoint.clone();
-        if let Some(ref checkpoint) = checkpoint {
-            crate::portable_checkpoint::validate_compatibility(checkpoint)
-                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-        }
         // Reject a cross-architecture artifact up front (400, not a mid-boot 500):
         // a packed VM/image carries native binaries that cannot run under a
         // different-arch guest kernel. Guest arch must match; host OS need not.
@@ -2964,38 +3072,16 @@ async fn create_machine_to_end(
             .map_err(|e| ApiError::BadRequest(e.to_string()))?;
         // Extraction happens after the agent manager creates this machine's data
         // dir (below), so the layers land in the machine's own dir, not here.
-        let canonical = path
-            .canonicalize()
-            .unwrap_or_else(|_| path.to_path_buf())
-            .to_string_lossy()
-            .into_owned();
-        let env_parsed: Vec<(String, String)> = manifest
-            .env
-            .iter()
-            .filter_map(|e| {
-                e.split_once('=')
-                    .map(|(k, v)| (k.to_string(), v.to_string()))
-            })
-            .collect();
-        // A .smolmachine is an untrusted, portable artifact: validate its secret
-        // refs Untrusted, which rejects every source kind, so a packed
-        // from_env/from_file can't read this host's env/files at exec time.
-        // Reject rather than carry/exfil.
-        for (key, r) in &manifest.secret_refs {
-            crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted).map_err(
-                |e| {
-                    ApiError::BadRequest(format!(
-                        "packed secret '{}': {} (packs may not carry secret refs)",
-                        key, e
-                    ))
-                },
-            )?;
-        }
+        source_smolmachine = Some(
+            path.canonicalize()
+                .unwrap_or_else(|_| path.to_path_buf())
+                .to_string_lossy()
+                .into_owned(),
+        );
         // VM-mode packs carry disks, not layers — capture the templates so the
         // machine's overlay/storage disks can be seeded from them below.
-        let vm_seed = if checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm
-        {
-            Some(VmModeSeed {
+        if manifest.checkpoint.is_none() && manifest.mode == smolvm_pack::format::PackMode::Vm {
+            vm_seed = Some(VmModeSeed {
                 overlay_template: manifest
                     .assets
                     .overlay_template
@@ -3010,225 +3096,50 @@ async fn create_machine_to_end(
                 storage_logical_size: manifest.assets.storage_logical_size,
                 storage_gb: req.storage_gb,
                 overlay_gb: req.overlay_gb,
-            })
-        } else {
-            None
-        };
-        // A VM-mode pack is NOT a container/image machine: its `image` is the
-        // synthetic `vm://<name>` label, not a pullable ref. `record.image.is_some()`
-        // is the universal "container machine" signal (exec routing, workload
-        // launch, pull-on-start, re-pack), so storing the vm:// label would make
-        // exec run `crun` over a nonexistent image instead of `vm_exec` in the VM
-        // (the /bin/sh-not-found bug). Store None so every consumer treats it as a
-        // VM; provenance lives in `source_smolmachine`.
-        let image = if let Some(workload) = checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-        {
-            Some(workload.image.clone())
-        } else if vm_seed.is_some() || checkpoint.is_some() {
-            None
-        } else {
-            Some(manifest.image)
-        };
-        // CLI-parity precedence: a request-supplied workload overrides the
-        // artifact's baked (entrypoint, cmd).
-        let (ep, cmd) = if req.entrypoint.is_empty() && req.cmd.is_empty() {
-            (manifest.entrypoint, manifest.cmd)
-        } else {
-            (req.entrypoint.clone(), req.cmd.clone())
-        };
-        (
-            image,
-            Some(canonical),
-            ep,
-            cmd,
-            env_parsed,
-            manifest.workdir,
-            manifest.cpus,
-            manifest.mem,
-            manifest.network,
-            manifest.secret_refs,
-            vm_seed,
-            checkpoint,
-        )
-    } else {
-        (
-            req.image.clone(),
-            None,
-            req.entrypoint.clone(),
-            req.cmd.clone(),
-            vec![],
-            None,
-            crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-            crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
-            req.network,
-            Default::default(),
-            None,
-            None,
-        )
-    };
-
-    let checkpoint_network = manifest_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.network.as_ref());
-    let restored_storage_gb = manifest_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.storage_gib)
-        .or(req.storage_gb);
-    let restored_overlay_gb = manifest_checkpoint
-        .as_ref()
-        .and_then(|checkpoint| checkpoint.overlay_gib)
-        .or(req.overlay_gb);
-    // Resolve before any work, so a bad base is a 400 and not a half-made machine.
-    let resolved_cache = match req.cache_disk.as_ref() {
-        Some(spec) => {
-            fetch_cache_base(&state, spec).await?;
-            Some(state.resolve_cache_disk(spec)?)
+            });
         }
-        None => None,
+        Some(manifest)
+    } else {
+        None
     };
+    let manifest_checkpoint = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.checkpoint.clone());
+
+    // Every option against what the source supplies or fixes, by the rules
+    // every creation path uses. Refusals happen here, before any disk work.
+    let source = match manifest.as_ref() {
+        Some(manifest) => crate::machine_spec::SpecSource::from_manifest(manifest),
+        None => crate::machine_spec::SpecSource::from_image(req.image.as_deref()),
+    };
+    let resolved = crate::machine_spec::resolve(source, spec, crate::machine_spec::Caller::Api)
+        .map_err(|error| ApiError::BadRequest(error.to_string()))?;
+    // A checkpoint can bring nested virtualization with it.
+    state.ensure_nested_virt_allowed(resolved.nested_virt)?;
     // A restored guest resumes with the devices it was captured with: a
     // checkpoint of a machine with a cache disk restores over the same base,
     // and one without takes none.
     let restore_cache_base = match manifest_checkpoint.clone() {
-        Some(checkpoint) => tokio::task::spawn_blocking(move || {
-            crate::portable_checkpoint::resolve_cache_base(&checkpoint, resolved_cache.as_ref())
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))?
-        .map_err(|error| ApiError::BadRequest(error.to_string()))?,
+        Some(checkpoint) => {
+            let cache_disk = resolved.cache_disk.clone();
+            tokio::task::spawn_blocking(move || {
+                crate::portable_checkpoint::resolve_cache_base(&checkpoint, cache_disk.as_ref())
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+            .map_err(|error| ApiError::BadRequest(error.to_string()))?
+        }
         None => None,
     };
-    let captured_ports: Vec<PortSpec> = checkpoint_network
-        .map(|network| {
-            network
-                .ports
-                .iter()
-                .map(|port| PortSpec {
-                    host: port.host,
-                    guest: port.guest,
-                    protocol: Default::default(),
-                })
-                .collect()
-        })
-        .unwrap_or_else(|| req.ports.clone());
-    let restored_ports = if manifest_checkpoint.is_some() {
-        checkpoint_host_ports(&captured_ports, &req.ports)?
-    } else {
-        captured_ports
-    };
-    let restored_network_backend = match manifest_checkpoint.as_ref() {
-        Some(checkpoint) => crate::portable_checkpoint::restored_network_backend(checkpoint)
-            .map_err(|error| ApiError::BadRequest(error.to_string()))?,
-        None => req.network_backend,
-    };
-    let restored_allowed_hosts = checkpoint_network
-        .and_then(|network| network.dns_filter_hosts.clone())
-        .or_else(|| req.allowed_hosts.clone());
-    if let Some(network) = checkpoint_network {
-        normalized_cidrs = network.allowed_cidrs.clone();
-    }
-
-    // Use explicit API resources when provided. Otherwise, preserve packed
-    // artifact manifest defaults, or the high VM defaults for non-artifact
-    // machines. Memory is ballooned, so a generous default does not imply
-    // immediate host commitment.
-    let (cpus, mem) = resolve_create_resources(&req, manifest_cpus, manifest_mem);
-    if let Some(ref checkpoint) = manifest_checkpoint {
-        if cpus != checkpoint.cpus || mem != checkpoint.memory_mib {
-            return Err(ApiError::BadRequest(format!(
-                "checkpoint requires {} vCPU(s) and {} MiB memory (requested {cpus} and {mem})",
-                checkpoint.cpus, checkpoint.memory_mib
-            )));
-        }
-        if !host_mount_specs.is_empty()
-            || !remote_volumes.is_empty()
-            || !disk_volumes.is_empty()
-            || req.network
-            || req.gpu
-            || req.cuda
-            || req.auto_graph
-            || req.nested_virt
-            || req.storage_gb.is_some()
-            || req.overlay_gb.is_some()
-            || req.network_backend.is_some()
-            || req.guest_subnet.is_some()
-            || req.docker_socket
-        {
-            return Err(ApiError::BadRequest(
-                "a live checkpoint must restore its captured CPU, memory, disk, and device topology; topology-changing create fields are not supported"
-                    .to_string(),
-            ));
-        }
-    }
-    crate::workload::validate_stop_settings(req.stop_signal.as_deref(), req.stop_timeout_secs)
-        .map_err(ApiError::BadRequest)?;
-    // Reject invalid resources up front (as the CLI does at create time), so the
-    // API returns a clear 400 here instead of persisting an unbootable machine
-    // that only fails with a deferred 500 when it is later started.
-    crate::data::resources::VmResources {
-        cpus,
-        memory_mib: mem,
-        storage_gib: restored_storage_gb,
-        overlay_gib: restored_overlay_gb,
-        ..Default::default()
-    }
-    .validate()
-    .map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    let network = checkpoint_network
-        .map(|network| network.enabled)
-        .unwrap_or(req.network || manifest_net);
+    let image = resolved.image.clone();
+    let restored_storage_gb = resolved.storage_gb;
+    let restored_overlay_gb = resolved.overlay_gb;
 
     if manifest_checkpoint.is_some() {
         crate::portable_checkpoint::log_phase(&name, "api_restore_verify", &mut checkpoint_phase);
     }
     // Reserve the name atomically (prevents concurrent creation)
     let guard = ReservationGuard::new(&state, name.clone())?;
-
-    let mut resources = ResourceSpec {
-        cpus: Some(cpus),
-        memory_mb: Some(mem),
-        network: Some(network),
-        gpu: Some(req.gpu),
-        cuda: Some(req.cuda || req.auto_graph),
-        nested_virt: req.nested_virt.then_some(true),
-        storage_gb: restored_storage_gb,
-        overlay_gb: restored_overlay_gb,
-        block_io: req.block_io,
-        disk_durability: req.disk_durability,
-        cache_disk: req.cache_disk.clone(),
-        allowed_cidrs: normalized_cidrs,
-        egress_rules: checkpoint_network.map_or_else(
-            || req.egress_rules.clone(),
-            |network| network.egress_rules.clone(),
-        ),
-        allowed_hosts: restored_allowed_hosts,
-        // A restored checkpoint keeps the bindings its workload was captured
-        // with unless the request names its own.
-        credentials: req
-            .credentials
-            .clone()
-            .or_else(|| checkpoint_network.and_then(|network| network.credential_policy.clone())),
-        network_backend: restored_network_backend,
-        // A restored guest already has its captured address in memory, so the
-        // checkpoint's subnet wins over anything requested.
-        guest_subnet: match manifest_checkpoint.as_ref() {
-            Some(checkpoint) => crate::portable_checkpoint::restored_guest_subnet(checkpoint)
-                .map_err(|error| ApiError::BadRequest(error.to_string()))?,
-            None => guest_subnet,
-        },
-        disk_volumes,
-    };
-    smolvm_network::EgressPolicy::unrestricted()
-        .with_rules(&resources.egress_rules)
-        .map_err(ApiError::BadRequest)?;
-    crate::network::validate_requested_network_backend(
-        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
-        resources.allowed_hosts.as_deref(),
-        restored_ports.len(),
-    )
-    .map_err(|error| ApiError::BadRequest(error.to_string()))?;
 
     // A machine without networking has its registry image fetched on the host
     // at start, which repoints it at the fetched archive and seeds from that.
@@ -3239,10 +3150,10 @@ async fn create_machine_to_end(
             crate::data::image_source::ImageSource::Registry(_)
         )
     }) && !crate::network::plan_launch_network_with(
-        &crate::api::state::resource_spec_to_vm_resources(&resources, network),
-        resources.allowed_hosts.as_deref(),
-        restored_ports.len(),
-        resources.credentials.is_some(),
+        &resolved.vm_resources(),
+        resolved.allowed_hosts.as_deref(),
+        resolved.ports.len(),
+        resolved.credentials.is_some(),
     )
     .has_network();
 
@@ -3348,10 +3259,6 @@ async fn create_machine_to_end(
             })
             .await
             .map_err(|e| ApiError::internal(format!("task error: {}", e)))??;
-    }
-
-    if let Some(size) = packed_storage_gib {
-        resources.storage_gb = Some(size);
     }
 
     if manifest_checkpoint.is_some() {
@@ -3535,71 +3442,11 @@ async fn create_machine_to_end(
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
 
-    // Validate request-body secret refs before persisting. Untrusted
-    // scope rejects every source kind, so any non-empty `secrets` map on
-    // the API surface is refused regardless of server binding — secrets
-    // must be configured locally via the CLI.
-    crate::api::handlers::validate_request_secrets(&req.secrets)?;
-    crate::api::handlers::validate_request_env(&req.env)?;
-    let mut workload_env = merge_request_env(env, &req.env);
-    if req.auto_graph {
-        crate::util::enable_cuda_auto_graph_env(&mut workload_env);
-    }
-
     // Complete registration: persists to DB + registers in ApiState
     let complete_result = guard.complete(MachineRegistration {
         manager,
-        mounts: host_mount_specs,
-        remote_volumes,
-        ports: restored_ports,
-        resources: resources.clone(),
-        restart: if let Some(workload) = manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-        {
-            RestartConfig {
-                policy: workload
-                    .restart_policy
-                    .parse()
-                    .map_err(ApiError::BadRequest)?,
-                max_retries: workload.restart_max_retries,
-                max_backoff_secs: workload.restart_max_backoff_secs,
-                ..Default::default()
-            }
-        } else {
-            match req.restart {
-                Some(ref spec) => {
-                    let policy = spec
-                        .policy
-                        .as_deref()
-                        .unwrap_or("never")
-                        .parse()
-                        .map_err(|e: String| ApiError::BadRequest(e))?;
-                    RestartConfig {
-                        policy,
-                        max_retries: spec.max_retries.unwrap_or(0),
-                        ..Default::default()
-                    }
-                }
-                None => RestartConfig::default(),
-            }
-        },
-        network,
-        mediated_egress_required: checkpoint_network
-            .is_some_and(|network| network.mediated_egress_required),
-        forkable: manifest_checkpoint.is_some(),
-        init_completed: manifest_checkpoint.is_some(),
-        docker_socket: req.docker_socket,
-        stop_signal: req.stop_signal.clone(),
-        stop_timeout_secs: req.stop_timeout_secs,
-        image: match &restored_host_image {
-            Some(restored) => Some(restored.local.clone()),
-            None => image,
-        },
-        image_origin: restored_host_image
-            .as_ref()
-            .map(|restored| restored.origin.clone()),
-        image_origin_digest: restored_host_image.map(|restored| restored.digest),
+        resolved,
+        host_image: restored_host_image,
         source_registry_ref: if manifest_checkpoint.is_some() {
             restored_pack
                 .as_ref()
@@ -3617,50 +3464,11 @@ async fn create_machine_to_end(
         } else {
             source_smolmachine
         },
-        packed_image_on_storage: packed_storage_gib.is_some(),
-        entrypoint,
-        cmd,
-        env: workload_env,
-        workdir: req.workdir.clone().or(workdir),
-        user: manifest_checkpoint
+        packed_storage_gib,
+        checkpoint_without_host_layers: manifest_checkpoint
             .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-            .and_then(|workload| workload.user.clone()),
-        fork_overlay_owner: manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.workload.as_ref())
-            .map(|workload| workload.overlay_owner.clone()),
-        host_uid_owner: manifest_checkpoint.as_ref().map(|_| name.clone()),
-        // Record secrets = packed refs from --from (validated Untrusted above)
-        // merged with request refs (validated Untrusted at ~line 333); request
-        // refs win on key collision. Both sources are store-only, so RecordReplay
-        // resolution at exec time stays safe.
-        secret_refs: {
-            let mut s = manifest_secret_refs;
-            s.extend(req.secrets.clone());
-            s
-        },
-        credential_placeholders: match (&req.credentials, checkpoint_network) {
-            (None, Some(network)) => network.credential_placeholders.clone(),
-            _ => Default::default(),
-        },
+            .is_some_and(crate::portable_checkpoint::carries_no_host_layers),
     });
-    if complete_result.is_ok() {
-        if let Some(id) = manifest_checkpoint
-            .as_ref()
-            .and_then(|checkpoint| checkpoint.lineage.as_ref())
-            .map(|lineage| lineage.id.clone())
-        {
-            // The next capture records this as its parent, which is what lets
-            // it be a delta of the checkpoint this machine was restored from.
-            if let Err(error) = state
-                .update_vm(&name, move |record| record.checkpoint_head = Some(id))
-                .await
-            {
-                tracing::warn!(machine = %name, ?error, "checkpoint head not recorded");
-            }
-        }
-    }
     if let Err(e) = complete_result {
         let data_dir = vm_data_dir(&name);
         smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(
@@ -3962,6 +3770,23 @@ fn optional_json_body<T: serde::de::DeserializeOwned + Default>(
         .map_err(|error| ApiError::BadRequest(format!("invalid JSON request body: {error}")))
 }
 
+/// A machine with redirect egress rules sends those flows to a mediated
+/// interceptor, so every start must bind one. Checked again where the machine
+/// launches; rejected here so the caller learns its request was incomplete
+/// rather than seeing the start fail.
+fn require_mediated_interceptor(record: &VmRecord, mediated_egress: bool) -> Result<(), ApiError> {
+    let redirects = record
+        .egress_rules
+        .iter()
+        .any(|rule| rule.action == smolvm_protocol::RuleAction::Redirect);
+    if redirects && !mediated_egress {
+        return Err(ApiError::BadRequest(
+            "this machine has redirect egress rules, so every start needs egressInterceptor with mediated: true".into(),
+        ));
+    }
+    Ok(())
+}
+
 /// Start a machine.
 #[utoipa::path(
     post,
@@ -4117,6 +3942,7 @@ pub async fn start_machine(
             "this machine requires egressInterceptor.address and egressInterceptor.token on every start".into(),
         ));
     }
+    require_mediated_interceptor(&record, mediated_egress)?;
 
     let mut recovered_unreachable = false;
     if resolved == RecordState::Unreachable {
@@ -4146,6 +3972,10 @@ pub async fn start_machine(
             )));
         }
     }
+
+    // A stop, or the recovery above, can end with the machine's process held
+    // by the kernel. The machine is not started on top of it.
+    refuse_start_while_held(&state, &name).await?;
 
     // A successful unreachable recovery, a Running record resolved Stopped by
     // PID+agent probing, or a durable Stopped record written by an out-of-process
@@ -4267,6 +4097,8 @@ pub async fn start_machine(
         && record.golden.is_none())
     .then(|| record.image.clone())
     .flatten();
+    let pull_platform = record.image_platform().map(str::to_owned);
+    let seeds_platform = crate::image_seed::serves_platform(pull_platform.as_deref());
     let start_has_credentials = registry_auth.is_some();
     let seed_auth = match &registry_auth {
         Some(auth) => crate::registry::PullAuth::Basic {
@@ -4276,18 +4108,27 @@ pub async fn start_machine(
         None => crate::registry::PullAuth::FromConfig,
     };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
+        crate::network::private_floor::log_record_hosts_blocked_by_private_floor(
+            &name_clone,
+            &restore_record,
+        );
         let mut seed_image = seed_image;
+        let seedable_image = |image: &str| {
+            seeds_platform
+                .then(|| crate::image_seed::seedable_image(&name_clone, Some(image), storage_gb))
+                .flatten()
+        };
         if let Some(image) = preseeded_image {
             match crate::image_seed::revalidate_seed(&name_clone, &image, &seed_auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                    seed_image = seedable_image(&image);
                 }
                 Err(error) => {
                     // The rejected disk is gone, so the machine can take a seed
                     // of the image it boots now, such as its host-fetched archive.
                     tracing::warn!(machine = %name_clone, %error, "pre-created image seed rejected");
-                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                    seed_image = seedable_image(&image);
                 }
             }
             // A fresh machine still has the blank disk its create made. When
@@ -4301,7 +4142,7 @@ pub async fn start_machine(
                     start_has_credentials,
                 )
             {
-                seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                seed_image = seedable_image(&image);
             }
         }
         if let Some(image) = seed_image {
@@ -4441,6 +4282,9 @@ pub async fn start_machine(
                 if let Some(auth) = pull_auth {
                     opts = opts.auth(auth);
                 }
+                if let Some(platform) = pull_platform {
+                    opts = opts.oci_platform(platform);
+                }
                 c.pull(&image_pull, opts)?;
             }
             Ok(())
@@ -4509,6 +4353,7 @@ pub async fn start_machine(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(crate::ENGINE_BUILD.to_string());
             if image_on_storage {
                 r.mark_image_on_storage();
             }
@@ -5541,6 +5386,7 @@ async fn boot_prepared_fork_inner(
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
+            r.engine_build = Some(crate::ENGINE_BUILD.to_string());
         })
         .await?
         .ok_or_else(|| {
@@ -6146,9 +5992,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                 }
                 let _ = state
                     .update_vm(&name, |r| {
-                        r.state = RecordState::Stopped;
-                        r.pid = None;
-                        r.pid_start_time = None;
+                        r.mark_process_stopped();
                         // A drain is a deliberate decommission: mark the machine
                         // user-stopped so the restart supervisor does not resurrect it
                         // in the window before the host is terminated (or if drain is
@@ -6240,7 +6084,14 @@ pub(crate) async fn delete_one(
     // A cleanup request may outlive its caller's deadline while waiting for a
     // branch. Keep it queued, and hold its locks through the blocking teardown.
     with_owned_operation(move |reply| async move {
+        let sessions = state.exec_sessions().clone();
+        let machine = name.clone();
         let result = delete_one_transaction(state, name).await;
+        if result.is_ok() {
+            // Its commands died with it; their ids must not be read on a
+            // machine that reuses the name.
+            sessions.forget_machine(&machine).await;
+        }
         let _ = reply.send(result);
     })
     .await
@@ -6542,9 +6393,10 @@ async fn delete_one_transaction(
     ),
     request_body = CredentialValuesRequest,
     responses(
-        (status = 204, description = "Values held for the machine's next boot"),
+        (status = 204, description = "Values held for the machine's next boot, and in use at once on a running machine"),
         (status = 400, description = "A value names no binding of the machine", body = ApiErrorResponse),
-        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "The machine runs but could not take the values; they still apply from its next boot", body = ApiErrorResponse)
     )
 )]
 pub async fn put_credential_values(
@@ -6566,13 +6418,25 @@ pub async fn put_credential_values(
             "machine '{name}' has no credential binding '{unknown}'"
         )));
     }
-    crate::credentials::supply_values(
-        &name,
-        req.values
-            .into_iter()
-            .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
-            .collect(),
-    );
+    let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = req
+        .values
+        .into_iter()
+        .map(|(k, v)| (k, zeroize::Zeroizing::new(v)))
+        .collect();
+    // A running machine resolves from the values its boot was handed, so it
+    // gets the new ones directly; the held copy covers its next boot.
+    let running = record.actual_state() == RecordState::Running;
+    let live = running.then(|| values.clone());
+    crate::credentials::supply_values(&name, values);
+    if let Some(values) = live {
+        let machine = name.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::agent::apply_live_credential_values(&machine, &values)
+        })
+        .await
+        .map_err(|error| ApiError::internal(format!("credential values task failed: {error}")))?
+        .map_err(|error| ApiError::Conflict(error.to_string()))?;
+    }
     Ok(axum::http::StatusCode::NO_CONTENT)
 }
 
@@ -7789,29 +7653,136 @@ fn registry_reference_tag_or_digest(parsed: &crate::registry::Reference) -> &str
         .unwrap_or("latest")
 }
 
-fn resolve_create_resources(
+/// The machine a create request asks for, as the spec every creation path
+/// resolves ([`crate::machine_spec::resolve`]). Every request field is named,
+/// so a new one does not compile until it reaches the spec or is named as
+/// something else (the source, the name). `cache_disk` is the request's cache
+/// disk, already fetched and resolved on this server.
+pub(crate) fn create_spec_from_request(
     req: &CreateMachineRequest,
-    manifest_cpus: u8,
-    manifest_mem: u32,
-) -> (u8, u32) {
-    (
-        req.cpus.unwrap_or(manifest_cpus),
-        req.mem.unwrap_or(manifest_mem),
-    )
-}
+    cache_disk: Option<crate::data::disk::CacheDisk>,
+) -> Result<crate::machine_spec::CreateSpec, ApiError> {
+    let CreateMachineRequest {
+        // The machine's name, not an option of it.
+        name: _,
+        cpus,
+        mem,
+        mounts,
+        disk_volumes,
+        ports,
+        network,
+        gpu,
+        cuda,
+        nested_virt,
+        auto_graph,
+        entrypoint,
+        cmd,
+        docker_socket,
+        stop_signal,
+        stop_timeout_secs,
+        storage_gb,
+        overlay_gb,
+        block_io,
+        disk_durability,
+        // Resolved by the caller into `cache_disk`.
+        cache_disk: _,
+        allowed_cidrs,
+        egress_rules,
+        allowed_hosts,
+        credentials,
+        network_backend,
+        guest_subnet,
+        restart,
+        // The source, and how to fetch it.
+        image: _,
+        from: _,
+        registry_ref: _,
+        registry_identity_token: _,
+        blob_peers: _,
+        secrets,
+        env,
+        workdir,
+    } = req;
 
-/// Manifest env is the baseline; request env layers on top and wins on name
-/// collision, so a control plane can override a packed default.
-fn merge_request_env(
-    manifest_env: Vec<(String, String)>,
-    request_env: &[crate::api::types::EnvVar],
-) -> Vec<(String, String)> {
-    let mut merged = manifest_env;
-    for (name, value) in crate::api::types::EnvVar::to_tuples(request_env) {
-        merged.retain(|(existing, _)| existing != &name);
-        merged.push((name, value));
+    // Remote volumes (`s3://` sources) apart from host mounts, mirroring the
+    // CLI's -v handling; host mount paths are validated here.
+    let mut remote_volumes = Vec::new();
+    let mut host_mounts = Vec::new();
+    for mount in mounts {
+        if crate::remote_volume::is_remote_source(&mount.source) {
+            remote_volumes.push(
+                crate::remote_volume::from_parts(&mount.source, &mount.target, mount.readonly)
+                    .map_err(|e| ApiError::BadRequest(e.to_string()))?,
+            );
+        } else {
+            host_mounts
+                .push(HostMount::try_from(mount).map_err(|e| ApiError::BadRequest(e.to_string()))?);
+        }
     }
-    merged
+    // Disk volumes take the same lone guest paths as the CLI's `-v PATH`.
+    let (not_guest_paths, disk_volumes) =
+        crate::data::storage::split_disk_volume_specs(disk_volumes)
+            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    if let Some(spec) = not_guest_paths.first() {
+        return Err(ApiError::BadRequest(format!(
+            "diskVolumes: {spec} is not an absolute guest path"
+        )));
+    }
+    // Untrusted scope rejects every source kind, so any non-empty `secrets`
+    // map on the API surface is refused; secrets are configured locally.
+    crate::api::handlers::validate_request_secrets(secrets)?;
+    crate::api::handlers::validate_request_env(env)?;
+    let mut env = crate::api::types::EnvVar::to_tuples(env);
+    if *auto_graph {
+        crate::util::enable_cuda_auto_graph_env(&mut env);
+    }
+    // A request workload replaces the source's entrypoint and command together.
+    let (entrypoint, cmd) = if entrypoint.is_empty() && cmd.is_empty() {
+        (None, None)
+    } else {
+        (Some(entrypoint.clone()), Some(cmd.clone()))
+    };
+    let restart_policy = restart
+        .as_ref()
+        .map(|spec| spec.policy.as_deref().unwrap_or("never").parse())
+        .transpose()
+        .map_err(|e: String| ApiError::BadRequest(e))?;
+    Ok(crate::machine_spec::CreateSpec {
+        entrypoint,
+        cmd,
+        env,
+        workdir: workdir.clone(),
+        secret_refs: secrets.clone(),
+        restart_policy,
+        restart_max_retries: restart.as_ref().map(|spec| spec.max_retries.unwrap_or(0)),
+        stop_signal: stop_signal.clone(),
+        stop_timeout_secs: *stop_timeout_secs,
+        cpus: *cpus,
+        mem: *mem,
+        storage_gb: *storage_gb,
+        overlay_gb: *overlay_gb,
+        block_io: *block_io,
+        disk_durability: *disk_durability,
+        cache_disk,
+        mounts: host_mounts,
+        remote_volumes,
+        disk_volumes,
+        net: *network,
+        network_backend: *network_backend,
+        guest_subnet: guest_subnet.clone(),
+        ports: ports.iter().map(PortMapping::from).collect(),
+        allowed_cidrs: allowed_cidrs.clone(),
+        allowed_hosts: allowed_hosts.clone(),
+        egress_rules: egress_rules.clone(),
+        credentials: credentials.clone(),
+        // Values arrive over the API, never from this server's environment.
+        credentials_supplied_only: true,
+        gpu: *gpu,
+        nested_virt: *nested_virt,
+        cuda: *cuda || *auto_graph,
+        docker_socket: *docker_socket,
+        ..Default::default()
+    })
 }
 
 #[cfg(test)]
@@ -8018,52 +7989,6 @@ mod tests {
             .unwrap();
             assert_eq!(cached["image"], image);
         }
-    }
-
-    #[test]
-    fn checkpoint_ports_allow_host_rebinding_but_preserve_guest_topology() {
-        let captured = vec![
-            PortSpec {
-                host: 30001,
-                guest: 8080,
-                protocol: Default::default(),
-            },
-            PortSpec {
-                host: 30002,
-                guest: 3000,
-                protocol: Default::default(),
-            },
-        ];
-        let requested = vec![
-            PortSpec {
-                host: 31002,
-                guest: 3000,
-                protocol: Default::default(),
-            },
-            PortSpec {
-                host: 31001,
-                guest: 8080,
-                protocol: Default::default(),
-            },
-        ];
-        let ports = checkpoint_host_ports(&captured, &requested).unwrap();
-        assert_eq!(ports[0].host, 31002);
-        assert_eq!(ports[1].host, 31001);
-        assert_eq!(
-            checkpoint_host_ports(&captured, &[]).unwrap()[0].host,
-            30001
-        );
-        assert!(checkpoint_host_ports(&captured, &requested[..1]).is_err());
-        assert!(checkpoint_host_ports(
-            &captured,
-            &[PortSpec {
-                host: 31001,
-                guest: 9090,
-                protocol: Default::default(),
-            }]
-        )
-        .is_err());
-        assert!(checkpoint_host_ports(&[], &requested).is_err());
     }
 
     #[tokio::test]
@@ -8609,76 +8534,6 @@ mod tests {
         assert_eq!(registry_reference_tag_or_digest(&latest_ref), "latest");
     }
 
-    fn minimal_create_request() -> CreateMachineRequest {
-        CreateMachineRequest {
-            credentials: None,
-            name: Some("test-vm".to_string()),
-            cpus: None,
-            mem: None,
-            mounts: vec![],
-            disk_volumes: Vec::new(),
-            ports: vec![],
-            network: false,
-            gpu: false,
-            cuda: false,
-            nested_virt: false,
-            auto_graph: false,
-            entrypoint: vec![],
-            cmd: vec![],
-            docker_socket: false,
-            stop_signal: None,
-            stop_timeout_secs: None,
-            storage_gb: None,
-            overlay_gb: None,
-            block_io: None,
-            disk_durability: None,
-            cache_disk: None,
-            allowed_cidrs: None,
-            egress_rules: Vec::new(),
-            allowed_hosts: None,
-            network_backend: None,
-            guest_subnet: None,
-            restart: None,
-            image: None,
-            from: None,
-            registry_ref: None,
-            registry_identity_token: None,
-            blob_peers: vec![],
-            secrets: Default::default(),
-            env: vec![],
-            workdir: None,
-        }
-    }
-
-    #[test]
-    fn request_env_layers_over_manifest_env_and_wins_collisions() {
-        let manifest_env = vec![
-            ("KEEP".to_string(), "manifest".to_string()),
-            ("OVERRIDE".to_string(), "manifest".to_string()),
-        ];
-        let request_env = vec![
-            crate::api::types::EnvVar {
-                name: "OVERRIDE".to_string(),
-                value: "request".to_string(),
-            },
-            crate::api::types::EnvVar {
-                name: "NEW".to_string(),
-                value: "request".to_string(),
-            },
-        ];
-
-        let merged = merge_request_env(manifest_env, &request_env);
-
-        assert_eq!(
-            merged,
-            vec![
-                ("KEEP".to_string(), "manifest".to_string()),
-                ("OVERRIDE".to_string(), "request".to_string()),
-                ("NEW".to_string(), "request".to_string()),
-            ]
-        );
-    }
-
     #[test]
     fn create_request_accepts_disk_volumes() {
         let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
@@ -8723,21 +8578,18 @@ mod tests {
 
     #[test]
     fn auto_graph_policy_overrides_conflicting_request_env() {
-        let mut env = merge_request_env(
-            vec![(
-                crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
-                "0".to_string(),
-            )],
-            &[crate::api::types::EnvVar {
-                name: crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV.to_string(),
-                value: "0".to_string(),
-            }],
-        );
-
-        crate::util::enable_cuda_auto_graph_env(&mut env);
-
+        let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "autoGraph": true,
+            "env": [
+                {"name": crate::util::CUDA_AUTO_GRAPH_ENV, "value": "0"},
+                {"name": crate::util::TORCHINDUCTOR_CUDAGRAPHS_ENV, "value": "0"}
+            ]
+        }))
+        .unwrap();
+        let spec = create_spec_from_request(&req, None).unwrap();
+        assert!(spec.cuda, "autoGraph implies CUDA");
         assert_eq!(
-            env,
+            spec.env,
             vec![
                 (
                     crate::util::CUDA_AUTO_GRAPH_ENV.to_string(),
@@ -8750,40 +8602,6 @@ mod tests {
             ]
         );
     }
-
-    #[test]
-    fn create_resources_use_high_defaults_when_omitted() {
-        let req = minimal_create_request();
-
-        assert_eq!(
-            resolve_create_resources(
-                &req,
-                crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-                crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
-            ),
-            (
-                crate::data::resources::DEFAULT_MICROVM_CPU_COUNT,
-                crate::data::resources::DEFAULT_MICROVM_MEMORY_MIB,
-            )
-        );
-    }
-
-    #[test]
-    fn create_resources_preserve_manifest_defaults_when_omitted() {
-        let req = minimal_create_request();
-
-        assert_eq!(resolve_create_resources(&req, 6, 12_288), (6, 12_288));
-    }
-
-    #[test]
-    fn create_resources_explicit_api_values_override_manifest_defaults() {
-        let mut req = minimal_create_request();
-        req.cpus = Some(2);
-        req.mem = Some(2048);
-
-        assert_eq!(resolve_create_resources(&req, 6, 12_288), (2, 2048));
-    }
-
     #[test]
     fn create_request_deserialization_keeps_resource_omission_distinct() {
         let req: CreateMachineRequest = serde_json::from_value(serde_json::json!({
@@ -9088,5 +8906,191 @@ mod tests {
         record.overlay_gb = overlay_gb;
         db.insert_vm(name, &record)
             .expect("failed to insert test vm");
+    }
+
+    #[test]
+    fn a_start_without_the_mediated_interceptor_its_redirect_rules_need_is_a_bad_request() {
+        let mut record = VmRecord::new("redirecting".to_string(), 1, 512, vec![], vec![], false);
+        assert!(require_mediated_interceptor(&record, false).is_ok());
+        record.egress_rules = vec![serde_json::from_value(serde_json::json!({
+            "transport": "tcp",
+            "cidr": "1.1.1.1/32",
+            "ports": {"start": 443, "end": 443},
+            "action": "redirect"
+        }))
+        .unwrap()];
+        assert!(matches!(
+            require_mediated_interceptor(&record, false),
+            Err(ApiError::BadRequest(_))
+        ));
+        assert!(require_mediated_interceptor(&record, true).is_ok());
+    }
+}
+
+/// The API server's stop, start and delete around a process the kernel holds
+/// after SIGKILL, stood in for by `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::db::SmolvmDb;
+    use crate::process::fake_held;
+    use tempfile::TempDir;
+
+    fn state() -> (TempDir, Arc<ApiState>) {
+        let dir = TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, Arc::new(ApiState::with_db(db)))
+    }
+
+    fn running(state: &ApiState, name: &str, pid: i32, start_time: Option<u64>) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = start_time;
+        state.db().insert_vm(name, &record).unwrap();
+    }
+
+    /// The two steps of the stop handler: end the process, then record it.
+    async fn api_stop(state: &Arc<ApiState>, name: &str) -> VmRecord {
+        let record = state.db().get_vm(name).unwrap().unwrap();
+        let machine = name.to_string();
+        let started = std::time::Instant::now();
+        let stopped = tokio::task::spawn_blocking(move || {
+            shutdown_machine_process(&machine, record.pid, record.pid_start_time, true)
+        })
+        .await
+        .unwrap();
+        assert!(stopped, "the stop must complete around a held process");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        reconcile_confirmed_stopped_machine(state, name, true)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_stop_of_a_held_machine_records_it_stopped_and_keeps_its_pid() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-stop";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+
+        let record = api_stop(&state, name).await;
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        assert_eq!(record.pid_start_time, Some(fake_held::START_TIME));
+        assert!(record.restart.user_stopped);
+        assert_eq!(record_to_info(name, &record).state, "stopped");
+    }
+
+    /// A second stop takes the handler's "not running" branch, which
+    /// reconciles again. That is where the PID used to be cleared.
+    #[tokio::test]
+    async fn api_stop_repeated_on_a_held_machine_still_keeps_its_pid() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-stop-twice";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+
+        let record = reconcile_confirmed_stopped_machine(&state, name, true)
+            .await
+            .unwrap();
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        assert_eq!(
+            state.db().get_vm(name).unwrap().unwrap().pid,
+            Some(held.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_start_is_refused_while_held_with_the_text_the_cli_uses() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-start";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+
+        let error = refuse_start_while_held(&state, name).await.unwrap_err();
+
+        match error {
+            ApiError::Conflict(message) => assert!(
+                message.contains(&fake_held::held(held.pid).start_refusal()),
+                "{message}"
+            ),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(
+            state.db().get_vm(name).unwrap().unwrap().pid,
+            Some(held.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_start_is_allowed_and_the_pid_forgotten_once_the_process_is_gone() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-then-gone";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+        assert!(refuse_start_while_held(&state, name).await.is_err());
+
+        held.disappear();
+
+        refuse_start_while_held(&state, name).await.unwrap();
+        let stored = state.db().get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    /// Delete discards the disks, so it kills at once. A held process must
+    /// not make it wait or fail, with or without a recorded start time.
+    #[tokio::test]
+    async fn api_delete_of_a_held_machine_completes_without_waiting_for_the_process() {
+        for start_time in [Some(fake_held::START_TIME), None] {
+            let held = fake_held::hold();
+            let pid = held.pid;
+            let started = std::time::Instant::now();
+            let stopped = tokio::task::spawn_blocking(move || {
+                shutdown_machine_process("api-held-delete", Some(pid), start_time, false)
+            })
+            .await
+            .unwrap();
+            assert!(stopped);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn api_stop_of_an_exited_machine_forgets_its_pid() {
+        let (_dir, state) = state();
+        let name = "api-exited-stop";
+        // No such process: Linux pids never reach 2^31.
+        running(&state, name, 0x7fff_fff0, Some(1));
+
+        let record = reconcile_confirmed_stopped_machine(&state, name, true)
+            .await
+            .unwrap();
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, None);
+        assert_eq!(record.pid_start_time, None);
+    }
+
+    /// A held process is not counted as a running machine or a live worker.
+    #[test]
+    fn a_held_process_does_not_count_as_running() {
+        let held = fake_held::hold();
+        let mut record = VmRecord::new("api-held-count".to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Stopped;
+        record.pid = Some(held.pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        assert!(record.is_process_alive());
+        assert!(!record.process_can_run());
+        held.disappear();
+        assert!(!record.is_process_alive());
     }
 }

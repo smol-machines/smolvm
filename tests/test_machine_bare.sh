@@ -316,6 +316,81 @@ test_machine_create_prints_named_start_hint() {
     ensure_data_dir_deleted "$vm_name"
 }
 
+# A delete that is refused must change nothing. It used to stop the machine
+# before asking, so a delete refused for want of a terminal (or answered "n")
+# still killed the workload it then kept on disk.
+test_refused_delete_leaves_machine_running() {
+    local vm_name="delete-refused-$$"
+    local output still
+    local rc=0
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+
+    output=$($SMOLVM machine delete --name "$vm_name" 2>&1 </dev/null) || rc=$?
+    still=$($SMOLVM machine exec --name "$vm_name" -- echo still-running 2>&1) || true
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    [[ $rc -ne 0 && "$output" == *"not a terminal"* ]] || {
+        echo "expected a refusal, got (rc=$rc): $output"
+        return 1
+    }
+    [[ "$still" == *"still-running"* ]] || {
+        echo "the refused delete stopped the machine: $output / $still"
+        return 1
+    }
+    ensure_data_dir_deleted "$vm_name"
+}
+
+# exec and cp on a paused machine must name resume. They used to print the
+# start hint of a stopped machine, and `machine start` refuses a paused one.
+test_paused_machine_points_exec_and_cp_at_resume() {
+    local vm_name="paused-hint-$$"
+    local exec_output cp_output
+    local exec_rc=0 cp_rc=0
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" --branchable 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+    $SMOLVM machine pause --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+
+    exec_output=$($SMOLVM machine exec --name "$vm_name" -- true 2>&1) || exec_rc=$?
+    cp_output=$($SMOLVM machine cp /etc/hostname "$vm_name":/tmp/x 2>&1) || cp_rc=$?
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    [[ $exec_rc -ne 0 && "$exec_output" == *"machine resume --name $vm_name"* && "$exec_output" != *"machine start"* ]] || {
+        echo "exec on a paused machine should name resume, got (rc=$exec_rc): $exec_output"
+        return 1
+    }
+    [[ $cp_rc -ne 0 && "$cp_output" == *"machine resume --name $vm_name"* && "$cp_output" != *"machine start"* ]] || {
+        echo "cp to a paused machine should name resume, got (rc=$cp_rc): $cp_output"
+        return 1
+    }
+    ensure_data_dir_deleted "$vm_name"
+}
+
+test_started_machine_outlives_boot_helper_cli() {
+    local vm_name="boot-helper-owner-$$"
+    local rc=0
+    "$SMOLVM" machine create --name "$vm_name" 2>&1 || return 1
+    SMOLVM_BOOT_BINARY="$SMOLVM" "$SMOLVM" machine start --name "$vm_name" --branchable 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        # The parent-death watcher polls every 500 ms; the persistent machine
+        # must remain usable after the CLI that started it has exited.
+        sleep 1
+        "$SMOLVM" machine exec --name "$vm_name" -- true 2>&1 || rc=$?
+    fi
+    "$SMOLVM" machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ $rc -eq 0 ]] || return "$rc"
+    ensure_data_dir_deleted "$vm_name"
+}
+
 test_machine_exec_when_stopped() {
     cleanup_machine
 
@@ -770,6 +845,9 @@ run_test "SIGTERM during exec does not stall VM" test_sigterm_during_exec_does_n
 run_test "Exec timeout does not stall VM" test_exec_timeout_does_not_stall_vm || true
 run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
+run_test "Refused delete leaves a running machine running" test_refused_delete_leaves_machine_running || true
+run_test "Paused machine points exec and cp at resume" test_paused_machine_points_exec_and_cp_at_resume || true
+run_test "CLI-started machine outlives its boot helper parent" test_started_machine_outlives_boot_helper_cli || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "File upload and download" test_file_upload_download || true

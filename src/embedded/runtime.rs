@@ -204,6 +204,22 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Create a persisted machine from `spec`: an image machine from `image`,
+    /// or a bare VM without one. Every option in `spec` is applied, or refused
+    /// by name, by the rules every creation path uses
+    /// ([`crate::machine_spec`]); [`Self::create_machine_from_pack_with`] takes
+    /// the same spec for a `.smolmachine`.
+    pub fn create_machine_with_spec(
+        &self,
+        name: &str,
+        image: Option<&str>,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            control::create_vm_from_spec(&self.db, name, image, spec.clone())
+        })
+    }
+
     /// Capture a running checkpointable machine into a portable artifact.
     ///
     /// The source resumes as soon as its consistent RAM/disk boundary is
@@ -481,14 +497,32 @@ impl EmbeddedRuntime {
         artifact: &std::path::Path,
         options: RestoreOptions,
     ) -> Result<()> {
+        self.restore_checkpoint_machine_with_spec(
+            name,
+            artifact,
+            options,
+            &crate::machine_spec::CreateSpec::default(),
+        )
+    }
+
+    /// [`Self::restore_checkpoint_machine_with`] with options for the restored
+    /// machine, resolved against what the checkpoint fixes by the rules every
+    /// creation path uses ([`crate::machine_spec`]). An option a live restore
+    /// cannot apply (a device, a resource size, the workload command) is
+    /// refused by name; host-side settings such as the egress policy, labels
+    /// or the stop signal replace the captured ones.
+    pub fn restore_checkpoint_machine_with_spec(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+        options: RestoreOptions,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
+        let RestoreOptions { keep_identity } = options;
+        let mut spec = spec.clone();
+        spec.keep_identity |= keep_identity;
         self.with_name_lock(name, || {
-            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
-            if options.keep_identity {
-                self.db
-                    .update_vm(name, |record| record.keep_identity = true)?
-                    .ok_or_else(|| Error::vm_not_found(name))?;
-            }
-            Ok(())
+            crate::portable_checkpoint::restore_from_path_with(&self.db, name, artifact, None, spec)
         })
     }
 
@@ -500,8 +534,29 @@ impl EmbeddedRuntime {
         name: &str,
         artifact: &std::path::Path,
     ) -> Result<()> {
+        self.restore_checkpoint_machine_detached_with_spec(
+            name,
+            artifact,
+            &crate::machine_spec::CreateSpec::default(),
+        )
+    }
+
+    /// [`Self::restore_checkpoint_machine_detached`] with options for the
+    /// restored machine, as [`Self::restore_checkpoint_machine_with_spec`].
+    pub fn restore_checkpoint_machine_detached_with_spec(
+        &self,
+        name: &str,
+        artifact: &std::path::Path,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
         self.with_name_lock(name, || {
-            crate::portable_checkpoint::restore_from_path(&self.db, name, artifact)?;
+            crate::portable_checkpoint::restore_from_path_with(
+                &self.db,
+                name,
+                artifact,
+                None,
+                spec.clone(),
+            )?;
             let start = (|| -> Result<VmHandle> {
                 let started = control::start_vm(&self.db, name)?;
                 let mut handle = started.handle;
@@ -1232,7 +1287,7 @@ impl EmbeddedRuntime {
         let s3_volumes = self.s3_volumes_for(name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.pull_image(image)?;
+        handle.pull_image(image, record.image_platform())?;
         handle.run_config(
             RunConfig::new(image, command)
                 .with_env(env)
@@ -1246,9 +1301,10 @@ impl EmbeddedRuntime {
 
     /// Pull an OCI image into the machine's storage.
     pub fn pull_image(&self, name: &str, image: &str) -> Result<ImageInfo> {
+        let record = control::get_record(&self.db, name)?;
         let handle = self.started_handle(name)?;
         let mut handle = lock_handle(&handle)?;
-        handle.pull_image(image)
+        handle.pull_image(image, record.image_platform())
     }
 
     /// Every machine in this host's shared DB, in name order. The DB is shared
@@ -1370,19 +1426,46 @@ impl EmbeddedRuntime {
     /// variable of the binding's name, except on a machine made with
     /// [`Self::create_machine_with_credentials`], which uses only what is
     /// supplied. A branch uses its golden's values until it is given its own.
-    /// Supply them before the start that should use them.
+    ///
+    /// A running machine also gets them at once: its next request to a bound
+    /// host carries the new value, with no restart. A value naming no binding
+    /// of the machine fails the call and holds nothing. When the running
+    /// machine cannot take them (one started before live values were
+    /// supported), the call fails, and the values still apply from its next
+    /// boot.
     pub fn supply_credential_values(
         &self,
         name: &str,
         values: std::collections::BTreeMap<String, String>,
-    ) {
-        crate::credentials::supply_values(
-            name,
-            values
+    ) -> Result<()> {
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            let bindings: Vec<&str> = record
+                .credential_policy
+                .iter()
+                .flat_map(|policy| policy.credentials.iter().map(|b| b.name.as_str()))
+                .collect();
+            if let Some(unknown) = values.keys().find(|k| !bindings.contains(&k.as_str())) {
+                return Err(Error::config(
+                    "credentials",
+                    format!("machine '{name}' has no credential binding '{unknown}'"),
+                ));
+            }
+            let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = values
                 .into_iter()
                 .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
-                .collect(),
-        );
+                .collect();
+            // A running machine resolves from the values its boot was handed,
+            // so it gets the new ones directly; the held copy covers its next boot.
+            let running =
+                crate::agent::state_probe::resolve_state(name, &record) == RecordState::Running;
+            let live = running.then(|| values.clone());
+            crate::credentials::supply_values(name, values);
+            match live {
+                Some(values) => crate::agent::apply_live_credential_values(name, &values),
+                None => Ok(()),
+            }
+        })
     }
 
     fn mount_bindings_for(&self, name: &str) -> Result<Vec<(String, String, bool)>> {
@@ -1565,6 +1648,67 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Publish TCP guest port `guest` of running machine `name` on a host port
+    /// the OS picks, and return it. The listener is bound before the port is
+    /// known, so nothing can take the port in between. The publication lasts
+    /// for this run of the machine: a restart does not bind the port again,
+    /// and the caller publishes anew.
+    pub fn publish_atomic(&self, name: &str, guest: u16) -> Result<u16> {
+        if guest == 0 {
+            return Err(Error::config(
+                "atomic port publication",
+                "guest port must be positive",
+            ));
+        }
+        self.with_name_lock(name, || {
+            let record = control::get_record(&self.db, name)?;
+            let run = match record.pid_start_time {
+                Some(run)
+                    if crate::agent::state_probe::resolve_state(name, &record)
+                        == RecordState::Running =>
+                {
+                    run
+                }
+                _ => {
+                    return Err(Error::config(
+                        "atomic port publication",
+                        "machine must be running",
+                    ))
+                }
+            };
+            if record.ports.len() + record.udp_ports.len() + record.live_allocated_ports().len()
+                >= crate::data::network::MAX_PORT_MAPPINGS
+            {
+                return Err(Error::config(
+                    "atomic port publication",
+                    "too many published ports",
+                ));
+            }
+            let host = match crate::agent::allocate_live_port(name, guest) {
+                Ok(host) => host,
+                Err(error) => {
+                    // The engine may have bound before its reply was lost.
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    return Err(error);
+                }
+            };
+            let saved = self.db.update_vm(name, |r| {
+                // Ports an earlier run picked closed with it.
+                r.allocated_ports.retain(|port| port.run == run);
+                r.allocated_ports
+                    .push(crate::config::AllocatedPort { host, guest, run });
+            });
+            match saved {
+                Ok(Some(_)) => Ok(host),
+                result => {
+                    let _ = crate::agent::apply_live_published_ports(name, &record.ports);
+                    result?;
+                    Err(Error::vm_not_found(name))
+                }
+            }
+        })
+    }
+
     /// Pack the stopped machine `name` into a `.smolmachine` at `output`
     /// (a `.smolmachine` extension is added when missing): its disks and
     /// configuration flattened into an artifact new machines boot from with
@@ -1598,15 +1742,56 @@ impl EmbeddedRuntime {
     /// `smolvm machine create --from` does. Start it with
     /// [`Self::start_machine`].
     pub fn create_machine_from_pack(&self, name: &str, pack: &std::path::Path) -> Result<()> {
+        self.create_machine_from_pack_with(name, pack, &crate::machine_spec::CreateSpec::default())
+    }
+
+    /// Create the stopped machine `name` from a `.smolmachine` artifact,
+    /// optionally applying an explicit caller outbound network policy before
+    /// the machine is published. Invalid policy fails before creation, so no
+    /// unrestricted intermediate record can be started by another process.
+    pub fn create_machine_from_pack_with_egress(
+        &self,
+        name: &str,
+        pack: &std::path::Path,
+        egress: Option<&crate::data::network::EgressPolicy>,
+    ) -> Result<()> {
+        self.create_machine_from_pack_with(
+            name,
+            pack,
+            &crate::machine_spec::CreateSpec {
+                egress: egress.cloned(),
+                ..Default::default()
+            },
+        )
+    }
+
+    /// [`Self::create_machine_from_pack`] with options for the machine. The
+    /// pack supplies defaults (resources, command, environment, ...) and
+    /// `spec` overrides them by the rules every creation path uses
+    /// ([`crate::machine_spec`]); a pack that is a live checkpoint fixes its
+    /// topology, and an option asking to change it is refused by name. A
+    /// branchable spec (`forkable`) starts the machine branchable every time.
+    pub fn create_machine_from_pack_with(
+        &self,
+        name: &str,
+        pack: &std::path::Path,
+        spec: &crate::machine_spec::CreateSpec,
+    ) -> Result<()> {
+        let spec = serde_json::to_vec(spec)
+            .map_err(|e| Error::config("create from pack", e.to_string()))?;
         self.with_name_lock(name, || {
-            run_bundled_cli(&[
-                "machine".as_ref(),
-                "create".as_ref(),
-                "--name".as_ref(),
-                name.as_ref(),
-                "--from".as_ref(),
-                pack.as_os_str(),
-            ])
+            run_bundled_cli_with_stdin(
+                &[
+                    "machine".as_ref(),
+                    "create".as_ref(),
+                    "--name".as_ref(),
+                    name.as_ref(),
+                    "--from".as_ref(),
+                    pack.as_os_str(),
+                    "--spec-stdin".as_ref(),
+                ],
+                &spec,
+            )
         })
     }
 
@@ -1742,6 +1927,11 @@ fn lock_name(lock: &Arc<Mutex<()>>) -> Result<MutexGuard<'_, ()>> {
 /// [`crate::embedded::bundle::boot_binary`]) with `args`, for the operations
 /// that live in the CLI. Fails, with the CLI's own message, when it does.
 fn run_bundled_cli(args: &[&std::ffi::OsStr]) -> Result<()> {
+    run_bundled_cli_with_stdin(args, &[])
+}
+
+/// Run the bundled CLI with `input` on its stdin (none when empty).
+fn run_bundled_cli_with_stdin(args: &[&std::ffi::OsStr], input: &[u8]) -> Result<()> {
     let exe = super::bundle::boot_binary().ok_or_else(|| {
         Error::config(
             "smolvm binary",
@@ -1749,12 +1939,28 @@ fn run_bundled_cli(args: &[&std::ffi::OsStr]) -> Result<()> {
         )
     })?;
     let mut command = std::process::Command::new(&exe);
-    command.args(args).stdin(std::process::Stdio::null());
+    command
+        .args(args)
+        .stdin(if input.is_empty() {
+            std::process::Stdio::null()
+        } else {
+            std::process::Stdio::piped()
+        })
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
     if let Some(lib_dir) = super::bundle::lib_dir() {
         command.env(crate::data::consts::ENV_SMOLVM_LIB_DIR, lib_dir);
     }
-    let output = command
-        .output()
+    let mut child = command
+        .spawn()
+        .map_err(|e| Error::agent("run smolvm", format!("{}: {e}", exe.display())))?;
+    if let Some(mut stdin) = child.stdin.take() {
+        use std::io::Write;
+        // A CLI that exits before reading reports why on stderr below.
+        let _ = stdin.write_all(input);
+    }
+    let output = child
+        .wait_with_output()
         .map_err(|e| Error::agent("run smolvm", format!("{}: {e}", exe.display())))?;
     if output.status.success() {
         return Ok(());
@@ -1878,6 +2084,46 @@ mod tests {
             // Spread the rest so a new spec field does not break the fixtures.
             ..MachineSpec::default()
         }
+    }
+
+    #[test]
+    fn credential_values_must_name_a_binding_of_an_existing_machine() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let one = |binding: &str| {
+            std::collections::BTreeMap::from([(binding.to_string(), "secret".to_string())])
+        };
+        assert!(runtime
+            .supply_credential_values("absent", one("github"))
+            .is_err());
+        let mut spec = test_spec("bound", true);
+        spec.allowed_hosts = vec!["github.com".into()];
+        runtime
+            .create_machine_with_credentials(
+                spec,
+                Vec::new(),
+                None,
+                None,
+                crate::credentials::CredentialPolicy {
+                    credentials: vec![crate::credentials::parse_credential_flag(
+                        "github=GH_TOKEN@github.com",
+                    )
+                    .unwrap()],
+                },
+            )
+            .unwrap();
+        let refused = runtime
+            .supply_credential_values("bound", one("notion"))
+            .unwrap_err()
+            .to_string();
+        assert!(
+            refused.contains("no credential binding 'notion'"),
+            "{refused}"
+        );
+        // A stopped machine holds the value for its next boot.
+        runtime
+            .supply_credential_values("bound", one("github"))
+            .unwrap();
+        crate::credentials::forget_values("bound");
     }
 
     #[test]
@@ -2076,7 +2322,7 @@ mod tests {
     #[test]
     fn reconnect_never_restarts_a_frozen_fork_base() {
         let db = test_db();
-        let mut record = test_spec("frozen-checkpoint", true).to_record();
+        let mut record = test_spec("frozen-checkpoint", true).to_record().unwrap();
         record.state = crate::config::RecordState::Frozen;
         db.insert_vm_if_not_exists("frozen-checkpoint", &record)
             .unwrap();
@@ -2112,7 +2358,7 @@ mod tests {
     #[test]
     fn a_clone_targets_its_golden_overlay() {
         let runtime = EmbeddedRuntime::with_db(test_db());
-        let mut record = test_spec("runtime-clone", true).to_record();
+        let mut record = test_spec("runtime-clone", true).to_record().unwrap();
         record.image = Some("example/image:latest".to_string());
         record.golden = Some("runtime-golden".to_string());
         runtime.db.insert_vm("runtime-clone", &record).unwrap();
@@ -2175,7 +2421,9 @@ mod tests {
     fn delete_already_stopped_staged_machine_does_not_reconnect() {
         let db = test_db();
         let runtime = EmbeddedRuntime::with_db(db.clone());
-        let mut record = test_spec("delete-stopped-staged", true).to_record();
+        let mut record = test_spec("delete-stopped-staged", true)
+            .to_record()
+            .unwrap();
         record.state = crate::config::RecordState::Stopped;
         record.staged_mounts = vec![(0, "/host/work".into(), "/work".into())];
         db.insert_vm("delete-stopped-staged", &record).unwrap();
@@ -2191,7 +2439,7 @@ mod tests {
         runtime
             .create_machine(test_spec("delete-parent", true))
             .unwrap();
-        let mut child = test_spec("delete-child", true).to_record();
+        let mut child = test_spec("delete-child", true).to_record().unwrap();
         child.golden = Some("delete-parent".to_string());
         db.insert_vm("delete-child", &child).unwrap();
 
@@ -2208,7 +2456,7 @@ mod tests {
         runtime
             .create_machine(test_spec("stop-parent", true))
             .unwrap();
-        let mut child = test_spec("stop-child", true).to_record();
+        let mut child = test_spec("stop-child", true).to_record().unwrap();
         child.golden = Some("stop-parent".to_string());
         db.insert_vm("stop-child", &child).unwrap();
 
@@ -2222,7 +2470,7 @@ mod tests {
     fn delete_machine_reaps_a_frozen_checkpoint_without_guest_shutdown() {
         let db = test_db();
         let runtime = EmbeddedRuntime::with_db(db.clone());
-        let mut record = test_spec("delete-frozen", true).to_record();
+        let mut record = test_spec("delete-frozen", true).to_record().unwrap();
         record.state = crate::config::RecordState::Frozen;
         db.insert_vm("delete-frozen", &record).unwrap();
 

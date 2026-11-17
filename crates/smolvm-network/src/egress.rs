@@ -127,6 +127,14 @@ impl Rules {
             Some(hosts) => dns::hostname_allowed(hostname, hosts),
         }
     }
+
+    /// Whether addresses learned for `name` may be kept. Unlike a DNS query,
+    /// which a list with no hosts lets through, an answer needs a host to match.
+    fn keeps_learned(&self, name: &str) -> bool {
+        self.allowed_hosts
+            .as_deref()
+            .is_some_and(|hosts| dns::hostname_allowed(name, hosts))
+    }
 }
 
 /// An IP learned from an allowed DNS answer.
@@ -531,7 +539,7 @@ impl EgressPolicy {
                 entry
                     .name
                     .as_deref()
-                    .is_none_or(|name| next.hostname_allowed(name))
+                    .is_none_or(|name| next.keeps_learned(name))
             });
         }
         *list.rules.write().unwrap_or_else(|e| e.into_inner()) = next;
@@ -640,6 +648,29 @@ impl EgressPolicy {
             Some(RuleAction::Deny) => false,
             None => self.allows(ip),
         }
+    }
+
+    /// Whether `--block-private` alone keeps TCP from `ip`: the address is
+    /// private and no allow rule covers it, so an `--allow-private` range
+    /// would reopen it. False for cloud metadata and on the strict floor,
+    /// which no exception reopens.
+    pub fn private_floor_blocks(&self, ip: IpAddr) -> bool {
+        if self.floor != FloorMode::Private || !is_floored(ip, self.floor) || is_link_local(ip) {
+            return false;
+        }
+        let mapped = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map(IpAddr::V4),
+            IpAddr::V4(_) => None,
+        };
+        !self.compiled_rules().iter().any(|rule| {
+            rule.action == RuleAction::Allow
+                && rule
+                    .transport
+                    .is_none_or(|value| value == FlowTransport::Tcp)
+                && rule.cidr.is_none_or(|cidr| {
+                    cidr.contains(ip) || mapped.is_some_and(|v4| cidr.contains(v4))
+                })
+        })
     }
 
     /// Attach the structured decision record for a host-minted launch.
@@ -925,7 +956,7 @@ impl EgressPolicy {
     pub fn learn_dns_answer(&self, answer: &[u8]) {
         let name = dns::question_name(answer).and_then(|n| dns::normalize_hostname(&n));
         if let (Some(list), Some(name)) = (&self.inner, name.as_deref()) {
-            if !list.rules().hostname_allowed(name) {
+            if !list.rules().keeps_learned(name) {
                 return;
             }
         }
@@ -1017,6 +1048,36 @@ mod tests {
             .unwrap();
         assert!(!policy.allows(github));
         assert!(policy.allows(pypi));
+    }
+
+    /// A list left with no hosts has no name filter, which passes every name.
+    #[test]
+    fn replacing_the_last_host_revokes_the_addresses_learned_for_it() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        assert!(policy.allows(github));
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        assert!(!policy.allows(github));
+    }
+
+    #[test]
+    fn an_answer_arriving_after_the_last_host_is_removed_is_not_learned() {
+        use crate::dns_cache::tests::{answer, query};
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let late = answer(
+            &query(1, "api.github.com", 1, false),
+            &[(300, [140, 82, 112, 6])],
+        );
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        policy.learn_dns_answer(&late);
+        assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6))));
     }
 
     #[test]
@@ -1275,6 +1336,50 @@ mod tests {
                 assert!(udp("203.0.113.5:443"));
             }
         }
+    }
+
+    #[test]
+    fn private_floor_blocks_only_what_an_exception_would_reopen() {
+        let ip = |text: &str| text.parse::<IpAddr>().unwrap();
+        let mut local = EgressPolicy::new(Some(&["100.64.0.9/32".to_string()]), None);
+        local.floor = FloorMode::MetadataAndLoopback;
+        assert!(!local.private_floor_blocks(ip("100.64.0.9")));
+
+        let blocked = local.clone().with_private_floor(&[]).unwrap();
+        // Named on the allow list, yet the floor still refuses it.
+        assert!(!blocked.allows_flow(FlowTransport::Tcp, ip("100.64.0.9"), Some(443)));
+        assert!(blocked.private_floor_blocks(ip("100.64.0.9")));
+        assert!(blocked.private_floor_blocks(ip("192.168.1.1")));
+        assert!(blocked.private_floor_blocks(ip("fd7a:115c:a1e0::1")));
+        assert!(blocked.private_floor_blocks(ip("::ffff:10.0.0.1")));
+        assert!(!blocked.private_floor_blocks(ip("203.0.113.5")));
+        assert!(!blocked.private_floor_blocks(ip("169.254.169.254")));
+
+        let reopened = local
+            .clone()
+            .with_private_floor(&[
+                "100.64.0.0/10".to_string(),
+                "fd7a:115c:a1e0::/48".to_string(),
+            ])
+            .unwrap();
+        assert!(reopened.allows_flow(FlowTransport::Tcp, ip("100.64.0.9"), Some(443)));
+        assert!(!reopened.private_floor_blocks(ip("100.64.0.9")));
+        assert!(!reopened.private_floor_blocks(ip("fd7a:115c:a1e0::1")));
+        assert!(reopened.private_floor_blocks(ip("192.168.1.1")));
+
+        // A UDP rule never reopens a private range for TCP.
+        let mut udp_only = EgressPolicy::unrestricted()
+            .with_rules(&[udp_allow("10.0.0.0/8", None)])
+            .unwrap();
+        udp_only.floor = FloorMode::MetadataAndLoopback;
+        let udp_only = udp_only.with_private_floor(&[]).unwrap();
+        assert!(udp_only.private_floor_blocks(ip("10.1.2.3")));
+
+        // The strict floor is not ours to reopen.
+        let mut strict = EgressPolicy::unrestricted();
+        strict.floor = FloorMode::Strict;
+        let strict = strict.with_private_floor(&[]).unwrap();
+        assert!(!strict.private_floor_blocks(ip("10.1.2.3")));
     }
 
     #[test]

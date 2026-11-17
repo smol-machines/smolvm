@@ -1,20 +1,30 @@
 # Browser display
 
-A machine started with `--gpu` can expose a display. The host serves it on
-one port: open it in a browser, or point a VNC client at it. Keyboard and
-pointer input reach the guest.
+A machine can expose a display. The host serves it on one port: open it in a
+browser, or point a VNC client at it. Keyboard and pointer input reach the
+guest.
 
 ```sh
-smolvm machine create --name desktop --gpu --net --image archlinux:latest
+smolvm machine create --name desktop --net --image archlinux:latest
 SMOLVM_DISPLAY=1280x800 SMOLVM_VNC=5900 smolvm machine start --name desktop
 ```
 
 Open `http://127.0.0.1:5900/`.
 
 `SMOLVM_DISPLAY=WIDTHxHEIGHT` adds a virtio-gpu scanout, so the guest gets a
-KMS connector on `/dev/dri/card0`. It has no effect without `--gpu`. There is
-no `/dev/fb0`; the guest needs something that drives KMS, such as a Wayland
-compositor or `modetest`.
+KMS connector on `/dev/dri/card0`. There is no `/dev/fb0`; the guest needs
+something that drives KMS, such as a Wayland compositor or `modetest`.
+
+The display does not need a host GPU. Without `--gpu` the guest renders in
+software (for a wlroots compositor, `WLR_RENDERER=pixman`) and the host only
+receives finished frames; on Linux the machine's process then opens no host
+graphics device. Add `--gpu` at create for GPU rendering in the guest.
+
+On Linux, a `--gpu` machine checks the host's `/dev/dri` nodes before it
+starts. If opening one does not return within 5 seconds, or no render node
+can be opened, a machine with `SMOLVM_DISPLAY` starts with the software
+display and a warning that names the node; a `--gpu` machine with no display
+is not started, and the error names the node.
 
 `SMOLVM_VNC=[host:]port` serves the display from the host; the guest runs no
 VNC server. A bare port binds `127.0.0.1`; a bare host uses port 5900. The

@@ -94,6 +94,9 @@ pub mod dns_filter_listener;
 pub mod docker_config;
 /// Language-neutral embedded runtime support shared by SDK adapters.
 pub mod embedded;
+/// The Docker Engine API, answered by smolvm: every container is a machine.
+#[cfg(unix)]
+pub mod engine;
 pub mod image_seed;
 pub mod image_store;
 /// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
@@ -102,6 +105,8 @@ pub mod image_store;
 /// needing a separate `_boot-vm`-capable helper on disk.
 pub mod internal_boot;
 pub mod log_rotation;
+/// One machine description, resolved the same way by every creation path.
+pub mod machine_spec;
 pub mod network;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
 pub mod pack_export;
@@ -120,6 +125,8 @@ pub mod smolfile;
 pub mod staged_mount;
 pub mod storage;
 pub mod systemd_scope;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod usage;
 pub mod util;
 pub mod vm;
@@ -164,3 +171,10 @@ pub use vm::{default_backend, VmBackend, VmHandle};
 
 /// Library version.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
+
+/// This engine build: the version plus the git commit it was built from
+/// (`unknown` for a build without git, such as one from a crates.io
+/// tarball). Recorded on a machine when it starts, and compared, not the
+/// executable's path or inode, when another engine asks to branch it: the
+/// same release installed as two files is one build.
+pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOLVM_GIT_COMMIT"));

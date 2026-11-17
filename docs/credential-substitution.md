@@ -159,7 +159,11 @@ Machines created over the HTTP API take their values only from
 embedded runtime (`create_machine_with_credentials`) take them only from
 `supply_credential_values`. Neither ever falls back to this host's
 environment. Supplied values are held in the supplying process's memory,
-never written anywhere, and take effect when the machine next starts.
+never written anywhere, and apply from the machine's next start; a running
+machine also gets them at once, so its next request to a bound host carries the
+new value without a restart. A value naming no binding of the machine is
+refused, and a running machine that cannot take values live (one started before
+live values were supported) fails the call while keeping them for its next start.
 
 Embedders resolve however they like: the engine asks a `CredentialResolver`
 with the machine name, binding name, destination host and port, method and

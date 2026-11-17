@@ -24,7 +24,7 @@ struct Cli {
 
     /// Keep all smolvm state (machines, images, caches, the database) under
     /// PATH instead of the user's default directories, for example to run a
-    /// second engine version beside an installed one. Linux only.
+    /// second engine version beside an installed one. Not supported on Windows.
     #[arg(long, global = true, value_name = "PATH")]
     state_dir: Option<std::path::PathBuf>,
 
@@ -56,6 +56,11 @@ enum Commands {
     /// Manage smolvm configuration (registries, defaults)
     #[command(subcommand)]
     Config(cli::config::ConfigCmd),
+
+    /// Serve the Docker Engine API: docker, Compose and Testcontainers run
+    /// every container as a machine
+    #[cfg(unix)]
+    Engine(cli::engine::EngineCmd),
 
     /// Print a shell completion script to stdout
     #[command(after_help = cli::completion::AFTER_HELP)]
@@ -154,7 +159,7 @@ fn stray_stub_note(exe_stem: &str) -> Option<String> {
 /// `SMOLVM_DATA_DIR` root that child processes inherit. Arguments after `--`
 /// belong to the workload and are never read. A relative path is made
 /// absolute so children started in another directory agree on it.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[cfg_attr(not(unix), allow(dead_code))]
 fn state_dir_from_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
@@ -180,6 +185,11 @@ fn state_dir_from_args(
 }
 
 fn main() {
+    cli::broken_pipe::install();
+    cli::broken_pipe::run(run_cli);
+}
+
+fn run_cli() {
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
     smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
@@ -187,7 +197,7 @@ fn main() {
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
     // first, single-threaded, so the set_var is safe.
-    #[cfg(target_os = "linux")]
+    #[cfg(unix)]
     if let Some(dir) = state_dir_from_args(std::env::args_os().skip(1)) {
         std::env::set_var("SMOLVM_DATA_DIR", dir);
     }
@@ -237,8 +247,8 @@ fn main() {
 
     let cli = Cli::parse();
     let error_format = cli.error_format;
-    if cli.state_dir.is_some() && !cfg!(target_os = "linux") {
-        eprintln!("Error: --state-dir is only supported on Linux");
+    if cli.state_dir.is_some() && !cfg!(unix) {
+        eprintln!("Error: --state-dir is not supported on Windows");
         std::process::exit(2);
     }
 
@@ -254,6 +264,8 @@ fn main() {
         Commands::Serve(cmd) => cmd.run(),
         Commands::Pack(cmd) => (*cmd).run(),
         Commands::Config(cmd) => cmd.run(),
+        #[cfg(unix)]
+        Commands::Engine(cmd) => cmd.run(),
         Commands::Completion { shell } => {
             let mut cmd = cli::completion::without_hidden(&Cli::command());
             cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)

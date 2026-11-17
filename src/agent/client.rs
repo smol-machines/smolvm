@@ -198,7 +198,7 @@ impl InteractiveInputReceiver {
         }
     }
 
-    fn try_recv(
+    pub(crate) fn try_recv(
         &mut self,
     ) -> std::result::Result<InteractiveInput, tokio::sync::mpsc::error::TryRecvError> {
         self.rx.try_recv()
@@ -1113,6 +1113,7 @@ fn registry_pull_credentials(
 
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
+    binary_stream: Arc<AtomicBool>,
     stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
@@ -1120,6 +1121,9 @@ pub struct AgentClient {
     file_target: Option<WorkloadTarget>,
     /// The agent's advertised capabilities, read once per connection.
     capabilities: Option<Vec<String>>,
+    /// Cumulative output ceiling of a streaming exec on this connection; see
+    /// [`MAX_STREAMING_EXEC_OUTPUT`] and [`Self::set_streaming_output_cap`].
+    streaming_output_cap: Option<usize>,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1316,6 +1320,8 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            binary_stream: Arc::new(AtomicBool::new(false)),
+            streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
         }
     }
 }
@@ -1411,6 +1417,14 @@ impl AgentClient {
         )
     }
 
+    /// Connect for a periodic sampler: one short timeout for the connect and
+    /// every read and write, so a sampler thread never waits long on a guest
+    /// that is paused or shutting down.
+    pub(crate) fn connect_for_sampling(socket_path: &Path, timeout: Duration) -> Result<Self> {
+        let ms = u64::try_from(timeout.as_millis()).unwrap_or(u64::MAX);
+        Self::connect_with_timeouts_ms(socket_path, ms, ms)
+    }
+
     /// Connect to the agent socket and configure read/write timeouts (in seconds).
     fn connect_with_timeouts(socket_path: &Path, read_secs: u64, write_secs: u64) -> Result<Self> {
         Self::connect_with_timeouts_ms(socket_path, read_secs * 1000, write_secs * 1000)
@@ -1433,7 +1447,18 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            binary_stream: Arc::new(AtomicBool::new(false)),
+            streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
         })
+    }
+
+    /// Change the cumulative output ceiling of streaming execs on this
+    /// connection (`None`: no ceiling). Only a caller that hands every event
+    /// straight to a consumer that pushes back, such as the CLI writing to its
+    /// own stdout, should lift it: the ceiling is what stops a guest that never
+    /// stops writing when nobody is reading any more.
+    pub fn set_streaming_output_cap(&mut self, cap: Option<usize>) {
+        self.streaming_output_cap = cap;
     }
 
     /// Set a trace ID for correlating this client session's requests with host API calls.
@@ -1444,7 +1469,16 @@ impl AgentClient {
 
     /// Encode a request wrapped in an Envelope with the current trace_id.
     fn encode_traced(&self, req: &AgentRequest) -> Result<Vec<u8>> {
-        let envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        if self.binary_stream.load(Ordering::Acquire) {
+            if let Some(frame) =
+                smolvm_protocol::binary_stream::encode_request(req, self.trace_id.as_deref())
+                    .map_err(|e| Error::agent("encode binary request", e.to_string()))?
+            {
+                return Ok(frame);
+            }
+        }
+        let mut envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
         encode_message(&envelope).map_err(|e| Error::agent("encode message", e.to_string()))
     }
 
@@ -2185,6 +2219,29 @@ impl AgentClient {
         expect_data(resp, "memory status")
     }
 
+    /// Report the guest's pressure stall information from
+    /// `/proc/pressure/{cpu,memory,io}`.
+    ///
+    /// Agents older than this request reject it, and so does a guest kernel
+    /// without `CONFIG_PSI`; either is "not available", not a failure.
+    pub fn pressure_status(&mut self) -> Result<smolvm_protocol::PressureStatus> {
+        let resp = self.request(&AgentRequest::PressureStatus)?;
+        expect_data(resp, "pressure status")
+    }
+
+    /// [`Self::pressure_status`] for a periodic sampler, which must tell a
+    /// transport failure (outer `Err`: retry) from the agent's own refusal
+    /// (inner `Err`: it is older than the request, or the guest kernel has
+    /// no PSI, and every later answer would be the same).
+    pub(crate) fn pressure_status_or_refusal(
+        &mut self,
+    ) -> Result<std::result::Result<smolvm_protocol::PressureStatus, String>> {
+        match self.request(&AgentRequest::PressureStatus)? {
+            AgentResponse::Error { message, .. } => Ok(Err(message)),
+            resp => expect_data(resp, "pressure status").map(Ok),
+        }
+    }
+
     /// Test network connectivity directly from the agent (not via chroot).
     /// Used to debug TSI networking.
     pub fn network_test(&mut self, url: &str) -> Result<serde_json::Value> {
@@ -2917,12 +2974,30 @@ impl AgentClient {
     fn interactive_session_io<F>(
         &mut self,
         request: AgentRequest,
+        input: InteractiveInputReceiver,
+        on_output: F,
+        op: &str,
+        poll_timeout_ms: i32,
+    ) -> Result<i32>
+    where
+        F: FnMut(InteractiveOutput),
+    {
+        self.interactive_session_io_started(request, input, || {}, on_output, op, poll_timeout_ms)
+    }
+
+    /// [`Self::interactive_session_io`], calling `on_started` once the agent
+    /// has spawned the command and before any of its output is delivered.
+    fn interactive_session_io_started<S, F>(
+        &mut self,
+        request: AgentRequest,
         mut input: InteractiveInputReceiver,
+        on_started: S,
         mut on_output: F,
         op: &str,
         poll_timeout_ms: i32,
     ) -> Result<i32>
     where
+        S: FnOnce(),
         F: FnMut(InteractiveOutput),
     {
         use crate::agent::terminal::poll_io;
@@ -2939,6 +3014,7 @@ impl AgentClient {
             AgentResponse::Error { message, .. } => return Err(Error::agent(op, message)),
             _ => return Err(Error::agent(op, "expected Started response")),
         }
+        on_started();
 
         let socket_fd = self.stream_raw_fd();
         let mut wake_fd = input.wake_fd();
@@ -3112,6 +3188,91 @@ impl AgentClient {
             input,
             on_output,
             "run interactive (io)",
+            POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// Run a command in the VM for a node-owned exec session: stdin, resize
+    /// and end of input arrive on `input`, output goes to `on_output`, and
+    /// `on_started` runs once the command is running. Unlike
+    /// [`Self::vm_exec_interactive_io`] it passes the command's timeout to the
+    /// agent, which kills the command and reports exit code 124 when it passes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn vm_exec_session_io<S, F>(
+        &mut self,
+        command: Vec<String>,
+        env: Vec<(String, String)>,
+        workdir: Option<String>,
+        timeout: Option<Duration>,
+        tty: bool,
+        input: InteractiveInputReceiver,
+        on_started: S,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        S: FnOnce(),
+        F: FnMut(InteractiveOutput),
+    {
+        let env = with_term_default(env, tty);
+        self.interactive_session_io_started(
+            AgentRequest::VmExec {
+                command,
+                env,
+                workdir,
+                timeout_ms: timeout.map(|t| t.as_millis() as u64),
+                interactive: true,
+                tty,
+                background: false,
+                stdin_data: None,
+            },
+            input,
+            on_started,
+            on_output,
+            "vm exec session",
+            POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// [`Self::vm_exec_session_io`] for an image machine: the command runs in
+    /// the machine's container, as the configured user, with its timeout.
+    pub fn run_session_io<S, F>(
+        &mut self,
+        config: RunConfig,
+        input: InteractiveInputReceiver,
+        on_started: S,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        S: FnOnce(),
+        F: FnMut(InteractiveOutput),
+    {
+        let tty = config.tty;
+        let env = with_term_default(config.env, tty);
+        self.interactive_session_io_started(
+            AgentRequest::Run {
+                image: config.image,
+                command: config.command,
+                env,
+                workdir: config.workdir,
+                user: config.user,
+                mounts: config.mounts,
+                timeout_ms: config.timeout.map(|t| t.as_millis() as u64),
+                interactive: true,
+                tty,
+                detached: false,
+                unprivileged: config.unprivileged,
+                persistent_overlay_id: config.persistent_overlay_id,
+                stdin_data: None,
+                background: false,
+                s3_volumes: config.s3_volumes.clone(),
+                stop_vm_on_exit: false,
+                stop_signal: None,
+                stop_timeout_secs: None,
+            },
+            input,
+            on_started,
+            on_output,
+            "run session",
             POLL_TIMEOUT_MS,
         )
     }
@@ -3612,10 +3773,12 @@ impl AgentClient {
         // this one. Commands that echo as they read can otherwise fill both
         // socket directions and wait on each other indefinitely.
         let mut writer = AgentClient {
+            binary_stream: self.binary_stream.clone(),
             stream: self.stream.try_clone()?,
             trace_id: self.trace_id.clone(),
             file_target: self.file_target.clone(),
             capabilities: self.capabilities.clone(),
+            streaming_output_cap: self.streaming_output_cap,
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -3868,8 +4031,11 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let mut resp: AgentResponse = serde_json::from_slice(&buf)
+        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
+        if binary {
+            self.binary_stream.store(true, Ordering::Release);
+        }
         // Rewrite a version-skew error as it enters, so every decode site —
         // the shared match helpers and the many inline `AgentResponse::Error`
         // matches (branchpoint_*, pod_*, …) — reports the skew the same way.
@@ -3895,7 +4061,9 @@ impl AgentClient {
 /// the collect loop) instead of growing unbounded.
 ///
 /// Semantics: this is a per-exec-session cap on the BUFFERED/relayed output of
-/// the streaming exec path. Interactive PTY sessions are long-lived by design
+/// the streaming exec path, the default for every connection. The CLI lifts
+/// it (see [`AgentClient::set_streaming_output_cap`]): it writes each frame to
+/// its own stdout and stops when that pipe closes, so nothing accumulates. Interactive PTY sessions are long-lived by design
 /// and do NOT flow through here — they use
 /// [`AgentClient::interactive_session_io`], which streams frame-by-frame to the
 /// WebSocket without accumulating — so a legitimate long interactive session is
@@ -3906,7 +4074,8 @@ fn collect_exec_events<F>(client: &mut AgentClient, op: &str, on_event: F) -> Re
 where
     F: FnMut(ExecEvent),
 {
-    collect_exec_events_inner(|| client.receive(), op, MAX_STREAMING_EXEC_OUTPUT, on_event)
+    let cap = client.streaming_output_cap;
+    collect_exec_events_inner(|| client.receive(), op, cap, on_event)
 }
 
 /// Cap-parameterized core of [`collect_exec_events`], pulling responses from a
@@ -3915,7 +4084,7 @@ where
 fn collect_exec_events_inner<N, F>(
     mut next_response: N,
     op: &str,
-    cap: usize,
+    cap: Option<usize>,
     mut on_event: F,
 ) -> Result<()>
 where
@@ -3961,7 +4130,7 @@ where
         // Cap check runs after relaying each frame (matching the buffered
         // path's "send chunk, then break at the cap" order): we relay at most
         // `cap` + one frame before terminating with a truncation signal.
-        if total >= cap {
+        if let Some(cap) = cap.filter(|cap| total >= *cap) {
             on_event(ExecEvent::Error(format!(
                 "streaming output exceeded {cap} byte cap; exec terminated (output truncated)"
             )));
@@ -4251,13 +4420,40 @@ mod collect_exec_cap_tests {
                     .ok_or_else(|| Error::agent("test", "no more responses"))
             },
             "test exec",
-            cap,
+            Some(cap),
             |e| events.push(e),
         );
         (events, res)
     }
 
     const TEST_CAP: usize = 1024;
+
+    #[test]
+    fn without_a_cap_every_frame_is_relayed_until_exit() {
+        // The CLI's --stream: far past any cap, all of it arrives, then the exit.
+        let mut responses = vec![AgentResponse::Started];
+        for _ in 0..1000 {
+            responses.push(stdout(TEST_CAP));
+        }
+        responses.push(AgentResponse::Exited {
+            exit_code: 0,
+            oom: false,
+        });
+        let mut iter = responses.into_iter();
+        let mut events = Vec::new();
+        collect_exec_events_inner(
+            || {
+                iter.next()
+                    .ok_or_else(|| Error::agent("test", "no more responses"))
+            },
+            "test exec",
+            None,
+            |e| events.push(e),
+        )
+        .unwrap();
+        assert_eq!(events.len(), 1001);
+        assert_eq!(events.last(), Some(&ExecEvent::Exit(0)));
+    }
 
     #[test]
     fn stops_at_cumulative_cap_with_truncation_signal() {
@@ -6083,5 +6279,67 @@ password = "mirror-secret"
         .unwrap();
         assert_eq!(auth.username, "explicit");
         assert_eq!(auth.password, "secret");
+    }
+}
+
+#[cfg(test)]
+mod binary_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn requests_switch_only_after_peer_acknowledges_binary() {
+        for binary in [false, true] {
+            let (stream, mut peer) = UdsStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let server = std::thread::spawn(move || {
+                let read = |peer: &mut UdsStream| {
+                    let mut header = [0; 4];
+                    peer.read_exact(&mut header).unwrap();
+                    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                    peer.read_exact(&mut body).unwrap();
+                    body
+                };
+                let body = read(&mut peer);
+                assert_eq!(body[0], b'{');
+                let envelope: Envelope<AgentRequest> = serde_json::from_slice(&body).unwrap();
+                assert_eq!(envelope.binary_stream, Some(1));
+                let mut response = Envelope::new(AgentResponse::Started);
+                if binary {
+                    response.binary_stream = Some(1);
+                }
+                peer.write_all(&encode_message(&response).unwrap()).unwrap();
+                let body = read(&mut peer);
+                assert_eq!(body[0] == 0, binary);
+                let envelope = smolvm_protocol::binary_stream::decode_request(&body).unwrap();
+                assert_eq!(envelope.trace_id.as_deref(), Some("stream-trace"));
+                assert!(
+                    matches!(envelope.body, AgentRequest::Stdin { data } if data == [0, 255, 10])
+                );
+                let response = AgentResponse::Stdout {
+                    data: vec![0, 255, 10],
+                };
+                let mut frame = Vec::new();
+                if binary {
+                    smolvm_protocol::binary_stream::write_response(&mut frame, &response).unwrap();
+                } else {
+                    frame = encode_message(&response).unwrap();
+                }
+                for byte in frame {
+                    peer.write_all(&[byte]).unwrap();
+                }
+            });
+            let mut client = AgentClient::from_stream(stream);
+            client.set_trace_id("stream-trace".into());
+            client.send_raw(&AgentRequest::Ping).unwrap();
+            assert!(matches!(client.recv_raw().unwrap(), AgentResponse::Started));
+            client.send_stdin(&[0, 255, 10]).unwrap();
+            assert!(
+                matches!(client.recv_raw().unwrap(), AgentResponse::Stdout { data } if data == [0, 255, 10])
+            );
+            server.join().unwrap();
+        }
     }
 }

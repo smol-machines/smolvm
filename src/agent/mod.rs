@@ -10,6 +10,7 @@ pub mod display;
 pub mod egress_watchlist;
 pub mod fork;
 mod fsnotify_watch;
+pub mod host_gpu;
 pub mod input;
 mod krun;
 mod launcher;
@@ -102,18 +103,19 @@ pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, validate_external_interceptor,
     DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,
 };
-pub(crate) use manager::cleanup_dead_vm_runtime_in_db;
+pub(crate) use manager::{allocate_live_port, cleanup_dead_vm_runtime_in_db};
 pub use manager::{
-    apply_live_egress_policy, apply_live_published_ports, cleanup_dead_vm_runtime, lock_live_egress,
+    apply_live_credential_values, apply_live_egress_policy, apply_live_published_ports,
+    cleanup_dead_vm_runtime, lock_live_egress,
 };
 pub use manager::{
-    bind_ready_listener, disk_used_mb, docker_config_dir, docker_config_mount, ensure_vm_dir,
-    machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials, read_egress_flows,
-    read_egress_signals, read_egress_telemetry, read_mediation_machine_id,
-    read_shared_pack_pointer, resolve_disk_image, restore_base_dir, shared_pack_cache_root,
-    shared_pack_pointer_path, vm_cache_root, vm_data_dir, vm_dir_hash, vm_uid_registry_dir,
-    AgentManager, AgentState, EgressDenial, EgressFlowSummary, EgressSignal, EGRESS_TELEMETRY_FILE,
-    SHARED_PACK_POINTER,
+    bind_ready_listener, branchable_now, disk_used_mb, docker_config_dir, docker_config_mount,
+    ensure_vm_dir, machine_layers_cache_dir, prune_orphaned_ready_markers, read_egress_denials,
+    read_egress_flows, read_egress_signals, read_egress_telemetry, read_guest_pressure,
+    read_mediation_machine_id, read_shared_pack_pointer, resolve_disk_image, restore_base_dir,
+    running_forkable, shared_pack_cache_root, shared_pack_pointer_path, vm_cache_root, vm_data_dir,
+    vm_dir_hash, vm_uid_registry_dir, AgentManager, AgentState, EgressDenial, EgressFlowSummary,
+    EgressSignal, GuestPressure, PressureStall, EGRESS_TELEMETRY_FILE, SHARED_PACK_POINTER,
 };
 
 /// Agent VM name.
@@ -160,6 +162,65 @@ pub fn default_gpu_backend_for_display() {
     }
 }
 
+/// The display size requested for this boot through `SMOLVM_DISPLAY`.
+pub fn requested_display() -> Option<(u32, u32)> {
+    parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+}
+
+/// How the virtio-gpu device is set up for one boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuDevice {
+    /// No virtio-gpu device.
+    None,
+    /// Host GPU acceleration through virglrenderer (`--gpu`), with a display
+    /// when one was requested.
+    Accelerated,
+    /// A display with no host GPU. On Linux the device runs libkrun's CPU 2D
+    /// component: the guest renders in software and the host only receives
+    /// finished frames, so the VM process opens no host graphics device and
+    /// loads no host graphics library.
+    SoftwareDisplay,
+}
+
+/// Choose the virtio-gpu setup from what the machine asked for.
+pub(crate) fn gpu_device(gpu: bool, display: Option<(u32, u32)>) -> GpuDevice {
+    match (gpu, display) {
+        (true, _) => GpuDevice::Accelerated,
+        (false, Some(_)) => GpuDevice::SoftwareDisplay,
+        (false, None) => GpuDevice::None,
+    }
+}
+
+/// The `virgl_flags` for `krun_set_gpu_options2` in the given setup.
+///
+/// On Linux a software display passes no flags at all, so libkrun starts no
+/// render server and never initialises virglrenderer; [`select_gpu_backend`]
+/// must have selected the 2D component. On other hosts the display path has
+/// only ever run with the accelerated flags, and they open no device node
+/// there, so it keeps them.
+pub(crate) fn virgl_flags_for(device: GpuDevice) -> u32 {
+    if cfg!(target_os = "linux") && device == GpuDevice::SoftwareDisplay {
+        0
+    } else {
+        gpu_virgl_flags()
+    }
+}
+
+/// Select libkrun's GPU backend for the given setup. Must run before the VM
+/// starts: libkrun reads `KRUN_GPU_BACKEND` when it builds the device.
+///
+/// A software display on Linux always uses the 2D component, whatever the
+/// environment says: this is the setup chosen when the host GPU must not be
+/// touched. An accelerated display keeps the existing per-host default.
+pub(crate) fn select_gpu_backend(device: GpuDevice, display: bool) {
+    if cfg!(target_os = "linux") && device == GpuDevice::SoftwareDisplay {
+        std::env::set_var("KRUN_GPU_BACKEND", "2d");
+        tracing::info!("display without host GPU: virtio-gpu runs the CPU 2D component");
+    } else if display {
+        default_gpu_backend_for_display();
+    }
+}
+
 /// Compute the `virgl_flags` bitmask for `krun_set_gpu_options2`.
 ///
 /// Shared by both the static (`launcher.rs`) and dynamic (`launcher_dynamic.rs`)
@@ -200,6 +261,34 @@ pub(crate) fn guest_workload_env(shm_size: Option<&str>) -> Vec<std::ffi::CStrin
         })
         .into_iter()
         .collect()
+}
+
+/// Idle-poll ceiling handed to the agent at boot, shared by both launchers.
+///
+/// On a macOS host a vCPU parked in WFI takes most of a virtio-fs round trip
+/// to wake (45 us for a statvfs on a bind mount, 36 of them between the host's
+/// reply and the guest's next request). Letting the guest kernel poll briefly
+/// before parking halves the trip: 45 -> 24 us per synchronous request, and an
+/// npm ci into a bind mount 27.6 -> 26.6 s, for 0.1 to 0.4 points of a core
+/// while the machine idles. Linux and Windows hosts wake a vCPU far faster and
+/// keep the kernel's default of no polling.
+pub(crate) fn guest_idle_poll_env() -> Vec<std::ffi::CString> {
+    idle_poll_env(cfg!(target_os = "macos"))
+}
+
+/// Measured ceiling for macOS hosts: a longer poll gained nothing more on the
+/// round trip and only cost idle CPU.
+const MACOS_IDLE_POLL_US: u32 = 50;
+
+fn idle_poll_env(host_is_macos: bool) -> Vec<std::ffi::CString> {
+    if !host_is_macos {
+        return Vec::new();
+    }
+    vec![std::ffi::CString::new(format!(
+        "{}={MACOS_IDLE_POLL_US}",
+        smolvm_protocol::guest_env::IDLE_POLL_US
+    ))
+    .expect("constant has no NUL")]
 }
 
 /// Build the guest-network environment variables handed to the agent at boot.
@@ -253,6 +342,11 @@ pub(crate) fn guest_network_env(
             push(guest_env::PREFIX_LEN6, n.prefix_len6.to_string());
         }
         push(guest_env::DNS, n.dns_server.to_string());
+        // smolvm's own gateway takes large frames; a pod's tap is a real 1500
+        // link, so the guest keeps the default there.
+        if gateway_mac.is_none() {
+            push(guest_env::MTU, guest_env::GATEWAY_LINK_MTU.to_string());
+        }
     } else if let Some(dns) = crate::data::network::effective_dns(
         dns_override,
         crate::network::EffectiveNetworkBackend::Tsi,
@@ -274,6 +368,19 @@ fn format_mac(mac: [u8; 6]) -> String {
         "{:02x}:{:02x}:{:02x}:{:02x}:{:02x}:{:02x}",
         mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]
     )
+}
+
+#[cfg(test)]
+mod idle_poll_env_tests {
+    use super::idle_poll_env;
+
+    #[test]
+    fn only_a_macos_host_asks_the_guest_to_poll_before_parking() {
+        assert!(idle_poll_env(false).is_empty());
+        let env = idle_poll_env(true);
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].to_str().unwrap(), "SMOLVM_IDLE_POLL_US=50");
+    }
 }
 
 #[cfg(test)]
@@ -343,5 +450,40 @@ mod guest_network_env_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_device_tests {
+    use super::{gpu_device, GpuDevice};
+
+    #[test]
+    fn display_without_gpu_gets_the_software_display() {
+        assert_eq!(
+            gpu_device(false, Some((1024, 768))),
+            GpuDevice::SoftwareDisplay
+        );
+    }
+
+    #[test]
+    fn gpu_is_accelerated_with_or_without_a_display() {
+        assert_eq!(gpu_device(true, None), GpuDevice::Accelerated);
+        assert_eq!(gpu_device(true, Some((1024, 768))), GpuDevice::Accelerated);
+    }
+
+    #[test]
+    fn neither_gpu_nor_display_gets_no_device() {
+        assert_eq!(gpu_device(false, None), GpuDevice::None);
+    }
+
+    /// With no flags libkrun starts no render server and does not initialise
+    /// the host renderer, which is what keeps the software display from
+    /// opening a host graphics device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn software_display_passes_no_renderer_flags_on_linux() {
+        use super::virgl_flags_for;
+        assert_eq!(virgl_flags_for(GpuDevice::SoftwareDisplay), 0);
+        assert_ne!(virgl_flags_for(GpuDevice::Accelerated), 0);
     }
 }

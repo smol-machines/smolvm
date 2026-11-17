@@ -7,15 +7,12 @@
 //! and `/proc/net/tcp6` lets `status` say which case it is.
 
 use smolvm::agent::AgentClient;
-use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
+use std::net::IpAddr;
 use std::path::Path;
 use std::time::Duration;
 
 /// Upper bound on the guest read; `status` must stay quick and never hang.
 const PROBE_TIMEOUT: Duration = Duration::from_secs(3);
-
-/// TCP state code for LISTEN in `/proc/net/tcp*`.
-const TCP_LISTEN: &str = "0A";
 
 /// Whether a published guest port has a server the host can reach.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -54,54 +51,9 @@ impl GuestPortState {
     }
 }
 
-/// Parse the LISTEN sockets out of `/proc/net/tcp` and `/proc/net/tcp6`
-/// content (either or both, concatenated). Header lines, malformed lines and
-/// sockets in any other state are skipped.
-pub fn parse_listeners(proc_net_tcp: &str) -> Vec<(IpAddr, u16)> {
-    proc_net_tcp
-        .lines()
-        .filter_map(|line| {
-            let mut fields = line.split_whitespace();
-            let _slot = fields.next()?;
-            let local = fields.next()?;
-            let _remote = fields.next()?;
-            let state = fields.next()?;
-            if state != TCP_LISTEN {
-                return None;
-            }
-            let (addr_hex, port_hex) = local.split_once(':')?;
-            let port = u16::from_str_radix(port_hex, 16).ok()?;
-            Some((parse_proc_addr(addr_hex)?, port))
-        })
-        .collect()
-}
-
-/// Decode a `/proc/net/tcp*` address. The kernel prints each 32-bit word of
-/// the network-order address as a native-endian integer; smolvm guests are
-/// little-endian (x86_64, aarch64).
-fn parse_proc_addr(hex: &str) -> Option<IpAddr> {
-    let word = |chunk: &str| u32::from_str_radix(chunk, 16).ok().map(u32::to_le_bytes);
-    match hex.len() {
-        8 => Some(IpAddr::V4(Ipv4Addr::from(word(hex)?))),
-        32 => {
-            let mut octets = [0u8; 16];
-            for i in 0..4 {
-                octets[i * 4..i * 4 + 4].copy_from_slice(&word(hex.get(i * 8..i * 8 + 8)?)?);
-            }
-            Some(IpAddr::V6(Ipv6Addr::from(octets)))
-        }
-        _ => None,
-    }
-}
-
-fn is_loopback(addr: &IpAddr) -> bool {
-    match addr {
-        IpAddr::V4(v4) => v4.is_loopback(),
-        IpAddr::V6(v6) => {
-            v6.is_loopback() || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_loopback())
-        }
-    }
-}
+// Shared with the guest's auto-ports watcher, which reads the same tables.
+use smolvm_protocol::auto_ports::is_loopback;
+pub use smolvm_protocol::auto_ports::parse_listeners;
 
 /// Classify one guest port against the parsed listeners.
 pub fn classify(listeners: &[(IpAddr, u16)], guest_port: u16) -> GuestPortState {
@@ -162,6 +114,7 @@ pub fn port_states(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::{Ipv4Addr, Ipv6Addr};
 
     const TCP: &str = "\
   sl  local_address rem_address   st tx_queue rx_queue tr tm->when retrnsmt   uid  timeout inode

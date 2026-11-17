@@ -794,7 +794,7 @@ impl ForkPoolController {
 /// execution.
 fn leased_worker_is_live(record: &crate::config::VmRecord) -> bool {
     use crate::config::RecordState;
-    record.is_process_alive() || matches!(record.state, RecordState::Paused | RecordState::Pausing)
+    record.process_can_run() || matches!(record.state, RecordState::Paused | RecordState::Pausing)
 }
 
 fn update_retained_snapshot(

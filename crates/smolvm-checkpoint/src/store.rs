@@ -4132,6 +4132,8 @@ mod tests {
             guest_cpu_features: None,
             cache_disk: None,
             agent_rootfs_digest: None,
+            nested_virt: false,
+            settings: Default::default(),
         });
         manifest
     }

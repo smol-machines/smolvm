@@ -58,6 +58,7 @@ macOS arm64, where throwaway-machine's says `result=blocked`; its `SKILL.md` say
 | [gpu.md](gpu.md) | Vulkan through virtio-gpu, and CUDA API remoting |
 | [nested-virtualization.md](nested-virtualization.md) | running KVM, and so smolvm or QEMU, inside a machine |
 | [named-networks.md](named-networks.md) | machines that reach each other by IP on a shared named network |
+| [docker-engine.md](docker-engine.md) | `smolvm engine`: the Docker Engine API, so the docker CLI, Compose, Testcontainers and Dev Containers run containers as machines |
 | [browser-display.md](browser-display.md) | a machine's display in the browser or a VNC client, with keyboard and pointer |
 | [hardware-video.md](hardware-video.md) | H.264 streaming of a machine's browser display |
 | [kubernetes.md](kubernetes.md) | pods as microVMs through a `RuntimeClass` |

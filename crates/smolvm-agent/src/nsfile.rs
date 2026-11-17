@@ -45,7 +45,12 @@ use std::process::{Command, Stdio};
 /// argv marker selecting the namespace helper instead of the PID-1 agent.
 const HELPER_ARG: &str = "ns-file";
 /// This binary, re-executed for the helper.
-const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+pub(crate) const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+/// argv after the binary for the helper that only waits on its stdin: started
+/// in a new user namespace, it is the process that namespace exists through
+/// while the agent sets it up (see [`crate::mount_owner`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const USERNS_HOLD_ARGS: [&str; 2] = [HELPER_ARG, "userns-hold"];
 
 /// Whether this invocation is the namespace file helper.
 ///
@@ -88,6 +93,12 @@ pub fn run_helper() -> i32 {
                 1
             }
         };
+    }
+    // argv: [bin, "ns-file", "userns-hold"] — exits when the agent closes
+    // its stdin.
+    if args.get(2).map(String::as_str) == Some(USERNS_HOLD_ARGS[1]) {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        return 0;
     }
     // argv: [bin, "ns-file", op, pid, path, (mode), (uid), (gid)]
     if args.len() < 5 {
@@ -134,13 +145,13 @@ pub fn run_helper() -> i32 {
 /// (asm-generic). Named here because the musl `libc` the agent builds against
 /// does not export them.
 #[cfg(target_os = "linux")]
-const SYS_OPEN_TREE: libc::c_long = 428;
+pub(crate) const SYS_OPEN_TREE: libc::c_long = 428;
 #[cfg(target_os = "linux")]
-const SYS_MOVE_MOUNT: libc::c_long = 429;
+pub(crate) const SYS_MOVE_MOUNT: libc::c_long = 429;
 #[cfg(target_os = "linux")]
-const OPEN_TREE_CLONE: libc::c_uint = 1;
+pub(crate) const OPEN_TREE_CLONE: libc::c_uint = 1;
 #[cfg(target_os = "linux")]
-const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+pub(crate) const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
 
 /// Clone the attached share at `source` as a detached mount, enter the
 /// container's mount namespace, and attach the clone at `target` there. The
@@ -277,20 +288,47 @@ pub(crate) fn attach_in_every_container(
     target: &str,
     read_only: bool,
 ) -> Result<(), String> {
-    let source = source.to_string_lossy().into_owned();
     let mode = if read_only { "ro" } else { "rw" };
     in_every_container(|pid| {
+        // Each container gets the share as a new container of its user would
+        // (see `storage::add_volume_bind_mounts`).
+        let source = match container_user(Path::new(crate::paths::CRUN_ROOT_DIR), pid) {
+            Some((uid, gid)) => crate::mount_owner::bind_source(source, uid, gid),
+            None => source.to_path_buf(),
+        };
         [
             "ns-file",
             "attach-mount",
             &pid.to_string(),
             target,
-            &source,
+            &source.to_string_lossy(),
             mode,
         ]
         .map(String::from)
         .to_vec()
     })
+}
+
+/// The uid and gid the workload of the container whose first process is `pid`
+/// runs as, read from the container's bundle: that process may be the
+/// keep-alive init, which runs as root whatever the workload's user is. The
+/// bundle is found through the `status` file crun keeps for each container
+/// under `state_root`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn container_user(state_root: &Path, pid: u32) -> Option<(u32, u32)> {
+    std::fs::read_dir(state_root)
+        .ok()?
+        .flatten()
+        .find_map(|container| {
+            let status = std::fs::read(container.path().join("status")).ok()?;
+            let status: serde_json::Value = serde_json::from_slice(&status).ok()?;
+            if status["pid"].as_u64() != Some(u64::from(pid)) {
+                return None;
+            }
+            let bundle = Path::new(status["bundle"].as_str()?);
+            let config = std::fs::read(bundle.join("config.json")).ok()?;
+            crate::oci::workload_user_of_config(&serde_json::from_slice(&config).ok()?)
+        })
 }
 
 /// Unmount `target` in every workload container.
@@ -1144,6 +1182,36 @@ fn parse_ok_reply(reply: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_container_user_is_the_workload_user_its_bundle_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("crun");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(state_root.join("smolvm-a")).unwrap();
+        std::fs::create_dir_all(state_root.join("smolvm-b")).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        // The keep-alive init (the container's process) runs as root.
+        std::fs::write(
+            bundle.join("config.json"),
+            serde_json::json!({
+                "process": { "user": { "uid": 0, "gid": 0 } },
+                "annotations": { crate::oci::WORKLOAD_USER_ANNOTATION: "405:100" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = |pid: u32| {
+            serde_json::json!({ "pid": pid, "bundle": bundle.to_str().unwrap() }).to_string()
+        };
+        std::fs::write(state_root.join("smolvm-a/status"), status(7)).unwrap();
+        std::fs::write(state_root.join("smolvm-b/status"), status(42)).unwrap();
+
+        assert_eq!(container_user(&state_root, 42), Some((405, 100)));
+        // No container with that pid, or no crun state at all.
+        assert_eq!(container_user(&state_root, 9), None);
+        assert_eq!(container_user(&temp.path().join("none"), 42), None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
