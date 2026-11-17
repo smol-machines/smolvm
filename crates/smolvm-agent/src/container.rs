@@ -24,7 +24,7 @@ const CONTAINER_FILES_DIR: &str = "/run/smolvm/containers";
 /// Run a container's command as its init and stream its I/O until it exits.
 #[cfg(target_os = "linux")]
 pub fn handle_container_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     spec: ContainerStartSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let mut started = match prepare(&spec) {
@@ -57,7 +57,7 @@ pub fn handle_container_start(
 
 #[cfg(not(target_os = "linux"))]
 pub fn handle_container_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     _spec: ContainerStartSpec,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::send_response(

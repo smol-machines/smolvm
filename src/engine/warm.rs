@@ -49,6 +49,13 @@ const BASE_READY: &str = "smolvm.engine/base-ready";
 const BASE_ENGINE: &str = "smolvm.engine/base-engine";
 const IDLE: Duration = Duration::from_secs(120);
 
+/// How long a start waits for the lock before it boots instead of branching.
+const BRANCH_WAIT: Duration = Duration::from_secs(30);
+
+/// How long a collection waits for the lock before leaving the bases to the
+/// next one.
+const COLLECT_WAIT: Duration = Duration::from_secs(10);
+
 /// Containers of one image (and size) running when another starts before
 /// the engine builds the image's base.
 const RUNNING_BEFORE_BASE: usize = 2;
@@ -311,7 +318,7 @@ pub(crate) fn branch(
     if !enabled() {
         return None;
     }
-    let _gate = base_lock(engine)?;
+    let _gate = base_lock(engine, BRANCH_WAIT)?;
     let own = engine.db.get_vm(machine).ok().flatten()?;
     if own.golden.is_some() {
         return None;
@@ -344,7 +351,7 @@ pub(crate) fn branch(
 /// Stop retired bases no running container depends on, and delete the ones
 /// no container depends on at all.
 pub(crate) fn collect(engine: &Arc<Engine>) {
-    let Some(_gate) = base_lock(engine) else {
+    let Some(_gate) = base_lock(engine, COLLECT_WAIT) else {
         return;
     };
     let current = engine.bases.current();
@@ -430,6 +437,19 @@ pub(crate) async fn shutdown(engine: &Arc<Engine>) {
     let _ = tokio::task::spawn_blocking(move || collect(&e)).await;
 }
 
+/// [`shutdown`] for an engine whose state was deleted: the bases cannot be
+/// asked to stop through it, so their machines are ended directly.
+pub(crate) async fn abandon(engine: &Arc<Engine>) {
+    engine.bases.retire_all();
+    let handles: Vec<_> = engine.bases.handles.lock().drain().collect();
+    let _ = tokio::task::spawn_blocking(move || {
+        for (_, mut handle) in handles {
+            let _ = handle.stop_paused();
+        }
+    })
+    .await;
+}
+
 fn shared_base(engine: &Engine, key: &str) -> Option<String> {
     engine
         .db
@@ -447,26 +467,47 @@ fn shared_base(engine: &Engine, key: &str) -> Option<String> {
 }
 
 // Branch selection and base collection must not race across supervisors.
-// Both callers already run on blocking threads.
-fn base_lock(engine: &Engine) -> Option<std::fs::File> {
+// Both callers already run on blocking threads. Every supervisor of an engine
+// shares this lock, so the wait for it is bounded: one that stalls while
+// holding it must not keep the others from starting, collecting or exiting.
+fn base_lock(engine: &Engine, wait: Duration) -> Option<std::fs::File> {
+    lock_within(&engine.config.root.join("warm.lock"), wait)
+}
+
+fn lock_within(path: &std::path::Path, wait: Duration) -> Option<std::fs::File> {
     use std::os::fd::AsRawFd;
     let file = std::fs::OpenOptions::new()
         .create(true)
         .truncate(false)
         .read(true)
         .write(true)
-        .open(engine.config.root.join("warm.lock"))
+        .open(path)
         .ok()?;
-    // SAFETY: the lock borrows a live descriptor and retains no pointers.
-    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX) } != 0 {
-        return None;
+    let deadline = Instant::now() + wait;
+    loop {
+        // SAFETY: the lock borrows a live descriptor and retains no pointers.
+        if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+            return Some(file);
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock
+            || Instant::now() >= deadline
+        {
+            return None;
+        }
+        std::thread::sleep(Duration::from_millis(10));
     }
-    Some(file)
 }
 
 /// Prevent new branches before allowing an idle owner to exit.
 pub(crate) fn prepare_idle_exit(engine: &Engine) -> bool {
-    let Some(_gate) = base_lock(engine) else {
+    // Nothing can branch from a supervisor that owns no base, so it does not
+    // need the lock to exit.
+    if engine.bases.handles.lock().is_empty() {
+        engine.bases.retire_all();
+        return true;
+    }
+    // The supervisor asks again on its next idle check.
+    let Some(_gate) = base_lock(engine, Duration::ZERO) else {
         return false;
     };
     if has_live_dependents(engine) {
@@ -519,6 +560,23 @@ mod tests {
             endpoint: "abc".into(),
         });
         vm
+    }
+
+    #[test]
+    fn a_held_base_lock_is_given_up_on_instead_of_waited_for() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("warm.lock");
+        let held = lock_within(&path, Duration::ZERO).expect("the lock is free");
+        let started = Instant::now();
+        assert!(lock_within(&path, Duration::ZERO).is_none());
+        assert!(lock_within(&path, Duration::from_millis(50)).is_none());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        drop(held);
+        // Parallel tests spawn processes: a fork can retain this descriptor
+        // until exec closes it, even though our own descriptor was dropped.
+        // Keep the held-lock assertions nonblocking, but allow that transient
+        // inherited reference to close before proving the lock is reusable.
+        assert!(lock_within(&path, Duration::from_secs(1)).is_some());
     }
 
     #[test]

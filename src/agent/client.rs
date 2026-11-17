@@ -1113,6 +1113,7 @@ fn registry_pull_credentials(
 
 /// Client for communicating with the smolvm-agent.
 pub struct AgentClient {
+    binary_stream: Arc<AtomicBool>,
     stream: UdsStream,
     /// Trace ID for correlating this client session's requests with host API calls.
     trace_id: Option<String>,
@@ -1322,6 +1323,7 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            binary_stream: Arc::new(AtomicBool::new(false)),
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
         }
@@ -1449,6 +1451,7 @@ impl AgentClient {
             trace_id: None,
             file_target: None,
             capabilities: None,
+            binary_stream: Arc::new(AtomicBool::new(false)),
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
         })
@@ -1471,7 +1474,16 @@ impl AgentClient {
 
     /// Encode a request wrapped in an Envelope with the current trace_id.
     fn encode_traced(&self, req: &AgentRequest) -> Result<Vec<u8>> {
-        let envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        if self.binary_stream.load(Ordering::Acquire) {
+            if let Some(frame) =
+                smolvm_protocol::binary_stream::encode_request(req, self.trace_id.as_deref())
+                    .map_err(|e| Error::agent("encode binary request", e.to_string()))?
+            {
+                return Ok(frame);
+            }
+        }
+        let mut envelope = Envelope::with_trace_id(req, self.trace_id.clone());
+        envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
         encode_message(&envelope).map_err(|e| Error::agent("encode message", e.to_string()))
     }
 
@@ -3797,6 +3809,7 @@ impl AgentClient {
         // this one. Commands that echo as they read can otherwise fill both
         // socket directions and wait on each other indefinitely.
         let mut writer = AgentClient {
+            binary_stream: self.binary_stream.clone(),
             stream: self.stream.try_clone()?,
             trace_id: self.trace_id.clone(),
             file_target: self.file_target.clone(),
@@ -4055,8 +4068,11 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let mut resp: AgentResponse = serde_json::from_slice(&buf)
+        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(&buf)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
+        if binary {
+            self.binary_stream.store(true, Ordering::Release);
+        }
         // Rewrite a version-skew error as it enters, so every decode site —
         // the shared match helpers and the many inline `AgentResponse::Error`
         // matches (branchpoint_*, pod_*, …) — reports the skew the same way.
@@ -6371,5 +6387,67 @@ password = "mirror-secret"
         .unwrap();
         assert_eq!(auth.username, "explicit");
         assert_eq!(auth.password, "secret");
+    }
+}
+
+#[cfg(test)]
+mod binary_negotiation_tests {
+    use super::*;
+
+    #[test]
+    fn requests_switch_only_after_peer_acknowledges_binary() {
+        for binary in [false, true] {
+            let (stream, mut peer) = UdsStream::pair().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+            let server = std::thread::spawn(move || {
+                let read = |peer: &mut UdsStream| {
+                    let mut header = [0; 4];
+                    peer.read_exact(&mut header).unwrap();
+                    let mut body = vec![0; u32::from_be_bytes(header) as usize];
+                    peer.read_exact(&mut body).unwrap();
+                    body
+                };
+                let body = read(&mut peer);
+                assert_eq!(body[0], b'{');
+                let envelope: Envelope<AgentRequest> = serde_json::from_slice(&body).unwrap();
+                assert_eq!(envelope.binary_stream, Some(1));
+                let mut response = Envelope::new(AgentResponse::Started);
+                if binary {
+                    response.binary_stream = Some(1);
+                }
+                peer.write_all(&encode_message(&response).unwrap()).unwrap();
+                let body = read(&mut peer);
+                assert_eq!(body[0] == 0, binary);
+                let envelope = smolvm_protocol::binary_stream::decode_request(&body).unwrap();
+                assert_eq!(envelope.trace_id.as_deref(), Some("stream-trace"));
+                assert!(
+                    matches!(envelope.body, AgentRequest::Stdin { data } if data == [0, 255, 10])
+                );
+                let response = AgentResponse::Stdout {
+                    data: vec![0, 255, 10],
+                };
+                let mut frame = Vec::new();
+                if binary {
+                    smolvm_protocol::binary_stream::write_response(&mut frame, &response).unwrap();
+                } else {
+                    frame = encode_message(&response).unwrap();
+                }
+                for byte in frame {
+                    peer.write_all(&[byte]).unwrap();
+                }
+            });
+            let mut client = AgentClient::from_stream(stream);
+            client.set_trace_id("stream-trace".into());
+            client.send_raw(&AgentRequest::Ping).unwrap();
+            assert!(matches!(client.recv_raw().unwrap(), AgentResponse::Started));
+            client.send_stdin(&[0, 255, 10]).unwrap();
+            assert!(
+                matches!(client.recv_raw().unwrap(), AgentResponse::Stdout { data } if data == [0, 255, 10])
+            );
+            server.join().unwrap();
+        }
     }
 }

@@ -40,12 +40,21 @@ impl Store {
 
     pub(crate) fn save_container(&self, record: &ContainerRecord) -> crate::Result<()> {
         let dir = self.container_dir(&record.id);
-        std::fs::create_dir_all(&dir)?;
+        // Only the container's own directory: a record saved after the engine
+        // state was deleted must not bring part of that state back.
+        match std::fs::create_dir(&dir) {
+            Err(e) if e.kind() != std::io::ErrorKind::AlreadyExists => return Err(e.into()),
+            _ => {}
+        }
         write_json(&dir.join("config.json"), record)
     }
 
     pub(crate) fn remove_container(&self, id: &str) {
         let _ = std::fs::remove_dir_all(self.container_dir(id));
+    }
+
+    pub(crate) fn load_container(&self, id: &str) -> crate::Result<Option<ContainerRecord>> {
+        read_json(&self.container_dir(id).join("config.json"))
     }
 
     pub(crate) fn load_containers(&self) -> crate::Result<Vec<ContainerRecord>> {

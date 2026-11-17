@@ -2,12 +2,15 @@
 """Exercise an isolated, socket-activated engine, including SIGKILL and idle exit.
 
 Set DOCKER_HOST to its socket and SMOLVM_ENGINE_TEST_ROOT to its state directory;
-never point this test at an engine with workloads you want to keep.
+never point this test at an engine with workloads you want to keep: its last
+step deletes that state directory.
 """
 from concurrent.futures import ThreadPoolExecutor
+import fcntl
 import json
 import os
 from pathlib import Path
+import shutil
 import signal
 import socket
 import subprocess
@@ -146,6 +149,54 @@ try:
     socket_dir = Path(os.environ["DOCKER_HOST"].removeprefix("unix://")).parent
     eventually(lambda: all(not (socket_dir / f"w-{cid[:24]}.sock").exists() for cid in ids))
     print("PASS: no API or workload supervisors remain after cleanup", flush=True)
+
+    def running(pid):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        # A killed child the test's own engine has not reaped yet is not running.
+        state = subprocess.run(["ps", "-o", "stat=", "-p", str(pid)], capture_output=True, text=True).stdout
+        return bool(state.strip()) and not state.strip().startswith("Z")
+
+    def start_workload(suffix):
+        name = f"{PREFIX}-{suffix}"
+        names.append(name)
+        docker("run", "-d", "--name", name, "alpine", "sleep", "300")
+        vm = inspect(name)["State"]["Pid"]
+        supervisor = int(subprocess.check_output(["ps", "-o", "ppid=", "-p", str(vm)], text=True))
+        assert supervisor > 1, "the machine has no supervisor"
+        return name, vm, supervisor
+
+    # SIGTERM is a stop request: the supervisor stops its machine and exits.
+    name, vm, supervisor = start_workload("term")
+    os.kill(supervisor, signal.SIGTERM)
+    eventually(lambda: not running(supervisor) and not running(vm))
+    assert inspect(name)["State"]["Status"] == "exited"
+    docker("rm", name)
+    names.remove(name)
+    # Every supervisor shares warm.lock. One that stalls while holding it must
+    # not keep the others alive, nor make them deaf to a stop request.
+    idle_name, idle_vm, idle_supervisor = start_workload("locked-idle")
+    name, vm, supervisor = start_workload("locked")
+    with open(ROOT / "warm.lock", "a") as held:
+        fcntl.flock(held, fcntl.LOCK_EX)
+        docker("rm", "-f", idle_name)
+        names.remove(idle_name)
+        eventually(lambda: not running(idle_supervisor) and not running(idle_vm))
+        os.kill(supervisor, signal.SIGTERM)
+        eventually(lambda: not running(supervisor) and not running(vm), timeout=45)
+    docker("rm", name)
+    names.remove(name)
+    print("PASS: SIGTERM stops a supervisor and its machine, and a held base lock keeps none alive", flush=True)
+    # Deleted engine state leaves nothing that can reach the workload: its
+    # supervisor stops it. This ends the isolated engine, so it comes last.
+    name, vm, supervisor = start_workload("deleted")
+    assert Path(docker("info", "--format", "{{.DockerRootDir}}")).resolve() == ROOT
+    names.clear()
+    shutil.rmtree(ROOT)
+    eventually(lambda: not running(supervisor) and not running(vm), timeout=60)
+    print("PASS: deleting the engine state stops its workloads and their supervisors", flush=True)
 finally:
     for name in names:
         subprocess.run(["docker", "rm", "-f", name], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)

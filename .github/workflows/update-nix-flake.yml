@@ -19,6 +19,7 @@ on:
         type: string
 
 permissions:
+  actions: write
   contents: write
   pull-requests: write
 
@@ -28,7 +29,11 @@ jobs:
     env:
       GH_TOKEN: ${{ github.token }}
     steps:
+      # From main, not the tag: a release tag sits on its release branch, whose
+      # version bumps must not reach main through this PR.
       - uses: actions/checkout@v4
+        with:
+          ref: main
 
       - name: Bump nix/smolvm.nix
         id: bump
@@ -70,3 +75,8 @@ jobs:
           else
             echo "::warning title=nix bump PR not opened::GITHUB_TOKEN is blocked from creating PRs; branch '${branch}' is pushed — open it at ${{ github.server_url }}/${{ github.repository }}/compare/main...${branch}?expand=1"
           fi
+          # A push or PR made with the workflow token starts no workflow, so the
+          # required no-ai-attribution check would never report on this branch and
+          # the PR could not merge. A workflow_dispatch is the one event this token
+          # may start: run the check on the branch so it reports on its head.
+          gh workflow run no-ai-attribution.yml --ref "$branch"

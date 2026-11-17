@@ -300,9 +300,9 @@ test_image_commit_save_load_export_import_push() {
     [[ "$out" == committed ]]
 }
 
-# The engine builds nothing itself, but buildx's own builder (a BuildKit
-# container it starts through the engine and talks to over `docker exec`)
-# builds, and `--load` hands the image back through `docker load`.
+# Explicit docker-container builders remain compatible alongside the native
+# default: Buildx starts BuildKit through the engine and talks over exec,
+# and --load hands the result back through docker load.
 test_buildx_container_builder_builds_and_loads() {
     docker buildx version >/dev/null 2>&1 || return 0
     local builder="$PREFIX-bx" img="$PREFIX-built:1" out status=0
@@ -352,7 +352,7 @@ test_build_is_refused_clearly() {
     printf 'FROM alpine\n' >"$WORK/Dockerfile"
     local out
     out=$(DOCKER_BUILDKIT=0 docker build -q "$WORK" 2>&1) && return 1
-    echo "$out" | has 'does not build images yet'
+    echo "$out" | has 'docker buildx build --builder smol-builder'
 }
 
 # --- volumes and mounts --------------------------------------------------------

@@ -576,7 +576,7 @@ pub(crate) async fn create(
             .is_some_and(|vm| e.bases.ready_for(&e, &vm));
         let builder = if branches { None } else { crate::image_seed::builder_exe().ok() };
         if let Some(exe) = builder {
-            if let Err(error) = crate::image_seed::seed_storage(
+            match crate::image_seed::seed_storage(
                 &exe,
                 &machine_for_task,
                 &pull_ref,
@@ -586,7 +586,13 @@ pub(crate) async fn create(
                 None,
                 None,
             ) {
-                tracing::debug!(%error, machine = %machine_for_task, "no image seed for the container");
+                Ok(true) => {
+                    // The disk already holds the resolved image, including for
+                    // --network none. Do not fetch and stage it again at start.
+                    e.db.update_vm_durable(&machine_for_task, |vm| vm.mark_image_on_storage())?;
+                }
+                Ok(false) => {}
+                Err(error) => tracing::debug!(%error, machine = %machine_for_task, "no image seed for the container"),
             }
         }
         Ok(())
@@ -2275,6 +2281,35 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
     }
     for t in tasks {
         let _ = t.await;
+    }
+}
+
+/// End the owner's machine without asking its guest, for a supervisor whose
+/// engine state was deleted: the agent socket a stop goes through went with
+/// it. A machine whose own files are still there (only the engine's records
+/// were deleted) is deleted too, as no container is left to own it.
+pub(crate) async fn abandon_all(engine: &Arc<Engine>) {
+    let owned: Vec<Arc<Container>> = engine
+        .containers
+        .read()
+        .values()
+        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()))
+        .cloned()
+        .collect();
+    for c in owned {
+        let handle = c.running.lock().as_mut().and_then(|r| r.vm.take());
+        let machine = c.record().machine;
+        let e = engine.clone();
+        let _ = tokio::task::spawn_blocking(move || {
+            let kept = crate::agent::vm_data_dir(&machine).exists();
+            if let Some(mut handle) = handle {
+                let _ = handle.stop_paused();
+            }
+            if kept && e.db.get_vm(&machine).ok().flatten().is_some() {
+                let _ = crate::embedded::control::delete_vm(&e.db, &machine);
+            }
+        })
+        .await;
     }
 }
 

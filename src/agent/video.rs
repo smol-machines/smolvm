@@ -136,11 +136,25 @@ fn auto_encoder() -> Encoder {
 
     #[cfg(target_os = "linux")]
     {
-        let nvidia = Path::new("/dev/nvidia0").exists() || Path::new("/dev/nvidiactl").exists();
-        let vaapi = Path::new(
-            &std::env::var("SMOLVM_VAAPI_DEVICE").unwrap_or_else(|_| "/dev/dri/renderD128".into()),
-        )
-        .exists();
+        // A hardware encoder is chosen only when its device node answers an
+        // open. On a host whose graphics driver is not responding the
+        // encoder process would block in that open and never produce video,
+        // so the software encoder is used instead. Checked once per process.
+        static CHOICE: std::sync::OnceLock<(bool, bool)> = std::sync::OnceLock::new();
+        let (nvidia, vaapi) = *CHOICE.get_or_init(|| {
+            let nvidia_node = ["/dev/nvidiactl", "/dev/nvidia0"]
+                .into_iter()
+                .map(Path::new)
+                .find(|node| node.exists());
+            let nvidia = nvidia_node.is_some_and(super::host_gpu::node_responds);
+            let vaapi_node = std::env::var("SMOLVM_VAAPI_DEVICE")
+                .unwrap_or_else(|_| "/dev/dri/renderD128".into());
+            let vaapi_node = Path::new(&vaapi_node);
+            // Only looked at when it would be used.
+            let vaapi =
+                !nvidia && vaapi_node.exists() && super::host_gpu::node_responds(vaapi_node);
+            (nvidia, vaapi)
+        });
         return linux_auto_encoder(nvidia, vaapi);
     }
 

@@ -103,6 +103,27 @@ pub fn export_overlay_owner(vm_name: &str, vm: &VmRecord) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageExportSource {
+    Artifact,
+    LocalArchiveOrDir,
+    StorageOrRegistry { rebase_from_registry: bool },
+}
+
+fn image_export_source(vm: &VmRecord, rebase_from_image: bool) -> Option<ImageExportSource> {
+    let image = vm.image.as_deref()?;
+    let is_local = crate::data::image_source::is_local_ref(image);
+    if vm.packed_layer_source().is_some() && (!rebase_from_image || is_local) {
+        return Some(ImageExportSource::Artifact);
+    }
+    if is_local && !vm.packed_image_on_storage {
+        return Some(ImageExportSource::LocalArchiveOrDir);
+    }
+    Some(ImageExportSource::StorageOrRegistry {
+        rebase_from_registry: rebase_from_image && !is_local,
+    })
+}
+
 /// Collect a stopped machine's pack assets into `collector` and report the
 /// pack mode. The caller has already: loaded the record, verified the machine
 /// is stopped, and collected its base assets (runtime libs, agent rootfs,
@@ -121,8 +142,6 @@ pub fn collect_from_vm_assets(
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
-    let is_artifact_sourced =
-        is_image_based && vm.source_smolmachine.is_some() && !vm.packed_image_on_storage;
 
     if !is_image_based && !overlay_disk.exists() {
         return Err(Error::agent(
@@ -140,81 +159,92 @@ pub fn collect_from_vm_assets(
     let mut image_env: Vec<String> = Vec::new();
     let mut image_user: Option<String> = None;
 
-    if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(
-            collector,
-            vm_name,
-            &overlay_owner,
-            &vm_dir,
-            staging_dir,
-            vm.source_smolmachine.as_deref(),
-            opts.include_workspace,
-        )?;
-    } else if is_image_based {
-        let image = vm.image.clone().unwrap();
-        // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
-        // dir) is flattened on boot and has no registry manifest, so the
-        // in-VM re-pull below cannot source it. Fail with a clear, actionable
-        // message instead of a confusing registry "UNAUTHORIZED" on
-        // `local:<hash>`.
-        if crate::data::image_source::is_local_ref(&image) {
-            // No registry manifest to re-pull, but the base rootfs is still
-            // reachable: an archive was flattened onto the machine's own storage
-            // disk at boot, and a rootfs dir is still the host directory the
-            // machine boots from. Either can be the lower layer.
+    match image_export_source(vm, opts.rebase_from_image) {
+        Some(ImageExportSource::Artifact) => {
+            if opts.rebase_from_image {
+                tracing::info!(
+                    image = %vm.image.as_deref().unwrap_or_default(),
+                    "local image has no registry base to rebase onto; packing from artifact"
+                );
+            }
+            export_flattened_from_artifact_sourced(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                staging_dir,
+                vm.source_smolmachine.as_deref(),
+                opts.include_workspace,
+            )?;
+        }
+        Some(ImageExportSource::LocalArchiveOrDir) => {
+            let image = vm.image.as_deref().unwrap();
             export_flattened_from_local_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                &image,
+                image,
                 opts.include_workspace,
             )?;
-        } else {
+        }
+        Some(ImageExportSource::StorageOrRegistry {
+            rebase_from_registry,
+        }) => {
+            let image = vm.image.as_deref().unwrap();
+            let mut effective_opts = opts.clone();
+            effective_opts.rebase_from_image = rebase_from_registry;
+            if opts.rebase_from_image && !rebase_from_registry {
+                tracing::info!(
+                    image = %image,
+                    "local image has no registry base to rebase onto; packing from storage"
+                );
+            }
             (image_env, image_user) = export_flattened_from_registry_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                &image,
-                opts,
+                image,
+                &effective_opts,
             )?;
         }
-    } else {
-        // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
-        // from the template; a default-size overlay is a qcow2 CoW image and
-        // must be flattened to a raw before it can be a template.
-        let overlay_for_pack = match overlay_fmt {
-            DiskFormat::Raw => overlay_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("overlay-flat.raw");
-                flatten_qcow2_to_raw(&overlay_disk, &flat)?;
-                flat
-            }
-        };
-        println!("Copying overlay disk ({})...", overlay_for_pack.display());
-        collector
-            .add_overlay_template(&overlay_for_pack)
-            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        None => {
+            // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
+            // from the template; a default-size overlay is a qcow2 CoW image and
+            // must be flattened to a raw before it can be a template.
+            let overlay_for_pack = match overlay_fmt {
+                DiskFormat::Raw => overlay_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = staging_dir.join("overlay-flat.raw");
+                    flatten_qcow2_to_raw(&overlay_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying overlay disk ({})...", overlay_for_pack.display());
+            collector
+                .add_overlay_template(&overlay_for_pack)
+                .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
 
-        if !storage_disk.exists() {
-            return Err(Error::agent(
-                "collect storage",
-                format!("storage disk not found at {}", storage_disk.display()),
-            ));
-        }
-        let storage_for_pack = match storage_fmt {
-            DiskFormat::Raw => storage_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("storage-flat.raw");
-                flatten_qcow2_to_raw(&storage_disk, &flat)?;
-                flat
+            if !storage_disk.exists() {
+                return Err(Error::agent(
+                    "collect storage",
+                    format!("storage disk not found at {}", storage_disk.display()),
+                ));
             }
-        };
-        println!("Copying storage disk ({})...", storage_for_pack.display());
-        collector
-            .add_vm_storage_template(&storage_for_pack)
-            .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+            let storage_for_pack = match storage_fmt {
+                DiskFormat::Raw => storage_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = staging_dir.join("storage-flat.raw");
+                    flatten_qcow2_to_raw(&storage_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying storage disk ({})...", storage_for_pack.display());
+            collector
+                .add_vm_storage_template(&storage_for_pack)
+                .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+        }
     }
 
     Ok(FromVmAssets {
@@ -876,11 +906,19 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<(Vec<String>, Option<String>)> {
-    let export_vm = ExportVm::start(vm_name, vm_dir, None, opts.rebase_from_image, opts.dns)?;
+    let rebase_from_registry =
+        opts.rebase_from_image && !crate::data::image_source::is_local_ref(image);
+    if opts.rebase_from_image && !rebase_from_registry {
+        tracing::info!(
+            image = %image,
+            "local image has no registry base to rebase onto; packing from storage"
+        );
+    }
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, rebase_from_registry, opts.dns)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
-    let image_info = if opts.rebase_from_image {
+    let image_info = if rebase_from_registry {
         eprintln!("Pulling {} in export VM...", image);
         client
             .pull_with_registry_config_and_progress(
@@ -949,6 +987,56 @@ mod cached_export_tests {
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
     use std::io::{Read, Write};
+
+    #[test]
+    fn cached_layer_order_excludes_workspace_and_unfinished_extractions() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::create_dir_all(layers.join("unfinished.partial")).unwrap();
+        std::fs::write(layers.join("workspace-seed/workspace.tar"), "workspace").unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("image.tar"), "image").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/image.tar".into()])
+        );
+    }
+
+    #[test]
+    fn cached_layer_order_preserves_manifest_order_and_requires_all_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::write(layers.join("zzz.tar"), "base").unwrap();
+        std::fs::create_dir(layers.join("aaa")).unwrap();
+        // Never guess alphabetical order for a multi-layer image.
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("layer-order"), "zzz\naaa\n").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/zzz.tar".into(), "layers/aaa".into()])
+        );
+        std::fs::remove_file(layers.join("zzz.tar")).unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+    }
+
+    #[test]
+    fn cached_layer_order_rejects_metadata_and_unsafe_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        for id in [
+            "workspace-seed",
+            "..",
+            "../layers/workspace-seed",
+            "evil'command",
+            "unfinished.partial",
+        ] {
+            std::fs::write(layers.join("layer-order"), id).unwrap();
+            assert_eq!(ordered_cached_layer_ids(temp.path()), None, "{id}");
+        }
+    }
     /// An export helper whose creator died is stopped and its scratch removed;
     /// a live process that was not booted from the scratch is left alone.
     #[cfg(target_os = "linux")]
@@ -1342,8 +1430,8 @@ fn export_flattened_from_artifact_sourced(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}) and could not be rebuilt: \
-                 the source artifact ({}) is not available. Restore the source \
+                 imported layer cache is incomplete or has no usable layer order ({}) \
+                 and could not be rebuilt from the source artifact ({}). Restore the source \
                  .smolmachine at that path, or start the machine once to \
                  re-extract, then re-run the export.",
                 pack_content_dir.display(),
@@ -1413,8 +1501,18 @@ fn export_flattened_from_artifact_sourced(
 /// when the cache (or its ordering) is gone.
 fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
-    let order_path = layers_dir.join("layer-order");
     let cached_form = |id: &str| -> Option<String> {
+        // Workspace seeds and interrupted extraction directories are metadata,
+        // not image layers; IDs also enter a guest shell command below.
+        if id.is_empty()
+            || matches!(id, "." | ".." | "workspace-seed")
+            || smolvm_pack::extract::is_partial_dir_name(id)
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return None;
+        }
         if layers_dir.join(id).is_dir() {
             Some(format!("layers/{}", id))
         } else if layers_dir.join(format!("{id}.tar")).is_file() {
@@ -1423,7 +1521,8 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
             None
         }
     };
-    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+    let order = cached_layer_order(pack_content_dir);
+    if let Some(contents) = order {
         let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
@@ -1447,6 +1546,22 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
         return None;
     }
     Some(entries)
+}
+
+fn cached_layer_order(pack_content_dir: &Path) -> Option<String> {
+    if let Ok(order) = std::fs::read_to_string(pack_content_dir.join("layers/layer-order")) {
+        return Some(order);
+    }
+    // Older macOS caches recorded order only on their case-sensitive volume.
+    // Lease it while reading the index, then export the retained original tars
+    // from the pack root; the helper's shared-cache mount contract is unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let lease = smolvm_pack::extract::acquire_layers_lease(pack_content_dir, false).ok()?;
+        std::fs::read_to_string(lease.path.join("layer-order")).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source
@@ -1806,7 +1921,10 @@ mod env_merge_tests {
 
 #[cfg(test)]
 mod from_vm_manifest_tests {
-    use super::{export_dns, export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
+    use super::{
+        export_dns, export_overlay_owner, image_export_source, seed_manifest_from_vm, FromVmAssets,
+        ImageExportSource,
+    };
     use crate::config::VmRecord;
     use smolvm_pack::{PackManifest, PackMode};
 
@@ -1933,6 +2051,43 @@ mod from_vm_manifest_tests {
         clone.golden = Some("orig".to_string());
         clone.fork_overlay_owner = Some("shared-owner".to_string());
         assert_eq!(export_overlay_owner("clone", &clone), "shared-owner");
+    }
+
+    /// A pack prepared on the machine's storage disk keeps its source image's
+    /// `local:` reference, but stores its layers in `/storage/layers` +
+    /// `/storage/manifests` rather than `/storage/image-archives`.
+    #[test]
+    fn a_local_image_on_storage_exports_from_storage_not_archive() {
+        let mut rec = record("m");
+        rec.image = Some("local:abc123".to_string());
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::LocalArchiveOrDir)
+        );
+
+        rec.source_smolmachine = Some("/tmp/source.smolmachine".to_string());
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::Artifact)
+        );
+        assert_eq!(
+            image_export_source(&rec, true),
+            Some(ImageExportSource::Artifact)
+        );
+
+        rec.packed_image_on_storage = true;
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::StorageOrRegistry {
+                rebase_from_registry: false
+            })
+        );
+        assert_eq!(
+            image_export_source(&rec, true),
+            Some(ImageExportSource::StorageOrRegistry {
+                rebase_from_registry: false
+            })
+        );
     }
 }
 

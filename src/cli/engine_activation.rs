@@ -19,6 +19,10 @@ fn run(program: &str, args: &[&str]) -> smolvm::Result<()> {
 }
 
 pub(super) fn install(config: &EngineConfig) -> smolvm::Result<()> {
+    install_command(config, "serve")
+}
+
+pub(super) fn install_command(config: &EngineConfig, command: &str) -> smolvm::Result<()> {
     use std::os::unix::fs::PermissionsExt;
     let parent = config
         .socket
@@ -51,7 +55,7 @@ pub(super) fn install(config: &EngineConfig) -> smolvm::Result<()> {
         std::fs::write(dir.join(format!("{name}.socket")), systemd_socket(config))?;
         std::fs::write(
             dir.join(format!("{name}.service")),
-            systemd_service(config, &exe),
+            systemd_service_command(config, &exe, command),
         )?;
         run(
             "systemctl",
@@ -77,7 +81,7 @@ pub(super) fn install(config: &EngineConfig) -> smolvm::Result<()> {
         let dir = home.join("Library/LaunchAgents");
         std::fs::create_dir_all(&dir)?;
         let path = dir.join(format!("{name}.plist"));
-        let plist = launch_agent(config, &exe, &name);
+        let plist = launch_agent_command(config, &exe, &name, command);
         let changed = std::fs::read_to_string(&path).ok().as_deref() != Some(&plist);
         std::fs::write(&path, plist)?;
         // Existing workloads are independent; changing the registration never stops them.
@@ -132,19 +136,27 @@ pub(super) fn uninstall(config: &EngineConfig) -> smolvm::Result<()> {
     let name = service_name(config);
     let home =
         dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
+    // The service manager keeps a registration made from a state directory
+    // after that directory, and the unit files in it, are deleted. So the
+    // registration is removed by name, whether or not its files are there.
     #[cfg(target_os = "linux")]
     {
         let dir = dirs::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("systemd/user");
-        if dir.join(format!("{name}.socket")).exists() {
-            run(
-                "systemctl",
-                &["--user", "disable", "--now", &format!("{name}.socket")],
-            )?;
-            run("systemctl", &["--user", "stop", &format!("{name}.service")])?;
-            std::fs::remove_file(dir.join(format!("{name}.socket")))?;
-            std::fs::remove_file(dir.join(format!("{name}.service")))?;
+        let (socket, service) = (format!("{name}.socket"), format!("{name}.service"));
+        let files = dir.join(&socket).exists();
+        let disabled = run("systemctl", &["--user", "disable", "--now", &socket]);
+        let stopped = run("systemctl", &["--user", "stop", &service]);
+        let unlinked = run("systemctl", &["--user", "disable", &service]).is_ok();
+        let known = files || disabled.is_ok() || unlinked;
+        if files {
+            disabled?;
+            stopped?;
+        }
+        if known {
+            let _ = std::fs::remove_file(dir.join(&socket));
+            let _ = std::fs::remove_file(dir.join(&service));
             run("systemctl", &["--user", "daemon-reload"])?;
         }
     }
@@ -153,13 +165,51 @@ pub(super) fn uninstall(config: &EngineConfig) -> smolvm::Result<()> {
         let path = home
             .join("Library/LaunchAgents")
             .join(format!("{name}.plist"));
-        if path.exists() {
+        match std::fs::remove_file(path) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(e.into()),
+        }
+        if registered(config) {
             let domain = format!("gui/{}", unsafe { libc::getuid() });
             run("launchctl", &["bootout", &format!("{domain}/{name}")])?;
-            std::fs::remove_file(path)?;
         }
     }
     Ok(())
+}
+
+/// [`uninstall`] for a caller that may be running in the service: nothing
+/// here waits for the service to stop, which would wait for the caller.
+pub(super) fn forget(config: &EngineConfig) {
+    let name = service_name(config);
+    #[cfg(target_os = "linux")]
+    {
+        let _ = run(
+            "systemctl",
+            &["--user", "disable", &format!("{name}.service")],
+        );
+        let _ = run(
+            "systemctl",
+            &[
+                "--user",
+                "--no-block",
+                "disable",
+                "--now",
+                &format!("{name}.socket"),
+            ],
+        );
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let target = format!("gui/{}/{name}", unsafe { libc::getuid() });
+        let _ = std::process::Command::new("launchctl")
+            .args(["bootout", &target])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    let _ = name;
 }
 
 pub(super) fn registered(config: &EngineConfig) -> bool {
@@ -213,11 +263,16 @@ fn systemd_socket(config: &EngineConfig) -> String {
     format!("[Unit]\nDescription=SmolVM Docker API socket\n[Socket]\nListenStream={}\nSocketMode=0600\nDirectoryMode=0700\nRemoveOnStop=true\n[Install]\nWantedBy=sockets.target\n", config.socket.to_string_lossy().replace('%', "%%"))
 }
 #[cfg(any(target_os = "linux", test))]
+#[cfg(test)]
 fn systemd_service(config: &EngineConfig, exe: &Path) -> String {
+    systemd_service_command(config, exe, "serve")
+}
+#[cfg(any(target_os = "linux", test))]
+fn systemd_service_command(config: &EngineConfig, exe: &Path, command: &str) -> String {
     let args = [
         exe.to_string_lossy().into_owned(),
         "engine".into(),
-        "serve".into(),
+        command.into(),
         "--socket".into(),
         config.socket.to_string_lossy().into_owned(),
         "--root".into(),
@@ -239,11 +294,16 @@ fn xml(s: &str) -> String {
         .replace('\'', "&apos;")
 }
 #[cfg(any(target_os = "macos", test))]
+#[cfg(test)]
 fn launch_agent(config: &EngineConfig, exe: &Path, name: &str) -> String {
+    launch_agent_command(config, exe, name, "serve")
+}
+#[cfg(any(target_os = "macos", test))]
+fn launch_agent_command(config: &EngineConfig, exe: &Path, name: &str, command: &str) -> String {
     let args = [
         exe.to_string_lossy().into_owned(),
         "engine".into(),
-        "serve".into(),
+        command.into(),
         "--socket".into(),
         config.socket.to_string_lossy().into_owned(),
         "--root".into(),
@@ -282,6 +342,28 @@ fn launch_agent(config: &EngineConfig, exe: &Path, name: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn builder_activation_selects_native_protocol_without_a_resident_process() {
+        let engine = EngineConfig {
+            socket: "/tmp/docker.sock".into(),
+            root: "/tmp/state".into(),
+        };
+        let builder = smolvm::engine::builder::config(&engine);
+        let unit = systemd_service_command(&builder, Path::new("/bin/smolvm"), "buildkit-serve");
+        assert!(unit.contains("buildkit-serve"));
+        assert!(!unit.contains("Restart="));
+        let plist = launch_agent_command(
+            &builder,
+            Path::new("/bin/smolvm"),
+            "builder",
+            "buildkit-serve",
+        );
+        assert!(plist.contains("<string>buildkit-serve</string>"));
+        assert!(plist.contains("/tmp/docker.buildkit.sock"));
+        assert!(!plist.contains("KeepAlive"));
+        assert!(!plist.contains("RunAtLoad"));
+    }
+
     #[test]
     fn activation_does_not_start_an_idle_service_or_kill_workloads() {
         let c = EngineConfig {

@@ -4,7 +4,7 @@
 use std::os::fd::{AsRawFd, FromRawFd};
 use std::path::{Path, PathBuf};
 use std::sync::{
-    atomic::{AtomicUsize, Ordering},
+    atomic::{AtomicBool, AtomicUsize, Ordering},
     Arc,
 };
 use std::time::{Duration, Instant};
@@ -111,22 +111,24 @@ async fn worker(engine: &Engine, id: &str) -> ApiResult<(tokio::net::UnixStream,
         return Ok((s, spawn));
     }
     use std::os::unix::process::CommandExt;
+    let ready = ReadySocket::bind(path.with_extension("ready"))?;
     let log = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(engine.store.container_dir(id).join("supervisor.log"))
         .map_err(internal)?;
-    let mut cmd = std::process::Command::new(std::env::current_exe().map_err(internal)?);
+    let mut cmd = tokio::process::Command::new(std::env::current_exe().map_err(internal)?);
     cmd.args(["engine", "supervise", "--id", id, "--socket"])
         .arg(&engine.config.socket)
         .arg("--root")
         .arg(&engine.config.root)
+        .env("SMOLVM_ENGINE_READY_SOCKET", &ready.path)
         .stdin(std::process::Stdio::null())
         .stdout(log.try_clone().map_err(internal)?)
         .stderr(log);
     // SAFETY: setsid is async-signal-safe and the child immediately execs.
     unsafe {
-        cmd.pre_exec(|| {
+        cmd.as_std_mut().pre_exec(|| {
             if libc::setsid() < 0 {
                 return Err(std::io::Error::last_os_error());
             }
@@ -134,28 +136,44 @@ async fn worker(engine: &Engine, id: &str) -> ApiResult<(tokio::net::UnixStream,
         });
     }
     let mut child = cmd.spawn().map_err(internal)?;
-    // Reap the child while this adapter exists; its lifetime is otherwise independent.
-    let deadline = Instant::now() + Duration::from_secs(60);
-    loop {
-        if let Ok(s) = tokio::net::UnixStream::connect(&path).await {
-            std::thread::spawn(move || {
-                let _ = child.wait();
-            });
-            return Ok((s, spawn));
+    if let Err(error) = ready.wait(&mut child, Duration::from_secs(60)).await {
+        let _ = child.kill().await;
+        return Err(error);
+    }
+    tokio::spawn(async move {
+        let _ = child.wait().await;
+    });
+    let stream = tokio::net::UnixStream::connect(&path)
+        .await
+        .map_err(internal)?;
+    Ok((stream, spawn))
+}
+
+// Owned under the per-container spawn lock; stale notifications cannot be reused.
+struct ReadySocket {
+    listener: tokio::net::UnixListener,
+    path: PathBuf,
+}
+impl ReadySocket {
+    fn bind(path: PathBuf) -> ApiResult<Self> {
+        let listener = super::bind_socket(&path).map_err(internal)?;
+        Ok(Self { listener, path })
+    }
+
+    async fn wait(&self, child: &mut tokio::process::Child, timeout: Duration) -> ApiResult<()> {
+        tokio::select! {
+            result = self.listener.accept() => { result.map_err(internal)?; Ok(()) }
+            status = child.wait() => Err(ApiError::internal(format!("workload supervisor exited: {}", status.map_err(internal)?))),
+            _ = tokio::time::sleep(timeout) => Err(ApiError::internal("workload supervisor did not become ready")),
         }
-        if let Some(status) = child.try_wait().map_err(internal)? {
-            return Err(ApiError::internal(format!(
-                "workload supervisor exited: {status}"
-            )));
-        }
-        if Instant::now() >= deadline {
-            return Err(ApiError::internal(
-                "workload supervisor did not become ready",
-            ));
-        }
-        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
+impl Drop for ReadySocket {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.path);
+    }
+}
+
 fn internal(e: impl std::fmt::Display) -> ApiError {
     ApiError::internal(e.to_string())
 }
@@ -245,16 +263,54 @@ fn component(value: &str) -> ApiResult<String> {
     String::from_utf8(decoded).map_err(|_| ApiError::bad_request("container name is not UTF-8"))
 }
 
+// Read-only owner operations use the supervisor's live record. Mutations and
+// cross-container operations still refresh all state before executing.
+fn owner_only_request(owner: &str, method: &axum::http::Method, path: &str) -> bool {
+    let Some(rest) = path.strip_prefix("/containers/") else {
+        return false;
+    };
+    let Some((id, action)) = rest.split_once('/') else {
+        return false;
+    };
+    id == owner
+        && matches!(
+            (method.as_str(), action),
+            ("GET", "json" | "logs" | "top" | "stats") | ("POST", "wait" | "attach" | "resize")
+        )
+}
+
+fn resolve_container(engine: &Engine, name: &str) -> ApiResult<String> {
+    if name.len() == 64 && name.bytes().all(|b| b.is_ascii_hexdigit()) {
+        if let Some(record) = engine.store.load_container(name).map_err(internal)? {
+            if record.id == name {
+                return Ok(record.id);
+            }
+        }
+    }
+    // Names, partial IDs and even a 64-character hex name retain the original
+    // resolution rules. Reload from disk so another process's rename is visible.
+    engine.refresh_containers().map_err(internal)?;
+    engine
+        .find_container(name)
+        .map(|c| c.id())
+        .ok_or_else(|| ApiError::no_such_container(name))
+}
+
 async fn dispatch_inner(
     engine: &Arc<Engine>,
     mut req: Request,
     next: axum::middleware::Next,
 ) -> ApiResult<Response> {
-    engine.refresh().map_err(internal)?;
-    if engine.owner.is_some() {
+    let path = req.uri().path().to_string();
+    if matches!(path.as_str(), "/_ping" | "/version") {
         return Ok(next.run(req).await);
     }
-    let path = req.uri().path().to_string();
+    if engine.owner.is_some() {
+        if !owner_only_request(engine.owner.as_deref().unwrap(), req.method(), &path) {
+            engine.refresh().map_err(internal)?;
+        }
+        return Ok(next.run(req).await);
+    }
     let mut target = None;
     if let Some(rest) = path.strip_prefix("/containers/") {
         let id = rest.split('/').next().unwrap_or("");
@@ -265,10 +321,7 @@ async fn dispatch_inner(
         if !collection {
             let suffix = &rest[id.len()..];
             let name = component(id)?;
-            let id = engine
-                .find_container(&name)
-                .ok_or_else(|| ApiError::no_such_container(&name))?
-                .id();
+            let id = resolve_container(engine, &name)?;
             // Canonical IDs also avoid static route collisions for names such
             // as "create" when the supervisor receives DELETE /containers/{id}.
             let query = req
@@ -281,7 +334,10 @@ async fn dispatch_inner(
                 .map_err(internal)?;
             target = Some(id);
         }
-    } else if let Some(rest) = path.strip_prefix("/exec/") {
+    } else {
+        engine.refresh().map_err(internal)?;
+    }
+    if let Some(rest) = path.strip_prefix("/exec/") {
         let id = rest.split('/').next().unwrap_or("");
         if id.len() == 64 && id.bytes().all(|b| b.is_ascii_hexdigit()) {
             if let Ok(bytes) = std::fs::read(engine.store.object_path("execs", id)) {
@@ -320,11 +376,25 @@ async fn dispatch_inner(
     if let Some(id) = target {
         return forward(engine, &id, req).await;
     }
+    if path.starts_with("/containers/") {
+        engine.refresh().map_err(internal)?;
+    }
     Ok(next.run(req).await)
 }
 
+/// Whether `path` still names the directory `held` was opened on. Holding it
+/// open keeps its inode from being reused, so a directory that was deleted
+/// and made again never passes for the one that was there.
+fn same_directory(path: &Path, held: &std::fs::File) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    match (std::fs::metadata(path), held.metadata()) {
+        (Ok(now), Ok(then)) => now.dev() == then.dev() && now.ino() == then.ino(),
+        _ => false,
+    }
+}
+
 /// Adopt the listener owned by the OS instead of unlinking its socket.
-fn activated_listener() -> std::io::Result<Option<tokio::net::UnixListener>> {
+pub(super) fn activated_listener() -> std::io::Result<Option<tokio::net::UnixListener>> {
     #[cfg(target_os = "linux")]
     let fd = {
         if std::env::var("LISTEN_PID").ok().as_deref() != Some(&std::process::id().to_string()) {
@@ -414,29 +484,73 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
         )?;
     }
     let app = super::api::router(engine.clone());
+    if engine.owner.is_some() {
+        if let Some(path) = std::env::var_os("SMOLVM_ENGINE_READY_SOCKET") {
+            // The public socket is listening and recovery is complete. The
+            // parent's subsequent HTTP ping still acknowledges acceptance.
+            let _ready = tokio::net::UnixStream::connect(path).await?;
+        }
+    }
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let e = engine.clone();
+    let root = std::fs::File::open(&engine.config.root)?;
+    let state_deleted = Arc::new(AtomicBool::new(false));
+    let deleted = state_deleted.clone();
     let exit_socket = socket.clone();
     let shutdown = async move {
-        loop {
-            tokio::select! {
-                _ = term.recv() => return None,
-                _ = tokio::signal::ctrl_c() => return None,
-                _ = tokio::time::sleep(Duration::from_millis(200)) => {
-                    let running = e.owner.as_deref().and_then(|id|e.find_container(id)).is_some_and(|c|c.is_running() || c.record().state.status=="restarting");
-                    if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
-                        if let Some(id) = &e.owner {
-                            if let Ok(gate) = lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
+        // The idle check waits on locks other processes hold. A stop request
+        // must not wait behind it, so it is a branch of its own.
+        let idle = async {
+            loop {
+                tokio::time::sleep(Duration::from_millis(200)).await;
+                // Nothing can list, stop or remove a workload whose engine state
+                // was deleted, so its supervisor stops it instead of leaving
+                // both running out of reach.
+                if e.owner.is_some() && !same_directory(&e.config.root, &root) {
+                    deleted.store(true, Ordering::SeqCst);
+                    return None;
+                }
+                let running = e
+                    .owner
+                    .as_deref()
+                    .and_then(|id| e.find_container(id))
+                    .is_some_and(|c| c.is_running() || c.record().state.status == "restarting");
+                if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
+                    if let Some(id) = &e.owner {
+                        match lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
+                            Ok(gate) => {
                                 let warm = e.clone();
-                                if e.activity.idle() && tokio::task::spawn_blocking(move || super::warm::prepare_idle_exit(&warm)).await.unwrap_or(false) {
+                                if e.activity.idle()
+                                    && tokio::task::spawn_blocking(move || {
+                                        super::warm::prepare_idle_exit(&warm)
+                                    })
+                                    .await
+                                    .unwrap_or(false)
+                                {
                                     let _ = std::fs::remove_file(&exit_socket);
                                     return Some(gate);
                                 }
                             }
-                        } else { return None; }
+                            // An idle, workload-free supervisor has nothing left to
+                            // coordinate when its engine state has been deleted.
+                            Err(error)
+                                if error.kind() == std::io::ErrorKind::NotFound
+                                    && !e.config.root.exists() =>
+                            {
+                                return None
+                            }
+                            Err(_) => {}
+                        }
+                    } else {
+                        return None;
                     }
                 }
             }
+        };
+        tokio::select! {
+            _ = term.recv() => None,
+            _ = tokio::signal::ctrl_c() => None,
+            gate = idle => gate,
         }
     };
     // On an explicit stop, bound the drain: an events stream may never end.
@@ -455,8 +569,13 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
         gate = shutdown => { let _ = stop.send(()); let _ = tokio::time::timeout(Duration::from_secs(5), &mut server).await; gate }
     };
     if engine.owner.is_some() {
-        super::containers::shutdown_all(&engine).await;
-        super::warm::shutdown(&engine).await;
+        if state_deleted.load(Ordering::SeqCst) {
+            super::containers::abandon_all(&engine).await;
+            super::warm::abandon(&engine).await;
+        } else {
+            super::containers::shutdown_all(&engine).await;
+            super::warm::shutdown(&engine).await;
+        }
     }
     if !os_owned {
         let _ = std::fs::remove_file(socket);
@@ -577,6 +696,74 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[tokio::test]
+    async fn supervisor_readiness_is_signalled_and_socket_is_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("ready");
+        let ready = ReadySocket::bind(path.clone()).unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let notify =
+            tokio::spawn(async move { tokio::net::UnixStream::connect(path).await.unwrap() });
+        ready
+            .wait(&mut child, Duration::from_secs(5))
+            .await
+            .unwrap();
+        let _connection = notify.await.unwrap();
+        child.kill().await.unwrap();
+        let path = ready.path.clone();
+        drop(ready);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test]
+    async fn supervisor_exit_before_ready_is_reported() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = ReadySocket::bind(dir.path().join("ready")).unwrap();
+        let mut child = tokio::process::Command::new("sh")
+            .args(["-c", "exit 7"])
+            .spawn()
+            .unwrap();
+        let error = ready
+            .wait(&mut child, Duration::from_secs(5))
+            .await
+            .unwrap_err();
+        assert!(error.message.contains("exited"), "{}", error.message);
+        assert_eq!(child.wait().await.unwrap().code(), Some(7));
+    }
+
+    #[tokio::test]
+    async fn supervisor_readiness_timeout_is_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let ready = ReadySocket::bind(dir.path().join("ready")).unwrap();
+        let mut child = tokio::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let error = ready
+            .wait(&mut child, Duration::from_millis(10))
+            .await
+            .unwrap_err();
+        child.kill().await.unwrap();
+        assert!(error.message.contains("did not become ready"));
+    }
+
+    #[test]
+    fn a_state_directory_deleted_and_made_again_is_not_the_same_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("engine");
+        std::fs::create_dir(&root).unwrap();
+        let held = std::fs::File::open(&root).unwrap();
+        assert!(same_directory(&root, &held));
+        std::fs::remove_dir(&root).unwrap();
+        assert!(!same_directory(&root, &held));
+        // What a record saved after the deletion leaves behind.
+        std::fs::create_dir(&root).unwrap();
+        assert!(!same_directory(&root, &held));
+    }
+
     #[test]
     fn stdin_half_close_does_not_discard_pending_output() {
         use std::os::fd::IntoRawFd;

@@ -10,6 +10,7 @@ pub mod display;
 pub mod egress_watchlist;
 pub mod fork;
 mod fsnotify_watch;
+pub mod host_gpu;
 pub mod input;
 mod krun;
 mod launcher;
@@ -158,6 +159,65 @@ pub fn default_gpu_backend_for_display() {
     if std::env::var_os("KRUN_GPU_BACKEND").is_none() {
         std::env::set_var("KRUN_GPU_BACKEND", "2d");
         tracing::info!("display requested on macOS: defaulting KRUN_GPU_BACKEND=2d");
+    }
+}
+
+/// The display size requested for this boot through `SMOLVM_DISPLAY`.
+pub fn requested_display() -> Option<(u32, u32)> {
+    parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
+}
+
+/// How the virtio-gpu device is set up for one boot.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum GpuDevice {
+    /// No virtio-gpu device.
+    None,
+    /// Host GPU acceleration through virglrenderer (`--gpu`), with a display
+    /// when one was requested.
+    Accelerated,
+    /// A display with no host GPU. On Linux the device runs libkrun's CPU 2D
+    /// component: the guest renders in software and the host only receives
+    /// finished frames, so the VM process opens no host graphics device and
+    /// loads no host graphics library.
+    SoftwareDisplay,
+}
+
+/// Choose the virtio-gpu setup from what the machine asked for.
+pub(crate) fn gpu_device(gpu: bool, display: Option<(u32, u32)>) -> GpuDevice {
+    match (gpu, display) {
+        (true, _) => GpuDevice::Accelerated,
+        (false, Some(_)) => GpuDevice::SoftwareDisplay,
+        (false, None) => GpuDevice::None,
+    }
+}
+
+/// The `virgl_flags` for `krun_set_gpu_options2` in the given setup.
+///
+/// On Linux a software display passes no flags at all, so libkrun starts no
+/// render server and never initialises virglrenderer; [`select_gpu_backend`]
+/// must have selected the 2D component. On other hosts the display path has
+/// only ever run with the accelerated flags, and they open no device node
+/// there, so it keeps them.
+pub(crate) fn virgl_flags_for(device: GpuDevice) -> u32 {
+    if cfg!(target_os = "linux") && device == GpuDevice::SoftwareDisplay {
+        0
+    } else {
+        gpu_virgl_flags()
+    }
+}
+
+/// Select libkrun's GPU backend for the given setup. Must run before the VM
+/// starts: libkrun reads `KRUN_GPU_BACKEND` when it builds the device.
+///
+/// A software display on Linux always uses the 2D component, whatever the
+/// environment says: this is the setup chosen when the host GPU must not be
+/// touched. An accelerated display keeps the existing per-host default.
+pub(crate) fn select_gpu_backend(device: GpuDevice, display: bool) {
+    if cfg!(target_os = "linux") && device == GpuDevice::SoftwareDisplay {
+        std::env::set_var("KRUN_GPU_BACKEND", "2d");
+        tracing::info!("display without host GPU: virtio-gpu runs the CPU 2D component");
+    } else if display {
+        default_gpu_backend_for_display();
     }
 }
 
@@ -390,5 +450,40 @@ mod guest_network_env_tests {
             ),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod gpu_device_tests {
+    use super::{gpu_device, GpuDevice};
+
+    #[test]
+    fn display_without_gpu_gets_the_software_display() {
+        assert_eq!(
+            gpu_device(false, Some((1024, 768))),
+            GpuDevice::SoftwareDisplay
+        );
+    }
+
+    #[test]
+    fn gpu_is_accelerated_with_or_without_a_display() {
+        assert_eq!(gpu_device(true, None), GpuDevice::Accelerated);
+        assert_eq!(gpu_device(true, Some((1024, 768))), GpuDevice::Accelerated);
+    }
+
+    #[test]
+    fn neither_gpu_nor_display_gets_no_device() {
+        assert_eq!(gpu_device(false, None), GpuDevice::None);
+    }
+
+    /// With no flags libkrun starts no render server and does not initialise
+    /// the host renderer, which is what keeps the software display from
+    /// opening a host graphics device.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn software_display_passes_no_renderer_flags_on_linux() {
+        use super::virgl_flags_for;
+        assert_eq!(virgl_flags_for(GpuDevice::SoftwareDisplay), 0);
+        assert_ne!(virgl_flags_for(GpuDevice::Accelerated), 0);
     }
 }

@@ -1,8 +1,12 @@
 //! Talking to a container's agent: an async connection speaking the agent's
-//! framed JSON protocol, the pump that carries a running container's I/O,
+//! negotiated framed protocol, the pump that carries a running container's I/O,
 //! and commands run inside a running container.
 
 use std::path::Path;
+use std::sync::{
+    atomic::{AtomicBool, Ordering},
+    Arc,
+};
 
 use smolvm_protocol::{AgentRequest, AgentResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -13,22 +17,34 @@ use tokio::net::UnixStream;
 const MAX_FRAME: usize = 64 << 20;
 
 /// The reading half of an agent connection.
-pub(crate) struct AgentReader(OwnedReadHalf);
+pub(crate) struct AgentReader(OwnedReadHalf, Arc<AtomicBool>);
 
 /// The writing half of an agent connection.
-pub(crate) struct AgentWriter(OwnedWriteHalf);
+pub(crate) struct AgentWriter(OwnedWriteHalf, Arc<AtomicBool>);
 
 /// Open a connection to the agent listening on `socket`.
 pub(crate) async fn connect(socket: &Path) -> std::io::Result<(AgentReader, AgentWriter)> {
     let stream = UnixStream::connect(socket).await?;
     let (r, w) = stream.into_split();
-    Ok((AgentReader(r), AgentWriter(w)))
+    let binary = Arc::new(AtomicBool::new(false));
+    Ok((AgentReader(r, binary.clone()), AgentWriter(w, binary)))
 }
 
 impl AgentWriter {
     pub(crate) async fn send(&mut self, request: &AgentRequest) -> std::io::Result<()> {
-        let frame = smolvm_protocol::encode_message(request)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        let binary = if self.1.load(Ordering::Acquire) {
+            smolvm_protocol::binary_stream::encode_request(request, None)?
+        } else {
+            None
+        };
+        let frame = if let Some(frame) = binary {
+            frame
+        } else {
+            let mut envelope = smolvm_protocol::Envelope::new(request);
+            envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
+            smolvm_protocol::encode_message(&envelope)
+                .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?
+        };
         self.0.write_all(&frame).await?;
         self.0.flush().await
     }
@@ -47,8 +63,11 @@ impl AgentReader {
         }
         let mut body = vec![0u8; len];
         self.0.read_exact(&mut body).await?;
-        serde_json::from_slice(&body)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        let (response, binary) = smolvm_protocol::binary_stream::decode_response(&body)?;
+        if binary {
+            self.1.store(true, Ordering::Release);
+        }
+        Ok(response)
     }
 }
 
@@ -189,5 +208,72 @@ pub(crate) async fn pump(
     tokio::select! {
         exit = receive => exit,
         _ = &mut forward => unreachable!("input forwarding never ends on its own"),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn split_connection_negotiates_binary_and_keeps_legacy_peers_working() {
+        for binary in [false, true] {
+            let directory = tempfile::tempdir().unwrap();
+            let path = directory.path().join("agent.sock");
+            let listener = tokio::net::UnixListener::bind(&path).unwrap();
+            let server = tokio::spawn(async move {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let size = stream.read_u32().await.unwrap();
+                let mut body = vec![0; size as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                let request: smolvm_protocol::Envelope<AgentRequest> =
+                    serde_json::from_slice(&body).unwrap();
+                assert_eq!(request.binary_stream, Some(1));
+                let mut response = smolvm_protocol::Envelope::new(AgentResponse::Started);
+                if binary {
+                    response.binary_stream = Some(1);
+                }
+                stream
+                    .write_all(&smolvm_protocol::encode_message(&response).unwrap())
+                    .await
+                    .unwrap();
+                let size = stream.read_u32().await.unwrap();
+                let mut body = vec![0; size as usize];
+                stream.read_exact(&mut body).await.unwrap();
+                assert_eq!(body[0] == 0, binary);
+                assert!(
+                    matches!(smolvm_protocol::binary_stream::decode_request(&body).unwrap().body,
+                    AgentRequest::Stdin { data } if data == [0, 255, 10])
+                );
+                let output = AgentResponse::Stderr {
+                    data: vec![0, 255, 10],
+                };
+                let mut frame = Vec::new();
+                if binary {
+                    smolvm_protocol::binary_stream::write_response(&mut frame, &output).unwrap();
+                } else {
+                    frame = smolvm_protocol::encode_message(&output).unwrap();
+                }
+                for byte in frame {
+                    stream.write_all(&[byte]).await.unwrap();
+                }
+            });
+            let (mut reader, mut writer) = connect(&path).await.unwrap();
+            writer.send(&AgentRequest::Ping).await.unwrap();
+            assert!(matches!(
+                reader.recv().await.unwrap(),
+                AgentResponse::Started
+            ));
+            writer
+                .send(&AgentRequest::Stdin {
+                    data: vec![0, 255, 10],
+                })
+                .await
+                .unwrap();
+            assert!(
+                matches!(reader.recv().await.unwrap(), AgentResponse::Stderr { data } if data == [0, 255, 10])
+            );
+            server.await.unwrap();
+        }
     }
 }

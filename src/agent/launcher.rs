@@ -960,8 +960,25 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
-        if resources.gpu {
-            let virgl_flags = super::gpu_virgl_flags();
+        //
+        // A display without `--gpu` also needs the virtio-gpu device, set up
+        // so that nothing on the host GPU is touched (see `GpuDevice`).
+        let display = super::requested_display();
+        let mut gpu_device = super::gpu_device(resources.gpu, display);
+        if gpu_device == super::GpuDevice::SoftwareDisplay
+            && (krun.set_gpu_options2.is_none()
+                || krun.add_display.is_none()
+                || krun.set_display_backend.is_none())
+        {
+            tracing::warn!(
+                "SMOLVM_DISPLAY is set but this libkrun has no display support; \
+                 starting without a display"
+            );
+            gpu_device = super::GpuDevice::None;
+        }
+        if gpu_device != super::GpuDevice::None {
+            super::select_gpu_backend(gpu_device, display.is_some());
+            let virgl_flags = super::virgl_flags_for(gpu_device);
             // Size the GPU shared-memory region. Caller may override
             // via `--gpu-vram <MiB>` (CLI) or `gpu_vram = N` (Smolfile);
             // default is `DEFAULT_GPU_VRAM_MIB`.
@@ -990,7 +1007,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     format!("krun_set_gpu_options2 failed (ret={}). Check that virglrenderer is installed.", ret),
                 ));
             }
-            tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+            if gpu_device == super::GpuDevice::Accelerated {
+                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+            }
 
             // Optional virtio-gpu scanout. Venus gives the guest GPU
             // *rendering*; a scanout gives it a *display*. With no display the
@@ -1000,10 +1019,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             //
             // Opt-in: a connector changes guest topology, and existing GPU
             // workloads (CUDA, headless Vulkan) neither need nor want one.
-            if let Some((w, h)) =
-                super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
-            {
-                super::default_gpu_backend_for_display();
+            if let Some((w, h)) = display {
                 let add_display = match krun.add_display {
                     Some(f) => f,
                     None => {

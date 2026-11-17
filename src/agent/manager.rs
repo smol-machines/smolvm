@@ -3041,7 +3041,11 @@ impl AgentManager {
         }
         // The database can retain identity when a PID file is missing.
         if let Some(name) = self.name() {
-            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+            let db = crate::db::SmolvmDb::open()?;
+            // A stopped machine keeps the PID of a process the kernel is
+            // holding: refused while it is present, forgotten once it is gone.
+            super::state_probe::refuse_start_while_held(&db, name)?;
+            if let Some(record) = db.get_vm(name)? {
                 if let Some(pid) = record.pid {
                     refuse_live_launch_pid(pid)?;
                 }
@@ -3187,6 +3191,17 @@ impl AgentManager {
                 }
             }
         }
+
+        // Before anything is locked or spawned: a machine that asked for the
+        // host GPU only gets it when the host's device nodes answer. A VM
+        // process that opens a device whose driver is not responding blocks
+        // in the kernel and can never be stopped.
+        super::host_gpu::resolve_for_boot(
+            self.name().unwrap_or("default"),
+            &mut resources,
+            super::requested_display().is_some(),
+            features.snapshot_dir.is_some(),
+        )?;
 
         if let Some(endpoint) = &features.external_interceptor {
             launcher::validate_external_interceptor(
@@ -4122,6 +4137,20 @@ impl AgentManager {
                         && process::poll_for_exit(pid, AGENT_STOP_TIMEOUT).is_some()
                         && !process::is_alive(pid));
                 if !exited {
+                    // A process already killed and held by the kernel has no
+                    // guest left to confirm anything and cannot be retried.
+                    if process::held_after_kill(pid).is_some()
+                        && process::poll_for_exit(pid, process::VM_SIGKILL_TIMEOUT).is_none()
+                    {
+                        if let Some(held) = process::held_after_kill(pid) {
+                            tracing::warn!(
+                                "machine '{}' is stopped, but {}",
+                                self.name().unwrap_or("default"),
+                                held.explain()
+                            );
+                            return Ok(());
+                        }
+                    }
                     return Err(Error::agent(
                         "stop agent",
                         format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {error}"),
@@ -4160,8 +4189,25 @@ impl AgentManager {
             // child. On macOS kill(pid, 0) can still see an exited child until
             // it is reaped, so a second liveness probe must not override that
             // confirmed exit (or mistake a recycled PID for this VM).
-            process::stop_vm_process(pid, VM_EXIT_FLUSH_TIMEOUT, process::VM_SIGKILL_TIMEOUT)
-                .is_ok()
+            match process::stop_vm_process_bounded(
+                pid,
+                VM_EXIT_FLUSH_TIMEOUT,
+                process::VM_SIGKILL_TIMEOUT,
+            ) {
+                Ok(process::VmStop::Exited(_)) => true,
+                Ok(process::VmStop::Held(held)) => {
+                    // The kernel will not let the process exit, and waiting
+                    // longer does not change that. It runs no more code, so
+                    // the stop completes around it and says what was left.
+                    tracing::warn!(
+                        "machine '{}' is stopped, but {}",
+                        self.name().unwrap_or("default"),
+                        held.explain()
+                    );
+                    return Ok(());
+                }
+                Err(_) => false,
+            }
         } else {
             false
         };
@@ -4769,6 +4815,11 @@ impl AgentManager {
 }
 
 fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
+    if let Some(held) = process::held_after_kill(pid) {
+        // Its files and published ports stay open until the kernel lets it
+        // go, and a write it had in flight can still land on the disks.
+        return Err(Error::agent("start agent", held.start_refusal()));
+    }
     if process::is_alive(pid) {
         return Err(Error::agent(
             "start agent",

@@ -325,6 +325,7 @@ pub(crate) fn start_vm_with_interceptor(
     name: &str,
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
+    crate::agent::state_probe::refuse_start_while_held(db, name)?;
     // A machine with no network cannot pull its registry image in-guest; the
     // host fetches it instead.
     let record = crate::image_store::pin_for_start(
@@ -526,6 +527,7 @@ pub fn start_vm_with_netns(
     name: &str,
     netns: std::path::PathBuf,
 ) -> Result<VmHandle> {
+    crate::agent::state_probe::refuse_start_while_held(db, name)?;
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         pod_netns: Some(netns),
@@ -1022,12 +1024,8 @@ pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
 
 /// Mark a machine record as stopped.
 pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
-    db.update_vm(name, |record| {
-        record.state = RecordState::Stopped;
-        record.pid = None;
-        record.pid_start_time = None;
-    })?
-    .ok_or_else(|| Error::vm_not_found(name))?;
+    db.update_vm(name, VmRecord::mark_process_stopped)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())
 }
 
@@ -1489,5 +1487,85 @@ mod tests {
                 .contains("duplicate clone name")
         );
         assert!(db.get_vm("duplicate").unwrap().is_none());
+    }
+}
+
+/// The embedded runtime's stop and start around a process the kernel holds
+/// after SIGKILL, stood in for by `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    fn running(db: &SmolvmDb, name: &str, pid: i32) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        db.insert_vm(name, &record).unwrap();
+    }
+
+    #[test]
+    fn embedded_stop_of_a_held_machine_keeps_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "embedded-held-stop";
+        running(&db, name, held.pid);
+
+        mark_stopped(&db, name).unwrap();
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn embedded_stop_of_an_exited_machine_forgets_its_pid() {
+        let (_dir, db) = db();
+        let name = "embedded-exited-stop";
+        // No such process: Linux pids never reach 2^31.
+        running(&db, name, 0x7fff_fff0);
+
+        mark_stopped(&db, name).unwrap();
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    #[test]
+    fn embedded_start_is_refused_while_held_and_allowed_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "embedded-held-start";
+        running(&db, name, held.pid);
+        mark_stopped(&db, name).unwrap();
+
+        for attempt in [
+            start_vm(&db, name).map(|_| ()),
+            start_vm_with_netns(&db, name, std::path::PathBuf::from("/nonexistent/netns"))
+                .map(|_| ()),
+        ] {
+            let error = attempt.unwrap_err().to_string();
+            assert!(error.contains(&held_refusal(held.pid)), "{error}");
+        }
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, Some(held.pid));
+
+        held.disappear();
+
+        // The check every start runs first now passes and forgets the PID.
+        crate::agent::state_probe::refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
+    }
+
+    fn held_refusal(pid: i32) -> String {
+        fake_held::held(pid).start_refusal()
     }
 }

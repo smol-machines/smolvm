@@ -29,6 +29,7 @@
 mod api;
 mod archive;
 mod build;
+pub mod builder;
 mod containers;
 mod events;
 mod exec;
@@ -130,6 +131,14 @@ impl Engine {
 
     /// Reattach to durable state without replacing the supervisor's live object.
     fn refresh(&self) -> crate::Result<()> {
+        self.refresh_containers()?;
+        self.images.refresh(&self.store)?;
+        self.volumes.refresh(&self.store)?;
+        self.networks.refresh(&self.store)?;
+        Ok(())
+    }
+
+    fn refresh_containers(&self) -> crate::Result<()> {
         let records = self.store.load_containers()?;
         let mut containers = self.containers.write();
         let owner = self.owner.as_deref();
@@ -139,10 +148,6 @@ impl Engine {
                 .entry(record.id.clone())
                 .or_insert_with(|| containers::Container::from_record(record));
         }
-        drop(containers);
-        self.images.refresh(&self.store)?;
-        self.volumes.refresh(&self.store)?;
-        self.networks.refresh(&self.store)?;
         Ok(())
     }
 
