@@ -301,7 +301,7 @@ pub fn docker_config_dir() -> Option<PathBuf> {
     }
 
     // Fall back to ~/.docker/
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = smolvm_paths::home_dir() {
         let docker_dir = home.join(".docker");
         if docker_dir.exists() {
             return Some(docker_dir);
@@ -1462,8 +1462,8 @@ fn read_egress_telemetry_at(path: &Path) -> Option<u64> {
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
+    smolvm_paths::cache_dir()
+        .or_else(smolvm_paths::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
@@ -1833,8 +1833,8 @@ impl AgentManager {
         let smolvm_runtime = if let Some(ref vm_name) = name {
             vm_data_dir(vm_name)
         } else {
-            dirs::runtime_dir()
-                .or_else(dirs::cache_dir)
+            smolvm_paths::runtime_dir()
+                .or_else(smolvm_paths::cache_dir)
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("smolvm")
         };
@@ -2044,8 +2044,8 @@ impl AgentManager {
             }
         }
 
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = smolvm_paths::data_local_dir()
+            .or_else(smolvm_paths::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
@@ -2116,7 +2116,7 @@ impl AgentManager {
             .unwrap_or(0);
         let key = format!("{:x}-{:x}", meta.len(), mtime);
 
-        let base = dirs::cache_dir()
+        let base = smolvm_paths::cache_dir()
             .ok_or_else(|| Error::storage("resolve cache dir", "no cache directory"))?
             .join("smolvm")
             .join("rootfs");
@@ -3579,7 +3579,7 @@ impl AgentManager {
                     crate::process::ensure_traversable(parent);
                 }
                 crate::process::ensure_traversable(&self.rootfs_path());
-                if let Some(home) = dirs::home_dir() {
+                if let Some(home) = smolvm_paths::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
                 }
                 #[cfg(target_os = "linux")]
@@ -3898,6 +3898,8 @@ impl AgentManager {
             use std::os::windows::process::CommandExt;
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            crate::process::prevent_inherited_stdio_leaks()
+                .map_err(|error| Error::agent("detach boot process pipes", error.to_string()))?;
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
         let child = cmd

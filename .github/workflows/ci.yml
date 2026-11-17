@@ -427,6 +427,12 @@ jobs:
       - name: Pack unit tests (native NTFS)
         run: cargo test -p smolvm-pack --lib
 
+      - name: State directory isolation (native Windows)
+        run: cargo test -p smolvm-paths --lib
+
+      - name: Windows file copy paths
+        run: cargo test --lib copy_paths
+
       - name: Test IPv4 UDP fragmentation and host socket buffers
         run: |
           cargo test -p smolvm-network --lib fragment

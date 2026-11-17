@@ -30,8 +30,8 @@ pub struct Store {
 /// The host's store, `<cache_dir>/smolvm/agent-rootfs-store`.
 pub fn host() -> Store {
     Store::at(
-        dirs::cache_dir()
-            .or_else(dirs::data_local_dir)
+        smolvm_paths::cache_dir()
+            .or_else(smolvm_paths::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("smolvm")
             .join("agent-rootfs-store"),

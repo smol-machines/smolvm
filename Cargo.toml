@@ -13,6 +13,7 @@ members = [
     "crates/smolvm-credentials",
     "crates/smolvm-oci-layer",
     "crates/smolvm-pack",
+    "crates/smolvm-paths",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
     "crates/smolvm-s3fs",
@@ -69,7 +70,8 @@ libloading = "0.8"
 # bridges. std has no UnixStream on Windows, but socket2 (Domain::UNIX) works
 # on Windows 10 1809+. See src/platform/uds.rs.
 socket2 = "0.6"
-dirs = "5"
+krun-socket = { git = "https://github.com/smol-machines/libkrun", rev = "4d910e78891e657072abf9c5de7c7c9af2b63f08" }
+smolvm-paths = { path = "crates/smolvm-paths", version = "1.35.0" }
 sha1 = "0.10"
 sha2 = "0.10"
 ring = "0.17.14"

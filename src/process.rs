@@ -242,6 +242,35 @@ pub fn close_inherited_fds_from(min_fd: i32) {
 #[cfg(not(unix))]
 pub fn close_inherited_fds_from(_min_fd: i32) {}
 
+/// Do not pass the launching command's original pipes to a detached Windows VM.
+/// Rust duplicates any explicitly selected child stdio handles, but its spawn
+/// also inherits other handles already marked inheritable by the caller (for
+/// example .NET Process). Redirecting the child's stdio alone leaves those
+/// original pipes open and prevents Studio/SDK readers from observing EOF.
+#[cfg(windows)]
+pub fn prevent_inherited_stdio_leaks() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: each constant selects a standard handle owned by this process.
+        let handle = unsafe { GetStdHandle(which) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: clear only inheritance, without closing or replacing the
+        // handle; subsequent Rust spawns duplicate their requested stdio.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn close_fds_from_dev_fd(min_fd: i32) -> bool {
     let entries = match std::fs::read_dir("/dev/fd") {
@@ -1513,7 +1542,7 @@ pub fn data_root_is_explicit() -> bool {
 }
 
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
-/// at it before any path is computed — every `dirs::`-derived path (VM dirs,
+/// at it before any path is computed — every `smolvm_paths::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
 /// isolation's dropped uids traverse to their data (an XDG-under-a-700-home
 /// layout can't). `SMOLVM_DATA_DIR` is honored for **every** command (so the CLI
@@ -1566,7 +1595,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
     // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
     // private image pulls keep finding their credentials after the relocation.
     if std::env::var_os("DOCKER_CONFIG").is_none() {
-        if let Some(dir) = dirs::home_dir()
+        if let Some(dir) = smolvm_paths::home_dir()
             .map(|h| h.join(".docker"))
             .filter(|d| d.is_dir())
         {
@@ -1578,7 +1607,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
     // Resolved after HOME moved, so it is the relocated data dir on every OS.
-    let rootfs_dst = dirs::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
+    let rootfs_dst = smolvm_paths::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
     if let (Some(src), Some(dst)) = (carry_rootfs_from, rootfs_dst) {
         if src != dst {
             if let Err(e) = sync_agent_rootfs(&src, &dst) {
@@ -1621,7 +1650,7 @@ fn overlay_workspace_root() -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    let home = dirs::home_dir()?;
+    let home = smolvm_paths::home_dir()?;
     let workspace = std::path::Path::new("/workspace");
     choose_workspace_root(
         fs_magic(&home),
@@ -1644,7 +1673,7 @@ fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    dirs::data_local_dir()
+    smolvm_paths::data_local_dir()
         .map(|d| d.join("smolvm/agent-rootfs"))
         .filter(|d| d.is_dir())
 }
@@ -1697,9 +1726,25 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     std::fs::rename(&staging, dst)
 }
 
-/// No-op where `HOME` does not root smolvm's paths (Windows).
+/// Windows state directories are resolved by the shared paths library; make
+/// the inherited root absolute before a child can start in another directory.
 #[cfg(not(unix))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+pub fn apply_system_data_root(_allow_auto: bool) {
+    let Some(root) = std::env::var_os("SMOLVM_DATA_DIR") else {
+        return;
+    };
+    if let Ok(root) = std::path::absolute(root) {
+        std::env::set_var("SMOLVM_DATA_DIR", root);
+    }
+    if std::env::var_os("DOCKER_CONFIG").is_none() {
+        if let Some(dir) = smolvm_paths::user_home_dir()
+            .map(|h| h.join(".docker"))
+            .filter(|d| d.is_dir())
+        {
+            std::env::set_var("DOCKER_CONFIG", dir);
+        }
+    }
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own
