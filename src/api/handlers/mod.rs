@@ -1,10 +1,12 @@
 //! HTTP request handlers.
 
 pub mod exec;
+pub mod exec_sessions;
 pub mod files;
 pub mod health;
 pub mod images;
 pub mod machines;
+pub mod mounts;
 pub mod node;
 pub mod p2p;
 pub mod pools;
@@ -266,6 +268,7 @@ mod tests {
         SecretRef {
             from_env: Some(name.to_string()),
             from_file: None,
+            from_keychain: None,
         }
     }
 
@@ -309,6 +312,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("/abs/key".into()),
+                from_keychain: None,
             },
         );
         assert!(
@@ -334,6 +338,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("relative/path".into()),
+                from_keychain: None,
             },
         );
         assert!(matches!(
@@ -368,6 +373,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("/absolute/path".into()),
+                from_keychain: None,
             },
         );
         let err = validate_request_secrets(&refs).unwrap_err();

@@ -63,8 +63,8 @@ else
     if printf '%s' "$out" | grep -q 'TOOMANYREQUESTS'; then
         printf '  - "TOOMANYREQUESTS" is Docker Hub refusing anonymous pulls from this address, not the install. Boot the same image from a mirror: verify-boot.sh --image mirror.gcr.io/library/alpine, or public.ecr.aws/docker/library/alpine.\n'
     fi
-    printf '  - "agent did not become ready within 30 seconds" is usually host load or a guest too large for this host, not the install. The 30s limit is fixed and no flag raises it for machine run or machine start; retry with a smaller --mem to tell the two apart.\n'
-    printf '  - "krun_start_enter returned: -22" on macOS is almost always the socket path length, not the disks its text names. Run preflight.sh and read socket_path_status.\n'
+    printf '  - "agent did not become ready within 30 seconds" is usually host load or a guest too large for this host, not the install. No flag raises the limit for machine run or machine start (from v1.29.0 a cold boot fails after 30s without progress, at most 180s in all); retry with a smaller --mem to tell the two apart.\n'
+    printf '  - "krun_start_enter returned: -22" on macOS before v1.28.0 is almost always the socket path length, not the disks its text names; from v1.28.0 the error says "socket path is N bytes". Run preflight.sh and read socket_path_status.\n'
     printf '  - the boot child sends its own output to /dev/null. To see the real failure, copy <vm-dir>/boot-config.json in a loop while a start is in flight (the child deletes it as soon as it reads it) and run: smolvm-bin _boot-vm <copy>\n'
 fi
 

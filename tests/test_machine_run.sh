@@ -648,13 +648,25 @@ run_test "Init: skipped on restart after first successful run" test_init_skipped
 
 test_piped_stdin_cat() {
     local out exit_code=0
-    out=$(echo "hello" | run_with_timeout 15 "$SMOLVM" machine run -i -- cat 2>/dev/null) \
+    # Build the pipe inside the timed command: run_with_timeout backgrounds it,
+    # and a background job's stdin is /dev/null, not the caller's pipe.
+    out=$(run_with_timeout 15 sh -c 'echo hello | "$@"' sh \
+        "$SMOLVM" machine run -i -- cat 2>/dev/null) \
         || exit_code=$?
     [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
     [[ "$out" == *"hello"* ]] || { echo "FAIL: expected 'hello', got: $out"; return 1; }
 }
 
+test_dev_null_stdin_cat() {
+    local exit_code=0
+    # macOS poll() reports /dev/null as POLLNVAL; the host must still see EOF (#1803).
+    run_with_timeout 15 "$SMOLVM" machine run -i -- cat </dev/null >/dev/null 2>&1 \
+        || exit_code=$?
+    [[ $exit_code -eq 0 ]] || { echo "FAIL: exit $exit_code (expected 0)"; return 1; }
+}
+
 run_test "Stdin: piped 'echo hello | run -i cat' returns data" test_piped_stdin_cat || true
+run_test "Stdin: 'run -i cat < /dev/null' exits" test_dev_null_stdin_cat || true
 
 # =============================================================================
 # Status messages go to stderr, not stdout
@@ -675,5 +687,26 @@ test_stdout_no_status_messages() {
 }
 
 run_test "Output: stdout has only command output, no status" test_stdout_no_status_messages || true
+
+# =============================================================================
+# A run whose VM never starts leaves no data directory (#1995)
+# =============================================================================
+
+test_machine_run_failed_start_leaves_no_data_dir() {
+    local out name cache
+    if out=$(SMOLVM_AGENT_ROOTFS=/nonexistent-agent-rootfs "$SMOLVM" machine run --image alpine -- echo hi 2>&1); then
+        echo "FAIL: a run with a missing agent rootfs succeeded"
+        return 1
+    fi
+    name=$(sed -n 's/^Starting ephemeral machine (\(vm-[0-9a-f]*\)).*/\1/p' <<<"$out")
+    [[ -n "$name" ]] || { echo "FAIL: no machine name in: $out"; return 1; }
+    if [[ "$(uname)" == Darwin ]]; then cache="$HOME/Library/Caches"; else cache="${XDG_CACHE_HOME:-$HOME/.cache}"; fi
+    if grep -lx "$name" "$cache"/smolvm/vms/*/name 2>/dev/null | grep -q .; then
+        echo "FAIL: $name left its data directory"
+        return 1
+    fi
+}
+
+run_test "Machine run: a failed start leaves no data directory" test_machine_run_failed_start_leaves_no_data_dir || true
 
 print_summary "Machine Run Tests"

@@ -140,12 +140,20 @@ install_from_dir() {
     mkdir -p "$BIN_DIR"
     ln -sf "$INSTALL_PREFIX/smolvm" "$BIN_DIR/smolvm"
 
+    # The Docker Engine API is opt-in: `smolvm engine` switches the Docker context.
+    if "$INSTALL_PREFIX/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
+        info "To run docker on smolvm, run 'smolvm engine' (it switches your Docker context to 'smol')."
+    fi
+
     success "Installed smolvm to $INSTALL_PREFIX"
     success "Symlink created at $BIN_DIR/smolvm"
 }
 
 # Uninstall
 uninstall() {
+    if [[ -x "$INSTALL_PREFIX/smolvm" ]]; then
+        "$INSTALL_PREFIX/smolvm" engine unregister >/dev/null 2>&1 || true
+    fi
     info "Uninstalling smolvm..."
 
     if [[ -d "$INSTALL_PREFIX" ]]; then

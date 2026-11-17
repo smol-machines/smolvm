@@ -119,6 +119,68 @@ pub async fn authorized_image_config(reference: &str, auth: &PullAuth) -> Result
     })
 }
 
+/// An image's identity and full config, as a container engine reports it.
+#[derive(Debug, Clone)]
+pub struct ImageMetadata {
+    /// Digest of the resolved single-platform manifest.
+    pub manifest_digest: String,
+    /// Digest of the config blob: the image id.
+    pub config_digest: String,
+    /// The whole config blob (`architecture`, `os`, `config`, `rootfs`,
+    /// `history`, ...).
+    pub config: serde_json::Value,
+    /// Sum of the compressed layer sizes.
+    pub compressed_size: u64,
+}
+
+/// Resolve `reference` (for `oci_platform`, or this host's platform) and
+/// fetch its config blob, authorized with `auth`. Same authorization as
+/// [`authorized_digest`]; no image layers are pulled.
+pub async fn authorized_image_metadata(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<ImageMetadata> {
+    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform).await?;
+    let manifest_digest = manifest_digest(&manifest_bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("parse image manifest", e.to_string()))?;
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| Error::agent("parse image manifest", "manifest has no config"))?
+        .to_string();
+    let compressed_size = manifest["layers"]
+        .as_array()
+        .map(|layers| layers.iter().map(|l| l["size"].as_u64().unwrap_or(0)).sum())
+        .unwrap_or(0);
+    let config_bytes = client
+        .pull_blob(&repo, &config_digest)
+        .await
+        .map_err(|e| Error::agent("fetch image config", e.to_string()))?;
+    if manifest_digest_matches(&config_bytes, &config_digest).is_err() {
+        return Err(Error::agent(
+            "fetch image config",
+            format!("config blob does not match {config_digest}"),
+        ));
+    }
+    let config = serde_json::from_slice(&config_bytes)
+        .map_err(|e| Error::agent("parse image config", e.to_string()))?;
+    Ok(ImageMetadata {
+        manifest_digest,
+        config_digest,
+        config,
+        compressed_size,
+    })
+}
+
+fn manifest_digest_matches(bytes: &[u8], digest: &str) -> std::result::Result<(), ()> {
+    if manifest_digest(bytes) == digest {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 /// Resolve `reference` to its platform manifest and return the summed
 /// `layers[].size` — the image's total COMPRESSED footprint, authorized with
 /// `auth`. `oci_platform` selects the index entry the way the guest's pull
@@ -262,7 +324,13 @@ pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<Fet
     }
 
     let staging = crate::data::image_source::archive_staging_dir()?;
-    let blobs = std::iter::once(&manifest.config).chain(manifest.layers.iter());
+    // A manifest may name one layer twice (the 32-byte empty layer, often).
+    // Each digest is one file in staging, so fetch it once: two downloads
+    // of the same digest would truncate and write the same path at once.
+    let mut seen = std::collections::HashSet::new();
+    let blobs = std::iter::once(&manifest.config)
+        .chain(manifest.layers.iter())
+        .filter(|blob| seen.insert(blob.digest.clone()));
     futures_util::future::try_join_all(
         blobs.map(|blob| download_blob(&client, &repo, blob, staging.path().join(blob_file(blob)))),
     )
@@ -475,8 +543,15 @@ fn write_save_archive(
     header.set_mode(0o644);
     header.set_cksum();
     tar.append_data(&mut header, "manifest.json", manifest.as_slice())?;
+    let mut archived = std::collections::HashSet::new();
     for blob in std::iter::once(config).chain(layers) {
         let name = blob_file(blob);
+        // A layer the manifest names twice goes in once: `manifest.json`
+        // points at the same file for both positions, and the loose copy is
+        // gone after the first pass.
+        if !archived.insert(name.clone()) {
+            continue;
+        }
         // Fixed metadata, so the same image makes the same archive bytes on
         // every host rather than carrying this download's time and owner.
         let file = std::fs::File::open(dir.join(&name))?;
@@ -612,6 +687,62 @@ mod tests {
             !dir.path().join(blob_file(&layer)).exists(),
             "loose blobs are dropped once archived"
         );
+    }
+
+    /// `ghcr.io/tobi/wrap:desktop` names the empty layer twice; the archive
+    /// holds it once and `manifest.json` lists it at both positions (issue #2024).
+    #[test]
+    fn a_layer_the_manifest_names_twice_is_archived_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = descriptor(br#"{"architecture":"amd64"}"#);
+        let empty = descriptor(b"empty layer");
+        let other = descriptor(b"other layer");
+        std::fs::write(
+            dir.path().join(blob_file(&config)),
+            br#"{"architecture":"amd64"}"#,
+        )
+        .unwrap();
+        std::fs::write(dir.path().join(blob_file(&empty)), b"empty layer").unwrap();
+        std::fs::write(dir.path().join(blob_file(&other)), b"other layer").unwrap();
+        let archive = dir.path().join("image.tar");
+        write_save_archive(
+            dir.path(),
+            &archive,
+            &config,
+            &[
+                descriptor(b"empty layer"),
+                descriptor(b"other layer"),
+                descriptor(b"empty layer"),
+            ],
+        )
+        .unwrap();
+
+        // one entry per distinct file, each name once
+        let mut names = Vec::new();
+        for entry in tar::Archive::new(std::fs::File::open(&archive).unwrap())
+            .entries()
+            .unwrap()
+        {
+            let entry = entry.unwrap();
+            let name = entry.path().unwrap().to_string_lossy().into_owned();
+            if name == "manifest.json" {
+                let manifest: serde_json::Value = serde_json::from_reader(entry).unwrap();
+                let layers = manifest[0]["Layers"].as_array().unwrap();
+                assert_eq!(layers.len(), 3);
+                assert_eq!(layers[0], blob_file(&empty));
+                assert_eq!(layers[2], blob_file(&empty));
+            }
+            names.push(name);
+        }
+        names.sort();
+        let mut expected = vec![
+            blob_file(&config),
+            blob_file(&empty),
+            blob_file(&other),
+            "manifest.json".to_string(),
+        ];
+        expected.sort();
+        assert_eq!(names, expected);
     }
 
     #[test]

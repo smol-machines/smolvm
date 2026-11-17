@@ -120,9 +120,13 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends dpkg-dev createrepo-c jq curl ca-certificates
-          url=$(curl -fsSL https://api.github.com/repos/goreleaser/nfpm/releases/latest \
-            | jq -r '.assets[] | select(.name|test("_amd64\\.deb$")) | .browser_download_url')
-          curl -fsSL "$url" -o /tmp/nfpm.deb
+          # Pinned and checksummed: resolving "latest" went through the
+          # unauthenticated GitHub API, which rate-limits shared runner IPs (403).
+          nfpm_version=2.47.0
+          nfpm_sha256=3f1cf344bd0b57373ca55636a78c08b0491f7293d609a456a9ac3b0b150fda97
+          curl -fsSL "https://github.com/goreleaser/nfpm/releases/download/v${nfpm_version}/nfpm_${nfpm_version}_amd64.deb" \
+            -o /tmp/nfpm.deb
+          echo "${nfpm_sha256}  /tmp/nfpm.deb" | sha256sum -c -
           sudo dpkg -i /tmp/nfpm.deb
 
       - name: Build packages

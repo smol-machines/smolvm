@@ -11,6 +11,7 @@ use serde::Serialize;
 use std::sync::Arc;
 use utoipa::ToSchema;
 
+use crate::agent::WorkloadTarget;
 use crate::api::error::{classify_ensure_running_error, ApiError};
 use crate::api::state::{ensure_running_and_persist, with_machine_client_traced, ApiState};
 use crate::api::TraceId;
@@ -24,43 +25,78 @@ pub struct FileUploadResponse {
     pub size: u64,
 }
 
-/// The machine's image and the persistent overlay its container runs on.
-///
-/// A fork clone's inherited overlay lives under its golden's id, which is how
-/// exec resolves it (`RunConfig::in_machine`). Keying file ops by the clone's
-/// own name mounted a fresh, empty overlay the running workload never sees, so
-/// uploads to a fork silently vanished and downloads missed the fork's files.
-async fn image_and_overlay_owner(
-    state: &ApiState,
-    id: &str,
-) -> Result<(Option<String>, String), ApiError> {
-    let record = state.lookup_vm(id).await?;
-    let overlay_owner = match &record {
-        Some(record) => crate::workload::persistent_overlay_owner_with_lineage(
-            id,
-            record.golden.as_deref(),
-            record.fork_overlay_owner.as_deref(),
-        ),
-        None => id.to_string(),
-    };
-    Ok((record.and_then(|record| record.image), overlay_owner))
+/// The filesystem the machine's commands run in, which its file operations
+/// must act on too; see [`crate::workload::machine_target`]. A fork clone's
+/// inherited overlay lives under its golden's id, as exec resolves it.
+async fn machine_target(state: &ApiState, id: &str) -> Result<WorkloadTarget, ApiError> {
+    Ok(state
+        .lookup_vm(id)
+        .await?
+        .map_or(WorkloadTarget::Vm, |record| {
+            crate::workload::machine_target(&record)
+        }))
+}
+
+/// Ownership and permission bits for an uploaded file. Without them a file lands
+/// as the agent writes it (root, 0644), which a workload running as another user
+/// (`runner`, `node`) can read but not own; `uid`/`gid` give it to that user.
+#[derive(Debug, Default, serde::Deserialize, utoipa::IntoParams)]
+#[into_params(parameter_in = Query)]
+pub struct UploadOptions {
+    /// Permission bits in octal, such as `0755` or `644`.
+    pub mode: Option<String>,
+    /// Owner uid inside the machine.
+    pub uid: Option<u32>,
+    /// Owner gid inside the machine.
+    pub gid: Option<u32>,
+}
+
+impl UploadOptions {
+    fn into_meta(self) -> Result<crate::agent::FileWriteMeta, ApiError> {
+        let mode = match self
+            .mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|m| !m.is_empty())
+        {
+            Some(m) => Some(
+                u32::from_str_radix(m.trim_start_matches("0o"), 8)
+                    .ok()
+                    .filter(|bits| *bits <= 0o7777)
+                    .ok_or_else(|| {
+                        ApiError::BadRequest(format!(
+                            "mode must be octal permission bits such as 0644, got '{m}'"
+                        ))
+                    })?,
+            ),
+            None => None,
+        };
+        Ok(crate::agent::FileWriteMeta {
+            mode,
+            uid: self.uid,
+            gid: self.gid,
+        })
+    }
 }
 
 /// Upload a file to a machine.
 ///
 /// Writes the request body as a file at the specified path inside the VM.
-/// Creates parent directories automatically.
+/// Creates parent directories automatically. `?mode=`, `?uid=` and `?gid=` set
+/// the file's permission bits and owner (see [`UploadOptions`]).
 #[utoipa::path(
     put,
     path = "/api/v1/machines/{id}/files/{path}",
     tag = "Files",
     params(
         ("id" = String, Path, description = "Machine name"),
-        ("path" = String, Path, description = "File path inside the VM (e.g., workspace/script.py)")
+        ("path" = String, Path, description = "File path inside the VM (e.g., workspace/script.py)"),
+        UploadOptions
     ),
     request_body(content = Vec<u8>, content_type = "application/octet-stream"),
     responses(
         (status = 200, description = "File uploaded", body = FileUploadResponse),
+        (status = 400, description = "Bad mode, uid or gid"),
         (status = 404, description = "Machine not found"),
         (status = 500, description = "Write failed")
     )
@@ -68,14 +104,23 @@ async fn image_and_overlay_owner(
 pub async fn upload_file(
     State(state): State<Arc<ApiState>>,
     Path((id, file_path)): Path<(String, String)>,
+    axum::extract::Query(opts): axum::extract::Query<UploadOptions>,
     trace_id: Option<axum::Extension<TraceId>>,
     headers: axum::http::HeaderMap,
     body: axum::body::Body,
 ) -> Result<Json<FileUploadResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
+    let meta = opts.into_meta()?;
     let limit = crate::api::MAX_FILE_UPLOAD_BYTES as u64;
     let too_large =
         || ApiError::PayloadTooLarge(format!("file exceeds the {} MiB upload limit", limit >> 20));
+    let unsized_too_large = || {
+        ApiError::PayloadTooLarge(format!(
+            "an upload without a Content-Length is limited to {} MiB; send its length to upload up to {} MiB",
+            crate::api::MAX_BUFFERED_UPLOAD_BYTES >> 20,
+            limit >> 20
+        ))
+    };
     let declared = headers
         .get(axum::http::header::CONTENT_LENGTH)
         .and_then(|v| v.to_str().ok())
@@ -88,7 +133,7 @@ pub async fn upload_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let (machine_image, overlay_id) = image_and_overlay_owner(&state, &id).await?;
+    let target = machine_target(&state, &id).await?;
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
@@ -100,15 +145,17 @@ pub async fn upload_file(
         Some(len) if len > smolvm_protocol::FILE_WRITE_SINGLE_SHOT_MAX as u64 => {
             UploadSource::Streamed(len, BodyReader::spawn(body, len))
         }
-        _ => UploadSource::Whole(axum::body::to_bytes(body, limit as usize).await.map_err(
-            |e| {
-                if e.to_string().contains("length limit") {
-                    too_large()
-                } else {
-                    ApiError::BadRequest(format!("upload body did not arrive in full: {e}"))
-                }
-            },
-        )?),
+        _ => UploadSource::Whole(
+            axum::body::to_bytes(body, crate::api::MAX_BUFFERED_UPLOAD_BYTES)
+                .await
+                .map_err(|e| {
+                    if e.to_string().contains("length limit") {
+                        unsized_too_large()
+                    } else {
+                        ApiError::BadRequest(format!("upload body did not arrive in full: {e}"))
+                    }
+                })?,
+        ),
     };
     let size = match &source {
         UploadSource::Streamed(len, _) => *len,
@@ -116,30 +163,17 @@ pub async fn upload_file(
     };
 
     with_machine_client_traced(&entry, tid, move |c| {
-        // For image machines, mount the per-machine persistent container overlay
-        // (same id exec uses) so the file lands INSIDE the container, not the
-        // read-only agent base. Pull the image first if it isn't present yet.
-        if let Some(ref image) = machine_image {
-            if c.query(image)?.is_none() {
-                c.pull_with_registry_config(image)?;
-            }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
-        }
+        c.use_target(target)?;
         match source {
             // The agent stages a streamed file and renames it into place only
             // once all of it is written, so a body that stops short leaves
             // nothing at the path.
             UploadSource::Streamed(len, reader) => {
-                c.write_file_from_reader(&guest_path, reader, len, None)
+                c.write_file_from_reader_with_progress(&guest_path, reader, len, meta, |_| {})
             }
-            UploadSource::Whole(bytes) => c.write_file(&guest_path, &bytes, None),
+            UploadSource::Whole(bytes) => {
+                c.write_file_with_progress(&guest_path, &bytes, meta, |_| {})
+            }
         }
     })
     .await?;
@@ -249,27 +283,13 @@ pub async fn download_file(
         .await
         .map_err(classify_ensure_running_error)?;
 
-    let (machine_image, overlay_id) = image_and_overlay_owner(&state, &id).await?;
+    let target = machine_target(&state, &id).await?;
 
     let file_path = file_path.trim_start_matches('/');
     let guest_path = format!("/{}", file_path);
 
     let data = with_machine_client_traced(&entry, tid, move |c| {
-        // Read from inside the container overlay for image machines (matching
-        // upload + exec), not the agent base.
-        if let Some(ref image) = machine_image {
-            if c.query(image)?.is_none() {
-                c.pull_with_registry_config(image)?;
-            }
-            // Activate the per-machine container overlay so the file op targets
-            // the image container, not the read-only agent base. `prepare_overlay`
-            // mounts but doesn't make it the active fs for write_file/read_file;
-            // a no-op container run (same path exec takes) does.
-            c.run_non_interactive(
-                crate::agent::RunConfig::new(image.clone(), vec!["/bin/true".to_string()])
-                    .with_persistent_overlay(Some(overlay_id.clone())),
-            )?;
-        }
+        c.use_target(target)?;
         // Asking for a directory returns its listing rather than an error: a
         // caller exploring a tree should not have to know in advance which
         // paths are files, and guessing names costs a request per miss.

@@ -37,9 +37,19 @@
 
 #[cfg(unix)]
 pub use imp::{
-    discard_unbooted_archive_storage, prewarm_recent_seeds, revalidate_seed, seed_root,
-    seed_storage, seed_storage_with_trust, seedable_image, wants_seed, SEED_MACHINE_PREFIX,
+    discard_unbooted_storage, ensure_image_seed, exit_by_signal, interruptible,
+    prewarm_recent_seeds, revalidate_seed, seed_root, seed_storage, seed_storage_with_trust,
+    seedable_image, wants_seed, SEED_MACHINE_PREFIX,
 };
+
+/// Whether a seed can serve a pull for `platform`. A seed holds the image for
+/// the guest's own architecture, which is also what `None` asks for. A machine
+/// that pulls another platform (a Rosetta machine pulls `linux/amd64`) starts
+/// without one: the guest would find the wrong architecture and pull again.
+pub fn serves_platform(platform: Option<&str>) -> bool {
+    platform
+        .is_none_or(|platform| platform.eq_ignore_ascii_case(crate::vm::rosetta::native_platform()))
+}
 
 /// The smolvm binary that builds seeds. The SDKs run inside `node` or `python`,
 /// so their own executable is not smolvm; they point `SMOLVM_BOOT_BINARY` at the
@@ -85,6 +95,16 @@ pub fn seed_first_start(
             )
         });
     if let Err(error) = seeded {
+        report_no_seed(name, &error);
+    }
+}
+
+/// Log why a start goes on without a seed. An interrupted build is no fallback:
+/// the CLI ends the command (see [`interruptible`]), so nothing pulls.
+fn report_no_seed(name: &str, error: &crate::Error) {
+    if seed_interrupted() {
+        tracing::debug!(machine = name, %error, "image seed build interrupted");
+    } else {
         tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
     }
 }
@@ -137,8 +157,33 @@ pub fn seed_ephemeral_run_with_trust(
             )
         });
     if let Err(error) = seeded {
-        tracing::warn!(machine = name, %error, "no image seed; pulling in the guest");
+        report_no_seed(name, &error);
     }
+}
+
+/// Whether a signal cut off the seed build of this process (see [`interruptible`]).
+#[cfg(unix)]
+fn seed_interrupted() -> bool {
+    imp::interrupt_signal().is_some()
+}
+
+/// Seeds need a Unix host; elsewhere no seed build can be interrupted.
+#[cfg(not(unix))]
+fn seed_interrupted() -> bool {
+    false
+}
+
+/// Seeds need a Unix host; elsewhere `seed` runs with no signal handling.
+#[cfg(not(unix))]
+pub fn interruptible(seed: impl FnOnce()) -> Option<i32> {
+    seed();
+    None
+}
+
+/// Seeds need a Unix host, so no seed build is interrupted elsewhere.
+#[cfg(not(unix))]
+pub fn exit_by_signal(signal: i32) -> ! {
+    std::process::exit(128 + signal)
 }
 
 /// Seeds need a Unix host; elsewhere nothing seeds.
@@ -188,7 +233,7 @@ pub fn seed_storage_with_trust(
 
 /// Seeds need a Unix host; elsewhere there is no seed to make room for.
 #[cfg(not(unix))]
-pub fn discard_unbooted_archive_storage(_: &str, _: &str) -> bool {
+pub fn discard_unbooted_storage(_: &str, _: &str, _: bool) -> bool {
     false
 }
 
@@ -203,6 +248,7 @@ mod imp {
     use std::os::fd::AsRawFd;
     use std::os::unix::fs::{MetadataExt, PermissionsExt};
     use std::path::{Path, PathBuf};
+    use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 
     use sha2::{Digest, Sha256};
 
@@ -218,12 +264,169 @@ mod imp {
     /// Name prefix of the throwaway machines that build seeds.
     pub const SEED_MACHINE_PREFIX: &str = "image-seed-";
 
-    /// A builder machine older than this is left over from a crashed build.
+    /// A builder machine older than this is left over from a crashed build, even
+    /// when its owner's PID now names another process.
     const STALE_BUILDER_SECS: u64 = 30 * 60;
 
     /// Default cap on the seed cache before unreferenced seeds are evicted;
     /// `SMOLVM_IMAGE_SEED_MAX_BYTES` overrides it.
     const DEFAULT_MAX_BYTES: u64 = 20 * 1024 * 1024 * 1024;
+
+    /// The signals [`interruptible`] catches while this process has a builder.
+    const INTERRUPT_SIGNALS: [libc::c_int; 2] = [libc::SIGINT, libc::SIGTERM];
+
+    /// The signal that cut off this process's seed build, 0 when none did.
+    static INTERRUPT: AtomicI32 = AtomicI32::new(0);
+
+    /// Builds of this process that have a builder machine to delete.
+    static BUILDS: AtomicUsize = AtomicUsize::new(0);
+
+    /// The builder step (a `smolvm` child process) running now, 0 when none.
+    static STEP_PID: AtomicI32 = AtomicI32::new(0);
+
+    /// Run `seed`, a CLI seed call, so that SIGINT or SIGTERM during a seed
+    /// build stops the build and deletes its builder machine instead of
+    /// leaving it behind. Returns the signal when one cut the build off; the
+    /// caller then ends the command with [`exit_by_signal`]. A signal outside
+    /// a build has its usual effect at once.
+    ///
+    /// Only the CLI calls this. The API, the SDKs and the server keep their
+    /// own signal handling.
+    pub fn interruptible(seed: impl FnOnce()) -> Option<i32> {
+        INTERRUPT.store(0, Ordering::SeqCst);
+        let handlers = InterruptHandlers::install();
+        seed();
+        drop(handlers);
+        interrupt_signal()
+    }
+
+    /// The signal that cut off this process's seed build, if one did.
+    pub(crate) fn interrupt_signal() -> Option<i32> {
+        match INTERRUPT.load(Ordering::SeqCst) {
+            0 => None,
+            signal => Some(signal),
+        }
+    }
+
+    /// End this process as `signal` would have, after an interrupted build
+    /// has cleaned up, so a shell sees the same exit status as before.
+    pub fn exit_by_signal(signal: i32) -> ! {
+        unsafe {
+            libc::signal(signal, libc::SIG_DFL);
+            libc::raise(signal);
+        }
+        std::process::exit(128 + signal)
+    }
+
+    /// The handlers of [`INTERRUPT_SIGNALS`] that were in place before
+    /// [`interruptible`]; dropping this puts them back.
+    struct InterruptHandlers(Vec<(libc::c_int, libc::sigaction)>);
+
+    impl InterruptHandlers {
+        fn install() -> Self {
+            let mut previous = Vec::with_capacity(INTERRUPT_SIGNALS.len());
+            for signal in INTERRUPT_SIGNALS {
+                unsafe {
+                    let mut old: libc::sigaction = std::mem::zeroed();
+                    if libc::sigaction(signal, std::ptr::null(), &mut old) != 0
+                        || old.sa_sigaction == libc::SIG_IGN
+                    {
+                        // An ignored signal (a background job of a
+                        // non-interactive shell ignores SIGINT) stays ignored.
+                        continue;
+                    }
+                    let mut action: libc::sigaction = std::mem::zeroed();
+                    action.sa_sigaction = on_interrupt as *const () as libc::sighandler_t;
+                    libc::sigemptyset(&mut action.sa_mask);
+                    // The build's own calls see no EINTR; it stops at its
+                    // next step instead.
+                    action.sa_flags = libc::SA_RESTART;
+                    if libc::sigaction(signal, &action, std::ptr::null_mut()) == 0 {
+                        previous.push((signal, old));
+                    }
+                }
+            }
+            Self(previous)
+        }
+    }
+
+    impl Drop for InterruptHandlers {
+        fn drop(&mut self) {
+            for (signal, old) in &self.0 {
+                unsafe { libc::sigaction(*signal, old, std::ptr::null_mut()) };
+            }
+        }
+    }
+
+    /// With no builder in this process, the signal has its usual effect.
+    /// Otherwise record it and stop the running step: a SIGINT makes a
+    /// `machine start` step stop its VM, as a Ctrl-C at a terminal does.
+    /// The build then fails at its next step and deletes the builder.
+    ///
+    /// SAFETY: only atomics, `signal`, `raise` and `kill`, all
+    /// async-signal-safe.
+    extern "C" fn on_interrupt(signal: libc::c_int) {
+        if BUILDS.load(Ordering::SeqCst) == 0 {
+            unsafe {
+                libc::signal(signal, libc::SIG_DFL);
+                libc::raise(signal);
+            }
+            return;
+        }
+        INTERRUPT.store(signal, Ordering::SeqCst);
+        let step = STEP_PID.load(Ordering::SeqCst);
+        if step > 0 {
+            unsafe { libc::kill(step, libc::SIGINT) };
+        }
+    }
+
+    /// Fail a build step that would start after a signal.
+    fn check_interrupt() -> Result<()> {
+        match interrupt_signal() {
+            Some(signal) => Err(Error::config(
+                "image seed",
+                format!("build interrupted by signal {signal}"),
+            )),
+            None => Ok(()),
+        }
+    }
+
+    /// Counts a build in [`BUILDS`] while it lives.
+    struct Building;
+
+    impl Building {
+        fn start() -> Self {
+            BUILDS.fetch_add(1, Ordering::SeqCst);
+            Self
+        }
+    }
+
+    impl Drop for Building {
+        fn drop(&mut self) {
+            BUILDS.fetch_sub(1, Ordering::SeqCst);
+        }
+    }
+
+    /// The name of the machine that builds seed `key` for process `pid`.
+    pub(super) fn builder_name(key: &str, pid: u32) -> String {
+        format!("{SEED_MACHINE_PREFIX}{}-{pid}", &key[..16])
+    }
+
+    /// The process that started builder `name`: the PID its name ends with.
+    pub(super) fn builder_owner(name: &str) -> Option<libc::pid_t> {
+        let (_, pid) = name.strip_prefix(SEED_MACHINE_PREFIX)?.rsplit_once('-')?;
+        pid.parse().ok().filter(|pid| *pid > 0)
+    }
+
+    /// Whether the process that started builder `name` no longer runs. A
+    /// process of another user still runs (EPERM); a name with no PID is
+    /// never taken as gone.
+    pub(super) fn builder_owner_gone(name: &str) -> bool {
+        builder_owner(name).is_some_and(|pid| {
+            let probe = unsafe { libc::kill(pid, 0) };
+            probe != 0 && std::io::Error::last_os_error().raw_os_error() == Some(libc::ESRCH)
+        })
+    }
 
     /// The image a machine's first start can seed from, or `None` when it cannot
     /// (not a fresh registry-image machine, a clone, a checkpoint restore) or
@@ -234,16 +437,18 @@ mod imp {
             || record.source_smolmachine.is_some()
             || record.vm_uid_owner().is_some()
             || record.golden.is_some()
+            || !super::serves_platform(record.image_platform())
         {
             return None;
         }
         seedable_image(name, record.image.as_deref(), record.storage_gb)
     }
 
-    /// `image` when a machine called `name` with that image and storage size can
-    /// start on a seed: a registry image, at least the default storage size (a
-    /// larger disk is the seed grown, see [`grow`]), no storage disk yet, and
-    /// seeding on.
+    /// `image` when a machine called `name` with that image can start on a
+    /// seed: a registry image or staged archive, no storage disk yet, and
+    /// seeding on. A disk at or above the default size is the default seed
+    /// grown (see [`grow`]); a smaller one gets a seed built at its own size
+    /// (see [`small_seed_gb`]).
     pub fn seedable_image(
         name: &str,
         image: Option<&str>,
@@ -252,7 +457,7 @@ mod imp {
         // The builder's own machine pulls the normal way.
         if name.starts_with(SEED_MACHINE_PREFIX)
             || std::env::var("SMOLVM_IMAGE_SEEDS").is_ok_and(|v| v.trim() == "0")
-            || storage_gb.is_some_and(|gb| gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+            || storage_gb == Some(0)
         {
             return None;
         }
@@ -285,12 +490,23 @@ mod imp {
     }
 
     /// Remove the blank storage disk a fresh machine `name` got at create, so its
-    /// first start can take a seed of the staged archive `image` it now boots.
-    /// Only for a staged archive: the server creates a machine's disks before
-    /// its start fetches the image on the host, so the disk exists but holds
-    /// nothing. Callers pass only machines that have never completed a start.
-    pub fn discard_unbooted_archive_storage(name: &str, image: &str) -> bool {
-        if local_archive(image).is_none_or(|archive| !archive.is_file()) {
+    /// first start can take a seed of `image`. The server creates a machine's
+    /// disks before its first start, so the disk exists but holds nothing; two
+    /// kinds of image only become seedable at that start:
+    ///
+    /// - a staged archive, which the start fetches on the host;
+    /// - a private registry image, when the start brings the registry
+    ///   credentials (`start_has_credentials`) that the create did not have, so
+    ///   the create's seed attempt was refused.
+    ///
+    /// Callers pass only machines that have never completed a start.
+    pub fn discard_unbooted_storage(name: &str, image: &str, start_has_credentials: bool) -> bool {
+        let archive = local_archive(image).is_some_and(|archive| archive.is_file());
+        let registry = start_has_credentials
+            && local_archive(image).is_none()
+            && !crate::data::image_source::is_local_ref(image)
+            && crate::data::image_source::packed_layers_dir_for_ref(image).is_none();
+        if !archive && !registry {
             return false;
         }
         let base = crate::agent::vm_data_dir(name).join(crate::storage::STORAGE_DISK_FILENAME);
@@ -468,6 +684,7 @@ mod imp {
             proxy,
             no_proxy,
             trust_host_certs,
+            small_seed_gb(storage_gb),
         )?;
         let Some((seed, format)) = seed_disk(&key_dir) else {
             return Err(Error::config(
@@ -487,6 +704,40 @@ mod imp {
         Ok(true)
     }
 
+    /// Make sure the seed of `image` exists, building it with `exe` when it
+    /// does not, without giving it to any machine yet. A container engine
+    /// calls this on `docker pull`, so the image's containers start on it.
+    pub fn ensure_image_seed(
+        exe: &Path,
+        image: &str,
+        auth: &PullAuth,
+        digest_ttl: Option<u64>,
+    ) -> Result<()> {
+        let EnsuredSeed {
+            root,
+            key_dir,
+            cache,
+            built,
+        } = ensure_seed(exe, image, auth, digest_ttl, None, None, false, None)?;
+        // Prune takes the cache's exclusive lock: let go of the shared one.
+        drop(cache);
+        note_recent_image(&root, image);
+        if built {
+            if let Some((seed, _)) = seed_disk(&key_dir) {
+                prune(&root, max_bytes(), &seed);
+            }
+        }
+        Ok(())
+    }
+
+    /// The size of the seed a disk of `storage_gb` needs when it is below the
+    /// default: a seed's filesystem fills the builder's disk and cannot be cut
+    /// down without resize2fs, so a smaller disk gets a seed built at exactly
+    /// its size. `None` means the default seed, grown as needed.
+    pub(super) fn small_seed_gb(storage_gb: Option<u64>) -> Option<u64> {
+        storage_gb.filter(|gb| *gb < crate::storage::DEFAULT_STORAGE_SIZE_GIB)
+    }
+
     /// The seed directory for `image` once its seed exists, holding the shared
     /// cache lock so prune cannot remove it before the caller attaches it.
     struct EnsuredSeed {
@@ -497,7 +748,9 @@ mod imp {
     }
 
     /// Make sure the seed for `image` at its current digest exists, building it
-    /// (with `exe`) when it does not.
+    /// (with `exe`) when it does not. `small_gb` asks for the seed of a disk
+    /// below the default size (see [`small_seed_gb`]).
+    #[allow(clippy::too_many_arguments)]
     fn ensure_seed(
         exe: &Path,
         image: &str,
@@ -506,6 +759,7 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         trust_host_certs: bool,
+        small_gb: Option<u64>,
     ) -> Result<EnsuredSeed> {
         let template = storage_template();
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -519,7 +773,7 @@ mod imp {
             Some(hash) => hash.to_string(),
             None => resolved_digest(image, auth, digest_ttl, resolve)?,
         };
-        let key = seed_key(image, &digest, template.as_deref())?;
+        let key = seed_key(image, &digest, template.as_deref(), small_gb)?;
         let root = seed_root();
         std::fs::create_dir_all(&root).map_err(|e| Error::config("image seed", e.to_string()))?;
         std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o711))
@@ -546,6 +800,7 @@ mod imp {
                     proxy,
                     no_proxy,
                     trust_host_certs,
+                    small_gb,
                 )?;
                 // The builder pulled the tag, not the digest. If the tag moved
                 // in the meantime, discard the seed rather than miskey it. An
@@ -689,7 +944,16 @@ mod imp {
         let root = seed_root();
         for image in prewarm_candidates(&root, now_secs()) {
             let started = std::time::Instant::now();
-            match ensure_seed(exe, &image, &PullAuth::FromConfig, None, None, None, false) {
+            match ensure_seed(
+                exe,
+                &image,
+                &PullAuth::FromConfig,
+                None,
+                None,
+                None,
+                false,
+                None,
+            ) {
                 Ok(EnsuredSeed { built, .. }) => tracing::info!(
                     %image,
                     built,
@@ -746,7 +1010,12 @@ mod imp {
                     rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?
                 }
             };
-            let key_dir = root.join(seed_key(image, &digest, template.as_deref())?);
+            let small_gb = small_seed_gb(
+                crate::db::SmolvmDb::open()?
+                    .get_vm(name)?
+                    .and_then(|record| record.storage_gb),
+            );
+            let key_dir = root.join(seed_key(image, &digest, template.as_deref(), small_gb)?);
             seed_disk(&key_dir)
                 .map(|(seed, _)| seed)
                 .ok_or_else(|| Error::config("image seed", "no seed for the authorized digest"))
@@ -782,9 +1051,12 @@ mod imp {
         proxy: Option<&str>,
         no_proxy: Option<&str>,
         trust_host_certs: bool,
+        small_gb: Option<u64>,
     ) -> Result<()> {
         reap_stale_builders(exe);
-        let tmp = format!("{SEED_MACHINE_PREFIX}{}-{}", &key[..16], std::process::id());
+        // From here a signal in the CLI deletes the builder (see `interruptible`).
+        let _building = Building::start();
+        let tmp = builder_name(key, std::process::id());
         let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
         // Set once the builder's disk format is known.
         let mut staged: Option<(PathBuf, PathBuf)> = None;
@@ -805,6 +1077,12 @@ mod imp {
             if trust_host_certs {
                 create.push("--trust-host-certs");
             }
+            // A small disk's seed is built on a disk of that size, so the
+            // filesystem the guest grows into it fits the machines it seeds.
+            let small_size = small_gb.map(|gb| gb.to_string());
+            if let Some(size) = small_size.as_deref() {
+                create.extend(["--storage", size]);
+            }
             run(exe, &create)?;
             let mut start = vec!["machine", "start", "--name", &tmp, "--no-workload"];
             if let Some(proxy) = proxy {
@@ -813,7 +1091,24 @@ mod imp {
             if let Some(no_proxy) = no_proxy {
                 start.extend(["--no-proxy", no_proxy]);
             }
-            run(exe, &start)?;
+            // The builder pulls with the caller's credentials, as the caller's own
+            // machine would, not with the host's registry config: a private image
+            // the start brought credentials for is otherwise refused here.
+            let credentials = match auth {
+                PullAuth::Basic { username, password } => {
+                    start.push("--registry-auth-stdin");
+                    let auth = crate::registry::RegistryAuth {
+                        username: username.clone(),
+                        password: password.clone(),
+                    };
+                    let mut line = serde_json::to_vec(&auth)
+                        .map_err(|e| Error::config("image seed", e.to_string()))?;
+                    line.push(b'\n');
+                    Some(line)
+                }
+                _ => None,
+            };
+            run_with_input(exe, &start, credentials.as_deref())?;
             // Compare the guest's stored config and layer digests to the
             // caller-authorized platform manifest. A second HEAD alone misses
             // tag ABA and a registry mirror serving different image bytes.
@@ -847,7 +1142,7 @@ mod imp {
             run(exe, &["machine", "stop", "--name", &tmp])?;
             stage_builder_disk(&tmp, key_dir, &mut staged)
         })();
-        let _ = run(exe, &["machine", "delete", "--name", &tmp, "-f"]);
+        let _ = run_cleanup(exe, &["machine", "delete", "--name", &tmp, "-f"]);
         let published = built.and_then(|()| {
             let (staging, seed) = staged.as_ref().expect("a built seed is staged");
             publish(staging, seed)
@@ -908,8 +1203,15 @@ mod imp {
     }
 
     /// A seed depends on the exact template bytes under it, the image content, the
-    /// guest architecture and the guest's storage layout.
-    pub(super) fn seed_key(image: &str, digest: &str, template: Option<&Path>) -> Result<String> {
+    /// guest architecture and the guest's storage layout, and for a disk below
+    /// the default size on that size. A default-size key is unchanged by the
+    /// size, so existing seeds stay valid.
+    pub(super) fn seed_key(
+        image: &str,
+        digest: &str,
+        template: Option<&Path>,
+        small_gb: Option<u64>,
+    ) -> Result<String> {
         // Without a template the disk is formatted by this smolvm version,
         // which the key already carries.
         let (path, identity) = match template {
@@ -940,6 +1242,10 @@ mod imp {
             &identity,
         ] {
             hash.update(part.as_bytes());
+            hash.update([0]);
+        }
+        if let Some(gb) = small_gb {
+            hash.update(format!("storage-gib:{gb}").as_bytes());
             hash.update([0]);
         }
         Ok(hex::encode(hash.finalize()))
@@ -1185,7 +1491,9 @@ mod imp {
         Some(PathBuf::from(std::ffi::OsStr::from_bytes(&name)))
     }
 
-    /// Delete builder machines left behind by a build that crashed.
+    /// Delete builder machines left behind by a build that crashed or was
+    /// killed: those whose owner process no longer runs, and any old enough
+    /// to be stale whatever their owner.
     fn reap_stale_builders(exe: &Path) {
         let Ok(config) = crate::config::SmolvmConfig::load() else {
             return;
@@ -1194,7 +1502,10 @@ mod imp {
         let stale: Vec<String> = config
             .list_vms()
             .filter(|(name, _)| name.starts_with(SEED_MACHINE_PREFIX))
-            .filter(|(_, record)| now.saturating_sub(record.created_at) >= STALE_BUILDER_SECS)
+            .filter(|(name, record)| {
+                builder_owner_gone(name)
+                    || now.saturating_sub(record.created_at) >= STALE_BUILDER_SECS
+            })
             .map(|(name, _)| name.clone())
             .collect();
         for name in stale {
@@ -1203,17 +1514,64 @@ mod imp {
     }
 
     /// Run one step of a seed build with this smolvm binary, capturing its output so
-    /// the builder's chatter stays off the caller's terminal.
+    /// the builder's chatter stays off the caller's terminal. After a signal
+    /// (see [`interruptible`]) no new step starts.
     fn run(exe: &Path, args: &[&str]) -> Result<()> {
-        let out = std::process::Command::new(exe)
+        run_with_input(exe, args, None)
+    }
+
+    /// [`run`], writing `input` to the step's stdin (and closing it) first.
+    fn run_with_input(exe: &Path, args: &[&str], input: Option<&[u8]>) -> Result<()> {
+        check_interrupt()?;
+        run_step(exe, args, input, false)
+    }
+
+    /// Run the step that deletes a builder. It also runs after a signal, in
+    /// its own process group, so a second Ctrl-C at the terminal does not
+    /// cut it off.
+    fn run_cleanup(exe: &Path, args: &[&str]) -> Result<()> {
+        run_step(exe, args, None, true)
+    }
+
+    fn run_step(exe: &Path, args: &[&str], input: Option<&[u8]>, cleanup: bool) -> Result<()> {
+        use std::io::Write;
+        use std::os::unix::process::CommandExt;
+        let seed_error = |e: std::io::Error| Error::config("image seed", e.to_string());
+        let mut command = std::process::Command::new(exe);
+        command
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")
             // An embedder's helper variable would tie the builder VM's life to
             // this short-lived CLI process, killing it as soon as `start` returns.
             .env_remove("SMOLVM_BOOT_BINARY")
-            .stdin(std::process::Stdio::null())
-            .output()
-            .map_err(|e| Error::config("image seed", e.to_string()))?;
+            .stdin(if input.is_some() {
+                std::process::Stdio::piped()
+            } else {
+                std::process::Stdio::null()
+            })
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped());
+        if cleanup {
+            command.process_group(0);
+        }
+        let mut child = command.spawn().map_err(seed_error)?;
+        if !cleanup {
+            // The signal handler stops this step. A signal that came before
+            // the handler could see the step stops it here.
+            STEP_PID.store(child.id() as i32, Ordering::SeqCst);
+            if interrupt_signal().is_some() {
+                unsafe { libc::kill(child.id() as i32, libc::SIGINT) };
+            }
+        }
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            // A step that exits before reading reports its own error below.
+            let _ = stdin.write_all(input);
+        }
+        let out = child.wait_with_output();
+        if !cleanup {
+            STEP_PID.store(0, Ordering::SeqCst);
+        }
+        let out = out.map_err(seed_error)?;
         if out.status.success() {
             return Ok(());
         }
@@ -1314,13 +1672,17 @@ mod tests {
     }
 
     #[test]
-    fn a_larger_disk_seeds_and_a_smaller_one_pulls() {
+    fn every_disk_size_seeds_and_a_small_one_gets_its_own_seed() {
         let default = crate::storage::DEFAULT_STORAGE_SIZE_GIB;
         let name = "seed-size-gate-test";
         assert!(seedable_image(name, Some("alpine"), None).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default)).is_some());
         assert!(seedable_image(name, Some("alpine"), Some(default * 5)).is_some());
-        assert!(seedable_image(name, Some("alpine"), Some(default - 1)).is_none());
+        assert!(seedable_image(name, Some("alpine"), Some(8)).is_some());
+        assert_eq!(small_seed_gb(None), None);
+        assert_eq!(small_seed_gb(Some(default)), None);
+        assert_eq!(small_seed_gb(Some(default * 5)), None);
+        assert_eq!(small_seed_gb(Some(8)), Some(8));
     }
 
     #[test]
@@ -1338,6 +1700,36 @@ mod tests {
         assert_eq!(seedable.as_deref(), Some(reference.as_str()));
         // A rootfs directory still boots as it is.
         assert!(seedable_image(name, Some("local-dir:/srv/rootfs"), None).is_none());
+    }
+
+    #[test]
+    fn a_first_start_with_credentials_replaces_the_blank_disk_of_a_private_image() {
+        let name = format!("seed-private-discard-test-{}", std::process::id());
+        let image = "registry.example.com/team/private@sha256:".to_string() + &"a".repeat(64);
+        let dir = crate::agent::vm_data_dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join(crate::storage::STORAGE_DISK_FILENAME);
+        std::fs::write(&disk, b"").unwrap();
+        // The create left a blank disk, which blocks a seed.
+        assert!(seedable_image(&name, Some(&image), None).is_none());
+
+        // A start without credentials keeps the disk: nothing new can seed.
+        assert!(!discard_unbooted_storage(&name, &image, false));
+        assert!(disk.exists());
+        // A local rootfs never seeds, credentials or not.
+        assert!(!discard_unbooted_storage(
+            &name,
+            "local-dir:/srv/rootfs",
+            true
+        ));
+        assert!(disk.exists());
+
+        // A start that brings the registry credentials drops it and can seed.
+        assert!(discard_unbooted_storage(&name, &image, true));
+        assert!(!disk.exists());
+        let seedable = seedable_image(&name, Some(&image), None);
+        let _ = std::fs::remove_dir_all(&dir);
+        assert_eq!(seedable.as_deref(), Some(image.as_str()));
     }
 
     #[test]
@@ -1411,18 +1803,83 @@ mod tests {
     }
 
     #[test]
+    fn a_machine_that_pulls_another_platform_does_not_seed() {
+        let native = crate::vm::rosetta::native_platform();
+        assert!(super::serves_platform(None));
+        assert!(super::serves_platform(Some(native)));
+        let other = if native == "linux/arm64" {
+            "linux/amd64"
+        } else {
+            "linux/arm64"
+        };
+        assert!(!super::serves_platform(Some(other)));
+
+        let mut record = crate::config::VmRecord::new(
+            "seed-test-other-platform".to_string(),
+            1,
+            512,
+            vec![],
+            vec![],
+            false,
+        );
+        record.image = Some("alpine:3.20".to_string());
+        record.oci_platform = Some(other.to_string());
+        assert_eq!(wants_seed(&record.name, &record, false), None);
+    }
+
+    #[test]
+    fn a_small_disk_seed_has_its_own_key_per_size() {
+        let default = seed_key("alpine", "sha256:aa", None, None).unwrap();
+        let eight = seed_key("alpine", "sha256:aa", None, Some(8)).unwrap();
+        assert_ne!(default, eight);
+        assert_ne!(
+            eight,
+            seed_key("alpine", "sha256:aa", None, Some(4)).unwrap()
+        );
+        assert_eq!(
+            eight,
+            seed_key("alpine", "sha256:aa", None, Some(8)).unwrap()
+        );
+    }
+
+    #[test]
+    fn a_builder_name_carries_its_owner_pid() {
+        let key = "0123456789abcdef0123456789abcdef";
+        let name = builder_name(key, 4242);
+        assert_eq!(name, "image-seed-0123456789abcdef-4242");
+        assert_eq!(builder_owner(&name), Some(4242));
+        // Never a PID that `kill` takes as a process group.
+        assert_eq!(builder_owner("image-seed-0123456789abcdef-0"), None);
+        assert_eq!(builder_owner("image-seed-0123456789abcdef-x1"), None);
+        assert_eq!(builder_owner("image-seed-0123456789abcdef"), None);
+        assert_eq!(builder_owner("init-bake-0123456789abcdef-4242"), None);
+    }
+
+    #[test]
+    fn a_builder_whose_owner_exited_is_reaped_and_a_live_one_is_not() {
+        let me = builder_name("0123456789abcdef", std::process::id());
+        assert!(!builder_owner_gone(&me));
+        let mut child = std::process::Command::new("true").spawn().unwrap();
+        let pid = child.id();
+        child.wait().unwrap();
+        assert!(builder_owner_gone(&builder_name("0123456789abcdef", pid)));
+        // A name with no owner is left to the age rule.
+        assert!(!builder_owner_gone("image-seed-0123456789abcdef"));
+    }
+
+    #[test]
     fn key_changes_with_digest_and_image() {
         let template = std::env::temp_dir().join("seed-key-template");
         std::fs::write(&template, b"t").unwrap();
         let template = Some(template.as_path());
-        let a = seed_key("alpine", "sha256:aa", template).unwrap();
-        assert_eq!(a, seed_key("alpine", "sha256:aa", template).unwrap());
-        assert_ne!(a, seed_key("alpine", "sha256:bb", template).unwrap());
-        assert_ne!(a, seed_key("busybox", "sha256:aa", template).unwrap());
+        let a = seed_key("alpine", "sha256:aa", template, None).unwrap();
+        assert_eq!(a, seed_key("alpine", "sha256:aa", template, None).unwrap());
+        assert_ne!(a, seed_key("alpine", "sha256:bb", template, None).unwrap());
+        assert_ne!(a, seed_key("busybox", "sha256:aa", template, None).unwrap());
         // A raw seed built without a template never answers for one built on it.
-        let bare = seed_key("alpine", "sha256:aa", None).unwrap();
+        let bare = seed_key("alpine", "sha256:aa", None, None).unwrap();
         assert_ne!(a, bare);
-        assert_eq!(bare, seed_key("alpine", "sha256:aa", None).unwrap());
+        assert_eq!(bare, seed_key("alpine", "sha256:aa", None, None).unwrap());
     }
 
     #[test]

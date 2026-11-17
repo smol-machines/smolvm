@@ -327,29 +327,47 @@ pub fn open_tap_in_netns(netns_path: &str, ifname: &str) -> io::Result<OwnedFd> 
 /// `nsenter` (iproute2 + util-linux) must be on PATH — they are on every k8s node.
 #[cfg(target_os = "linux")]
 pub fn setup_tc_redirect(netns_path: &str, cni_if: &str, tap_if: &str) -> io::Result<()> {
-    // A clsact/ingress qdisc on each device gives us the ingress hook the mirred
+    // An ingress qdisc on each device gives us the ingress hook the mirred
     // redirect attaches to. `matchall` (kernel 4.9+) classifies every frame.
-    tc(netns_path, &["qdisc", "add", "dev", cni_if, "ingress"])?;
-    tc(netns_path, &["qdisc", "add", "dev", tap_if, "ingress"])?;
-    tc(
+    //
+    // This must be idempotent: the tap dies with its fd, but the CNI interface
+    // outlives the VM, so a VM restarted in the same pod finds the previous
+    // run's qdisc and a redirect to a tap that no longer exists. `replace`
+    // keeps an existing qdisc, and our filter sits at its own priority so it
+    // can be swapped without touching filters anything else installed.
+    let pref = REDIRECT_PREF;
+    for dev in [cni_if, tap_if] {
+        tc(netns_path, &["qdisc", "replace", "dev", dev, "ingress"])?;
+    }
+    let stale = tc(
         netns_path,
-        &[
-            "filter", "add", "dev", cni_if, "ingress", "protocol", "all", "matchall", "action",
-            "mirred", "egress", "redirect", "dev", tap_if,
-        ],
+        &["filter", "show", "dev", cni_if, "ingress", "pref", pref],
     )?;
-    tc(
-        netns_path,
-        &[
-            "filter", "add", "dev", tap_if, "ingress", "protocol", "all", "matchall", "action",
-            "mirred", "egress", "redirect", "dev", cni_if,
-        ],
-    )?;
+    if !stale.trim().is_empty() {
+        tc(
+            netns_path,
+            &["filter", "del", "dev", cni_if, "ingress", "pref", pref],
+        )?;
+    }
+    for (from, to) in [(cni_if, tap_if), (tap_if, cni_if)] {
+        tc(
+            netns_path,
+            &[
+                "filter", "add", "dev", from, "ingress", "pref", pref, "protocol", "all",
+                "matchall", "action", "mirred", "egress", "redirect", "dev", to,
+            ],
+        )?;
+    }
     Ok(())
 }
 
+/// tc priority of the redirect filters, chosen so they can be found and
+/// replaced on re-attach without disturbing other ingress filters.
 #[cfg(target_os = "linux")]
-fn tc(netns_path: &str, args: &[&str]) -> io::Result<()> {
+const REDIRECT_PREF: &str = "49152";
+
+#[cfg(target_os = "linux")]
+fn tc(netns_path: &str, args: &[&str]) -> io::Result<String> {
     let out = std::process::Command::new("nsenter")
         .arg(format!("--net={netns_path}"))
         .arg("tc")
@@ -362,7 +380,7 @@ fn tc(netns_path: &str, args: &[&str]) -> io::Result<()> {
             String::from_utf8_lossy(&out.stderr).trim()
         )));
     }
-    Ok(())
+    Ok(String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
 #[cfg(target_os = "linux")]

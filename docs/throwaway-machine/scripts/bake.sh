@@ -42,7 +42,15 @@ printf 'elapsed_s=%s\n' "$elapsed"
 
 # Assert the value, not the exit code. A bake that did not cache still exits
 # zero, and the run that depends on it then fails much later with a message
-# about the registry.
+# about the registry. A cache that was written but did not boot is no bake
+# either: on macOS from v1.24.0 the bake prints both lines.
+if printf '%s' "$out" | grep -q 'baked in' && printf '%s' "$out" | grep -q 'did not become ready'; then
+    printf 'result=FAILED the image was cached, but the machine started from the cache did not boot.\n'
+    printf 'On macOS from v1.24.0 to at least v1.29.0 every --oci-cache run fails this way. A persistent\n'
+    printf 'machine with no network boots the image with no bake (README.md, "The network is off unless\n'
+    printf 'you ask for it").\n'
+    exit 1
+fi
 if printf '%s' "$out" | grep -q 'baked in'; then
     printf 'result=baked\n'
     exit 0

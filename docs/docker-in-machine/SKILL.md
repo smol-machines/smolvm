@@ -5,14 +5,11 @@ description: Runs a Docker daemon inside a smolvm machine and shows it working t
 
 # A Docker daemon inside a machine
 
-Verified on **smolvm v1.22.2** on macOS arm64, 2026-10-03, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
+Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
 the Smolfile with `memory = 1024`, for a host reason given below. Done means `docker info` succeeds inside the guest, a nested container runs, and
 Docker's data sits on the ext4 storage disk rather than the rootfs overlay.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
-
-smolvm boots OCI images without Docker. This is only for software **inside** the machine that must
-call Docker itself.
 
 **On Windows, up to and including v1.22.2, `dockerd` does not start in a machine.** The Windows
 guest kernel is built without bridge networking and POSIX message queues, so `dockerd` cannot
@@ -20,12 +17,19 @@ create its default network and, forced past that, containers still cannot be cre
 `references/windows.md` has the evidence and the direct kernel probe, which gave the same answer on
 v1.22.2.
 
-## The trap this packet exists for
+## Docker's data has to be on the machine's disk on every start
 
-**`init` runs once, so the bind mounts are gone on the second boot** and have to be re-applied on
-every start. The upstream example says so in its comments and re-applies them in its "Start
-dockerd" recipe, which `scripts/start-dockerd.sh` is. Reproduced on both hosts on v1.14.2, v1.18.2
-and v1.22.2, and on macOS on v1.16.1:
+From v1.28.1 a disk volume, a guest path with no host side, is a directory on the machine's ext4
+disk, bound into the workload on every start ([#1787](https://github.com/smol-machines/smolvm/pull/1787)).
+`assets/docker.smolfile` declares `/var/lib/docker` and `/var/lib/containerd` that way, and its
+`docker:dind` image starts `dockerd` itself on every start, so nothing has to be re-applied after a
+stop and start.
+
+**On v1.28.0 and earlier, `init` runs once, so the bind mounts are gone on the second boot** and
+have to be re-applied on every start. `assets/docker-bind-mounts.smolfile` is that configuration,
+and `scripts/start-dockerd.sh` re-applies the mounts and starts the daemon, as the upstream
+example's "Start dockerd" recipe does. Reproduced on both hosts on v1.14.2, v1.18.2 and v1.22.2,
+on macOS on v1.16.1, and with that file on v1.29.0:
 
 ```
 Init already completed, skipping 5 command(s)
@@ -37,9 +41,8 @@ Running `scripts/start-dockerd.sh` afterwards restored everything, and `docker i
 listed `alpine:latest`, because the images are on `/storage`. **The failure mode is a daemon that
 will not start, or one running on the wrong filesystem, not lost data.**
 
-`smolvm machine create --help` describes `--init` as "Run command on every VM start" at v1.22.2;
-`init` runs on the first start only, as [`smolfile.md`](../smolfile.md) says. More in
-`references/traps.md`.
+`init` runs on the first start only, as [`smolfile.md`](../smolfile.md) says, whatever
+`machine create --help` said before v1.23.7. More in `references/traps.md`.
 
 ## Procedure
 
@@ -51,30 +54,34 @@ scripts/preflight.sh
 
 `docker_in_machine=verified` on macOS and Linux, `unavailable` on Windows with the reason.
 
-**2. Create and install.** `assets/docker.smolfile` is the upstream example's configuration,
-shipped here because **the release tarball does not contain `examples/`**, so the `git clone` step
-in the docs site's guide (smolmachines.com/docs) is not something a released install can follow.
+**2. Create.** `assets/docker.smolfile`, for v1.28.1 and later, is `docker:dind` with the two disk
+volumes. On v1.28.0 and earlier pass `assets/docker-bind-mounts.smolfile`, the upstream example's
+configuration, shipped here because **the release tarball does not contain `examples/`**.
 
 ```bash
 scripts/create-docker-machine.sh              # name defaults to smolskill-docker
+scripts/create-docker-machine.sh smolskill-docker assets/docker-bind-mounts.smolfile   # v1.28.0 and earlier
 ```
 
-The `apk add docker` happens on the **first start**, not on create, and dominates the time.
+With the bind-mount file the `apk add docker` happens on the **first start** and dominates the
+time.
 
-**3. Start the daemon. Run this on every start, not only the first.**
+**3. Wait for the daemon. Run this on every start, not only the first.**
 
 ```bash
 scripts/start-dockerd.sh
 ```
 
-It re-applies both bind mounts, clears a stale pid file, starts `dockerd` with the `overlay2`
-driver and waits for `docker info` to answer:
+With the disk volumes it waits for the image's own `dockerd` to answer `docker info`. With the
+bind-mount file, where nothing starts the daemon, it re-applies both bind mounts, clears a stale
+pid file and starts `dockerd` with the `overlay2` driver, printing `starting dockerd on the bind
+mounts`. On v1.29.0 with the volumes:
 
 ```
- Server Version: 25.0.5
- Storage Driver: overlay2
+ Server Version: 29.9.0
+ Storage Driver: overlayfs
  Docker Root Dir: /var/lib/docker
-server_version=25.0.5
+server_version=29.9.0
 result=dockerd_up
 ```
 
@@ -85,7 +92,7 @@ scripts/verify-docker.sh
 ```
 
 ```
-storage_driver=ok (overlay2)
+storage_driver=ok (overlayfs)
 docker_root_device=ok (/dev/vda)
 pull=docker.io/library/alpine:latest
 nested_container=ok (NESTED_OK)
@@ -93,6 +100,9 @@ host_network=ok (HOSTNET_OK)
 host_socket=present (.../vms/<hash>/docker.sock)
 result=docker_ok
 ```
+
+`overlayfs` is the name Docker 29's containerd image store reports; Docker 25 on the bind-mount
+file reports `overlay2`, and the check takes either.
 
 `docker_root_device` is the check that matters. `docker info` succeeds while `/var/lib/docker`
 sits on the rootfs overlay, and the failure that follows is confusing and much later.
@@ -111,14 +121,15 @@ scripts/cleanup.sh --purge
 `cleanup.sh` waits up to 20 seconds, polling the machine list, and prints `waiting=up to 20s`
 first: an ephemeral machine's entry retires after its run returns.
 
-## Why Docker's data has to live on `/storage`
+## Why Docker's data has to live on the machine's disk
 
 A hard requirement, not a preference. The smolvm rootfs overlay uses the initramfs (ramfs) as its
 lower layer, ramfs has no file-handle support, and overlayfs then rejects it as an upper dir for
 Docker's nested overlay. Both mounts are needed: `/var/lib/containerd` holds the snapshotter's
 overlay state and fails the same way.
 
-That is why the Smolfile declares `storage = 20`, and why every check here is against `/dev/vda`.
+That is why both Smolfiles declare `storage = 20` and put the two directories on it, as disk
+volumes or as bind mounts from `/storage`, and why every check here is against `/dev/vda`.
 
 ## The host-side socket
 
@@ -154,8 +165,8 @@ verified**: neither host used here has a `docker` client.
 
 ## Platform arms
 
-- **macOS arm64**: v1.22.2 as shipped, every check passed, the restart trap and its recovery
-  included.
+- **macOS arm64**: v1.29.0 with the disk volumes, every check passed before and after a stop and
+  start; the bind-mount file on v1.29.0 too, the restart trap and its recovery included.
 - **Linux aarch64**: v1.18.2 and once on v1.22.2, with the Smolfile's memory at 1024 MiB: the Lima
   host could not boot larger guests inside the fixed 30 s readiness window, and the `install`
   packet's traps have the numbers. On a small or busy host, lower `memory` before suspecting
@@ -199,6 +210,34 @@ has `CONFIG_BRIDGE` and `CONFIG_POSIX_MQUEUE` both off, so `dockerd` fails on
 daemon comes up healthy while every container fails on `/dev/mqueue`. That result is from an
 earlier run on Windows 11 against v1.14.2, and the kernel probe on `references/windows.md` gave
 the same two answers on v1.22.2.
+
+## Re-verified on v1.29.0, with the disk volumes
+
+Run 2026-10-15 PT against v1.29.0 from the published release (the `darwin-arm64` archive, checksum
+checked), under a fresh isolated `HOME` on macOS 27.0.1 arm64, twice, the second time from a fresh
+`HOME`. Linux was not run.
+
+`create-docker-machine.sh` gave `result=installed` (Docker 29.9.0) in 17 s, `start-dockerd.sh`
+`result=dockerd_up` without starting a daemon of its own, and `verify-docker.sh`
+`storage_driver=ok (overlayfs)`, `docker_root_device=ok (/dev/vda)`, `nested_container=ok
+(NESTED_OK)`, `host_network=ok (HOSTNET_OK)`, `host_socket=present` and `result=docker_ok`. After a
+stop and start `df` put both directories on `/dev/vda`, `alpine:latest` was still listed, and the
+same checks passed. The first run's `verify-docker.sh` expected `overlay2` and failed on that line
+alone; the check now takes either name. With `assets/docker-bind-mounts.smolfile`,
+`start-dockerd.sh` printed `starting dockerd on the bind mounts` after each start and
+`verify-docker.sh` gave `result=docker_ok`.
+
+## Re-verified on v1.29.0, with the bind mounts
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, the scripts twice, the second time from a fresh `HOME`, and
+the checks beyond them once. Linux was not run, so the Linux stamp stays on its earlier release.
+
+`create-docker-machine.sh` gave `result=installed` (Docker 25.0.5), `start-dockerd.sh`
+`result=dockerd_up`, and `verify-docker.sh` `docker_root_device=ok (/dev/vda)`,
+`nested_container=ok (NESTED_OK)` and `result=docker_ok`. After a stop and start the machine
+printed `Init already completed, skipping 5 command(s)`, `NO_BIND_MOUNTS_AFTER_RESTART` and
+`DOCKERD_DOWN`; `start-dockerd.sh` brought it back and `alpine:latest` was still listed.
 
 ## Re-verified on v1.22.2
 

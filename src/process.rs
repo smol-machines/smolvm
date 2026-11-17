@@ -8,6 +8,7 @@ use std::os::fd::IntoRawFd;
 #[cfg(target_os = "linux")]
 use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(unix)]
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -339,6 +340,74 @@ pub fn harden_self() {
     }
 }
 
+/// Raise this process's open-file soft limit as far as the host allows and
+/// return the limit now in force (`None` where there is no such limit).
+///
+/// A machine's VMM holds one host socket per guest connection (TSI and
+/// virtio-net alike), so this limit caps how many connections a guest can
+/// have open at once. The soft limit goes to the hard limit; macOS refuses
+/// an unlimited soft limit on older releases, so there it is capped at
+/// `kern.maxfilesperproc`, the per-process ceiling only root can raise.
+#[cfg(unix)]
+pub fn raise_nofile_limit() -> Option<libc::rlim_t> {
+    // SAFETY: getrlimit/setrlimit on a local struct.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        let wanted = match macos_max_files_per_process() {
+            Some(per_process) => limit.rlim_max.min(per_process),
+            None => limit.rlim_max,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let wanted = limit.rlim_max;
+        // A soft limit above `kern.maxfilesperproc` (a shell with `ulimit -n`
+        // past it) is not the one in force: macOS holds the process to the
+        // per-process cap anyway. Set it to the cap so what we report, and
+        // what children inherit, is the limit that applies.
+        if wanted != limit.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: wanted,
+                rlim_max: limit.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                limit.rlim_cur = wanted;
+            }
+        }
+        Some(limit.rlim_cur)
+    }
+}
+
+/// No per-process open-file limit to raise on this platform.
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() -> Option<u64> {
+    None
+}
+
+/// `kern.maxfilesperproc`: the most files one macOS process may hold.
+#[cfg(target_os = "macos")]
+fn macos_max_files_per_process() -> Option<libc::rlim_t> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and `value`/`size` describe a
+    // writable c_int.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as libc::rlim_t)
+}
+
 /// `PR_SET_PTRACER` / `PR_SET_PTRACER_ANY` (yama LSM; absent from the `libc`
 /// crate). Opting in lets any same-uid process pread `/proc/<pid>/mem` under
 /// `ptrace_scope=1` — used so a forkable VM's CUDA clone workers (children of
@@ -393,7 +462,6 @@ pub fn set_dumpable(_dumpable: bool) {}
 // ============================================================================
 
 /// CPU accounting period for `cpu.max` (cgroup v2 default, 100 ms).
-#[cfg(target_os = "linux")]
 const CGROUP_CPU_PERIOD_US: u64 = 100_000;
 
 /// Cap on host tasks (threads/processes) a single VMM may spawn. Guest processes
@@ -407,6 +475,43 @@ const CGROUP_PIDS_MAX: u32 = 1024;
 /// `memory.max`. This is defense-in-depth atop the guest RAM bound already
 /// enforced by `krun_set_vm_config`, not the primary memory control.
 const VMM_MEM_OVERHEAD_MIB: u64 = 768;
+
+/// The `oom_score_adj` a VMM runs with, so that when the HOST runs out of
+/// memory the kernel's global OOM killer takes a branch child before anything
+/// else and a branch source last: a source's death kills every child that
+/// shares its RAM, while a child is one disposable unit of work. Plain
+/// machines keep 0. `SMOLVM_OOM_VICTIM_ORDER=0` leaves every score at 0.
+pub fn oom_score_adj_for(source: bool, clone: bool) -> i32 {
+    if std::env::var("SMOLVM_OOM_VICTIM_ORDER").as_deref() == Ok("0") {
+        return 0;
+    }
+    match (clone, source) {
+        (true, _) => 500,
+        (false, true) => -500,
+        (false, false) => 0,
+    }
+}
+
+/// Write this process's `oom_score_adj`. Lowering it below 0 needs
+/// CAP_SYS_RESOURCE (the service runs privileged on a node; a user's local
+/// service may not), so a refusal is for the caller to report, not fatal.
+#[cfg(target_os = "linux")]
+pub fn set_own_oom_score_adj(adj: i32) -> std::io::Result<()> {
+    std::fs::write("/proc/self/oom_score_adj", adj.to_string())
+}
+
+/// The service itself is the last thing the kernel should kill on a full host:
+/// with it gone no machine can be paused, stopped or reported. -900 keeps it
+/// killable as a last resort.
+#[cfg(target_os = "linux")]
+pub fn protect_service_from_oom() {
+    if std::env::var("SMOLVM_OOM_VICTIM_ORDER").as_deref() == Ok("0") {
+        return;
+    }
+    if let Err(e) = set_own_oom_score_adj(-900) {
+        tracing::debug!(error = %e, "could not lower the service's oom_score_adj (needs CAP_SYS_RESOURCE)");
+    }
+}
 
 /// Resolve this process's cgroup v2 directory from `/proc/self/cgroup`.
 ///
@@ -467,7 +572,8 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// `root`, deriving limits from the VM's resources.
 ///
 /// Caps applied (best-effort, each independently):
-/// - `cpu.max` = `vcpus * 100ms / 100ms` → bounds CPU to ~`vcpus` cores.
+/// - `cpu.max` grants `cpu_quota_usec_per_sec` of CPU per second: one CPU per
+///   vCPU, or less under the machine's CPU limit.
 /// - `pids.max` = [`CGROUP_PIDS_MAX`] → caps host tasks (fork-bomb containment).
 /// - `memory.high`/`memory.max` = guest RAM, unreclaimable-mapping allowance,
 ///   and proportional overhead, with a reclaim stage below the ceiling.
@@ -475,32 +581,27 @@ pub fn setup_cgroup_delegation_root() -> Option<std::path::PathBuf> {
 /// `root` must be a delegated root with `cpu`/`memory`/`pids` enabled in its
 /// `subtree_control` (see [`setup_cgroup_delegation_root`]); otherwise the limit
 /// files won't exist and the caps silently degrade while the process still runs.
-/// Never blocks boot.
+/// Never blocks boot. Returns whether the VMM joined the leaf.
 #[cfg(target_os = "linux")]
 pub fn place_in_cgroup(
     root: &std::path::Path,
-    vcpus: u8,
+    cpu_quota_usec_per_sec: u64,
     memory_mib: u32,
     cuda: bool,
     memfd_backed: bool,
-) {
+) -> bool {
     let pid = unsafe { libc::getpid() };
     let vm = root.join(format!("vm-{pid}"));
     if let Err(e) = std::fs::create_dir(&vm) {
         if e.kind() != std::io::ErrorKind::AlreadyExists {
             tracing::debug!(error = %e, dir = %vm.display(),
                 "could not create per-VM cgroup; VMM running uncapped");
-            return;
+            return false;
         }
     }
 
     // Set limits on the leaf *before* joining it.
-    let quota_us = u64::from(vcpus.max(1)) * CGROUP_CPU_PERIOD_US;
-    let _ = write_cgroup(
-        &vm,
-        "cpu.max",
-        &format!("{quota_us} {CGROUP_CPU_PERIOD_US}"),
-    );
+    let _ = write_cgroup(&vm, "cpu.max", &cpu_max_line(cpu_quota_usec_per_sec));
     let _ = write_cgroup(&vm, "pids.max", &CGROUP_PIDS_MAX.to_string());
     let budget = vmm_memory_budget(memory_mib, cuda, memfd_backed);
     let memory_limit_bytes = budget.max_bytes;
@@ -512,12 +613,13 @@ pub fn place_in_cgroup(
     if let Err(e) = write_cgroup(&vm, "cgroup.procs", &pid.to_string()) {
         tracing::debug!(error = %e, "failed to join per-VM cgroup; VMM running uncapped");
         let _ = std::fs::remove_dir(&vm); // leave no empty cgroup behind
-        return;
+        return false;
     }
     tracing::info!(
-        vcpus, memory_mib, cuda, memory_limit_bytes, cgroup = %vm.display(),
+        cpu_quota_usec_per_sec, memory_mib, cuda, memory_limit_bytes, cgroup = %vm.display(),
         "placed VMM subprocess in per-VM cgroup with cpu/pids/memory caps"
     );
+    true
 }
 
 /// Host-memory budget for one VMM's cgroup: a reclaim threshold and a hard
@@ -606,29 +708,81 @@ pub fn set_managed_vmm_memory_limit(
         return Ok(false);
     };
     let scope = crate::systemd_scope::scope_name(machine);
+    let owned = leaf == scope || leaf == format!("vm-{pid}");
+    if !owned {
+        return Ok(false);
+    }
+    // A generation's pages stay charged here until every child mapping them
+    // has exited, which can be after its record is gone. A ceiling below what
+    // is charged reclaims nothing (shmem) and kills the source on the spot.
+    let read = |file: &str| -> Option<u64> {
+        std::fs::read_to_string(dir.join(file))
+            .ok()?
+            .trim()
+            .parse()
+            .ok()
+    };
+    let requested = VmmMemoryBudget {
+        max_bytes: memory_max_bytes,
+        high_bytes: memory_high_bytes,
+    };
+    let budget = match read("memory.current") {
+        Some(charged) => floored_memory_budget(requested, charged, read("memory.max")),
+        None => requested,
+    };
+    if budget != requested {
+        tracing::warn!(
+            machine,
+            requested_max_bytes = memory_max_bytes,
+            kept_max_bytes = budget.max_bytes,
+            "kept a VM's memory limit above what its cgroup still holds"
+        );
+    }
+    let (memory_max_bytes, memory_high_bytes) = (budget.max_bytes, budget.high_bytes);
     if leaf == scope {
         crate::systemd_scope::set_scope_memory_max(machine, memory_max_bytes, memory_high_bytes)?;
         return Ok(true);
     }
-    if leaf == format!("vm-{pid}") {
-        write_cgroup(&dir, "memory.high", &memory_high_bytes.to_string()).map_err(|error| {
-            Error::agent(
-                "VM cgroup",
-                format!("update {} memory.high: {error}", dir.display()),
-            )
-        })?;
-        write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
-            Error::agent(
-                "VM cgroup",
-                format!(
-                    "update {} memory.max to {memory_max_bytes}: {error}",
-                    dir.display()
-                ),
-            )
-        })?;
-        return Ok(true);
+    write_cgroup(&dir, "memory.high", &memory_high_bytes.to_string()).map_err(|error| {
+        Error::agent(
+            "VM cgroup",
+            format!("update {} memory.high: {error}", dir.display()),
+        )
+    })?;
+    write_cgroup(&dir, "memory.max", &memory_max_bytes.to_string()).map_err(|error| {
+        Error::agent(
+            "VM cgroup",
+            format!(
+                "update {} memory.max to {memory_max_bytes}: {error}",
+                dir.display()
+            ),
+        )
+    })?;
+    Ok(true)
+}
+
+/// `requested`, unless it would put the ceiling under what the cgroup holds:
+/// then the ceiling stays that charge plus the requested reclaim band, never
+/// above the limit already in place when this was meant to lower it.
+#[cfg(any(target_os = "linux", test))]
+fn floored_memory_budget(
+    requested: VmmMemoryBudget,
+    charged: u64,
+    existing_max: Option<u64>,
+) -> VmmMemoryBudget {
+    let band = requested.max_bytes.saturating_sub(requested.high_bytes);
+    let floor = charged.saturating_add(band);
+    if requested.max_bytes >= floor {
+        return requested;
     }
-    Ok(false)
+    let max_bytes = match existing_max {
+        Some(existing) if existing > requested.max_bytes => floor.min(existing),
+        _ => floor,
+    };
+    VmmMemoryBudget {
+        max_bytes,
+        high_bytes: max_bytes.saturating_sub(band),
+    }
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -760,17 +914,66 @@ pub fn raise_managed_vmm_memory_budget(
 }
 
 /// Update only a verified VMM's own CPU quota, never a shared enclosing cgroup.
-#[cfg(target_os = "linux")]
 pub fn set_managed_vmm_cpu_count(
     machine: &str,
     pid: Pid,
     started: Option<u64>,
     cpus: u8,
 ) -> Result<bool> {
-    if cpus == 0 || !is_our_process_strict(pid, started) {
+    if cpus == 0 {
         return Err(Error::agent(
             "CPU resize",
             "invalid CPU count or VMM process identity changed",
+        ));
+    }
+    set_managed_vmm_cpu_quota(machine, pid, started, u64::from(cpus) * 1_000_000)
+}
+
+/// The `cpu.max` quota, per `period_us`, that grants `usec_per_sec` of CPU
+/// time per second. The kernel refuses a quota under 1 ms, so it never goes
+/// below that; [`cpu_max_period_us`] picks a period long enough that the floor
+/// does not raise the grant.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_quota_us(usec_per_sec: u64, period_us: u64) -> u64 {
+    (usec_per_sec.saturating_mul(period_us) / 1_000_000).max(1_000)
+}
+
+/// The `cpu.max` period for a grant of `usec_per_sec`: the 100 ms default, or
+/// longer (up to the kernel's 1 s maximum) when 1 ms per 100 ms would grant
+/// more than asked, as systemd stretches it for `CPUQuotaPerSecUSec`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_period_us(usec_per_sec: u64) -> u64 {
+    const DEFAULT: u64 = CGROUP_CPU_PERIOD_US;
+    const MAX: u64 = 1_000_000;
+    if usec_per_sec == 0 || usec_per_sec.saturating_mul(DEFAULT) / 1_000_000 >= 1_000 {
+        return DEFAULT;
+    }
+    (1_000u64 * 1_000_000).div_ceil(usec_per_sec).min(MAX)
+}
+
+/// The `cpu.max` contents granting `usec_per_sec` of CPU per second.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_line(usec_per_sec: u64) -> String {
+    let period = cpu_max_period_us(usec_per_sec);
+    format!("{} {period}", cpu_max_quota_us(usec_per_sec, period))
+}
+
+/// Set a verified VMM's own CPU quota to `usec_per_sec` of CPU time per
+/// second across all its threads (1_000_000 = one CPU), never a shared
+/// enclosing cgroup. The guest is not told: its vCPUs stay online and simply
+/// get less host time. Returns `false` when the VMM is not in a cgroup SmolVM
+/// owns, so no quota could be set.
+#[cfg(target_os = "linux")]
+pub fn set_managed_vmm_cpu_quota(
+    machine: &str,
+    pid: Pid,
+    started: Option<u64>,
+    usec_per_sec: u64,
+) -> Result<bool> {
+    if usec_per_sec == 0 || !is_our_process_strict(pid, started) {
+        return Err(Error::agent(
+            "CPU resize",
+            "invalid CPU quota or VMM process identity changed",
         ));
     }
     let Some(dir) = cgroup_v2_process_dir(pid) else {
@@ -778,34 +981,17 @@ pub fn set_managed_vmm_cpu_count(
     };
     let leaf = dir.file_name().and_then(|name| name.to_str()).unwrap_or("");
     if leaf == crate::systemd_scope::scope_name(machine) {
-        crate::systemd_scope::set_scope_cpu_count(machine, cpus)?;
+        crate::systemd_scope::set_scope_cpu_quota(machine, usec_per_sec)?;
     } else if leaf == format!("vm-{pid}") {
-        write_cgroup(
-            &dir,
-            "cpu.max",
-            &format!(
-                "{} {}",
-                u64::from(cpus) * CGROUP_CPU_PERIOD_US,
-                CGROUP_CPU_PERIOD_US
-            ),
-        )
-        .map_err(|error| Error::agent("CPU resize", format!("cannot update CPU quota: {error}")))?;
+        write_cgroup(&dir, "cpu.max", &cpu_max_line(usec_per_sec)).map_err(|error| {
+            Error::agent("CPU resize", format!("cannot update CPU quota: {error}"))
+        })?;
     } else {
         return Ok(false);
     }
     let quota = std::fs::read_to_string(dir.join("cpu.max"))
         .map_err(|error| Error::agent("CPU resize", format!("cannot verify CPU quota: {error}")))?;
-    let values: Vec<_> = quota.split_whitespace().collect();
-    let verified = match values.as_slice() {
-        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
-            (Ok(quota), Ok(period)) if period > 0 => {
-                period.checked_mul(u64::from(cpus)) == Some(quota)
-            }
-            _ => false,
-        },
-        _ => false,
-    };
-    if !verified || !is_our_process_strict(pid, started) {
+    if !cpu_max_matches(&quota, usec_per_sec) || !is_our_process_strict(pid, started) {
         return Err(Error::agent(
             "CPU resize",
             "CPU quota or VMM identity could not be verified after update",
@@ -814,13 +1000,29 @@ pub fn set_managed_vmm_cpu_count(
     Ok(true)
 }
 
+/// Whether a `cpu.max` line grants exactly `usec_per_sec` per second, at
+/// whatever period it uses.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn cpu_max_matches(cpu_max: &str, usec_per_sec: u64) -> bool {
+    let values: Vec<_> = cpu_max.split_whitespace().collect();
+    match values.as_slice() {
+        [quota, period] => match (quota.parse::<u64>(), period.parse::<u64>()) {
+            (Ok(quota), Ok(period)) if period > 0 => {
+                cpu_max_quota_us(usec_per_sec, period) == quota
+            }
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
 #[cfg(not(target_os = "linux"))]
 /// Report that this host has no Linux managed-scope CPU quota to update.
-pub fn set_managed_vmm_cpu_count(
+pub fn set_managed_vmm_cpu_quota(
     _machine: &str,
     _pid: Pid,
     _started: Option<u64>,
-    _cpus: u8,
+    _usec_per_sec: u64,
 ) -> Result<bool> {
     Ok(false)
 }
@@ -1299,6 +1501,17 @@ pub fn vm_uid_drop_active() -> bool {
     false
 }
 
+#[cfg(unix)]
+static EXPLICIT_DATA_ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the user named the data root (`--state-dir` or `SMOLVM_DATA_DIR`),
+/// as opposed to smolvm using or choosing its default one. Such a run sits
+/// beside the default install and must leave the user's own setup alone.
+#[cfg(unix)]
+pub fn data_root_is_explicit() -> bool {
+    EXPLICIT_DATA_ROOT.get().copied().unwrap_or(false)
+}
+
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
 /// at it before any path is computed — every `dirs::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
@@ -1308,15 +1521,18 @@ pub fn vm_uid_drop_active() -> bool {
 /// privileged with the uid drop active and no XDG override (serve only — a
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn apply_system_data_root(allow_auto: bool) {
-    let mut carry_rootfs_from = None;
+    // Only the first pass sees what the user asked for: a later one (serve
+    // runs its own) finds the variable this function set itself.
+    EXPLICIT_DATA_ROOT.get_or_init(|| std::env::var_os("SMOLVM_DATA_DIR").is_some());
+    #[cfg(target_os = "linux")]
+    let overlay_root = overlay_workspace_root();
+    #[cfg(not(target_os = "linux"))]
+    let overlay_root: Option<std::path::PathBuf> = None;
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
-    } else if let Some(workspace_root) = overlay_workspace_root() {
-        // The rootfs the installer laid down sits under the old home, which a
-        // dropped VMM uid cannot traverse; bring a copy into the new root.
-        carry_rootfs_from = installed_agent_rootfs();
+    } else if let Some(workspace_root) = overlay_root {
         // Name the choice so a second pass (`serve` runs one of its own, after
         // HOME has already moved off overlayfs) and every child keep this root
         // instead of falling through to /var/lib/smolvm.
@@ -1331,6 +1547,10 @@ pub fn apply_system_data_root(allow_auto: bool) {
     } else {
         return;
     };
+    // Relocating HOME also relocates the fallback agent rootfs path. Preserve
+    // the installed rootfs for explicit SMOLVM_DATA_DIR and serve's /var/lib
+    // default, just as we do for the overlayfs workspace default.
+    let carry_rootfs_from = installed_agent_rootfs();
     match std::fs::create_dir_all(&root) {
         Ok(()) => {
             use std::os::unix::fs::PermissionsExt;
@@ -1357,14 +1577,17 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
-    if let Some(src) = carry_rootfs_from {
-        let dst = root.join(".local/share/smolvm/agent-rootfs");
-        if let Err(e) = sync_agent_rootfs(&src, &dst) {
-            eprintln!(
-                "warning: could not copy the agent rootfs from {} to {}: {e}",
-                src.display(),
-                dst.display()
-            );
+    // Resolved after HOME moved, so it is the relocated data dir on every OS.
+    let rootfs_dst = dirs::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
+    if let (Some(src), Some(dst)) = (carry_rootfs_from, rootfs_dst) {
+        if src != dst {
+            if let Err(e) = sync_agent_rootfs(&src, &dst) {
+                eprintln!(
+                    "warning: could not copy the agent rootfs from {} to {}: {e}",
+                    src.display(),
+                    dst.display()
+                );
+            }
         }
     }
     tracing::info!(data_root = %root.display(), "smolvm state rooted at a system data dir");
@@ -1414,9 +1637,11 @@ fn choose_workspace_root(home_fs: Option<i64>, workspace_fs: Option<i64>) -> boo
 }
 
 /// The agent rootfs the installer put in the data dir, when nothing else names one.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
-    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some() {
+    if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some()
+        || crate::embedded::bundle::agent_rootfs_tar().is_some()
+    {
         return None;
     }
     dirs::data_local_dir()
@@ -1427,8 +1652,29 @@ fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
 /// Copy the agent rootfs to `dst` unless the copy there is already current.
 /// The agent binary's size and mtime stand for its version: `cp -a` keeps both,
 /// and an upgrade replaces the binary, so a stale copy is replaced too.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    let parent = dst
+        .parent()
+        .ok_or_else(|| std::io::Error::other("rootfs has no parent"))?;
+    std::fs::create_dir_all(parent)?;
+    // Multiple CLI invocations may relocate the same rootfs concurrently.
+    // Keep the version check and replacement under a cross-process lock.
+    let lock = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(parent.join(".agent-rootfs.lock"))?;
+    loop {
+        if unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX) } == 0 {
+            break;
+        }
+        let error = std::io::Error::last_os_error();
+        if error.kind() != std::io::ErrorKind::Interrupted {
+            return Err(error);
+        }
+    }
     let stamp = |root: &std::path::Path| {
         std::fs::metadata(root.join("usr/local/bin/smolvm-agent"))
             .ok()
@@ -1437,10 +1683,6 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     if stamp(dst).is_some() && stamp(dst) == stamp(src) {
         return Ok(());
     }
-    let parent = dst
-        .parent()
-        .ok_or_else(|| std::io::Error::other("rootfs has no parent"))?;
-    std::fs::create_dir_all(parent)?;
     let staging = parent.join(".agent-rootfs.new");
     let _ = std::fs::remove_dir_all(&staging);
     let status = std::process::Command::new("cp")
@@ -1455,8 +1697,8 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     std::fs::rename(&staging, dst)
 }
 
-/// No-op where the data root isn't applicable (macOS dev).
-#[cfg(not(target_os = "linux"))]
+/// No-op where `HOME` does not root smolvm's paths (Windows).
+#[cfg(not(unix))]
 pub fn apply_system_data_root(_allow_auto: bool) {}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
@@ -1579,6 +1821,12 @@ pub fn allocate_vm_uid(
 /// shares its golden's uid and never claims its own). Linux-only.
 #[cfg(target_os = "linux")]
 pub fn free_vm_uid(registry_dir: &std::path::Path, key_dir: &std::path::Path) {
+    // Most unprivileged VMs never had an assigned uid or a registry directory.
+    // Avoid a misleading lock warning when there is no allocation to release.
+    // Callers release only after the VM has stopped.
+    if !key_dir.join(".vm-uid").exists() {
+        return;
+    }
     let Ok(_registry_lock) = lock_uid_registry(registry_dir) else {
         tracing::warn!("unable to lock UID registry; retaining assignment");
         return;
@@ -1983,7 +2231,7 @@ fn make_idmap_userns(uid: u32, gid: u32) -> std::io::Result<libc::c_int> {
 #[cfg(target_os = "linux")]
 pub fn setup_private_idmap_mounts(
     pack: Option<(&std::path::Path, &std::path::Path)>,
-    seed_dir: Option<&std::path::Path>,
+    seed_dirs: &[std::path::PathBuf],
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
@@ -2020,7 +2268,7 @@ pub fn setup_private_idmap_mounts(
         if let Some((shared, target)) = pack {
             mount_idmapped(shared, target, userns_fd, true)?;
         }
-        if let Some(seed_dir) = seed_dir {
+        for seed_dir in seed_dirs {
             mount_idmapped(seed_dir, seed_dir, userns_fd, true)?;
         }
         Ok(())
@@ -2038,7 +2286,7 @@ pub fn setup_pack_idmap_mount(
     uid: u32,
     gid: u32,
 ) -> std::io::Result<()> {
-    setup_private_idmap_mounts(Some((shared, target)), None, uid, gid)
+    setup_private_idmap_mounts(Some((shared, target)), &[], uid, gid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2109,7 +2357,7 @@ fn mount_idmapped(
             c"".as_ptr(),
             libc::AT_FDCWD,
             target_c.as_ptr(),
-            libc::MOVE_MOUNT_F_EMPTY_PATH as libc::c_uint,
+            MOVE_MOUNT_F_EMPTY_PATH,
         )
     };
     let result = if rc != 0 { Err(errno()) } else { Ok(()) };
@@ -2153,42 +2401,174 @@ pub fn self_exe_for_spawn() -> std::io::Result<std::path::PathBuf> {
 /// under concurrent VM boots. Reaping only registered VM PIDs leaves those
 /// transient subprocesses to their own waits. Mirrors the guest agent's
 /// `BG_CHILDREN` pattern (`crates/smolvm-agent/src/main.rs`).
-static VM_CHILDREN: OnceLock<Mutex<Vec<i32>>> = OnceLock::new();
+#[cfg(unix)]
+static VM_CHILDREN: OnceLock<Mutex<Vec<VmChild>>> = OnceLock::new();
 
-fn vm_children() -> &'static Mutex<Vec<i32>> {
+/// A detached VM boot subprocess, and the machine directory its exit record
+/// goes to (see [`crate::vm_exit`]).
+#[cfg(unix)]
+struct VmChild {
+    pid: i32,
+    machine_dir: Option<std::path::PathBuf>,
+}
+
+#[cfg(unix)]
+fn vm_children() -> &'static Mutex<Vec<VmChild>> {
     VM_CHILDREN.get_or_init(|| Mutex::new(Vec::new()))
 }
 
+/// Wait statuses the sweep collected, kept for a later [`try_wait`] or
+/// [`wait`] on the same PID (a boot that failed reports its signal from it).
+/// Bounded: a status nobody asks for is only kept for so many exits.
+#[cfg(unix)]
+static REAPED: Mutex<std::collections::VecDeque<(i32, libc::c_int)>> =
+    Mutex::new(std::collections::VecDeque::new());
+#[cfg(unix)]
+const REAPED_KEPT: usize = 256;
+
 /// Track a detached VM boot subprocess PID so a later [`reap_vm_children`] sweep
-/// reaps it. The Rust `Child` handle's `Drop` does not `wait()`, so the caller
-/// can let it drop after recording the PID.
-pub fn register_vm_child(pid: i32) {
-    vm_children().lock().unwrap().push(pid);
+/// reaps it and records why it ended in `machine_dir`. The Rust `Child`
+/// handle's `Drop` does not `wait()`, so the caller can let it drop after
+/// recording the PID.
+#[cfg(unix)]
+pub fn register_vm_child(pid: i32, machine_dir: Option<std::path::PathBuf>) {
+    vm_children()
+        .lock()
+        .unwrap()
+        .push(VmChild { pid, machine_dir });
 }
 
-/// Reap any exited registered VM children (non-blocking, per-PID). Called from
-/// the serve supervisor tick. Scoped to registered PIDs so it never steals an
+/// No-op on Windows, where process handles carry exit status.
+#[cfg(not(unix))]
+pub fn register_vm_child(_pid: i32, _machine_dir: Option<std::path::PathBuf>) {}
+
+/// Reap any exited registered VM children (non-blocking, per-PID), recording
+/// why each ended. Called from the serve supervisor tick and before an
+/// in-process liveness check. Scoped to registered PIDs so it never steals an
 /// exit status from a sibling `.output()`/`.wait()` (the `ECHILD` fix).
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn reap_vm_children() {
     let mut guard = vm_children().lock().unwrap();
-    guard.retain(|&pid| {
-        let ret = unsafe { libc::waitpid(pid, std::ptr::null_mut(), libc::WNOHANG) };
-        match ret {
-            // >0 = reaped; drop from tracking.
-            r if r > 0 => false,
-            // 0 = still running; keep for the next sweep.
-            0 => true,
-            // <0 = error (typically ECHILD — already gone). Drop either way.
-            _ => false,
-        }
-    });
+    guard.retain(|child| matches!(reap_vm_child(child, false), Reap::Running));
 }
 
-/// No-op on non-Linux: VM scope adoption + the serve supervisor reaper are
-/// Linux-only; nothing registers VM children here.
-#[cfg(not(target_os = "linux"))]
+/// No-op on Windows: a process handle carries its exit code, and nothing
+/// registers VM children there.
+#[cfg(not(unix))]
 pub fn reap_vm_children() {}
+
+#[cfg(unix)]
+enum Reap {
+    Running,
+    Reaped,
+    Gone,
+}
+
+/// Reap one registered VM child, `block`ing until it exits or not. On Linux
+/// the exit is first observed without reaping, so the zombie's cgroup can
+/// still be read for an OOM kill.
+#[cfg(unix)]
+fn reap_vm_child(child: &VmChild, block: bool) -> Reap {
+    let nohang = if block { 0 } else { libc::WNOHANG };
+    #[cfg(target_os = "linux")]
+    let oom_kills = {
+        // SAFETY: `info` is a valid out-pointer; WNOWAIT leaves the child
+        // waitable, so the waitpid below still collects it.
+        let mut info: libc::siginfo_t = unsafe { std::mem::zeroed() };
+        let peeked = unsafe {
+            libc::waitid(
+                libc::P_PID,
+                child.pid as libc::id_t,
+                &mut info,
+                libc::WEXITED | libc::WNOWAIT | nohang,
+            )
+        };
+        if peeked < 0 {
+            return Reap::Gone;
+        }
+        // SAFETY: waitid filled `info`; si_pid is 0 when nothing has exited.
+        if unsafe { info.si_pid() } == 0 {
+            return Reap::Running;
+        }
+        crate::vm_exit::own_cgroup_oom_kills(child.pid)
+    };
+    #[cfg(not(target_os = "linux"))]
+    let oom_kills = None;
+    loop {
+        let mut status: libc::c_int = 0;
+        let ret = unsafe { libc::waitpid(child.pid, &mut status, nohang) };
+        if ret > 0 {
+            if let Some(dir) = &child.machine_dir {
+                crate::vm_exit::record(
+                    dir,
+                    &crate::vm_exit::from_wait_status(child.pid, status, oom_kills),
+                );
+            }
+            let mut reaped = REAPED.lock().unwrap_or_else(|p| p.into_inner());
+            if reaped.len() == REAPED_KEPT {
+                reaped.pop_front();
+            }
+            reaped.push_back((child.pid, status));
+            return Reap::Reaped;
+        }
+        if ret == 0 {
+            return Reap::Running;
+        }
+        if std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted {
+            return Reap::Gone;
+        }
+    }
+}
+
+/// The status of `pid` if it is a registered VM child: one the sweep already
+/// collected, or one reaped (and recorded) now. `None` means `pid` is not a
+/// VM child, or it is still running when `block` is false.
+#[cfg(unix)]
+fn take_vm_child_status(pid: i32, block: bool) -> Option<Option<libc::c_int>> {
+    {
+        let mut reaped = REAPED.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(at) = reaped.iter().position(|(p, _)| *p == pid) {
+            return Some(reaped.remove(at).map(|(_, status)| status));
+        }
+    }
+    let child = {
+        let mut children = vm_children().lock().unwrap();
+        let at = children.iter().position(|c| c.pid == pid)?;
+        if !block {
+            return Some(match reap_vm_child(&children[at], false) {
+                Reap::Running => None,
+                Reap::Reaped | Reap::Gone => {
+                    children.remove(at);
+                    take_reaped(pid)
+                }
+            });
+        }
+        children.remove(at)
+    };
+    // Blocking: wait outside the lock so the sweep keeps running.
+    match reap_vm_child(&child, true) {
+        Reap::Reaped => Some(take_reaped(pid)),
+        Reap::Running | Reap::Gone => Some(None),
+    }
+}
+
+#[cfg(unix)]
+fn take_reaped(pid: i32) -> Option<libc::c_int> {
+    let mut reaped = REAPED.lock().unwrap_or_else(|p| p.into_inner());
+    let at = reaped.iter().position(|(p, _)| *p == pid)?;
+    reaped.remove(at).map(|(_, status)| status)
+}
+
+#[cfg(unix)]
+fn exit_code_of(status: libc::c_int) -> i32 {
+    if libc::WIFEXITED(status) {
+        libc::WEXITSTATUS(status)
+    } else if libc::WIFSIGNALED(status) {
+        128 + libc::WTERMSIG(status)
+    } else {
+        -1
+    }
+}
 
 /// Install a GLOBAL SIGCHLD handler that reaps every terminated child via
 /// `waitpid(-1, WNOHANG)`. Used only by the `pack_run` fork-pool paths (single
@@ -2267,6 +2647,10 @@ pub fn is_alive(pid: Pid) -> bool {
     if pid <= 0 {
         return false;
     }
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return true;
+    }
     if unsafe { libc::kill(pid, 0) } != 0 {
         // Permission to signal a process is independent of its liveness.
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
@@ -2311,6 +2695,9 @@ pub fn is_alive(pid: Pid) -> bool {
 /// Handles EINTR by retrying the waitpid call.
 #[cfg(unix)]
 pub fn try_wait(pid: Pid) -> Option<i32> {
+    if let Some(status) = take_vm_child_status(pid, false) {
+        return status.map(exit_code_of);
+    }
     loop {
         let mut status: libc::c_int = 0;
         let result = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
@@ -2352,6 +2739,9 @@ pub fn try_wait(pid: Pid) -> Option<i32> {
 /// Returns the exit code. Handles EINTR by retrying the waitpid call.
 #[cfg(unix)]
 pub fn wait(pid: Pid) -> i32 {
+    if let Some(status) = take_vm_child_status(pid, true) {
+        return status.map_or(-1, exit_code_of);
+    }
     loop {
         let mut status: libc::c_int = 0;
         let result = unsafe { libc::waitpid(pid, &mut status, 0) };
@@ -2486,6 +2876,10 @@ pub fn process_start_time(pid: Pid) -> Option<u64> {
 /// Get the start time of a process (clock ticks since boot from /proc/pid/stat field 22).
 #[cfg(target_os = "linux")]
 pub fn process_start_time(pid: Pid) -> Option<u64> {
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return Some(fake_held::START_TIME);
+    }
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     // Format: pid (comm) state ppid ... starttime ...
     // comm can contain spaces and parentheses, so find the last ')' first.
@@ -2530,7 +2924,7 @@ pub fn open_kernel_userfaultfd() -> std::io::Result<OwnedFd> {
             ));
         }
     };
-    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW, FLAGS) };
+    let device_fd = unsafe { libc::ioctl(control.as_raw_fd(), USERFAULTFD_IOC_NEW as _, FLAGS) };
     if device_fd < 0 {
         let device_error = std::io::Error::last_os_error();
         return Err(std::io::Error::new(
@@ -2648,6 +3042,15 @@ pub fn process_memory_stats(pid: Pid) -> Option<ProcessMemoryStats> {
             return Some(stats);
         }
     }
+    process_memory_counters(pid)
+}
+
+/// Read a VMM's memory from the kernel's per-process counters (`statm`,
+/// `status`): resident, its private/shared split and anonymous memory, without
+/// PSS. Unlike `smaps_rollup`, which walks every mapping of a guest's RAM and
+/// takes tens of milliseconds per VMM, this costs microseconds, so it suits a
+/// sum over every machine on the node.
+pub fn process_memory_counters(pid: Pid) -> Option<ProcessMemoryStats> {
     let stats = process_stats(pid)?;
     #[cfg(target_os = "linux")]
     let statm = std::fs::read_to_string(format!("/proc/{pid}/statm"))
@@ -2675,6 +3078,139 @@ pub fn process_memory_stats(pid: Pid) -> Option<ProcessMemoryStats> {
         swap_pss_bytes: None,
         anon_bytes,
     })
+}
+
+/// How long a VMM's `smaps_rollup` sample is served before it is read again.
+/// The control plane integrates memory over minutes-long intervals, so a
+/// sample up to this old is an accurate enough gauge.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_TTL: Duration = Duration::from_secs(30);
+/// Wall time the process may spend reading `smaps_rollup` per
+/// [`MEMORY_SAMPLE_WINDOW`]. The read walks the VMM's page tables (measured on
+/// a 7.1 x86_64 host: ~5 ms per resident GiB, ~9 ms per GiB when the pages are
+/// copy-on-write shared with a branch source), so 100 large VMMs read at once
+/// would take seconds; the budget keeps any machine list near-instant.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_BUDGET: Duration = Duration::from_millis(100);
+/// The window [`MEMORY_SAMPLE_BUDGET`] is accounted over.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_WINDOW: Duration = Duration::from_secs(1);
+/// A cached sample not refreshed for this long belongs to a VMM that is gone.
+#[cfg(any(target_os = "linux", test))]
+const MEMORY_SAMPLE_EVICT_AFTER: Duration = Duration::from_secs(600);
+
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Clone, Copy)]
+struct CachedMemorySample {
+    start_time: Option<u64>,
+    sampled_at: Instant,
+    stats: ProcessMemoryStats,
+}
+
+/// Bounded-cost cache of per-VMM `smaps_rollup` samples: each VMM is read at
+/// most once per [`MEMORY_SAMPLE_TTL`], and all reads together spend at most
+/// [`MEMORY_SAMPLE_BUDGET`] per [`MEMORY_SAMPLE_WINDOW`]. Past the budget a
+/// stale sample is served, and a VMM never sampled reports no PSS.
+#[cfg(any(target_os = "linux", test))]
+#[derive(Debug, Default)]
+struct MemorySampleCache {
+    samples: std::collections::HashMap<Pid, CachedMemorySample>,
+    window_start: Option<Instant>,
+    spent: Duration,
+}
+
+#[cfg(any(target_os = "linux", test))]
+impl MemorySampleCache {
+    /// Return the sample for `pid`, calling `read` only when the cached one is
+    /// missing or older than the TTL and the read budget allows. `read` returns
+    /// the sample and how long it took. `start_time` tells a reused pid from the
+    /// process that held it; `current_rss` caps a cached PSS so a sample can
+    /// never report more than the process holds now.
+    fn sample(
+        &mut self,
+        pid: Pid,
+        start_time: Option<u64>,
+        current_rss: Option<u64>,
+        now: Instant,
+        read: impl FnOnce() -> (Option<ProcessMemoryStats>, Duration),
+    ) -> Option<ProcessMemoryStats> {
+        let window_start = *self.window_start.get_or_insert(now);
+        if now.saturating_duration_since(window_start) >= MEMORY_SAMPLE_WINDOW {
+            self.window_start = Some(now);
+            self.spent = Duration::ZERO;
+            self.samples.retain(|_, cached| {
+                now.saturating_duration_since(cached.sampled_at) < MEMORY_SAMPLE_EVICT_AFTER
+            });
+        }
+        let cached = self
+            .samples
+            .get(&pid)
+            .filter(|cached| cached.start_time == start_time)
+            .copied();
+        let capped = |cached: CachedMemorySample| {
+            let mut stats = cached.stats;
+            if let Some(rss) = current_rss {
+                stats.pss_bytes = stats.pss_bytes.map(|pss| pss.min(rss));
+            }
+            stats
+        };
+        if let Some(cached) = cached {
+            if now.saturating_duration_since(cached.sampled_at) < MEMORY_SAMPLE_TTL {
+                return Some(capped(cached));
+            }
+        }
+        if self.spent < MEMORY_SAMPLE_BUDGET {
+            let (stats, took) = read();
+            self.spent = self.spent.saturating_add(took);
+            if let Some(stats) = stats {
+                self.samples.insert(
+                    pid,
+                    CachedMemorySample {
+                        start_time,
+                        sampled_at: now,
+                        stats,
+                    },
+                );
+                return Some(stats);
+            }
+            self.samples.remove(&pid);
+            return None;
+        }
+        cached.map(capped)
+    }
+}
+
+/// PSS/private/shared memory for a VMM, for paths that report every machine
+/// (the machine list and status). Linux serves a cached `smaps_rollup` sample
+/// under [`MemorySampleCache`]'s TTL and read budget, falling back to the cheap
+/// counters (no PSS) when none is available; `current_rss` is the caller's
+/// fresh RSS reading. Other hosts read the counters directly.
+pub fn process_memory_stats_cached(
+    pid: Pid,
+    current_rss: Option<u64>,
+) -> Option<ProcessMemoryStats> {
+    #[cfg(target_os = "linux")]
+    {
+        static CACHE: OnceLock<Mutex<MemorySampleCache>> = OnceLock::new();
+        let start_time = process_start_time(pid);
+        let sampled = CACHE
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .sample(pid, start_time, current_rss, Instant::now(), || {
+                let began = Instant::now();
+                let stats = std::fs::read_to_string(format!("/proc/{pid}/smaps_rollup"))
+                    .ok()
+                    .and_then(|contents| parse_smaps_rollup(&contents));
+                (stats, began.elapsed())
+            });
+        if sampled.is_some() {
+            return sampled;
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = current_rss;
+    process_memory_counters(pid)
 }
 
 #[cfg(target_os = "linux")]
@@ -2753,6 +3289,27 @@ fn constrain_memory_to_ancestors(
 /// slice. This is a preflight, not a reservation against concurrent consumers.
 #[cfg(target_os = "linux")]
 pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMemoryStats> {
+    growth_memory_stats(pid, started, false)
+}
+
+/// Capacity for growth when the VMM runs in a cgroup SmolVM does not own (a
+/// machine started from the CLI runs in the user's session scope): that cgroup's
+/// own limit counts too, since it is never raised. With no limit anywhere up the
+/// chain (`memory.max` = max, as in a desktop session) only the host bounds it.
+#[cfg(target_os = "linux")]
+pub fn vmm_enclosing_growth_memory_stats(
+    pid: Pid,
+    started: Option<u64>,
+) -> Result<HostMemoryStats> {
+    growth_memory_stats(pid, started, true)
+}
+
+#[cfg(target_os = "linux")]
+fn growth_memory_stats(
+    pid: Pid,
+    started: Option<u64>,
+    own_cgroup: bool,
+) -> Result<HostMemoryStats> {
     let verify = || is_our_process_strict(pid, started);
     if !verify() {
         return Err(Error::agent("RAM resize", "VMM process identity changed"));
@@ -2765,8 +3322,8 @@ pub fn vmm_growth_memory_stats(pid: Pid, started: Option<u64>) -> Result<HostMem
         .and_then(|contents| parse_host_meminfo(&contents))
         .ok_or_else(|| Error::agent("RAM resize", "cannot verify host memory headroom"))?;
     let root = std::path::Path::new("/sys/fs/cgroup");
-    let parent = if dir == root {
-        root
+    let parent = if dir == root || own_cgroup {
+        dir.as_path()
     } else {
         dir.parent()
             .ok_or_else(|| Error::agent("RAM resize", "missing VMM cgroup parent"))?
@@ -2876,7 +3433,87 @@ fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// What the VM slice holds and may hold, read from its cgroup files.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmSliceMemory {
+    /// `memory.high` (`None` = no limit).
+    high_bytes: Option<u64>,
+    /// `memory.max` (`None` = no limit).
+    max_bytes: Option<u64>,
+    /// `memory.current`, page cache included.
+    current_bytes: u64,
+    /// Page cache the kernel can drop: `file` minus `shmem` from `memory.stat`
+    /// (guest RAM is shmem and counts under `file`).
+    reclaimable_cache_bytes: u64,
+}
+
+/// Host memory still available to VMs once the VM slice's own limit is
+/// counted, in the units `available_bytes` uses (host memory, the reserve the
+/// slice keeps out of reach included), or `None` when the slice has no limit.
+///
+/// The slice is used up to `limit = min(high, max)`; past that the kernel
+/// throttles or reclaims inside VM threads that may hold filesystem locks, and
+/// the node's own API stalls behind them. Page cache counts as free only above
+/// [`crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT`] of the limit,
+/// where proactive reclaim keeps it; below that line the kernel still charges it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn vm_slice_available_bytes(total_bytes: u64, slice: &VmSliceMemory) -> Option<u64> {
+    let limit = match (slice.high_bytes, slice.max_bytes) {
+        (Some(high), Some(max)) => high.min(max),
+        (Some(limit), None) | (None, Some(limit)) => limit,
+        (None, None) => return None,
+    };
+    let reclaim_line = (u128::from(limit)
+        * u128::from(crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT)
+        / 100) as u64;
+    let without_cache = slice
+        .current_bytes
+        .saturating_sub(slice.reclaimable_cache_bytes);
+    let used = without_cache.max(slice.current_bytes.min(reclaim_line));
+    // Memory outside the slice's hard cap is what the host keeps for itself;
+    // callers subtract their own reserve from the result, so add it back here.
+    let outside_slice = total_bytes.saturating_sub(slice.max_bytes.unwrap_or(limit));
+    Some(limit.saturating_sub(used).saturating_add(outside_slice))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cgroup_limit(contents: &str) -> Option<Option<u64>> {
+    match contents.trim() {
+        "max" => Some(None),
+        value => value.parse::<u64>().ok().map(Some),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_memory_stat_field(contents: &str, field: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == field).then(|| value.trim().parse::<u64>().ok())?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_vm_slice_memory() -> Option<VmSliceMemory> {
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(crate::systemd_scope::VM_SLICE);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let stat = read("memory.stat")?;
+    let file = parse_memory_stat_field(&stat, "file")?;
+    let shmem = parse_memory_stat_field(&stat, "shmem").unwrap_or(0);
+    Some(VmSliceMemory {
+        high_bytes: parse_cgroup_limit(&read("memory.high")?)?,
+        max_bytes: parse_cgroup_limit(&read("memory.max")?)?,
+        current_bytes: read("memory.current")?.trim().parse().ok()?,
+        reclaimable_cache_bytes: file.saturating_sub(shmem),
+    })
+}
+
 /// Report effective host memory available to SmolVM.
+///
+/// On a node that runs VMs in [`crate::systemd_scope::VM_SLICE`], this is also
+/// bounded by that slice's limit: VMs (branch children included) are charged
+/// there, not to this process's cgroup, and host `MemAvailable` counts the
+/// node's own page cache as free while the slice is already at its limit.
 pub fn host_memory_stats() -> Option<HostMemoryStats> {
     #[cfg(target_os = "linux")]
     {
@@ -2886,6 +3523,11 @@ pub fn host_memory_stats() -> Option<HostMemoryStats> {
                 stats.total_bytes = stats.total_bytes.min(limit);
                 stats.available_bytes = stats.available_bytes.min(headroom);
             }
+        }
+        if let Some(available) = read_vm_slice_memory()
+            .and_then(|slice| vm_slice_available_bytes(stats.total_bytes, &slice))
+        {
+            stats.available_bytes = stats.available_bytes.min(available);
         }
         Some(stats)
     }
@@ -2908,14 +3550,20 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
             buffer: *mut libc::c_void,
             buffersize: libc::c_int,
         ) -> libc::c_int;
+        fn mach_timebase_info(info: *mut MachTimebaseInfo) -> libc::c_int;
+    }
+
+    #[repr(C)]
+    struct MachTimebaseInfo {
+        numer: u32,
+        denom: u32,
     }
 
     const PROC_PIDTASKINFO: libc::c_int = 4;
 
     /// Subset of `struct proc_taskinfo` from <libproc.h>. CPU times are in
-    /// mach_absolute_time units, which on Apple Silicon equal 1 nanosecond.
-    /// (For full portability we'd convert via mach_timebase_info; on arm64
-    /// macOS the ratio is 1:1, and smolvm targets Apple Silicon.)
+    /// mach_absolute_time units, which are not nanoseconds on Apple Silicon:
+    /// its 24 MHz timebase makes one tick 125/3 ns.
     #[repr(C)]
     struct ProcTaskInfo {
         pti_virtual_size: u64,
@@ -2951,10 +3599,22 @@ pub fn process_stats(pid: Pid) -> Option<ProcessStats> {
     if ret <= 0 {
         return None;
     }
+    let mut timebase = MachTimebaseInfo { numer: 0, denom: 0 };
+    if unsafe { mach_timebase_info(&mut timebase) } != 0 || timebase.denom == 0 {
+        return None;
+    }
+    let ticks = info.pti_total_user.saturating_add(info.pti_total_system);
     Some(ProcessStats {
-        cpu_time_ns: info.pti_total_user.saturating_add(info.pti_total_system),
+        cpu_time_ns: mach_ticks_to_ns(ticks, timebase.numer, timebase.denom),
         rss_bytes: info.pti_resident_size,
     })
+}
+
+/// Convert mach_absolute_time ticks to nanoseconds with the host's timebase.
+#[cfg(target_os = "macos")]
+fn mach_ticks_to_ns(ticks: u64, numer: u32, denom: u32) -> u64 {
+    let ns = u128::from(ticks) * u128::from(numer) / u128::from(denom);
+    u64::try_from(ns).unwrap_or(u64::MAX)
 }
 
 /// Sample CPU time and RSS for a single process on Linux via /proc/<pid>/{stat,statm}.
@@ -3249,6 +3909,192 @@ pub const VM_SIGTERM_TIMEOUT: Duration = Duration::from_secs(3);
 /// down VM resources. This timeout must be long enough for that cleanup.
 pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A process that is still present after SIGKILL was delivered to it.
+///
+/// SIGKILL cannot be blocked or handled, so the only way to outlive it is a
+/// thread that is inside a kernel call the kernel will not interrupt (for
+/// example an `open()` of a device whose driver is not responding). Such a
+/// thread keeps the process entry, its open files and its listening ports
+/// until the call returns or the host reboots; no signal changes that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldProcess {
+    /// The process (thread group) id.
+    pub pid: Pid,
+    /// The threads that have not exited, with their scheduler state letter
+    /// from `/proc` (`D` is uninterruptible sleep).
+    pub blocked_threads: Vec<(Pid, char)>,
+}
+
+impl HeldProcess {
+    /// One sentence for the user: which PID was left behind and why.
+    pub fn explain(&self) -> String {
+        let threads = match self.blocked_threads.as_slice() {
+            [] => "a thread of it is".to_string(),
+            [(tid, state)] => format!("its thread {tid} (state {state}) is"),
+            many => format!(
+                "its threads {} are",
+                many.iter()
+                    .map(|(tid, state)| format!("{tid} (state {state})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        format!(
+            "process {} is still present after SIGKILL: {threads} blocked inside the \
+             kernel and cannot be killed. The kernel is holding it; it goes away when \
+             that kernel call returns or when the host is rebooted",
+            self.pid
+        )
+    }
+}
+
+impl HeldProcess {
+    /// Why a machine whose previous process is held cannot be started. Every
+    /// start path (CLI, API server, embedded runtime) refuses with this text.
+    pub fn start_refusal(&self) -> String {
+        format!(
+            "the previous run of this machine was stopped, but {}; refusing a second \
+             launch on its disks until then (delete the machine with --force to remove it)",
+            self.explain()
+        )
+    }
+}
+
+/// How [`stop_vm_process_bounded`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmStop {
+    /// The process exited with this code.
+    Exited(i32),
+    /// SIGKILL was delivered and the kernel has not let the process go.
+    Held(HeldProcess),
+}
+
+/// The process operations a VM stop needs. A trait so a test can stand in a
+/// process that survives SIGKILL, which cannot be produced on demand.
+pub(crate) trait ProcessControl {
+    fn is_alive(&self, pid: Pid) -> bool;
+    fn try_wait(&self, pid: Pid) -> Option<i32>;
+    fn terminate(&self, pid: Pid) -> bool;
+    fn kill(&self, pid: Pid) -> bool;
+    fn poll_for_exit(&self, pid: Pid, timeout: Duration) -> Option<i32>;
+    fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess>;
+}
+
+/// The host's real processes.
+pub(crate) struct HostProcesses;
+
+impl ProcessControl for HostProcesses {
+    fn is_alive(&self, pid: Pid) -> bool {
+        is_alive(pid)
+    }
+    fn try_wait(&self, pid: Pid) -> Option<i32> {
+        try_wait(pid)
+    }
+    fn terminate(&self, pid: Pid) -> bool {
+        terminate(pid)
+    }
+    fn kill(&self, pid: Pid) -> bool {
+        kill(pid)
+    }
+    fn poll_for_exit(&self, pid: Pid, timeout: Duration) -> Option<i32> {
+        poll_for_exit(pid, timeout)
+    }
+    fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess> {
+        held_after_kill(pid)
+    }
+}
+
+/// Whether `pid` has been killed and is still present: SIGKILL is pending on
+/// one of its threads, or its main thread has exited while others remain.
+///
+/// Right after a kill this is briefly true for any process, so callers ask
+/// only once the wait for SIGKILL to take effect has run out, or to explain
+/// a process they already found alive.
+#[cfg(target_os = "linux")]
+pub fn held_after_kill(pid: Pid) -> Option<HeldProcess> {
+    if pid <= 0 || !is_alive(pid) {
+        return None;
+    }
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return Some(fake_held::held(pid));
+    }
+    let leader_stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let leader_exited = matches!(linux_stat_state(&leader_stat), Some('Z' | 'X' | 'x'));
+    let mut kill_pending = false;
+    let mut blocked_threads = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<Pid>().ok())
+        else {
+            continue;
+        };
+        let Some(state) = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .as_deref()
+            .and_then(linux_stat_state)
+        else {
+            continue;
+        };
+        if matches!(state, 'Z' | 'X' | 'x') {
+            continue;
+        }
+        blocked_threads.push((tid, state));
+        if std::fs::read_to_string(entry.path().join("status"))
+            .is_ok_and(|status| linux_status_sigkill_pending(&status))
+        {
+            kill_pending = true;
+        }
+    }
+    blocked_threads.sort_unstable();
+    ((leader_exited && !blocked_threads.is_empty()) || kill_pending).then_some(HeldProcess {
+        pid,
+        blocked_threads,
+    })
+}
+
+/// Only Linux exposes what is needed to tell a held process from a slow exit.
+#[cfg(not(target_os = "linux"))]
+pub fn held_after_kill(_pid: Pid) -> Option<HeldProcess> {
+    None
+}
+
+/// The scheduler state letter from a `/proc/<pid>/stat` line.
+#[cfg(target_os = "linux")]
+fn linux_stat_state(stat: &str) -> Option<char> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_ascii_whitespace().next()?.chars().next()
+}
+
+/// Whether a `/proc/<pid>/task/<tid>/status` text shows SIGKILL pending on
+/// the thread (`SigPnd`) or on its process (`ShdPnd`).
+#[cfg(target_os = "linux")]
+fn linux_status_sigkill_pending(status: &str) -> bool {
+    const SIGKILL_BIT: u64 = 1 << (libc::SIGKILL - 1);
+    status.lines().any(|line| {
+        line.strip_prefix("SigPnd:")
+            .or_else(|| line.strip_prefix("ShdPnd:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & SIGKILL_BIT != 0)
+    })
+}
+
+/// Whether `pid` can still run guest or VMM code: it is alive and has not
+/// been left behind by a SIGKILL the kernel has yet to finish.
+///
+/// Use after a stop instead of [`is_alive`] where the question is "may its
+/// files be removed and its record marked stopped". A held process executes
+/// nothing more: every thread that could still run has exited, and a blocked
+/// thread dies as soon as its kernel call returns.
+pub fn can_still_run(pid: Pid) -> bool {
+    is_alive(pid) && held_after_kill(pid).is_none()
+}
+
 /// Stop a VM process with Hypervisor-aware timeouts.
 ///
 /// Two-phase shutdown:
@@ -3257,31 +4103,157 @@ pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Callers must verify process identity BEFORE calling this function.
 ///
-/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive.
+/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive. A
+/// process the kernel is holding after SIGKILL is an `Err` whose text says
+/// so; callers that can finish their work without the exit use
+/// [`stop_vm_process_bounded`].
 pub fn stop_vm_process(
     pid: Pid,
     sigterm_timeout: Duration,
     sigkill_timeout: Duration,
 ) -> Result<i32> {
-    if !is_alive(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    match stop_vm_process_bounded(pid, sigterm_timeout, sigkill_timeout)? {
+        VmStop::Exited(code) => Ok(code),
+        VmStop::Held(held) => Err(Error::agent("stop vm process", held.explain())),
+    }
+}
+
+/// [`stop_vm_process`], reporting a process the kernel is holding after
+/// SIGKILL as [`VmStop::Held`] instead of an error.
+///
+/// Either way the call returns within the two timeouts. A held process runs
+/// no more code, so a stop or delete can complete around it: the caller
+/// marks the machine stopped, tells the user which PID was left behind, and
+/// does not wait for an exit that may only come with a reboot.
+pub fn stop_vm_process_bounded(
+    pid: Pid,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<VmStop> {
+    #[cfg(all(test, target_os = "linux"))]
+    if fake_held::is_held(pid) {
+        return Ok(VmStop::Held(fake_held::held(pid)));
+    }
+    stop_vm_process_with(&HostProcesses, pid, sigterm_timeout, sigkill_timeout)
+}
+
+/// A stand-in for a process the kernel is holding after SIGKILL, for tests of
+/// the code that stops, deletes and restarts machines. Such a process cannot
+/// be produced on demand, so a test registers a PID here and the liveness,
+/// start-time, held-state and stop functions above answer for it as they
+/// would for the real thing. The PIDs are above the kernel's largest
+/// possible PID, so no real process is ever looked at or signalled.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod fake_held {
+    use super::{HeldProcess, Pid};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Mutex;
+
+    /// The start time every fake process reports.
+    pub(crate) const START_TIME: u64 = 424_242;
+
+    /// Linux caps PIDs at 4194304.
+    static NEXT_PID: AtomicI32 = AtomicI32::new(5_000_000);
+    static HELD: Mutex<BTreeSet<Pid>> = Mutex::new(BTreeSet::new());
+
+    /// A fake held process. Dropping it, or calling [`FakeHeld::disappear`],
+    /// is the host reboot: the process is gone.
+    pub(crate) struct FakeHeld {
+        pub(crate) pid: Pid,
+    }
+
+    impl FakeHeld {
+        /// The process goes away, as it does when the host reboots.
+        pub(crate) fn disappear(&self) {
+            HELD.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.pid);
+        }
+    }
+
+    impl Drop for FakeHeld {
+        fn drop(&mut self) {
+            self.disappear();
+        }
+    }
+
+    /// Register a new fake held process with a PID of its own.
+    pub(crate) fn hold() -> FakeHeld {
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
+        FakeHeld { pid }
+    }
+
+    pub(crate) fn is_held(pid: Pid) -> bool {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid)
+    }
+
+    pub(crate) fn held(pid: Pid) -> HeldProcess {
+        HeldProcess {
+            pid,
+            blocked_threads: vec![(pid + 1_000_000, 'D')],
+        }
+    }
+}
+
+pub(crate) fn stop_vm_process_with(
+    processes: &dyn ProcessControl,
+    pid: Pid,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<VmStop> {
+    if !processes.is_alive(pid) {
+        return Ok(VmStop::Exited(
+            processes.try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE),
+        ));
+    }
+    // Already killed, by an earlier stop or by its own exit: another signal
+    // changes nothing. Give the exit the SIGKILL wait to finish, since a
+    // process that is exiting normally looks the same for a moment.
+    if processes.held_after_kill(pid).is_some() {
+        if let Some(code) = processes.poll_for_exit(pid, sigkill_timeout) {
+            return Ok(VmStop::Exited(code));
+        }
+        if let Some(held) = processes.held_after_kill(pid) {
+            return Ok(VmStop::Held(held));
+        }
     }
 
     // Phase 1: SIGTERM + poll
-    if !terminate(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    if !processes.terminate(pid) {
+        // A failed signal is not evidence of exit: EPERM leaves the VMM alive.
+        // Only return success when the child has exited or the PID is gone.
+        if let Some(code) = processes.try_wait(pid) {
+            return Ok(VmStop::Exited(code));
+        }
+        if !processes.is_alive(pid) {
+            return Ok(VmStop::Exited(UNKNOWN_EXIT_CODE));
+        }
+        return Err(Error::agent(
+            "stop vm process",
+            format!("process {pid} is still alive after SIGTERM failed"),
+        ));
     }
 
-    if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
-        return Ok(code);
+    if let Some(code) = processes.poll_for_exit(pid, sigterm_timeout) {
+        return Ok(VmStop::Exited(code));
     }
 
     // Phase 2: SIGKILL + poll
     tracing::debug!(pid, "SIGTERM timeout, sending SIGKILL");
-    kill(pid);
+    processes.kill(pid);
 
-    if let Some(code) = poll_for_exit(pid, sigkill_timeout) {
-        return Ok(code);
+    if let Some(code) = processes.poll_for_exit(pid, sigkill_timeout) {
+        return Ok(VmStop::Exited(code));
+    }
+
+    // SIGKILL was delivered and the wait for it ran out. What is left is
+    // inside the kernel; more waiting or more signals do not help.
+    if let Some(held) = processes.held_after_kill(pid) {
+        return Ok(VmStop::Held(held));
     }
 
     Err(Error::agent(
@@ -3345,6 +4317,14 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
     }
 }
 
+/// kqueue can report EV_ERROR as an event; only NOTE_EXIT confirms death.
+#[cfg(target_os = "macos")]
+fn mac_process_exit_event(event: &libc::kevent) -> bool {
+    event.filter == libc::EVFILT_PROC
+        && event.flags & libc::EV_ERROR == 0
+        && event.fflags & libc::NOTE_EXIT != 0
+}
+
 /// [`wait_for_exit_event`] through kqueue's `NOTE_EXIT`.
 #[cfg(target_os = "macos")]
 fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
@@ -3383,7 +4363,11 @@ fn wait_for_exit_event(pid: Pid, timeout: Duration) -> ExitEvent {
         // SAFETY: waits for at most one event into `event`, with a valid timeout.
         let rc = unsafe { libc::kevent(kq_fd, std::ptr::null(), 0, &mut event, 1, &wait) };
         if rc > 0 {
-            return ExitEvent::Exited;
+            return if mac_process_exit_event(&event) {
+                ExitEvent::Exited
+            } else {
+                ExitEvent::Unavailable
+            };
         }
         if rc == 0 {
             if Instant::now() < deadline {
@@ -3407,6 +4391,11 @@ fn wait_for_exit_event(_pid: Pid, _timeout: Duration) -> ExitEvent {
 /// seen when it happens. Elsewhere it polls, aggressively at first and then
 /// backing off.
 pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
+    #[cfg(all(test, target_os = "linux"))]
+    if fake_held::is_held(pid) {
+        let _ = timeout;
+        return None;
+    }
     if let Some(code) = try_wait(pid) {
         return Some(code);
     }
@@ -3666,13 +4655,22 @@ pub fn detach_stdio_to_stderr_file(path: &std::path::Path) -> std::io::Result<()
 /// is still caught. Uses only `getppid` and `nanosleep`.
 #[cfg(unix)]
 pub fn exit_when_parent_is_not(parent: Pid) {
+    exit_when_parent_is_not_with(parent, || {});
+}
+
+/// [`exit_when_parent_is_not`], running `before_exit` once the parent is gone
+/// and before this process exits, such as shutting a guest down cleanly so its
+/// writes reach disk. `before_exit` must bound its own time.
+#[cfg(unix)]
+pub fn exit_when_parent_is_not_with(parent: Pid, before_exit: impl FnOnce() + Send + 'static) {
     let _ = std::thread::Builder::new()
         .name("parent-death-watch".into())
-        .spawn(move || loop {
-            if unsafe { libc::getppid() } != parent {
-                exit_child(0);
+        .spawn(move || {
+            while unsafe { libc::getppid() } == parent {
+                std::thread::sleep(std::time::Duration::from_millis(500));
             }
-            std::thread::sleep(std::time::Duration::from_millis(500));
+            before_exit();
+            exit_child(0);
         });
 }
 
@@ -3877,8 +4875,65 @@ extern "C" fn sigint_kill_handler(_sig: libc::c_int) {
     }
 }
 
+/// `MOVE_MOUNT_F_EMPTY_PATH` from <linux/mount.h>; the libc crate defines it
+/// for glibc only.
+#[cfg(target_os = "linux")]
+const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x0000_0004;
+
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cpu_max_quota_scales_to_the_period_with_the_kernel_floor() {
+        // 200 millicpus = 0.2 CPU = 20 ms per 100 ms period.
+        assert_eq!(super::cpu_max_quota_us(200_000, 100_000), 20_000);
+        assert_eq!(super::cpu_max_quota_us(4_000_000, 100_000), 400_000);
+        // Under 1 ms per period the kernel refuses; systemd raises it to 1 ms.
+        assert_eq!(super::cpu_max_quota_us(1_000, 100_000), 1_000);
+        assert_eq!(super::cpu_max_quota_us(200_000, 50_000), 10_000);
+    }
+
+    #[test]
+    fn a_grant_under_one_percent_stretches_the_period_instead_of_rounding_up() {
+        assert_eq!(super::cpu_max_line(4_000_000), "400000 100000");
+        assert_eq!(super::cpu_max_line(200_000), "20000 100000");
+        assert_eq!(super::cpu_max_line(10_000), "1000 100000");
+        // 5 millicpus: 1 ms per 200 ms, not 1 ms per 100 ms.
+        assert_eq!(super::cpu_max_line(5_000), "1000 200000");
+        // 1 millicpu reaches the kernel's 1 s maximum period exactly.
+        assert_eq!(super::cpu_max_line(1_000), "1000 1000000");
+        for usec in [1_000, 3_000, 5_000, 9_999, 10_000, 200_000] {
+            assert!(
+                super::cpu_max_matches(&super::cpu_max_line(usec), usec),
+                "{usec}"
+            );
+        }
+    }
+
+    #[test]
+    fn cpu_max_read_back_must_grant_the_requested_quota() {
+        assert!(super::cpu_max_matches("20000 100000\n", 200_000));
+        assert!(super::cpu_max_matches("400000 100000", 4_000_000));
+        assert!(super::cpu_max_matches("10000 50000", 200_000));
+        assert!(!super::cpu_max_matches("400000 100000", 200_000));
+        assert!(!super::cpu_max_matches("max 100000", 200_000));
+        assert!(!super::cpu_max_matches("20000 0", 200_000));
+        assert!(!super::cpu_max_matches("", 200_000));
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn kqueue_errors_are_not_process_exit_events() {
+        let mut event: libc::kevent = unsafe { std::mem::zeroed() };
+        event.filter = libc::EVFILT_PROC;
+        event.fflags = libc::NOTE_EXIT;
+        assert!(super::mac_process_exit_event(&event));
+        event.flags = libc::EV_ERROR;
+        assert!(!super::mac_process_exit_event(&event));
+        event.flags = 0;
+        event.fflags = 0;
+        assert!(!super::mac_process_exit_event(&event));
+    }
+
     #[cfg(unix)]
     #[test]
     fn poll_for_exit_reads_a_child_exit_code() {
@@ -4001,7 +5056,7 @@ mod tests {
             std::fs::write(vm.join(file), []).expect("create fake cgroup control");
         }
 
-        place_in_cgroup(root.path(), 2, 1024, true, false);
+        assert!(place_in_cgroup(root.path(), 2_000_000, 1024, true, false));
 
         assert_eq!(
             std::fs::read_to_string(vm.join("cpu.max")).expect("read boot CPU quota"),
@@ -4088,6 +5143,41 @@ mod tests {
             assert!(raised_memory_budget(existing, invalid).is_err());
             assert!(raised_memory_budget(invalid, existing).is_err());
         }
+    }
+
+    /// The 10-20 kill: deleting children dropped the lineage count while their
+    /// generations were still charged, and the lowered ceiling killed the source.
+    #[test]
+    fn a_lowered_memory_limit_never_drops_under_what_the_cgroup_holds() {
+        let existing = Some(1000);
+        let lowered = VmmMemoryBudget {
+            high_bytes: 300,
+            max_bytes: 400,
+        };
+        // Freed already: lower all the way.
+        assert_eq!(floored_memory_budget(lowered, 200, existing), lowered);
+        // Still charged: keep the charge plus the reclaim band.
+        assert_eq!(
+            floored_memory_budget(lowered, 700, existing),
+            VmmMemoryBudget {
+                high_bytes: 700,
+                max_bytes: 800
+            }
+        );
+        // Never above the limit it was meant to lower.
+        assert_eq!(
+            floored_memory_budget(lowered, 990, existing),
+            VmmMemoryBudget {
+                high_bytes: 900,
+                max_bytes: 1000
+            }
+        );
+        // A raise that already covers the charge is untouched.
+        let raised = VmmMemoryBudget {
+            high_bytes: 1900,
+            max_bytes: 2000,
+        };
+        assert_eq!(floored_memory_budget(raised, 990, existing), raised);
     }
 
     #[test]
@@ -4362,7 +5452,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
-        let fixture = Fixture(
+        let mut fixture = Fixture(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -4395,8 +5485,10 @@ mod tests {
             "stop must wait for workers, not just the leader"
         );
         assert!(try_wait(pid).is_none());
-        drop(fixture);
-        assert!(std::net::TcpListener::bind(address).is_ok());
+        // Closing stdin lets the worker exit. Rebinding the freed port here
+        // would race other tests that bind ephemeral ports in parallel.
+        drop(fixture.0.stdin.take());
+        assert!(fixture.0.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]
@@ -4980,6 +6072,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn unassigned_vm_release_does_not_open_missing_uid_registry() {
+        let dir = tempfile::tempdir().unwrap();
+        let registry = dir.path().join("uids");
+        let vm = dir.path().join("vms").join("ordinary");
+        std::fs::create_dir_all(&vm).unwrap();
+        free_vm_uid(&registry, &vm);
+        assert!(!registry.exists(), "unassigned VM has no uid registry");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn allocate_vm_uid_is_stable_collision_free_and_freeable() {
         let (base, reg, vms) = tmp_uid_dirs("alloc");
         let a = vms.join("aaaa");
@@ -5052,9 +6155,49 @@ mod tests {
 
     /// The selective reaper drains registered VM PIDs once they exit, and a
     /// non-child PID (would-be ECHILD) is dropped without affecting others.
+    /// Tests that sweep the process-wide registry run one at a time.
+    #[cfg(unix)]
+    static VM_CHILD_TESTS: Mutex<()> = Mutex::new(());
+
+    // A VM child killed by a signal leaves a record of it in its machine
+    // directory, and a later try_wait still reports the signal.
+    #[cfg(unix)]
+    #[test]
+    fn a_reaped_vm_child_records_why_it_ended() {
+        let _serial = VM_CHILD_TESTS.lock().unwrap_or_else(|p| p.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let child = std::process::Command::new("sh")
+            .args(["-c", "kill -KILL $$"])
+            .spawn()
+            .unwrap();
+        let pid = child.id() as i32;
+        std::mem::forget(child);
+        register_vm_child(pid, Some(dir.path().to_path_buf()));
+        let mut exit = None;
+        for _ in 0..100 {
+            reap_vm_children();
+            exit = crate::vm_exit::read(dir.path());
+            if exit.is_some() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let exit = exit.expect("the sweep records the exit");
+        assert_eq!(exit.pid, pid);
+        assert_eq!(exit.cause, crate::vm_exit::Cause::Killed);
+        assert_eq!(exit.signal_name.as_deref(), Some("SIGKILL"));
+        assert_eq!(
+            try_wait(pid),
+            Some(128 + libc::SIGKILL),
+            "the boot path still sees the signal"
+        );
+        assert_eq!(try_wait(pid), None, "the status is handed out once");
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn reap_vm_children_is_scoped_and_drains() {
+        let _serial = VM_CHILD_TESTS.lock().unwrap_or_else(|p| p.into_inner());
         // A real short-lived child: register its PID and forget the handle so the
         // reaper (not Child::drop) reaps it.
         let child = std::process::Command::new("true")
@@ -5062,9 +6205,9 @@ mod tests {
             .expect("spawn true");
         let real_pid = child.id() as i32;
         std::mem::forget(child);
-        register_vm_child(real_pid);
+        register_vm_child(real_pid, None);
         // A PID we never parented → waitpid returns ECHILD → must be dropped.
-        register_vm_child(i32::MAX);
+        register_vm_child(i32::MAX, None);
 
         // Sweep until the registry drains (the real child exits ~immediately).
         let mut drained = false;
@@ -5098,6 +6241,36 @@ mod tests {
         );
     }
 
+    /// CPU time is reported in nanoseconds on every host. On Apple Silicon
+    /// `proc_pidinfo` counts in mach ticks of about 41.7 ns, so an unconverted
+    /// value reads some forty times too low.
+    #[cfg(any(target_os = "macos", target_os = "linux", windows))]
+    #[test]
+    fn process_stats_cpu_time_is_in_nanoseconds() {
+        let me = std::process::id() as Pid;
+        let before = process_stats(me).expect("sample before").cpu_time_ns;
+        let spin = std::time::Duration::from_millis(300);
+        let started = std::time::Instant::now();
+        let mut sink = 0u64;
+        while started.elapsed() < spin {
+            sink = std::hint::black_box(sink.wrapping_add(1));
+        }
+        let after = process_stats(me).expect("sample after").cpu_time_ns;
+        let spent = after.saturating_sub(before);
+        assert!(
+            spent >= 150_000_000,
+            "300 ms of busy wall time must count at least 150 ms of CPU, got {spent} ns"
+        );
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn mach_ticks_scale_by_the_timebase() {
+        assert_eq!(mach_ticks_to_ns(24_000_000, 125, 3), 1_000_000_000);
+        assert_eq!(mach_ticks_to_ns(1_000, 1, 1), 1_000);
+        assert_eq!(mach_ticks_to_ns(u64::MAX, 125, 3), u64::MAX);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn smaps_rollup_distinguishes_proportional_private_and_shared_memory() {
@@ -5115,6 +6288,143 @@ mod tests {
         assert_eq!(stats.private_bytes, Some(704 * 1024));
         assert_eq!(stats.shared_mapped_bytes, Some(320 * 1024));
         assert_eq!(stats.swap_pss_bytes, Some(16 * 1024));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn smaps_rollup_without_pss_reports_no_pss() {
+        let sample = "Rss:                1024 kB\n\
+                      Shared_Clean:          0 kB\n\
+                      Shared_Dirty:          0 kB\n\
+                      Private_Clean:         0 kB\n\
+                      Private_Dirty:      1024 kB\n";
+        let stats = parse_smaps_rollup(sample).expect("parse rollup");
+        assert_eq!(stats.rss_bytes, 1024 * 1024);
+        assert_eq!(stats.pss_bytes, None);
+    }
+
+    fn memory_sample(pss_mib: u64) -> ProcessMemoryStats {
+        ProcessMemoryStats {
+            rss_bytes: (2 * pss_mib) << 20,
+            pss_bytes: Some(pss_mib << 20),
+            private_bytes: None,
+            shared_mapped_bytes: None,
+            swap_pss_bytes: None,
+            anon_bytes: None,
+        }
+    }
+
+    fn pss_mib(stats: Option<ProcessMemoryStats>) -> Option<u64> {
+        stats.and_then(|s| s.pss_bytes).map(|b| b >> 20)
+    }
+
+    #[test]
+    fn memory_sample_cache_reads_each_vmm_at_most_once_per_ttl() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        let reads = std::cell::Cell::new(0);
+        let read = |mib| {
+            reads.set(reads.get() + 1);
+            (Some(memory_sample(mib)), Duration::from_millis(1))
+        };
+        assert_eq!(
+            pss_mib(cache.sample(7, Some(1), None, t0, || read(100))),
+            Some(100)
+        );
+        let within = t0 + MEMORY_SAMPLE_TTL - Duration::from_millis(1);
+        assert_eq!(
+            pss_mib(cache.sample(7, Some(1), None, within, || read(200))),
+            Some(100)
+        );
+        assert_eq!(reads.get(), 1, "a fresh sample is served without a read");
+        let after = t0 + MEMORY_SAMPLE_TTL;
+        assert_eq!(
+            pss_mib(cache.sample(7, Some(1), None, after, || read(300))),
+            Some(300)
+        );
+        assert_eq!(reads.get(), 2, "an expired sample is read again");
+    }
+
+    #[test]
+    fn memory_sample_cache_spends_at_most_its_budget_per_window() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        // Warm pid 2, then let it expire.
+        cache.sample(2, Some(1), None, t0, || {
+            (Some(memory_sample(512)), Duration::from_millis(1))
+        });
+        let t1 = t0 + MEMORY_SAMPLE_TTL + MEMORY_SAMPLE_WINDOW;
+        // One slow read uses up the whole window's budget.
+        let first = cache.sample(1, Some(1), None, t1, || {
+            (Some(memory_sample(64)), MEMORY_SAMPLE_BUDGET)
+        });
+        assert_eq!(pss_mib(first), Some(64));
+        // Past the budget, a stale sample is served (capped at the fresh RSS)
+        // and a never-sampled VMM reports none; neither reads.
+        let stale = cache.sample(2, Some(1), Some(256 << 20), t1, || {
+            panic!("over budget: must not read")
+        });
+        assert_eq!(
+            pss_mib(stale),
+            Some(256),
+            "stale PSS never exceeds current RSS"
+        );
+        let unseen = cache.sample(3, Some(1), None, t1, || {
+            panic!("over budget: must not read")
+        });
+        assert!(unseen.is_none());
+        // The next window has budget again.
+        let t2 = t1 + MEMORY_SAMPLE_WINDOW;
+        let refreshed = cache.sample(3, Some(1), None, t2, || {
+            (Some(memory_sample(32)), Duration::from_millis(1))
+        });
+        assert_eq!(pss_mib(refreshed), Some(32));
+    }
+
+    #[test]
+    fn memory_sample_cache_never_serves_a_reused_pid_the_old_sample() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        cache.sample(9, Some(1), None, t0, || {
+            (Some(memory_sample(900)), Duration::from_millis(1))
+        });
+        // Same pid, new process, budget spent: no sample rather than the old one.
+        cache.spent = MEMORY_SAMPLE_BUDGET;
+        assert!(cache
+            .sample(9, Some(2), None, t0, || panic!(
+                "over budget: must not read"
+            ))
+            .is_none());
+        cache.spent = Duration::ZERO;
+        let fresh = cache.sample(9, Some(2), None, t0, || {
+            (Some(memory_sample(10)), Duration::from_millis(1))
+        });
+        assert_eq!(pss_mib(fresh), Some(10));
+    }
+
+    #[test]
+    fn memory_sample_cache_drops_failed_reads_and_gone_vmms() {
+        let mut cache = MemorySampleCache::default();
+        let t0 = Instant::now();
+        cache.sample(4, Some(1), None, t0, || {
+            (Some(memory_sample(40)), Duration::from_millis(1))
+        });
+        cache.sample(5, Some(1), None, t0, || {
+            (Some(memory_sample(50)), Duration::from_millis(1))
+        });
+        // A failed read (process gone or smaps restricted) forgets the sample.
+        let t1 = t0 + MEMORY_SAMPLE_TTL;
+        assert!(cache
+            .sample(4, Some(1), None, t1, || (None, Duration::ZERO))
+            .is_none());
+        assert!(!cache.samples.contains_key(&4));
+        // A VMM nobody asks about is evicted once its sample is long dead.
+        let t2 = t0 + MEMORY_SAMPLE_EVICT_AFTER + MEMORY_SAMPLE_WINDOW;
+        cache.sample(6, Some(1), None, t2, || {
+            (Some(memory_sample(60)), Duration::from_millis(1))
+        });
+        assert!(!cache.samples.contains_key(&5));
+        assert!(cache.samples.contains_key(&6));
     }
 
     #[cfg(target_os = "linux")]
@@ -5137,6 +6447,77 @@ mod tests {
         assert_eq!(stats.available_bytes, 4_096_000 * 1024);
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn slice(high: Option<u64>, max: Option<u64>, current: u64, cache: u64) -> VmSliceMemory {
+        VmSliceMemory {
+            high_bytes: high.map(|g| g * GIB),
+            max_bytes: max.map(|g| g * GIB),
+            current_bytes: current * GIB,
+            reclaimable_cache_bytes: cache * GIB,
+        }
+    }
+
+    #[test]
+    fn vm_slice_without_a_limit_does_not_bound_available_memory() {
+        assert_eq!(
+            vm_slice_available_bytes(755 * GIB, &slice(None, None, 700, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn vm_slice_at_its_throttle_has_no_headroom_however_much_the_host_caches() {
+        // x86-xfs-worker-0 on 2026-11-12: high 702 GiB, max 710 GiB on a 755 GiB
+        // host, the slice at its throttle while MemAvailable still looked large.
+        let available = vm_slice_available_bytes(755 * GIB, &slice(Some(702), Some(710), 702, 0));
+        assert_eq!(
+            available,
+            Some(45 * GIB),
+            "only the host's own reserve is left"
+        );
+    }
+
+    #[test]
+    fn vm_slice_page_cache_counts_as_free_only_above_the_reclaim_line() {
+        let limit = 700;
+        let line = limit * crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT / 100;
+        // 680 GiB used, 300 GiB of it cache: the cache above the line is free,
+        // the cache below it is not.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 680, 300)).unwrap();
+        assert_eq!(available, (limit - line) * GIB);
+        // Mostly guest RAM: what is not cache counts in full.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 680, 10)).unwrap();
+        assert_eq!(available, (limit - 670) * GIB);
+        // Below the line nothing changes: memory.current is what counts.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 200, 150)).unwrap();
+        assert_eq!(available, (limit - 200) * GIB);
+    }
+
+    #[test]
+    fn vm_slice_uses_memory_max_when_memory_high_is_unlimited() {
+        let available = vm_slice_available_bytes(755 * GIB, &slice(None, Some(710), 600, 0));
+        assert_eq!(available, Some((710 - 600 + 45) * GIB));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_files_parse() {
+        assert_eq!(parse_cgroup_limit("max\n"), Some(None));
+        assert_eq!(
+            parse_cgroup_limit("753583259648\n"),
+            Some(Some(753_583_259_648))
+        );
+        assert_eq!(parse_cgroup_limit("bogus"), None);
+        let stat = "anon 10737418240\nfile 109521666048\nshmem 78383153152\nfile_mapped 1\n";
+        assert_eq!(parse_memory_stat_field(stat, "file"), Some(109_521_666_048));
+        assert_eq!(parse_memory_stat_field(stat, "shmem"), Some(78_383_153_152));
+        assert_eq!(parse_memory_stat_field(stat, "file_dirty"), None);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_memory_stats_samples_self() {
@@ -5146,6 +6527,20 @@ mod tests {
         if let Some(pss) = stats.pss_bytes {
             assert!(pss <= stats.rss_bytes);
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn process_memory_counters_sample_self_without_pss() {
+        let stats = process_memory_counters(std::process::id() as Pid)
+            .expect("memory counters must sample the current process");
+        assert!(stats.rss_bytes > 0);
+        assert!(stats.pss_bytes.is_none(), "counters never walk smaps");
+        let (private, shared) = (
+            stats.private_bytes.unwrap(),
+            stats.shared_mapped_bytes.unwrap(),
+        );
+        assert!(private <= stats.rss_bytes && shared <= stats.rss_bytes);
     }
 
     /// A PID that does not exist must yield None, not a bogus sample.
@@ -5194,5 +6589,225 @@ mod tests {
         let _ = child.kill();
         let _ = child.wait();
         assert!(!cmdline_contains(pid, &token), "a dead PID must not match");
+    }
+}
+
+#[cfg(test)]
+mod oom_victim_order_tests {
+    use super::oom_score_adj_for;
+
+    #[test]
+    fn children_go_first_sources_last_others_untouched() {
+        assert_eq!(
+            oom_score_adj_for(false, true),
+            500,
+            "a restored branch child"
+        );
+        assert_eq!(
+            oom_score_adj_for(true, true),
+            500,
+            "a child that is itself branchable is still a child"
+        );
+        assert_eq!(oom_score_adj_for(true, false), -500, "a branch source");
+        assert_eq!(oom_score_adj_for(false, false), 0, "a plain machine");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod nofile_limit_tests {
+    use super::*;
+
+    /// The tests below change this process's open-file limit; one must not
+    /// move it between another's raise and its check.
+    static RLIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_open_file_limit_rises_to_the_hard_limit_or_the_macos_cap() {
+        let _guard = RLIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let raised = raise_nofile_limit().expect("getrlimit works");
+        // SAFETY: getrlimit on a local struct.
+        let hard = unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            assert_eq!(
+                limit.rlim_cur, raised,
+                "the returned limit is the one in force"
+            );
+            limit.rlim_max
+        };
+        #[cfg(target_os = "macos")]
+        let wanted = macos_max_files_per_process().map_or(hard, |cap| hard.min(cap));
+        #[cfg(not(target_os = "macos"))]
+        let wanted = hard;
+        assert_eq!(raised, wanted);
+    }
+
+    /// A shell can hand a process a soft limit above `kern.maxfilesperproc`
+    /// (`ulimit -n` past it). macOS holds the process to the cap regardless,
+    /// so the raise must bring the soft limit down to the cap instead of
+    /// reporting a limit that is not in force.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_soft_limit_above_the_macos_cap_comes_down_to_it() {
+        let _guard = RLIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = macos_max_files_per_process().expect("kern.maxfilesperproc");
+        // SAFETY: getrlimit/setrlimit on local structs.
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            if limit.rlim_max <= cap {
+                // No soft limit above the cap is possible on this host.
+                return;
+            }
+            let above = libc::rlimit {
+                rlim_cur: limit.rlim_max.min(cap * 2),
+                rlim_max: limit.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &above), 0);
+        }
+        assert_eq!(raise_nofile_limit(), Some(cap));
+    }
+}
+
+#[cfg(test)]
+mod held_process_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// A process that ignores SIGTERM and, when `survives_kill` is set, is
+    /// still present after SIGKILL the way a thread blocked in the kernel
+    /// keeps it.
+    struct FakeProcess {
+        survives_kill: bool,
+        killed: Cell<bool>,
+        signals: RefCell<Vec<&'static str>>,
+        waited: RefCell<Vec<Duration>>,
+    }
+
+    impl FakeProcess {
+        fn new(survives_kill: bool) -> Self {
+            Self {
+                survives_kill,
+                killed: Cell::new(false),
+                signals: RefCell::new(Vec::new()),
+                waited: RefCell::new(Vec::new()),
+            }
+        }
+        fn gone(&self) -> bool {
+            self.killed.get() && !self.survives_kill
+        }
+    }
+
+    impl ProcessControl for FakeProcess {
+        fn is_alive(&self, _pid: Pid) -> bool {
+            !self.gone()
+        }
+        fn try_wait(&self, _pid: Pid) -> Option<i32> {
+            self.gone().then_some(137)
+        }
+        fn terminate(&self, _pid: Pid) -> bool {
+            self.signals.borrow_mut().push("TERM");
+            true
+        }
+        fn kill(&self, _pid: Pid) -> bool {
+            self.signals.borrow_mut().push("KILL");
+            self.killed.set(true);
+            true
+        }
+        fn poll_for_exit(&self, _pid: Pid, timeout: Duration) -> Option<i32> {
+            self.waited.borrow_mut().push(timeout);
+            self.gone().then_some(137)
+        }
+        fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess> {
+            (self.killed.get() && self.survives_kill).then(|| HeldProcess {
+                pid,
+                blocked_threads: vec![(pid + 7, 'D')],
+            })
+        }
+    }
+
+    const TERM_WAIT: Duration = Duration::from_millis(20);
+    const KILL_WAIT: Duration = Duration::from_millis(30);
+
+    #[test]
+    fn process_that_survives_sigkill_is_reported_held_within_the_two_waits() {
+        let process = FakeProcess::new(true);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert_eq!(
+            outcome,
+            VmStop::Held(HeldProcess {
+                pid: 4242,
+                blocked_threads: vec![(4249, 'D')],
+            })
+        );
+        // One SIGTERM, one SIGKILL, and no wait beyond the two given.
+        assert_eq!(*process.signals.borrow(), ["TERM", "KILL"]);
+        assert_eq!(*process.waited.borrow(), [TERM_WAIT, KILL_WAIT]);
+    }
+
+    #[test]
+    fn process_that_dies_on_sigkill_is_reported_exited() {
+        let process = FakeProcess::new(false);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert_eq!(outcome, VmStop::Exited(137));
+    }
+
+    #[test]
+    fn stopping_an_already_held_process_sends_no_further_signal() {
+        let process = FakeProcess::new(true);
+        process.killed.set(true);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert!(matches!(outcome, VmStop::Held(_)));
+        assert!(process.signals.borrow().is_empty());
+        assert_eq!(*process.waited.borrow(), [KILL_WAIT]);
+    }
+
+    #[test]
+    fn explanation_names_the_pid_the_thread_and_the_reboot() {
+        let text = HeldProcess {
+            pid: 2768452,
+            blocked_threads: vec![(2768460, 'D')],
+        }
+        .explain();
+        assert_eq!(
+            text,
+            "process 2768452 is still present after SIGKILL: its thread 2768460 (state D) \
+             is blocked inside the kernel and cannot be killed. The kernel is holding it; \
+             it goes away when that kernel call returns or when the host is rebooted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigkill_pending_is_read_from_the_thread_and_process_masks() {
+        let thread = "Name:\tgpu worker\nSigPnd:\t0000000000000100\nShdPnd:\t0000000000000000\n";
+        let process = "SigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n";
+        let term_only = "SigPnd:\t0000000000004000\nShdPnd:\t0000000000004000\n";
+        assert!(linux_status_sigkill_pending(thread));
+        assert!(linux_status_sigkill_pending(process));
+        assert!(!linux_status_sigkill_pending(term_only));
+        assert!(!linux_status_sigkill_pending(""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_letter_is_read_past_a_name_with_spaces_and_parentheses() {
+        assert_eq!(linux_stat_state("2768460 (gpu worker) D 1 2 3"), Some('D'));
+        assert_eq!(linux_stat_state("7 (a) b) Z 1"), Some('Z'));
+        assert_eq!(linux_stat_state("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_process_is_not_held() {
+        let me = std::process::id() as Pid;
+        assert_eq!(held_after_kill(me), None);
+        assert!(can_still_run(me));
     }
 }

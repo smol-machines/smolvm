@@ -310,11 +310,135 @@ fn compression_slots(parallelism: usize) -> usize {
     (parallelism / MAX_COMPRESSION_WORKERS).max(1)
 }
 
-/// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
-/// later packs can reuse it. The name is a digest of every entry's path, type,
-/// size, mode, owner, inode and change time: any change to the tree, including
-/// a reinstall, gives a new name. `None` when the tree cannot be read.
-fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
+/// Content digest, `sha256:<hex>`, of the agent rootfs at `rootfs_dir`: every
+/// entry's path, type and permission bits, a regular file's bytes and a
+/// symlink's target, in sorted order. Owners and times are left out, so the
+/// tree a checkpoint's `agent-rootfs.tar` unpacks to has the digest of the tree
+/// it was packed from, and the host's per-boot ready markers are skipped as the
+/// tar skips them. This names the userland a guest booted with: a checkpoint
+/// records it and a restore boots the rootfs with that digest, since the
+/// captured processes keep that userland mapped.
+///
+/// A symlink counts with mode `0o777` whatever its own bits: Linux gives every
+/// symlink those and ignores them, while macOS keeps the bits it was created
+/// with, so a tree packed on a Mac and unpacked on Linux would otherwise never
+/// have the digest the Mac recorded.
+pub fn agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    rootfs_digest(rootfs_dir, false)
+}
+
+/// [`agent_rootfs_digest`] as smolvm 1.34.3 and older computed it, counting a
+/// symlink's own mode bits. On Linux it is always equal to the current digest;
+/// on macOS it is the digest machines started there before the change recorded.
+pub fn legacy_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    rootfs_digest(rootfs_dir, true)
+}
+
+/// Mode every symlink counts with in [`agent_rootfs_digest`].
+#[cfg(unix)]
+const SYMLINK_DIGEST_MODE: u32 = 0o777;
+
+fn rootfs_digest(rootfs_dir: &Path, symlink_own_mode: bool) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    fn walk(
+        dir: &Path,
+        relative: &Path,
+        top: bool,
+        symlink_own_mode: bool,
+        hash: &mut Sha256,
+    ) -> std::io::Result<()> {
+        let mut entries: Vec<fs::DirEntry> = fs::read_dir(dir)?.collect::<std::io::Result<_>>()?;
+        entries.sort_by_key(|e| e.file_name());
+        for entry in entries {
+            let name = entry.file_name();
+            if top
+                && name
+                    .to_string_lossy()
+                    .starts_with(smolvm_protocol::AGENT_READY_MARKER)
+            {
+                continue;
+            }
+            let path = entry.path();
+            let metadata = fs::symlink_metadata(&path)?;
+            let relative = relative.join(&name);
+            hash.update(relative.to_string_lossy().as_bytes());
+            hash.update([0]);
+            let kind = metadata.file_type();
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let mode = if kind.is_symlink() && !symlink_own_mode {
+                    SYMLINK_DIGEST_MODE
+                } else {
+                    metadata.mode() & 0o7777
+                };
+                hash.update(mode.to_le_bytes());
+            }
+            #[cfg(not(unix))]
+            let _ = symlink_own_mode;
+            if kind.is_symlink() {
+                hash.update(b"l");
+                hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
+            } else if kind.is_dir() {
+                hash.update(b"d");
+                walk(&path, &relative, false, symlink_own_mode, hash)?;
+            } else if kind.is_file() {
+                hash.update(b"f");
+                hash.update(metadata.len().to_le_bytes());
+                let mut file = File::open(&path)?;
+                let mut content = Sha256::new();
+                std::io::copy(&mut file, &mut content)?;
+                hash.update(content.finalize());
+            } else {
+                // a device node or fifo in the tree: its kind and name count
+                hash.update(b"o");
+            }
+            hash.update([0]);
+        }
+        Ok(())
+    }
+    let mut hash = Sha256::new();
+    hash.update(b"smolvm-agent-rootfs-v1\0");
+    walk(rootfs_dir, Path::new(""), true, symlink_own_mode, &mut hash)?;
+    Ok(format!("sha256:{:x}", hash.finalize()))
+}
+
+/// [`agent_rootfs_digest`], remembered beside the rootfs tar cache under the
+/// tree's metadata hash, so a tree that has not changed is not read again: a
+/// launch asks for the digest of the rootfs it boots, and reading a rootfs is
+/// a few hundred milliseconds. Any change to the tree misses the cache.
+pub fn cached_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
+    let cached = rootfs_metadata_hash(rootfs_dir).and_then(|hash| {
+        let dir = dirs::cache_dir()?
+            .join("smolvm")
+            // v2: symlinks count with one fixed mode (see agent_rootfs_digest),
+            // so a value cached before that change may be wrong on macOS.
+            .join("agent-rootfs-digests-v2");
+        fs::create_dir_all(&dir).ok()?;
+        Some(dir.join(hash))
+    });
+    if let Some(path) = &cached {
+        if let Ok(digest) = fs::read_to_string(path) {
+            let digest = digest.trim();
+            if digest.len() == "sha256:".len() + 64 && digest.starts_with("sha256:") {
+                return Ok(digest.to_string());
+            }
+        }
+    }
+    let digest = agent_rootfs_digest(rootfs_dir)?;
+    if let Some(path) = &cached {
+        let temporary = path.with_extension(format!("{}.tmp", std::process::id()));
+        if fs::write(&temporary, &digest).is_ok() && fs::rename(&temporary, path).is_err() {
+            let _ = fs::remove_file(&temporary);
+        }
+    }
+    Ok(digest)
+}
+
+/// A hash of every entry's path, type, size, mode, owner, inode and change
+/// time under `rootfs_dir`: any change to the tree, including a reinstall,
+/// gives a new value. `None` when the tree cannot be read.
+fn rootfs_metadata_hash(rootfs_dir: &Path) -> Option<String> {
     use sha2::{Digest, Sha256};
     #[cfg(unix)]
     use std::os::unix::fs::MetadataExt;
@@ -353,7 +477,14 @@ fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
                 }
             }
             #[cfg(not(unix))]
-            hash.update(metadata.len().to_le_bytes());
+            {
+                hash.update(metadata.len().to_le_bytes());
+                if let Ok(modified) = metadata.modified() {
+                    if let Ok(since) = modified.duration_since(std::time::UNIX_EPOCH) {
+                        hash.update(since.as_nanos().to_le_bytes());
+                    }
+                }
+            }
             if metadata.file_type().is_symlink() {
                 hash.update(fs::read_link(&path)?.to_string_lossy().as_bytes());
             } else if metadata.is_dir() {
@@ -365,9 +496,17 @@ fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
     let mut hash = Sha256::new();
     hash.update(b"agent-rootfs-tar-v1\0");
     walk(rootfs_dir, Path::new(""), true, &mut hash).ok()?;
+    Some(format!("{:x}", hash.finalize()))
+}
+
+/// Where an agent rootfs tar built from `rootfs_dir` as it is now is kept, so
+/// later packs can reuse it. The name is the tree's metadata hash, so any
+/// change to the tree gives a new name. `None` when the tree cannot be read.
+fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
+    let hash = rootfs_metadata_hash(rootfs_dir)?;
     let cache = dirs::cache_dir()?.join("smolvm").join("agent-rootfs-tars");
     fs::create_dir_all(&cache).ok()?;
-    Some(cache.join(format!("{:x}.tar", hash.finalize())))
+    Some(cache.join(format!("{hash}.tar")))
 }
 
 /// Keep the tar just built at `built` as `cached` for later packs, and drop
@@ -404,15 +543,19 @@ fn publish_agent_rootfs_tar(built: &Path, cached: &Path) {
 /// Find a pre-formatted disk template by filename.
 ///
 /// Searches in order:
-/// 1. `~/.smolvm/{filename}` (installed location)
-/// 2. Next to the current executable (development)
+/// 1. Directories registered with [`add_template_root`] (an embedder's bundle)
+/// 2. `~/.smolvm/{filename}` (installed location)
+/// 3. Next to the current executable (development)
 ///
 /// Each location is checked for the plain file first and then for a `.zst`
 /// sibling, which is expanded on demand by [`materialize_template`]. Releases
 /// ship only the compressed form; the plain file is still honored so existing
 /// installs and development trees keep working untouched.
 pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
-    let mut roots: Vec<PathBuf> = Vec::new();
+    let mut roots: Vec<PathBuf> = TEMPLATE_ROOTS
+        .lock()
+        .map(|roots| roots.clone())
+        .unwrap_or_default();
     if let Some(home) = dirs::home_dir() {
         roots.push(home.join(".smolvm"));
     }
@@ -443,6 +586,21 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
         }
     }
     None
+}
+
+/// Directories searched for templates before the default locations.
+static TEMPLATE_ROOTS: std::sync::Mutex<Vec<PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+/// Also look for templates in `dir`, ahead of `~/.smolvm` and the executable's
+/// directory. An embedder (the Python or Node SDK) ships them beside its other
+/// assets; without them a Linux host with no reflink copies a whole image seed
+/// into every new machine instead of layering a qcow2 overlay on it.
+pub fn add_template_root(dir: PathBuf) {
+    if let Ok(mut roots) = TEMPLATE_ROOTS.lock() {
+        if !roots.contains(&dir) {
+            roots.push(dir);
+        }
+    }
 }
 
 /// Expand `compressed` into a sparse file and return the expanded path.
@@ -1817,6 +1975,19 @@ pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
 mod tests {
     use super::*;
 
+    // An embedder's registered directory is searched first, so an SDK that
+    // ships templates beside its assets gets them without touching ~/.smolvm.
+    #[test]
+    fn a_registered_template_root_is_searched() {
+        let dir = tempfile::tempdir().unwrap();
+        let name = "registered-root-test-template.ext4";
+        std::fs::write(dir.path().join(name), b"template").unwrap();
+        assert_eq!(find_existing_template(name), None);
+        add_template_root(dir.path().to_path_buf());
+        add_template_root(dir.path().to_path_buf());
+        assert_eq!(find_existing_template(name), Some(dir.path().join(name)));
+    }
+
     #[test]
     fn digest_to_filename_rejects_path_traversal() {
         // A valid hex digest is accepted.
@@ -1977,6 +2148,103 @@ mod tests {
         // lib/ is only created when collect_libraries() is called
         assert!(!staging.join("lib").exists());
         assert!(staging.join("layers").exists());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_symlinks_own_mode_does_not_change_the_rootfs_digest() {
+        // macOS keeps a symlink's mode bits and Linux reports 0o777 for every
+        // one, so a tree packed on a Mac and unpacked on Linux must keep its
+        // digest. The legacy digest still counts them, for machines that
+        // recorded it.
+        use std::ffi::CString;
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("rootfs");
+        fs::create_dir_all(root.join("bin")).unwrap();
+        fs::write(root.join("bin/busybox"), b"busybox").unwrap();
+        std::os::unix::fs::symlink("busybox", root.join("bin/sh")).unwrap();
+        let set_link_mode = |mode: libc::mode_t| {
+            let path = CString::new(root.join("bin/sh").as_os_str().as_bytes()).unwrap();
+            let set = unsafe {
+                libc::fchmodat(
+                    libc::AT_FDCWD,
+                    path.as_ptr(),
+                    mode,
+                    libc::AT_SYMLINK_NOFOLLOW,
+                )
+            };
+            assert_eq!(set, 0, "{}", std::io::Error::last_os_error());
+        };
+        set_link_mode(0o777);
+        let linux_like = agent_rootfs_digest(&root).unwrap();
+        let legacy_linux_like = legacy_agent_rootfs_digest(&root).unwrap();
+        assert_eq!(
+            legacy_linux_like, linux_like,
+            "the formulas agree on a 0o777 symlink"
+        );
+        set_link_mode(0o700);
+        assert_eq!(agent_rootfs_digest(&root).unwrap(), linux_like);
+        assert_ne!(legacy_agent_rootfs_digest(&root).unwrap(), linux_like);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_rootfs_digest_names_content_not_times_owners_or_markers() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let make = |name: &str| {
+            let rootfs = temp.path().join(name);
+            fs::create_dir_all(rootfs.join("bin")).unwrap();
+            fs::create_dir_all(rootfs.join("sbin")).unwrap();
+            fs::write(rootfs.join("bin/sh"), b"#!/bin/sh\nexec busybox sh\n").unwrap();
+            fs::set_permissions(rootfs.join("bin/sh"), fs::Permissions::from_mode(0o755)).unwrap();
+            std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", rootfs.join("sbin/init"))
+                .unwrap();
+            rootfs
+        };
+        let a = make("a");
+        let b = make("b");
+        // a host's per-boot marker and a later modification time are not content
+        fs::write(
+            b.join(format!("{}.cafef00d", smolvm_protocol::AGENT_READY_MARKER)),
+            b"1",
+        )
+        .unwrap();
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(3600);
+        File::open(b.join("bin/sh"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        let digest = agent_rootfs_digest(&a).unwrap();
+        assert!(
+            digest.starts_with("sha256:") && digest.len() == 71,
+            "{digest}"
+        );
+        assert_eq!(agent_rootfs_digest(&b).unwrap(), digest);
+        assert_eq!(cached_agent_rootfs_digest(&a).unwrap(), digest);
+
+        // a byte, a permission bit and a link target each change it
+        fs::write(b.join("bin/sh"), b"#!/bin/sh\nexec busybox ash\n").unwrap();
+        let changed_bytes = agent_rootfs_digest(&b).unwrap();
+        assert_ne!(changed_bytes, digest);
+        fs::set_permissions(b.join("bin/sh"), fs::Permissions::from_mode(0o700)).unwrap();
+        let changed_mode = agent_rootfs_digest(&b).unwrap();
+        assert_ne!(changed_mode, changed_bytes);
+        fs::remove_file(b.join("sbin/init")).unwrap();
+        std::os::unix::fs::symlink("/bin/sh", b.join("sbin/init")).unwrap();
+        assert_ne!(agent_rootfs_digest(&b).unwrap(), changed_mode);
+
+        // the tar a checkpoint carries unpacks to a tree with the same digest
+        let staging = temp.path().join("staging");
+        let mut collector = AssetCollector::new(staging.clone()).unwrap();
+        collector.collect_agent_rootfs(&a).unwrap();
+        let unpacked = temp.path().join("unpacked");
+        fs::create_dir_all(&unpacked).unwrap();
+        let mut archive = tar::Archive::new(File::open(staging.join("agent-rootfs.tar")).unwrap());
+        archive.set_preserve_permissions(true);
+        archive.unpack(&unpacked).unwrap();
+        assert_eq!(agent_rootfs_digest(&unpacked).unwrap(), digest);
     }
 
     #[test]

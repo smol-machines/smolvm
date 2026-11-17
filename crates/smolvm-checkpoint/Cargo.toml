@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-checkpoint"
-version = "1.26.1"
+version = "1.35.0"
 edition = "2021"
 description = "Incremental checkpoint storage and portable export for SmolVM"
 license = "Apache-2.0"
@@ -13,7 +13,7 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
 ring = "0.17.14"
-zstd = "0.13"
+zstd = "0.14.3"
 tempfile = "3"
 tracing = "0.1"
 libc = "0.2"

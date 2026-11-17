@@ -58,6 +58,15 @@ from a continuing source can add backing layers even when the resulting children
 siblings. Stop and pack the desired state into a new root before continuing
 from a chain at the limit.
 
+## Host mounts
+
+A capture refuses a machine with host mounts unless you pass `--host-mounts`,
+because they bind the artifact to a host where the same paths exist.
+`--host-mounts` records each mount (host path, guest path, read-only) and a
+restore attaches them again at the same guest paths; it refuses on a host where
+a recorded directory is missing. `machine pause` always keeps host mounts: a
+paused machine resumes on the host that paused it.
+
 ## History
 
 Every checkpoint records its *lineage*: a unique id, the machine it came from,
@@ -140,9 +149,8 @@ smolvm machine checkpoint --export-from ./after.checkpoint \
   --output ./portable.checkpoint
 ```
 
-The file carries the checkpoint's retained history (see [History](#history));
-add `--history 0` or `--at` for a single generation. Export does not need the
-original store. Omitting `--store` when capturing a machine continues to produce
+Export does not need the original store; [History](#history) says what the file
+carries. Omitting `--store` when capturing a machine continues to produce
 a standalone file directly. Treat all checkpoint files as sensitive: they
 contain the machine's captured memory and disk data, and may contain its
 credential CA's private key. The file and directory layouts are specified in

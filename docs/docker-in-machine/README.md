@@ -11,6 +11,29 @@ longer commented version, with the kernel requirements, a TCP
 endpoint recipe, a K3d cluster and the managed-cloud variant where each exec has its own mount
 namespace.
 
+## The short version: two disk volumes
+
+From v1.28.1, give Docker its data directories as disk volumes, a guest path with no host side:
+
+```bash
+smolvm machine create --name dind --net --image docker:dind \
+  -v /var/lib/docker -v /var/lib/containerd
+smolvm machine start --name dind
+smolvm machine exec --name dind -- docker run --rm alpine echo ok
+```
+
+Each path is a directory on the machine's ext4 disk, bound into the workload on every start, so
+there are no bind mounts to re-apply and no `start-dockerd.sh` step after a stop and start. In a
+Smolfile it is `volumes = ["/var/lib/docker", "/var/lib/containerd"]`. On Linux x86_64 with a
+build of that change, `df /var/lib/docker` read `/dev/vda` on the first boot and after a stop and
+start, the `alpine` image survived the restart, and a nested `docker run` succeeded both times. The
+same machine without the volumes had `/var/lib/docker` on the overlay root and `docker run` failed.
+On macOS arm64 with v1.29.0 the commands above gave the same: `/dev/vda` and a nested `docker run`
+before and after a stop and start, `alpine:latest` still listed, and `docker info` answering 4 s
+after each start.
+
+The rest of this packet is the procedure for v1.28.0 and earlier, which have no disk volumes.
+
 ## Docker's data has to live on `/storage`
 
 The machine's root filesystem is already an overlay, and Docker's `overlay2` driver cannot put its
@@ -21,18 +44,16 @@ overlayfs needs. `/storage` is the machine's ext4 disk, and Docker's data root b
 dockerd --data-root=/storage/docker --storage-driver=overlay2
 ```
 
-The Smolfile here instead bind-mounts `/storage/docker` onto `/var/lib/docker`, which reads better
-to a container tool that assumes the default path. Both work. **`docker info` will not tell you
+`assets/docker-bind-mounts.smolfile`, for v1.28.0 and earlier, instead bind-mounts `/storage/docker`
+onto `/var/lib/docker`, which reads better to a container tool that assumes the default path. Both
+work. **`docker info` will not tell you
 which filesystem you ended up on**, so check the device, not the daemon.
 
 ## The bind mounts are gone on the second boot
 
-`init` runs once, not on every start, so after a stop and start the mounts are absent and `dockerd`
-is down. The upstream example's comments say the mounts must be re-applied after every start, and
-its "Start dockerd" recipe does that; `scripts/start-dockerd.sh` is that recipe. Run it after every
-start. The failure mode is a daemon that will
-not start, or one running on the wrong filesystem, not lost data: the images are on `/storage` and
-survive.
+`init` runs once, so after a stop and start the bind mounts are gone and `dockerd` is down.
+`scripts/start-dockerd.sh`, the upstream example's "Start dockerd" recipe, re-applies them; run it
+after every start. The images are on `/storage` and survive.
 
 ## Reaching the daemon from the host
 
@@ -55,8 +76,23 @@ address other hosts can reach.
 
 ## Ports
 
-Declare host-to-guest ports at create time. Dynamic ports chosen later by Compose or Testcontainers
-are not published through the outer VM boundary automatically, so pin the ones the host must reach.
+Create the machine with `--auto-ports` (Smolfile `auto_ports = true`) and the ports Compose or
+Testcontainers choose later appear on the host at the same number while they listen: `docker run -p
+8080:80 nginx` inside the machine makes `curl http://127.0.0.1:8080` work on the host. Docker's
+userland proxy listens in the guest's own network namespace, which is what auto ports watch, so
+keep it on (the default); with `"userland-proxy": false` Docker publishes through iptables only
+and nothing appears. A host port already in use is skipped rather than moved, and ports below 1024
+need `-p`. Without `--auto-ports`, declare host-to-guest ports at create time and pin the ones the
+host must reach. Rules and limits: "Ports that appear on their own" in
+[`throwaway-machine`](../throwaway-machine/README.md).
+
+## x86_64 images on Apple silicon
+
+Create the machine with `--rosetta` and `docker run --platform linux/amd64` runs x86_64 images
+through Rosetta in every container Docker starts, with nothing to configure in the daemon:
+`docker run --rm --platform linux/amd64 alpine uname -m` prints `x86_64`, and amd64 `node`,
+`python` and `postgres` images run. The program keeps the PID it was started with, so PID 1
+semantics, `pg_ctl -w` and `docker stop` behave as on a native image.
 
 ## Platforms
 

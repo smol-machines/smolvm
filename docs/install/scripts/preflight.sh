@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.23.0"
+VERIFIED_VERSION="1.29.0"
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 
@@ -69,7 +69,7 @@ case "$kernel" in
         if [ "$arch" != "aarch64" ]; then
             emit hardware_verified no
             blocked=1
-            note "no darwin-x86_64 archive is published for v1.23.0, so the installer accepts an Intel Mac and then stops at the download"
+            note "no darwin-x86_64 archive is published for v1.29.0, so the installer accepts an Intel Mac and then stops at the download"
         else
             emit hardware_verified yes
         fi
@@ -81,7 +81,7 @@ case "$kernel" in
         if [ "$len" -gt 100 ]; then
             emit socket_path_status too_long
             blocked=1
-            note "HOME is too deep: every VM start will fail with krun_start_enter -22, whose text blames disks and device options. Install under a shorter HOME."
+            note "HOME is too deep: every VM start will fail. From v1.28.0 the error names the socket path and its length; before it, krun_start_enter -22, whose text blames disks and device options. Install under a shorter HOME."
         else
             emit socket_path_status ok
         fi

@@ -78,6 +78,14 @@ pub struct PortSpec {
     /// Port inside the machine.
     #[schema(example = 80)]
     pub guest: u16,
+    /// Transport to forward: `tcp` (the default) or `udp`. A UDP port is
+    /// forwarded per remote client, and the machine answers each client
+    /// through the same host port.
+    #[serde(
+        default,
+        skip_serializing_if = "crate::data::network::PortProtocol::is_tcp"
+    )]
+    pub protocol: crate::data::network::PortProtocol,
 }
 
 /// A shared cache disk: a read-only base image the machine reads through its
@@ -222,6 +230,10 @@ pub struct ResourceSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     #[schema(example = "10.200.0.0/30")]
     pub guest_subnet: Option<String>,
+    /// Guest paths kept on the machine's storage disk (see
+    /// `CreateMachineRequest::disk_volumes`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
 }
 
 // ============================================================================
@@ -314,6 +326,18 @@ pub struct UpdateEgressRequest {
     /// host. Mirrors `--net` on `machine update`.
     #[serde(default)]
     pub allow_all: bool,
+    /// Start from an empty allow list before applying this request's
+    /// additions, so the machine ends up with exactly what the request names.
+    /// A reset that names nothing needs `allowAll` to open egress. Cannot be
+    /// combined with removals. Mirrors `--reset-allow-list` on `machine update`.
+    #[serde(default)]
+    pub reset_allow_list: bool,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub allow_udp: Vec<String>,
+    #[allow(missing_docs)]
+    #[serde(default)]
+    pub remove_allow_udp: Vec<String>,
 }
 
 /// Environment variable.
@@ -363,6 +387,193 @@ pub struct ExecResponse {
     #[serde(with = "smolvm_protocol::base64_bytes")]
     #[schema(value_type = String)]
     pub stderr_b64: Vec<u8>,
+}
+
+/// Start a command the node owns: it outlives the request that started it,
+/// keeps its output for readers to fetch by offset, and keeps its exit code
+/// until read. See `api::exec_sessions`.
+///
+/// Same command fields as [`ExecRequest`], plus the session's id and shape.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct CreateExecSessionRequest {
+    /// The session's id, 8 to 64 of `[A-Za-z0-9_-]`. A client chooses it so a
+    /// retried start finds the session the first one made instead of running
+    /// the command twice. Generated when absent.
+    #[serde(default)]
+    pub exec_id: Option<String>,
+    /// Command and arguments.
+    #[schema(example = json!(["echo", "hello"]))]
+    pub command: Vec<String>,
+    /// Environment variables.
+    #[serde(default)]
+    pub env: Vec<EnvVar>,
+    /// Ad-hoc secret refs; rejected unless empty (see [`ExecRequest`]).
+    #[serde(default)]
+    #[schema(value_type = Object)]
+    pub secrets: RequestSecretRefs,
+    /// Working directory.
+    #[serde(default)]
+    pub workdir: Option<String>,
+    /// Run as this user (image machines).
+    #[serde(default)]
+    pub user: Option<String>,
+    /// Kill the command after this many seconds (exit code 124).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Data written to the command's stdin when it starts. Unless
+    /// `interactive`, stdin is closed after it.
+    #[serde(default)]
+    pub stdin: Option<String>,
+    /// Stdin stays open for sequenced frames (`POST .../stdin` or the attach
+    /// WebSocket). An interactive session left without a reader for the
+    /// detach grace is killed.
+    #[serde(default)]
+    pub interactive: bool,
+    /// Run the command on a PTY (implies `interactive`); stderr joins stdout.
+    #[serde(default)]
+    pub tty: bool,
+    /// Initial terminal width (`tty` only).
+    #[serde(default)]
+    pub cols: Option<u16>,
+    /// Initial terminal height (`tty` only).
+    #[serde(default)]
+    pub rows: Option<u16>,
+    /// Boot a stopped machine to run the command (the default).
+    #[serde(default = "auto_start_default")]
+    #[schema(default = true)]
+    pub auto_start: bool,
+    /// Wait up to this many seconds (at most 60) for output or the exit before
+    /// answering, and answer with the output from offset 0; a short command
+    /// then needs this one request.
+    #[serde(default)]
+    pub wait_secs: Option<u64>,
+    /// Most output bytes in the answer.
+    #[serde(default)]
+    pub max_bytes: Option<usize>,
+}
+
+/// Query for reading an exec session's output.
+#[derive(Debug, Default, Deserialize, ToSchema, utoipa::IntoParams)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecSessionReadQuery {
+    /// Return output from this offset. It also acknowledges every byte before
+    /// it, which the node then drops. Default 0.
+    #[serde(default)]
+    pub after: u64,
+    /// Wait up to this many seconds (at most 60) for output past `after` or
+    /// the exit. Default 0.
+    #[serde(default)]
+    pub wait: Option<u64>,
+    /// Most output bytes in the answer.
+    #[serde(default)]
+    pub max: Option<usize>,
+}
+
+/// One piece of an exec session's output.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecOutputChunk {
+    /// `stdout` or `stderr`.
+    pub stream: String,
+    /// Offset of the first byte. Stdout and stderr share one offset space.
+    pub offset: u64,
+    /// The bytes, base64-encoded.
+    #[serde(with = "smolvm_protocol::base64_bytes")]
+    #[schema(value_type = String)]
+    pub data: Vec<u8>,
+}
+
+/// Offsets a reader asked for that the node no longer holds: it fell more
+/// than the output window behind after being away longer than the detach
+/// grace.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+pub struct ExecOutputGap {
+    /// First offset no longer held.
+    pub from: u64,
+    /// The oldest offset still held.
+    pub to: u64,
+}
+
+/// An exec session's state and the output a read returned.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecSessionResponse {
+    /// The exec id.
+    pub exec_id: String,
+    /// `starting`, `running` or `exited`.
+    pub state: String,
+    /// The command ended and `output` reaches the end of its output: nothing
+    /// more will come. Stop reading here.
+    pub done: bool,
+    /// The command's exit code, once it exited.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exit_code: Option<i32>,
+    /// Why the session ended without an exit code (killed, the machine
+    /// stopped, it never started), or what went wrong around it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<String>,
+    /// Output after the offset asked for, in offset order.
+    pub output: Vec<ExecOutputChunk>,
+    /// Pass as `after` on the next read.
+    pub next: u64,
+    /// The oldest offset the node still holds.
+    pub start: u64,
+    /// One past the newest byte produced.
+    pub end: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    /// Offsets asked for that are no longer held.
+    pub lost: Option<ExecOutputGap>,
+    /// The last stdin frame applied (0 = none).
+    pub stdin_applied: u64,
+    /// It runs on a PTY.
+    pub tty: bool,
+    /// Its stdin takes sequenced frames.
+    pub interactive: bool,
+    /// Unix milliseconds.
+    pub created_at: u64,
+}
+
+/// One stdin frame for an interactive exec session.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecStdinRequest {
+    /// The frame's sequence number; the first is 1. A frame applies only after
+    /// the one before it; a frame already applied is acknowledged and ignored.
+    pub seq: u64,
+    /// The bytes, base64-encoded, at most 64 KiB.
+    #[serde(default, with = "smolvm_protocol::base64_bytes")]
+    #[schema(value_type = String)]
+    pub data: Vec<u8>,
+    /// Close stdin after this frame.
+    #[serde(default)]
+    pub eof: bool,
+}
+
+/// The last stdin frame applied.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecStdinResponse {
+    /// The last frame applied (0 = none).
+    pub stdin_applied: u64,
+}
+
+/// Resize an exec session's terminal.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields)]
+pub struct ExecResizeRequest {
+    /// Width in columns.
+    pub cols: u16,
+    /// Height in rows.
+    pub rows: u16,
+}
+
+/// The exec sessions on a machine.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ListExecSessionsResponse {
+    /// The sessions, oldest first.
+    pub execs: Vec<crate::api::exec_sessions::SessionSummary>,
 }
 
 /// Request to export a stopped machine to a `.smolmachine` and push it to a
@@ -536,6 +747,16 @@ pub struct PullImageResponse {
 // Logs Types
 // ============================================================================
 
+/// Query parameters for the stop endpoint.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+pub struct StopQuery {
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed, instead of the machine's stop timeout; 0 kills it at once.
+    #[serde(default)]
+    #[schema(example = 30)]
+    pub timeout: Option<u64>,
+}
+
 /// Query parameters for logs endpoint.
 #[derive(Debug, Deserialize, ToSchema)]
 pub struct LogsQuery {
@@ -549,6 +770,20 @@ pub struct LogsQuery {
     /// Output format: "raw" (default) or "json" (only emit valid JSON lines).
     #[serde(default)]
     pub format: Option<String>,
+    /// Which log: "console" (default), the machine's agent and kernel
+    /// console, or "workload", its workload's stdout and stderr, which is
+    /// kept across restarts and readable while the machine is stopped.
+    #[serde(default)]
+    pub source: Option<String>,
+    /// Resume from this file offset: the `id` of the last event received.
+    /// The SSE `Last-Event-ID` header does the same. Every event of a resumed
+    /// read carries the offset just past its line as its `id`.
+    #[serde(default)]
+    pub after: Option<u64>,
+    /// Give every event the offset just past its line as its `id`, so the
+    /// read can be resumed with `after`.
+    #[serde(default)]
+    pub ids: bool,
 }
 
 // ============================================================================
@@ -618,7 +853,9 @@ pub struct CapacityResponse {
     pub used_memory_mb: u64,
     /// Proportional resident memory (MB) across VM processes. Unlike summed
     /// RSS, this counts clean pages shared by branch siblings only once in the
-    /// aggregate. Omitted where the host cannot provide process PSS.
+    /// aggregate. Omitted: `/capacity` sums the kernel's cheap per-process
+    /// counters, which carry no PSS, because summing `smaps_rollup` over every
+    /// machine outlasts the node-agent's poll. A machine's own usage reports it.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub used_memory_pss_mb: Option<u64>,
     /// Private resident memory (MB) across VM processes.
@@ -635,8 +872,26 @@ pub struct CapacityResponse {
     /// Effective memory currently available (MB) to this runtime.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_memory_available_mb: Option<u64>,
+    /// Host memory (MB) a branch must leave free on this node. A branch of N
+    /// children is refused unless `host_memory_available_mb` covers this plus
+    /// `N * (branch_child_overhead_mb + branch_child_growth_fraction * the
+    /// source's guest RAM)` plus any fresh RAM generation it copies.
+    /// Omitted when branch memory admission is off or host memory is unknown.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_reserve_mb: Option<u64>,
+    /// Boot overhead (MB) branch admission charges per child on this node.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_child_overhead_mb: Option<u64>,
+    /// Share of a child's guest RAM (0..=1) branch admission charges per child
+    /// on top of `branch_child_overhead_mb`, for the pages it dirties later.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub branch_child_growth_fraction: Option<f64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
+    /// Disk space (bytes) the node's incremental checkpoint store held at its
+    /// last retention run. Omitted until one has run.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub checkpoint_store_bytes: Option<u64>,
     /// Opaque id minted once per serve process. It changes iff the serve restarts
     /// — the signal the control uses to detect that this node's warm pool (and any
     /// in-memory VM state) was wiped, so it can prune the now-stale pool records.
@@ -715,6 +970,13 @@ pub struct CreateMachineRequest {
     /// Host mounts to attach.
     #[serde(default)]
     pub mounts: Vec<MountSpec>,
+    /// Guest paths kept on the machine's storage disk instead of its overlay
+    /// root, like Docker's anonymous volume `-v /var/lib/docker` (the CLI's
+    /// `-v PATH` with no host side). Put a nested container engine's data root
+    /// here so it can use overlayfs instead of falling back to vfs.
+    #[serde(default)]
+    #[schema(example = json!(["/var/lib/docker", "/var/lib/containerd"]))]
+    pub disk_volumes: Vec<String>,
     /// Port mappings (host:guest).
     #[serde(default)]
     pub ports: Vec<PortSpec>,
@@ -751,6 +1013,17 @@ pub struct CreateMachineRequest {
     /// Off by default.
     #[serde(default)]
     pub docker_socket: bool,
+    /// Signal sent to the workload when the machine stops, so it can save its
+    /// state and exit: a name such as `SIGINT` or `SIGRTMIN+3`, or a number.
+    /// Default `SIGTERM`.
+    #[serde(default)]
+    #[schema(example = "SIGINT")]
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed. Default 10, at most 300.
+    #[serde(default)]
+    #[schema(example = 30)]
+    pub stop_timeout_secs: Option<u64>,
     /// Storage disk size in GiB (default: 20).
     #[serde(default)]
     pub storage_gb: Option<u64>,
@@ -807,7 +1080,9 @@ pub struct CreateMachineRequest {
     /// Restart policy configuration.
     #[serde(default)]
     pub restart: Option<RestartSpec>,
-    /// OCI image reference (e.g., "alpine:latest"). Mutually exclusive with `from`.
+    /// OCI image reference (e.g., "alpine:latest"), or a `docker save` / OCI
+    /// archive or rootfs directory under the server's `--local-image-dir`.
+    /// Mutually exclusive with `from`.
     #[serde(default)]
     pub image: Option<String>,
     /// Path to a `.smolmachine` or `.checkpoint` artifact. Creates from
@@ -856,6 +1131,11 @@ pub struct CreateMachineRequest {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineInfo {
+    /// Maximum number of backing layers across storage, overlay and cache disks.
+    /// Measured on machine detail requests; omitted when unavailable. A raw or
+    /// standalone disk has depth zero. This is not the branch generation.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub disk_chain_depth: Option<usize>,
     /// Process identity for conditional live mutations; absent when unavailable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub runtime: Option<crate::agent::live_resize::RuntimeIdentity>,
@@ -869,6 +1149,10 @@ pub struct MachineInfo {
     /// Current state ("created", "running", "stopped").
     #[schema(example = "running")]
     pub state: String,
+    /// Why the host put the machine in this state when it was not the user:
+    /// a branch child the memory pressure guard paused says so here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state_reason: Option<String>,
     /// Number of vCPUs.
     #[schema(example = 2)]
     pub cpus: u8,
@@ -914,6 +1198,9 @@ pub struct MachineInfo {
     #[serde(skip_serializing_if = "Option::is_none")]
     #[schema(example = 2)]
     pub overlay_gb: Option<u64>,
+    /// Guest paths kept on the machine's storage disk.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
     /// Host block I/O engine used by this machine.
     pub block_io: crate::data::resources::BlockIoEngine,
     /// When this machine's guest disk writes must reach the host's disk.
@@ -921,7 +1208,10 @@ pub struct MachineInfo {
     /// The machine's shared cache disk, its base named by file name.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<CacheDiskSpec>,
-    /// Whether ordinary starts launch this machine as a branch source.
+    /// Whether this machine can be branched as it is: how it was launched while
+    /// it runs (a plain-created machine started with `branchable` is one, a
+    /// branchable-created one started plain is not), else whether an ordinary
+    /// start launches it as a branch source.
     pub branchable: bool,
     /// Legacy alias for `branchable`.
     pub forkable: bool,
@@ -950,11 +1240,31 @@ pub struct MachineInfo {
     #[schema(example = 1048576)]
     pub egress_bytes: Option<u64>,
     /// Matches against the operator's egress watchlist (`smolvm serve
-    /// --egress-watchlist`), grouped by label and destination, latest first.
-    /// Omitted when there are none. Recorded by the host-side network stack the
+    /// --egress-watchlist`), and stratum handshakes under the built-in label
+    /// `stratum` (a miner logging in to its pool, whatever the pool), grouped
+    /// by label and destination, latest first. Omitted when there are none. Recorded by the host-side network stack the
     /// guest cannot reach, for virtio-net machines.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub egress_signals: Option<Vec<crate::agent::EgressSignal>>,
+    /// CPU limit in force on the running VMM, in milli-CPUs across all vCPUs,
+    /// set with `PUT /machines/{name}/cpu-limit` and reapplied on every later
+    /// launch until cleared. Omitted when none is set or the machine is stopped.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    #[schema(example = 200)]
+    pub cpu_limit_millicpus: Option<u32>,
+    /// Open TCP flows of a running virtio-net machine, from the host-side
+    /// network stack's flow table, refreshed about every 15 s. Omitted for TSI
+    /// machines, stopped machines, and a summary older than two minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub egress_flows: Option<crate::agent::EgressFlowSummary>,
+    /// Pressure stall information from inside the guest
+    /// (`/proc/pressure/{cpu,memory,io}`), refreshed about every 15 s: how
+    /// much of the time tasks waited for CPU, memory or IO, which the host's
+    /// view of the VMM process cannot tell. Omitted for stopped machines,
+    /// before the first sample, for a guest kernel without PSI, and for a
+    /// sample older than two minutes.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pressure: Option<crate::agent::GuestPressure>,
     /// Host-minted identity of this launch, as carried by mediated egress
     /// decisions (`machineId`), so a decider can map flows to the machine up
     /// front. Present only while a mediated-egress machine is running.
@@ -1129,6 +1439,40 @@ pub struct ResizeMachineRequest {
     pub overlay_gb: Option<u64>,
 }
 
+/// Request to replace a machine's published ports.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetPortsRequest {
+    /// The machine's published ports, the whole set; an empty list removes
+    /// them all. A running machine takes TCP changes now; its UDP ports stay
+    /// as they are until it stops.
+    pub ports: Vec<PortSpec>,
+}
+
+/// Request to set or clear a running machine's live CPU limit.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetCpuLimitRequest {
+    /// Host CPU the machine's VMM may use, in milli-CPUs across all its vCPUs
+    /// (200 = a fifth of one CPU), from 1 to vCPUs × 1000. `null` clears the
+    /// limit back to one CPU per vCPU. Required: an empty body is refused.
+    /// The guest still sees all its vCPUs, and the limit holds for every later
+    /// launch of the machine until cleared.
+    #[schema(example = 200, required = true, nullable = true)]
+    #[serde(deserialize_with = "present_or_null")]
+    pub millicpus: Option<u32>,
+}
+
+/// Deserialize a field that must be present but may be `null`. Unlike a plain
+/// `Option`, a missing field is an error rather than `None`.
+fn present_or_null<'de, D, T>(deserializer: D) -> std::result::Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Option::<T>::deserialize(deserializer)
+}
+
 /// Query string for `POST /machines/{name}/start`.
 #[derive(Debug, Default, Deserialize, ToSchema)]
 pub struct StartMachineQuery {
@@ -1146,6 +1490,19 @@ pub struct StartMachineQuery {
     /// Explicit logical VRAM limit per source/child session, in MiB.
     #[serde(default, rename = "cudaVramLimitMib")]
     pub cuda_vram_limit_mib: Option<u64>,
+}
+
+impl StartMachineQuery {
+    /// Take the start options a caller put in the JSON body as well as the
+    /// query string. Either may ask for a branchable start; a value set in
+    /// the query string wins over the body's.
+    pub fn with_body(self, body: &StartMachineRequest) -> Self {
+        Self {
+            forkable: self.forkable || body.branchable,
+            fork_pool_size: self.fork_pool_size.or(body.branch_pool_size),
+            cuda_vram_limit_mib: self.cuda_vram_limit_mib.or(body.cuda_vram_limit_mib),
+        }
+    }
 }
 
 /// Credentials for the registry a machine's image lives in.
@@ -1209,6 +1566,19 @@ pub struct StartMachineRequest {
     /// the API server only and is never written to the machine record.
     #[serde(default)]
     pub egress_interceptor: Option<ExternalInterceptorSpec>,
+
+    /// Start as a branch source; the same as the `branchable` query parameter,
+    /// so a caller that puts its start options in the body is not ignored.
+    #[serde(default, alias = "forkable")]
+    pub branchable: bool,
+
+    /// The `branchPoolSize` query parameter, accepted in the body too.
+    #[serde(default, alias = "forkPoolSize")]
+    pub branch_pool_size: Option<u32>,
+
+    /// The `cudaVramLimitMib` query parameter, accepted in the body too.
+    #[serde(default)]
+    pub cuda_vram_limit_mib: Option<u64>,
 }
 
 /// Host interceptor binding supplied in a machine start request.
@@ -1300,6 +1670,13 @@ pub struct ForkRequest {
     /// Keep the source paused as a reusable branch base.
     #[serde(default)]
     pub freeze_source: bool,
+    /// Keep the source's `/etc/machine-id` (and dbus id) in the clone instead
+    /// of minting a fresh one. Hostname, SSH host keys and cloud-init state are
+    /// still re-minted. For same-tenant fan-out whose tools key a per-machine
+    /// cache by machine id (Nx names its cache database after it), so a warm
+    /// source's cache stays visible in every clone.
+    #[serde(default)]
+    pub keep_machine_id: bool,
     /// Maximum seconds to wait for the golden workload's forkpoint. Defaults
     /// to 240 when `waitReady` or `hold` is enabled.
     #[serde(default)]
@@ -1318,6 +1695,9 @@ pub struct ForkRequest {
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
+    /// Labels set on the child over the ones inherited from the source.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// Preferred public name for [`ForkRequest`].
@@ -1626,6 +2006,17 @@ pub type BranchLeaseInfo = ForkLeaseInfo;
 
 #[cfg(test)]
 mod deny_unknown_field_tests {
+    #[test]
+    fn cpu_limit_requires_millicpus_and_null_clears() {
+        let set: SetCpuLimitRequest = serde_json::from_str(r#"{"millicpus":200}"#).unwrap();
+        assert_eq!(set.millicpus, Some(200));
+        let clear: SetCpuLimitRequest = serde_json::from_str(r#"{"millicpus":null}"#).unwrap();
+        assert_eq!(clear.millicpus, None);
+        assert!(serde_json::from_str::<SetCpuLimitRequest>("{}").is_err());
+        assert!(serde_json::from_str::<SetCpuLimitRequest>(r#"{"millicpus":-1}"#).is_err());
+        assert!(serde_json::from_str::<SetCpuLimitRequest>(r#"{"millicpus":1,"cpus":2}"#).is_err());
+    }
+
     /// An exec boots a stopped machine unless the caller opts out; the opt-out
     /// is what lets a readiness probe reach a machine without waking it.
     #[test]
@@ -1766,7 +2157,7 @@ mod registry_auth_tests {
         // And it must stay redacted when nested in the request struct.
         let req = StartMachineRequest {
             registry_auth: Some(spec),
-            egress_interceptor: None,
+            ..Default::default()
         };
         assert!(!format!("{req:?}").contains("ghp_super_secret_value"));
     }

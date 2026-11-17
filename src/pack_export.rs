@@ -103,6 +103,27 @@ pub fn export_overlay_owner(vm_name: &str, vm: &VmRecord) -> String {
     )
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ImageExportSource {
+    Artifact,
+    LocalArchiveOrDir,
+    StorageOrRegistry { rebase_from_registry: bool },
+}
+
+fn image_export_source(vm: &VmRecord, rebase_from_image: bool) -> Option<ImageExportSource> {
+    let image = vm.image.as_deref()?;
+    let is_local = crate::data::image_source::is_local_ref(image);
+    if vm.packed_layer_source().is_some() && (!rebase_from_image || is_local) {
+        return Some(ImageExportSource::Artifact);
+    }
+    if is_local && !vm.packed_image_on_storage {
+        return Some(ImageExportSource::LocalArchiveOrDir);
+    }
+    Some(ImageExportSource::StorageOrRegistry {
+        rebase_from_registry: rebase_from_image && !is_local,
+    })
+}
+
 /// Collect a stopped machine's pack assets into `collector` and report the
 /// pack mode. The caller has already: loaded the record, verified the machine
 /// is stopped, and collected its base assets (runtime libs, agent rootfs,
@@ -121,7 +142,6 @@ pub fn collect_from_vm_assets(
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
-    let is_artifact_sourced = is_image_based && vm.source_smolmachine.is_some();
 
     if !is_image_based && !overlay_disk.exists() {
         return Err(Error::agent(
@@ -139,81 +159,92 @@ pub fn collect_from_vm_assets(
     let mut image_env: Vec<String> = Vec::new();
     let mut image_user: Option<String> = None;
 
-    if is_artifact_sourced && !opts.rebase_from_image {
-        export_flattened_from_artifact_sourced(
-            collector,
-            vm_name,
-            &overlay_owner,
-            &vm_dir,
-            staging_dir,
-            vm.source_smolmachine.as_deref(),
-            opts.include_workspace,
-        )?;
-    } else if is_image_based {
-        let image = vm.image.clone().unwrap();
-        // A locally-sourced image (`--image -` / `--image file.tar` / a rootfs
-        // dir) is flattened on boot and has no registry manifest, so the
-        // in-VM re-pull below cannot source it. Fail with a clear, actionable
-        // message instead of a confusing registry "UNAUTHORIZED" on
-        // `local:<hash>`.
-        if crate::data::image_source::is_local_ref(&image) {
-            // No registry manifest to re-pull, but the base rootfs is still
-            // reachable: an archive was flattened onto the machine's own storage
-            // disk at boot, and a rootfs dir is still the host directory the
-            // machine boots from. Either can be the lower layer.
+    match image_export_source(vm, opts.rebase_from_image) {
+        Some(ImageExportSource::Artifact) => {
+            if opts.rebase_from_image {
+                tracing::info!(
+                    image = %vm.image.as_deref().unwrap_or_default(),
+                    "local image has no registry base to rebase onto; packing from artifact"
+                );
+            }
+            export_flattened_from_artifact_sourced(
+                collector,
+                vm_name,
+                &overlay_owner,
+                &vm_dir,
+                staging_dir,
+                vm.source_smolmachine.as_deref(),
+                opts.include_workspace,
+            )?;
+        }
+        Some(ImageExportSource::LocalArchiveOrDir) => {
+            let image = vm.image.as_deref().unwrap();
             export_flattened_from_local_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                &image,
+                image,
                 opts.include_workspace,
             )?;
-        } else {
+        }
+        Some(ImageExportSource::StorageOrRegistry {
+            rebase_from_registry,
+        }) => {
+            let image = vm.image.as_deref().unwrap();
+            let mut effective_opts = opts.clone();
+            effective_opts.rebase_from_image = rebase_from_registry;
+            if opts.rebase_from_image && !rebase_from_registry {
+                tracing::info!(
+                    image = %image,
+                    "local image has no registry base to rebase onto; packing from storage"
+                );
+            }
             (image_env, image_user) = export_flattened_from_registry_image(
                 collector,
                 vm_name,
                 &overlay_owner,
                 &vm_dir,
-                &image,
-                opts,
+                image,
+                &effective_opts,
             )?;
         }
-    } else {
-        // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
-        // from the template; a default-size overlay is a qcow2 CoW image and
-        // must be flattened to a raw before it can be a template.
-        let overlay_for_pack = match overlay_fmt {
-            DiskFormat::Raw => overlay_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("overlay-flat.raw");
-                flatten_qcow2_to_raw(&overlay_disk, &flat)?;
-                flat
-            }
-        };
-        println!("Copying overlay disk ({})...", overlay_for_pack.display());
-        collector
-            .add_overlay_template(&overlay_for_pack)
-            .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
+        None => {
+            // Bare VM: its state is the rootfs overlay disk. VM-mode restores boot
+            // from the template; a default-size overlay is a qcow2 CoW image and
+            // must be flattened to a raw before it can be a template.
+            let overlay_for_pack = match overlay_fmt {
+                DiskFormat::Raw => overlay_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = staging_dir.join("overlay-flat.raw");
+                    flatten_qcow2_to_raw(&overlay_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying overlay disk ({})...", overlay_for_pack.display());
+            collector
+                .add_overlay_template(&overlay_for_pack)
+                .map_err(|e| Error::agent("collect overlay", e.to_string()))?;
 
-        if !storage_disk.exists() {
-            return Err(Error::agent(
-                "collect storage",
-                format!("storage disk not found at {}", storage_disk.display()),
-            ));
-        }
-        let storage_for_pack = match storage_fmt {
-            DiskFormat::Raw => storage_disk.clone(),
-            DiskFormat::Qcow2 => {
-                let flat = staging_dir.join("storage-flat.raw");
-                flatten_qcow2_to_raw(&storage_disk, &flat)?;
-                flat
+            if !storage_disk.exists() {
+                return Err(Error::agent(
+                    "collect storage",
+                    format!("storage disk not found at {}", storage_disk.display()),
+                ));
             }
-        };
-        println!("Copying storage disk ({})...", storage_for_pack.display());
-        collector
-            .add_vm_storage_template(&storage_for_pack)
-            .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+            let storage_for_pack = match storage_fmt {
+                DiskFormat::Raw => storage_disk.clone(),
+                DiskFormat::Qcow2 => {
+                    let flat = staging_dir.join("storage-flat.raw");
+                    flatten_qcow2_to_raw(&storage_disk, &flat)?;
+                    flat
+                }
+            };
+            println!("Copying storage disk ({})...", storage_for_pack.display());
+            collector
+                .add_vm_storage_template(&storage_for_pack)
+                .map_err(|e| Error::agent("collect storage", e.to_string()))?;
+        }
     }
 
     Ok(FromVmAssets {
@@ -240,7 +271,13 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     if let Some(ref image) = assets.image {
         manifest.image = image.clone();
     }
+    manifest.cpus = vm.cpus;
+    manifest.mem = vm.mem;
     manifest.network = vm.network;
+    manifest.block_private = vm.block_private.clone();
+    manifest.allowed_cidrs = vm.allowed_cidrs.clone();
+    manifest.dns_filter_hosts = vm.dns_filter_hosts.clone();
+    manifest.egress_rules = vm.egress_rules.clone();
     manifest.gpu = vm.gpu.unwrap_or(false);
     manifest.cuda = vm.cuda;
     // Carry the record's (entrypoint, cmd) through as-is. An empty entrypoint
@@ -257,6 +294,142 @@ pub fn seed_manifest_from_vm(manifest: &mut PackManifest, vm: &VmRecord, assets:
     // resolves it: the machine's own user wins, else the image's USER.
     manifest.user = vm.user.clone().or_else(|| assets.image_user.clone());
     manifest.secret_refs = vm.secret_refs.clone();
+}
+
+/// Validated outbound egress fields extracted from a [`PackManifest`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ValidatedManifestEgress {
+    /// Private-range exceptions; `Some([])` blocks every private range.
+    pub block_private: Option<Vec<String>>,
+    /// Outbound CIDR allow-list carried with the pack.
+    pub allowed_cidrs: Option<Vec<String>>,
+    /// Hostnames and patterns permitted by the guest DNS filter.
+    pub dns_filter_hosts: Option<Vec<String>>,
+    /// Ordered outbound egress rules (`--deny-cidr` / `--allow-udp`).
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
+}
+
+impl ValidatedManifestEgress {
+    /// Layer CLI policy over an artifact: replace an explicit allow list as a
+    /// unit, retain inherited restrictions, and put new denies before allows.
+    pub fn with_cli_overrides(
+        self,
+        allowed_cidrs: Option<Vec<String>>,
+        dns_filter_hosts: Option<Vec<String>>,
+        block_private: Option<Vec<String>>,
+        rules: Vec<smolvm_protocol::EgressRule>,
+    ) -> Self {
+        let replaces_allow_list = allowed_cidrs.is_some() || dns_filter_hosts.is_some();
+        let mut egress_rules: Vec<_> = rules
+            .iter()
+            .filter(|rule| rule.action == smolvm_protocol::RuleAction::Deny)
+            .cloned()
+            .collect();
+        egress_rules.extend(self.egress_rules);
+        egress_rules.extend(
+            rules
+                .into_iter()
+                .filter(|rule| rule.action != smolvm_protocol::RuleAction::Deny),
+        );
+        Self {
+            allowed_cidrs: if replaces_allow_list {
+                allowed_cidrs
+            } else {
+                self.allowed_cidrs
+            },
+            dns_filter_hosts: if replaces_allow_list {
+                dns_filter_hosts
+            } else {
+                self.dns_filter_hosts
+            },
+            block_private: block_private.or(self.block_private),
+            egress_rules,
+        }
+    }
+}
+
+/// Validate and normalize the outbound egress policy carried by an untrusted
+/// [`PackManifest`], holding its CIDRs, host patterns, and egress rules to the
+/// same rules `machine create` enforces.
+pub fn validated_manifest_egress(
+    manifest: &PackManifest,
+) -> crate::Result<ValidatedManifestEgress> {
+    let block_private = manifest
+        .block_private
+        .as_ref()
+        .map(|cidrs| {
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed block_private", reason))
+        })
+        .transpose()?;
+    let allowed_cidrs = match &manifest.allowed_cidrs {
+        Some(cidrs) => Some(
+            cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed allowed_cidrs", reason))?,
+        ),
+        None => None,
+    };
+    let dns_filter_hosts = match &manifest.dns_filter_hosts {
+        Some(hosts) => Some(
+            hosts
+                .iter()
+                .map(|entry| validate_packed_host_entry(entry))
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .map_err(|reason| crate::Error::config("packed dns_filter_hosts", reason))?,
+        ),
+        None => None,
+    };
+    smolvm_network::EgressPolicy::unrestricted()
+        .with_rules(&manifest.egress_rules)
+        .map_err(|reason| crate::Error::config("packed egress_rules", reason))?;
+    let egress_rules = manifest
+        .egress_rules
+        .iter()
+        .map(|rule| {
+            let cidr = rule
+                .cidr
+                .as_deref()
+                .map(crate::smolfile::parse_cidr)
+                .transpose()
+                .map_err(|reason| crate::Error::config("packed egress_rules", reason))?;
+            Ok(smolvm_protocol::EgressRule {
+                transport: rule.transport,
+                cidr,
+                ports: rule.ports,
+                action: rule.action,
+            })
+        })
+        .collect::<crate::Result<Vec<_>>>()?;
+    Ok(ValidatedManifestEgress {
+        block_private,
+        allowed_cidrs,
+        dns_filter_hosts,
+        egress_rules,
+    })
+}
+
+fn validate_packed_host_entry(entry: &str) -> std::result::Result<String, String> {
+    match entry.strip_prefix('=') {
+        Some(exact) if !exact.starts_with("*.") => {
+            smolvm_protocol::host_pattern::encode_strict(exact)
+        }
+        Some(_) => Err(format!(
+            "invalid host pattern {entry:?}: use an exact DNS hostname or *.domain"
+        )),
+        None => smolvm_protocol::host_pattern::encode_strict(entry).map(|encoded| {
+            if entry.starts_with("*.") {
+                encoded
+            } else {
+                entry.trim_end_matches('.').to_ascii_lowercase()
+            }
+        }),
+    }
 }
 
 /// Layer a machine's own env over the image's declared env, as `KEY=VALUE`.
@@ -373,10 +546,10 @@ fn parse_helper_override(value: Option<&str>) -> Option<u64> {
     value?.trim().parse::<u64>().ok().filter(|gib| *gib > 0)
 }
 
-/// Apparent bytes held under `dir`, used to size the helper for an
-/// artifact-sourced machine whose image lives here rather than on its disk.
+/// Apparent bytes held under `dir`, used to size a helper or pack VM disk for
+/// an image that lives here on the host rather than on a machine's disk.
 /// Unreadable entries are skipped: this only feeds a disk-size heuristic.
-fn directory_apparent_bytes(dir: &Path) -> u64 {
+pub fn directory_apparent_bytes(dir: &Path) -> u64 {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return 0;
     };
@@ -419,9 +592,12 @@ impl ExportVm {
             return Err(Error::agent(
                 "pack from VM",
                 format!(
-                    "machine '{vm_name}' has no storage disk yet ({}) — it has \
-                     never been started. Start it once so its state exists, or \
-                     pack the image directly with `pack create -I <image>`.",
+                    "machine '{vm_name}' has no storage disk yet ({}): it has \
+                     never been started. Start it once so its state exists, stop \
+                     it, and pack it again:\
+                     \n\n  smolvm machine start --name {vm_name}\
+                     \n  smolvm machine stop --name {vm_name}\
+                     \n\nOr pack the image it was created from directly with `pack create -I <image>`.",
                     storage_disk.display()
                 ),
             ));
@@ -503,6 +679,8 @@ impl ExportVm {
                 network,
                 network_backend: None,
                 dns,
+                dns_options: Vec::new(),
+                shm_size: None,
                 gpu: false,
                 cuda: false,
                 gpu_vram_mib: None,
@@ -514,10 +692,13 @@ impl ExportVm {
                 disk_durability: Default::default(),
                 disks: Vec::new(),
                 cache_disk: None,
+                disk_volumes: Vec::new(),
+                block_private: None,
                 allowed_cidrs: None,
                 egress_rules: Vec::new(),
                 network_name: None,
                 guest_subnet: None,
+                switch: None,
             },
             features,
         ) {
@@ -865,11 +1046,19 @@ fn export_flattened_from_registry_image(
     image: &str,
     opts: &FromVmExportOptions,
 ) -> crate::Result<(Vec<String>, Option<String>)> {
-    let export_vm = ExportVm::start(vm_name, vm_dir, None, opts.rebase_from_image, opts.dns)?;
+    let rebase_from_registry =
+        opts.rebase_from_image && !crate::data::image_source::is_local_ref(image);
+    if opts.rebase_from_image && !rebase_from_registry {
+        tracing::info!(
+            image = %image,
+            "local image has no registry base to rebase onto; packing from storage"
+        );
+    }
+    let export_vm = ExportVm::start(vm_name, vm_dir, None, rebase_from_registry, opts.dns)?;
     let mut client = export_vm.connect()?;
     export_vm.mount_source_storage(&mut client)?;
 
-    let image_info = if opts.rebase_from_image {
+    let image_info = if rebase_from_registry {
         eprintln!("Pulling {} in export VM...", image);
         client
             .pull_with_registry_config_and_progress(
@@ -938,11 +1127,64 @@ mod cached_export_tests {
     use crate::platform::uds::UdsStream;
     use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
     use std::io::{Read, Write};
+
+    #[test]
+    fn cached_layer_order_excludes_workspace_and_unfinished_extractions() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::create_dir_all(layers.join("unfinished.partial")).unwrap();
+        std::fs::write(layers.join("workspace-seed/workspace.tar"), "workspace").unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("image.tar"), "image").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/image.tar".into()])
+        );
+    }
+
+    #[test]
+    fn cached_layer_order_preserves_manifest_order_and_requires_all_layers() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        std::fs::write(layers.join("zzz.tar"), "base").unwrap();
+        std::fs::create_dir(layers.join("aaa")).unwrap();
+        // Never guess alphabetical order for a multi-layer image.
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+        std::fs::write(layers.join("layer-order"), "zzz\naaa\n").unwrap();
+        assert_eq!(
+            ordered_cached_layer_ids(temp.path()),
+            Some(vec!["layers/zzz.tar".into(), "layers/aaa".into()])
+        );
+        std::fs::remove_file(layers.join("zzz.tar")).unwrap();
+        assert_eq!(ordered_cached_layer_ids(temp.path()), None);
+    }
+
+    #[test]
+    fn cached_layer_order_rejects_metadata_and_unsafe_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let layers = temp.path().join("layers");
+        std::fs::create_dir_all(layers.join("workspace-seed")).unwrap();
+        for id in [
+            "workspace-seed",
+            "..",
+            "../layers/workspace-seed",
+            "evil'command",
+            "unfinished.partial",
+        ] {
+            std::fs::write(layers.join("layer-order"), id).unwrap();
+            assert_eq!(ordered_cached_layer_ids(temp.path()), None, "{id}");
+        }
+    }
     /// An export helper whose creator died is stopped and its scratch removed;
     /// a live process that was not booted from the scratch is left alone.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_orphaned_export_helper_is_stopped_and_its_scratch_removed() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         // Above any pid_max, so no live process can hold it while tests run in
         // parallel and recycle pids.
@@ -958,7 +1200,16 @@ mod cached_export_tests {
 
         let orphan_dir = root.path().join("orphan");
         // Like a real orphan, the helper is not this process's child: its
-        // creator is gone, so init reaps it once it is killed.
+        // creator is gone. Once killed it is a zombie until whoever adopted it
+        // reaps it, and the reaper waits only 5 s for it to go, so this test
+        // process adopts it (it runs alone, so no other test's children are
+        // affected) and reaps exactly it below, instead of relying on an
+        // ancestor that may not reap in time.
+        // SAFETY: prctl with integer arguments.
+        assert_eq!(
+            unsafe { libc::prctl(libc::PR_SET_CHILD_SUBREAPER, 1, 0, 0, 0) },
+            0
+        );
         let launched = std::process::Command::new("sh")
             .args([
                 "-c",
@@ -974,10 +1225,17 @@ mod cached_export_tests {
             .parse()
             .unwrap();
         scratch(&orphan_dir, helper);
+        let reaper = std::thread::spawn(move || {
+            let mut status = 0;
+            // SAFETY: waits for one pid this process adopted.
+            unsafe { libc::waitpid(helper as libc::pid_t, &mut status, 0) };
+        });
 
         let other_dir = root.path().join("other");
         let mut unrelated = std::process::Command::new("sleep")
             .arg("60")
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
             .spawn()
             .unwrap();
         scratch(&other_dir, unrelated.id());
@@ -988,6 +1246,7 @@ mod cached_export_tests {
             !orphan_dir.exists(),
             "the orphaned helper's scratch is removed"
         );
+        reaper.join().unwrap();
         assert!(
             !std::path::Path::new(&format!("/proc/{helper}")).exists(),
             "the orphaned helper is stopped"
@@ -1002,6 +1261,20 @@ mod cached_export_tests {
         );
         unrelated.kill().unwrap();
         unrelated.wait().unwrap();
+    }
+
+    /// A never-started machine is refused before any helper boots, naming the
+    /// start that creates its disk and the stop the export needs after it.
+    #[test]
+    fn never_started_machine_hint_names_the_start_and_the_stop() {
+        let vm_dir = tempfile::tempdir().unwrap();
+        let Some(error) = ExportVm::start("x", vm_dir.path(), None, false, None).err() else {
+            panic!("a machine without a storage disk must be refused");
+        };
+        let message = error.to_string();
+        let start = message.find("smolvm machine start --name x");
+        let stop = message.find("smolvm machine stop --name x");
+        assert!(start.is_some() && start < stop, "{message}");
     }
 
     fn exercise(
@@ -1297,8 +1570,8 @@ fn export_flattened_from_artifact_sourced(
             "pack from VM",
             format!(
                 "VM '{vm_name}' was created from a .smolmachine artifact, but its \
-                 imported layer cache is missing ({}) and could not be rebuilt: \
-                 the source artifact ({}) is not available. Restore the source \
+                 imported layer cache is incomplete or has no usable layer order ({}) \
+                 and could not be rebuilt from the source artifact ({}). Restore the source \
                  .smolmachine at that path, or start the machine once to \
                  re-extract, then re-run the export.",
                 pack_content_dir.display(),
@@ -1368,8 +1641,18 @@ fn export_flattened_from_artifact_sourced(
 /// when the cache (or its ordering) is gone.
 fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
     let layers_dir = pack_content_dir.join("layers");
-    let order_path = layers_dir.join("layer-order");
     let cached_form = |id: &str| -> Option<String> {
+        // Workspace seeds and interrupted extraction directories are metadata,
+        // not image layers; IDs also enter a guest shell command below.
+        if id.is_empty()
+            || matches!(id, "." | ".." | "workspace-seed")
+            || smolvm_pack::extract::is_partial_dir_name(id)
+            || !id
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"-_.".contains(&b))
+        {
+            return None;
+        }
         if layers_dir.join(id).is_dir() {
             Some(format!("layers/{}", id))
         } else if layers_dir.join(format!("{id}.tar")).is_file() {
@@ -1378,7 +1661,8 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
             None
         }
     };
-    if let Ok(contents) = std::fs::read_to_string(&order_path) {
+    let order = cached_layer_order(pack_content_dir);
+    if let Some(contents) = order {
         let ids: Vec<&str> = contents
             .lines()
             .map(str::trim)
@@ -1402,6 +1686,22 @@ fn ordered_cached_layer_ids(pack_content_dir: &Path) -> Option<Vec<String>> {
         return None;
     }
     Some(entries)
+}
+
+fn cached_layer_order(pack_content_dir: &Path) -> Option<String> {
+    if let Ok(order) = std::fs::read_to_string(pack_content_dir.join("layers/layer-order")) {
+        return Some(order);
+    }
+    // Older macOS caches recorded order only on their case-sensitive volume.
+    // Lease it while reading the index, then export the retained original tars
+    // from the pack root; the helper's shared-cache mount contract is unchanged.
+    #[cfg(target_os = "macos")]
+    {
+        let lease = smolvm_pack::extract::acquire_layers_lease(pack_content_dir, false).ok()?;
+        std::fs::read_to_string(lease.path.join("layer-order")).ok()
+    }
+    #[cfg(not(target_os = "macos"))]
+    None
 }
 
 /// Overlay-mount `lowers` (bottom -> top, helper-local paths) with the source
@@ -1598,7 +1898,10 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             // resolver to configure.
             network: false,
             network_backend: None,
+            switch: None,
             dns: None,
+            dns_options: Vec::new(),
+            shm_size: None,
             gpu: false,
             cuda: false,
             gpu_vram_mib: None,
@@ -1610,6 +1913,8 @@ fn flatten_qcow2_to_raw(qcow2_path: &Path, dest_raw: &Path) -> crate::Result<()>
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             allowed_cidrs: None,
             egress_rules: Vec::new(),
             network_name: None,
@@ -1696,6 +2001,7 @@ mod env_merge_tests {
             "darwin/arm64".to_string(),
         );
         seed_manifest_from_vm(&mut manifest, &vm, &assets);
+        assert_eq!((manifest.cpus, manifest.mem), (1, 512));
         assert_eq!(manifest.user.as_deref(), Some("nginx"));
 
         vm.user = Some("501:20".to_string());
@@ -1755,7 +2061,10 @@ mod env_merge_tests {
 
 #[cfg(test)]
 mod from_vm_manifest_tests {
-    use super::{export_dns, export_overlay_owner, seed_manifest_from_vm, FromVmAssets};
+    use super::{
+        export_dns, export_overlay_owner, image_export_source, seed_manifest_from_vm,
+        validated_manifest_egress, FromVmAssets, ImageExportSource, ValidatedManifestEgress,
+    };
     use crate::config::VmRecord;
     use smolvm_pack::{PackManifest, PackMode};
 
@@ -1861,6 +2170,71 @@ mod from_vm_manifest_tests {
         assert_eq!(m.cmd, vec!["--port", "8080"]);
     }
 
+    /// Issue #1989: packing a networked machine that was scoped with
+    /// `--allow-host`, `--allow-cidr`, or `--deny-cidr` must carry that egress
+    /// policy into the manifest instead of leaving `manifest.network = true`
+    /// with no rules (which silently widened the packed machine to open internet).
+    #[test]
+    fn seed_manifest_from_vm_preserves_egress_allow_list_and_rules() {
+        let mut rec = record("scoped");
+        rec.network = true;
+        rec.block_private = Some(vec![]);
+        rec.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        rec.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "=exact.example.com".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
+        rec.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+
+        let mut m = manifest();
+        seed_manifest_from_vm(&mut m, &rec, &assets());
+
+        assert!(m.network);
+        assert_eq!(m.allowed_cidrs, rec.allowed_cidrs);
+        assert_eq!(m.dns_filter_hosts, rec.dns_filter_hosts);
+        assert_eq!(m.egress_rules, rec.egress_rules);
+        assert_eq!(
+            validated_manifest_egress(&m).unwrap(),
+            ValidatedManifestEgress {
+                block_private: rec.block_private,
+                allowed_cidrs: rec.allowed_cidrs,
+                dns_filter_hosts: rec.dns_filter_hosts,
+                egress_rules: rec.egress_rules,
+            }
+        );
+    }
+
+    #[test]
+    fn validated_manifest_egress_rejects_malformed_cidrs_hosts_and_rules() {
+        let mut bad_cidr = manifest();
+        bad_cidr.allowed_cidrs = Some(vec!["not-a-cidr".to_string()]);
+        assert!(validated_manifest_egress(&bad_cidr).is_err());
+
+        for bad_host in ["", "*", "https://pypi.org", "1.2.3.4", "=*.pypi.org"] {
+            let mut bad = manifest();
+            bad.dns_filter_hosts = Some(vec![bad_host.to_string()]);
+            assert!(
+                validated_manifest_egress(&bad).is_err(),
+                "{bad_host:?} must be rejected"
+            );
+        }
+
+        let mut bad_rule = manifest();
+        bad_rule.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("not-a-cidr".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+        assert!(validated_manifest_egress(&bad_rule).is_err());
+    }
+
     /// A branched or checkpoint-restored machine keeps writing to its source's
     /// overlay. Export used to look up `persistent-<own-name>`, found nothing,
     /// and flattened an empty overlay, silently dropping every exec-made change.
@@ -1882,6 +2256,43 @@ mod from_vm_manifest_tests {
         clone.golden = Some("orig".to_string());
         clone.fork_overlay_owner = Some("shared-owner".to_string());
         assert_eq!(export_overlay_owner("clone", &clone), "shared-owner");
+    }
+
+    /// A pack prepared on the machine's storage disk keeps its source image's
+    /// `local:` reference, but stores its layers in `/storage/layers` +
+    /// `/storage/manifests` rather than `/storage/image-archives`.
+    #[test]
+    fn a_local_image_on_storage_exports_from_storage_not_archive() {
+        let mut rec = record("m");
+        rec.image = Some("local:abc123".to_string());
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::LocalArchiveOrDir)
+        );
+
+        rec.source_smolmachine = Some("/tmp/source.smolmachine".to_string());
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::Artifact)
+        );
+        assert_eq!(
+            image_export_source(&rec, true),
+            Some(ImageExportSource::Artifact)
+        );
+
+        rec.packed_image_on_storage = true;
+        assert_eq!(
+            image_export_source(&rec, false),
+            Some(ImageExportSource::StorageOrRegistry {
+                rebase_from_registry: false
+            })
+        );
+        assert_eq!(
+            image_export_source(&rec, true),
+            Some(ImageExportSource::StorageOrRegistry {
+                rebase_from_registry: false
+            })
+        );
     }
 }
 

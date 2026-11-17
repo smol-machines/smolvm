@@ -26,7 +26,7 @@ machine: it can be checkpointed, restored and branched there like any other.
 | Source is an arm64 Mac, destination is arm64 Linux with KVM | Running state cannot change CPU architecture. |
 | The machine was started by a smolvm that supports the move | Older runtimes do not record the guest clock or the virtual board. smolvm refuses those checkpoints with "capture it again with a newer smolvm". |
 | The Linux CPU provides every feature the guest was given | A Mac guest's features are a subset of current arm64 server CPUs, including Graviton and Axion. A missing feature is named in the error. |
-| At most 16 vCPUs, no GPU, no host mounts | The same limits as any portable checkpoint, plus the vCPU numbering both hypervisors share. |
+| At most 16 vCPUs, no GPU; host mounts only with `--host-mounts`, and only when each recorded host path exists on the Linux host | The same limits as any portable checkpoint, plus the vCPU numbering both hypervisors share. |
 
 ## What changes after the move
 

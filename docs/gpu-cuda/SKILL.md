@@ -41,13 +41,10 @@ scripts/preflight.sh
 ```
 
 Read-only: it starts no VM and touches no NVIDIA state. It reports the GPU and driver version,
-whether your user can open `/dev/kvm`, and the host's own `libcuda` count. `result=blocked` with
-`gpu_present=no` is the answer that saves the most time, because a run without a GPU does not
-fail: it reaches the CPU emulation device.
-
-**If the question is "can this machine run CUDA", the preflight answers it and nothing else needs
-to run.** Do not reach for the probe to decide that: on a host with no NVIDIA GPU the probe starts
-a VM, reaches a CPU emulation device and returns a passing round trip, which reads like a yes.
+whether your user can open `/dev/kvm`, and the host's own `libcuda` count. **If the question is "can
+this machine run CUDA", the preflight answers it and nothing else needs to run.** `result=blocked`
+with `gpu_present=no` saves the most time, because on a host with no NVIDIA GPU the probe starts a
+VM, reaches a CPU emulation device and returns a passing round trip, which reads like a yes.
 Verified on macOS arm64 on v1.16.1, v1.18.2 and v1.22.2: `gpu_present=no` and `unsupported=cuda`;
 on v1.22.2 the note read `macOS has no CUDA driver, so --cuda has nothing to reach here.`
 

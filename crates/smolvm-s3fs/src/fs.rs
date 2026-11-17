@@ -27,7 +27,7 @@
 //!   this mount update the caches as they happen; a change made by another
 //!   writer becomes visible within the TTL.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -50,12 +50,79 @@ const FATTR_FH: u32 = 1 << 6;
 const SMALL_FILE_MAX: u64 = 1024 * 1024;
 /// Memory the small-file cache may hold; least recently used goes first.
 const SMALL_CACHE_BYTES: u64 = 256 * 1024 * 1024;
+const DIRECTORY_CACHE_NAMES: usize = 100_000;
+const DIRECTORY_CACHE_COUNT: usize = 1024;
 
 /// What a path resolved to, kept for the cache TTL.
 #[derive(Clone, Debug, PartialEq)]
 enum Known {
     Present(Node),
     Absent,
+}
+
+struct CachedDirectory {
+    names: HashSet<String>,
+    fetched: Instant,
+}
+
+#[derive(Default)]
+struct Metadata {
+    entries: HashMap<String, (Known, Instant)>,
+    directories: HashMap<String, CachedDirectory>,
+    listed_names: usize,
+    generation: u64,
+}
+
+impl Metadata {
+    fn prune_entries(&mut self, ttl: Duration) {
+        if self.entries.len() > 100_000 {
+            self.entries.retain(|_, (_, at)| at.elapsed() < ttl);
+        }
+    }
+
+    fn record(&mut self, path: &str, known: Known, at: Instant) {
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        if let Some(directory) = self.directories.get_mut(parent) {
+            match &known {
+                Known::Present(_) => {
+                    if directory.names.insert(name.to_string()) {
+                        self.listed_names += 1;
+                    }
+                }
+                Known::Absent => {
+                    if directory.names.remove(name) {
+                        self.listed_names -= 1;
+                    }
+                }
+            }
+        }
+        self.entries.insert(path.to_string(), (known, at));
+        self.bound_directories();
+    }
+
+    fn bound_directories(&mut self) {
+        while self.listed_names > DIRECTORY_CACHE_NAMES
+            || self.directories.len() > DIRECTORY_CACHE_COUNT
+        {
+            let Some(oldest) = self
+                .directories
+                .iter()
+                .min_by_key(|(_, directory)| directory.fetched)
+                .map(|(path, _)| path.clone())
+            else {
+                break;
+            };
+            if let Some(directory) = self.directories.remove(&oldest) {
+                self.listed_names -= directory.names.len();
+            }
+        }
+    }
+}
+
+#[derive(Clone, Copy)]
+struct CacheSnapshot {
+    generation: u64,
+    started: Instant,
 }
 
 /// A small object's bytes, valid while the object keeps this size and time.
@@ -79,6 +146,7 @@ struct Staged {
     key: String,
     size: u64,
     dirty: bool,
+    writers: usize,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -97,14 +165,12 @@ pub struct S3Fs {
     inodes: Mutex<HashMap<u64, String>>,
     /// path -> inode, so repeated lookups are stable (the kernel caches by ino).
     paths: Mutex<HashMap<String, u64>>,
-    /// Open write handles, keyed by file handle.
+    /// Shared writable files, keyed by their reference-counted file handle.
     staged: Mutex<HashMap<u64, Staged>>,
-    /// Paths with an unflushed staging file, so reads see pending writes.
-    pending: Mutex<HashMap<String, u64>>,
     /// How long a lookup, a miss or a small file's bytes are trusted.
     cache_ttl: Duration,
     /// path -> what it resolved to, and when.
-    meta: Mutex<HashMap<String, (Known, Instant)>>,
+    meta: Mutex<Metadata>,
     /// path -> the whole bytes of a small object.
     small: Mutex<HashMap<String, SmallFile>>,
 }
@@ -130,9 +196,8 @@ impl S3Fs {
             inodes: Mutex::new(inodes),
             paths: Mutex::new(paths),
             staged: Mutex::new(HashMap::new()),
-            pending: Mutex::new(HashMap::new()),
             cache_ttl,
-            meta: Mutex::new(HashMap::new()),
+            meta: Mutex::new(Metadata::default()),
             small: Mutex::new(HashMap::new()),
         })
     }
@@ -143,8 +208,15 @@ impl S3Fs {
             return None;
         }
         let meta = self.meta.lock().ok()?;
-        let (known, at) = meta.get(path)?;
-        (at.elapsed() < self.cache_ttl).then(|| known.clone())
+        if let Some((known, at)) = meta.entries.get(path) {
+            if at.elapsed() < self.cache_ttl {
+                return Some(known.clone());
+            }
+        }
+        let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+        let directory = meta.directories.get(parent)?;
+        (directory.fetched.elapsed() < self.cache_ttl && !directory.names.contains(name))
+            .then_some(Known::Absent)
     }
 
     /// Record what `path` is. A change made through this mount calls this as
@@ -155,33 +227,120 @@ impl S3Fs {
         }
         if let Ok(mut meta) = self.meta.lock() {
             // Bounded: drop what has expired once the table grows large.
-            if meta.len() > 100_000 {
+            if meta.entries.len() > 100_000 {
                 let ttl = self.cache_ttl;
-                meta.retain(|_, (_, at)| at.elapsed() < ttl);
+                meta.entries.retain(|_, (_, at)| at.elapsed() < ttl);
             }
-            meta.insert(path.to_string(), (known, Instant::now()));
+            meta.generation = meta.generation.wrapping_add(1);
+            meta.record(path, known, Instant::now());
+        }
+    }
+
+    fn cache_snapshot(&self) -> CacheSnapshot {
+        CacheSnapshot {
+            generation: self.meta.lock().map(|meta| meta.generation).unwrap_or(0),
+            started: Instant::now(),
+        }
+    }
+
+    fn remember_observed(&self, path: &str, known: Known, snapshot: CacheSnapshot) {
+        if self.cache_ttl.is_zero() || snapshot.started.elapsed() >= self.cache_ttl {
+            return;
+        }
+        if let Ok(mut meta) = self.meta.lock() {
+            if meta.generation == snapshot.generation {
+                meta.prune_entries(self.cache_ttl);
+                meta.record(path, known, snapshot.started);
+            }
+        }
+    }
+
+    fn invalidate_copied_destination(&self, path: &str) {
+        if let Ok(mut meta) = self.meta.lock() {
+            meta.generation = meta.generation.wrapping_add(1);
+            meta.entries.remove(path);
+            let (parent, name) = path.rsplit_once('/').unwrap_or(("", path));
+            if let Some(directory) = meta.directories.get_mut(parent) {
+                if directory.names.insert(name.to_string()) {
+                    meta.listed_names += 1;
+                }
+            }
+            meta.bound_directories();
         }
     }
 
     /// Record one listed level: every child, and the directory itself.
-    fn remember_listing(&self, dir: &str, listing: &s3::Listing) {
-        if !dir.is_empty() {
-            self.remember(dir, Known::Present(Node::Dir));
+    fn remember_listing(
+        &self,
+        dir: &str,
+        listing: &s3::Listing,
+        complete: bool,
+        snapshot: CacheSnapshot,
+    ) {
+        if self.cache_ttl.is_zero() || snapshot.started.elapsed() >= self.cache_ttl {
+            return;
         }
+        let Ok(mut meta) = self.meta.lock() else {
+            return;
+        };
+        if meta.generation != snapshot.generation {
+            return;
+        }
+        meta.prune_entries(self.cache_ttl);
+        if !dir.is_empty()
+            && (listing.directory_marker_exists
+                || !listing.objects.is_empty()
+                || !listing.prefixes.is_empty())
+        {
+            meta.record(dir, Known::Present(Node::Dir), snapshot.started);
+        }
+        let mut names = HashSet::new();
         for d in &listing.prefixes {
-            self.remember(&Self::join(dir, d), Known::Present(Node::Dir));
+            names.insert(d.clone());
+            meta.record(
+                &Self::join(dir, d),
+                Known::Present(Node::Dir),
+                snapshot.started,
+            );
         }
         for o in &listing.objects {
             if o.key.ends_with('/') {
+                let name = o.key.trim_end_matches('/');
+                if !name.is_empty() {
+                    names.insert(name.to_string());
+                    meta.record(
+                        &Self::join(dir, name),
+                        Known::Present(Node::Dir),
+                        snapshot.started,
+                    );
+                }
                 continue;
             }
-            self.remember(
+            names.insert(o.key.clone());
+            meta.record(
                 &Self::join(dir, &o.key),
                 Known::Present(Node::File {
                     size: o.size,
                     mtime: o.last_modified_secs,
                 }),
+                snapshot.started,
             );
+        }
+        let single_level = names
+            .iter()
+            .all(|name| !name.is_empty() && !name.contains('/'));
+        if complete && single_level && names.len() <= DIRECTORY_CACHE_NAMES {
+            if let Some(old) = meta.directories.insert(
+                dir.to_string(),
+                CachedDirectory {
+                    names,
+                    fetched: snapshot.started,
+                },
+            ) {
+                meta.listed_names -= old.names.len();
+            }
+            meta.listed_names += meta.directories[dir].names.len();
+            meta.bound_directories();
         }
     }
 
@@ -342,10 +501,10 @@ impl S3Fs {
         if path.is_empty() {
             return Some(Node::Dir);
         }
-        if let Ok(pending) = self.pending.lock() {
-            if let Some(size) = pending.get(path) {
+        if let Ok(staged) = self.staged.lock() {
+            if let Some(st) = staged.values().find(|st| st.key == path) {
                 return Some(Node::File {
-                    size: *size,
+                    size: st.size,
                     mtime: Self::now(),
                 });
             }
@@ -355,6 +514,7 @@ impl S3Fs {
             Some(Known::Absent) => return None,
             None => {}
         }
+        let snapshot = self.cache_snapshot();
         let mut head_failed = false;
         match self.client.head(path) {
             Ok(Some(info)) => {
@@ -362,7 +522,7 @@ impl S3Fs {
                     size: info.size,
                     mtime: info.last_modified_secs,
                 };
-                self.remember(path, Known::Present(node.clone()));
+                self.remember_observed(path, Known::Present(node.clone()), snapshot);
                 return Some(node);
             }
             Ok(None) => {}
@@ -373,15 +533,20 @@ impl S3Fs {
         }
         // Not an object: it may still be a directory prefix. The listing that
         // answers that also describes its children, which come next.
-        match self.client.list_dir(path) {
-            Ok(l) if !l.objects.is_empty() || !l.prefixes.is_empty() => {
-                self.remember_listing(path, &l);
+        match self.client.list_dir_snapshot(path) {
+            Ok((l, complete))
+                if l.directory_marker_exists || !l.objects.is_empty() || !l.prefixes.is_empty() =>
+            {
+                self.remember_listing(path, &l, complete, snapshot);
                 Some(Node::Dir)
             }
             // Only a definite answer is remembered: a failed HEAD or LIST is a
             // transient error, not proof the path is absent.
-            Ok(_) if !head_failed => {
-                self.remember(path, Known::Absent);
+            Ok((listing, complete)) if !head_failed => {
+                self.remember_listing(path, &listing, complete, snapshot);
+                if complete {
+                    self.remember_observed(path, Known::Absent, snapshot);
+                }
                 None
             }
             _ => None,
@@ -395,6 +560,24 @@ impl S3Fs {
     /// Open a staging file, seeded with the object's current bytes when it
     /// exists — required so a partial write does not truncate the rest away.
     fn open_staged(&self, path: &str, truncate: bool) -> std::io::Result<u64> {
+        let mut staged = self
+            .staged
+            .lock()
+            .map_err(|_| std::io::Error::other("staging lock poisoned"))?;
+        if let Some((fh, st)) = staged.iter_mut().find(|(_, st)| st.key == path) {
+            if truncate {
+                st.file.set_len(0)?;
+                st.size = 0;
+                st.dirty = true;
+            }
+            st.writers += 1;
+            return Ok(*fh);
+        }
+        let bytes = if truncate {
+            Vec::new()
+        } else {
+            self.client.get(path, None).map_err(std::io::Error::other)?
+        };
         let fh = self.next_fh.fetch_add(1, Ordering::Relaxed);
         let spath = self.staging_path(fh);
         let mut file = std::fs::OpenOptions::new()
@@ -403,30 +586,22 @@ impl S3Fs {
             .create(true)
             .truncate(true)
             .open(&spath)?;
-        let mut size = 0u64;
-        if !truncate {
-            if let Ok(bytes) = self.client.get(path, None) {
-                file.write_all(&bytes)?;
-                file.flush()?;
-                size = bytes.len() as u64;
-                file.seek(SeekFrom::Start(0))?;
-            }
+        if let Err(error) = file.write_all(&bytes) {
+            let _ = std::fs::remove_file(&spath);
+            return Err(error);
         }
-        if let Ok(mut staged) = self.staged.lock() {
-            staged.insert(
-                fh,
-                Staged {
-                    file,
-                    path: spath,
-                    key: path.to_string(),
-                    size,
-                    dirty: truncate,
-                },
-            );
-        }
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.insert(path.to_string(), size);
-        }
+        let size = bytes.len() as u64;
+        staged.insert(
+            fh,
+            Staged {
+                file,
+                path: spath,
+                key: path.to_string(),
+                size,
+                dirty: truncate,
+                writers: 1,
+            },
+        );
         Ok(fh)
     }
 
@@ -440,7 +615,8 @@ impl S3Fs {
     /// tail in place and read back a mix of old and new data.
     fn truncate(&self, path: &str, fh: Option<u64>, size: u64) -> Result<(), i32> {
         let mut staged_any = false;
-        if let Ok(mut guard) = self.staged.lock() {
+        let mut guard = self.staged.lock().map_err(|_| libc::EIO)?;
+        {
             // Resize every open handle on this object, not only the one the
             // request names. An `O_TRUNC` open arrives as a truncate with no
             // file handle while a staging file is already open, and leaving
@@ -458,9 +634,6 @@ impl S3Fs {
             }
         }
         if staged_any {
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.insert(path.to_string(), size);
-            }
             return Ok(());
         }
         // No open handle: rewrite the object at its new length. Growing pads
@@ -468,9 +641,15 @@ impl S3Fs {
         let mut bytes = if size == 0 {
             Vec::new()
         } else {
-            self.client.get(path, None).unwrap_or_default()
+            self.client.get(path, None).map_err(|_| libc::EIO)?
         };
-        bytes.resize(size as usize, 0);
+        let size_usize = usize::try_from(size).map_err(|_| libc::EFBIG)?;
+        if size_usize > bytes.len() {
+            bytes
+                .try_reserve(size_usize - bytes.len())
+                .map_err(|_| libc::EFBIG)?;
+        }
+        bytes.resize(size_usize, 0);
         self.client.put(path, &bytes).map_err(|_| libc::EIO)?;
         self.forget_bytes(path);
         self.remember(
@@ -480,11 +659,6 @@ impl S3Fs {
                 mtime: Self::now(),
             }),
         );
-        // The object now really is this size, so no pending entry is needed —
-        // and a stale one would misreport the size of every later read.
-        if let Ok(mut pending) = self.pending.lock() {
-            pending.remove(path);
-        }
         Ok(())
     }
 
@@ -497,6 +671,9 @@ impl S3Fs {
         let Some(st) = guard.get_mut(&fh) else {
             return Ok(()); // read-only handle: nothing staged
         };
+        if close {
+            st.writers = st.writers.saturating_sub(1);
+        }
         if st.dirty {
             let mut buf = Vec::with_capacity(st.size as usize);
             if st.file.seek(SeekFrom::Start(0)).is_err() || st.file.read_to_end(&mut buf).is_err() {
@@ -516,13 +693,9 @@ impl S3Fs {
                 }),
             );
         }
-        if close {
+        if st.writers == 0 {
             if let Some(st) = guard.remove(&fh) {
                 let _ = std::fs::remove_file(&st.path);
-            }
-            drop(guard);
-            if let Ok(mut pending) = self.pending.lock() {
-                pending.remove(path);
             }
         }
         Ok(())
@@ -598,7 +771,8 @@ impl Filesystem for S3Fs {
                 if offset > 0 {
                     return Reply::Directory(Vec::new()); // single-shot listing
                 }
-                let listing = match self.client.list_dir(&path) {
+                let snapshot = self.cache_snapshot();
+                let (listing, complete) = match self.client.list_dir_snapshot(&path) {
                     Ok(l) => l,
                     Err(e) => {
                         tracing::warn!(path, error = %e, "list failed");
@@ -607,7 +781,7 @@ impl Filesystem for S3Fs {
                 };
                 // `ls -l` and the lookups that follow a listing then cost
                 // nothing: the listing already said what each child is.
-                self.remember_listing(&path, &listing);
+                self.remember_listing(&path, &listing, complete, snapshot);
                 let mut buf = Vec::new();
                 let mut next = 1u64;
                 for (name, kind) in [(".", DT_DIR), ("..", DT_DIR)] {
@@ -705,14 +879,28 @@ impl Filesystem for S3Fs {
 
                 // A file with unflushed writes must read back what was written,
                 // not the stale object still sitting in the bucket.
-                if fh != 0 {
-                    if let Ok(mut guard) = self.staged.lock() {
-                        if let Some(st) = guard.get_mut(&fh) {
+                {
+                    let Ok(mut guard) = self.staged.lock() else {
+                        return Reply::Error(libc::EIO);
+                    };
+                    let staged_fh = if guard.contains_key(&fh) {
+                        Some(fh)
+                    } else {
+                        guard
+                            .iter()
+                            .find(|(_, st)| st.key == path)
+                            .map(|(fh, _)| *fh)
+                    };
+                    if let Some(staged_fh) = staged_fh {
+                        if let Some(st) = guard.get_mut(&staged_fh) {
                             let mut buf = vec![0u8; size as usize];
                             if st.file.seek(SeekFrom::Start(offset)).is_err() {
                                 return Reply::Error(libc::EIO);
                             }
-                            let n = st.file.read(&mut buf).unwrap_or(0);
+                            let n = match st.file.read(&mut buf) {
+                                Ok(n) => n,
+                                Err(_) => return Reply::Error(libc::EIO),
+                            };
                             buf.truncate(n);
                             return Reply::Data(buf);
                         }
@@ -752,9 +940,6 @@ impl Filesystem for S3Fs {
                 let Some(data) = req.data.get(40..40 + size) else {
                     return Reply::Error(libc::EINVAL);
                 };
-                let Some(path) = self.path_of(req.nodeid) else {
-                    return Reply::Error(libc::ENOENT);
-                };
                 let Ok(mut guard) = self.staged.lock() else {
                     return Reply::Error(libc::EIO);
                 };
@@ -768,21 +953,24 @@ impl Filesystem for S3Fs {
                 }
                 st.dirty = true;
                 st.size = st.size.max(offset + size as u64);
-                let new_size = st.size;
-                drop(guard);
-                if let Ok(mut pending) = self.pending.lock() {
-                    pending.insert(path, new_size);
-                }
                 Reply::Written(size as u32)
             }
 
             // FLUSH (close(2)) and FSYNC both have to make the data durable:
             // for object storage "durable" means the upload has happened.
             op::FLUSH | op::FSYNC => {
-                let fh = req.u64_at(0);
+                let mut fh = req.u64_at(0);
                 let Some(path) = self.path_of(req.nodeid) else {
                     return Reply::Error(libc::ENOENT);
                 };
+                if req.opcode == op::FSYNC && fh == 0 {
+                    let Ok(guard) = self.staged.lock() else {
+                        return Reply::Error(libc::EIO);
+                    };
+                    if let Some((handle, _)) = guard.iter().find(|(_, st)| st.key == path) {
+                        fh = *handle;
+                    }
+                }
                 match self.flush_staged(fh, &path, false) {
                     Ok(()) => Reply::Ok,
                     Err(e) => Reply::Error(e),
@@ -897,25 +1085,35 @@ impl Filesystem for S3Fs {
                 };
                 let from = Self::join(&parent, &old_name);
                 let to = Self::join(&new_parent, &new_name);
-                let bytes = match self.client.get(&from, None) {
-                    Ok(b) => b,
-                    Err(_) => return Reply::Error(libc::ENOENT),
+                if from == to {
+                    return match self.stat(&from) {
+                        Some(_) => Reply::Ok,
+                        None => Reply::Error(libc::ENOENT),
+                    };
+                }
+                let source = self.known(&from);
+                let mtime = match self.client.copy(&from, &to) {
+                    Ok(mtime) => mtime,
+                    Err(s3::Error::Status { status: 404, .. }) => {
+                        return Reply::Error(libc::ENOENT);
+                    }
+                    Err(error) => {
+                        tracing::warn!(from, to, error = %error, "rename copy failed");
+                        return Reply::Error(libc::EIO);
+                    }
                 };
-                if self.client.put(&to, &bytes).is_err() {
+                self.forget_bytes(&to);
+                self.invalidate_copied_destination(&to);
+                if let Err(error) = self.client.delete(&from) {
+                    tracing::warn!(from, to, error = %error, "rename source delete failed");
                     return Reply::Error(libc::EIO);
                 }
-                let _ = self.client.delete(&from);
                 self.rename_path(&from, &to);
                 self.forget_bytes(&from);
-                self.forget_bytes(&to);
                 self.remember(&from, Known::Absent);
-                self.remember(
-                    &to,
-                    Known::Present(Node::File {
-                        size: bytes.len() as u64,
-                        mtime: Self::now(),
-                    }),
-                );
+                if let Some(Known::Present(Node::File { size, .. })) = source {
+                    self.remember(&to, Known::Present(Node::File { size, mtime }));
+                }
                 Reply::Ok
             }
 
@@ -944,6 +1142,503 @@ impl Filesystem for S3Fs {
 mod tests {
     use super::*;
 
+    const COPIED_OBJECT: &str = "<CopyObjectResult><ETag>&quot;abc&quot;</ETag><LastModified>2013-05-24T00:00:00.000Z</LastModified></CopyObjectResult>";
+
+    fn file_request(fs: &S3Fs, opcode: u32, path: &str, data: &[u8]) -> Reply {
+        fs.dispatch(&Request {
+            opcode,
+            unique: 1,
+            nodeid: fs.ino_for(path),
+            uid: 0,
+            gid: 0,
+            data,
+        })
+    }
+
+    fn write_file(fs: &S3Fs, path: &str, fh: u64, offset: u64, bytes: &[u8]) {
+        let mut data = vec![0; 40];
+        data[..8].copy_from_slice(&fh.to_ne_bytes());
+        data[8..16].copy_from_slice(&offset.to_ne_bytes());
+        data[16..20].copy_from_slice(&(bytes.len() as u32).to_ne_bytes());
+        data.extend_from_slice(bytes);
+        assert!(matches!(
+            file_request(fs, fuse::op::WRITE, path, &data),
+            Reply::Written(size) if size as usize == bytes.len()
+        ));
+    }
+
+    fn read_file(fs: &S3Fs, path: &str, fh: u64, offset: u64, size: u32) -> Reply {
+        let mut data = vec![0; 40];
+        data[..8].copy_from_slice(&fh.to_ne_bytes());
+        data[8..16].copy_from_slice(&offset.to_ne_bytes());
+        data[16..20].copy_from_slice(&size.to_ne_bytes());
+        file_request(fs, fuse::op::READ, path, &data)
+    }
+
+    #[test]
+    fn independent_readers_see_pending_bytes_and_eof_without_s3() {
+        for ttl in [Duration::ZERO, Duration::from_secs(60)] {
+            let server = crate::test_support::Server::new(vec![("PUT", "/b/file", 200, "")]);
+            let mut fs = fs_with_ttl(ttl);
+            fs.client = server.client("");
+            fs.remember("file", Known::Present(Node::File { size: 5, mtime: 1 }));
+            let fh = fs.open_staged("file", true).unwrap();
+            write_file(&fs, "file", fh, 0, b"pending");
+            assert!(
+                matches!(read_file(&fs, "file", 0, 1, 3), Reply::Data(bytes) if bytes == b"end")
+            );
+            assert!(
+                matches!(read_file(&fs, "file", 0, 7, 8), Reply::Data(bytes) if bytes.is_empty())
+            );
+            assert!(matches!(fs.stat("file"), Some(Node::File { size: 7, .. })));
+            fs.flush_staged(fh, "file", true).unwrap();
+            assert_eq!(server.finish_requests()[0].body, b"pending");
+            std::fs::remove_dir_all(&fs.scratch).unwrap();
+        }
+    }
+
+    #[test]
+    fn multiple_writers_share_bytes_and_closing_one_preserves_the_other() {
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/file", 200, "abcdef"),
+            ("PUT", "/b/file", 200, ""),
+            ("PUT", "/b/file", 200, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let first = fs.open_staged("file", false).unwrap();
+        write_file(&fs, "file", first, 0, b"XY");
+        let second = fs.open_staged("file", false).unwrap();
+        write_file(&fs, "file", second, 4, b"ZZ");
+        assert!(
+            matches!(read_file(&fs, "file", first, 0, 6), Reply::Data(bytes) if bytes == b"XYcdZZ")
+        );
+        fs.flush_staged(first, "file", true).unwrap();
+        assert!(matches!(fs.stat("file"), Some(Node::File { size: 6, .. })));
+        write_file(&fs, "file", second, 2, b"12");
+        fs.flush_staged(second, "file", true).unwrap();
+        assert!(fs.staged.lock().unwrap().is_empty());
+        let requests = server.finish_requests();
+        assert_eq!(requests[1].body, b"XYcdZZ");
+        assert_eq!(requests[2].body, b"XY12ZZ");
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn truncate_is_visible_to_all_open_writers_and_readers() {
+        let server = crate::test_support::Server::new(vec![("PUT", "/b/file", 200, "")]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let first = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", first, 0, b"old contents");
+        let second = fs.open_staged("file", true).unwrap();
+        assert!(
+            matches!(read_file(&fs, "file", first, 0, 20), Reply::Data(bytes) if bytes.is_empty())
+        );
+        write_file(&fs, "file", first, 0, b"new");
+        fs.truncate("file", Some(second), 5).unwrap();
+        assert!(
+            matches!(read_file(&fs, "file", 0, 0, 20), Reply::Data(bytes) if bytes == b"new\0\0")
+        );
+        fs.flush_staged(first, "file", true).unwrap();
+        fs.flush_staged(second, "file", true).unwrap();
+        assert_eq!(server.finish_requests()[0].body, b"new\0\0");
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn failed_downloads_never_stage_or_overwrite_an_empty_file() {
+        for status in [403, 404, 500] {
+            let server = crate::test_support::Server::new(vec![
+                ("GET", "/b/file", status, "unavailable"),
+                ("GET", "/b/file", status, "unavailable"),
+            ]);
+            let mut fs = fs_with_ttl(Duration::ZERO);
+            fs.client = server.client("");
+            assert!(fs.open_staged("file", false).is_err());
+            assert!(fs.staged.lock().unwrap().is_empty());
+            assert_eq!(std::fs::read_dir(&fs.scratch).unwrap().count(), 0);
+            assert_eq!(fs.truncate("file", None, 8), Err(libc::EIO));
+            assert_eq!(server.finish_requests().len(), 2);
+            std::fs::remove_dir_all(&fs.scratch).unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_uploads_preserve_pending_data_for_reading_and_retry() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/file", 500, "unavailable"),
+            ("PUT", "/b/file", 200, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let fh = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", fh, 0, b"keep me");
+        assert_eq!(fs.flush_staged(fh, "file", true), Err(libc::EIO));
+        assert!(
+            matches!(read_file(&fs, "file", 0, 0, 20), Reply::Data(bytes) if bytes == b"keep me")
+        );
+        assert!(fs.staged.lock().unwrap()[&fh].dirty);
+        let reopened = fs.open_staged("file", false).unwrap();
+        fs.flush_staged(reopened, "file", true).unwrap();
+        let requests = server.finish_requests();
+        assert!(requests.iter().all(|request| request.body == b"keep me"));
+        assert!(fs.staged.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn readonly_fsync_uploads_pending_data_but_readonly_close_does_not() {
+        let server = crate::test_support::Server::new(vec![("PUT", "/b/file", 200, "")]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let fh = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", fh, 0, b"sync from reader");
+        assert!(matches!(
+            file_request(&fs, fuse::op::FLUSH, "file", &0u64.to_ne_bytes()),
+            Reply::Ok
+        ));
+        assert!(fs.staged.lock().unwrap()[&fh].dirty);
+        assert!(matches!(
+            file_request(&fs, fuse::op::FSYNC, "file", &0u64.to_ne_bytes()),
+            Reply::Ok
+        ));
+        assert!(!fs.staged.lock().unwrap()[&fh].dirty);
+        fs.flush_staged(fh, "file", true).unwrap();
+        assert_eq!(server.finish_requests()[0].body, b"sync from reader");
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn readonly_fsync_propagates_upload_errors_and_can_retry() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/file", 503, "unavailable"),
+            ("PUT", "/b/file", 200, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        let fh = fs.open_staged("file", true).unwrap();
+        write_file(&fs, "file", fh, 0, b"retry");
+        assert!(matches!(
+            file_request(&fs, fuse::op::FSYNC, "file", &0u64.to_ne_bytes()),
+            Reply::Error(libc::EIO)
+        ));
+        assert!(fs.staged.lock().unwrap()[&fh].dirty);
+        assert!(matches!(
+            file_request(&fs, fuse::op::FSYNC, "file", &0u64.to_ne_bytes()),
+            Reply::Ok
+        ));
+        fs.flush_staged(fh, "file", true).unwrap();
+        assert!(server
+            .finish_requests()
+            .iter()
+            .all(|request| request.body == b"retry"));
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    #[test]
+    fn local_read_errors_are_not_reported_as_eof() {
+        let fs = fs_with_ttl(Duration::ZERO);
+        let fh = fs.open_staged("file", true).unwrap();
+        fs.staged.lock().unwrap().get_mut(&fh).unwrap().file =
+            std::fs::File::open(&fs.scratch).unwrap();
+        assert!(matches!(
+            read_file(&fs, "file", 0, 0, 20),
+            Reply::Error(libc::EIO)
+        ));
+        std::fs::remove_dir_all(&fs.scratch).unwrap();
+    }
+
+    fn rename(fs: &S3Fs, from: &str, to: &str) -> Reply {
+        let mut data = FUSE_ROOT_ID.to_ne_bytes().to_vec();
+        data.extend_from_slice(from.as_bytes());
+        data.push(0);
+        data.extend_from_slice(to.as_bytes());
+        data.push(0);
+        fs.dispatch(&Request {
+            opcode: fuse::op::RENAME,
+            unique: 1,
+            nodeid: FUSE_ROOT_ID,
+            uid: 0,
+            gid: 0,
+            data: &data,
+        })
+    }
+
+    #[test]
+    fn rename_copies_without_transferring_payload_and_preserves_the_inode() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            ("DELETE", "/b/from", 204, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember(
+            "from",
+            Known::Present(Node::File {
+                size: 1_000_000_000,
+                mtime: 1,
+            }),
+        );
+        fs.remember("to", Known::Present(Node::File { size: 1, mtime: 2 }));
+        let source_ino = fs.ino_for("from");
+        let replaced_ino = fs.ino_for("to");
+        for path in ["from", "to"] {
+            fs.small.lock().unwrap().insert(
+                path.into(),
+                SmallFile {
+                    size: 1,
+                    mtime: 2,
+                    bytes: std::sync::Arc::new(vec![0]),
+                    fetched: Instant::now(),
+                    used: Instant::now(),
+                },
+            );
+        }
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Ok));
+        assert_eq!(fs.path_of(source_ino).as_deref(), Some("to"));
+        assert!(fs.path_of(replaced_ino).is_none());
+        assert_eq!(fs.known("from"), Some(Known::Absent));
+        assert!(fs.small.lock().unwrap().is_empty());
+        assert_eq!(
+            fs.stat("to"),
+            Some(Node::File {
+                size: 1_000_000_000,
+                mtime: 1369353600
+            })
+        );
+        let requests = server.finish_requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|request| request.body.is_empty()));
+    }
+
+    #[test]
+    fn rename_copy_failures_never_delete_the_source() {
+        for (status, body, errno) in [
+            (403, "<Error><Code>AccessDenied</Code></Error>", libc::EIO),
+            (404, "<Error><Code>NoSuchKey</Code></Error>", libc::ENOENT),
+            (500, "<Error><Code>InternalError</Code></Error>", libc::EIO),
+            (200, "<Error><Code>InternalError</Code></Error>", libc::EIO),
+            (200, "<CopyObjectResult/>", libc::EIO),
+        ] {
+            let server = crate::test_support::Server::new(vec![("PUT", "/b/to", status, body)]);
+            let mut fs = fs_with_ttl(Duration::from_secs(60));
+            fs.client = server.client("");
+            let source_ino = fs.ino_for("from");
+            assert!(matches!(rename(&fs, "from", "to"), Reply::Error(error) if error == errno));
+            assert_eq!(fs.path_of(source_ino).as_deref(), Some("from"));
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn rename_delete_failure_reports_an_error_and_invalidates_the_destination() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            (
+                "DELETE",
+                "/b/from",
+                403,
+                "<Error><Code>AccessDenied</Code></Error>",
+            ),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember("from", Known::Present(Node::File { size: 3, mtime: 1 }));
+        fs.remember("to", Known::Present(Node::File { size: 1, mtime: 2 }));
+        let source_ino = fs.ino_for("from");
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Error(libc::EIO)));
+        assert_eq!(fs.path_of(source_ino).as_deref(), Some("from"));
+        assert!(matches!(fs.known("from"), Some(Known::Present(_))));
+        assert_eq!(fs.known("to"), None);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn rename_without_cached_source_drops_stale_destination_metadata() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            ("DELETE", "/b/from", 204, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember("to", Known::Absent);
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Ok));
+        assert_eq!(fs.known("to"), None);
+        assert_eq!(server.finish().len(), 2);
+    }
+
+    #[test]
+    fn rename_to_the_same_path_leaves_the_object_alone() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        fs.remember("from", Known::Present(Node::File { size: 3, mtime: 1 }));
+        assert!(matches!(rename(&fs, "from", "from"), Reply::Ok));
+        assert!(matches!(fs.known("from"), Some(Known::Present(_))));
+        fs.remember("missing", Known::Absent);
+        assert!(matches!(
+            rename(&fs, "missing", "missing"),
+            Reply::Error(libc::ENOENT)
+        ));
+    }
+
+    const EMPTY_DIRECTORY: &str = "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>";
+
+    fn create_empty_directory(fs: &S3Fs) -> u64 {
+        let mut data = Vec::new();
+        data.extend_from_slice(&0o755u32.to_ne_bytes());
+        data.extend_from_slice(&0u32.to_ne_bytes());
+        data.extend_from_slice(b"empty\0");
+        match fs.dispatch(&Request {
+            opcode: fuse::op::MKDIR,
+            unique: 1,
+            nodeid: FUSE_ROOT_ID,
+            uid: 0,
+            gid: 0,
+            data: &data,
+        }) {
+            Reply::Entry(attr) => attr.ino,
+            _ => panic!("mkdir must succeed"),
+        }
+    }
+
+    fn empty_directory_server() -> crate::test_support::Server {
+        crate::test_support::Server::new(vec![
+            ("PUT", "/b/empty/", 200, ""),
+            ("HEAD", "/b/empty", 404, ""),
+            ("GET", "/b/", 200, EMPTY_DIRECTORY),
+        ])
+    }
+
+    #[test]
+    fn empty_directory_survives_expired_metadata_cache() {
+        let server = empty_directory_server();
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        create_empty_directory(&fs);
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        fs.meta.lock().unwrap().entries.get_mut("empty").unwrap().1 =
+            Instant::now() - Duration::from_secs(120);
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn empty_directory_survives_disabled_metadata_cache() {
+        let server = empty_directory_server();
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        create_empty_directory(&fs);
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn empty_directory_survives_a_fresh_filesystem_instance() {
+        let server = empty_directory_server();
+        let mut original = fs_with_ttl(Duration::from_secs(60));
+        original.client = server.client("");
+        create_empty_directory(&original);
+        drop(original);
+        let mut fresh = fs_with_ttl(Duration::from_secs(60));
+        fresh.client = server.client("");
+        assert_eq!(fresh.stat("empty"), Some(Node::Dir));
+        assert_eq!(server.finish().len(), 3);
+    }
+
+    #[test]
+    fn directory_lookup_preserves_missing_and_implicit_directory_semantics() {
+        for (body, expected) in [
+            ("<ListBucketResult/>", None),
+            (
+                "<ListBucketResult><Contents><Key>empty/file</Key><Size>1</Size></Contents></ListBucketResult>",
+                Some(Node::Dir),
+            ),
+            (
+                "<ListBucketResult><CommonPrefixes><Prefix>empty/sub/</Prefix></CommonPrefixes></ListBucketResult>",
+                Some(Node::Dir),
+            ),
+        ] {
+            let server = crate::test_support::Server::new(vec![
+                ("HEAD", "/b/empty", 404, ""),
+                ("GET", "/b/", 200, body),
+            ]);
+            let mut fs = fs_with_ttl(Duration::ZERO);
+            fs.client = server.client("");
+            assert_eq!(fs.stat("empty"), expected);
+            assert_eq!(server.finish().len(), 2);
+        }
+    }
+
+    #[test]
+    fn a_directory_marker_is_not_a_child_when_removing_a_directory() {
+        for (body, empty) in [
+            (EMPTY_DIRECTORY, true),
+            (
+                "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><Contents><Key>empty/file</Key><Size>1</Size></Contents></ListBucketResult>",
+                false,
+            ),
+            (
+                "<ListBucketResult><Contents><Key>empty/</Key><Size>0</Size></Contents><CommonPrefixes><Prefix>empty/sub/</Prefix></CommonPrefixes></ListBucketResult>",
+                false,
+            ),
+        ] {
+            let mut responses = vec![("GET", "/b/", 200, body)];
+            if empty {
+                responses.push(("DELETE", "/b/empty/", 204, ""));
+            }
+            let expected_requests = responses.len();
+            let server = crate::test_support::Server::new(responses);
+            let mut fs = fs_with_ttl(Duration::from_secs(60));
+            fs.client = server.client("");
+            let result = fs.dispatch(&Request {
+                opcode: fuse::op::RMDIR,
+                unique: 1,
+                nodeid: FUSE_ROOT_ID,
+                uid: 0,
+                gid: 0,
+                data: b"empty\0",
+            });
+            if empty {
+                assert!(matches!(result, Reply::Ok));
+                assert_eq!(fs.known("empty"), Some(Known::Absent));
+            } else {
+                assert!(matches!(result, Reply::Error(libc::ENOTEMPTY)));
+            }
+            assert_eq!(server.finish().len(), expected_requests);
+        }
+    }
+
+    #[test]
+    fn a_directory_marker_is_not_a_child_in_readdir() {
+        let server = crate::test_support::Server::new(vec![
+            ("HEAD", "/b/empty", 404, ""),
+            ("GET", "/b/", 200, EMPTY_DIRECTORY),
+            ("GET", "/b/", 200, EMPTY_DIRECTORY),
+        ]);
+        let mut fs = fs_with_ttl(Duration::ZERO);
+        fs.client = server.client("");
+        assert_eq!(fs.stat("empty"), Some(Node::Dir));
+        let mut data = [0u8; 40];
+        data[16..20].copy_from_slice(&4096u32.to_ne_bytes());
+        let result = fs.dispatch(&Request {
+            opcode: fuse::op::READDIR,
+            unique: 1,
+            nodeid: fs.ino_for("empty"),
+            uid: 0,
+            gid: 0,
+            data: &data,
+        });
+        match result {
+            Reply::Directory(entries) => {
+                assert_eq!(entries.len(), 64);
+                assert_eq!(&entries[24..25], b".");
+                assert_eq!(&entries[56..58], b"..");
+            }
+            _ => panic!("readdir must succeed"),
+        }
+        assert_eq!(server.finish().len(), 3);
+    }
+
     fn fs() -> S3Fs {
         fs_with_ttl(Duration::ZERO)
     }
@@ -951,7 +1646,12 @@ mod tests {
     /// A mount whose bucket is unreachable, so any answer it gives without an
     /// error came from its cache.
     fn fs_with_ttl(cache_ttl: Duration) -> S3Fs {
-        let dir = std::env::temp_dir().join(format!("s3fs-test-{}", std::process::id()));
+        static NEXT_TEST: AtomicU64 = AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "s3fs-test-{}-{}",
+            std::process::id(),
+            NEXT_TEST.fetch_add(1, Ordering::Relaxed)
+        ));
         S3Fs::new(
             s3::Client::new(s3::Config {
                 endpoint: "http://127.0.0.1:1".into(),
@@ -981,8 +1681,9 @@ mod tests {
                 last_modified_secs: 7,
             }],
             prefixes: vec!["sub".into()],
+            ..Default::default()
         };
-        fs.remember_listing("d", &listing);
+        fs.remember_listing("d", &listing, true, fs.cache_snapshot());
         fs.remember("d/missing", Known::Absent);
         assert!(matches!(
             fs.stat("d/a.txt"),
@@ -1000,6 +1701,214 @@ mod tests {
         let fs = fs_with_ttl(Duration::ZERO);
         fs.remember("d/a.txt", Known::Present(Node::Dir));
         assert!(fs.known("d/a.txt").is_none());
+    }
+
+    #[test]
+    fn complete_empty_directory_answers_sibling_misses_without_requests() {
+        let server = crate::test_support::Server::new(vec![
+            ("HEAD", "/b/empty", 404, ""),
+            (
+                "GET",
+                "/b/",
+                200,
+                "<ListBucketResult><IsTruncated>false</IsTruncated></ListBucketResult>",
+            ),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        assert!(fs.stat("empty").is_none());
+        fs.remember("empty", Known::Present(Node::Dir));
+        for name in ["file", ".file.tmp", "other"] {
+            let path = format!("empty/{name}");
+            assert_eq!(fs.known(&path), Some(Known::Absent));
+            assert!(fs.stat(&path).is_none());
+        }
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn incomplete_or_disabled_listing_cache_never_proves_a_miss() {
+        for (ttl, complete) in [(Duration::ZERO, true), (Duration::from_secs(60), false)] {
+            let fs = fs_with_ttl(ttl);
+            fs.remember_listing(
+                "dir",
+                &s3::Listing::default(),
+                complete,
+                fs.cache_snapshot(),
+            );
+            assert_eq!(fs.known("dir/missing"), None);
+        }
+    }
+
+    #[test]
+    fn incomplete_directory_probe_does_not_cache_a_negative_answer() {
+        let server = crate::test_support::Server::new(vec![
+            ("HEAD", "/b/missing", 404, ""),
+            ("GET", "/b/", 200, "<ListBucketResult/>"),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        assert!(fs.stat("missing").is_none());
+        assert_eq!(fs.known("missing"), None);
+        assert_eq!(fs.known("missing/child"), None);
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn inferred_misses_and_local_updates_do_not_extend_listing_lifetime() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        fs.remember_listing("dir", &s3::Listing::default(), true, fs.cache_snapshot());
+        let fetched = fs.meta.lock().unwrap().directories["dir"].fetched;
+        assert_eq!(fs.known("dir/first"), Some(Known::Absent));
+        fs.remember("dir/new", Known::Present(Node::File { size: 3, mtime: 1 }));
+        assert_eq!(fs.meta.lock().unwrap().directories["dir"].fetched, fetched);
+        fs.meta
+            .lock()
+            .unwrap()
+            .directories
+            .get_mut("dir")
+            .unwrap()
+            .fetched = Instant::now() - Duration::from_secs(61);
+        assert_eq!(fs.known("dir/first"), None);
+        assert_eq!(fs.known("dir/second"), None);
+    }
+
+    #[test]
+    fn local_changes_fence_out_old_listings_and_lookup_answers() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let old = fs.cache_snapshot();
+        fs.remember_listing("dir", &s3::Listing::default(), true, old);
+        fs.remember("dir/new", Known::Present(Node::File { size: 3, mtime: 1 }));
+        fs.remember_observed("dir/new", Known::Absent, old);
+        fs.remember_listing("dir", &s3::Listing::default(), true, old);
+        assert!(matches!(
+            fs.known("dir/new"),
+            Some(Known::Present(Node::File { size: 3, .. }))
+        ));
+        assert!(fs.meta.lock().unwrap().directories["dir"]
+            .names
+            .contains("new"));
+        let before_delete = fs.cache_snapshot();
+        fs.remember("dir/new", Known::Absent);
+        let stale = s3::Listing {
+            objects: vec![s3::ObjectInfo {
+                key: "new".into(),
+                size: 3,
+                last_modified_secs: 1,
+            }],
+            ..Default::default()
+        };
+        fs.remember_listing("dir", &stale, true, before_delete);
+        fs.remember_observed("dir/new", Known::Present(Node::Dir), before_delete);
+        assert_eq!(fs.known("dir/new"), Some(Known::Absent));
+        assert!(!fs.meta.lock().unwrap().directories["dir"]
+            .names
+            .contains("new"));
+    }
+
+    #[test]
+    fn slow_responses_do_not_receive_a_fresh_cache_lifetime() {
+        let fs = fs_with_ttl(Duration::from_secs(1));
+        let snapshot = CacheSnapshot {
+            generation: 0,
+            started: Instant::now() - Duration::from_secs(2),
+        };
+        fs.remember_listing("dir", &s3::Listing::default(), true, snapshot);
+        fs.remember_observed("dir/file", Known::Absent, snapshot);
+        assert_eq!(fs.known("dir/file"), None);
+        assert!(fs.meta.lock().unwrap().directories.is_empty());
+    }
+
+    #[test]
+    fn copied_destination_is_not_hidden_by_a_complete_listing() {
+        let server = crate::test_support::Server::new(vec![
+            ("PUT", "/b/to", 200, COPIED_OBJECT),
+            ("DELETE", "/b/from", 204, ""),
+        ]);
+        let mut fs = fs_with_ttl(Duration::from_secs(60));
+        fs.client = server.client("");
+        fs.remember_listing("", &s3::Listing::default(), true, fs.cache_snapshot());
+        assert_eq!(fs.known("to"), Some(Known::Absent));
+        assert!(matches!(rename(&fs, "from", "to"), Reply::Ok));
+        assert_eq!(fs.known("to"), None);
+        assert!(fs.meta.lock().unwrap().directories[""].names.contains("to"));
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn marker_objects_and_file_directory_collisions_are_not_negative_hits() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let listing = s3::Listing {
+            prefixes: vec!["both".into()],
+            objects: vec![
+                s3::ObjectInfo {
+                    key: "child/".into(),
+                    size: 0,
+                    last_modified_secs: 0,
+                },
+                s3::ObjectInfo {
+                    key: "both".into(),
+                    size: 2,
+                    last_modified_secs: 1,
+                },
+            ],
+            ..Default::default()
+        };
+        fs.remember_listing("dir", &listing, true, fs.cache_snapshot());
+        assert_eq!(fs.known("dir/child"), Some(Known::Present(Node::Dir)));
+        assert!(matches!(
+            fs.known("dir/both"),
+            Some(Known::Present(Node::File { size: 2, .. }))
+        ));
+        assert_eq!(fs.known("dir/absent"), Some(Known::Absent));
+    }
+
+    #[test]
+    fn non_delimited_provider_responses_cannot_hide_implicit_directories() {
+        let fs = fs_with_ttl(Duration::from_secs(60));
+        let listing = s3::Listing {
+            objects: vec![s3::ObjectInfo {
+                key: "nested/file".into(),
+                size: 2,
+                last_modified_secs: 1,
+            }],
+            ..Default::default()
+        };
+        fs.remember_listing("dir", &listing, true, fs.cache_snapshot());
+        assert_eq!(fs.known("dir/nested"), None);
+        assert_eq!(fs.known("dir/missing"), None);
+    }
+
+    #[test]
+    fn directory_cache_bounds_both_names_and_empty_directories() {
+        let mut meta = Metadata::default();
+        for index in 0..=DIRECTORY_CACHE_COUNT {
+            meta.directories.insert(
+                index.to_string(),
+                CachedDirectory {
+                    names: HashSet::new(),
+                    fetched: Instant::now(),
+                },
+            );
+            meta.bound_directories();
+        }
+        assert_eq!(meta.directories.len(), DIRECTORY_CACHE_COUNT);
+        assert!(!meta.directories.contains_key("0"));
+        meta.directories.clear();
+        let names = (0..DIRECTORY_CACHE_NAMES)
+            .map(|index| index.to_string())
+            .collect();
+        meta.directories.insert(
+            "dir".into(),
+            CachedDirectory {
+                names,
+                fetched: Instant::now(),
+            },
+        );
+        meta.listed_names = DIRECTORY_CACHE_NAMES;
+        meta.record("dir/new", Known::Present(Node::Dir), Instant::now());
+        assert!(meta.directories.is_empty());
+        assert_eq!(meta.listed_names, 0);
     }
 
     // `rename(2)` keeps the inode and moves the name onto it. Forgetting the

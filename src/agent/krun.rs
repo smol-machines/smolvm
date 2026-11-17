@@ -11,6 +11,16 @@ use std::path::{Path, PathBuf};
 /// Serve ownership and mode from the `user.containers.override_stat` xattr
 /// (see libkrun's `KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT`).
 pub const KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT: u32 = 1 << 0;
+/// `krun_add_virtiofs4` flag for a live device: host directories are attached
+/// to it and detached from it at runtime through the control socket (see
+/// libkrun's `KRUN_VIRTIOFS_FLAG_LIVE`).
+pub const KRUN_VIRTIOFS_FLAG_LIVE: u32 = 1 << 1;
+/// `krun_add_virtiofs4` flag letting the guest keep a missing name for a
+/// second instead of asking the host at every stat of it. Only for shares
+/// whose host directory the watcher follows, since the watcher is what drops
+/// the guest's entry when the host creates the name (see libkrun's
+/// `KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES`).
+pub const KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES: u32 = 1 << 2;
 
 /// Whether the libkrun this binary would load can serve host-extracted image
 /// layers with their recorded ownership: on macOS and Windows the server
@@ -150,6 +160,9 @@ pub struct KrunFunctions {
     pub get_guest_ram: Option<unsafe extern "C" fn(u32, *mut u64, u32, *mut u64) -> i32>,
     /// Register a Unix control socket for the VM (pause/resume/checkpoint/restore).
     pub set_control_socket: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
+    /// Route every TSI guest DNS query to a host forwarder on loopback.
+    /// `None` on libkrun builds that predate it.
+    pub set_dns_forwarder: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
     /// Boot the VM as a fork clone from a snapshot directory (CoW-map a golden
     /// VM's RAM + restore state instead of cold-booting).
     pub set_snapshot: Option<unsafe extern "C" fn(u32, *const libc::c_char) -> i32>,
@@ -253,6 +266,7 @@ impl KrunFunctions {
         let add_input_device = load_optional_sym!("krun_add_input_device");
         let get_guest_ram = load_optional_sym!("krun_get_guest_ram");
         let set_control_socket = load_optional_sym!("krun_set_control_socket");
+        let set_dns_forwarder = load_optional_sym!("krun_set_dns_forwarder");
         let set_snapshot = load_optional_sym!("krun_set_snapshot");
         let set_snapshot_memory_fd = load_optional_sym!("krun_set_snapshot_memory_fd");
         let set_snapshot_memory_fd2 = load_optional_sym!("krun_set_snapshot_memory_fd2");
@@ -293,6 +307,7 @@ impl KrunFunctions {
             add_input_device,
             get_guest_ram,
             set_control_socket,
+            set_dns_forwarder,
             set_snapshot,
             set_snapshot_memory_fd,
             set_snapshot_memory_fd2,

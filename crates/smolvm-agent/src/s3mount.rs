@@ -188,8 +188,24 @@ fn probe(spec: &MountSpec) -> Result<(), String> {
             } else {
                 format!("{}/{}", spec.bucket, spec.prefix)
             };
-            format!("s3://{at} is not reachable: {e}")
+            if refused_by_service(&e) {
+                format!(
+                    "s3://{at} {}: {e} (check the bucket, prefix and credentials)",
+                    smolvm_protocol::REMOTE_VOLUME_REFUSED
+                )
+            } else {
+                format!("s3://{at} is not reachable: {e}")
+            }
         })
+}
+
+/// Whether S3 answered and refused the request itself — bad credentials, a
+/// missing bucket, a denied prefix — as opposed to a transport failure or a
+/// throttle, which a retry can fix.
+#[cfg(any(target_os = "linux", test))]
+fn refused_by_service(e: &s3::Error) -> bool {
+    matches!(e, s3::Error::Status { status, .. }
+        if (400..500).contains(status) && *status != 408 && *status != 429)
 }
 
 /// Mount every volume into `container_id`'s namespace and wait until each is
@@ -280,6 +296,22 @@ pub fn spawn(pid: u32, spec: &MountSpec) -> Result<std::process::Child, String> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_a_service_refusal_is_the_callers_error() {
+        let status = |status| s3::Error::Status {
+            status,
+            code: String::new(),
+            message: String::new(),
+        };
+        for refused in [400, 403, 404] {
+            assert!(refused_by_service(&status(refused)), "{refused}");
+        }
+        for retryable in [408, 429, 500, 503] {
+            assert!(!refused_by_service(&status(retryable)), "{retryable}");
+        }
+        assert!(!refused_by_service(&s3::Error::Transport("reset".into())));
+    }
 
     fn spec() -> MountSpec {
         MountSpec {

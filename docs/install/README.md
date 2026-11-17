@@ -22,14 +22,13 @@ pages; `SKILL.md` records the version each claim was last verified on.
 
 ## Where it puts things
 
-Under `$HOME`: the binary in `~/.smolvm` and the launcher in `~/.local/bin`. `references/layout.md`
-has the full tree, including what an uninstall leaves behind on purpose.
+Under `$HOME`: the binary in `~/.smolvm` and the launcher in `~/.local/bin`. Run as root on Linux,
+the installer puts the binary in `/opt/smolvm` and the launcher in `/usr/local/bin` instead.
+The `teardown` packet's `references/locations.md` has the full tree, including what an uninstall
+leaves behind on purpose.
 
-**To install without touching an existing copy**, point `HOME` at a scratch directory: every path
-above moves with it on macOS, and on Linux once `XDG_DATA_HOME` and `XDG_CACHE_HOME` are unset,
-since both outrank `HOME` there. Keep that directory shallow on macOS, because a VM's agent socket
-path has about 100 bytes to work with and a deep `HOME` fails every boot with an error that blames
-disks.
+**To install without touching an existing copy**, point `HOME` at a scratch directory;
+`references/layout.md` has the conditions on Linux and macOS and why the directory must stay shallow.
 
 ## Windows
 

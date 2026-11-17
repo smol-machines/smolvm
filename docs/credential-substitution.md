@@ -18,8 +18,9 @@ smolvm machine exec --name notes -- sh -c \
 # {"object":"user", …}                <- Notion received the real key
 ```
 
-The same placeholder sent anywhere else — another host, a query string, a
-request body — is refused or travels as the literal placeholder string.
+The same placeholder sent anywhere else — another host, a query string, or a
+request body without an explicit form-body binding — is refused or travels as
+the literal placeholder string.
 
 A binding can instead set a header outright, so the guest needs no
 placeholder at all (see [Setting a header](#setting-a-header)).
@@ -32,7 +33,7 @@ placeholder, and the exact hosts it may be sent to. It never carries the value.
 Command line (repeatable, implies `--net`):
 
 ```sh
---credential NAME=ENV_VAR@HOST[,HOST...]
+--credential NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER]
 ```
 
 Smolfile:
@@ -53,8 +54,30 @@ allowed_hosts = ["api.github.com"]
 methods = ["GET", "HEAD"]        # optional; default is every method
 ```
 
-API (`POST /v1/machines`): the same object under `credentials`, with
-`injection_location: { "header": true }` accepted for compatibility.
+For an OAuth refresh token sent in a form body, add `:body` to the CLI
+binding or set `injection_location = { header = true, body = true }` in a
+Smolfile. The host substitutes placeholders only in
+`application/x-www-form-urlencoded` request bodies to the binding's hosts and
+methods. The default remains header substitution only. For example:
+
+```sh
+smolvm machine create --name oauth --image curlimages/curl:8.11.1 \
+  --allow-host auth.example.com \
+  --secret-file REFRESH_TOKEN=/path/to/refresh-token \
+  --credential refresh=REFRESH_TOKEN@auth.example.com:body
+```
+
+Inside the VM, `curl -d "grant_type=refresh_token&refresh_token=$REFRESH_TOKEN"
+https://auth.example.com/token` sends the host's current file value as one
+percent-encoded form field. The same placeholder in a header and the form body
+of one request is allowed; two different placeholders are refused.
+
+The CLI accepts `:body` and `:set-header=HEADER` together in either order:
+`:body:set-header=HEADER` or `:set-header=HEADER:body`.
+
+API (`POST /api/v1/machines`): the same object under `credentials`, with
+`injection_location: { "header": true, "body": true }` for form-body
+substitution (omit `body` to keep the default).
 
 Rules checked at create:
 
@@ -73,9 +96,22 @@ Rules checked at create:
 A binding with `set_header` sets that request header to the credential's
 value on every request to its hosts with its methods, replacing whatever the
 guest sent. The value is the whole header value, `Bearer …` or `Basic …`
-included. The guest needs no placeholder and holds nothing: this is the shape
-of a firewall that brokers credentials by domain, for clients you cannot
-point at a placeholder (a `git clone` of a private repository, say).
+included. With the CLI form, `ENV_VAR` still receives an unused opaque
+placeholder in the guest; the complete secret value and resolved header remain
+on the host. This is the shape of a firewall that brokers credentials by
+domain, for clients you cannot point at a placeholder (a `git clone` of a
+private repository, say).
+
+On the CLI, add `:set-header=HEADER` to the binding. For example, this reads
+the complete `GITHUB_AUTH` value from the host environment when the machine
+starts and injects it as the `Authorization` header for requests to
+`api.github.com`; the guest never receives that secret:
+
+```sh
+smolvm machine create --name github --image alpine:3.20 \
+  --credential github=GITHUB_AUTH@api.github.com:set-header=authorization
+GITHUB_AUTH='Bearer ghp_…' smolvm machine start --name github
+```
 
 ```toml
 [[network.credentials]]
@@ -100,15 +136,18 @@ methods = ["GET", "POST"]
 
 ## Where the value comes from
 
-The host resolves each binding on every request, so rotating a credential
-needs no restart, and nothing is cached across requests.
+The host resolves each binding on every request, in the process `machine start`
+launched. A file reference is therefore read fresh each time, so rotating the
+file needs no restart. An environment variable is read from the environment
+`machine start` ran with, so changing it later, including on a `machine exec`,
+has no effect until a restart.
 
 1. A `[secrets]` reference (or `--secret-env` / `--secret-file`) under the
    **same variable name** as the binding's `environment_variable`. That
    reference feeds the substitution instead of being injected as plaintext.
-2. Otherwise, the host environment variable of that name at `machine start`
-   and `machine exec` time. This is the `dotenvx run -- smolvm machine start …`
-   path: decrypted values live only in the host process.
+2. Otherwise, the host environment variable of that name, as `machine start`
+   saw it. This is the `dotenvx run -- smolvm machine start …` path: decrypted
+   values live only in the host process.
 
 ```toml
 [secrets]
@@ -120,7 +159,11 @@ Machines created over the HTTP API take their values only from
 embedded runtime (`create_machine_with_credentials`) take them only from
 `supply_credential_values`. Neither ever falls back to this host's
 environment. Supplied values are held in the supplying process's memory,
-never written anywhere, and take effect when the machine next starts.
+never written anywhere, and apply from the machine's next start; a running
+machine also gets them at once, so its next request to a bound host carries the
+new value without a restart. A value naming no binding of the machine is
+refused, and a running machine that cannot take values live (one started before
+live values were supported) fails the call while keeping them for its next start.
 
 Embedders resolve however they like: the engine asks a `CredentialResolver`
 with the machine name, binding name, destination host and port, method and
@@ -162,12 +205,16 @@ the destination. The interceptor reads the TLS server name:
 
 Refused with a `403` and a one-line reason in the body:
 
-- a placeholder in the path, query string or request body;
+- a placeholder in the path or query string, or in a request body when the
+  binding lacks `:body`;
 - a placeholder in a routing or framing header (`Host`, `Content-Length`,
   `Transfer-Encoding`, `Connection`, `Cookie`, …);
 - more than one placeholder in a request;
 - a placeholder the machine did not mint, or one whose binding does not allow
   this host or method (`405`).
+
+Under `:body`, a request body that is not `application/x-www-form-urlencoded`
+is refused with a `415`.
 
 `502 smolvm credentials: credential unavailable` means the host could not
 resolve the binding — the variable is unset, the file is missing or
@@ -211,8 +258,8 @@ Those inject the plaintext into the guest environment: convenient, but a
 compromised workload can read and exfiltrate it. A credential binding gives
 the workload the *ability to use* the value at named hosts and nothing else.
 Use secrets injection for values a program must read (a database URL it
-parses); use credential bindings for bearer tokens and API keys that only ever
-appear in a request header.
+parses); use credential bindings for bearer tokens and API keys sent in headers
+or form bodies to explicit hosts.
 
 ## External host interceptor
 

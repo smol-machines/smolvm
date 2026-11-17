@@ -1,7 +1,8 @@
 # CUDA inside a machine
 
-`--cuda` remotes the guest's CUDA **Driver API** calls to the host's NVIDIA GPU over vsock. It is a
-different feature from `--gpu`, which is Vulkan graphics; they share nothing but the word GPU.
+`--cuda` remotes the guest's CUDA **Driver API** calls, and Runtime API calls through a `libcudart`
+shim, to the host's NVIDIA GPU over vsock. It is a different feature from `--gpu`, which is Vulkan
+graphics; they share nothing but the word GPU.
 
 `SKILL.md` is the procedure and carries the version stamps and the per-platform results.
 
@@ -37,11 +38,8 @@ like a yes.
 
 ## What is covered
 
-Init and device queries, contexts including the primary-context flow the CUDA runtime uses, module
-load and unload for PTX, cubin and fatbin, allocation and copies in both directions, kernel launch,
-streams, events and `cuGetProcAddress`. Work executes synchronously on the host, and `*Async` calls
-complete before returning, which the CUDA contract permits. This covers programs written against
-the Driver API, the `cu*` C functions.
+[GPU and CUDA](../gpu.md#cuda-api-remoting) lists the Driver API surface and the Runtime API shim (`libcudart`,
+cuBLAS, cuBLASLt, cuDNN) that lowers onto it. This packet's probe exercises the Driver API, the `cu*` C functions.
 
 ## Use a glibc image, and load the shim by path
 

@@ -19,14 +19,19 @@
 //! ```
 
 pub mod admission;
+pub(crate) mod cache_base_budget;
+pub(crate) mod cache_base_fetch;
 #[cfg(target_os = "linux")]
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
 pub mod error;
+pub mod exec_sessions;
 pub mod guest_rollout;
 pub mod handlers;
 pub mod inflight;
+pub mod memory_pressure;
 pub mod pool_controller;
+pub mod progress;
 pub mod resize_controller;
 pub mod rollout;
 pub mod state;
@@ -84,6 +89,12 @@ use state::ApiState;
         handlers::exec::exec_stream,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
+        handlers::exec_sessions::create_exec_session,
+        handlers::exec_sessions::list_exec_sessions,
+        handlers::exec_sessions::read_exec_session,
+        handlers::exec_sessions::exec_session_stdin,
+        handlers::exec_sessions::resize_exec_session,
+        handlers::exec_sessions::delete_exec_session,
         // Files
         handlers::files::upload_file,
         handlers::files::download_file,
@@ -106,7 +117,13 @@ use state::ApiState;
         handlers::machines::sync_machine,
         handlers::machines::delete_machine,
         handlers::machines::resize_machine,
+        handlers::machines::set_machine_ports,
+        handlers::machines::set_machine_cpu_limit,
+        handlers::mounts::list_mounts,
+        handlers::mounts::attach_mount,
+        handlers::mounts::detach_mount,
         handlers::machines::publish_cache_disk,
+        handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
         handlers::machines::put_credential_values,
         handlers::machines::export_machine,
@@ -140,12 +157,18 @@ use state::ApiState;
         types::PortSpec,
         types::ResourceSpec,
         types::ExecRequest,
+        types::CreateExecSessionRequest,
+        types::ExecSessionReadQuery,
+        types::ExecStdinRequest,
+        types::ExecResizeRequest,
         types::RunRequest,
         types::EnvVar,
         types::PullImageRequest,
         types::DeleteQuery,
         types::LogsQuery,
         types::ResizeMachineRequest,
+        types::SetPortsRequest,
+        types::SetCpuLimitRequest,
         types::CacheDiskSpec,
         types::PublishCacheDiskRequest,
         types::PublishCacheDiskResponse,
@@ -177,10 +200,19 @@ use state::ApiState;
         types::MachineInfo,
         types::EgressDenialInfo,
         crate::agent::EgressSignal,
+        crate::agent::EgressFlowSummary,
+        crate::agent::GuestPressure,
+        crate::agent::PressureStall,
         types::EgressEventsResponse,
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
+        types::ExecSessionResponse,
+        types::ExecOutputChunk,
+        types::ExecOutputGap,
+        types::ExecStdinResponse,
+        types::ListExecSessionsResponse,
+        exec_sessions::SessionSummary,
         types::ExportResponse,
         types::ImageInfo,
         types::ListImagesResponse,
@@ -212,10 +244,26 @@ pub struct ApiDoc;
 /// wrapped in this timeout.
 const API_REQUEST_TIMEOUT_SECS: u64 = 300;
 
+/// Timeout for creating a machine. Creating one from an image builds its image
+/// seed, which pulls the whole image inside the request, and a large image from
+/// a customer's own registry runs past [`API_REQUEST_TIMEOUT_SECS`]. Each image
+/// pull is already bounded at ten minutes (`IMAGE_PULL_TIMEOUT_SECS`), so this
+/// window sits above that and the pull, not the request, decides when it is
+/// stuck. The control plane's create timeout matches it.
+const CREATE_REQUEST_TIMEOUT_SECS: u64 = 900;
+const _: () = assert!(
+    CREATE_REQUEST_TIMEOUT_SECS > crate::agent::IMAGE_PULL_TIMEOUT_SECS,
+    "a machine create must outlast the image pull it waits on"
+);
+
 /// Body cap for the file-upload route. axum's 2 MiB default silently 413s larger
-/// uploads before the handler runs; the control plane permits 100 MiB, so match
-/// it here. The agent streams the write and enforces the true ceiling.
-pub(crate) const MAX_FILE_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
+/// uploads before the handler runs; the control plane permits 1 GiB, so match
+/// it here. A body of declared length streams into the guest, so this costs no
+/// memory; the agent enforces the true ceiling.
+pub(crate) const MAX_FILE_UPLOAD_BYTES: usize = 1024 * 1024 * 1024;
+/// Cap for an upload without a Content-Length, which is read whole into memory
+/// before it is written.
+pub(crate) const MAX_BUFFERED_UPLOAD_BYTES: usize = 100 * 1024 * 1024;
 /// Bounded but large enough for cohorts of pre-tokenized RL prompts.
 const MAX_ROLLOUT_REQUEST_BYTES: usize = 20 * 1024 * 1024;
 
@@ -292,6 +340,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
     // above. No request timeout: the transfer is as large as a blob pull, and
     // it runs off the critical path where slowness costs nothing.
     let warm_route = Router::new().route("/artifacts/warm", post(handlers::prewarm::warm_artifact));
+    // Upload of a checkpoint captured with `defer_upload`: no request timeout,
+    // as large as the capture it follows, and mTLS-gated like the routes above.
+    let held_checkpoint_route = Router::new()
+        .route(
+            "/checkpoints/{key}/upload",
+            post(handlers::machines::upload_held_checkpoint),
+        )
+        // The owner deleted the checkpoint: drop this node's copies of it.
+        .route(
+            "/checkpoints/{key}",
+            delete(handlers::machines::forget_checkpoint),
+        );
 
     // Long-lived streaming routes (no request timeout): SSE logs and the
     // interactive PTY WebSocket both outlive the 5-minute API timeout.
@@ -305,6 +365,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route(
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
+        )
+        // A terminal attached to an exec session; it lasts as long as the user.
+        .route(
+            "/{id}/execs/{exec}/attach",
+            get(handlers::exec_sessions::attach_exec_session),
         );
 
     // Bounded metadata and lifecycle routes. These have no caller-selected
@@ -321,7 +386,6 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/mediation-events",
             get(handlers::machines::get_machine_mediation_events),
         )
-        .route("/", post(handlers::machines::create_machine))
         .route("/{id}/branches", post(handlers::machines::branch_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route(
@@ -341,9 +405,16 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/resume", post(handlers::machines::resume_machine))
         .route("/{id}/sync", post(handlers::machines::sync_machine))
         .route("/{id}/resize", post(handlers::machines::resize_machine))
+        .route("/{id}/ports", put(handlers::machines::set_machine_ports))
         .route(
-            "/{id}/cache-disk/publish",
-            post(handlers::machines::publish_cache_disk),
+            "/{id}/cpu-limit",
+            put(handlers::machines::set_machine_cpu_limit),
+        )
+        .route(
+            "/{id}/mounts",
+            get(handlers::mounts::list_mounts)
+                .post(handlers::mounts::attach_mount)
+                .delete(handlers::mounts::detach_mount),
         )
         .route(
             "/{id}/egress",
@@ -355,13 +426,12 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         )
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
-        // File I/O routes. The upload handler buffers the whole body (`body:
-        // Bytes`), so without a raised limit axum's 2 MiB default rejects any
-        // larger upload with a bare 413 "Failed to buffer the request body" —
-        // the control plane already permits 100 MiB here, so match it (the agent
-        // streams the write, so the real ceiling is FILE_TRANSFER_MAX_TOTAL).
-        // Per-route so only uploads get the large cap; the agent enforces the
-        // true maximum.
+        // File I/O routes. Without a raised limit axum's 2 MiB default rejects
+        // any larger upload with a bare 413 "Failed to buffer the request
+        // body"; the control plane permits 1 GiB here, so match it. The
+        // handler streams a body of declared length and caps one without at
+        // MAX_BUFFERED_UPLOAD_BYTES. Per-route so only uploads get the large
+        // cap; the agent enforces the true maximum (FILE_TRANSFER_MAX_TOTAL).
         .route(
             "/{id}/files/{*path}",
             put(handlers::files::upload_file).layer(DefaultBodyLimit::max(MAX_FILE_UPLOAD_BYTES)),
@@ -373,6 +443,13 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             Duration::from_secs(API_REQUEST_TIMEOUT_SECS),
         ));
 
+    let create_route = Router::new()
+        .route("/", post(handlers::machines::create_machine))
+        .layer(TimeoutLayer::with_status_code(
+            StatusCode::REQUEST_TIMEOUT,
+            Duration::from_secs(CREATE_REQUEST_TIMEOUT_SECS),
+        ));
+
     // Long operations own their deadline. In particular, exec and run pass
     // `timeout_secs` through to the guest agent; wrapping them in the generic
     // five-minute timeout used to turn a valid 30-minute exec into an HTTP 408
@@ -382,12 +459,43 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/exec", post(handlers::exec::exec_command))
         .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
         .route("/{id}/run", post(handlers::exec::run_command))
-        .route("/{id}/images/pull", post(handlers::images::pull_image));
+        // Exec sessions: a start answers once its command runs (it may boot the
+        // machine and pull its image first), and a read may wait up to a minute
+        // for output, so neither takes the five-minute request timeout.
+        .route(
+            "/{id}/execs",
+            post(handlers::exec_sessions::create_exec_session)
+                .get(handlers::exec_sessions::list_exec_sessions),
+        )
+        .route(
+            "/{id}/execs/{exec}",
+            get(handlers::exec_sessions::read_exec_session)
+                .delete(handlers::exec_sessions::delete_exec_session),
+        )
+        .route(
+            "/{id}/execs/{exec}/stdin",
+            post(handlers::exec_sessions::exec_session_stdin),
+        )
+        .route(
+            "/{id}/execs/{exec}/resize",
+            post(handlers::exec_sessions::resize_exec_session),
+        )
+        .route("/{id}/images/pull", post(handlers::images::pull_image))
+        // Flattening and uploading a cache disk scales with its size: a 32 GB
+        // publish ran past the five-minute timeout every time and answered 408
+        // while its upload was still going. It gives up only once it stops
+        // making progress instead.
+        .route(
+            "/{id}/cache-disk/publish",
+            post(handlers::machines::publish_cache_disk)
+                .layer(axum::middleware::from_fn(progress::idle_timeout)),
+        );
 
     // Machine routes
     let machine_routes = Router::new()
         .merge(logs_route)
         .merge(bounded_machine_routes)
+        .merge(create_route)
         .merge(long_machine_routes);
 
     // Automatic pool operations are bounded by the same request timeout as
@@ -445,12 +553,18 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{name}/batches", post(handlers::rollouts::generate_batch))
         .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
 
+    // Cache bases this server holds: the control plane removes one a failed
+    // publish left behind, or one whose cache disk was deleted.
+    let cache_base_routes =
+        Router::new().route("/{base}", delete(handlers::machines::delete_cache_base));
+
     // API v1 routes
     let api_v1 = Router::new()
         .nest("/machines", machine_routes)
         .nest("/pools", pool_routes)
         .nest("/rollout-executors", rollout_routes)
-        .nest("/volumes", volume_routes);
+        .nest("/volumes", volume_routes)
+        .nest("/cache-bases", cache_base_routes);
 
     let cors = build_cors(cors_origins);
 
@@ -464,6 +578,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .merge(drain_route)
         .merge(p2p_route)
         .merge(warm_route)
+        .merge(held_checkpoint_route)
         .merge(metrics_route)
         .nest("/api/v1", api_v1)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))

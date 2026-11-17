@@ -12,17 +12,22 @@ the repo is unchanged, the workload could not reach the network, and nothing is 
 The Linux runs used the scripts of their date; this version's preflight, run and cleanup scripts
 ran on Linux aarch64 on v1.22.2 on 2026-10-03.
 
-**The cancel is `scripts/cleanup.sh --cancel`, never Ctrl-C**: on `run.sh` Ctrl-C leaves the CLI
-and its VM running on v1.20.2 too, as "Cancelling" below measures.
+**On macOS from v1.24.0 the offline route does not run**
+([#1819](https://github.com/smol-machines/smolvm/issues/1819)). Every `--oci-cache` run, the bake's own
+included, fails with `agent did not become ready within 30 seconds`: measured on v1.24.0, v1.24.1,
+v1.25.0, v1.25.1, v1.27.3, v1.28.1 and v1.29.0, while v1.23.3 and v1.23.7 boot the same command on
+the same host. The preflight says `offline_shape=unavailable` there and `bake.sh` says
+`result=FAILED`. For a run with no network, use the persistent machine with no network in
+`README.md`, which boots the image with no bake; the network-on route works.
 
-Two issues shaped this packet and **v1.20.2 fixed both on macOS and Linux**; older releases still
-have them:
+**Ctrl-C on `run.sh` ends the run from v1.20.2**: the script forwards an interrupt or a `SIGTERM`
+to the CLI, which ends its VM. Before v1.20.2 the cancel is `scripts/cleanup.sh --cancel`, as
+"Cancelling" below measures.
 
-- **[#1193](https://github.com/smol-machines/smolvm/issues/1193)**, fixed in v1.20.2: before it,
-  a cached run's VM outlives an interrupted CLI, invisible to `machine list`.
-- **[#1192](https://github.com/smol-machines/smolvm/issues/1192)**, fixed in v1.20.2: before it, a
-  cached run with any mount never boots on macOS; `references/macos.md` gives the older releases a
-  route.
+Two issues shaped this packet, both **fixed in v1.20.2 on macOS and Linux**; older releases still have them:
+[#1193](https://github.com/smol-machines/smolvm/issues/1193), a cached run's VM outlives an interrupted CLI, invisible
+to `machine list`; and [#1192](https://github.com/smol-machines/smolvm/issues/1192), a cached run with any mount never
+boots on macOS, for which `references/macos.md` gives the older releases a route.
 
 ## Workflow
 
@@ -144,13 +149,15 @@ smolvm machine run -it --image alpine -v "$PWD/repo:/workspace:ro" -- /bin/sh
 `touch /workspace/x` gave `Read-only file system` and `wget` gave `bad address 'example.com'`; after
 `exit`, `machine list` printed `No machines found` and no smolvm process was left.
 
-## Cancelling, and why Ctrl-C is not it
+## Cancelling
 
 On v1.20.2, Ctrl-C or `SIGKILL` on the CLI itself ends the VM within a second on both routes, on
-macOS arm64 and Linux aarch64. **Interrupting `run.sh` is not a cancel**: the CLI it backgrounds
-ignores `SIGINT`, so Ctrl-C on the script left the CLI and its VM running on the offline route on both
-hosts, and killing the script alone left them on either route. For code that hangs or loops that is
-unbounded exposure.
+macOS arm64 and Linux aarch64. `run.sh` starts the CLI in the background, which starts it with
+`SIGINT` ignored, so before the script forwarded signals Ctrl-C on it left the CLI and its VM
+running on the offline route on both hosts, and killing the script alone left them on either route.
+It now forwards `SIGINT` and `SIGTERM` to the CLI: on macOS arm64 on v1.27.3, on the network-on
+route, Ctrl-C to the script's process group and `SIGTERM` to the script alone each ended the CLI and
+its VM, with `cli_exit=130` and `cli_exit=143`. The offline route was not run again.
 
 Before v1.20.2 the offline route is worse: interrupting the CLI itself leaves the VM running with no
 CLI route to it, roughly 230 MB held per survivor (#1193). `references/traps.md` has the
@@ -212,7 +219,8 @@ Read these when the situation calls for them; they are not needed for a normal r
 - **Linux x86_64**: the offline route was verified on v1.14.2 on an NVIDIA A10 cloud host, not
   re-run since.
 - **macOS arm64**: **the offline route, the network-on route and the cancel path on both were run
-  here on v1.23.0**, 2026-10-04. Before v1.20.2 the offline shape is unavailable (#1192, reproduced
+  here on v1.23.0**, 2026-10-04; on v1.29.0 everything but the offline route, which fails from
+  v1.24.0. Before v1.20.2 the offline shape is unavailable (#1192, reproduced
   3 of 3 on v1.18.2), and `references/macos.md` gives the routes run on v1.18.2.
 - **Windows x86_64**: the offline shape is unavailable for a different reason, the bake never
   completes. `references/windows.md`, **re-run on 2026-10-03 against v1.22.2** on Windows 11 Home
@@ -262,10 +270,32 @@ on v1.22.2 and v1.23.0 on macOS the same cancel printed `cancelled=<pid> config=
 
 **3. "Can I run untrusted code on this host?"**
 
-On macOS arm64 on v1.23.0 the preflight says `offline_shape=available` and `result=ready`. Before
+On macOS arm64 on v1.23.0 the preflight says `offline_shape=available` and `result=ready`; from
+v1.24.0 it says `offline_shape=unavailable` and `result=blocked`, as above. Before
 v1.20.2 it says `offline_shape=unavailable`, `offline_shape_blocker=smol-machines/smolvm#1192` and
 `result=blocked`, and `bake.sh` refuses with `result=unsupported_on_macos` rather than baking
 something unusable.
+
+## Run on v1.29.0, not re-verified
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, twice, the second time from a fresh `HOME`. Linux was not
+run. The stamp stays on v1.23.0 because the offline route failed.
+
+**The offline route failed.** `bake.sh` printed `baked in 10s` and then `agent did not become ready
+within 30 seconds`, and `run.sh` the same error with `used_host_cache=yes`, so `verify.sh` found
+no artifact. The same `machine run --oci-cache` with `--net` and without it failed 3 of 3 on
+v1.29.0 and passed on v1.23.7, so the cause is in smolvm, not in the scripts.
+
+**Everything else held.** The network-on route gave `inside_workspace=ok (readonly)`,
+`inside_out=ok (writable)`, `inside_network=ok (REACHED)`, `artifact=ok (42)` and
+`result=isolation_held`; once in three it exited 255 with no artifact and the log was overwritten
+before it was read. `--allow-host example.com` reached it. Ctrl-C to the script's process group gave
+`cli_exit=130` and no machine; `SIGKILL` to the script left `running (eph)`, and
+`cleanup.sh --cancel --purge` printed `cancelled=<pid>` and `result=clean`. The interactive shell
+above gave `Read-only file system` and `bad address 'example.com'`. The persistent machine with no
+network in `README.md` started in 7 s with `network` false, the same two refusals, and `42` in the
+output directory.
 
 ## Re-verified on v1.23.0
 

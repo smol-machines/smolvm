@@ -38,7 +38,8 @@ EXAMPLES:
   smolvm serve start -l 0.0.0.0:9000                Listen on all interfaces, port 9000
   smolvm serve start -l unix:///tmp/smol.sock       Listen on a Unix domain socket
   smolvm serve start -v                             Enable verbose logging")]
-    Start(ServeStartCmd),
+    // Boxed: the server flags dwarf the other variant.
+    Start(Box<ServeStartCmd>),
 
     /// Export OpenAPI specification for SDK generation
     Openapi(OpenapiCmd),
@@ -47,7 +48,7 @@ EXAMPLES:
 impl ServeCmd {
     pub fn run(self) -> Result<()> {
         match self {
-            ServeCmd::Start(cmd) => cmd.run(),
+            ServeCmd::Start(cmd) => (*cmd).run(),
             ServeCmd::Openapi(cmd) => cmd.run(),
         }
     }
@@ -97,11 +98,37 @@ pub struct ServeStartCmd {
     #[arg(long = "allow-nested-virt")]
     allow_nested_virt: bool,
 
+    /// Loopback port for the guest rollout routes. Every server binds it,
+    /// whatever --listen says, so give each its own to run several on one
+    /// host. Running machines keep the port they started with.
+    #[arg(
+        long = "guest-rollout-port",
+        value_name = "PORT",
+        env = "SMOLVM_GUEST_ROLLOUT_HOST_PORT",
+        default_value_t = smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
+        value_parser = clap::value_parser!(u16).range(1..)
+    )]
+    guest_rollout_port: u16,
+
     /// Directory of cache disk bases the API may attach (`cacheDisk` on
     /// create) and publish into. A request names a base by file name in this
     /// directory, never by path. Unset: the API refuses cache disks.
     #[arg(long = "cache-disk-dir", value_name = "DIR")]
     cache_disk_dir: Option<std::path::PathBuf>,
+
+    /// Most GiB the cache disk bases may hold before the least recently used
+    /// unattached ones are removed (they are fetched again when needed). A
+    /// tenth of the filesystem is always kept free as well. Default: half the
+    /// filesystem holding `--cache-disk-dir`.
+    #[arg(long = "cache-disk-max-gb", value_name = "GIB", requires = "cache_disk_dir",
+          value_parser = clap::value_parser!(u64).range(1..))]
+    cache_disk_max_gb: Option<u64>,
+
+    /// Directory of local images the API may create machines from: `docker
+    /// save` / OCI archives and unpacked rootfs directories. A request's `image`
+    /// path must resolve inside it. Unset: the API accepts registry images only.
+    #[arg(long = "local-image-dir", value_name = "DIR")]
+    local_image_dir: Option<std::path::PathBuf>,
 
     /// Flag, or block, guest traffic to destinations on this watchlist. Each line
     /// is `<label> dns-sha256:<hex>` or `<label> ip-sha256:<hex>`: SHA-256 of a
@@ -182,6 +209,17 @@ fn server_restore_cache(entries: u16, gib: u64) -> smolvm::portable_checkpoint::
     }
 }
 
+/// A failed `serve start` must leave VMs loaded from the database running.
+/// Their managers adopt the live child on reconnect, and would stop it on Drop
+/// unless detached before the last API state reference goes away.
+struct DetachMachinesOnExit(Arc<ApiState>);
+
+impl Drop for DetachMachinesOnExit {
+    fn drop(&mut self) {
+        self.0.detach_all();
+    }
+}
+
 impl ServeStartCmd {
     /// Run the serve command.
     pub fn run(self) -> Result<()> {
@@ -245,6 +283,11 @@ impl ServeStartCmd {
             tracing::info!("verbose logging enabled");
         }
 
+        // A node admitting branches for a control plane: on a large host, keep
+        // the host reserve and charge each child for its growth (local CLI use
+        // and small hosts keep the old, looser defaults).
+        smolvm::agent::fork::enable_serve_branch_admission();
+
         // Per-VM resource isolation + lossless-restart placement. Two paths:
         //
         // - systemd host: adopt each VM into its OWN `smolvm-vm-<id>.scope` after
@@ -263,6 +306,42 @@ impl ServeStartCmd {
         if smolvm::systemd_scope::is_available() {
             std::env::set_var("SMOLVM_VM_USE_SCOPE", "1");
             tracing::info!("per-VM systemd transient scopes enabled (lossless serve restart)");
+            // VMs run in their own slice so they can never starve this API; on
+            // big hosts a few CPUs are kept free of VMs altogether.
+            match smolvm::systemd_scope::configure_vm_slice() {
+                Ok(reserved) => tracing::info!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    reserved_cpus = reserved,
+                    "VM slice ready"
+                ),
+                Err(error) => {
+                    tracing::warn!(%error, "could not limit the VM slice's CPUs; VMs may use every CPU")
+                }
+            }
+            // Host services keep a memory reserve no VM can take: an OOM then
+            // kills a VM inside the slice instead of wedging the host.
+            match smolvm::systemd_scope::configure_vm_slice_memory() {
+                Ok(cap) if cap.limits.raised_to_current => tracing::warn!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    host_total_mib = cap.host_total_mib,
+                    reserved_mib = cap.reserved_mib,
+                    memory_high_bytes = cap.limits.high_bytes,
+                    memory_max_bytes = cap.limits.max_bytes,
+                    "VM slice memory cap raised to what running VMs already hold; the full reserve applies on a later serve start"
+                ),
+                Ok(cap) => tracing::info!(
+                    slice = smolvm::systemd_scope::VM_SLICE,
+                    host_total_mib = cap.host_total_mib,
+                    reserved_mib = cap.reserved_mib,
+                    memory_high_bytes = cap.limits.high_bytes,
+                    memory_max_bytes = cap.limits.max_bytes,
+                    "VM slice memory cap"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "could not cap the VM slice's memory; VMs may use all host memory"
+                ),
+            }
         } else if let Some(root) = smolvm::process::setup_cgroup_delegation_root() {
             tracing::info!(cgroup_root = %root.display(), "per-VM cgroup resource caps enabled");
             std::env::set_var("SMOLVM_CGROUP_ROOT", &root);
@@ -313,26 +392,7 @@ impl ServeStartCmd {
         // VMM subprocesses may route exactly one gateway port to the
         // lease-authenticated rollout listener started below. This is internal
         // node configuration, never a guest-supplied egress exception.
-        let guest_rollout_host_port =
-            std::env::var(smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV)
-                .ok()
-                .map(|value| {
-                    value
-                        .parse::<u16>()
-                        .ok()
-                        .filter(|port| *port != 0)
-                        .ok_or_else(|| {
-                            smolvm::error::Error::config(
-                                "configure guest rollout ingress",
-                                format!(
-                                    "{} must be an integer between 1 and 65535",
-                                    smolvm::api::guest_rollout::GUEST_ROLLOUT_HOST_PORT_ENV
-                                ),
-                            )
-                        })
-                })
-                .transpose()?
-                .unwrap_or(smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT);
+        let guest_rollout_host_port = self.guest_rollout_port;
         smolvm::network::launch::configure_guest_host_service(
             smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT,
             guest_rollout_host_port,
@@ -430,6 +490,10 @@ impl ServeStartCmd {
         let state = Arc::new(ApiState::new().map_err(|e| {
             smolvm::error::Error::config("initialize api state", format!("{:?}", e))
         })?);
+        // Startup can fail after reconnecting persisted VMs (a port collision,
+        // invalid TLS config, etc.). Disarm adopted managers on every exit path,
+        // including errors before the server reaches its normal shutdown path.
+        let _detach_machines = DetachMachinesOnExit(state.clone());
         state.set_allow_nested_virt(self.allow_nested_virt);
         if let Some(dir) = &self.cache_disk_dir {
             std::fs::create_dir_all(dir).map_err(|e| {
@@ -446,6 +510,17 @@ impl ServeStartCmd {
             })?;
             println!("Cache disks enabled from {}", dir.display());
             state.set_cache_disk_dir(Some(dir));
+            state.set_cache_disk_max_bytes(self.cache_disk_max_gb.map(|gb| gb << 30));
+        }
+        if let Some(dir) = &self.local_image_dir {
+            let dir = dir.canonicalize().map_err(|e| {
+                smolvm::error::Error::config(
+                    "local image directory",
+                    format!("{}: {e}", dir.display()),
+                )
+            })?;
+            println!("Local images enabled from {}", dir.display());
+            state.set_local_image_dir(Some(dir));
         }
         if let Some(path) = &self.egress_watchlist {
             smolvm::agent::egress_watchlist::enable(path.clone())
@@ -470,6 +545,10 @@ impl ServeStartCmd {
         let reclaimed = state.reclaim_dangling_vm_dirs();
         if reclaimed > 0 {
             println!("Reclaimed {reclaimed} dangling VM data dir(es)");
+        }
+        let swept = smolvm::portable_checkpoint::sweep_abandoned_checkpoint_scratch();
+        if swept > 0 {
+            println!("Removed {swept} abandoned checkpoint scratch dir(s)");
         }
         // A previous run may have stopped while restored checkpoint RAM was
         // still being written back; finish that in the background.
@@ -513,6 +592,22 @@ impl ServeStartCmd {
             result
         });
 
+        // Resolve the serve API's TLS posture before binding. In fleet mode this
+        // is fail-closed: a missing/partial mTLS config aborts startup rather
+        // than silently serving plain HTTP (control↔node mTLS, increment 3).
+        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
+            client_cn: self.mtls_client_cn.clone(),
+            allow_peer_blobs: self.mtls_allow_peer_blobs,
+        })
+        .map_err(|e| smolvm::error::Error::Config {
+            operation: "serve tls".to_string(),
+            reason: e.to_string(),
+        })?;
+
+        // The service outlives its machines when the host is out of memory.
+        #[cfg(target_os = "linux")]
+        smolvm::process::protect_service_from_oom();
+
         // Spawn supervisor task
         let supervisor_state = state.clone();
         let supervisor_shutdown = shutdown_rx.clone();
@@ -535,6 +630,16 @@ impl ServeStartCmd {
             state.clone(),
             shutdown_rx.clone(),
         ));
+        // Branch children that outgrow the host are paused, newest first, and
+        // resumed when memory comes back (see api::memory_pressure).
+        let memory_pressure_handle = tokio::spawn(smolvm::api::memory_pressure::run(
+            state.clone(),
+            shutdown_rx.clone(),
+        ));
+        // Incremental captures publish into the node's checkpoint store; keep
+        // it bounded now and after each capture (see checkpoint_retention).
+        #[cfg(unix)]
+        smolvm::checkpoint_retention::start_background(state.db().clone());
 
         // A new smolvm version makes every image seed stale, so the first
         // machine of each image would wait for a seed build. Rebuild the seeds
@@ -566,18 +671,6 @@ impl ServeStartCmd {
         let local_app = smolvm::api::create_local_router(state.clone(), self.cors_origins.clone());
         let app = smolvm::api::create_router(state, self.cors_origins.clone());
 
-        // Resolve the serve API's TLS posture before binding. In fleet mode this
-        // is fail-closed: a missing/partial mTLS config aborts startup rather
-        // than silently serving plain HTTP (control↔node mTLS, increment 3).
-        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
-            client_cn: self.mtls_client_cn.clone(),
-            allow_peer_blobs: self.mtls_allow_peer_blobs,
-        })
-        .map_err(|e| smolvm::error::Error::Config {
-            operation: "serve tls".to_string(),
-            reason: e.to_string(),
-        })?;
-
         // Listen server on TCP or Unix socket
         let grace = resolve_shutdown_grace(
             self.shutdown_grace,
@@ -601,20 +694,32 @@ impl ServeStartCmd {
         // particular, a pool fill must not register a newly booted worker after
         // `detach_all` has already walked the registry.
         let _ = shutdown_tx.send(true);
-        let guest_rollout_result = guest_rollout_handle.await.map_err(|error| {
-            smolvm::error::Error::config("guest rollout ingress task", error.to_string())
-        })?;
-        if let Err(error) = guest_rollout_result {
-            tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
-            if server_result.is_ok() {
-                return Err(smolvm::error::Error::Io(error));
+        let mut server_result = server_result;
+        match guest_rollout_handle.await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                tracing::error!(%error, "guest rollout ingress stopped unexpectedly");
+                if server_result.is_ok() {
+                    server_result = Err(smolvm::error::Error::Io(error));
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "guest rollout ingress task failed");
+                if server_result.is_ok() {
+                    server_result = Err(smolvm::error::Error::config(
+                        "guest rollout ingress task",
+                        error.to_string(),
+                    ));
+                }
             }
         }
-        server_result?;
         // A blocking resize retains lifecycle ownership until its bounded
         // runtime/agent calls finish. Do not drain/detach underneath that work.
         if let Err(error) = resize_controller_handle.await {
             tracing::error!(%error, "resize recovery controller failed during shutdown");
+        }
+        if let Err(error) = memory_pressure_handle.await {
+            tracing::error!(%error, "memory pressure guard failed during shutdown");
         }
         let mut pool_controller_handle = pool_controller_handle;
         match tokio::time::timeout(
@@ -646,21 +751,15 @@ impl ServeStartCmd {
         let drain = std::env::var("SMOLVM_DRAIN_ON_SHUTDOWN")
             .map(|v| v != "0" && !v.eq_ignore_ascii_case("false"))
             .unwrap_or(false);
-        if drain {
-            if !smolvm::api::handlers::machines::drain_machines(&drain_state).await {
-                tracing::warn!("drain incomplete; preserving remaining VMs for retry");
-            }
-            drain_state.detach_all();
-        } else {
-            // Non-draining shutdown (a binary-upgrade restart): VMs must survive
-            // for the next `serve` process to reconnect to. Skipping drain isn't
-            // enough — `AgentManager::drop` stops any VM it owns, so tearing down
-            // `ApiState` would kill every running VM. Disarm each manager's Drop
-            // first, mirroring the CLI's detach-before-exit.
-            drain_state.detach_all();
+        if drain
+            && server_result.is_ok()
+            && !smolvm::api::handlers::machines::drain_machines(&drain_state).await
+        {
+            tracing::warn!("drain incomplete; preserving remaining VMs for retry");
         }
-
-        Ok(())
+        // `_detach_machines` disarms every manager after the controllers have
+        // stopped, whether shutdown was graceful or an HTTP listener failed.
+        server_result
     }
 
     async fn serve_tcp(
@@ -814,9 +913,7 @@ impl ServeStartCmd {
         internal_shutdown: tokio::sync::watch::Receiver<bool>,
         grace: std::time::Duration,
     ) -> Result<()> {
-        let socket_guard = UnixSocketGuard::bind(&path)?;
-        let listener =
-            tokio::net::UnixListener::bind(&socket_guard.path).map_err(smolvm::error::Error::Io)?;
+        let (socket_guard, listener) = bind_private_unix_socket(&path)?;
 
         tracing::info!(path = %socket_guard.path.display(), "starting HTTP API server");
         println!(
@@ -890,10 +987,41 @@ fn default_listen_value() -> String {
     }
 }
 
+// Bind under a private directory and publish only after tightening the socket
+// mode. Binding at the final path before chmod leaves a window for other local
+// users to connect and wait for the API to start accepting requests.
+#[cfg(unix)]
+fn bind_private_unix_socket(
+    path: &std::path::Path,
+) -> Result<(UnixSocketGuard, tokio::net::UnixListener)> {
+    use std::os::unix::fs::PermissionsExt;
+
+    let mut guard = UnixSocketGuard::bind(path)?;
+    let parent = path.parent().ok_or_else(|| {
+        smolvm::error::Error::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "Unix socket needs a parent directory",
+        ))
+    })?;
+    let staging = tempfile::Builder::new()
+        .prefix(".smolvm-socket-")
+        .tempdir_in(parent)
+        .map_err(smolvm::error::Error::Io)?;
+    let staged_path = staging.path().join("s");
+    let listener =
+        tokio::net::UnixListener::bind(&staged_path).map_err(smolvm::error::Error::Io)?;
+    std::fs::set_permissions(&staged_path, std::fs::Permissions::from_mode(0o600))
+        .map_err(smolvm::error::Error::Io)?;
+    std::fs::rename(&staged_path, path).map_err(smolvm::error::Error::Io)?;
+    guard.published = true;
+    Ok((guard, listener))
+}
+
 #[cfg(unix)]
 #[derive(Debug)]
 struct UnixSocketGuard {
     path: PathBuf,
+    published: bool,
 }
 
 #[cfg(unix)]
@@ -903,14 +1031,34 @@ impl UnixSocketGuard {
             std::fs::create_dir_all(parent).map_err(smolvm::error::Error::Io)?;
         }
 
-        match std::fs::remove_file(path) {
-            Ok(()) => {}
+        use std::os::unix::fs::FileTypeExt;
+        match std::fs::symlink_metadata(path) {
+            Ok(metadata) if metadata.file_type().is_socket() => {
+                match std::os::unix::net::UnixStream::connect(path) {
+                    Ok(_) => {
+                        return Err(smolvm::error::Error::Io(std::io::Error::new(
+                            std::io::ErrorKind::AddrInUse,
+                            "API socket already has a listener",
+                        )));
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::ConnectionRefused => {}
+                    Err(e) => return Err(smolvm::error::Error::Io(e)),
+                }
+                std::fs::remove_file(path).map_err(smolvm::error::Error::Io)?;
+            }
+            Ok(_) => {
+                return Err(smolvm::error::Error::Io(std::io::Error::new(
+                    std::io::ErrorKind::AlreadyExists,
+                    "refusing to replace a non-socket API path",
+                )));
+            }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
             Err(e) => return Err(smolvm::error::Error::Io(e)),
         }
 
         Ok(Self {
             path: path.to_path_buf(),
+            published: false,
         })
     }
 }
@@ -918,6 +1066,9 @@ impl UnixSocketGuard {
 #[cfg(unix)]
 impl Drop for UnixSocketGuard {
     fn drop(&mut self) {
+        if !self.published {
+            return;
+        }
         if let Err(e) = std::fs::remove_file(&self.path) {
             if e.kind() != std::io::ErrorKind::NotFound {
                 tracing::warn!(path = %self.path.display(), error = %e, "failed to remove unix socket");
@@ -1134,6 +1285,29 @@ mod tests {
     }
 
     #[test]
+    fn the_guest_rollout_port_defaults_to_the_guest_port_and_can_move() {
+        use clap::Parser;
+        let parse = |args: &[&str]| {
+            super::ServeStartCmd::try_parse_from(
+                std::iter::once("serve").chain(args.iter().copied()),
+            )
+        };
+        if std::env::var_os("SMOLVM_GUEST_ROLLOUT_HOST_PORT").is_none() {
+            assert_eq!(
+                parse(&[]).unwrap().guest_rollout_port,
+                smolvm::api::guest_rollout::GUEST_ROLLOUT_PORT
+            );
+        }
+        assert_eq!(
+            parse(&["--guest-rollout-port", "10091"])
+                .unwrap()
+                .guest_rollout_port,
+            10091
+        );
+        assert!(parse(&["--guest-rollout-port", "0"]).is_err());
+    }
+
+    #[test]
     fn shutdown_grace_defaults_and_is_bounded() {
         use super::parse_shutdown_grace as grace;
         assert_eq!(grace(None).as_secs(), 5);
@@ -1152,6 +1326,50 @@ mod tests {
         assert_eq!(grace(None, Some("300")).as_secs(), 300);
         assert_eq!(grace(None, None).as_secs(), 5);
         assert_eq!(grace(Some(999_999), None).as_secs(), 3600);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn unix_api_socket_is_private_before_it_can_accept_connections() {
+        use std::os::unix::fs::{symlink, FileTypeExt, PermissionsExt};
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("api.sock");
+        let ordinary = dir.path().join("ordinary");
+        std::fs::write(&ordinary, "keep").unwrap();
+        assert!(super::bind_private_unix_socket(&ordinary).is_err());
+        assert_eq!(std::fs::read_to_string(&ordinary).unwrap(), "keep");
+        symlink(&ordinary, &path).unwrap();
+        assert!(super::bind_private_unix_socket(&path).is_err());
+        assert!(std::fs::symlink_metadata(&path)
+            .unwrap()
+            .file_type()
+            .is_symlink());
+        std::fs::remove_file(&path).unwrap();
+
+        let (guard, listener) = super::bind_private_unix_socket(&path).unwrap();
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_socket());
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        let client = tokio::net::UnixStream::connect(&path).await.unwrap();
+        let (_server, _) = listener.accept().await.unwrap();
+        drop(client);
+        drop(listener);
+        drop(guard);
+        assert!(!path.exists());
+
+        let active = std::os::unix::net::UnixListener::bind(&path).unwrap();
+        assert!(super::bind_private_unix_socket(&path).is_err());
+        assert!(std::fs::metadata(&path).unwrap().file_type().is_socket());
+        drop(active);
+        let (guard, _listener) = super::bind_private_unix_socket(&path).unwrap();
+        assert_eq!(
+            std::fs::metadata(&path).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        drop(guard);
     }
 
     /// `/slow` answers after `delay`, signalling `entered` as it starts, so a

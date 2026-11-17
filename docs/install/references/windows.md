@@ -165,10 +165,9 @@ Get-Content "$env:LOCALAPPDATA\smolvm\vms\<hash>\agent-console.log" -Tail 40
   succeeded and `$LASTEXITCODE` is 0. Do not set `$ErrorActionPreference = 'Stop'` around a
   smolvm call, and do not read red text as failure.
 - **Device ceiling on WHP, through v1.22.2.** Four `-v` mounts boot; five fail with `no more IRQs
-  are available`. Publishing ports adds one network device, however many ports, as
-  `--allow-host` or `--allow-cidr` would, so four mounts plus two ports fails while two plus two
-  boots. That ceiling holds through v1.22.2. v1.23.0 ships a libkrun whose x86_64 guests have
-  IRQs 5 to 23 (#1521); it was not run on Windows, so its ceiling here is not measured.
+  are available`. Published ports add one network device however many there are, as `--allow-host`
+  or `--allow-cidr` do, so four mounts plus two ports fails while two plus two boots. v1.23.0's
+  libkrun gives x86_64 guests IRQs 5 to 23 (#1521); not run on Windows, so its ceiling is unmeasured.
 - **Path length was not a problem** in the paths this run exercised: a volume mount from a
   237-character directory worked and nothing broke approaching 260 characters.
 - **The rest of the platform picture**, in the `dev-env`, `local-api` and `gpu-cuda` packets.

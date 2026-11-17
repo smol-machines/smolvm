@@ -1,0 +1,24 @@
+# A machine to run a coding agent in. The project directory is mounted at
+# /workspace, the network is on, and the agents are installed once, on the
+# machine's first start. Swap the npm line for whichever agent you use.
+image = "node:22-bookworm-slim"
+net = true
+cpus = 4
+memory = 4096
+
+# The agent runs as root inside the machine. Claude Code refuses its
+# skip-permissions mode as root unless told it is in a sandbox, which it is.
+env = ["IS_SANDBOX=1"]
+
+[dev]
+volumes = [".:/workspace"]
+workdir = "/workspace"
+init = [
+  "apt-get update -qq && apt-get install -yqq git openssh-client ca-certificates ripgrep >/dev/null",
+  # The repo is owned by your host user; git refuses it as root without this.
+  "git config --system --add safe.directory '*'",
+  "npm install -g --silent opencode-ai @anthropic-ai/claude-code",
+]
+
+[auth]
+ssh_agent = true

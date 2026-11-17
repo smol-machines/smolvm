@@ -57,7 +57,7 @@ use crate::egress::EgressPolicy;
 use crate::icmp_relay;
 use crate::queues::NetworkFrameQueues;
 use crate::tcp_listeners::AcceptedTcpConnection;
-use crate::tcp_relay::{spawn_tcp_relay, TcpRelayTable};
+use crate::tcp_relay::TcpRelayTable;
 use crate::udp_relay;
 use crate::virtio_net_log;
 use smoltcp::iface::{
@@ -73,7 +73,7 @@ use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
     IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{Receiver, SyncSender, TryRecvError, TrySendError};
@@ -83,8 +83,16 @@ use std::time::{Duration, Instant as StdInstant};
 
 const DNS_SOCKET_PORT: u16 = 53;
 const TCP_RELAY_STATS_INTERVAL: Duration = Duration::from_secs(5);
-const DNS_PACKET_SLOTS: usize = 8;
-const DNS_BUFFER_BYTES: usize = 2048;
+// Room for a burst: 128 concurrent lookups are 256 queries (A and AAAA). The
+// queue held 8 queries and 2 KiB of answers, so a burst lost the rest silently
+// and each loser waited out the guest resolver's 5 s retry.
+const DNS_PACKET_SLOTS: usize = 512;
+const DNS_RX_BYTES: usize = 64 * 1024;
+const DNS_TX_BYTES: usize = 256 * 1024;
+/// Answers held back while the guest-facing DNS socket is full, at most.
+const DNS_BACKLOG_MAX: usize = 1024;
+/// Poll again this soon while answers are held back.
+const DNS_BACKLOG_RETRY: Duration = Duration::from_millis(2);
 // DNS-over-TCP to the gateway. Real resolvers (and resolv.conf clients) fall
 // back to TCP for truncated answers and EDNS, so the gateway filter must serve
 // TCP/53 in addition to UDP/53. A small pool of listening sockets handles
@@ -98,6 +106,9 @@ const DNS_TCP_TX_BYTES: usize = 8192;
 // and reject a guest that sends a bogus oversized prefix.
 const DNS_TCP_MAX_MSG: usize = 4096;
 const DEFAULT_IDLE_TIMEOUT_MS: i32 = 100;
+/// How often the poll loop refreshes the open-flow summary. Shorter than the
+/// launcher's 15 s file flush so a flushed summary is at most this stale.
+const FLOW_SUMMARY_INTERVAL: Duration = Duration::from_secs(5);
 /// Packet slots per ICMP raw socket buffer (per direction).
 const ICMP_PACKET_SLOTS: usize = 16;
 /// Payload bytes per ICMP raw socket buffer (per direction).
@@ -118,6 +129,8 @@ pub struct VirtioPollConfig {
     pub gateway_ipv4: Ipv4Addr,
     /// Guest IPv4 address.
     pub guest_ipv4: Ipv4Addr,
+    /// IPv4 prefix length of the link the gateway and guest share.
+    pub prefix_len4: u8,
     /// Gateway IPv6 (ULA) address.
     pub gateway_ipv6: Ipv6Addr,
     /// Guest IPv6 (ULA) address.
@@ -126,6 +139,9 @@ pub struct VirtioPollConfig {
     pub prefix_len6: u8,
     /// Upstream resolver the gateway forwards guest DNS queries to.
     pub upstream_dns: Ipv4Addr,
+    /// Every upstream resolver, in the order to try them (see
+    /// [`crate::GuestNetworkConfig::upstream_resolvers`]).
+    pub upstream_resolvers: [Option<IpAddr>; crate::MAX_UPSTREAM_RESOLVERS],
     /// Dedicated loopback service reachable only at the guest-visible gateway.
     pub host_service: Option<crate::GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it.
@@ -138,11 +154,15 @@ fn parse_tcp_relay_capacity(value: &str) -> Option<usize> {
     value
         .parse::<usize>()
         .ok()
-        .filter(|capacity| (1..=4096).contains(capacity))
+        .filter(|capacity| (1..=MAX_TCP_RELAY_CAPACITY).contains(capacity))
 }
 
-/// Bound the per-machine host socket, thread, and guest buffer budget even when
-/// an operator opts into more than the default 512 concurrent TCP relays.
+/// Upper bound on `SMOLVM_TCP_RELAY_CAPACITY`: each flow holds a host socket
+/// and guest-facing buffers, so even an operator override stays bounded.
+const MAX_TCP_RELAY_CAPACITY: usize = 1 << 20;
+
+/// Concurrent guest TCP flows one machine may hold when the operator sets
+/// `SMOLVM_TCP_RELAY_CAPACITY`; the default is the relay table's own.
 fn tcp_relay_capacity_from_env() -> Option<usize> {
     let value = match std::env::var("SMOLVM_TCP_RELAY_CAPACITY") {
         Ok(value) => value,
@@ -155,7 +175,7 @@ fn tcp_relay_capacity_from_env() -> Option<usize> {
     match parse_tcp_relay_capacity(&value) {
         Some(capacity) => Some(capacity),
         _ => {
-            tracing::warn!(%value, "SMOLVM_TCP_RELAY_CAPACITY must be between 1 and 4096; using default");
+            tracing::warn!(%value, max = MAX_TCP_RELAY_CAPACITY, "SMOLVM_TCP_RELAY_CAPACITY must be between 1 and the max; using default");
             None
         }
     }
@@ -167,7 +187,17 @@ enum FrameAction {
         source: SocketAddr,
         destination: SocketAddr,
     },
+    /// Any other guest TCP segment: delivered to its flow's own socket set
+    /// when it has one, otherwise to the shared set (DNS over TCP, or a
+    /// segment for no flow, which smoltcp answers with a reset).
+    Tcp {
+        source: SocketAddr,
+        destination: SocketAddr,
+    },
     DnsQuery,
+    /// ARP or IPv6 neighbor discovery: TCP flows waiting on the guest's link
+    /// address are polled again once it is known.
+    Neighbor,
     /// Non-DNS guest UDP, relayed to a host socket (see `udp_relay`).
     UdpFlow {
         destination: SocketAddr,
@@ -193,8 +223,10 @@ pub fn start_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
+    #[cfg(unix)] switch: Option<crate::switch::SwitchHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
     // A restored guest retains TCP state, but this host-side stack is new.
     // Replaying both the port and ISN sequence collides with saved connections
@@ -218,20 +250,26 @@ pub fn start_network_stack(
                 queues,
                 config,
                 tcp_receiver,
+                udp_publish,
                 egress,
                 fabric,
+                #[cfg(unix)]
+                switch,
                 sequence_seed,
                 port_seed,
             )
         })
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_network_stack(
     queues: Arc<NetworkFrameQueues>,
     config: VirtioPollConfig,
     mut tcp_receiver: Option<Receiver<AcceptedTcpConnection>>,
+    udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
+    #[cfg(unix)] switch: Option<crate::switch::SwitchHandle>,
     sequence_seed: u64,
     port_seed: u16,
 ) {
@@ -260,6 +298,8 @@ fn run_network_stack(
     let dns_routing = DnsRouting {
         upstream: config.upstream_dns,
         gateway: config.gateway_ipv4,
+        #[cfg(unix)]
+        switch: switch.clone(),
     };
     let dns_socket_handle = add_dns_socket(&mut sockets);
     let dns_tcp_handles = add_dns_tcp_sockets(&mut sockets);
@@ -275,6 +315,14 @@ fn run_network_stack(
         IpAddr::V6(link_local_from_mac(config.gateway_mac)),
     ];
     let relay_wake = Arc::new(queues.relay_wake.clone());
+    // One host thread pumps every TCP flow; a flow costs only its host socket.
+    let reactor = {
+        let shutdown_queues = queues.clone();
+        crate::tcp_reactor::RelayReactor::start(
+            relay_wake.clone(),
+            Arc::new(move || shutdown_queues.is_shutting_down()),
+        )
+    };
     let mut relays = TcpRelayTable::new(
         tcp_relay_capacity_from_env(),
         egress.clone(),
@@ -283,6 +331,13 @@ fn run_network_stack(
     )
     .with_published_port_seed(port_seed)
     .with_intercept(config.intercept);
+    match reactor {
+        Ok(reactor) => relays = relays.with_reactor(reactor),
+        Err(error) => virtio_net_log!(
+            "virtio-net: could not start the shared TCP relay ({}); each connection gets its own thread",
+            error
+        ),
+    }
     let datagram_egress = if config.intercept.is_some_and(|mode| mode.all_tcp()) {
         egress.deny_all_datagrams()
     } else {
@@ -293,7 +348,14 @@ fn run_network_stack(
     let mut relay_spawn_failures = 0_u64;
     let mut reported_relay_spawn_failures = 0_u64;
     let mut last_relay_stats = StdInstant::now();
+    let mut last_flow_summary: Option<StdInstant> = None;
     let mut udp_sockets = udp_relay::UdpSocketTable::new();
+    // Published UDP ports: one gateway-side session per remote client.
+    let mut published_udp = crate::udp_publish::PublishedUdpTable::new(
+        config.gateway_ipv4,
+        config.guest_ipv4,
+        port_seed,
+    );
     let udp_channels = {
         let shutdown_queues = queues.clone();
         udp_relay::start_udp_relay(
@@ -316,6 +378,7 @@ fn run_network_stack(
         dns_relay::start_dns_relay(
             relay_wake.clone(),
             Arc::new(move || shutdown_queues.is_shutting_down()),
+            crate::upstream_list(config.upstream_dns, &config.upstream_resolvers),
         )
     };
     let mut dns_gateway = DnsGateway::new();
@@ -338,6 +401,26 @@ fn run_network_stack(
         let now = smoltcp_now(clock);
 
         while let Some(frame) = device.stage_next_frame() {
+            // The container switch takes packets for other machines on this
+            // machine's networks, and answers the guest's ARP for them.
+            #[cfg(unix)]
+            if let Some(handle) = switch.as_ref() {
+                match switch_action(frame, handle, config.gateway_mac) {
+                    Some(SwitchAction::Forward { src, dst, packet }) => {
+                        handle.forward(src, dst, packet);
+                        device.drop_staged_frame();
+                        continue;
+                    }
+                    Some(SwitchAction::Reply(reply)) => {
+                        if queues.host_to_guest.push(reply).is_ok() {
+                            queues.host_wake.wake();
+                        }
+                        device.drop_staged_frame();
+                        continue;
+                    }
+                    None => {}
+                }
+            }
             // We inspect the frame before giving it to smoltcp because certain
             // flows need side effects first:
             // - TCP SYN: pre-create a matching smoltcp socket + relay entry
@@ -365,14 +448,46 @@ fn run_network_stack(
                     source,
                     destination,
                 } => {
-                    virtio_net_log!(
+                    tracing::debug!(
                         "virtio-net: guest TCP SYN source={} destination={}",
                         source,
                         destination
                     );
                     if !relays.has_socket_for(&source, &destination) {
-                        relays.create_tcp_socket(source, destination, &mut sockets);
+                        relays.create_tcp_socket(source, destination);
                     }
+                    // No flow (refused or denied): the shared set has no socket
+                    // for it either, so smoltcp answers the SYN with a reset.
+                    let result = match relays.flow_for(source, destination) {
+                        Some(flow) => relays.ingress(flow, &mut interface, &mut device, now),
+                        None => interface.poll_ingress_single(now, &mut device, &mut sockets),
+                    };
+                    if matches!(result, PollIngressSingleResult::None) {
+                        device.drop_staged_frame();
+                    }
+                }
+                FrameAction::Tcp {
+                    source,
+                    destination,
+                } => {
+                    let result = match relays.flow_for(source, destination) {
+                        Some(flow) => relays.ingress(flow, &mut interface, &mut device, now),
+                        None => interface.poll_ingress_single(now, &mut device, &mut sockets),
+                    };
+                    if matches!(result, PollIngressSingleResult::None) {
+                        device.drop_staged_frame();
+                    }
+                }
+                FrameAction::Neighbor => {
+                    if matches!(
+                        interface.poll_ingress_single(now, &mut device, &mut sockets),
+                        PollIngressSingleResult::None
+                    ) {
+                        device.drop_staged_frame();
+                    }
+                    relays.touch_all();
+                }
+                FrameAction::DnsQuery | FrameAction::Passthrough => {
                     if matches!(
                         interface.poll_ingress_single(now, &mut device, &mut sockets),
                         PollIngressSingleResult::None
@@ -380,7 +495,11 @@ fn run_network_stack(
                         device.drop_staged_frame();
                     }
                 }
-                FrameAction::DnsQuery | FrameAction::Passthrough => {
+                FrameAction::UdpFlow { destination }
+                    if published_udp.is_session_endpoint(destination) =>
+                {
+                    // The guest answering a published-port client: deliver it to
+                    // that client's session socket. Not egress, so no policy.
                     if matches!(
                         interface.poll_ingress_single(now, &mut device, &mut sockets),
                         PollIngressSingleResult::None
@@ -428,11 +547,14 @@ fn run_network_stack(
             }
         }
 
+        if let Some(channels) = &udp_publish {
+            published_udp.deliver_inbound(&mut sockets, &channels.from_host);
+        }
+
         relay_accepted_tcp_connection(
             &mut tcp_receiver,
             &mut relays,
             &mut interface,
-            &mut sockets,
             config.gateway_ipv4,
             config.guest_ipv4,
         );
@@ -443,9 +565,10 @@ fn run_network_stack(
         interface.poll_maintenance(now);
         wake_guest_if_needed(&queues, &device);
 
-        // Move payloads between established smoltcp TCP sockets and host relay
-        // threads, and service the DNS gateway socket.
-        relays.relay_data(&mut sockets);
+        // Service the TCP flows with work: payloads to and from their host
+        // relays, their output to the guest, and their timers.
+        let new_connections = relays.service(&mut interface, &mut device, now);
+        wake_guest_if_needed(&queues, &device);
         // Enqueue guest DNS queries to the offload thread (or answer blocked
         // ones locally), then deliver any answers it has produced back to the
         // guest. Neither step blocks on the upstream resolver.
@@ -454,7 +577,7 @@ fn run_network_stack(
             dns_socket_handle,
             &mut sockets,
             &egress,
-            dns_routing,
+            &dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -463,7 +586,7 @@ fn run_network_stack(
             &mut dns_tcp_conns,
             &mut sockets,
             &egress,
-            dns_routing,
+            &dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
         );
@@ -487,6 +610,12 @@ fn run_network_stack(
         }
         udp_sockets.deliver_replies(&mut sockets, &udp_channels.from_relay);
         udp_sockets.expire_idle(&mut sockets);
+        if let Some(channels) = &udp_publish {
+            if published_udp.drain_to_host(&mut sockets, &channels.to_host) {
+                channels.host_wake.wake();
+            }
+            published_udp.expire_idle(&mut sockets);
+        }
 
         // ICMP echo: the raw sockets captured any guest echo requests during
         // ingress above. Forward external pings to the relay (answering gateway
@@ -520,26 +649,22 @@ fn run_network_stack(
 
         // Once the guest-side TCP handshake is established inside smoltcp, we
         // can spawn the corresponding host relay thread.
-        for connection in relays.take_new_connections(&mut sockets) {
+        for connection in new_connections {
             relay_spawn_attempts = relay_spawn_attempts.saturating_add(1);
-            if spawn_tcp_relay(
-                connection.destination,
-                connection.relay_target,
-                connection.from_smoltcp,
-                connection.to_smoltcp,
-                relay_wake.clone(),
-                connection.proxy_wake,
-                connection.exit_state,
-            )
-            .is_ok()
-            {
+            if relays.start_relay(connection, relay_wake.clone()).is_ok() {
                 relay_spawn_successes = relay_spawn_successes.saturating_add(1);
             } else {
                 relay_spawn_failures = relay_spawn_failures.saturating_add(1);
             }
         }
 
-        relays.cleanup_closed(&mut sockets);
+        // Open-flow telemetry for the machine list, taken from the relay
+        // table on a slow cadence so the per-packet path stays untouched.
+        if last_flow_summary.is_none_or(|at| at.elapsed() >= FLOW_SUMMARY_INTERVAL) {
+            let taken = StdInstant::now();
+            queues.publish_flow_summary(relays.flow_summary(taken));
+            last_flow_summary = Some(taken);
+        }
 
         let relay_table_under_pressure =
             relays.active_connections() >= relays.capacity().saturating_mul(3) / 4;
@@ -564,12 +689,26 @@ fn run_network_stack(
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
         wake_guest_if_needed(&queues, &device);
 
-        let timeout = interface
+        let shared_delay = interface
             .poll_delay(now, &sockets)
-            .map(|duration| Duration::from_millis(duration.total_millis().min(u32::MAX as u64)));
+            .map(|d| d.total_millis());
+        let flow_delay = relays
+            .next_timer()
+            .map(|at| at.saturating_sub(now.total_millis()).max(0) as u64);
+        let timeout = match (shared_delay, flow_delay) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+        .map(|millis| Duration::from_millis(millis.min(u32::MAX as u64)));
         let timeout = match timeout {
             Some(timeout) => Some(timeout),
             None => Some(Duration::from_millis(DEFAULT_IDLE_TIMEOUT_MS as u64)),
+        };
+        // Held-back DNS answers go out as soon as the socket drains.
+        let timeout = if dns_gateway.backlog.is_empty() {
+            timeout
+        } else {
+            timeout.map(|t| t.min(DNS_BACKLOG_RETRY))
         };
 
         // Block until either wake notifies the shared poller or the timeout
@@ -589,7 +728,7 @@ fn create_interface(
     //
     // Equivalent conceptual state:
     //   MAC: config.gateway_mac
-    //   IP : config.gateway_ipv4/30
+    //   IP : config.gateway_ipv4/prefix_len4 (a /30 unless the link is wider)
     //        config.gateway_ipv6/64 (ULA) + fe80 link-local
     //
     // The guest IP exists as a peer on the same virtual link; it is not an
@@ -601,7 +740,10 @@ fn create_interface(
     let mut interface = Interface::new(interface_config, device, Instant::ZERO);
     interface.update_ip_addrs(|addresses| {
         addresses
-            .push(IpCidr::new(IpAddress::Ipv4(config.gateway_ipv4), 30))
+            .push(IpCidr::new(
+                IpAddress::Ipv4(config.gateway_ipv4),
+                config.prefix_len4.clamp(1, 30),
+            ))
             .expect("failed to add gateway IPv4 address");
         addresses
             .push(IpCidr::new(
@@ -662,8 +804,8 @@ fn link_local_from_mac(mac: [u8; 6]) -> Ipv6Addr {
 fn add_dns_socket(sockets: &mut SocketSet<'_>) -> SocketHandle {
     let rx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
     let tx_meta = vec![PacketMetadata::EMPTY; DNS_PACKET_SLOTS];
-    let rx_buffer = PacketBuffer::new(rx_meta, vec![0u8; DNS_BUFFER_BYTES]);
-    let tx_buffer = PacketBuffer::new(tx_meta, vec![0u8; DNS_BUFFER_BYTES]);
+    let rx_buffer = PacketBuffer::new(rx_meta, vec![0u8; DNS_RX_BYTES]);
+    let tx_buffer = PacketBuffer::new(tx_meta, vec![0u8; DNS_TX_BYTES]);
     let mut socket = UdpSocket::new(rx_buffer, tx_buffer);
     socket
         .bind(smoltcp::wire::IpListenEndpoint {
@@ -809,7 +951,6 @@ fn relay_accepted_tcp_connection(
     tcp_receiver: &mut Option<Receiver<AcceptedTcpConnection>>,
     relays: &mut TcpRelayTable,
     interface: &mut Interface,
-    sockets: &mut SocketSet<'_>,
     gateway_ipv4: Ipv4Addr,
     guest_ipv4: Ipv4Addr,
 ) {
@@ -830,7 +971,7 @@ fn relay_accepted_tcp_connection(
                 Ok(connection) => {
                     let guest_destination =
                         SocketAddr::new(std::net::IpAddr::V4(guest_ipv4), connection.guest_port);
-                    virtio_net_log!(
+                    tracing::debug!(
                         "virtio-net: accepted published TCP connection peer={} host_port={} guest_destination={}",
                         connection.peer_addr,
                         connection.host_port,
@@ -841,7 +982,6 @@ fn relay_accepted_tcp_connection(
                         gateway_ipv4,
                         guest_destination,
                         connection.stream,
-                        sockets,
                     ) {
                         tracing::warn!(
                             host_port = connection.host_port,
@@ -877,6 +1017,9 @@ const MAX_PENDING_DNS: usize = 512;
 struct DnsGateway {
     next_id: u64,
     pending_udp: HashMap<u64, PendingDnsUdp>,
+    /// UDP answers the guest-facing socket had no room for yet, oldest first.
+    /// Dropping one would cost the guest a full resolver timeout.
+    backlog: VecDeque<(Vec<u8>, UdpMetadata)>,
 }
 
 /// The guest-reply context we must remember while a UDP query is off-thread.
@@ -892,6 +1035,31 @@ impl DnsGateway {
         Self {
             next_id: 0,
             pending_udp: HashMap::new(),
+            backlog: VecDeque::new(),
+        }
+    }
+
+    /// Queue `answer` for the guest: straight into the socket when nothing is
+    /// held back and it fits, otherwise behind the held-back answers.
+    fn send_udp(&mut self, socket: &mut UdpSocket<'_>, answer: Vec<u8>, meta: UdpMetadata) {
+        self.flush_backlog(socket);
+        if self.backlog.is_empty() && socket.send_slice(&answer, meta).is_ok() {
+            return;
+        }
+        if self.backlog.len() >= DNS_BACKLOG_MAX {
+            virtio_net_log!("virtio-net: dropping DNS answer (guest socket backlog full)");
+            return;
+        }
+        self.backlog.push_back((answer, meta));
+    }
+
+    /// Move held-back answers into the socket while it has room.
+    fn flush_backlog(&mut self, socket: &mut UdpSocket<'_>) {
+        while let Some((answer, meta)) = self.backlog.front() {
+            if socket.send_slice(answer, *meta).is_err() {
+                return;
+            }
+            self.backlog.pop_front();
         }
     }
 
@@ -904,10 +1072,13 @@ impl DnsGateway {
 
 /// Where guest DNS answers come from: the upstream resolver queries are
 /// forwarded to, and the gateway address answered for the gateway's own name.
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct DnsRouting {
     upstream: Ipv4Addr,
     gateway: Ipv4Addr,
+    /// The container switch, whose networks' names this machine resolves.
+    #[cfg(unix)]
+    switch: Option<crate::switch::SwitchHandle>,
 }
 
 /// The decision for a single guest DNS query, made on the poll thread using the
@@ -929,7 +1100,8 @@ enum DnsDecision {
 /// The gateway's own name is answered before the filter runs: it names
 /// gateway-internal plumbing, not egress, so it must resolve even under a
 /// strict allow-host policy.
-fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Addr) -> DnsDecision {
+fn classify_dns_query(query: &[u8], egress: &EgressPolicy, routing: &DnsRouting) -> DnsDecision {
+    let gateway_ipv4 = routing.gateway;
     // A watchlist match is recorded; a `block` entry also answers the name as
     // nonexistent, so the guest sees an ordinary failed lookup. Otherwise the
     // policy below decides exactly as it would without a watchlist.
@@ -940,17 +1112,32 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, gateway_ipv4: Ipv4Add
             }
         }
     }
-    if dns::question_name(query)
+    if let Some(name) = dns::question_name(query)
         .and_then(|n| dns::normalize_hostname(&n))
-        .is_some_and(|n| n == dns::GATEWAY_HOSTNAME)
+        .filter(|n| dns::is_gateway_hostname(n))
     {
         if egress
-            .record_decision("dns", "allow", &dns::GATEWAY_HOSTNAME, "internal_gateway")
+            .record_decision("dns", "allow", &name, "internal_gateway")
             .is_err()
         {
             return DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL));
         }
         return DnsDecision::Immediate(dns::gateway_response(query, gateway_ipv4));
+    }
+    // Names of the machines on this machine's networks are the switch's to
+    // answer, before any upstream resolver: they exist only here.
+    #[cfg(unix)]
+    if let Some(switch) = routing.switch.as_ref() {
+        if let Some(ips) = dns::question_name(query)
+            .and_then(|n| dns::normalize_hostname(&n))
+            .and_then(|n| switch.lookup(&n))
+        {
+            return DnsDecision::Immediate(dns::addresses_response(
+                query,
+                &ips,
+                crate::switch::NAME_TTL_SECS,
+            ));
+        }
     }
     if !egress.dns_filter_active() {
         let name = dns::question_name(query).unwrap_or_default();
@@ -985,7 +1172,7 @@ fn dispatch_dns_udp(
     dns_socket_handle: SocketHandle,
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
-    routing: DnsRouting,
+    routing: &DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -998,14 +1185,14 @@ fn dispatch_dns_udp(
             Ok((q, m)) => (q.to_vec(), m.endpoint, m.local_address),
             Err(_) => break,
         };
-        match classify_dns_query(&query, egress, routing.gateway) {
+        match classify_dns_query(&query, egress, routing) {
             DnsDecision::Immediate(response) => {
                 let response_meta = UdpMetadata {
                     endpoint,
                     local_address,
                     meta: Default::default(),
                 };
-                let _ = socket.send_slice(&response, response_meta);
+                gateway.send_udp(socket, response, response_meta);
             }
             DnsDecision::Forward { learn } => {
                 if gateway.pending_udp.len() >= MAX_PENDING_DNS {
@@ -1057,6 +1244,7 @@ fn deliver_dns_responses(
     gateway: &mut DnsGateway,
     from_relay: &Receiver<DnsResponse>,
 ) {
+    gateway.flush_backlog(sockets.get_mut::<UdpSocket>(dns_socket_handle));
     while let Ok(response) = from_relay.try_recv() {
         if let Some(pending) = gateway.pending_udp.remove(&response.id) {
             if let Some(answer) = response.answer {
@@ -1069,7 +1257,7 @@ fn deliver_dns_responses(
                     local_address: pending.local_address,
                     meta: Default::default(),
                 };
-                let _ = socket.send_slice(&answer, response_meta);
+                gateway.send_udp(socket, answer, response_meta);
             }
             continue;
         }
@@ -1160,7 +1348,7 @@ fn process_dns_tcp(
     conns: &mut [DnsTcpConn],
     sockets: &mut SocketSet<'_>,
     egress: &EgressPolicy,
-    routing: DnsRouting,
+    routing: &DnsRouting,
     gateway: &mut DnsGateway,
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
@@ -1225,7 +1413,7 @@ fn process_dns_tcp(
                     query.len(),
                     routing.upstream
                 );
-                match classify_dns_query(&query, egress, routing.gateway) {
+                match classify_dns_query(&query, egress, routing) {
                     DnsDecision::Immediate(response) => {
                         frame_dns_tcp_response(conn, &response);
                         conn.done = true;
@@ -1305,6 +1493,65 @@ fn smoltcp_now(clock: StdInstant) -> Instant {
     Instant::from_millis(elapsed.as_millis() as i64)
 }
 
+/// What the container switch does with one guest frame.
+#[cfg(unix)]
+enum SwitchAction {
+    /// An IP packet for another machine on one of this machine's networks.
+    Forward {
+        src: std::net::IpAddr,
+        dst: std::net::IpAddr,
+        packet: Vec<u8>,
+    },
+    /// A frame to hand straight back to the guest (an ARP reply or an IPv6
+    /// neighbor advertisement).
+    Reply(Vec<u8>),
+}
+
+#[cfg(unix)]
+fn switch_action(
+    frame: &[u8],
+    switch: &crate::switch::SwitchHandle,
+    gateway_mac: [u8; 6],
+) -> Option<SwitchAction> {
+    if frame.len() < 14 {
+        return None;
+    }
+    match [frame[12], frame[13]] {
+        [0x08, 0x00] => {
+            let packet = &frame[14..];
+            let (src, dst) = crate::switch::ipv4_endpoints(packet)?;
+            let (src, dst) = (std::net::IpAddr::V4(src), std::net::IpAddr::V4(dst));
+            (switch.route(dst) == crate::switch::Route::Peer).then(|| SwitchAction::Forward {
+                src,
+                dst,
+                packet: packet.to_vec(),
+            })
+        }
+        [0x86, 0xdd] => {
+            if let Some((target, reply)) = crate::switch::ndp_reply(frame, gateway_mac) {
+                return switch
+                    .answers_ndp_for(target)
+                    .then_some(SwitchAction::Reply(reply));
+            }
+            let packet = &frame[14..];
+            let (src, dst) = crate::switch::ipv6_endpoints(packet)?;
+            let (src, dst) = (std::net::IpAddr::V6(src), std::net::IpAddr::V6(dst));
+            (switch.route(dst) == crate::switch::Route::Peer).then(|| SwitchAction::Forward {
+                src,
+                dst,
+                packet: packet.to_vec(),
+            })
+        }
+        [0x08, 0x06] => {
+            let (target, reply) = crate::switch::arp_reply(frame, gateway_mac)?;
+            switch
+                .answers_arp_for(target)
+                .then_some(SwitchAction::Reply(reply))
+        }
+        _ => None,
+    }
+}
+
 fn classify_guest_frame(
     frame: &[u8],
     gateway_addrs: &[IpAddr],
@@ -1360,10 +1607,19 @@ fn classify_guest_frame(
                 ipv6.payload(),
             )
         }
+        EthernetProtocol::Arp => return FrameAction::Neighbor,
         _ => return FrameAction::Passthrough,
     };
 
     match protocol {
+        // Router/neighbor solicitation and advertisement, and redirect.
+        smoltcp::wire::IpProtocol::Icmpv6
+            if transport
+                .first()
+                .is_some_and(|kind| (133..=137).contains(kind)) =>
+        {
+            FrameAction::Neighbor
+        }
         smoltcp::wire::IpProtocol::Tcp => {
             let tcp = match TcpPacket::new_checked(transport) {
                 Ok(packet) => packet,
@@ -1384,7 +1640,10 @@ fn classify_guest_frame(
                     }
                 }
             } else {
-                FrameAction::Passthrough
+                FrameAction::Tcp {
+                    source: SocketAddr::new(src_ip, tcp.src_port()),
+                    destination: SocketAddr::new(dst_ip, tcp.dst_port()),
+                }
             }
         }
         smoltcp::wire::IpProtocol::Udp => {
@@ -1425,10 +1684,12 @@ mod tests {
             guest_mac: [2, 0, 0, 0, 0, 2],
             gateway_ipv4: Ipv4Addr::new(100, 96, 0, 1),
             guest_ipv4: Ipv4Addr::new(100, 96, 0, 2),
+            prefix_len4: 30,
             gateway_ipv6: "fd00::1".parse().unwrap(),
             guest_ipv6: "fd00::2".parse().unwrap(),
             prefix_len6: 64,
             upstream_dns: Ipv4Addr::new(1, 1, 1, 1),
+            upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
             mtu: 1500,
@@ -1575,7 +1836,9 @@ mod relay_capacity_tests {
     fn relay_capacity_rejects_unbounded_or_invalid_values() {
         assert_eq!(parse_tcp_relay_capacity("320"), Some(320));
         assert_eq!(parse_tcp_relay_capacity("4096"), Some(4096));
-        for value in ["0", "4097", "-1", "100000000000000000000", "bad"] {
+        assert_eq!(parse_tcp_relay_capacity("200000"), Some(200_000));
+        assert_eq!(parse_tcp_relay_capacity("1048576"), Some(1_048_576));
+        for value in ["0", "1048577", "-1", "100000000000000000000", "bad"] {
             assert_eq!(parse_tcp_relay_capacity(value), None);
         }
     }

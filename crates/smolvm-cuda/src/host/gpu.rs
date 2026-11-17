@@ -1045,7 +1045,7 @@ impl GpuBackend {
                         };
                         let mut stat: libc::statfs = unsafe { std::mem::zeroed() };
                         if unsafe { libc::fstatfs(file.as_raw_fd(), &mut stat) } != 0
-                            || stat.f_type != TMPFS_MAGIC
+                            || !is_tmpfs(&stat, TMPFS_MAGIC)
                         {
                             return Some(response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()));
                         }
@@ -4361,6 +4361,14 @@ fn zc_trace_segments(dir: &str, segments: &[(u64, u64)]) {
             segments.len()
         ));
     }
+}
+
+/// Whether `stat` describes a filesystem of type `magic`. The type of
+/// `f_type` differs between glibc and musl, so both sides are widened.
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)]
+fn is_tmpfs(stat: &libc::statfs, magic: libc::c_long) -> bool {
+    stat.f_type as i64 == magic as i64
 }
 
 #[cfg(test)]

@@ -54,15 +54,32 @@ pub struct IncrementalCapture {
 
 /// Capture `name` into the node store and export it to `artifact`: a delta
 /// against the checkpoint the machine continues from when this node holds it,
-/// otherwise a complete chunked file.
+/// otherwise a complete chunked file. `force_full` exports a complete file
+/// even when a base is held, so a caller can bound how long a chain of deltas
+/// a restore must import; the capture still lands in the store and the next
+/// one can be a delta of it.
 pub fn capture(
     name: &str,
     artifact: &Path,
+    force_full: bool,
     release_source: impl FnOnce(),
 ) -> Result<IncrementalCapture> {
     let store = node_store();
     let published = published_dir(&store);
     std::fs::create_dir_all(&published).map_err(io("create checkpoint store"))?;
+    // The checkpoint this capture deltas against stays while it is read. The
+    // caller holds the machine's lifecycle lock, so the head cannot move.
+    let head = crate::db::SmolvmDb::open()
+        .and_then(|db| db.get_vm(name))
+        .ok()
+        .flatten()
+        .and_then(|record| record.checkpoint_head);
+    let _base_pin = match head.as_deref() {
+        Some(head) => {
+            crate::checkpoint_retention::pin(&store, head).map_err(io("pin checkpoint base"))?
+        }
+        None => None,
+    };
     let nanos = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
@@ -79,8 +96,8 @@ pub fn capture(
         .and_then(|checkpoint| checkpoint.lineage.clone())
         .ok_or_else(|| Error::agent("incremental checkpoint", "capture recorded no lineage"))?;
     let base = match lineage.parent.as_deref() {
-        Some(parent) => held_checkpoint(&store, parent)?,
-        None => None,
+        Some(parent) if !force_full => held_checkpoint(&store, parent)?,
+        _ => None,
     };
     let started = std::time::Instant::now();
     let export = store::export_chunked(&output, base.as_deref(), artifact, |manifest| {
@@ -106,6 +123,7 @@ pub fn capture(
         export_ms = export_elapsed.as_millis() as u64,
         "incremental checkpoint exported"
     );
+    crate::checkpoint_retention::request();
     Ok(IncrementalCapture {
         result,
         base: base.and(lineage.parent),
@@ -160,6 +178,8 @@ pub fn known_files_for(_store: &Path, _parent: &str) -> store::KnownFiles {
 /// How a chunked checkpoint file became available on this node.
 #[derive(Debug, Clone, Default)]
 pub struct Imported {
+    /// Keeps the stored checkpoint from being forgotten while this is alive.
+    pub pin: Option<std::sync::Arc<crate::checkpoint_retention::Pin>>,
     /// Lineage id of the checkpoint.
     pub id: String,
     /// The stored directory holding it.
@@ -193,8 +213,15 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         .map(|lineage| lineage.id.clone())
         .ok_or_else(|| Error::config("restore checkpoint", "chunked checkpoint has no id"))?;
     let store = node_store();
+    std::fs::create_dir_all(&store).map_err(io("create checkpoint store"))?;
+    // Pinned before it is looked up, so a forget either finished first or
+    // waits for this restore.
+    let pin = crate::checkpoint_retention::pin(&store, &id)
+        .map_err(io("pin checkpoint"))?
+        .map(std::sync::Arc::new);
     if let Some(directory) = held_checkpoint(&store, &id)? {
         return Ok(Some(Imported {
+            pin,
             id,
             directory,
             base: checkpoint.base.as_ref().map(|base| base.id.clone()),
@@ -202,8 +229,11 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
             ..Default::default()
         }));
     }
+    let mut _base_pin = None;
     let base = match checkpoint.base.as_ref() {
         Some(base) => {
+            _base_pin = crate::checkpoint_retention::pin(&store, &base.id)
+                .map_err(io("pin base checkpoint"))?;
             let Some(directory) = held_checkpoint(&store, &base.id)? else {
                 return Err(Error::agent_conflict(
                     "restore checkpoint",
@@ -271,12 +301,44 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
     )
     .map_err(io("record checkpoint lineage"))?;
     Ok(Some(Imported {
+        pin,
         id,
         directory,
         base_objects,
         base: base.map(|(id, _)| id),
         already_held: false,
     }))
+}
+
+/// `Some` once `shared` is extracted: the tree for a chunked `artifact`, or
+/// `None` inside for a classic one, which takes the ordinary path.
+fn already_prepared(artifact: &Path, shared: &Path) -> Result<Option<Option<PathBuf>>> {
+    if !smolvm_pack::extract::is_extracted(shared) {
+        return Ok(None);
+    }
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
+        .map_err(|e| Error::agent("read checkpoint manifest", e.to_string()))?;
+    let chunked = manifest
+        .checkpoint
+        .as_ref()
+        .is_some_and(|c| c.payload == smolvm_pack::format::CheckpointLayout::Chunked);
+    Ok(Some(chunked.then(|| shared.to_path_buf())))
+}
+
+/// The lock the pack extractor holds while it extracts into `shared`.
+fn lock_shared_extraction(shared: &Path) -> Result<std::fs::File> {
+    let mut options = std::fs::OpenOptions::new();
+    options.create(true).write(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let lock = options
+        .open(shared.with_extension("lock"))
+        .map_err(io("open shared extraction lock"))?;
+    lock.lock().map_err(io("lock shared extraction"))?;
+    Ok(lock)
 }
 
 /// Make a chunked checkpoint file restorable through the ordinary extraction
@@ -288,17 +350,17 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         .map_err(|e| Error::agent("read checkpoint footer", e.to_string()))?;
     let shared_root = crate::agent::shared_pack_cache_root();
     let shared = smolvm_pack::extract::shared_pack_dir(&shared_root, footer.checksum);
-    if smolvm_pack::extract::is_extracted(&shared) {
-        let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
-            .map_err(|e| Error::agent("read checkpoint manifest", e.to_string()))?;
-        if manifest
-            .checkpoint
-            .as_ref()
-            .is_some_and(|c| c.payload == smolvm_pack::format::CheckpointLayout::Chunked)
-        {
-            return Ok(Some(shared));
-        }
-        return Ok(None);
+    if let Some(prepared) = already_prepared(artifact, &shared)? {
+        return Ok(prepared);
+    }
+    std::fs::create_dir_all(&shared_root).map_err(io("create shared extraction root"))?;
+    // Overlapping restores of one checkpoint share the partial directory
+    // below and each cleared it on entry, removing the tree another was still
+    // writing. The extractor's lock for this checksum makes them take turns;
+    // the ones that waited find the tree published and reuse it.
+    let _lock = lock_shared_extraction(&shared)?;
+    if let Some(prepared) = already_prepared(artifact, &shared)? {
+        return Ok(prepared);
     }
     let started = std::time::Instant::now();
     let Some(imported) = import(artifact)? else {
@@ -308,11 +370,14 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     let store = node_store();
     // The nearest ancestor this node has materialized and still holds.
     let mut base_tree = None;
+    let mut _base_pin = None;
     let mut cursor = store::find_lineage(&store, &imported.id)
         .map_err(io("read checkpoint lineage"))?
         .and_then(|record| record.parent);
     for _ in 0..64 {
         let Some(id) = cursor else { break };
+        let pinned =
+            crate::checkpoint_retention::pin(&store, &id).map_err(io("pin checkpoint base"))?;
         if let (Ok(tree), Some(stored)) = (
             std::fs::read_to_string(materialized_record(&store, &id)),
             held_checkpoint(&store, &id)?,
@@ -320,6 +385,7 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             let tree = PathBuf::from(tree.trim());
             if smolvm_pack::extract::is_extracted(&tree) {
                 base_tree = Some((stored, tree));
+                _base_pin = pinned;
                 break;
             }
         }
@@ -327,7 +393,6 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             .map_err(io("read checkpoint lineage"))?
             .and_then(|record| record.parent);
     }
-    std::fs::create_dir_all(&shared_root).map_err(io("create shared extraction root"))?;
     let partial = shared_root.join(format!(
         ".{:08x}-materialize-{}",
         footer.checksum,

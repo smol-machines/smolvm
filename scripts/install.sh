@@ -397,7 +397,10 @@ install_smolvm() {
 
     # Extract
     info "Extracting archive..."
-    tar -xzf "$archive" -C "$tmp_dir" || {
+    # --no-same-owner: as root, tar would otherwise give every file the uid/gid
+    # stored in the archive (the release builder's), and `cp -a` below carries
+    # that owner into the installed agent-rootfs.
+    tar --no-same-owner -xzf "$archive" -C "$tmp_dir" || {
         error "Failed to extract archive"
         rm -rf "$tmp_dir"
         exit 1
@@ -617,7 +620,9 @@ install_smolvm() {
     fi
 
     # Everything a dropped VM uid loads must be readable and traversable by it.
+    # Only root may change it: the agent-rootfs holds the init every VM boots.
     if [[ "$SYSTEM_INSTALL" == true ]]; then
+        chown -R 0:0 "$prefix"
         chmod -R a+rX "$prefix"
         # An earlier install under root's home would otherwise shadow this one
         # through its ~/.local/bin symlink.
@@ -628,6 +633,13 @@ install_smolvm() {
                 info "Pointed $old_link at the system install"
             fi
         done
+    fi
+
+    # The Docker Engine API is opt-in: `smolvm engine` selects the `smol` Docker
+    # context, which would redirect a user's existing docker CLI, so an install
+    # or upgrade never runs it. It only says how.
+    if [[ "$SYSTEM_INSTALL" != true ]] && "$prefix/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
+        info "To run docker, Compose and Testcontainers on smolvm, run 'smolvm engine' (it switches your Docker context to 'smol')."
     fi
 
     # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
@@ -692,6 +704,9 @@ modify_path() {
 
 # Uninstall smolvm
 uninstall_smolvm() {
+    if [[ -x "$1/smolvm" ]]; then
+        "$1/smolvm" engine unregister >/dev/null 2>&1 || true
+    fi
     local prefix="$1"
 
     info "Uninstalling smolvm..."

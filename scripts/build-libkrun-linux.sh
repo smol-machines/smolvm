@@ -26,6 +26,11 @@
 #                         (it wraps a guest-kernel blob; its floor is GLIBC_2.2),
 #                         so when the goal is lowering libkrun's glibc floor there's
 #                         no need to recompile the kernel — skips the slow step.
+#   LINUX_GLIBC=2.31      link libkrun against this glibc version (with zig and
+#                         cargo-zigbuild) instead of the build host's, so it loads
+#                         on hosts that old. The build host's glibc sets the floor
+#                         otherwise (22.04 -> 2.34). The build fails if any symbol
+#                         still needs a newer glibc.
 set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -130,10 +135,25 @@ echo "--- building libkrun (BLK=1 NET=1 INPUT=1 ${GPU_FLAG}) ---"
 # strip only holds if symbols bind lazily — full RELRO's BIND_NOW would eagerly
 # resolve the now-unprovided virgl symbols and fail the load. Must match the
 # relro-level=partial that build-dist.sh applies on its own libkrun compiles.
-( cd libkrun && make clean >/dev/null 2>&1 || true; \
-  env "${INIT_ENV[@]}" \
-  RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" \
-  make --no-print-directory BLK=1 NET=1 INPUT=1 "${GPU_FLAG}" )
+if [[ -n "${LINUX_GLIBC:-}" ]]; then
+    # The Makefile's `cargo build --features ...`, linked against an older glibc
+    # by zig, under the Makefile's versioned file name.
+    command -v cargo-zigbuild >/dev/null 2>&1 \
+        || { echo "ERROR: LINUX_GLIBC needs zig and cargo-zigbuild on PATH" >&2; exit 1; }
+    KRUN_FEATURES="blk,net,input$([[ "$GPU" == "1" ]] && echo ",gpu" || true)"
+    KRUN_FULL_VERSION="$(sed -n 's/^FULL_VERSION=//p' libkrun/Makefile)"
+    ( cd libkrun && rm -rf target/release/libkrun.so*; \
+      env "${INIT_ENV[@]}" PKG_CONFIG_ALLOW_CROSS=1 \
+      RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" \
+      cargo zigbuild --release --target "${ARCH}-unknown-linux-gnu.${LINUX_GLIBC}" --features "$KRUN_FEATURES" \
+      && mkdir -p target/release \
+      && cp "target/${ARCH}-unknown-linux-gnu/release/libkrun.so" "target/release/libkrun.so.${KRUN_FULL_VERSION}" )
+else
+    ( cd libkrun && make clean >/dev/null 2>&1 || true; \
+      env "${INIT_ENV[@]}" \
+      RUSTFLAGS="${RUSTFLAGS:+$RUSTFLAGS }-C relro-level=partial" \
+      make --no-print-directory BLK=1 NET=1 INPUT=1 "${GPU_FLAG}" )
+fi
 KRUN_SO="$(ls -1 libkrun/target/release/libkrun.so.*.*.* 2>/dev/null | head -1)"
 [[ -n "$KRUN_SO" ]] || { echo "ERROR: libkrun build produced no .so" >&2; exit 1; }
 
@@ -178,6 +198,12 @@ if [[ "$GPU" == "1" ]]; then
             patchelf --remove-needed libvirglrenderer.so.1 "$lk"
         fi
     done
+fi
+
+# A library that still needs a newer glibc than asked for would only load on
+# newer hosts; fail rather than ship it.
+if [[ -n "${LINUX_GLIBC:-}" ]]; then
+    "$(dirname "$0")/check-glibc-floor.sh" "$LINUX_GLIBC" "$LIBDIR/libkrun.so"
 fi
 
 # Record which submodule commits these libs came from, so CI can detect a stale

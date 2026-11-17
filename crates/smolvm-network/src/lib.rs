@@ -25,7 +25,7 @@
 //! │  ├─ reader thread
 //! │  └─ writer thread
 //! ├─ TcpPortListeners
-//! │  └─ one non-blocking accept loop per `-p HOST:GUEST`
+//! │  └─ one accept thread for every `-p HOST:GUEST`
 //! ├─ Arc<NetworkFrameQueues>
 //! │  ├─ guest_to_host
 //! │  ├─ host_to_guest
@@ -57,8 +57,11 @@
 //! - accepting published host TCP ports and forwarding them into guest TCP
 //!   connections
 
+pub mod acceptor;
 pub mod device;
 pub mod dns;
+pub mod dns_cache;
+pub mod dns_forward;
 pub mod dns_relay;
 pub mod egress;
 pub mod fabric;
@@ -66,14 +69,20 @@ pub mod fabric;
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
 pub mod icmp_relay;
+pub mod opening;
+pub mod publish_bind;
 // CNI netns ↔ virtio-net L2 bridge for the Kubernetes runtime (Linux only:
 // needs /dev/net/tun + setns).
 #[cfg(target_os = "linux")]
 pub mod netns_tap;
 pub mod queues;
 pub mod stack;
+#[cfg(unix)]
+pub mod switch;
 pub mod tcp_listeners;
+pub mod tcp_reactor;
 pub mod tcp_relay;
+pub mod udp_publish;
 pub mod udp_relay;
 pub mod watchlist;
 
@@ -94,28 +103,83 @@ use stack::{start_network_stack, VirtioPollConfig};
 use tcp_listeners::create_tcp_channel;
 pub use tcp_listeners::BoundPublishedPorts;
 use tcp_listeners::TcpPortListeners;
+pub use tcp_relay::FlowSummary;
 
 /// Default upstream DNS resolver used by the gateway runtime.
 pub const DEFAULT_DNS_ADDR: IpAddr = IpAddr::V4(Ipv4Addr::new(1, 1, 1, 1));
 
-/// Host->guest published TCP port mapping serviced by the virtio gateway.
+/// Transport a published port forwards.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default)]
+pub enum PortProtocol {
+    /// A host TCP listener; each accepted connection becomes a guest connection.
+    #[default]
+    Tcp,
+    /// A host UDP socket; each client address becomes a guest-facing session.
+    Udp,
+}
+
+/// Host->guest published port mapping serviced by the virtio gateway.
 ///
 /// This stays crate-local so the launchers can translate CLI/data-layer port
 /// mappings into the gateway runtime without pulling the gateway logic back
 /// into the main `smolvm` crate.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PortMapping {
-    /// Port bound on the host loopback interface.
+    /// Port bound on the host.
     pub host: u16,
     /// Port exposed inside the guest.
     pub guest: u16,
+    /// Transport forwarded between them.
+    pub protocol: PortProtocol,
+    /// The host address the port listens on; `None` is the default publish
+    /// address (see [`publish_bind`]).
+    pub listen: Option<IpAddr>,
 }
 
 impl PortMapping {
-    /// Create a new published port mapping.
+    /// Create a new published TCP port mapping.
     pub const fn new(host: u16, guest: u16) -> Self {
-        Self { host, guest }
+        Self::with_protocol(host, guest, PortProtocol::Tcp)
     }
+
+    /// Create a new published port mapping for `protocol`.
+    pub const fn with_protocol(host: u16, guest: u16, protocol: PortProtocol) -> Self {
+        Self {
+            host,
+            guest,
+            protocol,
+            listen: None,
+        }
+    }
+
+    /// This mapping, listening on `listen` instead of the default address.
+    pub const fn listening_on(mut self, listen: Option<IpAddr>) -> Self {
+        self.listen = listen;
+        self
+    }
+}
+
+/// Upstream resolvers a DNS forwarder takes, at most: glibc's own limit
+/// (`MAXNS`).
+pub const MAX_UPSTREAM_RESOLVERS: usize = 3;
+
+/// The upstream resolvers as socket addresses, in order: `resolvers` when any
+/// is set, otherwise `primary` alone.
+pub fn upstream_list(
+    primary: Ipv4Addr,
+    resolvers: &[Option<IpAddr>; MAX_UPSTREAM_RESOLVERS],
+) -> Vec<std::net::SocketAddr> {
+    let mut list: Vec<std::net::SocketAddr> = Vec::new();
+    for addr in resolvers.iter().flatten() {
+        let addr = std::net::SocketAddr::new(*addr, 53);
+        if !list.contains(&addr) {
+            list.push(addr);
+        }
+    }
+    if list.is_empty() {
+        list.push(std::net::SocketAddr::new(IpAddr::V4(primary), 53));
+    }
+    list
 }
 
 /// Static guest network configuration for the virtio-net MVP.
@@ -156,6 +220,10 @@ pub struct GuestNetworkConfig {
     /// caller passes `--dns <ip>` so a VM on a network that blocks the default
     /// resolver can still resolve names.
     pub upstream_dns: Ipv4Addr,
+    /// Every upstream resolver the gateway's DNS forwarder may use, in the
+    /// order to try them, failing over when one is silent (as glibc does across
+    /// `resolv.conf`). All `None` means [`Self::upstream_dns`] alone.
+    pub upstream_resolvers: [Option<IpAddr>; MAX_UPSTREAM_RESOLVERS],
     /// Optional dedicated host service reachable only through the gateway IP.
     pub host_service: Option<GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it. Each stream
@@ -189,6 +257,7 @@ impl GuestNetworkConfig {
                 IpAddr::V4(ip) => ip,
                 IpAddr::V6(_) => Ipv4Addr::new(1, 1, 1, 1),
             },
+            upstream_resolvers: [None; MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
         }
@@ -331,10 +400,39 @@ pub const EGRESS_DECISIONS_LOG: &str = "egress-decisions.jsonl";
 /// folder, so only the host can change a running machine's allow list.
 pub const EGRESS_SOCKET: &str = "egress.sock";
 
-/// Filename of the per-VM egress signal log: watchlist matches, recorded beside
-/// the denial log by the launcher and read back by the host's
-/// `read_egress_signals`. Created on the first match only.
+pub const PORTS_SOCKET: &str = "ports.sock";
+
+pub fn render_port_mappings(mappings: &[PortMapping]) -> String {
+    mappings
+        .iter()
+        .map(|mapping| format!("{}:{}\n", mapping.host, mapping.guest))
+        .collect()
+}
+
+pub fn parse_port_mappings(text: &str) -> Result<Vec<PortMapping>, String> {
+    text.lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(|line| {
+            line.split_once(':')
+                .and_then(|(host, guest)| {
+                    Some(PortMapping::new(host.parse().ok()?, guest.parse().ok()?))
+                })
+                .filter(|mapping| mapping.host != 0 && mapping.guest != 0)
+                .ok_or_else(|| format!("invalid port mapping '{line}'"))
+        })
+        .collect()
+}
+
+/// Filename of the per-VM egress signal log: watchlist matches and stratum
+/// handshakes, recorded beside the denial log by the launcher and read back by
+/// the host's `read_egress_signals`. Created on the first signal only.
 pub const EGRESS_SIGNALS_LOG: &str = "egress-signals.log";
+
+/// Label of the signal a guest's stratum handshake records: a miner logging in
+/// to its pool. Built in, so it is recorded whether or not an operator watchlist
+/// is attached, and reported beside watchlist matches.
+pub const STRATUM_SIGNAL: &str = "stratum";
 
 /// Whether the host can actually reach the IPv6 internet.
 ///
@@ -436,8 +534,55 @@ pub(crate) use virtio_net_log;
 pub struct VirtioNetworkRuntime {
     queues: std::sync::Arc<NetworkFrameQueues>,
     _frame_bridge: FrameStreamBridge,
-    published_ports: Option<TcpPortListeners>,
+    published_ports: PublishedPorts,
+    _published_udp: Option<udp_publish::UdpPortPublisher>,
     poll_handle: Option<JoinHandle<()>>,
+}
+
+#[derive(Clone)]
+pub struct PublishedPorts {
+    tcp: std::sync::Arc<std::sync::Mutex<TcpPortListeners>>,
+    /// UDP mappings, bound once at start: changing them needs a restart.
+    udp: std::sync::Arc<Vec<PortMapping>>,
+}
+
+impl PublishedPorts {
+    fn lock(&self) -> std::sync::MutexGuard<'_, TcpPortListeners> {
+        self.tcp
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The published TCP mappings, the ones a running machine can change.
+    /// UDP mappings are bound once at start and are not listed here.
+    pub fn mappings(&self) -> Vec<PortMapping> {
+        self.lock().mappings()
+    }
+
+    /// Publish a new loopback TCP listener without releasing its allocated port.
+    pub fn publish_atomic(&self, guest: u16) -> io::Result<PortMapping> {
+        self.lock().publish_atomic(guest)
+    }
+
+    /// The UDP mappings bound at start, which stay until the machine stops.
+    pub fn udp_mappings(&self) -> Vec<PortMapping> {
+        self.udp.to_vec()
+    }
+
+    /// Make `next` the published TCP set. A UDP mapping is refused: a UDP port
+    /// is bound for the runtime's life, so changing one needs a restart.
+    pub fn replace(&self, next: &[PortMapping]) -> io::Result<()> {
+        if next
+            .iter()
+            .any(|mapping| mapping.protocol == PortProtocol::Udp)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::Unsupported,
+                "published UDP ports cannot change on a running machine; stop it first",
+            ));
+        }
+        self.lock().replace(next)
+    }
 }
 
 /// Start the host-side virtio-net runtime for one guest NIC.
@@ -495,6 +640,28 @@ pub fn start_virtio_network(
     egress: EgressPolicy,
     fabric_lease: Option<fabric::FabricLease>,
 ) -> io::Result<VirtioNetworkRuntime> {
+    start_virtio_network_on(
+        host_stream,
+        guest_network,
+        published_ports,
+        egress,
+        fabric_lease,
+        #[cfg(unix)]
+        None,
+    )
+}
+
+/// [`start_virtio_network`] for a machine on the container switch
+/// ([`switch`]): its packets for other machines on its networks go through
+/// the switch, and their names resolve.
+pub fn start_virtio_network_on(
+    host_stream: Socket,
+    guest_network: GuestNetworkConfig,
+    mut published_ports: BoundPublishedPorts,
+    egress: EgressPolicy,
+    fabric_lease: Option<fabric::FabricLease>,
+    #[cfg(unix)] switch_endpoint: Option<switch::SwitchEndpoint>,
+) -> io::Result<VirtioNetworkRuntime> {
     if guest_network.intercept.is_some_and(|mode| mode.all_tcp()) && fabric_lease.is_some() {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
@@ -517,19 +684,35 @@ pub fn start_virtio_network(
         )?),
         None => None,
     };
+    #[cfg(unix)]
+    let switch = match switch_endpoint {
+        Some(endpoint) => Some(switch::start_switch(
+            endpoint,
+            queues.clone(),
+            guest_network.gateway_mac,
+            guest_network.guest_mac,
+        )?),
+        None => None,
+    };
     let frame_bridge = start_frame_stream_bridge(host_stream, queues.clone())?;
     // tcp_sender sends the accepted TCP connections to the channel
     // tcp_receiver receives the accepted TCP connections via the channel, and let it be consumed in poll thread.
     let (tcp_sender, tcp_receiver) = create_tcp_channel();
-    let tcp_listeners = if published_ports.is_empty() {
-        None
-    } else {
-        Some(TcpPortListeners::start(
-            published_ports,
-            tcp_sender,
-            queues.relay_wake.clone(),
-        )?)
-    };
+    // UDP mappings are fixed for the runtime's life; only TCP ones are live.
+    let udp_mappings: Vec<PortMapping> = published_ports
+        .udp
+        .iter()
+        .map(|(mapping, _)| *mapping)
+        .collect();
+    let (udp_publisher, udp_publish) =
+        match udp_publish::start_udp_publisher(&mut published_ports, queues.relay_wake.clone())? {
+            Some((publisher, channels)) => (Some(publisher), Some(channels)),
+            None => (None, None),
+        };
+    // Always started, even with no TCP port yet, so ports can be published
+    // on the running machine later.
+    let tcp_listeners =
+        TcpPortListeners::start(published_ports, tcp_sender, queues.relay_wake.clone())?;
     let poll_handle = start_network_stack(
         queues.clone(),
         VirtioPollConfig {
@@ -537,23 +720,32 @@ pub fn start_virtio_network(
             guest_mac: guest_network.guest_mac,
             gateway_ipv4: guest_network.gateway_ip,
             guest_ipv4: guest_network.guest_ip,
+            prefix_len4: guest_network.prefix_len,
             gateway_ipv6: guest_network.gateway_ip6,
             guest_ipv6: guest_network.guest_ip6,
             prefix_len6: guest_network.prefix_len6,
             upstream_dns: guest_network.upstream_dns,
+            upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
-            mtu: 1500,
+            mtu: usize::from(smolvm_protocol::guest_env::GATEWAY_LINK_MTU),
         },
-        tcp_listeners.as_ref().map(|_| tcp_receiver),
+        Some(tcp_receiver),
+        udp_publish,
         egress,
         fabric,
+        #[cfg(unix)]
+        switch,
     )?;
 
     Ok(VirtioNetworkRuntime {
         queues,
         _frame_bridge: frame_bridge,
-        published_ports: tcp_listeners,
+        published_ports: PublishedPorts {
+            tcp: std::sync::Arc::new(std::sync::Mutex::new(tcp_listeners)),
+            udp: std::sync::Arc::new(udp_mappings),
+        },
+        _published_udp: udp_publisher,
         poll_handle: Some(poll_handle),
     })
 }
@@ -572,6 +764,17 @@ impl VirtioNetworkRuntime {
     /// VM's runtime dir for the node API to read (the runtime is not `Clone`).
     pub fn egress_counter(&self) -> std::sync::Arc<std::sync::atomic::AtomicU64> {
         self.queues.egress_counter()
+    }
+
+    /// A cheap, cloneable read handle to this NIC's open-flow summary, which
+    /// the poll loop refreshes every few seconds, so the launcher can flush it
+    /// to the VM's runtime dir for the node API to read.
+    pub fn flow_summary_slot(&self) -> queues::FlowSummarySlot {
+        self.queues.flow_summary_slot()
+    }
+
+    pub fn published_ports(&self) -> PublishedPorts {
+        self.published_ports.clone()
     }
 
     /// Take ownership of the runtime and block until the libkrun stream closes
@@ -596,7 +799,7 @@ impl Drop for VirtioNetworkRuntime {
     /// here because the frame bridge joins its own threads in its own `Drop`.
     fn drop(&mut self) {
         self.queues.begin_shutdown();
-        self.published_ports = None;
+        self.published_ports.lock().close();
         if let Some(handle) = self.poll_handle.take() {
             let _ = handle.join();
         }
@@ -607,6 +810,18 @@ impl Drop for VirtioNetworkRuntime {
 mod tests {
     use super::*;
     use std::time::UNIX_EPOCH;
+
+    #[test]
+    fn port_mappings_round_trip_through_the_control_format() {
+        let mappings = vec![PortMapping::new(3000, 3000), PortMapping::new(8080, 80)];
+        let rendered = render_port_mappings(&mappings);
+        assert_eq!(rendered, "3000:3000\n8080:80\n");
+        assert_eq!(parse_port_mappings(&rendered).unwrap(), mappings);
+        assert!(parse_port_mappings("").unwrap().is_empty());
+        for bad in ["3000", "a:1", "0:80", "80:0", "70000:80"] {
+            assert!(parse_port_mappings(bad).is_err(), "{bad}");
+        }
+    }
 
     #[test]
     fn formats_timestamped_network_log_prefix() {

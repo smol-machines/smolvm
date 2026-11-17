@@ -103,9 +103,18 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // The getppid()-based reparenting check is POSIX-specific; on Windows the
     // parent-death watchdog is not wired up (the SDK in-process embedder path is
     // a Unix concern here).
+    //
+    // Before exiting it shuts the guest down cleanly once it knows how to reach
+    // the agent, as `machine stop` does: otherwise writes the guest had not
+    // flushed are lost, which a persistent machine booted again later shows
+    // as files that are simply gone.
     #[cfg(unix)]
     if std::env::var_os("SMOLVM_BOOT_WATCH_PARENT").as_deref() == Some(std::ffi::OsStr::new("1")) {
-        crate::process::exit_when_parent_is_not(unsafe { libc::getppid() });
+        crate::process::exit_when_parent_is_not_with(unsafe { libc::getppid() }, || {
+            if let Some(socket) = AGENT_SOCKET.get() {
+                flush_guest_before_exit(socket);
+            }
+        });
     }
 
     // Read boot config
@@ -116,6 +125,8 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
 
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
+    #[cfg(unix)]
+    let _ = AGENT_SOCKET.set(config.vsock_socket.clone());
 
     // Redirect stdio. When SMOLVM_GPU_DEBUG=1, keep stderr pointed at a
     // debug log file so virglrenderer/MoltenVK errors are captured.
@@ -207,29 +218,62 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     // Defense-in-depth before this process becomes the VMM host for an untrusted
     // guest: block setuid privilege escalation and core dumps (which would leak
     // guest RAM). See docs/runtime-isolation-hardening.md for the full roadmap.
-    crate::process::harden_self();
-
-    // A guardian-backed clone needs userfaultfd to resolve faults originating
-    // inside KVM. Open it while this dedicated boot process still has the host
-    // service's privileges; libkrun takes ownership after the uid drop.
+    // When the HOST runs out of memory the kernel should take a branch child
+    // before a plain machine, and a branch source last (its death takes every
+    // child with it). Set before hardening: once this process is non-dumpable its own
+    // /proc/self files are root-owned and even raising the score is refused;
+    // lowering it also needs the privileges still held here.
     #[cfg(target_os = "linux")]
-    preopen_guardian_userfaultfd()?;
+    {
+        let clone = std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some();
+        let source = !clone && std::env::var_os("SMOLVM_FORKABLE").is_some();
+        let adj = crate::process::oom_score_adj_for(source, clone);
+        if adj != 0 {
+            if let Err(e) = crate::process::set_own_oom_score_adj(adj) {
+                eprintln!("[oom] could not set oom_score_adj={adj}: {e}");
+            }
+        }
 
-    // If the supervisor delegated a cgroup v2 root (via SMOLVM_CGROUP_ROOT),
-    // place this VMM in a per-VM cgroup with cpu/pids/memory caps so an untrusted
-    // guest can't peg host CPU, fork-bomb the host, or balloon VMM memory. Inert
-    // when the env var is unset (no delegation) — never blocks boot.
-    #[cfg(target_os = "linux")]
-    if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
-        crate::process::place_in_cgroup(
-            std::path::Path::new(&cgroup_root),
-            config.resources.cpus,
-            config.resources.memory_mib,
-            config.cuda,
-            // Match scope-mode accounting for both sources and restored clones.
-            std::env::var_os("SMOLVM_FORKABLE").is_some()
-                || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
-        );
+        crate::process::harden_self();
+
+        // A guardian-backed clone needs userfaultfd to resolve faults originating
+        // inside KVM. Open it while this dedicated boot process still has the host
+        // service's privileges; libkrun takes ownership after the uid drop.
+        #[cfg(target_os = "linux")]
+        preopen_guardian_userfaultfd()?;
+
+        // If the supervisor delegated a cgroup v2 root (via SMOLVM_CGROUP_ROOT),
+        // place this VMM in a per-VM cgroup with cpu/pids/memory caps so an untrusted
+        // guest can't peg host CPU, fork-bomb the host, or balloon VMM memory. Inert
+        // when the env var is unset (no delegation) — never blocks boot.
+        #[cfg(target_os = "linux")]
+        if let Some(cgroup_root) = std::env::var_os("SMOLVM_CGROUP_ROOT") {
+            // A CPU limit set on the machine holds for every VMM it launches.
+            let vm_dir = config.vsock_socket.parent();
+            let (cpu_limit, cpu_quota) = vm_dir.map_or(
+                (
+                    None,
+                    crate::agent::cpu_limit::effective_quota_usec(config.resources.cpus, None),
+                ),
+                |dir| crate::agent::cpu_limit::launch_limit(dir, config.resources.cpus),
+            );
+            let placed = crate::process::place_in_cgroup(
+                std::path::Path::new(&cgroup_root),
+                cpu_quota,
+                config.resources.memory_mib,
+                config.cuda,
+                // Match scope-mode accounting for both sources and restored clones.
+                std::env::var_os("SMOLVM_FORKABLE").is_some()
+                    || std::env::var_os("SMOLVM_SNAPSHOT_DIR").is_some(),
+            );
+            if let (true, Some(dir)) = (placed, vm_dir) {
+                crate::agent::cpu_limit::record_launch_limit(
+                    dir,
+                    std::process::id() as i32,
+                    cpu_limit,
+                );
+            }
+        }
     }
 
     // Present private backing stores through idmapped mounts in this VMM's own
@@ -239,8 +283,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     {
         // The seed belongs to the launcher uid. A mount is needed only when
         // this VMM will drop to a different, per-VM uid.
-        let seed_dir = std::env::var_os("SMOLVM_VM_UID")
-            .and_then(|_| seed_dir_for_disk(&config.storage_disk_path));
+        let seed_dirs = if std::env::var_os("SMOLVM_VM_UID").is_some() {
+            boot_seed_dirs(&config)
+        } else {
+            Vec::new()
+        };
         let pack = config.pack_idmap_source.as_ref().map(|shared| {
             let target = config.packed_layers_dir.as_ref().unwrap_or_else(|| {
                 eprintln!("[pack-idmap] idmap source set without a mountpoint; refusing to boot");
@@ -248,7 +295,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             });
             (shared.as_path(), target.as_path())
         });
-        if pack.is_none() && seed_dir.is_none() {
+        if pack.is_none() && seed_dirs.is_empty() {
             // No private mount needed for this boot.
         } else {
             let uid: u32 = std::env::var("SMOLVM_VM_UID")
@@ -264,9 +311,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
                 .ok()
                 .and_then(|s| s.parse().ok())
                 .unwrap_or(uid);
-            if let Err(e) =
-                crate::process::setup_private_idmap_mounts(pack, seed_dir.as_deref(), uid, gid)
-            {
+            if let Err(e) = crate::process::setup_private_idmap_mounts(pack, &seed_dirs, uid, gid) {
                 eprintln!("[idmap] failed to mount private backing store, refusing to boot: {e}");
                 if e.raw_os_error() == Some(libc::EINVAL) {
                     eprintln!(
@@ -613,27 +658,6 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         overlay: Some(&overlay_disk),
     };
 
-    // Start DNS filter listener if configured
-    let dns_filter_socket_path = if let Some(ref hosts) = config.dns_filter_hosts {
-        if !hosts.is_empty() {
-            let socket_path = config
-                .vsock_socket
-                .parent()
-                .unwrap_or(std::path::Path::new("/tmp"))
-                .join("dns-filter.sock");
-            if let Err(e) = crate::dns_filter_listener::start(&socket_path, hosts.clone()) {
-                tracing::warn!(error = %e, "failed to start DNS filter listener");
-                None
-            } else {
-                Some(socket_path)
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
     // CUDA-over-vsock opt-in, resolved once here at the boot-config boundary so
     // the launcher receives a typed socket path (it never reads the environment).
     // Two ways in, both inherited by this boot subprocess from the manager:
@@ -710,12 +734,30 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         None
     };
 
+    // Workload logs: the guest streams a detached workload's stdout and
+    // stderr here for the machine's whole life, and this process appends them
+    // to the machine's workload.log.
+    let workload_log_socket: Option<std::path::PathBuf> =
+        config.workload_log.as_ref().and_then(|log| {
+            let socket = config.vsock_socket.with_extension("logs");
+            match crate::workload_log::start(&socket, log) {
+                Ok(()) => Some(socket),
+                Err(e) => {
+                    tracing::warn!(error = %e, "failed to start the workload log listener");
+                    None
+                }
+            }
+        });
+
     proc_timing!("ready to launch");
 
     // Egress telemetry lands in the per-VM dir (the vsock socket's parent), the
     // same dir serve resolves from the machine name — so no name needs threading
     // across the process boundary.
-    let egress_telemetry_path = config.vsock_socket.parent().map(|dir| dir.join("egress"));
+    let egress_telemetry_path = config
+        .vsock_socket
+        .parent()
+        .map(|dir| dir.join(crate::agent::EGRESS_TELEMETRY_FILE));
 
     let cache_layer = cache_disk_layer(&config);
     let result = launch_agent_vm(&LaunchConfig {
@@ -728,9 +770,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         port_mappings: &config.ports,
         resources: config.resources,
         ssh_agent_socket: config.ssh_agent_socket.as_deref(),
-        dns_filter_socket: dns_filter_socket_path.as_deref(),
+        dns_filter_socket: None,
         cuda_socket: cuda_socket.as_deref(),
         docker_socket: docker_socket.as_deref(),
+        workload_log_socket: workload_log_socket.as_deref(),
+        auto_ports: config.auto_ports.as_ref(),
         published_sockets: &config.published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,
@@ -770,7 +814,15 @@ fn boot_disk_backing_paths(
 ) -> Vec<PathBuf> {
     [storage, overlay]
         .into_iter()
-        .chain(extra_disks.iter().map(|(path, _, _)| path.as_path()))
+        // An attached disk is opened in the format it was attached in: only a
+        // qcow2 one has a backing chain to grant, and a raw one whose bytes the
+        // guest made look like qcow2 must not widen what the VMM may read.
+        .chain(
+            extra_disks
+                .iter()
+                .filter(|(_, _, format)| *format == DiskFormat::Qcow2)
+                .map(|(path, _, _)| path.as_path()),
+        )
         .chain(cache_layer)
         .flat_map(qcow2_backing_chain)
         .collect()
@@ -781,6 +833,24 @@ fn cache_disk_layer(config: &crate::agent::boot_config::BootConfig) -> Option<Pa
     config.resources.cache_disk.as_ref()?;
     let dir = config.storage_disk_path.parent()?;
     Some(dir.join(Path::new(crate::data::storage::CACHE_DISK_FILENAME).with_extension("qcow2")))
+}
+
+/// The seeds behind every disk this boot attaches. An export helper boots on a
+/// fresh disk of its own and attaches the source machine's seeded storage as an
+/// extra disk, so looking only at the boot's own storage left that seed
+/// root-only and the dropped VMM could not open the source.
+#[cfg(target_os = "linux")]
+fn boot_seed_dirs(config: &crate::agent::boot_config::BootConfig) -> Vec<PathBuf> {
+    let mut dirs: Vec<PathBuf> = Vec::new();
+    let disks = [&config.storage_disk_path, &config.overlay_disk_path]
+        .into_iter()
+        .chain(config.extra_disks.iter().map(|(path, _, _)| path));
+    for dir in disks.filter_map(|disk| seed_dir_for_disk(disk)) {
+        if !dirs.contains(&dir) {
+            dirs.push(dir);
+        }
+    }
+    dirs
 }
 
 /// Find a seed in the storage backing chain, including a fork's intermediate
@@ -927,5 +997,62 @@ mod backing_chain_tests {
                 vec![golden.clone(), raw.clone()]
             );
         }
+    }
+}
+
+/// The guest agent's socket, known once the boot config is read, for the
+/// parent-death watchdog's clean shutdown.
+#[cfg(unix)]
+static AGENT_SOCKET: std::sync::OnceLock<std::path::PathBuf> = std::sync::OnceLock::new();
+
+/// Longest the parent-death watchdog waits for the guest to shut down before
+/// exiting regardless.
+#[cfg(unix)]
+const PARENT_DEATH_SHUTDOWN: std::time::Duration = std::time::Duration::from_secs(20);
+
+/// Ask the guest to freeze and flush its filesystems and power off, as `machine
+/// stop` does, so a VM whose owner exited keeps what it wrote. Best-effort: an
+/// agent that cannot be reached, or does not answer in time, is left to the
+/// exit that follows.
+#[cfg(unix)]
+fn flush_guest_before_exit(socket: &std::path::Path) {
+    let shutdown = crate::agent::AgentClient::connect(socket)
+        .and_then(|mut client| client.shutdown_within(PARENT_DEATH_SHUTDOWN));
+    if let Err(error) = shutdown {
+        tracing::warn!(%error, "owner exited; could not shut the guest down cleanly before exiting");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod parent_death_tests {
+    /// A guest that never answers must not keep a VM whose owner is gone
+    /// alive: the clean shutdown gives up and the exit goes ahead.
+    #[test]
+    fn an_unresponsive_agent_does_not_hold_up_the_exit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        // Accept and hold the connection without ever replying.
+        let _held = std::thread::spawn(move || {
+            let connection = listener.accept();
+            std::thread::sleep(std::time::Duration::from_secs(60));
+            drop(connection);
+        });
+        let started = std::time::Instant::now();
+        super::flush_guest_before_exit(&socket);
+        assert!(
+            started.elapsed() < super::PARENT_DEATH_SHUTDOWN,
+            "gave up after {:?}",
+            started.elapsed()
+        );
+    }
+
+    /// No agent listening at all (a guest still booting) fails at once.
+    #[test]
+    fn a_missing_agent_fails_at_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let started = std::time::Instant::now();
+        super::flush_guest_before_exit(&dir.path().join("absent.sock"));
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
     }
 }

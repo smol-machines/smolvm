@@ -5,7 +5,7 @@
 
 use crate::data::validate_vm_name;
 use crate::error::{Error, Result};
-use crate::process::{self, ChildProcess};
+use crate::process::{self, ChildProcess, Pid};
 use crate::storage::{DiskFormat, OverlayDisk, StorageDisk};
 use parking_lot::Mutex;
 use smolvm_protocol::AGENT_READY_MARKER;
@@ -20,11 +20,87 @@ use super::{HostMount, PortMapping, VmResources};
 // Configuration Constants
 // ============================================================================
 
-/// Timeout for the agent to become ready after starting.
+/// How long a cold boot may go without visible progress before it counts as
+/// wedged rather than slow.
 const AGENT_READY_TIMEOUT: Duration = Duration::from_secs(30);
+/// The longest a cold boot may take, progress or not. A slow host disk can keep
+/// a progressing boot past [`AGENT_READY_TIMEOUT`]: an image disk's first
+/// flush waits for every byte the host has not yet written.
+const AGENT_READY_MAX: Duration = Duration::from_secs(180);
+/// How often the cold-boot wait looks for progress.
+const BOOT_PROGRESS_INTERVAL: Duration = Duration::from_millis(250);
 /// Restored CUDA clones resume an already-initialized agent accept loop. If it
 /// does not answer within this window, the restore is wedged rather than cold-booting.
 const CLONE_AGENT_READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Evidence that a cold boot is moving: the guest console log grows (the agent
+/// logs each boot stage), or a thread of the VMM waits on disk I/O, which is
+/// what a guest flush waiting for the host to write its disk looks like.
+struct BootProgress {
+    console: Option<PathBuf>,
+    pid: Option<Pid>,
+    console_len: u64,
+    last: Instant,
+}
+
+impl BootProgress {
+    fn new(console: Option<PathBuf>, pid: Option<Pid>, now: Instant) -> Self {
+        let console_len = console_len(console.as_deref());
+        Self {
+            console,
+            pid,
+            console_len,
+            last: now,
+        }
+    }
+
+    /// Record progress seen since the last look.
+    fn observe(&mut self, now: Instant) {
+        let len = console_len(self.console.as_deref());
+        let grew = len > self.console_len;
+        self.console_len = len;
+        if grew || self.pid.is_some_and(vmm_waits_on_io) {
+            self.last = now;
+        }
+    }
+
+    /// How long the boot has shown no progress.
+    fn idle_for(&self, now: Instant) -> Duration {
+        now.saturating_duration_since(self.last)
+    }
+}
+
+fn console_len(path: Option<&Path>) -> u64 {
+    path.and_then(|path| std::fs::metadata(path).ok())
+        .map_or(0, |meta| meta.len())
+}
+
+/// Whether any thread of `pid` is in uninterruptible disk wait (`D`). Readable
+/// for a non-dumpable process: `/proc/<pid>/task/<tid>/stat` is world-readable.
+#[cfg(target_os = "linux")]
+fn vmm_waits_on_io(pid: Pid) -> bool {
+    let Ok(tasks) = std::fs::read_dir(format!("/proc/{pid}/task")) else {
+        return false;
+    };
+    tasks.flatten().any(|task| {
+        std::fs::read_to_string(task.path().join("stat"))
+            .ok()
+            .and_then(|stat| task_state(&stat))
+            == Some('D')
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+fn vmm_waits_on_io(_pid: Pid) -> bool {
+    false
+}
+
+/// The state letter of a `/proc/.../stat` line: the first field after the
+/// command, which is parenthesized and may itself contain spaces or `)`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn task_state(stat: &str) -> Option<char> {
+    stat.rsplit_once(')')?.1.trim_start().chars().next()
+}
 
 fn agent_ready_timeout(is_cuda_clone: bool) -> Duration {
     if is_cuda_clone {
@@ -37,9 +113,18 @@ fn agent_ready_timeout(is_cuda_clone: bool) -> Duration {
 // Re-use shared polling constants from process module.
 use crate::process::FAST_POLL_INTERVAL;
 
-/// Timeout for agent to stop gracefully before force kill.
+/// How long a stop whose shutdown handshake failed waits for the VM to have
+/// exited on its own before reporting it left alive for a retry.
 /// Reduced from 5s - VMs typically exit within 100ms after shutdown signal.
 const AGENT_STOP_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// How long a VM whose guest acknowledged shutdown gets after SIGTERM before
+/// SIGKILL. The VMM writes each disk image out on exit: the qcow2 metadata
+/// that keeps the image consistent takes about a millisecond, but the fsync
+/// that makes it durable against a host crash takes seconds on a large image
+/// (4.8 s measured for 4 GiB of scattered new clusters), and SIGKILL would
+/// cut it short. A VMM that exits sooner ends the wait sooner.
+const VM_EXIT_FLUSH_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// Timeout when waiting for agent to stop.
 const WAIT_FOR_STOP_TIMEOUT: Duration = Duration::from_secs(10);
@@ -245,6 +330,7 @@ pub fn docker_config_mount() -> Option<HostMount> {
         target: PathBuf::from("/root/.docker"),
         read_only: true,
         staged: false,
+        recorded_ownership: false,
     })
 }
 
@@ -304,6 +390,43 @@ struct AgentInner {
 /// name-path exceeds the kernel socket budget, so we don't offer it.
 pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
+}
+
+/// Whether the VM named `name` is running as a branch source: what its running
+/// configuration (`agent.config.json` in its data directory, written at launch
+/// and removed at stop) says. `None` when there is none to read: the machine is
+/// not running, or an engine that predates the record started it.
+pub fn running_forkable(name: &str) -> Option<bool> {
+    forkable_in_running_config(&vm_data_dir(name).join("agent.config.json"))
+}
+
+fn forkable_in_running_config(path: &Path) -> Option<bool> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RunningVmConfig>(&content)
+        .ok()
+        .map(|config| config.forkable)
+}
+
+/// Whether `record`'s machine can be branched as it is now. A running machine is
+/// what it was launched as: `machine start --branchable` on a machine created
+/// without it makes a branch source that the record alone would deny, and the
+/// record alone would promise a source of a machine that was started plain.
+/// A machine that is not running is what its next ordinary start launches,
+/// [`VmRecord::forkable_on_start`].
+pub fn branchable_now(
+    record: &crate::config::VmRecord,
+    state: &crate::config::RecordState,
+) -> bool {
+    let running = (*state == crate::config::RecordState::Running)
+        .then(|| running_forkable(&record.name))
+        .flatten();
+    branchable_from(record, running)
+}
+
+/// [`branchable_now`] with the running configuration's answer already read:
+/// it decides for a running machine, the record for every other.
+fn branchable_from(record: &crate::config::VmRecord, running_forkable: Option<bool>) -> bool {
+    running_forkable.unwrap_or_else(|| record.forkable_on_start())
 }
 
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
@@ -397,8 +520,9 @@ pub fn resolve_disk_image(dir: &Path, raw_filename: &str) -> (PathBuf, DiskForma
 /// this lives *under* the machine's own [`vm_data_dir`], which means:
 /// - it is reclaimed for free when the data dir is removed on delete;
 /// - it is outside `pack prune`'s scope (never reaped while the machine exists);
-/// - the macOS case-sensitive layers volume is owned 1:1 by the machine, so the
-///   stop/delete paths can detach it unconditionally with no co-tenant risk.
+/// - the macOS case-sensitive volume is owned by this machine and any fork
+///   children linking to it. Stop/delete detach it once those references are
+///   removed; standalone process-lease orphan sweeping never reclaims it.
 ///
 /// The subdir is `pack` (deliberately not `layers`) so it cannot collide with
 /// the `layers/` subtree that `extract_sidecar` creates *inside* this directory.
@@ -445,8 +569,22 @@ pub fn read_shared_pack_pointer(layers_cache_dir: &std::path::Path) -> Option<Pa
 /// sockets and console between the two processes. Resolved from the name on both
 /// sides, so no path needs to be threaded across the process boundary.
 pub fn egress_telemetry_file(name: &str) -> PathBuf {
-    vm_data_dir(name).join("egress")
+    vm_data_dir(name).join(EGRESS_TELEMETRY_FILE)
 }
+
+/// Per-VM open-flow summary file: `<vm_data_dir>/egress-flows`. The VM
+/// subprocess rewrites it (temp file + rename) from the network stack's flow
+/// table; serve reads it when building `MachineInfo`. Resolved from the name on
+/// both sides of the process boundary, like [`egress_telemetry_file`].
+pub fn egress_flows_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(EGRESS_FLOWS_FILE)
+}
+
+/// File name of the per-VM open-flow summary inside the VM data dir.
+pub const EGRESS_FLOWS_FILE: &str = "egress-flows";
+
+/// File name of [`egress_telemetry_file`] inside the per-VM dir.
+pub const EGRESS_TELEMETRY_FILE: &str = "egress";
 
 /// Per-VM egress denial audit log: `<vm_data_dir>/egress-denials.log`. The
 /// virtio-net runtime appends one line per denied connect/sendto/resolve
@@ -459,44 +597,177 @@ pub fn egress_denials_log_file(name: &str) -> PathBuf {
 }
 
 /// Replace a running machine's allow list with `record`'s, through the egress
-/// control socket its network runtime serves. Returns once the runtime has the
-/// new list in force.
-pub fn apply_live_egress_policy(name: &str, record: &crate::config::VmRecord) -> Result<()> {
-    use std::io::{Read, Write};
-    let fail = |reason: String| {
+/// control socket its network runtime serves. With `with_rules`, the message
+/// also carries a `rules <json>` line that replaces the runtime's whole ordered
+/// rule list with `record.egress_rules` (deny rules included; the runtime keeps
+/// its `--allow-private` exceptions); without it the rules stay as they are.
+/// Returns once the runtime has the new policy in force.
+pub fn apply_live_egress_policy(
+    name: &str,
+    record: &crate::config::VmRecord,
+    with_rules: bool,
+) -> Result<()> {
+    let mut rendered = smolvm_network::egress::render_live_policy(
+        record.allowed_cidrs.as_deref().unwrap_or(&[]),
+        record.dns_filter_hosts.as_deref().unwrap_or(&[]),
+    );
+    if with_rules {
+        let rules = smolvm_network::egress::render_live_rules(&record.egress_rules)
+            .map_err(|reason| Error::config("egress policy", reason))?;
+        rendered.push_str(&rules);
+    }
+    send_live_change(name, smolvm_network::EGRESS_SOCKET, &rendered).map_err(|reason| {
+        let reason = live_egress_refusal(reason, with_rules);
         Error::config(
             "egress policy",
             format!("could not change machine '{name}''s allow list while it runs: {reason}"),
         )
-    };
-    let path = vm_data_dir(name).join(smolvm_network::EGRESS_SOCKET);
+    })
+}
+
+#[allow(missing_docs)]
+pub fn lock_live_egress(name: &str) -> Result<std::fs::File> {
+    lock_live_egress_at(&vm_data_dir(name).join("egress-update.lock"))
+}
+
+fn lock_live_egress_at(path: &Path) -> Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(path)
+        .map_err(|error| Error::agent("egress update lock", error.to_string()))?;
+    super::fork::lock_file_exclusive(&file)
+        .map_err(|error| Error::agent("egress update lock", error.to_string()))?;
+    Ok(file)
+}
+
+fn live_egress_refusal(reason: String, with_rules: bool) -> String {
+    if with_rules && reason.contains("expected `cidr <range>` or `host <name>`") {
+        return format!(
+            "{reason}; this machine was started before live UDP allow changes were supported and needs a restart"
+        );
+    }
+    reason
+}
+
+/// Publish exactly `ports` on a running machine through the ports control
+/// socket its network runtime serves. Returns once the listeners match.
+pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()> {
+    // A replace names the whole set, so it keeps the ports this run picked
+    // itself: they are not in `ports`, which holds the configured ones.
+    let allocated = crate::db::SmolvmDb::open()?
+        .get_vm(name)?
+        .map(|record| record.live_allocated_ports())
+        .unwrap_or_default();
+    let mappings = published_set(ports, &allocated);
+    let rendered = smolvm_network::render_port_mappings(&mappings);
+    send_live_change(name, smolvm_network::PORTS_SOCKET, &rendered).map_err(|reason| {
+        Error::config(
+            "published ports",
+            format!("could not change machine '{name}''s published ports while it runs: {reason}"),
+        )
+    })
+}
+
+/// The whole TCP set a running machine publishes: its configured `ports`, then
+/// the `allocated` ones its run picked that the configured set does not already
+/// name by host port.
+fn published_set(
+    ports: &[(u16, u16)],
+    allocated: &[(u16, u16)],
+) -> Vec<smolvm_network::PortMapping> {
+    let mut mappings: Vec<smolvm_network::PortMapping> = ports
+        .iter()
+        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
+        .collect();
+    for &(host, guest) in allocated {
+        if !mappings.iter().any(|mapping| mapping.host == host) {
+            mappings.push(smolvm_network::PortMapping::new(host, guest));
+        }
+    }
+    mappings
+}
+
+/// Hand running machine `name` new values for its credential bindings, by
+/// binding name: its next request to a bound host uses them.
+pub fn apply_live_credential_values(
+    name: &str,
+    values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
+) -> Result<()> {
+    let values: std::collections::BTreeMap<&str, &str> = values
+        .iter()
+        .map(|(binding, value)| (binding.as_str(), value.as_str()))
+        .collect();
+    let request = zeroize::Zeroizing::new(serde_json::json!({ "values": values }).to_string());
+    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
+        Error::config(
+            "credentials",
+            format!(
+                "could not hand machine '{name}' its new credential values while it runs: {reason}"
+            ),
+        )
+    })
+}
+
+fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    let reply = send_live_request(name, socket, rendered)?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    }
+}
+
+pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
+    let reply = send_live_request(
+        name,
+        smolvm_network::PORTS_SOCKET,
+        &format!("allocate {guest}\n"),
+    )
+    .map_err(|reason| Error::config("atomic port publication", reason))?;
+    let mapping = reply
+        .trim()
+        .strip_prefix("ok ")
+        .and_then(|ports| ports.split_once(':'))
+        .and_then(|(host, returned_guest)| {
+            Some((
+                host.parse::<u16>().ok()?,
+                returned_guest.parse::<u16>().ok()?,
+            ))
+        })
+        .filter(|(host, returned_guest)| *host != 0 && *returned_guest == guest)
+        .ok_or_else(|| {
+            Error::config(
+                "atomic port publication",
+                "machine does not support atomic port allocation",
+            )
+        })?;
+    Ok(mapping.0)
+}
+
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
+    use std::io::{Read, Write};
+    let path = vm_data_dir(name).join(socket);
     let mut stream =
         crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
             |e| {
-                fail(format!(
-                    "{e}; a machine started before live changes were supported needs a restart"
-                ))
+                format!("{e}; a machine started before live changes were supported needs a restart")
             },
         )?;
-    let rendered = smolvm_network::egress::render_live_policy(
-        record.allowed_cidrs.as_deref().unwrap_or(&[]),
-        record.dns_filter_hosts.as_deref().unwrap_or(&[]),
-    );
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
         .and_then(|()| stream.shutdown(std::net::Shutdown::Write))
-        .map_err(|e| fail(e.to_string()))?;
+        .map_err(|e| e.to_string())?;
     let mut reply = String::new();
     stream
         .read_to_string(&mut reply)
-        .map_err(|e| fail(e.to_string()))?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(fail(
-            other.strip_prefix("error: ").unwrap_or(other).to_string(),
-        )),
-    }
+        .map_err(|e| e.to_string())?;
+    Ok(reply)
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
@@ -581,7 +852,8 @@ fn parse_egress_denial_line(line: &str) -> Option<EgressDenial> {
 }
 
 /// Per-VM egress signal log: `<vm_data_dir>/egress-signals.log`, where the
-/// virtio-net runtime records matches against the operator's egress watchlist.
+/// virtio-net runtime records matches against the operator's egress watchlist
+/// and stratum handshakes.
 pub fn egress_signals_log_file(name: &str) -> PathBuf {
     vm_data_dir(name).join(smolvm_network::EGRESS_SIGNALS_LOG)
 }
@@ -591,9 +863,11 @@ pub fn egress_signals_log_file(name: &str) -> PathBuf {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct EgressSignal {
-    /// The watchlist entry's label, as written in the watchlist file.
+    /// The watchlist entry's label, as written in the watchlist file, or
+    /// `stratum` for a miner's pool login.
     pub label: String,
-    /// What matched: the name asked in a DNS question, or `ip:port`.
+    /// What matched: the name asked in a DNS question or a TLS ClientHello,
+    /// or `ip:port`.
     pub dest: String,
     /// How many times it was recorded in the recent log. A repeat within a
     /// minute is recorded once, so this counts minutes with activity, roughly.
@@ -619,8 +893,8 @@ pub fn read_mediation_machine_id(name: &str) -> Option<String> {
     Some(id.iter().map(|byte| format!("{byte:02x}")).collect())
 }
 
-/// Summarize the watchlist matches recorded for `name`, latest first, or `None`
-/// when there are none (no watchlist, or nothing matched). Only the log's
+/// Summarize the signals recorded for `name`, latest first, or `None` when
+/// there are none. Only the log's
 /// recent tail is read, bounding the work per machine-info call.
 pub fn read_egress_signals(name: &str) -> Option<Vec<EgressSignal>> {
     read_egress_signals_at(&egress_signals_log_file(name))
@@ -699,24 +973,491 @@ pub fn spawn_egress_flush(
     path: std::path::PathBuf,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    std::thread::spawn(move || loop {
-        let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = std::fs::write(&path, bytes.to_string()) {
-            tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+    std::thread::spawn(move || {
+        let mut file = SampleFile::new(path.clone());
+        loop {
+            let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = write_egress_telemetry(&mut file, bytes) {
+                tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
         }
-        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
     });
 }
 
+/// Bytes every per-VM sample file is padded to with trailing spaces, which
+/// JSON and integer parsing both ignore. A shorter sample then overwrites a
+/// longer one whole, with no truncate between.
+const SAMPLE_FILE_PAD: usize = 1024;
+
+/// A small per-VM sample file a thread in the VM subprocess rewrites every
+/// few seconds, kept open and overwritten in place.
+///
+/// These files used to be written to a temp file renamed over the old one.
+/// On XFS each such rename frees the replaced inode through the allocation
+/// group's AGI buffer and holds the directory's lock meanwhile; on 2026-11-12
+/// a VMM throttled for memory inside an XFS create held that AGI lock, every
+/// VMM's sampler queued on it holding its VM directory's lock, and serve
+/// blocked opening files in those directories. An in-place overwrite of
+/// already allocated bytes creates, frees and renames nothing. One `write` of
+/// the whole padded buffer is atomic against a reader on XFS (buffered reads
+/// and writes take the inode's I/O lock); elsewhere a torn read fails to parse
+/// and reads as no sample, as a missing file does.
+struct SampleFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl SampleFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            buf: Vec::with_capacity(SAMPLE_FILE_PAD),
+        }
+    }
+
+    /// Replace the file's content with `content`.
+    fn write(&mut self, content: &[u8]) -> std::io::Result<()> {
+        self.buf.clear();
+        self.buf.extend_from_slice(content);
+        let len = self.buf.len().max(SAMPLE_FILE_PAD);
+        self.buf.resize(len, b' ');
+        if self.file.is_none() {
+            self.file = Some(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.path)?,
+            );
+        }
+        let file = self.file.as_mut().expect("opened above");
+        let written = overwrite_whole(file, &self.buf);
+        if written.is_err() {
+            // Reopen next time (the file may have been removed).
+            self.file = None;
+        }
+        written
+    }
+}
+
+fn overwrite_whole(file: &mut std::fs::File, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(buf)?;
+    // Only a file left longer by an older writer needs trimming.
+    if file.metadata()?.len() > buf.len() as u64 {
+        file.set_len(buf.len() as u64)?;
+    }
+    Ok(())
+}
+
+/// Open TCP flows of a running machine, as last flushed by its network stack.
+/// Outbound flows are the guest's own connections; inbound ones arrived on a
+/// published port.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct EgressFlowSummary {
+    /// Open guest-initiated TCP flows.
+    pub outbound_open: u32,
+    /// Open published-port TCP flows.
+    pub inbound_open: u32,
+    /// Distinct destination IPs among the open outbound flows.
+    pub distinct_outbound_peers: u32,
+    /// Age in seconds, as of `updatedAt`, of the longest-lived open outbound
+    /// flow; 0 when there is none.
+    pub oldest_outbound_secs: u64,
+    /// `ip:port` of the longest-lived open outbound flow.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oldest_outbound_dest: Option<String>,
+    /// When the summary was taken (RFC 3339).
+    pub updated_at: String,
+}
+
+impl EgressFlowSummary {
+    fn from_network(at: std::time::SystemTime, summary: &smolvm_network::FlowSummary) -> Self {
+        Self {
+            outbound_open: summary.outbound_open,
+            inbound_open: summary.inbound_open,
+            distinct_outbound_peers: summary.distinct_outbound_peers,
+            oldest_outbound_secs: summary.oldest_outbound_secs,
+            oldest_outbound_dest: summary.oldest_outbound_dest.map(|dest| dest.to_string()),
+            updated_at: humantime::format_rfc3339_seconds(at).to_string(),
+        }
+    }
+}
+
+/// A flow summary older than this is stale: the network stack that wrote it
+/// stopped refreshing it, so it no longer describes the machine.
+const EGRESS_FLOWS_STALE_SECS: u64 = 120;
+
+/// Spawn a detached thread (in the VM subprocess) that rewrites the per-VM
+/// open-flow summary file from `slot` every [`EGRESS_FLUSH_SECS`], in place
+/// (see [`SampleFile`]). Best-effort, like [`spawn_egress_flush`].
+#[cfg_attr(not(unix), allow(dead_code))]
+pub fn spawn_egress_flows_flush(
+    path: std::path::PathBuf,
+    slot: smolvm_network::queues::FlowSummarySlot,
+) {
+    let spawned = std::thread::Builder::new()
+        .name("smolvm-egress-flows".into())
+        .spawn(move || {
+            let mut file = SampleFile::new(path.clone());
+            loop {
+            let latest = slot
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .clone();
+            if let Some((at, summary)) = latest {
+                if let Err(e) =
+                    write_egress_flows(&mut file, &EgressFlowSummary::from_network(at, &summary))
+                {
+                    tracing::debug!(path = ?path, error = %e, "egress flow summary flush failed");
+                }
+            }
+            std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "egress flow summary flusher did not start");
+    }
+}
+
+fn write_egress_flows(file: &mut SampleFile, summary: &EgressFlowSummary) -> std::io::Result<()> {
+    file.write(&serde_json::to_vec(summary)?)
+}
+
+/// Read a running machine's open-flow summary written by
+/// [`spawn_egress_flows_flush`]. `None` when the machine is not running, the
+/// file is absent (TSI machine, or not yet flushed) or unparseable, or the
+/// summary is stale.
+pub fn read_egress_flows(name: &str, running: bool) -> Option<EgressFlowSummary> {
+    if !running {
+        return None;
+    }
+    let text = std::fs::read_to_string(egress_flows_file(name)).ok()?;
+    parse_egress_flows(&text, std::time::SystemTime::now())
+}
+
+fn parse_egress_flows(text: &str, now: std::time::SystemTime) -> Option<EgressFlowSummary> {
+    let summary: EgressFlowSummary = serde_json::from_str(text).ok()?;
+    let at = humantime::parse_rfc3339(&summary.updated_at).ok()?;
+    // A summary from the future (clock step) is kept; one too old is not.
+    let age = now.duration_since(at).unwrap_or_default();
+    (age.as_secs() <= EGRESS_FLOWS_STALE_SECS).then_some(summary)
+}
+
+/// Per-VM guest pressure file: `<vm_data_dir>/pressure`. The VM subprocess
+/// rewrites it from the guest agent's `PressureStatus` answer; serve reads it
+/// when building `MachineInfo`, like [`egress_flows_file`].
+pub fn pressure_file(name: &str) -> PathBuf {
+    vm_data_dir(name).join(PRESSURE_FILE)
+}
+
+/// File name of the per-VM guest pressure sample inside the VM data dir.
+pub const PRESSURE_FILE: &str = "pressure";
+
+/// How often the VM subprocess asks the guest for its pressure stalls.
+const PRESSURE_SAMPLE_SECS: u64 = 15;
+
+/// How long the sampler waits for the guest before giving up on one sample.
+const PRESSURE_SAMPLE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A guest pressure sample older than this is stale: the sampler that wrote it
+/// has stopped, so it no longer describes the machine.
+const PRESSURE_STALE_SECS: u64 = 120;
+
+/// The guest's pressure stall information, as last sampled from its kernel.
+///
+/// Each resource carries the kernel's `some` and `full` shares (percent over
+/// the last 10, 60 and 300 seconds) and the stalled time since boot in
+/// microseconds, so a reader keeping samples can compute the share over its
+/// own window from the totals.
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureStall {
+    /// Share of the last 10 s with at least one task stalled, in percent.
+    pub some_avg10: f64,
+    /// Share of the last 60 s with at least one task stalled, in percent.
+    pub some_avg60: f64,
+    /// Share of the last 300 s with at least one task stalled, in percent.
+    pub some_avg300: f64,
+    /// Microseconds since boot with at least one task stalled.
+    pub some_total_us: u64,
+    /// Share of the last 10 s with every task stalled, in percent. Always 0
+    /// for CPU.
+    pub full_avg10: f64,
+    /// Share of the last 60 s with every task stalled, in percent.
+    pub full_avg60: f64,
+    /// Share of the last 300 s with every task stalled, in percent.
+    pub full_avg300: f64,
+    /// Microseconds since boot with every task stalled.
+    pub full_total_us: u64,
+}
+
+impl From<smolvm_protocol::PressureStall> for PressureStall {
+    fn from(s: smolvm_protocol::PressureStall) -> Self {
+        Self {
+            some_avg10: s.some_avg10,
+            some_avg60: s.some_avg60,
+            some_avg300: s.some_avg300,
+            some_total_us: s.some_total_us,
+            full_avg10: s.full_avg10,
+            full_avg60: s.full_avg60,
+            full_avg300: s.full_avg300,
+            full_total_us: s.full_total_us,
+        }
+    }
+}
+
+/// Pressure stall information of a running machine's guest, from
+/// `/proc/pressure/{cpu,memory,io}` inside it, refreshed about every 15 s.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct GuestPressure {
+    /// Time tasks waited for a CPU.
+    pub cpu: PressureStall,
+    /// Time tasks waited for memory: reclaim, swap and refaults.
+    pub memory: PressureStall,
+    /// Time tasks waited for block IO.
+    pub io: PressureStall,
+    /// When the sample was taken (RFC 3339).
+    pub updated_at: String,
+}
+
+impl GuestPressure {
+    fn from_status(at: std::time::SystemTime, status: smolvm_protocol::PressureStatus) -> Self {
+        Self {
+            cpu: status.cpu.into(),
+            memory: status.memory.into(),
+            io: status.io.into(),
+            updated_at: humantime::format_rfc3339_seconds(at).to_string(),
+        }
+    }
+}
+
+/// Spawn a detached thread (in the VM subprocess) that asks the guest agent
+/// for its pressure stalls every [`PRESSURE_SAMPLE_SECS`] and rewrites `path`
+/// with the answer, in place (see [`SampleFile`]).
+///
+/// Best-effort, like [`spawn_egress_flows_flush`]: a guest that is not up yet
+/// or is paused costs one short timeout and the sample is retried next tick.
+/// An agent that rejects the request (older than it, or a kernel without
+/// PSI) ends the thread, since every later answer would be the same.
+pub fn spawn_pressure_sampler(vsock_socket: PathBuf, path: PathBuf) {
+    let _ = std::fs::remove_file(&path);
+    let spawned = std::thread::Builder::new()
+        .name("smolvm-pressure".into())
+        .spawn(move || {
+            let mut client: Option<super::AgentClient> = None;
+            let mut file = SampleFile::new(path.clone());
+            loop {
+                std::thread::sleep(Duration::from_secs(PRESSURE_SAMPLE_SECS));
+                let connected = match client.as_mut() {
+                    Some(c) => c,
+                    None => match super::AgentClient::connect_for_sampling(
+                        &vsock_socket,
+                        PRESSURE_SAMPLE_TIMEOUT,
+                    ) {
+                        Ok(c) => client.insert(c),
+                        Err(e) => {
+                            tracing::debug!(error = %e, "pressure sampler could not reach the agent");
+                            continue;
+                        }
+                    },
+                };
+                match sample_pressure(connected) {
+                    Ok(status) => {
+                        let sample =
+                            GuestPressure::from_status(std::time::SystemTime::now(), status);
+                        if let Err(e) = write_pressure(&mut file, &sample) {
+                            tracing::debug!(path = ?path, error = %e, "pressure sample write failed");
+                        }
+                    }
+                    Err(PressureFailure::Transient) => client = None,
+                    Err(PressureFailure::Unsupported(reason)) => {
+                        tracing::debug!(reason = %reason, "guest reports no pressure; sampler stopped");
+                        let _ = std::fs::remove_file(&path);
+                        return;
+                    }
+                }
+            }
+        });
+    if let Err(e) = spawned {
+        tracing::debug!(error = %e, "pressure sampler did not start");
+    }
+}
+
+enum PressureFailure {
+    /// The socket failed; reconnect next tick.
+    Transient,
+    /// The agent refused the request; it will refuse every later one too.
+    Unsupported(String),
+}
+
+fn sample_pressure(
+    client: &mut super::AgentClient,
+) -> std::result::Result<smolvm_protocol::PressureStatus, PressureFailure> {
+    match client.pressure_status_or_refusal() {
+        Ok(Ok(status)) => Ok(status),
+        Ok(Err(refusal)) => Err(PressureFailure::Unsupported(refusal)),
+        Err(_) => Err(PressureFailure::Transient),
+    }
+}
+
+fn write_pressure(file: &mut SampleFile, sample: &GuestPressure) -> std::io::Result<()> {
+    file.write(&serde_json::to_vec(sample)?)
+}
+
+/// Read a running machine's guest pressure sample written by
+/// [`spawn_pressure_sampler`]. `None` when the machine is not running, the
+/// file is absent (guest not sampled yet, or without PSI) or unparseable, or
+/// the sample is stale.
+pub fn read_guest_pressure(name: &str, running: bool) -> Option<GuestPressure> {
+    if !running {
+        return None;
+    }
+    let text = std::fs::read_to_string(pressure_file(name)).ok()?;
+    parse_guest_pressure(&text, std::time::SystemTime::now())
+}
+
+fn parse_guest_pressure(text: &str, now: std::time::SystemTime) -> Option<GuestPressure> {
+    let sample: GuestPressure = serde_json::from_str(text).ok()?;
+    let at = humantime::parse_rfc3339(&sample.updated_at).ok()?;
+    let age = now.duration_since(at).unwrap_or_default();
+    (age.as_secs() <= PRESSURE_STALE_SECS).then_some(sample)
+}
+
+#[cfg(test)]
+mod pressure_tests {
+    use super::*;
+
+    fn status() -> smolvm_protocol::PressureStatus {
+        smolvm_protocol::PressureStatus {
+            cpu: smolvm_protocol::PressureStall {
+                some_avg10: 12.5,
+                some_total_us: 1_000_000,
+                ..Default::default()
+            },
+            memory: smolvm_protocol::PressureStall {
+                full_avg10: 3.0,
+                full_total_us: 20_000,
+                ..Default::default()
+            },
+            io: Default::default(),
+        }
+    }
+
+    #[test]
+    fn a_fresh_sample_round_trips_and_a_stale_one_is_dropped() {
+        let at = std::time::SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000);
+        let sample = GuestPressure::from_status(at, status());
+        let text = serde_json::to_string(&sample).unwrap();
+        assert!(text.contains("\"someAvg10\":12.5"));
+        assert!(text.contains("\"fullTotalUs\":20000"));
+
+        let read = parse_guest_pressure(&text, at + Duration::from_secs(30)).expect("fresh");
+        assert_eq!(read, sample);
+        assert_eq!(
+            parse_guest_pressure(&text, at + Duration::from_secs(121)),
+            None
+        );
+        assert_eq!(parse_guest_pressure("{}", at), None);
+    }
+
+    #[test]
+    fn the_file_is_written_whole_and_only_read_while_running() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(PRESSURE_FILE);
+        let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
+        write_pressure(&mut SampleFile::new(path.clone()), &sample).unwrap();
+        // Rewritten in place: no staging file, no rename.
+        assert!(!path.with_extension("tmp").exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_guest_pressure(&text, std::time::SystemTime::now()),
+            Some(sample)
+        );
+        assert_eq!(
+            read_guest_pressure("no-such-machine-for-pressure", false),
+            None
+        );
+    }
+
+    #[test]
+    fn a_sample_file_is_overwritten_in_place_and_a_shorter_value_reads_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress");
+        let mut file = SampleFile::new(path.clone());
+        file.write(b"123456789").unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        file.write(b"42").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len(), SAMPLE_FILE_PAD);
+        assert_eq!(text.trim().parse::<u64>().unwrap(), 42);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode,
+                "same inode, no rename"
+            );
+        }
+        // JSON samples parse with the padding.
+        let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
+        write_pressure(&mut file, &sample).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_guest_pressure(&text, std::time::SystemTime::now()),
+            Some(sample)
+        );
+        // A file left longer by an older writer is trimmed to the padded size.
+        std::fs::write(&path, vec![b'9'; SAMPLE_FILE_PAD * 2]).unwrap();
+        let mut fresh = SampleFile::new(path.clone());
+        fresh.write(b"7").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "7");
+    }
+}
+
+/// Staging path older flushers wrote before renaming over the telemetry file;
+/// still removed with it.
+fn egress_telemetry_staging(path: &Path) -> PathBuf {
+    path.with_extension("tmp")
+}
+
+/// Replace the telemetry file's value with `bytes`, in place (see
+/// [`SampleFile`]).
+#[cfg_attr(not(unix), allow(dead_code))]
+fn write_egress_telemetry(file: &mut SampleFile, bytes: u64) -> std::io::Result<()> {
+    file.write(bytes.to_string().as_bytes())
+}
+
+/// Drop the previous VMM process's egress total before a new one launches.
+/// The counter is cumulative since its VMM process started, so a value left by
+/// the last run must not be reported under the next run's pid: until the new
+/// VMM's first flush the machine reports no egress, and afterwards only its
+/// own. A missing file (TSI VM, never booted, non-Unix host) is a no-op.
+fn clear_egress_telemetry_at(path: &Path) {
+    let _ = std::fs::remove_file(egress_telemetry_staging(path));
+    let _ = std::fs::remove_file(path);
+}
+
 /// Read the per-VM egress telemetry file written by [`spawn_egress_flush`].
-/// Returns `None` if the file is absent (TSI VM, or not yet flushed) or
-/// unparseable — egress is simply unavailable for that machine.
+/// Returns `None` if the file is absent (TSI VM, or not yet flushed by the
+/// current VMM) or unparseable — egress is simply unavailable for that machine.
 pub fn read_egress_telemetry(name: &str) -> Option<u64> {
-    std::fs::read_to_string(egress_telemetry_file(name))
-        .ok()?
-        .trim()
-        .parse()
-        .ok()
+    read_egress_telemetry_at(&egress_telemetry_file(name))
+}
+
+fn read_egress_telemetry_at(path: &Path) -> Option<u64> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
 }
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
@@ -829,7 +1570,7 @@ fn ready_marker_unwritable(_marker: &Path) -> bool {
 /// signal. socket2's `Domain::UNIX` works on unix AND Windows (Win10+), unlike
 /// std's unix-only `UnixListener`, so this builds on every host. Returns None on
 /// any error — readiness then falls back to the marker/ping.
-fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
+pub fn bind_ready_listener(path: &Path) -> Option<socket2::Socket> {
     let _ = std::fs::remove_file(path);
     let sock = socket2::Socket::new(socket2::Domain::UNIX, socket2::Type::STREAM, None).ok()?;
     sock.bind(&socket2::SockAddr::unix(path).ok()?).ok()?;
@@ -937,6 +1678,9 @@ pub struct AgentManager {
     name: Option<String>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
+    /// A rootfs chosen at launch over `rootfs_path`: a branch boots its
+    /// golden's rootfs, which may not be the installed one after a roll.
+    rootfs_override: std::sync::Mutex<Option<PathBuf>>,
     /// Storage disk for OCI layers.
     storage_disk: StorageDisk,
     /// Overlay disk for persistent rootfs changes.
@@ -1094,7 +1838,13 @@ impl AgentManager {
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("smolvm")
         };
-        std::fs::create_dir_all(&smolvm_runtime)?;
+        // A named machine's directory is made by `ensure_vm_dir` when it is
+        // launched. Observing one (status, exec, stop) must create nothing,
+        // or a name that was never created leaves an empty `vms/<hash>/`
+        // behind. Only the shared runtime dir of ephemeral runs is made here.
+        if name.is_none() {
+            std::fs::create_dir_all(&smolvm_runtime)?;
+        }
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
@@ -1107,6 +1857,7 @@ impl AgentManager {
         Ok(Self {
             name,
             rootfs_path,
+            rootfs_override: std::sync::Mutex::new(None),
             storage_disk,
             overlay_disk,
             vsock_socket,
@@ -1174,7 +1925,10 @@ impl AgentManager {
 
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
         let name = name.into();
-        let rootfs_path = Self::default_rootfs_path()?;
+        let rootfs_path = match access {
+            DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,
+            DiskAccess::Observe => Self::default_rootfs_path()?,
+        };
         // Named VMs get their own storage disk. A launch commits the name→hash
         // binding on first call and detects collisions on subsequent calls
         // (refusing to open a hash dir that belongs to a different name); an
@@ -1206,6 +1960,15 @@ impl AgentManager {
         Self::open(name, DiskAccess::Observe)
     }
 
+    /// The agent rootfs this launch boots.
+    fn rootfs_path(&self) -> PathBuf {
+        self.rootfs_override
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+            .unwrap_or_else(|| self.rootfs_path.clone())
+    }
+
     /// Get the VM name if this is a named agent.
     pub fn name(&self) -> Option<&str> {
         self.name.as_deref()
@@ -1220,6 +1983,20 @@ impl AgentManager {
         };
         let db = crate::db::SmolvmDb::open()?;
         crate::agent::fork::restart_blocking_dependent_clones(&db, name)
+    }
+
+    /// The agent rootfs a launch of `name` boots. A pending live restore
+    /// boots the rootfs its checkpoint pinned (the host's installed one while
+    /// its digest matches, else the store's copy; see `rootfs_store`), since
+    /// the captured processes keep that userland mapped. Any other launch is a
+    /// cold boot on the installed rootfs.
+    fn launch_rootfs_path(name: &str) -> Result<PathBuf> {
+        if let Some(digest) = crate::portable_checkpoint::pinned_rootfs_digest(&vm_data_dir(name)) {
+            let path = crate::agent::rootfs_store::resolve(&digest)?;
+            tracing::info!(machine = name, digest, rootfs = %path.display(), "booting the agent rootfs the restore pinned");
+            return Ok(path);
+        }
+        Self::default_rootfs_path()
     }
 
     /// Get the default path for the agent rootfs.
@@ -1255,7 +2032,11 @@ impl AgentManager {
             if dir.is_dir() {
                 return Ok(dir);
             }
-            for name in ["agent-rootfs.tar.gz", "agent-rootfs.tar"] {
+            for name in [
+                "agent-rootfs.tar.zst",
+                "agent-rootfs.tar.gz",
+                "agent-rootfs.tar",
+            ] {
                 let tar = exe_dir.join(name);
                 if tar.is_file() {
                     return Self::ensure_extracted_rootfs(&tar);
@@ -1354,13 +2135,24 @@ impl AgentManager {
         // Use the system `tar` — it preserves symlinks (e.g. /sbin/init) and modes
         // (the executable agent), which the tar crate handling here would not need
         // to reimplement. Extraction runs on the host before VM boot (unsandboxed).
-        let status = std::process::Command::new("tar")
-            .arg("-xpf")
-            .arg(tar)
-            .arg("-C")
-            .arg(&tmp)
-            .status()
-            .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))?;
+        let status = if tar.extension().is_some_and(|ext| ext == "zst") {
+            Self::extract_zstd_tar(tar, &tmp)
+        } else {
+            std::process::Command::new("tar")
+                .arg("-xpf")
+                .arg(tar)
+                .arg("-C")
+                .arg(&tmp)
+                .status()
+                .map_err(|e| Error::storage("extract rootfs tar", e.to_string()))
+        };
+        let status = match status {
+            Ok(status) => status,
+            Err(e) => {
+                let _ = std::fs::remove_dir_all(&tmp);
+                return Err(e);
+            }
+        };
         // tar's exit status cannot decide this on its own: a healthy Windows
         // extraction also exits non-zero, on the extended-attribute warning.
         if let Err(e) = Self::accept_extraction(&tmp, status) {
@@ -1385,6 +2177,31 @@ impl AgentManager {
             }
         }
         Ok(dest)
+    }
+
+    /// Extract a zstd-compressed rootfs tarball into `dest`: decompressed here
+    /// and streamed into the system `tar`, which then needs no `zstd` program
+    /// of its own (GNU tar shells out to one for `.zst`, and hosts often lack it).
+    fn extract_zstd_tar(tar: &Path, dest: &Path) -> Result<std::process::ExitStatus> {
+        let fail = |e: std::io::Error| Error::storage("extract rootfs tar", e.to_string());
+        let mut decoder = zstd::stream::read::Decoder::new(std::fs::File::open(tar).map_err(fail)?)
+            .map_err(fail)?;
+        let mut child = std::process::Command::new("tar")
+            .arg("-xpf")
+            .arg("-")
+            .arg("-C")
+            .arg(dest)
+            .stdin(std::process::Stdio::piped())
+            .spawn()
+            .map_err(fail)?;
+        let copied = {
+            let mut stdin = child.stdin.take().expect("tar stdin is piped");
+            std::io::copy(&mut decoder, &mut stdin)
+        };
+        let status = child.wait().map_err(fail)?;
+        // A decode error means a damaged tarball, whatever tar made of the rest.
+        copied.map_err(fail)?;
+        Ok(status)
     }
 
     /// Get the current state of the agent.
@@ -1717,6 +2534,9 @@ impl AgentManager {
 
     /// Inner liveness check that accepts a lock guard to avoid double-locking.
     fn is_process_alive_inner(&self, inner: &AgentInner) -> bool {
+        // An embedding process is the VMM's parent: reap (and record) an exit
+        // here, as serve's supervisor tick does.
+        crate::process::reap_vm_children();
         // Try in-memory child handle first (has stored start time)
         if let Some(child) = inner.child.as_ref() {
             return crate::process::is_our_process(child.pid(), child.start_time());
@@ -1813,10 +2633,11 @@ impl AgentManager {
             return Ok(());
         }
         // This runs only on the relaunch path, after stop()/reset_stale_running_state,
-        // so no live VM is using the volume. The original start leaked a lease to keep
-        // it mounted; drop that stale mount (and its lease files) before acquiring a
-        // fresh one, so a config-change restart doesn't stack a second lease/mount on
-        // the first. Gated by the same conditions as the re-acquire below, so the
+        // so this VM is no longer using the volume. The original start leaked a lease
+        // to keep it mounted; drop that stale mount before acquiring a fresh one.
+        // force_detach preserves the mount if fork children still reference it; the
+        // acquisition then reuses it without disturbing their host handles.
+        // Gated by the same conditions as the re-acquire below, so the
         // explicit-start paths (features already `Some`, mount still live) return
         // early above and never detach. macOS hdiutil detach; a no-op on Linux.
         smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
@@ -2034,7 +2855,7 @@ impl AgentManager {
 
     /// Host path of this VM's per-VM readiness marker.
     fn ready_marker_path(&self) -> PathBuf {
-        self.rootfs_path.join(self.ready_marker_name())
+        self.rootfs_path().join(self.ready_marker_name())
     }
 
     /// Common pre-launch setup: validate state, pre-format disks, clean markers.
@@ -2125,7 +2946,7 @@ impl AgentManager {
         }
 
         tracing::info!(
-            rootfs = %self.rootfs_path.display(),
+            rootfs = %self.rootfs_path().display(),
             storage = %self.storage_disk.path().display(),
             socket = %self.vsock_socket.display(),
             mount_count = mounts.len(),
@@ -2158,12 +2979,12 @@ impl AgentManager {
         }
 
         // Validate rootfs exists
-        if !self.rootfs_path.exists() {
+        if !self.rootfs_path().exists() {
             let mut inner = self.inner.lock();
             inner.state = AgentState::Stopped;
             return Err(Error::agent(
                 "verify rootfs",
-                format!("agent rootfs not found: {}", self.rootfs_path.display()),
+                format!("agent rootfs not found: {}", self.rootfs_path().display()),
             ));
         }
 
@@ -2191,12 +3012,27 @@ impl AgentManager {
             });
         }
 
+        self.clear_previous_run_files();
+
+        Ok(())
+    }
+
+    /// Remove per-run files the previous VMM process left in the VM dir.
+    fn clear_previous_run_files(&self) {
         // Clean up old socket and this VM's stale (per-VM) readiness marker.
         let _ = std::fs::remove_file(&self.vsock_socket);
         let _ = std::fs::remove_file(self.ready_marker_path());
         let _ = std::fs::remove_file(&self.startup_error_log);
-
-        Ok(())
+        // The egress counter restarts with the VMM; never report the last
+        // run's total under the process about to be spawned.
+        if let Some(dir) = self.vsock_socket.parent() {
+            clear_egress_telemetry_at(&dir.join(EGRESS_TELEMETRY_FILE));
+            // Same for the open-flow summary: the last run's connections must
+            // not be read as the new process's.
+            let flows = dir.join(EGRESS_FLOWS_FILE);
+            let _ = std::fs::remove_file(flows.with_extension("tmp"));
+            let _ = std::fs::remove_file(&flows);
+        }
     }
 
     fn verify_no_persisted_process(&self) -> Result<()> {
@@ -2205,7 +3041,11 @@ impl AgentManager {
         }
         // The database can retain identity when a PID file is missing.
         if let Some(name) = self.name() {
-            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+            let db = crate::db::SmolvmDb::open()?;
+            // A stopped machine keeps the PID of a process the kernel is
+            // holding: refused while it is present, forgotten once it is gone.
+            super::state_probe::refuse_start_while_held(&db, name)?;
+            if let Some(record) = db.get_vm(name)? {
                 if let Some(pid) = record.pid {
                     refuse_live_launch_pid(pid)?;
                 }
@@ -2352,6 +3192,17 @@ impl AgentManager {
             }
         }
 
+        // Before anything is locked or spawned: a machine that asked for the
+        // host GPU only gets it when the host's device nodes answer. A VM
+        // process that opens a device whose driver is not responding blocks
+        // in the kernel and can never be stopped.
+        super::host_gpu::resolve_for_boot(
+            self.name().unwrap_or("default"),
+            &mut resources,
+            super::requested_display().is_some(),
+            features.snapshot_dir.is_some(),
+        )?;
+
         if let Some(endpoint) = &features.external_interceptor {
             launcher::validate_external_interceptor(
                 endpoint,
@@ -2363,6 +3214,55 @@ impl AgentManager {
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
+                // The userland this boot runs on, for the checkpoints and pauses
+                // taken from it. A branch boots its golden's live snapshot, so
+                // it runs on the golden's rootfs: after a roll that installed a
+                // new rootfs beside the old one, that is the directory the golden
+                // booted, or the store's copy; a host with neither refuses.
+                let mut rootfs_digest =
+                    smolvm_pack::assets::cached_agent_rootfs_digest(&self.rootfs_path())
+                        .map_err(|e| Error::agent("read agent rootfs", e.to_string()))?;
+                if let (Some(snapshot), Some(golden)) = (&features.snapshot_dir, &record.golden) {
+                    if crate::portable_checkpoint::pending_dir(&vm_data_dir(name)).as_deref()
+                        != Some(snapshot.as_path())
+                    {
+                        let golden_record = db.get_vm(golden)?;
+                        let golden_digest = golden_record
+                            .as_ref()
+                            .and_then(|g| g.agent_rootfs_digest.clone());
+                        if let Some(golden_digest) = golden_digest.filter(|d| *d != rootfs_digest) {
+                            let Some(path) = crate::agent::rootfs_store::golden_rootfs(
+                                golden_record
+                                    .as_ref()
+                                    .and_then(|g| g.agent_rootfs_path.as_deref()),
+                                &golden_digest,
+                                &crate::agent::rootfs_store::host(),
+                            ) else {
+                                return Err(Error::agent(
+                                    "branch machine",
+                                    format!(
+                                        "golden '{golden}' runs on agent rootfs {golden_digest}, which this host no longer has (its installed rootfs is {rootfs_digest}); a branch of its live state must boot the same rootfs, so restart the golden before branching it"
+                                    ),
+                                ));
+                            };
+                            tracing::info!(machine = name, golden, digest = %golden_digest, rootfs = %path.display(), "branch boots its golden's agent rootfs");
+                            *self
+                                .rootfs_override
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner()) = Some(path);
+                            rootfs_digest = golden_digest;
+                        }
+                    }
+                }
+                let rootfs_path = self.rootfs_path();
+                if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str())
+                    || record.agent_rootfs_path.as_deref() != Some(rootfs_path.as_path())
+                {
+                    db.update_vm(name, |r| {
+                        r.agent_rootfs_digest = Some(rootfs_digest.clone());
+                        r.agent_rootfs_path = Some(rootfs_path.clone());
+                    })?;
+                }
                 if record.mediated_egress_required {
                     // A persisted mediated boundary cannot be downgraded by
                     // a restart path that only supplies the broker binding.
@@ -2508,12 +3408,14 @@ impl AgentManager {
             if let Some(ref ctl) = features.control_socket {
                 v.push(("SMOLVM_CONTROL_SOCKET", ctl.to_string_lossy().into_owned()));
             }
-            // Idle reclaim is on by default (SMOLVM_IDLE_RECLAIM=0/off
-            // disables); a pulse without host-side release is pure waste, so
-            // the libkrun reclaim gate follows the same switch. libkrun
-            // additionally hard-disables reclaim for forkable (CoW-shared)
-            // guest RAM regardless of this env.
-            if crate::agent::launcher::idle_reclaim_minutes().is_some() {
+            // Hand the pages the guest frees back to the host. On macOS a
+            // free page report or balloon page is only released with this
+            // gate on (Linux and Windows always release), and without it the
+            // guest's idle page-cache reclaim and the idle balloon pulse free
+            // memory the host never gets back. An explicit setting in the
+            // host env wins. libkrun only punches RAM files it owns, so
+            // forkable (CoW-shared) guest RAM stays intact either way.
+            if std::env::var_os("SMOLVM_BALLOON_RECLAIM").is_none() {
                 v.push(("SMOLVM_BALLOON_RECLAIM", "1".to_string()));
             }
             if let Some(ref snap) = features.snapshot_dir {
@@ -2676,7 +3578,7 @@ impl AgentManager {
                 if let Some(parent) = d.parent() {
                     crate::process::ensure_traversable(parent);
                 }
-                crate::process::ensure_traversable(&self.rootfs_path);
+                crate::process::ensure_traversable(&self.rootfs_path());
                 if let Some(home) = dirs::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
                 }
@@ -2753,10 +3655,11 @@ impl AgentManager {
         let packed_layers_dax_window =
             super::virtiofs::packed_layers_window_for_launch(features.snapshot_dir.as_deref());
         let records_window = features.packed_layers_dir.is_some();
+        let leased_layers = features.packed_layers_dir.clone();
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
-            rootfs_path: self.rootfs_path.clone(),
+            rootfs_path: self.rootfs_path(),
             storage_disk_path: self.storage_disk.path().to_path_buf(),
             overlay_disk_path: self.overlay_disk.path().to_path_buf(),
             vsock_socket: self.vsock_socket.clone(),
@@ -2772,6 +3675,7 @@ impl AgentManager {
             // the machine's resources (the embedded SDK/CLI path sets the latter).
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
+            auto_ports: features.auto_ports,
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
@@ -2792,7 +3696,8 @@ impl AgentManager {
                     __d.push((
                         disk.path.clone(),
                         disk.read_only,
-                        crate::data::disk::detect_disk_format(&disk.path),
+                        disk.boot_format()
+                            .map_err(|e| crate::Error::agent("attach disk", e))?,
                     ));
                 }
                 if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
@@ -2811,6 +3716,13 @@ impl AgentManager {
                 __d
             },
             pod_netns: features.pod_netns,
+            // Ephemeral machines share one runtime directory, so only a named
+            // machine keeps a workload log of its own.
+            workload_log: self.name.as_ref().and_then(|_| {
+                self.vsock_socket
+                    .parent()
+                    .map(crate::workload_log::workload_log_path)
+            }),
         };
         // The operator's egress watchlist, copied beside the vsock socket where
         // the network runtime looks for it (or a stale copy removed when none).
@@ -2838,8 +3750,6 @@ impl AgentManager {
         );
 
         // Spawn fresh subprocess (posix_spawn on macOS — safe for multi-threaded parents)
-        let exe = crate::process::self_exe_for_spawn()
-            .map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let spawn_start = Instant::now();
         // Embedders (e.g. the Node SDK, where current_exe is `node`) can point the
         // boot subprocess at a `_boot-vm`-capable, signed helper binary instead of self.
@@ -2859,7 +3769,8 @@ impl AgentManager {
         // `features.watch_parent = Some(false)` — otherwise its persistent
         // machines die the moment the CLI process exits.
         let watch_parent = features.watch_parent.unwrap_or(boot_binary.is_some());
-        let boot_exe = boot_binary.unwrap_or_else(|| exe.clone());
+        let boot_exe =
+            vm_boot_executable().map_err(|e| Error::agent("find smolvm binary", e.to_string()))?;
         let mut cmd = std::process::Command::new(&boot_exe);
         if let Some(service) = crate::network::launch::guest_host_service()
             .map_err(|reason| Error::config("configure guest rollout ingress", reason))?
@@ -3000,7 +3911,12 @@ impl AgentManager {
         // (In non-serve callers without a supervisor this is a harmless no-op —
         // the sweep is only driven from serve.) The `child` handle drops without
         // waiting (Rust `Child::drop` is a no-op), leaving the PID for the sweep.
-        crate::process::register_vm_child(child_pid);
+        crate::process::register_vm_child(child_pid, self.name().map(vm_data_dir));
+        // The layers lease names this launcher; hand it to the VMM so it ends
+        // with the VM rather than with a long-lived `serve`. macOS only.
+        if let Some(layers) = leased_layers.as_deref() {
+            smolvm_pack::extract::hand_machine_layers_lease_to(layers, child_pid);
+        }
         // Captures of this machine record the window its guest booted with.
         if let (Some(name), true) = (self.name(), records_window) {
             if let Some(start) = crate::process::process_start_time(child_pid) {
@@ -3036,12 +3952,13 @@ impl AgentManager {
                     config.cuda,
                     fork_memfd,
                 );
+                // A CPU limit set on the machine holds for every VMM it launches.
+                let (cpu_limit, cpu_quota) =
+                    super::cpu_limit::launch_limit(&vm_data_dir(name), resources_for_config.cpus);
                 let caps = crate::systemd_scope::ScopeCaps {
                     memory_max_bytes: Some(budget.max_bytes),
                     memory_high_bytes: Some(budget.high_bytes),
-                    cpu_quota_usec_per_sec: Some(
-                        u64::from(resources_for_config.cpus.max(1)) * 1_000_000,
-                    ),
+                    cpu_quota_usec_per_sec: Some(cpu_quota),
                     tasks_max: Some(1024),
                 };
                 if let Err(e) = crate::systemd_scope::adopt_into_scope(name, child_pid, &caps) {
@@ -3050,6 +3967,7 @@ impl AgentManager {
                     self.abort_failed_launch(child_pid)?;
                     return Err(Error::agent("adopt VM scope", e.to_string()));
                 }
+                super::cpu_limit::record_launch_limit(&vm_data_dir(name), child_pid, cpu_limit);
                 adopted_scope = Some(name);
             }
         }
@@ -3175,7 +4093,12 @@ impl AgentManager {
         pid: crate::process::Pid,
         start_time: Option<u64>,
         guest_is_paused: bool,
+        stop_timeout: Option<Duration>,
     ) -> Result<()> {
+        // Whatever ends the VMM from here, smolvm asked for it.
+        if let Some(name) = self.name() {
+            crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+        }
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
         // then refuse the stop. Identity is still verified below, from the PID
@@ -3197,7 +4120,10 @@ impl AgentManager {
                 connected = connection.is_ok(),
                 "shutdown agent connect finished"
             );
-            let shutdown = connection.and_then(|mut client| client.shutdown());
+            let shutdown = connection.and_then(|mut client| match stop_timeout {
+                Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
+                None => client.shutdown(),
+            });
             let acked = shutdown.is_ok();
 
             // Process identity is not proof that guest writes reached disk. A slow
@@ -3211,6 +4137,20 @@ impl AgentManager {
                         && process::poll_for_exit(pid, AGENT_STOP_TIMEOUT).is_some()
                         && !process::is_alive(pid));
                 if !exited {
+                    // A process already killed and held by the kernel has no
+                    // guest left to confirm anything and cannot be retried.
+                    if process::held_after_kill(pid).is_some()
+                        && process::poll_for_exit(pid, process::VM_SIGKILL_TIMEOUT).is_none()
+                    {
+                        if let Some(held) = process::held_after_kill(pid) {
+                            tracing::warn!(
+                                "machine '{}' is stopped, but {}",
+                                self.name().unwrap_or("default"),
+                                held.explain()
+                            );
+                            return Ok(());
+                        }
+                    }
                     return Err(Error::agent(
                         "stop agent",
                         format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {error}"),
@@ -3238,17 +4178,41 @@ impl AgentManager {
             || process::is_our_process_strict(pid, start_time)
             || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
 
-        if identity_ok {
+        let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
                     "PID start-time not verified, identity confirmed via vsock"
                 );
             }
-            let _ = process::stop_vm_process(pid, AGENT_STOP_TIMEOUT, process::VM_SIGKILL_TIMEOUT);
-        }
+            // The stop helper observes the kernel's exit event or reaps our
+            // child. On macOS kill(pid, 0) can still see an exited child until
+            // it is reaped, so a second liveness probe must not override that
+            // confirmed exit (or mistake a recycled PID for this VM).
+            match process::stop_vm_process_bounded(
+                pid,
+                VM_EXIT_FLUSH_TIMEOUT,
+                process::VM_SIGKILL_TIMEOUT,
+            ) {
+                Ok(process::VmStop::Exited(_)) => true,
+                Ok(process::VmStop::Held(held)) => {
+                    // The kernel will not let the process exit, and waiting
+                    // longer does not change that. It runs no more code, so
+                    // the stop completes around it and says what was left.
+                    tracing::warn!(
+                        "machine '{}' is stopped, but {}",
+                        self.name().unwrap_or("default"),
+                        held.explain()
+                    );
+                    return Ok(());
+                }
+                Err(_) => false,
+            }
+        } else {
+            false
+        };
 
-        if process::is_alive(pid) {
+        if !exit_confirmed && process::is_alive(pid) {
             if !identity_ok {
                 // Kill was skipped (no vsock ack, start-time unverifiable) AND the
                 // process is genuinely still alive — a real orphan/leak risk.
@@ -3284,11 +4248,14 @@ impl AgentManager {
         // Include the per-VM readiness marker so the shared rootfs doesn't
         // accumulate one stale marker per VM ever booted.
         let ready_marker = self.ready_marker_path();
+        // The workload log listener's socket; the log itself is kept.
+        let workload_log_socket = self.vsock_socket.with_extension("logs");
         for path in [
             &self.pid_file,
             &self.config_file,
             &self.vsock_socket,
             &ready_marker,
+            &workload_log_socket,
         ] {
             if let Err(e) = std::fs::remove_file(path) {
                 if e.kind() != std::io::ErrorKind::NotFound {
@@ -3348,15 +4315,23 @@ impl AgentManager {
             inner.child.as_ref().map(|c| c.pid())
         };
 
+        // Whatever ends the VMM from here, smolvm asked for it.
+        let mark = |pid| {
+            if let Some(name) = self.name() {
+                crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+            }
+        };
         let killed_pid = match owned_child {
             Some(pid) => {
                 if process::is_alive(pid) {
+                    mark(pid);
                     process::kill(pid);
                 }
                 Some(pid)
             }
             None => match self.read_pid_file_with_start_time() {
                 Some((pid, start_time)) => {
+                    mark(pid);
                     if process::kill_verified(pid, start_time) {
                         Some(pid)
                     } else if process::cmdline_contains(
@@ -3436,7 +4411,13 @@ impl AgentManager {
 
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
-        self.stop_inner(false)
+        self.stop_inner(false, None)
+    }
+
+    /// [`stop`](Self::stop), giving the workload `stop_timeout` to exit after
+    /// its stop signal instead of the timeout it was launched with.
+    pub fn stop_with_timeout(&self, stop_timeout: Duration) -> Result<()> {
+        self.stop_inner(false, Some(stop_timeout))
     }
 
     /// Stop a machine whose guest is paused and already quiesced.
@@ -3449,10 +4430,10 @@ impl AgentManager {
     /// burns the deadline and then refuses to stop a machine that is safe to
     /// terminate — leaving it running, and billing, with no way out but delete.
     pub fn stop_paused(&self) -> Result<()> {
-        self.stop_inner(true)
+        self.stop_inner(true, None)
     }
 
-    fn stop_inner(&self, guest_is_paused: bool) -> Result<()> {
+    fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -3462,7 +4443,8 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
-                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused) {
+                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
+                {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
@@ -3501,7 +4483,8 @@ impl AgentManager {
         };
 
         if let Some(pid) = child_pid {
-            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused) {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
+            {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
@@ -3654,8 +4637,16 @@ impl AgentManager {
         // uses, and it costs at most ~20ms of the ~320ms boot.
         const SOCKET_PROBE_INTERVAL: Duration = Duration::from_millis(20);
         let mut next_socket_probe = Duration::ZERO;
+        let child_pid = self.inner.lock().child.as_ref().map(|child| child.pid());
+        let mut progress = BootProgress::new(self.console_log.clone(), child_pid, start);
+        let mut next_progress_check = Duration::ZERO;
 
-        while start.elapsed() < timeout {
+        // A boot fails when it shows no progress for `timeout`, or at the cap.
+        while start.elapsed() < AGENT_READY_MAX && progress.idle_for(Instant::now()) < timeout {
+            if start.elapsed() >= next_progress_check {
+                next_progress_check = start.elapsed() + BOOT_PROGRESS_INTERVAL;
+                progress.observe(Instant::now());
+            }
             // Check if child process is still alive
             {
                 let mut inner = self.inner.lock();
@@ -3756,13 +4747,20 @@ impl AgentManager {
             std::thread::sleep(Duration::from_millis(poll_ms));
         }
 
-        Err(Error::agent(
-            "wait for ready",
+        let elapsed = start.elapsed();
+        let reason = if elapsed >= AGENT_READY_MAX {
             format!(
                 "agent did not become ready within {} seconds",
+                AGENT_READY_MAX.as_secs()
+            )
+        } else {
+            format!(
+                "agent did not become ready within {} seconds: no boot progress for {} seconds",
+                elapsed.as_secs(),
                 timeout.as_secs()
-            ),
-        ))
+            )
+        };
+        Err(Error::agent("wait for ready", reason))
     }
 
     /// Wait for the agent to stop.
@@ -3817,6 +4815,11 @@ impl AgentManager {
 }
 
 fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
+    if let Some(held) = process::held_after_kill(pid) {
+        // Its files and published ports stay open until the kernel lets it
+        // go, and a write it had in flight can still land on the disks.
+        return Err(Error::agent("start agent", held.start_refusal()));
+    }
     if process::is_alive(pid) {
         return Err(Error::agent(
             "start agent",
@@ -3992,8 +4995,184 @@ fn boot_failure_reason(
     }
 }
 
+/// The binary a VM boots as (`<it> _boot-vm`): the embedder's registered boot
+/// helper or `SMOLVM_BOOT_BINARY`, else this executable. An embedding SDK's host
+/// process (`node`, `python`) cannot boot a VM itself, so its VMs run the helper.
+pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
+    match crate::embedded::bundle::boot_binary() {
+        Some(helper) => Ok(helper),
+        None => crate::process::self_exe_for_spawn(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
+    /// A live replace keeps the ports this run picked itself, without
+    /// publishing one twice when the configured set already names its host port.
+    #[test]
+    fn a_live_replace_keeps_the_runs_own_ports() {
+        let set = |ports: &[(u16, u16)], allocated: &[(u16, u16)]| -> Vec<(u16, u16)> {
+            super::published_set(ports, allocated)
+                .iter()
+                .map(|m| (m.host, m.guest))
+                .collect()
+        };
+        assert_eq!(
+            set(&[(8080, 80)], &[(49152, 3000)]),
+            [(8080, 80), (49152, 3000)]
+        );
+        assert_eq!(set(&[], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(49152, 3000)], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(8080, 80)], &[]), [(8080, 80)]);
+    }
+
+    #[test]
+    fn a_running_configuration_says_whether_the_vm_was_launched_forkable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        assert_eq!(
+            super::forkable_in_running_config(&path),
+            None,
+            "no file: nothing is running"
+        );
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mounts":[],"ports":[],"resources":{"cpus":1,"memory_mib":256,"network":false},"forkable":true}"#,
+        )
+        .unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), Some(true));
+        // an engine that predates the field launched it plain
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mounts":[],"ports":[],"resources":{"cpus":1,"memory_mib":256,"network":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), Some(false));
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), None);
+    }
+
+    #[test]
+    fn a_running_machine_reports_how_it_was_launched_and_a_stopped_one_its_record() {
+        use crate::config::VmRecord;
+        let mut record = VmRecord::new("m".to_string(), 1, 256, vec![], vec![], false);
+        assert!(!record.forkable_on_start());
+        // created plain, started --branchable: branchable now
+        assert!(super::branchable_from(&record, Some(true)));
+        // created branchable, started plain by an older path: not branchable now
+        record.forkable = true;
+        assert!(!super::branchable_from(&record, Some(false)));
+        // nothing running: the record decides
+        assert!(super::branchable_from(&record, None));
+        record.forkable = false;
+        assert!(!super::branchable_from(&record, None));
+    }
+
+    #[test]
+    fn egress_flow_summary_round_trips_through_its_file_and_goes_stale() {
+        use super::*;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join(EGRESS_FLOWS_FILE);
+        let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
+        let summary = EgressFlowSummary::from_network(
+            taken,
+            &smolvm_network::FlowSummary {
+                outbound_open: 3,
+                inbound_open: 1,
+                distinct_outbound_peers: 2,
+                oldest_outbound_secs: 7200,
+                oldest_outbound_dest: Some("198.51.100.7:3333".parse().unwrap()),
+            },
+        );
+        write_egress_flows(&mut SampleFile::new(path.clone()), &summary).unwrap();
+        assert!(!path.with_extension("tmp").exists());
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert!(text.contains("\"oldestOutboundDest\":\"198.51.100.7:3333\""));
+        assert!(text.contains("\"updatedAt\":\"2027-01-15T08:00:00Z\""));
+
+        let fresh = taken + std::time::Duration::from_secs(EGRESS_FLOWS_STALE_SECS);
+        assert_eq!(parse_egress_flows(&text, fresh), Some(summary.clone()));
+        let stale = fresh + std::time::Duration::from_secs(1);
+        assert_eq!(parse_egress_flows(&text, stale), None);
+        // A clock that stepped back keeps the summary rather than hiding it.
+        assert_eq!(
+            parse_egress_flows(&text, std::time::UNIX_EPOCH),
+            Some(summary)
+        );
+        assert_eq!(parse_egress_flows("not json", fresh), None);
+    }
+
+    #[test]
+    fn egress_flow_summary_without_an_outbound_flow_omits_the_destination() {
+        use super::*;
+        let summary = EgressFlowSummary::from_network(
+            std::time::UNIX_EPOCH,
+            &smolvm_network::FlowSummary::default(),
+        );
+        let text = serde_json::to_string(&summary).unwrap();
+        assert!(!text.contains("oldestOutboundDest"));
+        assert_eq!(
+            serde_json::from_str::<EgressFlowSummary>(&text).unwrap(),
+            summary
+        );
+    }
+
+    #[test]
+    fn live_egress_updates_of_one_machine_run_one_at_a_time() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("egress-update.lock");
+        let held = super::lock_live_egress_at(&path).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let second = super::lock_live_egress_at(&path).unwrap();
+                sender.send(()).unwrap();
+                drop(second);
+            })
+        };
+        assert!(receiver
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
+        drop(held);
+        receiver
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        waiter.join().unwrap();
+    }
+
+    #[test]
+    fn a_runtime_that_predates_live_rules_asks_for_a_restart() {
+        let record = crate::config::VmRecord::new("worker".into(), 1, 512, vec![], vec![], true);
+        let mut rendered = smolvm_network::egress::render_live_policy(&["10.0.0.0/8".into()], &[]);
+        rendered
+            .push_str(&smolvm_network::egress::render_live_rules(&record.egress_rules).unwrap());
+        let older_runtime_reply = rendered
+            .lines()
+            .enumerate()
+            .find(|(_, line)| !line.starts_with("cidr ") && !line.starts_with("host "))
+            .map(|(index, _)| {
+                format!(
+                    "line {}: expected `cidr <range>` or `host <name>`",
+                    index + 1
+                )
+            })
+            .unwrap();
+
+        let explained = super::live_egress_refusal(older_runtime_reply.clone(), true);
+        assert!(explained.contains("restart"), "{explained}");
+        assert!(explained.contains("UDP allow"), "{explained}");
+        assert_eq!(
+            super::live_egress_refusal(older_runtime_reply.clone(), false),
+            older_runtime_reply
+        );
+        assert_eq!(
+            super::live_egress_refusal("line 2: invalid rules: eof".into(), true),
+            "line 2: invalid rules: eof"
+        );
+    }
+
     #[test]
     fn console_tail_keeps_whole_last_lines() {
         assert_eq!(super::console_tail("a\nb\n", 100), "a\nb\n");
@@ -4042,26 +5221,65 @@ mod tests {
         let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
         // No agent listening, exactly as for a paused guest.
         manager.vsock_socket = temp.path().join("missing-agent.sock");
-        let mut child = std::process::Command::new("sleep")
-            .arg("30")
-            .spawn()
-            .unwrap();
-        let pid = child.id() as crate::process::Pid;
+        // Repeat under CI load to catch intermittent process identity races.
+        for attempt in 0..512 {
+            let mut child = std::process::Command::new("sleep")
+                .arg("30")
+                .spawn()
+                .unwrap();
+            let pid = child.id() as crate::process::Pid;
 
-        let started = std::time::Instant::now();
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), true);
-        let elapsed = started.elapsed();
-        let survived = matches!(child.try_wait(), Ok(None));
-        let _ = child.kill();
-        let _ = child.wait();
+            // A freshly spawned child can briefly have no macOS proc_pidinfo
+            // start time. Wait for an identity before testing the strict stop path;
+            // without one the stop correctly refuses to signal an unknown PID.
+            let identity_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let start_time = loop {
+                if let Some(start_time) = process::process_start_time(pid) {
+                    break start_time;
+                }
+                if std::time::Instant::now() >= identity_deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("spawned test child never acquired a verifiable start time");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            };
 
-        assert!(result.is_ok(), "a paused guest must stop: {result:?}");
-        assert!(!survived, "the paused VM's process must be gone");
-        // The handshake was skipped, not merely fast: its own deadline is 5s.
-        assert!(
-            elapsed < std::time::Duration::from_secs(5),
-            "took {elapsed:?}, so the shutdown handshake was still attempted"
-        );
+            let before_start = process::process_start_time(pid);
+            let identity_verified = process::is_our_process_strict(pid, Some(start_time));
+            let started = std::time::Instant::now();
+            let result = manager.stop_vm_process(pid, Some(start_time), true, None);
+            let elapsed = started.elapsed();
+            let after_start = process::process_start_time(pid);
+            // NOTE_EXIT can arrive just before a child becomes waitable on
+            // macOS. Give the kernel a bounded interval to finish the exit.
+            let reap_deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+            let survived = loop {
+                match child.try_wait() {
+                    Ok(None) if std::time::Instant::now() < reap_deadline => {
+                        std::thread::sleep(std::time::Duration::from_millis(1));
+                    }
+                    Ok(None) => break true,
+                    _ => break false,
+                }
+            };
+            let _ = child.kill();
+            let _ = child.wait();
+
+            assert!(
+                result.is_ok(),
+                "iteration={attempt}, a paused guest must stop: {result:?}; start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, survived={survived}, elapsed={elapsed:?}"
+            );
+            assert!(
+                !survived,
+                "iteration={attempt}, the paused VM's process must be gone: result={result:?}, start={start_time}, before={before_start:?}, verified={identity_verified}, after={after_start:?}, elapsed={elapsed:?}"
+            );
+            // The handshake was skipped, not merely fast: its own deadline is 5s.
+            assert!(
+                elapsed < std::time::Duration::from_secs(5),
+                "took {elapsed:?}, so the shutdown handshake was still attempted"
+            );
+        }
     }
 
     #[cfg(unix)]
@@ -4077,7 +5295,7 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as crate::process::Pid;
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false);
+        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false, None);
         let survived = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();
@@ -4197,7 +5415,47 @@ mod tests {
     use super::*;
 
     #[test]
+    fn new_launch_never_reports_previous_vmm_egress() {
+        let temp = tempfile::tempdir().unwrap();
+        let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
+        let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
+        let mut manager = AgentManager::new(temp.path().join("rootfs"), storage, overlay).unwrap();
+        manager.vsock_socket = temp.path().join("agent.sock");
+        let egress = temp.path().join(EGRESS_TELEMETRY_FILE);
+
+        // The previous VMM's final flush is still on disk after it stopped.
+        write_egress_telemetry(&mut SampleFile::new(egress.clone()), 1_000_000).unwrap();
+        assert_eq!(read_egress_telemetry_at(&egress), Some(1_000_000));
+
+        // A new launch clears it, so before the new VMM's first flush there is
+        // no reading to attribute to the new process.
+        manager.clear_previous_run_files();
+        assert_eq!(read_egress_telemetry_at(&egress), None);
+
+        // After the first flush, only the new run's bytes are reported.
+        write_egress_telemetry(&mut SampleFile::new(egress.clone()), 42).unwrap();
+        assert_eq!(read_egress_telemetry_at(&egress), Some(42));
+        assert!(!egress_telemetry_staging(&egress).exists());
+
+        // Clearing a VM dir with no telemetry (TSI, never flushed) is a no-op.
+        manager.clear_previous_run_files();
+        manager.clear_previous_run_files();
+        assert_eq!(read_egress_telemetry_at(&egress), None);
+
+        // The previous run's open-flow summary is cleared the same way.
+        let flows = temp.path().join(EGRESS_FLOWS_FILE);
+        std::fs::write(&flows, b"{}").unwrap();
+        std::fs::write(flows.with_extension("tmp"), b"{}").unwrap();
+        manager.clear_previous_run_files();
+        assert!(!flows.exists());
+        assert!(!flows.with_extension("tmp").exists());
+    }
+
+    #[test]
     fn launch_refuses_live_persisted_pid_without_agent_reachability() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
         let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
@@ -4303,10 +5561,151 @@ mod tests {
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
     }
 
+    /// `machine status`, `exec` and `stop` open a machine to observe it. On a
+    /// name that was never created that must leave no `vms/<hash>/` behind;
+    /// only a launch makes the machine's directory.
+    #[test]
+    fn observing_a_machine_that_was_never_created_leaves_no_data_dir() {
+        let name = format!(
+            "never-created-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = vm_data_dir(&name);
+        assert!(!dir.exists(), "fresh name already has {}", dir.display());
+        // Whatever a failing run leaves behind is removed, so the host is not
+        // littered by the very bug under test.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(dir.clone());
+
+        let manager = AgentManager::for_vm(&name).unwrap();
+        assert_eq!(manager.name(), Some(name.as_str()));
+        assert!(
+            !dir.exists(),
+            "observing a machine that was never created made {}",
+            dir.display()
+        );
+    }
+
     #[test]
     fn restored_cuda_clones_fail_faster_than_other_boots() {
         assert_eq!(agent_ready_timeout(true), Duration::from_secs(10));
         assert_eq!(agent_ready_timeout(false), Duration::from_secs(30));
+    }
+
+    // A zstd rootfs tarball extracts through the system tar without a `zstd`
+    // program: modes and symlinks survive, and a damaged one is an error.
+    #[cfg(unix)]
+    #[test]
+    fn a_zstd_rootfs_tarball_extracts_with_modes_and_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("sbin")).unwrap();
+        std::fs::create_dir_all(src.join("usr/local/bin")).unwrap();
+        let agent = src.join("usr/local/bin/smolvm-agent");
+        std::fs::write(&agent, b"agent").unwrap();
+        std::fs::set_permissions(&agent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", src.join("sbin/init")).unwrap();
+        let tar = dir.path().join("rootfs.tar");
+        assert!(std::process::Command::new("tar")
+            .args(["-cf"])
+            .arg(&tar)
+            .arg("-C")
+            .arg(&src)
+            .arg(".")
+            .status()
+            .unwrap()
+            .success());
+        let zst = dir.path().join("agent-rootfs.tar.zst");
+        let compressed = zstd::stream::encode_all(std::fs::File::open(&tar).unwrap(), 3).unwrap();
+        std::fs::write(&zst, &compressed).unwrap();
+
+        let out = dir.path().join("out");
+        std::fs::create_dir_all(&out).unwrap();
+        assert!(AgentManager::extract_zstd_tar(&zst, &out)
+            .unwrap()
+            .success());
+        let mode = std::fs::metadata(out.join("usr/local/bin/smolvm-agent"))
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(mode & 0o777, 0o755);
+        assert_eq!(
+            std::fs::read_link(out.join("sbin/init")).unwrap(),
+            std::path::PathBuf::from("/usr/local/bin/smolvm-agent")
+        );
+
+        let damaged = dir.path().join("damaged.tar.zst");
+        std::fs::write(&damaged, &compressed[..compressed.len() / 2]).unwrap();
+        let out2 = dir.path().join("out2");
+        std::fs::create_dir_all(&out2).unwrap();
+        assert!(AgentManager::extract_zstd_tar(&damaged, &out2).is_err());
+    }
+
+    // The state is the first field after the command, which is parenthesized
+    // and may contain spaces or a `)` of its own.
+    #[test]
+    fn task_state_reads_past_any_command_name() {
+        assert_eq!(task_state("123 (smol-vmm) D 1 2 3"), Some('D'));
+        assert_eq!(task_state("123 (fc_vcpu 0) S 1 2 3"), Some('S'));
+        assert_eq!(task_state("123 (a) b) R 1"), Some('R'));
+        assert_eq!(task_state("garbage"), None);
+    }
+
+    // Console growth is progress; a quiet console with no I/O wait is not, so
+    // a wedged boot still fails after the no-progress window.
+    #[test]
+    fn boot_progress_tracks_console_growth() {
+        let dir = tempfile::tempdir().unwrap();
+        let console = dir.path().join("console.log");
+        std::fs::write(&console, "boot agent_entry\n").unwrap();
+        let start = Instant::now();
+        let mut progress = BootProgress::new(Some(console.clone()), None, start);
+
+        let later = start + Duration::from_secs(20);
+        progress.observe(later);
+        assert_eq!(
+            progress.idle_for(later),
+            Duration::from_secs(20),
+            "no growth, no progress"
+        );
+
+        std::fs::write(&console, "boot agent_entry\nboot rootfs_done\n").unwrap();
+        progress.observe(later);
+        assert_eq!(
+            progress.idle_for(later),
+            Duration::ZERO,
+            "growth is progress"
+        );
+        assert_eq!(
+            progress.idle_for(later + Duration::from_secs(31)),
+            Duration::from_secs(31)
+        );
+    }
+
+    // A sleeping process is not waiting on disk I/O, and a gone one reads as
+    // no progress rather than an error.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_sleeping_process_is_not_in_io_wait() {
+        let mut child = std::process::Command::new("sleep")
+            .arg("5")
+            .spawn()
+            .unwrap();
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(!vmm_waits_on_io(child.id() as Pid));
+        let _ = child.kill();
+        let _ = child.wait();
+        assert!(!vmm_waits_on_io(Pid::MAX));
     }
 
     #[test]

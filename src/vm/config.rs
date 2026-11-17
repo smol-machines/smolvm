@@ -470,6 +470,7 @@ mod tests {
                 target: "/guest".into(),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
             })
             .command(vec!["/bin/sh".to_string()])
             .workdir("/app")

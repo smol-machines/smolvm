@@ -5,7 +5,7 @@ description: Keeps a persistent smolvm machine with its dependencies already ins
 
 # A persistent dev machine
 
-Verified on **smolvm v1.22.2** on macOS arm64, 2026-10-03, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
+Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24; the Linux runs used
 the Smolfile with `memory = 1024`, for the host reason in "Platform arms". Done means a second `start` is fast, skips provisioning, and the packages installed in
 the first session are still there.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
@@ -13,8 +13,9 @@ on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 The whole use case turns on one fact: **`init` runs once, not on every start**, as
 [`smolfile.md`](../smolfile.md) says, and as the docs site (smolmachines.com/docs) says under "When
-init runs". `smolvm machine create --help` reads "Run command on every VM start" at v1.22.2;
-provisioning that relies on that line is missing on the second boot.
+init runs". `smolvm machine create --help` reads "Run command on every VM start" at v1.22.2, and
+"Run command once, on the machine's first start" from v1.23.7; provisioning that relies on the old
+line is missing on the second boot.
 
 ## Procedure
 
@@ -126,19 +127,18 @@ Observed, not inferred:
 | pip `--user` packages | yes | under `$HOME`, on the overlay |
 | `$HOME/...` files | yes | overlay |
 | files written at `/` | yes | overlay |
-| `/tmp` | **no** | `tmpfs` |
+| `/tmp` | **no** | emptied at each start, like a `tmpfs` |
 | `/storage/...` | yes | the ext4 disk itself |
 
 The root filesystem is an overlay whose upper layer lives on the machine's ext4 disk, which is why
-writes to `/` persist while `tmpfs` mounts do not.
+writes to `/` persist while `tmpfs` mounts and `/tmp` do not.
 
 ## Traps
 
 Full detail in `references/traps.md`. The ones that cost the most:
 
-- **`init` runs once.** `machine create --help` reads "Run command on every VM start" at
-  v1.22.2. Anything that must hold on every boot, a bind mount above all, runs
-  in the command that needs it.
+- **`init` runs once** (top of this file). Anything that must hold on every boot, a bind mount
+  above all, runs in the command that needs it.
 - **Give a machine you `exec` into a long-lived workload.** Without one, an `exec` right after
   `start` can answer ``the container `smolvm-<hash>` is not running`` instead of running.
 - **`machine shell` does not start a stopped machine** on v1.22.2, while its help says "starts it
@@ -171,14 +171,13 @@ Full detail in `references/traps.md`. The ones that cost the most:
   and once on v1.22.2 at 1024. At 2048 on v1.18.2 the restart failed with `agent did not become
   ready within 30 seconds`: on a small or busy host lower `memory` before suspecting smolvm, and
   check the mount source first (the `install` packet's traps have the numbers).
-- **macOS arm64**: the scripts were run here on v1.22.2 as shipped, and every check passed.
+- **macOS arm64**: the scripts were run here on v1.29.0 as shipped, and every check passed.
 - **Linux x86_64**: verified on v1.14.2 on an NVIDIA A10 cloud host, not re-run since.
 - **Windows x86_64**: `references/windows.md`, **re-run on 2026-10-03 against v1.22.2** on
   Windows 11 Home build 10.0.26200 UBR 9457. Create, three stops and three starts, with a marker read back after each start: **a
   stopped machine starts again and its state survives**, as on v1.14.6, where on v1.14.2 it did
   not. That page also carries the WHP device ceiling a Windows preflight needs through v1.22.2:
   four `-v` mounts, three when a port is published.
-- **`init` after a checkpoint restore**: not verified anywhere.
 
 ## Eval prompts, and what they produced
 
@@ -234,6 +233,17 @@ failures_after_restart=0/20
 ```
 
 The changing hash is the tell: the workload container is being relaunched between execs.
+
+## Re-verified on v1.29.0
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, the scripts twice, the second time from a fresh `HOME`, and
+the checks beyond them once. Linux was not run, so the Linux stamp stays on its earlier release.
+
+`create-dev-machine.sh` gave `result=up` with `init_ran_as=root`, `exec_user=app` and
+`workdir=/app`; `verify-persistence.sh` gave `init_ran_once=ok (yes)`, `package_version=ok (2.34.2)`,
+`home_file=ok (SURVIVES)`, `storage_file=ok (SURVIVES)`, `tmp_file=ok (WIPED)` and
+`result=persistent`, and the second start printed `Init already completed, skipping 3 command(s)`.
 
 ## Re-verified on v1.22.2
 

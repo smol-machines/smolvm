@@ -15,9 +15,8 @@ smolvm serve start --listen 127.0.0.1:8080           # loopback TCP instead
 smolvm serve openapi -o ./openapi.json               # the field names from your binary
 ```
 
-The default listen path is derived rather than fixed, and the help's own default line and its
-example disagree: on macOS the socket appeared at `/tmp/smolvm.sock` and on Linux at
-`/run/user/<uid>/smolvm.sock`. Read the path the server reports rather than assuming either.
+The default listen path differs per platform (`/tmp/smolvm.sock` on macOS,
+`/run/user/<uid>/smolvm.sock` on Linux) and `--help` shows only one; read the path the server reports.
 
 **A plain server has no authentication of any kind.** Whoever can reach the socket or the port can
 create and run machines, so treat it as equivalent to a shell on the host, and prefer the Unix
@@ -26,19 +25,35 @@ plain loopback listener beside it; `references/traps.md` has both.
 
 ## The endpoints
 
-The HTTP API section of [`AGENTS.md`](../../AGENTS.md#http-api) lists the key endpoints; pause and
-resume are added here.
+The key endpoints; `smolvm serve openapi` has the rest.
 
 ```
 POST   /api/v1/machines                    create           GET    /api/v1/machines            list
 GET    /api/v1/machines/:name              get              DELETE /api/v1/machines/:name       delete
 POST   /api/v1/machines/:name/start        start            POST   /api/v1/machines/:name/stop  stop
 POST   /api/v1/machines/:name/exec         exec             POST   /api/v1/machines/:name/exec/stream  exec, SSE
+GET    /api/v1/machines/:name/exec/interactive  exec, WebSocket
+POST   /api/v1/machines/:name/execs        exec session     GET    /api/v1/machines/:name/execs/:exec?after=N  its output
+POST   /api/v1/machines/:name/execs/:exec/stdin  stdin frame  GET    /api/v1/machines/:name/execs/:exec/attach   WebSocket
+DELETE /api/v1/machines/:name/execs/:exec  kill and forget
 PUT    /api/v1/machines/:name/files/*path  upload           GET    /api/v1/machines/:name/files/*path  download
 GET    /api/v1/machines/:name/logs         logs, SSE        POST   /api/v1/machines/:name/images/pull   pull
 POST   /api/v1/machines/:name/pause        pause            POST   /api/v1/machines/:name/resume  resume
+POST   /api/v1/machines/:name/resize       live resize      POST   /api/v1/pools                warm branch pool
+POST   /api/v1/pools/:name/leases          lease a worker   (see ../branching.md#warm-pools-over-the-api)
 ```
 
+An exec session is a command the server owns rather than the request that started it: a dropped
+connection does not end it. Give it an `execId` (a retried start then finds the same session), read
+its output with `?after=` the `next` of the last answer until `done` (each byte comes once, and
+`after` tells the server it may drop what precedes it), and send interactive stdin as frames
+numbered from 1 (a resent frame is applied once). The server holds 8 MiB of unread output per
+session; a command whose reader stays away longer than 120 s is no longer held back, and the reader
+is told which offsets it lost. `GET .../logs?ids=true` gives every log line its file offset as the
+SSE `id`, and `?after=` (or `Last-Event-ID`) resumes from it.
+
+Machines that ask for nested virtualization (`nestedVirt`) are refused unless the server is started
+with `--allow-nested-virt`; turning it off again also keeps existing nested machines from starting.
 A `GET` on the files route for a directory returns a listing, `{"entries":[{"kind":..., "name":...,
 "size":...}]}`. Pause on macOS before v1.20.0 needs a machine started with `?branchable=true` on the start call,
 and this packet's pause steps always start it that way.

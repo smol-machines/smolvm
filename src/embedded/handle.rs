@@ -1,7 +1,5 @@
 //! Runtime VM handle for embedded SDK backends.
 
-use std::time::Duration;
-
 use crate::agent::{AgentClient, AgentManager, RunConfig};
 use crate::config::VmRecord;
 use crate::Result;
@@ -58,37 +56,22 @@ impl VmHandle {
         self.client_mut()?.run_non_interactive(config)
     }
 
-    /// Pull an OCI image and run a command inside it.
-    ///
-    /// Returns `(exit_code, stdout_bytes, stderr_bytes)`. Bytes are raw
-    /// to preserve binary output.
-    pub fn run(
-        &mut self,
-        image: &str,
-        command: Vec<String>,
-        env: Vec<(String, String)>,
-        workdir: Option<String>,
-        timeout: Option<Duration>,
-    ) -> Result<(i32, Vec<u8>, Vec<u8>)> {
-        // Reuse the machine's persistent overlay, exactly as the streaming sibling
-        // and the CLI do. Without it every call builds a fresh container overlay:
-        // filesystem changes from one call are invisible to the next, and the
-        // rebuild dominates the call — measured at ~2.1s per exec against ~12ms
-        // once the overlay is reused.
-        let name = self.manager.name().map(str::to_string);
-        let client = self.client_mut()?;
-        client.pull_with_registry_config(image)?;
-        let config = RunConfig::new(image, command)
-            .with_env(env)
-            .with_workdir(workdir)
-            .with_timeout(timeout)
-            .with_persistent_overlay(name);
-        client.run_non_interactive(config)
+    /// Point this connection's file operations at `target`; see
+    /// [`AgentClient::use_target`].
+    pub fn use_target(&mut self, target: crate::agent::WorkloadTarget) -> Result<()> {
+        self.client_mut()?.use_target(target)
     }
 
-    /// Pull an OCI image into the VM storage.
-    pub fn pull_image(&mut self, image: &str) -> Result<ImageInfo> {
-        self.client_mut()?.pull_with_registry_config(image)
+    /// Pull an OCI image into the VM storage for `platform` (`os/arch`), or for
+    /// the guest's own architecture when `None`. A machine keeps one platform
+    /// per reference, so every pull of its image passes
+    /// [`VmRecord::image_platform`].
+    pub fn pull_image(&mut self, image: &str, platform: Option<&str>) -> Result<ImageInfo> {
+        let mut options = crate::agent::PullOptions::new().use_registry_config(true);
+        if let Some(platform) = platform {
+            options = options.oci_platform(platform);
+        }
+        self.client_mut()?.pull(image, options)
     }
 
     /// List cached OCI images in the VM storage.
@@ -102,8 +85,8 @@ impl VmHandle {
         let Some(image) = record.image.as_deref() else {
             return Ok(());
         };
+        self.pull_image(image, record.image_platform())?;
         let client = self.client_mut()?;
-        client.pull_with_registry_config(image)?;
         let mut env = record.env.clone();
         env.extend(crate::embedded::control::credential_env(record));
         crate::workload::launch_image_workload(client, name, record, env)?;
@@ -127,8 +110,25 @@ impl VmHandle {
 
     /// Stop the VM and drop the cached agent client.
     pub fn stop(&mut self) -> Result<()> {
+        self.stop_with_timeout(None)
+    }
+
+    /// [`stop`](Self::stop), giving the workload `stop_timeout` to exit after
+    /// its stop signal instead of the timeout it was launched with.
+    pub fn stop_with_timeout(&mut self, stop_timeout: Option<std::time::Duration>) -> Result<()> {
         self.client = None;
-        self.manager.stop()
+        match stop_timeout {
+            Some(stop_timeout) => self.manager.stop_with_timeout(stop_timeout),
+            None => self.manager.stop(),
+        }
+    }
+
+    /// Stop a VM whose guest is paused (a frozen branch base): its agent
+    /// cannot answer a shutdown request, so the VMM is ended directly.
+    #[cfg(unix)]
+    pub fn stop_paused(&mut self) -> Result<()> {
+        self.client = None;
+        self.manager.stop_paused()
     }
 
     /// Let a CLI-started VM outlive the process that launched it.

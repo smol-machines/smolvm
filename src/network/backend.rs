@@ -1,11 +1,24 @@
 use clap::ValueEnum;
 
+/// `VIRTIO_NET_F_GUEST_CSUM`: the guest may receive packets with checksums it
+/// does not have to verify (the host still sends full checksums).
+const NET_FEATURE_GUEST_CSUM: u32 = 1 << 1;
+/// `VIRTIO_NET_F_GUEST_TSO4` / `_TSO6`: the guest may receive segments larger
+/// than one packet.
+const NET_FEATURE_GUEST_TSO4: u32 = 1 << 7;
+const NET_FEATURE_GUEST_TSO6: u32 = 1 << 8;
+
 /// Feature set advertised to libkrun for unixstream-backed virtio-net.
 ///
-/// The current smoltcp-backed MVP expects ordinary packets from the guest.
-/// Leave checksum and segmentation offloads disabled until the host path
-/// explicitly handles those packet shapes.
-pub const COMPAT_NET_FEATURES: u32 = 0;
+/// Only the receive-side features, and only for their side effect: with them
+/// the guest's virtio-net driver posts 64 KB receive buffers instead of
+/// 1500-byte ones, so it can take the large frames of the gateway link
+/// ([`smolvm_protocol::guest_env::GATEWAY_LINK_MTU`]). The host never sends a
+/// GSO packet (libkrun's header carries no GSO type) and offers no transmit
+/// offload, so the guest still hands the host ordinary, fully checksummed
+/// packets, which is all the host stack understands.
+pub const COMPAT_NET_FEATURES: u32 =
+    NET_FEATURE_GUEST_CSUM | NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6;
 /// TSI feature bit that enables INET socket hijacking.
 pub const TSI_FEATURE_HIJACK_INET: u32 = 1 << 0;
 

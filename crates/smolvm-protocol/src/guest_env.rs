@@ -82,6 +82,12 @@ pub const MACHINE_NAME: &str = "SMOLVM_MACHINE_NAME";
 /// interval. Read by the guest agent; forwarded from the host env verbatim.
 pub const DISK_TRIM: &str = "SMOLVM_DISK_TRIM";
 
+/// Tunes the in-guest reclaim of idle page cache, which lets the host take
+/// back memory a finished job left cached: `off`/`0` disables it, `<seconds>`
+/// sets how long the machine must be quiet first. Read by the guest agent;
+/// forwarded from the host env verbatim.
+pub const MEMORY_TRIM: &str = "SMOLVM_MEMORY_TRIM";
+
 /// Selects whether the guest should configure a real virtio NIC.
 pub const BACKEND: &str = "SMOLVM_NETWORK_BACKEND";
 /// Canonical backend value meaning "configure guest virtio-net".
@@ -94,6 +100,11 @@ pub const GATEWAY: &str = "SMOLVM_NETWORK_GATEWAY";
 pub const PREFIX_LEN: &str = "SMOLVM_NETWORK_PREFIX_LEN";
 /// Guest MAC address in colon-separated string form.
 pub const GUEST_MAC: &str = "SMOLVM_NETWORK_GUEST_MAC";
+/// Gateway MAC address in colon-separated string form. Optional: set when the
+/// CNI pre-programs the gateway as a static neighbor entry
+/// so nothing answers ARP on the link, and the guest must install the entry
+/// itself rather than resolve it.
+pub const GATEWAY_MAC: &str = "SMOLVM_NETWORK_GATEWAY_MAC";
 /// Guest IPv6 (ULA) address. Optional: absent means IPv4-only guest config.
 pub const GUEST_IP6: &str = "SMOLVM_NETWORK_GUEST_IP6";
 /// Guest-visible default gateway IPv6 address.
@@ -102,8 +113,51 @@ pub const GATEWAY6: &str = "SMOLVM_NETWORK_GATEWAY6";
 pub const PREFIX_LEN6: &str = "SMOLVM_NETWORK_PREFIX_LEN6";
 /// Guest-visible DNS server IPv4 address.
 pub const DNS: &str = "SMOLVM_NETWORK_DNS";
-/// Enables the guest-side DNS filtering proxy.
-pub const DNS_FILTER: &str = "SMOLVM_DNS_FILTER";
+/// Link MTU for `eth0`. Optional: absent means 1500, which is what a host
+/// without this key expects.
+pub const MTU: &str = "SMOLVM_NETWORK_MTU";
+/// The MTU of the link between the guest and smolvm's own gateway. That gateway
+/// ends every TCP connection on the host, so the internet's 1500 never applies
+/// on this hop; a 64 KB link carries a download in ~40x fewer packets, and each
+/// packet costs CPU in the guest and in the host stack alike.
+pub const GATEWAY_LINK_MTU: u16 = 65520;
+/// Resolver `options` for the guest's `/etc/resolv.conf`, space-separated
+/// (`--dns-option`, repeatable), e.g. `timeout:1 attempts:3 rotate use-vc`.
+/// Every writer of resolv.conf appends them as one `options` line.
+pub const DNS_OPTIONS: &str = "SMOLVM_NETWORK_DNS_OPTIONS";
+/// `/dev/shm` size for the workload container (`--shm-size`), already a
+/// tmpfs `size=` value from [`shm_size_option`]. Unset = half the guest RAM.
+pub const SHM_SIZE: &str = "SMOLVM_SHM_SIZE";
+/// Enables the guest-side port forwarder on [`crate::ports::PORT_FORWARD`].
+pub const PORT_FORWARD: &str = "SMOLVM_PORT_FORWARD";
+/// Enables the guest's listening-port watcher, which reports its TCP
+/// listeners on [`crate::ports::AUTO_PORTS`] so the host publishes them.
+pub const AUTO_PORTS: &str = "SMOLVM_AUTO_PORTS";
+
+/// Validate a `--shm-size` value and return it as a tmpfs `size=` value: a
+/// byte count with an optional `k`, `m` or `g` suffix (`512m`, `2g`), or a
+/// share of guest RAM from 1% to 100% (`25%`). The host and the agent both
+/// check it, so a hand-edited record cannot reach the mount.
+pub fn shm_size_option(value: &str) -> Result<String, String> {
+    let value = value.trim().to_ascii_lowercase();
+    let refuse = || {
+        format!("invalid --shm-size `{value}`: use bytes with an optional k/m/g suffix (e.g. 512m, 2g) or a share of RAM (e.g. 25%)")
+    };
+    if let Some(percent) = value.strip_suffix('%') {
+        return match percent.parse::<u8>() {
+            Ok(1..=100) => Ok(value),
+            _ => Err(refuse()),
+        };
+    }
+    let digits = value.trim_end_matches(['k', 'm', 'g']);
+    if value.len() - digits.len() > 1 {
+        return Err(refuse());
+    }
+    match digits.parse::<u64>() {
+        Ok(1..) => Ok(value),
+        _ => Err(refuse()),
+    }
+}
 /// Enables the guest-side Docker socket bridge: the agent listens on the
 /// `ports::DOCKER` vsock port and proxies each connection to the in-guest
 /// Docker daemon socket, so the host can reach it over a Unix socket.
@@ -119,3 +173,43 @@ pub const PUBLISH_SOCKETS: &str = "SMOLVM_PUBLISH_SOCKETS";
 /// base. The agent mounts its ext4 filesystem, making one on a blank base,
 /// and exposes it to every workload at the guest path.
 pub const CACHE_DISK: &str = "SMOLVM_CACHE_DISK";
+
+/// Guest paths backed by the machine's storage disk, encoded by
+/// [`crate::disk_volume::encode`]. The agent binds a per-path directory on the
+/// disk at each one in every workload. Absent means none.
+pub const DISK_VOLUMES: &str = "SMOLVM_DISK_VOLUMES";
+
+/// Ceiling, in microseconds, for the guest kernel's poll before it parks an
+/// idle CPU (`/proc/smolvm-idle-poll-us`). The agent writes it at boot; absent
+/// means the kernel's default, no polling. The host sets it where the wake
+/// from a parked CPU has been measured to dominate a virtio-fs round trip.
+pub const IDLE_POLL_US: &str = "SMOLVM_IDLE_POLL_US";
+
+/// Enables forwarding a detached workload's stdout and stderr to the host over
+/// the `ports::WORKLOAD_LOGS` vsock port, where the host appends them to the
+/// machine's `workload.log`. Absent means the output is discarded.
+pub const WORKLOAD_LOGS: &str = "SMOLVM_WORKLOAD_LOGS";
+
+#[cfg(test)]
+mod shm_size_tests {
+    use super::shm_size_option;
+
+    #[test]
+    fn shm_size_takes_byte_counts_and_shares_of_ram() {
+        for (given, size) in [
+            ("512m", "512m"),
+            ("2G", "2g"),
+            ("65536k", "65536k"),
+            ("1048576", "1048576"),
+            ("25%", "25%"),
+            ("100%", "100%"),
+        ] {
+            assert_eq!(shm_size_option(given).as_deref(), Ok(size), "{given}");
+        }
+        for bad in [
+            "", "0", "0m", "0%", "101%", "1.5g", "2gb", "-1m", "m", "10t", "50%%", "size=1g",
+        ] {
+            assert!(shm_size_option(bad).is_err(), "{bad:?} must be refused");
+        }
+    }
+}

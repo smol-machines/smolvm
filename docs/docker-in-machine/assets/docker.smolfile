@@ -3,25 +3,19 @@
 # launch containers. smolvm boots OCI images without Docker, so this is only for
 # software inside the machine that needs the daemon.
 #
-# The bind mounts below are in `init`, as in the upstream example, and `init`
-# runs ONCE: they hold for the first boot only. scripts/start-dockerd.sh, the
-# example's "Start dockerd" recipe, re-applies them on every start.
+# From v1.28.1. The docker:dind image starts dockerd as its workload on every
+# start, and the two volumes are directories on the machine's ext4 disk, bound
+# into the workload on every start. On v1.28.0 and earlier, which have no disk
+# volumes, use docker-bind-mounts.smolfile.
+image = "docker:dind"
 cpus = 2
 memory = 2048
 net = true
 
-# Docker's data directory must live on /storage, not on the rootfs overlay.
-# This is a hard requirement: the rootfs overlay uses the initramfs (ramfs) as
-# its lower layer, ramfs has no file-handle support, and overlayfs then rejects
-# it as an upper dir for Docker's nested overlay.
+# Docker's data directory must live on the machine's disk, not on the rootfs
+# overlay: the overlay's lower layer is ramfs, which has no file-handle support,
+# and overlayfs then rejects it as an upper dir for Docker's nested overlay.
 storage = 20
+volumes = ["/var/lib/docker", "/var/lib/containerd"]
 
 docker_socket = true
-
-init = [
-    "apk update -q",
-    "apk add docker -q",
-    "mkdir -p /storage/docker /var/lib/docker /storage/containerd /var/lib/containerd",
-    "mount --bind /storage/docker /var/lib/docker",
-    "mount --bind /storage/containerd /var/lib/containerd",
-]

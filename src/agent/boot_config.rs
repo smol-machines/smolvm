@@ -55,6 +55,10 @@ pub struct BootConfig {
     /// VM data dir; the guest agent proxies it to `/var/run/docker.sock`.
     #[serde(default)]
     pub expose_docker: bool,
+    /// Publish the TCP ports the guest listens on at the same host port on
+    /// loopback (`--auto-ports`). Only the local CLI's launches set it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`),
     /// carried into the boot subprocess and applied by the launcher.
     #[serde(default)]
@@ -105,4 +109,9 @@ pub struct BootConfig {
     /// Host-only identity of a branch source's launch.
     #[serde(default)]
     pub mediated_parent_id: [u8; 16],
+    /// File the workload's stdout and stderr are appended to. Set for named
+    /// machines; the boot process listens for the guest's output while the
+    /// machine runs.
+    #[serde(default)]
+    pub workload_log: Option<PathBuf>,
 }

@@ -1,0 +1,37 @@
+name: No AI attribution
+
+# The author of a change is the person responsible for it, so commits, commit
+# authors and PR text must not credit an AI tool. Required on the default
+# branch; it re-runs when the PR title or body is edited.
+on:
+  pull_request:
+    types: [opened, edited, reopened, synchronize]
+  push:
+    branches: [main]
+  # A PR opened with the workflow token (the Nix flake bump) triggers no
+  # workflow, so its required check would never report. The bump starts this
+  # run on its branch instead; it checks that branch's commits against main.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  no-ai-attribution:
+    name: no-ai-attribution
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Check commits and PR text
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$EVENT" in
+            pull_request) python3 .github/scripts/no-ai-attribution.py pr ;;
+            push) python3 .github/scripts/no-ai-attribution.py push ;;
+            *) python3 .github/scripts/no-ai-attribution.py range origin/main HEAD ;;
+          esac

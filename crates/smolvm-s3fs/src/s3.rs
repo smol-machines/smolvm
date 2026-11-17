@@ -14,7 +14,7 @@ use crate::sigv4::{self, Credentials, SignRequest, EMPTY_SHA256, UNSIGNED_PAYLOA
 pub enum Error {
     /// Transport or TLS failure.
     Transport(String),
-    /// S3 answered with a non-2xx status; `code` is the parsed `<Code>` when present.
+    /// S3 reported an error, including errors embedded in a 2xx response.
     Status {
         status: u16,
         code: String,
@@ -75,6 +75,7 @@ pub struct ObjectInfo {
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct Listing {
     pub objects: Vec<ObjectInfo>,
+    pub directory_marker_exists: bool,
     /// Sub-prefixes, i.e. child directories (without the trailing `/`).
     pub prefixes: Vec<String>,
 }
@@ -288,6 +289,38 @@ impl Client {
         Ok(())
     }
 
+    pub fn copy(&self, from: &str, to: &str) -> Result<u64> {
+        let source = format!("/{}/{}", self.cfg.bucket, self.full_key(from));
+        let headers = vec![
+            (
+                "x-amz-copy-source".into(),
+                sigv4::uri_encode(&source, false),
+            ),
+            ("x-amz-metadata-directive".into(), "COPY".into()),
+            ("content-length".into(), "0".into()),
+        ];
+        let response = self.send("PUT", &self.full_key(to), &[], headers, Some(b""))?;
+        let body = response
+            .into_string()
+            .map_err(|error| Error::Transport(error.to_string()))?;
+        if let Some(code) = xml_field(&body, "Code") {
+            return Err(Error::Status {
+                status: 200,
+                code,
+                message: xml_field(&body, "Message").unwrap_or_default(),
+            });
+        }
+        if !body.contains("<CopyObjectResult")
+            || !body.trim_end().ends_with("</CopyObjectResult>")
+            || xml_field(&body, "ETag").is_none_or(|etag| etag.is_empty())
+        {
+            return Err(Error::Parse("invalid copy response".into()));
+        }
+        xml_field(&body, "LastModified")
+            .and_then(|value| parse_iso8601(&value))
+            .ok_or_else(|| Error::Parse("copy response has no valid LastModified".into()))
+    }
+
     pub fn delete(&self, rel: &str) -> Result<()> {
         let key = self.full_key(rel);
         match self.send("DELETE", &key, &[], Vec::new(), None) {
@@ -301,12 +334,18 @@ impl Client {
     /// List one directory level under `rel` using a delimiter, so the result
     /// separates child objects from child "directories" the way readdir needs.
     pub fn list_dir(&self, rel: &str) -> Result<Listing> {
+        self.list_dir_snapshot(rel).map(|(listing, _)| listing)
+    }
+
+    pub(crate) fn list_dir_snapshot(&self, rel: &str) -> Result<(Listing, bool)> {
         let mut prefix = self.full_key(rel);
         if !prefix.is_empty() && !prefix.ends_with('/') {
             prefix.push('/');
         }
         let mut out = Listing::default();
         let mut token: Option<String> = None;
+        let mut tokens = std::collections::HashSet::new();
+        let mut complete = true;
         loop {
             let mut query = vec![
                 ("list-type".to_string(), "2".to_string()),
@@ -324,12 +363,21 @@ impl Client {
             let body = r
                 .into_string()
                 .map_err(|e| Error::Transport(e.to_string()))?;
+            let root = body
+                .find("<ListBucketResult")
+                .map(|start| body[start..].trim_end())
+                .ok_or_else(|| Error::Parse("invalid listing response".into()))?;
+            let empty_root = root.ends_with("/>") && !root[..root.len() - 2].contains('>');
+            if !root.ends_with("</ListBucketResult>") && !empty_root {
+                return Err(Error::Parse("invalid listing response".into()));
+            }
 
             for c in xml_blocks(&body, "Contents") {
                 let Some(key) = xml_field(&c, "Key") else {
                     continue;
                 };
                 if key == prefix {
+                    out.directory_marker_exists = true;
                     continue; // the directory marker itself
                 }
                 let rel_key = key.strip_prefix(&prefix).unwrap_or(&key).to_string();
@@ -359,14 +407,25 @@ impl Client {
                 }
             }
 
-            match xml_field(&body, "NextContinuationToken") {
-                Some(t) if xml_field(&body, "IsTruncated").as_deref() == Some("true") => {
-                    token = Some(t)
+            match xml_field(&body, "IsTruncated").as_deref() {
+                Some("true") => {
+                    let next = xml_field(&body, "NextContinuationToken")
+                        .filter(|value| !value.is_empty())
+                        .ok_or_else(|| Error::Parse("truncated listing has no token".into()))?;
+                    if !tokens.insert(next.clone()) {
+                        return Err(Error::Parse("listing repeats a continuation token".into()));
+                    }
+                    token = Some(next);
                 }
-                _ => break,
+                Some("false") => break,
+                None => {
+                    complete = false;
+                    break;
+                }
+                Some(_) => return Err(Error::Parse("invalid listing truncation flag".into())),
             }
         }
-        Ok(out)
+        Ok((out, complete))
     }
 }
 
@@ -506,6 +565,161 @@ fn parse_http_date(s: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn complete_listing_requires_all_pages_and_encodes_continuation_tokens() {
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/", 200, "<ListBucketResult><Contents><Key>dir/first</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>a+b /%</NextContinuationToken></ListBucketResult>"),
+            ("GET", "/b/", 200, "<ListBucketResult><Contents><Key>dir/last</Key><Size>2</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>"),
+        ]);
+        let (listing, complete) = server.client("").list_dir_snapshot("dir").unwrap();
+        assert!(complete);
+        assert_eq!(
+            listing
+                .objects
+                .iter()
+                .map(|object| object.key.as_str())
+                .collect::<Vec<_>>(),
+            ["first", "last"]
+        );
+        let requests = server.finish_requests();
+        assert!(requests[1]
+            .line
+            .contains("continuation-token=a%2Bb%20%2F%25"));
+    }
+
+    #[test]
+    fn listing_without_a_truncation_flag_is_not_negative_cache_evidence() {
+        let server = crate::test_support::Server::new(vec![(
+            "GET", "/b/", 200, "<ListBucketResult><Contents><Key>file</Key><Size>1</Size></Contents></ListBucketResult>",
+        )]);
+        let (listing, complete) = server.client("").list_dir_snapshot("").unwrap();
+        assert!(!complete);
+        assert_eq!(listing.objects.len(), 1);
+        server.finish();
+    }
+
+    #[test]
+    fn malformed_or_unresumable_listings_are_rejected() {
+        for body in [
+            "<ListBucketResult><IsTruncated>true</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken></NextContinuationToken></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>unknown</IsTruncated></ListBucketResult>",
+            "<ListBucketResult><IsTruncated>false</IsTruncated><Nested/>",
+            "<html>not an S3 response</html>",
+        ] {
+            let server = crate::test_support::Server::new(vec![("GET", "/b/", 200, body)]);
+            assert!(server.client("").list_dir_snapshot("").is_err(), "{body}");
+            assert_eq!(server.finish_requests().len(), 1);
+        }
+    }
+
+    #[test]
+    fn repeated_listing_tokens_do_not_loop_or_publish_partial_results() {
+        let page = "<ListBucketResult><IsTruncated>true</IsTruncated><NextContinuationToken>same</NextContinuationToken></ListBucketResult>";
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/", 200, page),
+            ("GET", "/b/", 200, page),
+        ]);
+        assert!(server.client("").list_dir_snapshot("").is_err());
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn later_page_failures_do_not_publish_a_partial_listing() {
+        let server = crate::test_support::Server::new(vec![
+            ("GET", "/b/", 200, "<ListBucketResult><Contents><Key>first</Key><Size>1</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>"),
+            ("GET", "/b/", 503, "unavailable"),
+        ]);
+        assert!(server.client("").list_dir_snapshot("").is_err());
+        assert_eq!(server.finish_requests().len(), 2);
+    }
+
+    #[test]
+    fn server_side_copy_encodes_the_source_and_signs_its_headers() {
+        let server = crate::test_support::Server::new(vec![(
+            "PUT",
+            "/b/mount/target%20%2B.txt",
+            200,
+            "<CopyObjectResult xmlns=\"http://s3.amazonaws.com/doc/2006-03-01/\"><LastModified>2013-05-24T00:00:00.000Z</LastModified><ETag>&quot;abc&quot;</ETag></CopyObjectResult>",
+        )]);
+        let mut cfg = server.client("mount").config().clone();
+        cfg.credentials = Some(Credentials {
+            access_key_id: "test-access".into(),
+            secret_access_key: "test-secret".into(),
+            session_token: None,
+        });
+        let client = Client::new(cfg);
+        assert_eq!(
+            client.copy("source +%?#é.txt", "target +.txt").unwrap(),
+            1369353600
+        );
+        let requests = server.finish_requests();
+        assert_eq!(requests.len(), 1);
+        let request = &requests[0];
+        assert!(request.body.is_empty());
+        let header = |name| {
+            request
+                .headers
+                .iter()
+                .find(|(key, _)| key == name)
+                .unwrap()
+                .1
+                .as_str()
+        };
+        assert_eq!(
+            header("x-amz-copy-source"),
+            "/b/mount/source%20%2B%25%3F%23%C3%A9.txt"
+        );
+        assert_eq!(header("x-amz-metadata-directive"), "COPY");
+        assert!(header("authorization").contains("x-amz-copy-source"));
+        assert!(header("authorization").contains("x-amz-metadata-directive"));
+    }
+
+    #[test]
+    fn copy_rejects_embedded_errors_and_invalid_success_bodies() {
+        for body in [
+            "<Error><Code>SlowDown</Code><Message>try again</Message></Error>",
+            "",
+            "<CopyObjectResult/>",
+            "<CopyObjectResult><ETag>abc</ETag><LastModified>invalid</LastModified></CopyObjectResult>",
+            "<CopyObjectResult><LastModified>2013-05-24T00:00:00.000Z</LastModified></CopyObjectResult>",
+            "<CopyObjectResult><ETag>abc</ETag><LastModified>2013-05-24T00:00:00.000Z</LastModified>",
+        ] {
+            let server = crate::test_support::Server::new(vec![("PUT", "/b/to", 200, body)]);
+            assert!(server.client("").copy("from", "to").is_err(), "{body}");
+            assert_eq!(server.finish().len(), 1);
+        }
+    }
+
+    #[test]
+    fn a_directory_marker_survives_pagination_without_becoming_a_child() {
+        let server = crate::test_support::Server::new(vec![
+            (
+                "GET",
+                "/b/",
+                200,
+                "<ListBucketResult><Contents><Key>mount/empty/</Key><Size>0</Size></Contents><IsTruncated>true</IsTruncated><NextContinuationToken>next</NextContinuationToken></ListBucketResult>",
+            ),
+            (
+                "GET",
+                "/b/",
+                200,
+                "<ListBucketResult><Contents><Key>mount/empty/file</Key><Size>1</Size></Contents><IsTruncated>false</IsTruncated></ListBucketResult>",
+            ),
+        ]);
+        let listing = server.client("mount").list_dir("empty").unwrap();
+        assert!(listing.directory_marker_exists);
+        assert_eq!(listing.objects.len(), 1);
+        assert_eq!(listing.objects[0].key, "file");
+        assert!(listing.prefixes.is_empty());
+        let requests = server.finish();
+        assert_eq!(requests.len(), 2);
+        assert!(requests
+            .iter()
+            .all(|request| request.contains("prefix=mount%2Fempty%2F")));
+        assert!(requests[1].contains("continuation-token=next"));
+    }
 
     #[test]
     fn parses_a_listing_into_objects_and_child_directories() {

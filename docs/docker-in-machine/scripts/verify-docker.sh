@@ -28,7 +28,10 @@ check() {
 }
 exec_in() { "$SMOLVM" machine exec --name "$NAME" -- "$@" 2>&1 | tr -d '\r'; }
 
-check storage_driver "$(exec_in docker info --format '{{.Driver}}')" overlay2
+# An overlay driver: overlay2, or overlayfs, the name Docker 29's containerd
+# image store reports (docker:dind on v1.29.0).
+driver="$(exec_in docker info --format '{{.Driver}}')"
+case "$driver" in overlayfs) check storage_driver "$driver" overlayfs ;; *) check storage_driver "$driver" overlay2 ;; esac
 
 # The backing device, not the path. Both readings print /var/lib/docker.
 # shellcheck disable=SC2016  # the awk field reference belongs to the guest shell

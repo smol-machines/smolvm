@@ -19,6 +19,13 @@ source cannot run `machine exec` while frozen. The flag works with both single
 and batch branches. The HTTP branch request and automatic pool creation request
 accept `"freezeSource": true`; a pool retains this setting for refills.
 
+Every branch gets a fresh hostname, machine-id and SSH host keys. Build tools
+that key a per-machine cache by `/etc/machine-id` (Nx names its cache database
+after it) therefore see an empty cache in each child. For a fan-out that stays
+within one tenant, the HTTP branch request accepts `"keepMachineId": true` to
+leave the source's machine-id in the child; hostname and SSH host keys are still
+re-minted.
+
 ```bash
 smolvm machine branch --from source --name child --freeze-source
 smolvm machine branch --from source --name child-2  # reuses the frozen checkpoint
@@ -71,6 +78,10 @@ keeps running with the helper as its init. A batch branch waits
 single `--name` branch never waits. With `--name-prefix` or `--hold`, even a
 count of one is a batch and gets the same boundary, identity, and release.
 
+A child inherits the source's labels. `--label KEY=VALUE` on `machine branch`
+sets or replaces a label on the child, so a caller that finds its machines by
+label can tell children apart from their source.
+
 Add `--branchable` to a child when it must branch again. A branchable child
 costs the same as a leaf: both share the source's memory pages, and branching
 the child later copies only the pages it has written since, so a deep tree of
@@ -83,3 +94,64 @@ source in memory; `machine checkpoint` saves that same state as a durable
 Building checkpoint tooling in Rust? [`smolvm-checkpoint`](../crates/smolvm-checkpoint)
 provides incremental storage, verified file restoration, and portable export
 without depending on the VM runtime.
+
+## Disk-chain compaction
+
+Live branches share immutable disk layers. SmolVM compacts these layers in the
+background, including layers inherited from an earlier source. When an inherited
+base is already deep, compaction produces a standalone disk rather than retaining
+that deep base. Repeated golden → job → next golden cycles therefore do not keep
+adding disk layers indefinitely.
+
+Before a live branch approaches the disk-layer safety limit, SmolVM waits for any
+in-flight compaction and finishes necessary compaction before capturing the source.
+That branch can take longer and requires space for the flattened disk. The active,
+writable layer is never flattened; existing children retain their disk contents.
+A compaction failure fails the branch before capture instead of proceeding toward
+the limit. This does not remove the separate logical branch-ancestry safety limit.
+
+The layers a checkpoint restore installs under a machine's writable disk are
+compacted like branch layers, so a machine restored from a deep checkpoint, or
+branched from one, is shortened at its first branch instead of keeping every
+captured layer. A branch of a frozen source sits on that source's disk, which is
+never replaced while branches read it; once that disk is eight or more layers
+deep, the next branch first folds the layers beneath it, and if that is not
+enough copies it once into a standalone disk that the source keeps and every
+later branch of it shares. A chain of frozen sources, each the previous one's
+branch, therefore stays short as well. A live branch of a machine that is still
+deeper than 32 layers goes ahead and flattens the generation it creates before
+its children open it; only a chain of 64 layers, which takes that flatten failing
+again and again, is refused.
+
+`GET /api/v1/machines/{name}` reports `diskChainDepth`: the maximum number of backing
+layers across the machine's storage, overlay and cache disks. A standalone disk
+has depth zero. The field is omitted when depth cannot be measured, and on bulk
+list responses. It measures disk layers, not branch generation.
+
+Compaction coordinates across CLI and server processes, and with disk-layer
+garbage collection. It can shorten a frozen source's inherited chain without
+replacing that source's active disk. Reader parallelism adapts to the process's
+file-descriptor limit. Shallow branches do not wait for the compaction GC lock.
+
+See [compaction QA and rollout](branch-and-checkpoint/disk-chain-compaction-qa.md)
+for failure tests, temporary-space requirements and deployment precautions.
+
+## Warm pools over the API
+
+`smolvm serve` keeps a pool of held branches of a running branchable source and
+hands one out per lease, with the job's environment and files installed before
+its program runs.
+
+```sh
+J='-H content-type:application/json'
+curl $J -XPOST $API/api/v1/pools -d '{"name":"p","source":"src","desiredReady":4}'
+curl $J -XPOST $API/api/v1/pools/p/leases -d '{"idempotencyKey":"job-1","env":["JOB=1"],
+  "files":[{"path":"job.json","dataBase64":"e30="}]}'
+curl -XPOST $API/api/v1/pools/p/leases/$LEASE/heartbeat   # before expiresAt
+curl -XPOST $API/api/v1/pools/p/leases/$LEASE/complete    # the worker is replaced
+```
+
+Files land under `/workspace`. A lease returns the worker's `machine` name for
+the exec and file APIs. Reusing an `idempotencyKey` with a different body is
+refused. Without `waitSecs` a lease fails with 503 when no worker is ready.
+`PUT …/size` changes the target and `DELETE …?force=true` cancels active leases.

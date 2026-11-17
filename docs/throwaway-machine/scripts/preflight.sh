@@ -86,8 +86,14 @@ case "$kernel" in
             blocked=1
         fi
         # The offline shape is bake with --oci-cache, then run with mounts and
-        # no network. Before v1.20.2 that combination never boots on macOS.
-        if [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "$FIXED_IN"; then
+        # no network. Before v1.20.2 that combination never boots on macOS, and
+        # from v1.24.0 no --oci-cache run boots there (measured through v1.29.0).
+        if [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "1.24.0"; then
+            emit offline_shape unavailable
+            emit offline_shape_blocker "an --oci-cache run does not boot on macOS from v1.24.0"
+            blocked=1
+            note "from v1.24.0 to at least v1.29.0, on macOS every --oci-cache run, the bake's own included, fails with 'agent did not become ready within 30 seconds', so the offline shape cannot run here. A persistent machine with no network boots the image with no bake (README.md, \"The network is off unless you ask for it\")."
+        elif [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "$FIXED_IN"; then
             emit offline_shape available
         else
             emit offline_shape unavailable

@@ -8,7 +8,7 @@
 //! and provides the same API as the old confy-based implementation.
 
 use crate::data::network;
-use crate::data::resources::{DEFAULT_MICROVM_CPU_COUNT, DEFAULT_MICROVM_MEMORY_MIB};
+use crate::data::resources::{default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT};
 use crate::db::SmolvmDb;
 use crate::error::Result;
 use crate::network::NetworkBackend;
@@ -223,7 +223,7 @@ impl SmolvmConfig {
             db: SmolvmDb::open()?,
             version: 1,
             default_cpus: DEFAULT_MICROVM_CPU_COUNT,
-            default_mem: DEFAULT_MICROVM_MEMORY_MIB,
+            default_mem: default_microvm_memory_mib(),
             default_dns: network::default_dns(),
             #[cfg(target_os = "macos")]
             storage_volume: String::new(),
@@ -254,7 +254,7 @@ impl SmolvmConfig {
         let default_mem = config_map
             .get("default_mem")
             .and_then(|s| s.parse().ok())
-            .unwrap_or(DEFAULT_MICROVM_MEMORY_MIB);
+            .unwrap_or_else(default_microvm_memory_mib);
         let default_dns = config_map
             .get("default_dns")
             .cloned()
@@ -385,9 +385,25 @@ pub struct EgressUpdate {
     /// Permit a removal that empties the list, which allows egress to every
     /// host (`--net` on the CLI, `allowAll` on the API).
     pub allow_all: bool,
+    /// Start from an empty allow list before applying this update's additions,
+    /// so the machine ends up with exactly what the update names and nothing
+    /// it allowed before (`--reset-allow-list` on the CLI, `resetAllowList` on
+    /// the API). A reset that names nothing still needs `allow_all` to open
+    /// egress; it cannot be combined with removals, which would have nothing
+    /// to remove.
+    pub reset_allow_list: bool,
+    #[allow(missing_docs)]
+    pub allow_udp: Vec<smolvm_protocol::EgressRule>,
+    #[allow(missing_docs)]
+    pub remove_allow_udp: Vec<smolvm_protocol::EgressRule>,
 }
 
 impl EgressUpdate {
+    #[allow(missing_docs)]
+    pub fn changes_udp_rules(&self) -> bool {
+        !self.allow_udp.is_empty() || !self.remove_allow_udp.is_empty()
+    }
+
     /// Whether this update changes nothing.
     pub fn is_empty(&self) -> bool {
         self.allow_hosts.is_empty()
@@ -396,7 +412,21 @@ impl EgressUpdate {
             && !self.outbound_localhost_only
             && self.remove_allow_hosts.is_empty()
             && self.remove_allow_cidrs.is_empty()
+            && !self.reset_allow_list
+            && !self.changes_udp_rules()
     }
+}
+
+/// A TCP port published on a host port the engine picked, and the run it
+/// belongs to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AllocatedPort {
+    /// The host port the OS picked.
+    pub host: u16,
+    /// The guest port it forwards to.
+    pub guest: u16,
+    /// Start time of the VM process that bound it ([`VmRecord::pid_start_time`]).
+    pub run: u64,
 }
 
 /// Record of a VM in the registry.
@@ -416,6 +446,11 @@ pub struct VmRecord {
     #[serde(default)]
     pub state: RecordState,
 
+    /// Why the machine is paused when the host paused it rather than the user
+    /// (the memory pressure guard). Cleared by a resume.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pause_reason: Option<String>,
+
     /// Durable execution state retained until a successful explicit resume.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub paused_checkpoint: Option<std::path::PathBuf>,
@@ -428,6 +463,12 @@ pub struct VmRecord {
     /// Used alongside PID to detect PID reuse by the OS.
     #[serde(default)]
     pub pid_start_time: Option<u64>,
+
+    /// The engine build ([`crate::ENGINE_BUILD`]) that started the running
+    /// process. A branch is refused from another build; absent on records
+    /// written by engines that did not record it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub engine_build: Option<String>,
 
     /// Number of vCPUs.
     #[serde(default = "default_cpus")]
@@ -455,6 +496,15 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub cache_disk: Option<crate::data::disk::CacheDisk>,
 
+    /// Guest paths backed by the machine's storage disk (`-v /var/lib/docker`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub disk_volumes: Vec<String>,
+
+    /// Private-range egress block and its exceptions (`--block-private`,
+    /// `--allow-private`). See `VmResources::block_private`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
+
     /// Volume mounts (host_path, guest_path, read_only).
     #[serde(default)]
     pub mounts: Vec<(String, String, bool)>,
@@ -466,9 +516,42 @@ pub struct VmRecord {
     #[serde(default)]
     pub staged_mounts: Vec<(usize, String, String)>,
 
-    /// Port mappings (host_port, guest_port).
+    /// The live mounts keep the guest's file ownership in an xattr (see
+    /// [`crate::data::storage::HostMount::recorded_ownership`]).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
+
+    /// The fork source whose host directories this branch's staged working
+    /// copies were seeded from. A branch keeps the copies (they live on its own
+    /// cloned storage disk and survive restarts, since the mounts stay
+    /// recorded) but never synchronizes them back: the host directories belong
+    /// to the source, and two descendants writing one tree would interleave
+    /// their changes. Inherited by the branch's own branches.
+    #[serde(default)]
+    pub staged_mounts_detached_from: Option<String>,
+
+    /// TCP port mappings (host_port, guest_port).
     #[serde(default)]
     pub ports: Vec<(u16, u16)>,
+
+    /// UDP port mappings (host_port, guest_port). Kept apart from `ports` so a
+    /// record a release without UDP publishing reads still loads, with only its
+    /// TCP mappings.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub udp_ports: Vec<(u16, u16)>,
+
+    /// TCP ports published on a host port the engine picked while the machine
+    /// ran (`publish_atomic`). Each lasts only for the run that picked it: the
+    /// OS may hand the number to anyone once that run ends, so no start binds
+    /// one again, and a new run publishes its own. See
+    /// [`Self::live_allocated_ports`].
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub allocated_ports: Vec<AllocatedPort>,
+
+    /// Host addresses published ports listen on, for the ports that name
+    /// one; the others listen on the default publish address.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub listen_addresses: Vec<crate::data::network::ListenAddress>,
 
     /// User-published Unix-socket bridges (`--expose-socket` / `--mount-socket`).
     #[serde(default)]
@@ -496,6 +579,11 @@ pub struct VmRecord {
     /// Enable Rosetta 2 for x86_64 binary translation on Apple Silicon.
     #[serde(default)]
     pub rosetta: Option<bool>,
+
+    /// Platform (`os/arch`) asked for the machine's image at create. `None`
+    /// leaves the choice to [`VmRecord::image_platform`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oci_platform: Option<String>,
 
     /// Restart configuration.
     #[serde(default)]
@@ -562,6 +650,14 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns: Option<std::net::Ipv4Addr>,
 
+    /// Resolver options for the guest resolv.conf (`--dns-option`), in order.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub dns_options: Vec<String>,
+    /// `/dev/shm` size for the workload container (`--shm-size`): a tmpfs
+    /// size such as `512m` or `25%` of guest RAM. `None` = half the RAM.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<String>,
+
     /// Named inter-VM network this machine joins on start (virtio-net only).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub network_name: Option<String>,
@@ -569,6 +665,10 @@ pub struct VmRecord {
     /// IPv4 subnet for the guest link (virtio-net only). None = `100.96.0.0/30`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub guest_subnet: Option<String>,
+
+    /// Container switch this machine joins on start (virtio-net only).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub switch: Option<crate::data::network::SwitchAttachment>,
 
     /// OCI image for auto-container creation on start.
     #[serde(default)]
@@ -646,6 +746,16 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub stop_on_exit: bool,
 
+    /// Signal the workload is sent when the machine stops (`SIGTERM` when
+    /// unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_signal: Option<String>,
+
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed (10 when unset).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_timeout_secs: Option<u64>,
+
     /// Planned number of runnable CUDA fork clones. Persisted so every clone
     /// receives the same pre-initialization VRAM policy as its golden.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -663,6 +773,12 @@ pub struct VmRecord {
     /// the VM data dir, so a host client can drive it with `DOCKER_HOST=unix://…`.
     #[serde(default)]
     pub docker_socket: bool,
+
+    /// Publish every TCP port the guest listens on at the same host port on
+    /// loopback while it listens (`--auto-ports`). Applied only when the local
+    /// CLI starts the machine, never by `smolvm serve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_ports: Option<crate::data::network::AutoPorts>,
 
     /// Hostnames for DNS filtering. When set, the guest DNS proxy filters
     /// queries against this allowlist.
@@ -693,10 +809,11 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::collections::BTreeMap::is_empty")]
     pub credential_placeholders: std::collections::BTreeMap<String, String>,
 
-    /// The credential bindings came in over the HTTP API, so their values come
-    /// only from that API (`PUT /machines/{name}/credential-values`) and never
-    /// from this host's environment: an API caller must not be able to route a
-    /// host variable to a host of its choosing.
+    /// The credential bindings came from someone other than this host's
+    /// operator (an HTTP API caller, an embedder, or a restored checkpoint), so
+    /// their values come only from `PUT /machines/{name}/credential-values` or
+    /// `supply_credential_values` and never from this host's environment: they
+    /// must not be able to route a host variable to a host of their choosing.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credentials_supplied_by_api: bool,
 
@@ -709,6 +826,10 @@ pub struct VmRecord {
     /// them via virtiofs instead of pulling the image from a registry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub source_smolmachine: Option<String>,
+
+    /// The packed image lives on the machine's storage disk, not a host share.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub packed_image_on_storage: bool,
 
     /// Registry reference `source_smolmachine` was pulled from, if any. Carried
     /// into a live checkpoint so another host can fetch the same pack.
@@ -756,6 +877,20 @@ pub struct VmRecord {
     /// records it as its parent, which is what links checkpoints into history.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub checkpoint_head: Option<String>,
+
+    /// Content digest of the agent rootfs this machine's live state runs on,
+    /// recorded at each boot. A checkpoint or pause carries it, and a live
+    /// restore boots the rootfs with this digest (see `agent::rootfs_store`),
+    /// since the captured processes keep that userland mapped. A cold start
+    /// takes the host's installed rootfs and records its digest here.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rootfs_digest: Option<String>,
+
+    /// The directory that rootfs was booted from, so a branch of this machine's
+    /// live state can boot the same directory after the installed rootfs moved
+    /// on (a roll installs the new one beside the old).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_rootfs_path: Option<std::path::PathBuf>,
 
     /// Persistent container-overlay owner inherited from the root of a fork
     /// lineage. A clone's live overlay keeps its original on-disk name across
@@ -821,6 +956,37 @@ fn default_mem() -> u32 {
 }
 
 impl VmRecord {
+    /// The host directory holding this machine's `local:` image, mounted so the
+    /// guest boots that image offline, or `None` when it has no local image or
+    /// its packed image was prepared on its own storage disk. Such a disk holds
+    /// the pack's image under the same reference, and mounting the archive the
+    /// reference also names would boot the pack's source image instead.
+    pub fn local_image_layers_dir(&self) -> Option<std::path::PathBuf> {
+        if self.packed_image_on_storage {
+            return None;
+        }
+        crate::data::image_source::packed_layers_dir_for_ref(self.image.as_deref()?)
+    }
+
+    /// The artifact whose layers must be mounted from the host, if any.
+    pub fn packed_layer_source(&self) -> Option<&str> {
+        if self.packed_image_on_storage {
+            None
+        } else {
+            self.source_smolmachine.as_deref()
+        }
+    }
+
+    /// The platform this machine's image is pulled for, or `None` for the
+    /// guest's own architecture. Every pull of the image has to agree on it:
+    /// the guest keeps one platform per reference and re-pulls on a mismatch.
+    pub fn image_platform(&self) -> Option<&str> {
+        crate::vm::rosetta::image_platform(
+            self.oci_platform.as_deref(),
+            self.rosetta.unwrap_or(false),
+        )
+    }
+
     /// Host identity owner; guest overlay names only serve as a legacy fallback.
     pub fn vm_uid_owner(&self) -> Option<&str> {
         self.host_uid_owner
@@ -851,24 +1017,34 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            pause_reason: None,
             paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
+            engine_build: None,
             cpus,
             mem,
             block_io: Default::default(),
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             mounts,
             staged_mounts: Vec::new(),
+            recorded_ownership: false,
+            staged_mounts_detached_from: None,
             ports,
+            udp_ports: Vec::new(),
+            allocated_ports: Vec::new(),
+            listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
             nested_virt: None,
             rosetta: None,
+            oci_platform: None,
             restart: RestartConfig::default(),
             last_exit_code: None,
             init: Vec::new(),
@@ -884,8 +1060,11 @@ impl VmRecord {
             egress_rules: Vec::new(),
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
+            shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -901,10 +1080,13 @@ impl VmRecord {
             detached: false,
             keep_identity: false,
             stop_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -913,11 +1095,14 @@ impl VmRecord {
             credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
+            packed_image_on_storage: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
             golden: None,
             checkpoint_head: None,
+            agent_rootfs_digest: None,
+            agent_rootfs_path: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -942,24 +1127,34 @@ impl VmRecord {
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
+            pause_reason: None,
             paused_checkpoint: None,
             pid: None,
             pid_start_time: None,
+            engine_build: None,
             cpus,
             mem,
             block_io: Default::default(),
             disk_durability: Default::default(),
             disks: Vec::new(),
             cache_disk: None,
+            disk_volumes: Vec::new(),
+            block_private: None,
             mounts,
             staged_mounts: Vec::new(),
+            recorded_ownership: false,
+            staged_mounts_detached_from: None,
             ports,
+            udp_ports: Vec::new(),
+            allocated_ports: Vec::new(),
+            listen_addresses: Vec::new(),
             published_sockets: Vec::new(),
             network,
             gpu: None,
             gpu_vram_mib: None,
             nested_virt: None,
             rosetta: None,
+            oci_platform: None,
             restart,
             last_exit_code: None,
             init: Vec::new(),
@@ -975,8 +1170,11 @@ impl VmRecord {
             egress_rules: Vec::new(),
             network_backend: None,
             dns: None,
+            dns_options: Vec::new(),
+            shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             image: None,
             entrypoint: Vec::new(),
             cmd: Vec::new(),
@@ -992,10 +1190,13 @@ impl VmRecord {
             detached: false,
             keep_identity: false,
             stop_on_exit: false,
+            stop_signal: None,
+            stop_timeout_secs: None,
             cuda_fork_pool_size: None,
             cuda_vram_limit_mib: None,
             cuda_preload_modules: false,
             docker_socket: false,
+            auto_ports: None,
             dns_filter_hosts: None,
             credential_policy: None,
             external_interceptor_required: false,
@@ -1004,11 +1205,14 @@ impl VmRecord {
             credentials_supplied_by_api: false,
             ephemeral: false,
             source_smolmachine: None,
+            packed_image_on_storage: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
             golden: None,
             checkpoint_head: None,
+            agent_rootfs_digest: None,
+            agent_rootfs_path: None,
             fork_generation: None,
             fork_lineage_pid_start_time: None,
             fork_overlay_owner: None,
@@ -1028,6 +1232,38 @@ impl VmRecord {
             crate::process::is_our_process(pid, self.pid_start_time)
         } else {
             false
+        }
+    }
+
+    /// The machine's recorded process, when the kernel is holding it after
+    /// SIGKILL: still present, running no code, and impossible to remove
+    /// before the host reboots. `None` once it is gone or if the PID now
+    /// belongs to another process.
+    pub fn held_process(&self) -> Option<crate::process::HeldProcess> {
+        let pid = self.pid?;
+        if !crate::process::is_our_process(pid, self.pid_start_time) {
+            return None;
+        }
+        crate::process::held_after_kill(pid)
+    }
+
+    /// Whether the recorded process can still run guest or VMM code: it is
+    /// alive and not held by the kernel after SIGKILL.
+    pub fn process_can_run(&self) -> bool {
+        self.is_process_alive() && self.held_process().is_none()
+    }
+
+    /// Record that the machine is stopped. This is the one way a stop
+    /// forgets the process, on every surface: the PID is cleared unless the
+    /// kernel is still holding that process, in which case it stays so a
+    /// later start is refused while the process has the machine's disks
+    /// open. [`crate::agent::state_probe::refuse_start_while_held`] clears
+    /// it once the process is gone.
+    pub fn mark_process_stopped(&mut self) {
+        self.state = RecordState::Stopped;
+        if self.held_process().is_none() {
+            self.pid = None;
+            self.pid_start_time = None;
         }
     }
 
@@ -1054,6 +1290,7 @@ impl VmRecord {
                 target: std::path::PathBuf::from(guest),
                 read_only: *ro,
                 staged: false,
+                recorded_ownership: self.recorded_ownership,
             })
             .collect::<std::collections::VecDeque<_>>();
         let staged = self
@@ -1084,23 +1321,62 @@ impl VmRecord {
         mounts
     }
 
-    /// Convert stored ports to PortMapping format.
-    pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
-        self.ports
+    /// The `(host, guest)` pairs of [`Self::allocated_ports`] that belong to the
+    /// machine's current run. Those of an earlier run are stale: their
+    /// listeners closed with it.
+    pub fn live_allocated_ports(&self) -> Vec<(u16, u16)> {
+        let Some(run) = self.pid_start_time else {
+            return Vec::new();
+        };
+        self.allocated_ports
             .iter()
-            .map(|(host, guest)| crate::data::network::PortMapping::new(*host, *guest))
+            .filter(|port| port.run == run)
+            .map(|port| (port.host, port.guest))
             .collect()
     }
 
+    /// Convert stored ports to PortMapping format, TCP then UDP.
+    pub fn port_mappings(&self) -> Vec<crate::data::network::PortMapping> {
+        use crate::data::network::{PortMapping, PortProtocol};
+        let listen = |host: u16, protocol: PortProtocol| {
+            self.listen_addresses
+                .iter()
+                .find(|l| l.host == host && l.protocol == protocol)
+                .map(|l| l.address)
+        };
+        let tcp = self.ports.iter().map(|(host, guest)| {
+            PortMapping::new(*host, *guest).listening_on(listen(*host, PortProtocol::Tcp))
+        });
+        let udp = self.udp_ports.iter().map(|(host, guest)| {
+            PortMapping::with_protocol(*host, *guest, PortProtocol::Udp)
+                .listening_on(listen(*host, PortProtocol::Udp))
+        });
+        tcp.chain(udp).collect()
+    }
+
+    /// Store `mappings`, TCP into `ports` and UDP into `udp_ports`.
+    pub fn set_port_mappings(&mut self, mappings: &[crate::data::network::PortMapping]) {
+        let (tcp, udp) = crate::data::network::PortMapping::split_tuples(mappings);
+        self.ports = tcp;
+        self.udp_ports = udp;
+        self.listen_addresses = crate::data::network::PortMapping::listen_addresses(mappings);
+    }
+
     /// Whether this machine's registry image must be fetched on the HOST before
-    /// it boots: a REGISTRY reference, on a first boot, with no network.
+    /// it boots: a REGISTRY reference, on a first boot, that the guest's own
+    /// network cannot reach: no network, an inbound-only network (published
+    /// ports without egress), or an egress allow list that does not name the
+    /// registry.
     ///
     /// The pull normally runs inside the guest (the agent shells out to
-    /// `crane`), so a machine with no network device cannot fetch its own image.
-    /// Rather than refuse such a machine, the start path fetches the image on the
-    /// host, which has network, and pins it as a local archive the guest
-    /// flattens offline (see [`crate::image_store::fetch_image_archive`]). The
-    /// machine itself never gets network.
+    /// `crane`). Rather than refuse such a machine, the start path fetches the
+    /// image on the host, which has network, and pins it as a local archive the
+    /// guest flattens offline (see [`crate::image_store::fetch_image_archive`]).
+    /// The machine's own network policy is untouched: the pull is the engine's,
+    /// not the workload's, exactly as for a machine with no network at all. An
+    /// allow list that does name the registry (and, for Docker Hub and GHCR,
+    /// the hosts they serve downloads from) keeps the pull in the guest, where
+    /// the operator chose to route it.
     ///
     /// Deliberately narrow: only a registry reference needs fetching. A local
     /// archive or directory is already on the host, a `.smolmachine` has its
@@ -1128,7 +1404,43 @@ impl VmRecord {
         matches!(
             crate::data::image_source::classify(image),
             crate::data::image_source::ImageSource::Registry(_)
-        ) && !self.launch_network_plan().has_network()
+        ) && !self.guest_can_pull(image)
+    }
+
+    /// Whether the guest's own network reaches `image`'s registry: outbound
+    /// egress with no policy at all, or an allow list that names every apex the
+    /// pull talks to ([`crate::registry::registry_pull_hosts`]), either the apex
+    /// itself or its subdomains, since registries answer from sub-hosts.
+    /// `Some([])` is a deny-all list, not an absent one, and a CIDR-only list
+    /// cannot be checked against hostnames here, so both send the pull to the
+    /// host rather than guess.
+    fn guest_can_pull(&self, image: &str) -> bool {
+        use smolvm_protocol::host_pattern::matches;
+        if !self.launch_network_plan().outbound {
+            return false;
+        }
+        if self.dns_filter_hosts.is_none()
+            && self.allowed_cidrs.is_none()
+            && self.egress_rules.is_empty()
+        {
+            return true;
+        }
+        let hosts = self.dns_filter_hosts.as_deref().unwrap_or(&[]);
+        crate::registry::registry_pull_hosts(image)
+            .iter()
+            .all(|apex| {
+                let apex = apex.split(':').next().unwrap_or(apex);
+                let sub_host = format!("pull.{apex}");
+                hosts
+                    .iter()
+                    .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
+            })
+    }
+
+    /// Whether this machine's staged mounts synchronize back to their host
+    /// directories. False on a branch, which only keeps the working copies.
+    pub fn staged_mounts_sync_to_host(&self) -> bool {
+        self.staged_mounts_detached_from.is_none()
     }
 
     /// Whether this machine's image can be fetched. Always: a machine with no
@@ -1252,10 +1564,30 @@ impl VmRecord {
         cidrs: Vec<String>,
         hosts: Vec<String>,
     ) -> Result<()> {
+        // Egress rules imply networking at launch (`plan_launch_network_with`),
+        // so turning networking off clears them alongside the allow list rather
+        // than leaving a deny rule to re-enable open egress on start.
+        let rules = if network {
+            self.egress_rules.clone()
+        } else {
+            Vec::new()
+        };
+        self.replace_egress_and_rules(network, cidrs, hosts, rules)
+    }
+
+    fn replace_egress_and_rules(
+        &mut self,
+        network: bool,
+        cidrs: Vec<String>,
+        hosts: Vec<String>,
+        rules: Vec<smolvm_protocol::EgressRule>,
+    ) -> Result<()> {
         let mut next = self.clone();
         next.network = network;
         next.allowed_cidrs = (!cidrs.is_empty()).then_some(cidrs);
         next.dns_filter_hosts = (!hosts.is_empty()).then_some(hosts);
+        let adds_rules = !rules.is_empty() && rules != self.egress_rules;
+        next.egress_rules = rules;
         if let Some(credentials) = next.credential_policy.as_ref() {
             credentials
                 .validate(next.dns_filter_hosts.as_deref())
@@ -1269,7 +1601,8 @@ impl VmRecord {
         // host-side stack only; on TSI it would be silently unenforced. A
         // machine pinned to TSI (explicitly, or by a checkpoint it resumes)
         // cannot take one.
-        let restricted = next.allowed_cidrs.is_some() || next.dns_filter_hosts.is_some();
+        let restricted =
+            next.allowed_cidrs.is_some() || next.dns_filter_hosts.is_some() || adds_rules;
         if restricted && after == crate::network::EffectiveNetworkBackend::Tsi {
             return Err(crate::Error::config(
                 "egress policy",
@@ -1298,8 +1631,10 @@ impl VmRecord {
     /// This record after one add/remove amendment of its egress allow list, or
     /// `None` when the update is empty. Hosts are stored as `machine create`
     /// stores them: `allow_hosts` bare (a name and its subdomains),
-    /// `allow_host_patterns` strict-encoded. Removing the last entry would open
-    /// egress to every host, so that needs `allow_all` to say so. Shared by
+    /// `allow_host_patterns` strict-encoded. `reset_allow_list` drops the stored
+    /// list first, so the result is exactly the update's additions. Removing or
+    /// resetting away the last entry would open egress to every host, so that
+    /// needs `allow_all` to say so. Shared by
     /// `machine update` and the API's egress endpoint; the full replace-style
     /// checks (credentials, TSI, saved memory) run in [`Self::replace_egress`].
     pub fn updated_egress(&self, update: &EgressUpdate) -> Result<Option<VmRecord>> {
@@ -1310,6 +1645,18 @@ impl VmRecord {
         let mut hosts = self.dns_filter_hosts.clone().unwrap_or_default();
         let mut cidrs = self.allowed_cidrs.clone().unwrap_or_default();
         let was_restricted = !hosts.is_empty() || !cidrs.is_empty();
+
+        if update.reset_allow_list {
+            if !update.remove_allow_hosts.is_empty() || !update.remove_allow_cidrs.is_empty() {
+                return Err(crate::Error::config(
+                    "update",
+                    "resetting the allow list replaces it, so there is nothing for a removal \
+                     to remove; name the full new list instead",
+                ));
+            }
+            hosts.clear();
+            cidrs.clear();
+        }
 
         for host in &update.remove_allow_hosts {
             let strict = encode_strict(host.trim()).ok();
@@ -1363,6 +1710,37 @@ impl VmRecord {
             }
         }
 
+        let is_udp_allow = |rule: &smolvm_protocol::EgressRule| {
+            rule.transport == Some(smolvm_protocol::FlowTransport::Udp)
+                && rule.action == smolvm_protocol::RuleAction::Allow
+        };
+        let mut rules = self.egress_rules.clone();
+        for rule in &update.remove_allow_udp {
+            let before = rules.len();
+            rules.retain(|stored| !(is_udp_allow(stored) && stored == rule));
+            if rules.len() == before {
+                return Err(crate::Error::config(
+                    "update",
+                    format!(
+                        "'{}' is not in machine '{}''s UDP allows",
+                        crate::smolfile::udp_allow_label(rule),
+                        self.name
+                    ),
+                ));
+            }
+        }
+        for rule in &update.allow_udp {
+            if !is_udp_allow(rule) {
+                return Err(crate::Error::config(
+                    "allow udp",
+                    "a UDP allow must have the UDP transport and the allow action",
+                ));
+            }
+            if !rules.contains(rule) {
+                rules.push(rule.clone());
+            }
+        }
+
         if was_restricted && hosts.is_empty() && cidrs.is_empty() && !update.allow_all {
             return Err(crate::Error::config(
                 "update",
@@ -1372,7 +1750,7 @@ impl VmRecord {
             ));
         }
         let mut next = self.clone();
-        next.replace_egress(true, cidrs, hosts)?;
+        next.replace_egress_and_rules(true, cidrs, hosts, rules)?;
         Ok(Some(next))
     }
 
@@ -1418,7 +1796,7 @@ impl VmRecord {
         crate::network::plan_launch_network_with(
             &self.vm_resources(),
             self.dns_filter_hosts.as_deref(),
-            self.ports.len(),
+            self.ports.len() + self.udp_ports.len(),
             self.credential_policy.is_some(),
         )
     }
@@ -1441,11 +1819,16 @@ impl VmRecord {
             disk_durability: self.disk_durability,
             disks: self.disks.clone(),
             cache_disk: self.cache_disk.clone(),
+            disk_volumes: self.disk_volumes.clone(),
+            block_private: self.block_private.clone(),
             allowed_cidrs: self.allowed_cidrs.clone(),
             egress_rules: self.egress_rules.clone(),
             dns: self.dns,
+            dns_options: self.dns_options.clone(),
+            shm_size: self.shm_size.clone(),
             network_name: self.network_name.clone(),
             guest_subnet: self.guest_subnet.clone(),
+            switch: self.switch.clone(),
         }
     }
 }
@@ -1454,11 +1837,247 @@ impl VmRecord {
 mod tests {
     use super::*;
 
+    /// Only the current run's picked ports are live; an earlier run's closed
+    /// with it, and a record that is not running has none.
+    #[test]
+    fn only_the_current_runs_allocated_ports_are_live() {
+        let mut record = VmRecord::new("m".into(), 1, 512, vec![], vec![], false);
+        record.allocated_ports = vec![
+            AllocatedPort {
+                host: 49152,
+                guest: 3000,
+                run: 100,
+            },
+            AllocatedPort {
+                host: 49153,
+                guest: 3001,
+                run: 200,
+            },
+        ];
+        assert!(record.live_allocated_ports().is_empty());
+        record.pid_start_time = Some(200);
+        assert_eq!(record.live_allocated_ports(), [(49153, 3001)]);
+        let json = serde_json::to_string(&record).unwrap();
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.allocated_ports, record.allocated_ports);
+        // A record written before the field existed still loads.
+        let mut old: serde_json::Value = serde_json::from_str(&json).unwrap();
+        old.as_object_mut().unwrap().remove("allocated_ports");
+        let old: VmRecord = serde_json::from_value(old).unwrap();
+        assert!(old.allocated_ports.is_empty());
+    }
+
+    /// UDP mappings live beside the TCP list, so a record without any reads
+    /// and writes exactly as before, and an older reader still loads one with.
+    #[test]
+    fn udp_ports_round_trip_without_changing_tcp_only_records() {
+        use crate::data::network::{PortMapping, PortProtocol};
+        let mut record = VmRecord::new("game".into(), 1, 512, vec![], vec![(8080, 80)], true);
+        let tcp_only = serde_json::to_value(&record).unwrap();
+        assert!(tcp_only.get("udp_ports").is_none());
+
+        let udp = PortMapping::with_protocol(27015, 27015, PortProtocol::Udp);
+        record.set_port_mappings(&[PortMapping::new(8080, 80), udp]);
+        assert_eq!(record.ports, vec![(8080, 80)]);
+        assert_eq!(record.udp_ports, vec![(27015, 27015)]);
+        assert_eq!(
+            record.port_mappings(),
+            vec![PortMapping::new(8080, 80), udp]
+        );
+
+        let json = serde_json::to_string(&record).unwrap();
+        let back: VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.port_mappings(), record.port_mappings());
+    }
+
     /// A machine with `image`, and whatever networking the args describe.
     fn rec_with_image(image: &str, network: bool, ports: Vec<(u16, u16)>) -> VmRecord {
         let mut r = VmRecord::new("m".to_string(), 1, 512, vec![], ports, network);
         r.image = Some(image.to_string());
         r
+    }
+
+    // A record written before `--dns-option` existed still loads (no options),
+    // and a record's options reach the launch resources in order.
+    #[test]
+    fn dns_options_persist_on_the_record_and_reach_launch_resources() {
+        let mut record = VmRecord::new("d".to_string(), 1, 512, vec![], vec![], true);
+        let mut old = serde_json::to_value(&record).unwrap();
+        assert!(
+            old.get("dns_options").is_none(),
+            "empty options are not written"
+        );
+        old.as_object_mut().unwrap().remove("dns_options");
+        let loaded: VmRecord = serde_json::from_value(old).unwrap();
+        assert!(loaded.dns_options.is_empty());
+
+        record.dns_options = vec!["timeout:1".into(), "use-vc".into()];
+        let loaded: VmRecord =
+            serde_json::from_value(serde_json::to_value(&record).unwrap()).unwrap();
+        assert_eq!(loaded.vm_resources().dns_options, ["timeout:1", "use-vc"]);
+    }
+
+    #[test]
+    fn updated_egress_reset_replaces_the_list_and_keeps_the_last_entry_guard() {
+        let mut record = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
+        record.dns_filter_hosts =
+            Some(vec!["old.example".to_string(), "*.old.example".to_string()]);
+        record.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
+
+        // A reset alone is a change, not a no-op, and it would open egress, so
+        // it needs allow_all like a removal of the last entry does.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("every host"), "{err}");
+
+        // Reset with additions: exactly the additions remain, nothing older.
+        let next = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_host_patterns: vec!["pypi.org".to_string(), "*.npmjs.org".to_string()],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        let hosts = next.dns_filter_hosts.clone().unwrap();
+        assert_eq!(hosts.len(), 2);
+        assert!(
+            !hosts.iter().any(|h| h.contains("old.example")),
+            "{hosts:?}"
+        );
+        assert!(next.allowed_cidrs.as_deref().unwrap_or_default().is_empty());
+
+        // Reset plus allow_all: an open machine, no list at all.
+        let open = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_all: true,
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert!(open
+            .dns_filter_hosts
+            .as_deref()
+            .unwrap_or_default()
+            .is_empty());
+        assert!(open.allowed_cidrs.as_deref().unwrap_or_default().is_empty());
+
+        // Reset and removal contradict each other.
+        let err = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                remove_allow_hosts: vec!["old.example".to_string()],
+                allow_hosts: vec!["new.example".to_string()],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("replaces"), "{err}");
+    }
+
+    fn udp_allow(spec: &str) -> smolvm_protocol::EgressRule {
+        crate::smolfile::parse_allow_udp(spec).unwrap()
+    }
+
+    #[test]
+    fn updated_egress_appends_udp_allows_after_the_deny_rules_and_keeps_egress_open() {
+        let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], false);
+        let deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        record.egress_rules = vec![deny.clone()];
+
+        let next = record
+            .updated_egress(&EgressUpdate {
+                allow_udp: vec![udp_allow("1.1.1.1:123"), udp_allow("1.1.1.1:123")],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.egress_rules,
+            vec![deny.clone(), udp_allow("1.1.1.1:123")]
+        );
+        assert!(next.network, "a UDP allow implies networking");
+        assert!(next.allowed_cidrs.is_none() && next.dns_filter_hosts.is_none());
+
+        let err = next
+            .updated_egress(&EgressUpdate {
+                remove_allow_udp: vec![udp_allow("1.1.1.1:53")],
+                ..Default::default()
+            })
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("1.1.1.1/32:53"), "{err}");
+
+        let removed = next
+            .updated_egress(&EgressUpdate {
+                remove_allow_udp: vec![udp_allow("1.1.1.1:123")],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(removed.egress_rules, vec![deny.clone()]);
+    }
+
+    #[test]
+    fn updated_egress_reset_leaves_the_rules_alone() {
+        let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], true);
+        let deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        record.egress_rules = vec![deny.clone(), udp_allow("1.1.1.1:123")];
+        record.allowed_cidrs = Some(vec!["192.0.2.0/24".to_string()]);
+
+        let next = record
+            .updated_egress(&EgressUpdate {
+                reset_allow_list: true,
+                allow_cidrs: vec!["198.51.100.0/24".to_string()],
+                allow_udp: vec![udp_allow("8.8.8.8:443")],
+                ..Default::default()
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            next.egress_rules,
+            vec![deny, udp_allow("1.1.1.1:123"), udp_allow("8.8.8.8:443")]
+        );
+        assert_eq!(
+            next.allowed_cidrs.as_deref(),
+            Some(["198.51.100.0/24".to_string()].as_slice())
+        );
+    }
+
+    #[test]
+    fn udp_allow_changes_are_flagged_and_refused_on_tsi() {
+        let update = EgressUpdate {
+            allow_udp: vec![udp_allow("1.1.1.1")],
+            ..Default::default()
+        };
+        assert!(!update.is_empty());
+        assert!(update.changes_udp_rules());
+        assert!(!EgressUpdate {
+            allow_cidrs: vec!["1.1.1.1/32".to_string()],
+            ..Default::default()
+        }
+        .changes_udp_rules());
+
+        let mut record = VmRecord::new("t".to_string(), 1, 512, vec![], vec![], true);
+        record.network_backend = Some(crate::network::NetworkBackend::Tsi);
+        let err = record.updated_egress(&update).unwrap_err().to_string();
+        assert!(err.contains("TSI"), "{err}");
     }
 
     #[test]
@@ -1554,6 +2173,16 @@ mod tests {
     }
 
     #[test]
+    fn udp_only_ports_plan_virtio_net_as_the_launcher_does() {
+        let mut record = VmRecord::new("u".to_string(), 1, 512, vec![], vec![], true);
+        record.udp_ports = vec![(9000, 9000)];
+        assert_eq!(
+            record.launch_network_plan().backend,
+            crate::network::launch::EffectiveNetworkBackend::VirtioNet
+        );
+    }
+
+    #[test]
     fn a_machine_running_without_an_allow_list_cannot_gain_one_live() {
         let open = VmRecord::new("e".to_string(), 1, 512, vec![], vec![], true);
         let restricted = open
@@ -1583,18 +2212,57 @@ mod tests {
     }
 
     #[test]
-    fn granting_network_any_way_leaves_the_pull_to_the_guest() {
-        // Explicit --net.
+    fn open_egress_leaves_the_pull_to_the_guest() {
         assert!(!rec_with_image("alpine", true, vec![]).image_needs_host_fetch());
-        // A published port implicitly enables networking.
-        assert!(!rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
-        // An egress policy also forces a network backend.
+    }
+
+    // The guest pulls with its own network, so a network that cannot reach the
+    // registry is as good as none: the host fetches.
+    #[test]
+    fn a_guest_whose_network_cannot_reach_the_registry_gets_a_host_fetch() {
+        // Published ports give an inbound path, not egress.
+        assert!(rec_with_image("alpine", false, vec![(8080, 80)]).image_needs_host_fetch());
+        // An allow list that does not name the registry, by CIDR or by host.
         let mut cidr = rec_with_image("alpine", false, vec![]);
         cidr.allowed_cidrs = Some(vec!["10.0.0.0/8".to_string()]);
-        assert!(!cidr.image_needs_host_fetch());
+        assert!(cidr.image_needs_host_fetch());
         let mut dns = rec_with_image("alpine", false, vec![]);
         dns.dns_filter_hosts = Some(vec!["example.com".to_string()]);
-        assert!(!dns.image_needs_host_fetch());
+        assert!(dns.image_needs_host_fetch());
+        // A deny-all list is a list.
+        let mut deny = rec_with_image("alpine", true, vec![]);
+        deny.dns_filter_hosts = Some(vec![]);
+        assert!(deny.image_needs_host_fetch());
+        // Docker Hub redirects blobs to another host; naming only docker.io
+        // would fail mid-pull in the guest.
+        let mut hub = rec_with_image("alpine", true, vec![]);
+        hub.dns_filter_hosts = Some(vec!["docker.io".to_string()]);
+        assert!(hub.image_needs_host_fetch());
+    }
+
+    #[test]
+    fn an_allow_list_naming_the_registry_keeps_the_pull_in_the_guest() {
+        // Both Docker Hub apexes, as `registry_pull_hosts` names them.
+        let mut hub = rec_with_image("alpine", true, vec![]);
+        hub.dns_filter_hosts = Some(vec!["docker.io".to_string(), "docker.com".to_string()]);
+        assert!(!hub.image_needs_host_fetch());
+        // Wildcards cover the sub-hosts a registry answers from.
+        let mut wild = rec_with_image("alpine", true, vec![]);
+        wild.dns_filter_hosts = Some(vec!["*.docker.io".to_string(), "*.docker.com".to_string()]);
+        assert!(!wild.image_needs_host_fetch());
+        // GHCR redirects blobs to githubusercontent.com; both apexes are needed.
+        let mut ghcr = rec_with_image("ghcr.io/acme/app:1", true, vec![]);
+        ghcr.dns_filter_hosts = Some(vec!["=ghcr.io".to_string()]);
+        assert!(ghcr.image_needs_host_fetch());
+        ghcr.dns_filter_hosts = Some(vec![
+            "=ghcr.io".to_string(),
+            "githubusercontent.com".to_string(),
+        ]);
+        assert!(!ghcr.image_needs_host_fetch());
+        // A registry with a port is matched by host.
+        let mut private = rec_with_image("registry.example.com:5000/team/app:2", true, vec![]);
+        private.dns_filter_hosts = Some(vec!["*.example.com".to_string()]);
+        assert!(!private.image_needs_host_fetch());
     }
 
     // These resolve from bytes the host already has.
@@ -1632,6 +2300,39 @@ mod tests {
         let mut r = rec_with_image("alpine:3.20", false, vec![]);
         r.source_smolmachine = Some("library/alpine:latest".to_string());
         assert!(!r.image_needs_host_fetch());
+    }
+
+    /// A machine whose packed image is on its storage disk keeps the `local:`
+    /// reference of the pack's source image, and must not mount that image's
+    /// archive: doing so booted the source image instead of the pack.
+    #[test]
+    fn a_local_image_on_storage_mounts_no_archive() {
+        let mut record = rec_with_image("local:abc", false, vec![]);
+        assert!(record.local_image_layers_dir().is_some());
+        record.packed_image_on_storage = true;
+        assert_eq!(record.local_image_layers_dir(), None);
+    }
+
+    #[test]
+    fn a_storage_seed_keeps_provenance_without_mounting_host_layers() {
+        let mut record = rec_with_image("alpine:latest", false, vec![]);
+        record.source_smolmachine = Some("removed.smolmachine".into());
+        assert_eq!(record.packed_layer_source(), Some("removed.smolmachine"));
+        record.packed_image_on_storage = true;
+        assert_eq!(record.packed_layer_source(), None);
+        assert!(!record.image_needs_host_fetch());
+        assert!(!record.init_completed);
+        let serialized = serde_json::to_value(&record).unwrap();
+        let restored: VmRecord = serde_json::from_value(serialized.clone()).unwrap();
+        assert!(restored.packed_image_on_storage);
+        let mut legacy = serialized;
+        legacy
+            .as_object_mut()
+            .unwrap()
+            .remove("packed_image_on_storage");
+        let legacy: VmRecord = serde_json::from_value(legacy).unwrap();
+        assert!(!legacy.packed_image_on_storage);
+        assert_eq!(legacy.packed_layer_source(), Some("removed.smolmachine"));
     }
 
     #[test]
@@ -1751,6 +2452,7 @@ mod tests {
             SecretRef {
                 from_env: None,
                 from_file: Some("/run/secrets/tls.key".into()),
+                from_keychain: None,
             },
         );
         record.secret_refs.insert(
@@ -1758,6 +2460,7 @@ mod tests {
             SecretRef {
                 from_env: Some("PROD_DB".into()),
                 from_file: None,
+                from_keychain: None,
             },
         );
 
@@ -2093,10 +2796,12 @@ mod tests {
             crate::data::disk::AttachedDisk {
                 path: std::path::PathBuf::from("/dev/nvme1n1"),
                 read_only: false,
+                format: None,
             },
             crate::data::disk::AttachedDisk {
                 path: std::path::PathBuf::from("/srv/golden.img"),
                 read_only: true,
+                format: None,
             },
         ];
         let decoded: VmRecord =
@@ -2333,6 +3038,33 @@ mod tests {
                 record.dns_filter_hosts.clone()
             ),
             (None, None)
+        );
+
+        // A machine with a deny rule (e.g. created from a pack that carried
+        // `--allow-host pypi.org --deny-cidr 1.1.1.1/32`) that has its egress
+        // replaced with `network: false` must clear `egress_rules` too, so the
+        // remaining deny rule does not re-enable networking at launch with the
+        // allow list gone.
+        record.dns_filter_hosts = Some(vec!["pypi.org".to_string()]);
+        record.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("1.1.1.1/32".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
+        record
+            .apply_egress_policy(&network::EgressPolicy::default())
+            .unwrap();
+        assert!(!record.network);
+        assert_eq!(record.allowed_cidrs, None);
+        assert_eq!(record.dns_filter_hosts, None);
+        assert!(record.egress_rules.is_empty());
+        assert_eq!(
+            record.launch_network_plan(),
+            crate::network::LaunchNetworkPlan {
+                backend: crate::network::EffectiveNetworkBackend::None,
+                outbound: false,
+            }
         );
     }
 

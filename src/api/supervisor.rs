@@ -318,7 +318,7 @@ impl Supervisor {
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
         let resources = record.vm_resources();
-        let source_smolmachine = record.source_smolmachine.clone();
+        let source_smolmachine = record.packed_layer_source().map(str::to_owned);
         let dns_filter_hosts = record.dns_filter_hosts.clone();
         let cuda_fork_pool_size = record.cuda_fork_pool_size;
         let cuda_vram_limit_mib = record.cuda_vram_limit_mib;
@@ -333,6 +333,7 @@ impl Supervisor {
             let mut features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
                 source_smolmachine.as_deref(),
+                entry.packed_image_on_storage,
                 entry.image.as_deref(),
                 dns_filter_hosts,
                 entry.credentials.clone(),

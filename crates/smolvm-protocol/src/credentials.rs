@@ -30,8 +30,8 @@ use std::fmt;
 
 /// Prefix every generated placeholder starts with. The interceptor refuses
 /// requests that carry this prefix anywhere it does not substitute (path,
-/// query, body, unsupported headers) so a placeholder can never leak upstream
-/// unreplaced.
+/// query, unsupported bodies or headers) so a placeholder can never leak
+/// upstream unreplaced.
 pub const PLACEHOLDER_PREFIX: &str = "SMOL_PLACEHOLDER_";
 
 /// Guest directory the machine's public credential CA is mounted at.
@@ -66,6 +66,10 @@ pub struct InjectionLocation {
     /// or any other ordinary header). Routing and framing headers are excluded.
     #[serde(default = "yes")]
     pub header: bool,
+    /// Substitute inside an application/x-www-form-urlencoded request body.
+    /// Opt in explicitly: OAuth refresh grants carry their token in the body.
+    #[serde(default)]
+    pub body: bool,
 }
 
 fn yes() -> bool {
@@ -74,7 +78,10 @@ fn yes() -> bool {
 
 impl Default for InjectionLocation {
     fn default() -> Self {
-        Self { header: true }
+        Self {
+            header: true,
+            body: false,
+        }
     }
 }
 
@@ -231,7 +238,7 @@ impl CredentialPolicy {
                     "credential {name:?} method {method:?} is not supported"
                 ));
             }
-            if !binding.injection_location.header {
+            if !binding.injection_location.header && !binding.injection_location.body {
                 return refuse(format!("credential {name:?} enables no injection location"));
             }
         }
@@ -452,6 +459,24 @@ mod tests {
         .unwrap();
         assert_eq!(policy.credentials, vec![notion()]);
         policy.validate(None).unwrap();
+    }
+
+    #[test]
+    fn form_body_location_is_opt_in_and_can_be_used_without_header_injection() {
+        let mut policy = CredentialPolicy {
+            credentials: vec![notion()],
+        };
+        assert!(!policy.credentials[0].injection_location.body);
+        policy.credentials[0].injection_location = InjectionLocation {
+            header: false,
+            body: true,
+        };
+        policy.validate(None).unwrap();
+        let roundtrip: CredentialPolicy =
+            serde_json::from_str(&serde_json::to_string(&policy).unwrap()).unwrap();
+        assert_eq!(roundtrip, policy);
+        policy.credentials[0].injection_location.body = false;
+        assert!(policy.validate(None).is_err());
     }
 
     #[test]

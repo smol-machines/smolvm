@@ -1,9 +1,8 @@
 //! Classifying the `--image` value into an image *source*.
 //!
-//! smolvm is a microVM runtime, not a container runtime: it does not parse OCI
-//! manifests, extract layers, or apply whiteouts itself. It delegates producing
+//! smolvm is a microVM runtime, not a container runtime: it delegates producing
 //! a root filesystem to container-specific tooling (the guest's bundled `crane`
-//! for registries and `docker save` archives, or the user for an already-
+//! for registries and local image archives, or the user for an already-
 //! unpacked directory). This module's only job is to decide *which* kind of
 //! source the user gave, so the right delegation runs.
 //!
@@ -12,7 +11,7 @@
 //! - `-` → an archive streamed on stdin (`docker save img | smolvm … --image -`).
 //! - an explicit path (`/…`, `./…`, `../…`) or an archive-extensioned name
 //!   (`*.tar`, `*.tar.gz`, `*.tgz`) → a local source. A directory is used as a
-//!   ready-made rootfs; anything else is treated as a `docker save` archive.
+//!   ready-made rootfs; anything else is treated as a local image archive.
 //! - everything else (`alpine`, `repo:tag`, `ghcr.io/owner/repo@sha256:…`) → a
 //!   registry reference, even if a same-named file happens to sit in the cwd.
 
@@ -27,7 +26,7 @@ pub enum ImageSource {
     /// An OCI registry reference (`alpine`, `repo:tag`, `repo@sha256:…`).
     /// Resolved by the guest agent pulling with `crane` — the existing path.
     Registry(String),
-    /// A `docker save` / `podman save` tar archive (optionally gzipped), read
+    /// A `docker save`, `podman save`, or OCI tar archive (optionally gzipped), read
     /// from a file or stdin. Flattened into a rootfs by `crane export`.
     Archive(ArchiveInput),
     /// An already-unpacked root filesystem directory (apptainer-style). Used
@@ -272,6 +271,10 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     if meta.len() > max_archive_bytes() {
         return Err(too_large(meta.len()));
     }
+    // Stage the file a symlink points at, not the link: a hardlink to a
+    // symlink is itself a symlink to a host path, which the guest cannot
+    // follow through the share.
+    let path = &path.canonicalize()?;
     let hash = hash_file(path)?;
     let archive_path = cache_base.join(&hash).join(ARCHIVE_FILE);
     // A cache hit is trusted only if the staged file is still the size we just
@@ -729,6 +732,25 @@ mod tests {
         // Identical content → identical hash, idempotent (no error, reused).
         let h2 = stage_from_file(src.path(), cache.path()).unwrap();
         assert_eq!(h1, h2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stage_from_file_stages_the_file_behind_a_symlink() {
+        let cache = tempfile::tempdir().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let real = dir.path().join("image.tar");
+        std::fs::write(&real, b"fake docker save archive").unwrap();
+        let link = dir.path().join("link.tar");
+        std::os::unix::fs::symlink(&real, &link).unwrap();
+
+        let hash = stage_from_file(&link, cache.path()).unwrap();
+        let staged = cache.path().join(&hash).join(ARCHIVE_FILE);
+        assert!(
+            std::fs::symlink_metadata(&staged).unwrap().is_file(),
+            "staged archive must be a regular file, not a link to the host path"
+        );
+        assert_eq!(std::fs::read(&staged).unwrap(), b"fake docker save archive");
     }
 
     #[test]

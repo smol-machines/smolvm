@@ -7,7 +7,7 @@
 A file uploaded before the workload container is up is written into the agent's own namespace.
 Once the container starts, reads resolve **inside the container**, and for a path the container
 mounts over, the earlier file is no longer in the view being read. `/tmp` is exactly such a path:
-it is a tmpfs inside the guest, so the container's own `/tmp` masks whatever was seeded underneath.
+the container mounts its own `/tmp` over the image's, which masks whatever was seeded underneath.
 
 Both directions pick a namespace per request. `handle_file_write` and
 `handle_streaming_file_read` each switch on `nsfile::GuestNs::for_workload()`
@@ -75,8 +75,9 @@ written and the exit code is 0.
 ## A plain server has no authentication of any kind
 
 `serve start` exposes create, exec and file routes, and started plainly it has no TLS, token or
-auth. On loopback that is a single-user boundary; the Unix socket, whose file permissions are the
-boundary, is the safer default and is why it is smolvm's default and this packet's.
+auth. Loopback TCP is reachable by other local users. A Unix socket is the safer default: smolvm
+binds it in a private temporary directory, sets mode `0600`, then publishes it at the requested
+path before accepting connections. Run the server and its API clients as the same user.
 
 **Mutual TLS is configured from the environment, not by a flag.** With `SMOLVM_SERVE_TLS_CERT`,
 `SMOLVM_SERVE_TLS_KEY` and `SMOLVM_SERVE_TLS_CLIENT_CA` set, measured on macOS arm64 on v1.22.2: a
@@ -89,6 +90,20 @@ moves it, to a loopback address only). It has no authentication and answers only
 `/readyz`, `/capacity` and `/metrics`; the machine, exec and file routes are on the TLS port. Only
 `/health` was requested here.
 
+## Local image archives can be OCI layouts
+
+`POST /api/v1/machines` accepts a server-local `image` path to a `docker save` archive, an OCI
+layout tar (optionally gzipped) or an unpacked rootfs directory. For an OCI archive without Docker's
+`manifest.json`, the guest streams a small compatibility manifest into its image flattener; the
+input archive is unchanged. Choose an archive containing a Linux image for the guest's architecture.
+
+**From v1.27.1 the server takes a local path only under `serve start --local-image-dir <DIR>`.**
+Measured on macOS arm64 on v1.27.3, each a `400`: without the flag a create naming a path answers
+``local images are disabled on this server; start `smolvm serve` with --local-image-dir ...``; with
+it, a path that does not resolve inside the directory, symlinks followed, answers `local image
+'<path>' is outside this server's local image directory`; and `"image":"-"` answers `image '-'
+requires CLI stdin`, with or without the flag.
+
 ## Only one server per host, unless you move its rollout port
 
 Every `serve start` binds `127.0.0.1:10081` for the branch-pool rollout routes, whatever `--listen`
@@ -99,7 +114,8 @@ Error: config operation failed: bind guest rollout ingress: 127.0.0.1:10081: Add
 ```
 
 Measured on macOS arm64 on v1.22.2 with another server already holding the port. With
-`SMOLVM_GUEST_ROLLOUT_HOST_PORT=10091` the second server started and answered on `/health`.
+`SMOLVM_GUEST_ROLLOUT_HOST_PORT=10091` the second server started and answered on `/health`. From
+v1.28.2 the same setting is the `--guest-rollout-port` flag; the variable still works.
 
 ## Field names, versions and error bodies
 
@@ -107,3 +123,10 @@ Those have their own page: `references/api-fields.md`. The short version is that
 are refused with `422` from v1.22.2 and were accepted with 200 and ignored before it, `network`
 and `memoryMb` are not `net` and `memory`, and the version in the exported spec is not the
 binary's.
+
+## Corrections
+
+- **2026-10-15, v1.29.0 run.** No v1.28.2 was released: `--guest-rollout-port` first ships in
+  v1.29.0. With it, a second `serve start --listen 127.0.0.1:8898 --guest-rollout-port 10091`
+  answered `/health` while the first held 10081; without it the second failed with
+  `bind guest rollout ingress: 127.0.0.1:10081: Address already in use (os error 48)`.

@@ -14,7 +14,7 @@ Measured on macOS arm64 after one install and one machine:
 
 | Path | What it holds | Size after a first boot |
 |---|---|---|
-| `~/.smolvm` | the binary and its bundled libraries | about 92 MB |
+| `~/.smolvm` | the binary and its bundled libraries | about 88 MB |
 | `~/.local/bin/smolvm` | the launcher symlink on your `PATH` | a link |
 | `~/Library/Application Support/smolvm` | the agent rootfs and the machine registry | about 48 MB |
 | `~/Library/Caches/smolvm` | one directory per machine: disks and pulled layers | grows with each machine |

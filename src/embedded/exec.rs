@@ -20,6 +20,9 @@ pub struct ExecOptions {
     /// as root and has no per-command user, so setting this there is an error
     /// rather than a silent root.
     pub user: Option<String>,
+    /// Text written to the command's stdin, which is then closed. Never
+    /// stored on the guest's disk.
+    pub stdin: Option<String>,
 }
 
 /// Cancels a running command from another thread.

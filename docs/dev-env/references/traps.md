@@ -8,7 +8,7 @@
 - A host mount source that goes missing stops every later start
 - `machine shell` does not start a stopped machine
 - A host `volumes` mount was not writable by the `app` user
-- `/tmp` is tmpfs and is wiped by a stop
+- `/tmp` is wiped by a stop
 - `machine delete` prompts and defaults to No
 - A VPN inside the machine takes its gateway and resolver
 - Do not run two lifecycle commands against the same machine at once
@@ -29,7 +29,8 @@ it in the same command that needs it. The `docker-in-machine` packet is built ar
 the workload ... the same as `init` in a Smolfile". [`smolfile.md`](../../smolfile.md) says `init`
 "runs once as root, like a Dockerfile `RUN`", and the docs site's `introduction/concepts/smolfile.md`
 (smolmachines.com/docs) says under "When init runs" that it runs once, on the first start. Observed:
-once, on the first start.
+once, on the first start. From v1.23.7 `machine create --help` says the same: "Run command once, on
+the machine's first start".
 
 `init` also runs **as root**, even with `user` set: `/init-ran-as.txt` contained `root` while
 `exec` and `shell` ran as `app`. There is no `machine start --init` to force a re-run.
@@ -112,8 +113,8 @@ regression until the two were compared side by side.
 
 ## `machine shell` does not start a stopped machine
 
-`smolvm machine --help` describes `shell` as "Open an interactive shell in a machine (starts it if
-stopped)". It does not:
+Before v1.23.7 `smolvm machine --help` described `shell` as "Open an interactive shell in a machine
+(starts it if stopped)"; from v1.23.7 it says "in a running machine". It does not start one:
 
 ```
 $ smolvm machine stop --name dev
@@ -134,7 +135,7 @@ root. `user` also takes a numeric `uid[:gid]`, which `machine create --help` giv
 match the owner of a mounted host directory: on v1.22.2 on macOS arm64, `machine run -v
 "$PWD/src:/app" --user "$(id -u):$(id -g)"` wrote `/app/w` and the file appeared on the host.
 
-## `/tmp` is tmpfs and is wiped by a stop
+## `/tmp` is wiped by a stop
 
 Anything a provisioning step leaves in `/tmp` is gone on the next start, while the same step's
 writes to `$HOME` or `/` persist. What survives, verified by writing one file per filesystem and
@@ -145,7 +146,7 @@ restarting:
 | pip `--user` packages | yes | under `$HOME`, on the overlay |
 | `$HOME/...` files | yes | overlay |
 | files written at `/` | yes | overlay |
-| `/tmp` | **no** | `tmpfs` |
+| `/tmp` | **no** | emptied at each start, like a `tmpfs` |
 | `/storage/...` | yes | the ext4 disk itself |
 
 Read from inside the guest, the mechanism is an overlay whose upper layer lives on the machine's

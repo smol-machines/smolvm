@@ -6,7 +6,9 @@ use serde::{Deserialize, Serialize};
 use smolvm_pack::format::PackManifest;
 use std::collections::{HashMap, HashSet};
 use std::fs::{self, File};
-use std::io::{self, Read, Seek, SeekFrom, Write};
+use std::io::{self, Read, Write};
+#[cfg(not(unix))]
+use std::io::{Seek, SeekFrom};
 use std::path::{Component, Path};
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex, OnceLock};
@@ -299,10 +301,14 @@ impl Writer {
                         pending.push(Some(None));
                         free.push(buffer);
                     }
-                    Ok(Some(Job::Data)) => {
+                    Ok(Some(job @ (Job::Data | Job::Read(_)))) => {
+                        let read = match job {
+                            Job::Read(read) => Some(read),
+                            _ => None,
+                        };
                         let seq = pending.len();
                         pending.push(None);
-                        if self.pool.submit(seq, buffer, done.clone()).is_err() {
+                        if self.pool.submit(seq, buffer, read, done.clone()).is_err() {
                             failure = Some(io::Error::other("checkpoint worker pool stopped"));
                             break;
                         }
@@ -563,6 +569,9 @@ impl Writer {
         let mut offset = 0;
         #[cfg(unix)]
         let mut seek_sparse = true;
+        // Workers read their own chunks: positional reads share no cursor.
+        #[cfg(unix)]
+        let shared = Arc::new(source.try_clone()?);
         let chunks = self.ingest_chunks(|buffer| {
             if offset >= size {
                 return Ok(None);
@@ -599,10 +608,20 @@ impl Writer {
             } else if hole {
                 Job::Hole(count as usize)
             } else {
-                buffer.resize(count as usize, 0);
-                source.seek(SeekFrom::Start(offset))?;
-                source.read_exact(buffer)?;
-                Job::Data
+                #[cfg(unix)]
+                let job = Job::Read(ChunkRead {
+                    file: Arc::clone(&shared),
+                    offset,
+                    len: count as usize,
+                });
+                #[cfg(not(unix))]
+                let job = {
+                    buffer.resize(count as usize, 0);
+                    source.seek(SeekFrom::Start(offset))?;
+                    source.read_exact(buffer)?;
+                    Job::Data
+                };
+                job
             };
             offset += count;
             Ok(Some(job))
@@ -633,6 +652,11 @@ impl Writer {
             files,
         };
         validate_index(&index)?;
+        // Every chunk is stored by now. Publishing makes each new object
+        // durable in parallel from the same budget, which this capture's idle
+        // workers would otherwise hold, leaving tens of thousands of fsyncs
+        // to run one at a time.
+        self.pool.shutdown();
         self.publish_pending()?;
         let mut file = File::options()
             .write(true)
@@ -1052,6 +1076,23 @@ pub fn find_generation_source(
     Ok(None)
 }
 
+/// Remove checkpoint `id` from the store's lineage index, so no later capture
+/// or restore finds it. Returns whether a record was removed.
+pub fn remove_lineage(store: &Path, id: &str) -> io::Result<bool> {
+    if !valid_generation_id(id) {
+        return Ok(false);
+    }
+    let dir = store.join(LINEAGE_DIR);
+    match fs::remove_file(dir.join(format!("{id}.json"))) {
+        Ok(()) => {
+            File::open(&dir)?.sync_all()?;
+            Ok(true)
+        }
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(e),
+    }
+}
+
 /// Look up where a checkpoint id was published in `store`.
 pub fn find_lineage(store: &Path, id: &str) -> io::Result<Option<LineageRecord>> {
     if !valid_generation_id(id) {
@@ -1111,6 +1152,35 @@ enum Job {
     Hole(usize),
     /// The reader filled the buffer it was handed with this chunk's bytes.
     Data,
+    /// A worker reads this chunk itself, into the buffer it is handed. Only
+    /// unix files are read this way; elsewhere the reader keeps doing it.
+    #[cfg_attr(not(unix), allow(dead_code))]
+    Read(ChunkRead),
+}
+
+/// A chunk a worker reads with a positional read instead of the reader thread.
+/// A sequential reader is bound by the latency of one read at a time: on a
+/// network disk with 128 KiB readahead that held a capture to about 330 MB/s
+/// on a disk that serves 2.3 GB/s to eight readers at once.
+struct ChunkRead {
+    file: Arc<File>,
+    offset: u64,
+    len: usize,
+}
+
+fn read_chunk(read: &ChunkRead, buffer: &mut Vec<u8>) -> io::Result<()> {
+    buffer.resize(read.len, 0);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileExt;
+        read.file.read_exact_at(buffer, read.offset)
+    }
+    #[cfg(not(unix))]
+    {
+        let mut file = &*read.file;
+        file.seek(SeekFrom::Start(read.offset))?;
+        file.read_exact(buffer)
+    }
 }
 
 struct Done {
@@ -1122,7 +1192,7 @@ struct Done {
     result: io::Result<ChunkResult>,
 }
 
-type Submission = (usize, Vec<u8>, mpsc::Sender<Done>);
+type Submission = (usize, Vec<u8>, Option<ChunkRead>, mpsc::Sender<Done>);
 
 /// A stored chunk's object hash (`None` for zeros), its accounting, and, when
 /// object durability is deferred, the not yet published object file.
@@ -1141,8 +1211,8 @@ struct Pool {
     window: usize,
     inline_paths: (std::path::PathBuf, std::path::PathBuf),
     options: WriteOptions,
-    // Released only after Drop has joined every worker.
-    _permit: WorkerPermit,
+    // Released only after its workers are joined, by Drop or `shutdown`.
+    permit: Option<WorkerPermit>,
 }
 
 impl Pool {
@@ -1210,8 +1280,15 @@ impl Pool {
             let objects = objects.to_path_buf();
             let worker = spawn(Box::new(move || loop {
                 let next = receiver.lock().unwrap_or_else(|e| e.into_inner()).recv();
-                let Ok((seq, bytes, done)) = next else { break };
-                let result = worker_result(|| store_chunk(&cache, &objects, &bytes, options));
+                let Ok((seq, mut bytes, read, done)) = next else {
+                    break;
+                };
+                let result = worker_result(|| {
+                    if let Some(read) = &read {
+                        read_chunk(read, &mut bytes)?;
+                    }
+                    store_chunk(&cache, &objects, &bytes, options)
+                });
                 // The submitter may already have abandoned this file; its
                 // receiver being gone is not an error here.
                 let _ = done.send(Done { seq, bytes, result });
@@ -1233,13 +1310,22 @@ impl Pool {
             window,
             inline_paths: (cache.to_path_buf(), objects.to_path_buf()),
             options,
-            _permit: permit,
+            permit: Some(permit),
         })
     }
 
-    fn submit(&self, seq: usize, bytes: Vec<u8>, done: mpsc::Sender<Done>) -> Result<(), ()> {
+    fn submit(
+        &self,
+        seq: usize,
+        mut bytes: Vec<u8>,
+        read: Option<ChunkRead>,
+        done: mpsc::Sender<Done>,
+    ) -> Result<(), ()> {
         if self.workers.is_empty() {
             let result = worker_result(|| {
+                if let Some(read) = &read {
+                    read_chunk(read, &mut bytes)?;
+                }
                 store_chunk(
                     &self.inline_paths.0,
                     &self.inline_paths.1,
@@ -1252,13 +1338,17 @@ impl Pool {
         self.jobs
             .as_ref()
             .expect("pool sender lives until drop")
-            .send((seq, bytes, done))
+            .send((seq, bytes, read, done))
             .map_err(|_| ())
     }
 }
 
-// Capture and restore share this budget. Contended operations run on their
-// existing caller thread instead of waiting for another capture to finish.
+// Capture and restore share this budget. A permit is held for a whole capture,
+// a minute or more, so handing out only what is left starved every operation
+// that started during one: it got no workers and hashed and compressed tens of
+// GiB on its caller thread, 14 s of work taking over 3 minutes. Each operation
+// may take what is free, and one that finds too little still gets a fair share
+// on top, up to twice the limit. Only past that does it run on its caller.
 struct WorkerBudget {
     limit: usize,
     used: AtomicUsize,
@@ -1269,13 +1359,24 @@ impl WorkerBudget {
         let previous = self
             .used
             .try_update(Ordering::AcqRel, Ordering::Acquire, |used| {
-                Some(used + requested.min(self.limit.saturating_sub(used)))
+                Some(used + self.grant(requested, used))
             })
             .expect("worker reservation always supplies a value");
         WorkerPermit {
-            count: requested.min(self.limit.saturating_sub(previous)),
+            count: self.grant(requested, previous),
             budget: Arc::clone(self),
         }
+    }
+
+    /// Workers granted to a request for `requested` while `used` are taken:
+    /// everything free, but no less than a quarter of the limit while the
+    /// total stays within twice the limit.
+    fn grant(&self, requested: usize, used: usize) -> usize {
+        let free = self.limit.saturating_sub(used);
+        let share = (self.limit / 4)
+            .max(1)
+            .min((self.limit * 2).saturating_sub(used));
+        requested.min(free.max(share))
     }
 }
 
@@ -1412,12 +1513,22 @@ fn write_at(file: &File, offset: u64, bytes: &[u8]) -> io::Result<()> {
     }
 }
 
-impl Drop for Pool {
-    fn drop(&mut self) {
+impl Pool {
+    /// Join the workers and return their share of the budget. Later chunks
+    /// are stored on the caller's thread.
+    fn shutdown(&mut self) {
         self.jobs.take();
         for worker in self.workers.drain(..) {
             let _ = worker.join();
         }
+        self.window = 1;
+        self.permit.take();
+    }
+}
+
+impl Drop for Pool {
+    fn drop(&mut self) {
+        self.shutdown();
     }
 }
 
@@ -1523,11 +1634,10 @@ fn cache_lock(cache: &Path, exclusive: bool) -> io::Result<File> {
     Ok(lock)
 }
 
-/// Remove cache objects that no retained checkpoint references. Captures hold
-/// a shared lock until all hard links are durable; pruning takes it exclusively.
+/// Remove unpublished capture directories left by a terminated capture. The
+/// caller holds the store's exclusive lock, so no capture can own one.
 #[cfg(unix)]
-pub fn prune(cache: &Path) -> io::Result<u64> {
-    let _lock = cache_lock(cache, true)?;
+fn remove_abandoned_captures(cache: &Path) -> io::Result<()> {
     let staging = cache.join("staging");
     if staging.is_dir() {
         for entry in fs::read_dir(&staging)? {
@@ -1547,6 +1657,15 @@ pub fn prune(cache: &Path) -> io::Result<u64> {
         }
         File::open(&staging)?.sync_all()?;
     }
+    Ok(())
+}
+
+/// Remove cache objects that no retained checkpoint references. Captures hold
+/// a shared lock until all hard links are durable; pruning takes it exclusively.
+#[cfg(unix)]
+pub fn prune(cache: &Path) -> io::Result<u64> {
+    let _lock = cache_lock(cache, true)?;
+    remove_abandoned_captures(cache)?;
     let objects = cache.join("objects");
     let mut removed = 0;
     for entry in fs::read_dir(&objects)? {
@@ -1561,11 +1680,7 @@ pub fn prune(cache: &Path) -> io::Result<u64> {
             fs::remove_file(entry.path())?;
             continue;
         }
-        if name.len() != 64
-            || !name
-                .bytes()
-                .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
-        {
+        if !is_object_name(&name) {
             continue;
         }
         let meta = entry.metadata()?;
@@ -1580,6 +1695,180 @@ pub fn prune(cache: &Path) -> io::Result<u64> {
     }
     File::open(&objects)?.sync_all()?;
     Ok(removed)
+}
+
+/// How old an interrupted object write must be before a batched prune removes it.
+#[cfg(unix)]
+const ABANDONED_OBJECT_WRITE: std::time::Duration = std::time::Duration::from_secs(24 * 60 * 60);
+
+/// What [`prune_in_batches`] removed and what the store still holds.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct PruneStats {
+    /// Objects removed: unreferenced ones and interrupted writes.
+    pub removed_objects: u64,
+    /// Disk space those objects occupied.
+    pub removed_bytes: u64,
+    /// Objects the store still holds.
+    pub kept_objects: u64,
+    /// Disk space the objects the store still holds occupy.
+    pub kept_bytes: u64,
+}
+
+/// Disk space a file occupies: its allocated blocks.
+#[cfg(unix)]
+fn allocated(meta: &fs::Metadata) -> u64 {
+    use std::os::unix::fs::MetadataExt;
+    meta.blocks().saturating_mul(512)
+}
+
+#[cfg(unix)]
+fn is_object_name(name: &str) -> bool {
+    name.len() == 64
+        && name
+            .bytes()
+            .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+}
+
+/// [`prune`] for a store too large to scan under one lock: the objects are
+/// scanned `batch` at a time without the lock, and the store's exclusive lock
+/// is taken only for a batch that has something to remove, and only while it
+/// re-checks and removes that batch's candidates. A capture therefore waits at
+/// most one batch, not the whole scan. An object is removed only when the
+/// store's own name is its last link, re-checked under the lock, which is the
+/// same rule [`prune`] applies. Interrupted object writes (staging-prefixed
+/// temporaries) are removed only once a day old: unlike [`prune`], this does
+/// not hold the lock across the whole store, so a younger one may belong to a
+/// capture that has not finished.
+#[cfg(unix)]
+pub fn prune_in_batches(cache: &Path, batch: usize) -> io::Result<PruneStats> {
+    use std::os::unix::fs::MetadataExt;
+    let batch = batch.max(1);
+    if !cache.is_dir() {
+        return Ok(PruneStats::default());
+    }
+    {
+        let _lock = cache_lock(cache, true)?;
+        remove_abandoned_captures(cache)?;
+    }
+    let objects = cache.join("objects");
+    let mut stats = PruneStats::default();
+    let mut entries = match fs::read_dir(&objects) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(stats),
+        Err(error) => return Err(error),
+    };
+    let mut removed_any = false;
+    loop {
+        let mut candidates = Vec::new();
+        let mut seen = 0;
+        for entry in entries.by_ref() {
+            let entry = entry?;
+            seen += 1;
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            let staging = name.starts_with(OBJECT_STAGING_PREFIX);
+            if !staging && !is_object_name(&name) {
+                if seen >= batch {
+                    break;
+                }
+                continue;
+            }
+            match entry.metadata() {
+                Ok(meta) if meta.is_file() => {
+                    let dead_staging = staging
+                        && meta.modified().is_ok_and(|at| {
+                            at.elapsed().unwrap_or_default() >= ABANDONED_OBJECT_WRITE
+                        });
+                    if staging && !dead_staging {
+                        // Not counted: not yet an object of the store.
+                    } else if staging || meta.nlink() == 1 {
+                        candidates.push((entry.path(), staging));
+                    } else {
+                        stats.kept_objects += 1;
+                        stats.kept_bytes += allocated(&meta);
+                    }
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+            if seen >= batch {
+                break;
+            }
+        }
+        if seen == 0 {
+            break;
+        }
+        if candidates.is_empty() {
+            continue;
+        }
+        let _lock = cache_lock(cache, true)?;
+        for (path, staging) in candidates {
+            // A capture may have linked it since the unlocked scan.
+            let meta = match fs::symlink_metadata(&path) {
+                Ok(meta) if meta.is_file() => meta,
+                Ok(_) => continue,
+                Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error),
+            };
+            if staging || meta.nlink() == 1 {
+                fs::remove_file(&path)?;
+                stats.removed_objects += 1;
+                stats.removed_bytes += allocated(&meta);
+                removed_any = true;
+            } else {
+                stats.kept_objects += 1;
+                stats.kept_bytes += allocated(&meta);
+            }
+        }
+    }
+    if removed_any {
+        File::open(&objects)?.sync_all()?;
+    }
+    Ok(stats)
+}
+
+/// Stored checkpoint pruning requires Linux or macOS.
+#[cfg(not(unix))]
+pub fn prune_in_batches(_cache: &Path, _batch: usize) -> io::Result<PruneStats> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "stored checkpoints require Linux or macOS",
+    ))
+}
+
+/// Objects of the stored checkpoint at `directory` that no other checkpoint
+/// links: removing the directory leaves the store's own name their last link,
+/// so a prune then reclaims them. Returns their count and disk space.
+#[cfg(unix)]
+pub fn exclusive_objects(directory: &Path) -> io::Result<(u64, u64)> {
+    use std::os::unix::fs::MetadataExt;
+    let mut count = 0;
+    let mut bytes = 0;
+    let entries = match fs::read_dir(directory.join("objects")) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok((0, 0)),
+        Err(error) => return Err(error),
+    };
+    for entry in entries {
+        let meta = match entry?.metadata() {
+            Ok(meta) => meta,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        // This checkpoint's link and the store's.
+        if meta.is_file() && meta.nlink() <= 2 {
+            count += 1;
+            bytes += allocated(&meta);
+        }
+    }
+    Ok((count, bytes))
+}
+
+/// Exclusive object accounting requires Linux or macOS.
+#[cfg(not(unix))]
+pub fn exclusive_objects(_directory: &Path) -> io::Result<(u64, u64)> {
+    Ok((0, 0))
 }
 
 /// Stored checkpoint creation and pruning require Linux or macOS.
@@ -1636,6 +1925,11 @@ fn read_index_from(path: &Path) -> io::Result<Index> {
 
 fn read_index(directory: &Path) -> io::Result<Index> {
     read_index_from(&directory.join(INDEX))
+}
+
+/// Whether `id` has the form of a checkpoint (lineage) id.
+pub fn is_checkpoint_id(id: &str) -> bool {
+    valid_generation_id(id)
 }
 
 fn valid_generation_id(id: &str) -> bool {
@@ -2431,16 +2725,19 @@ pub fn publish(source: &Path, destination: &Path) -> io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let src = std::ffi::CString::new(source.as_os_str().as_bytes())?;
     let dst = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    // Through the system call: the libc crate declares renameat2 for glibc
+    // only, and musl has the call all the same.
     #[cfg(target_os = "linux")]
     let result = unsafe {
-        libc::renameat2(
+        libc::syscall(
+            libc::SYS_renameat2,
             libc::AT_FDCWD,
             src.as_ptr(),
             libc::AT_FDCWD,
             dst.as_ptr(),
             libc::RENAME_NOREPLACE,
         )
-    };
+    } as libc::c_int;
     #[cfg(target_os = "macos")]
     let result = unsafe { libc::renamex_np(src.as_ptr(), dst.as_ptr(), libc::RENAME_EXCL) };
     #[cfg(not(any(target_os = "linux", target_os = "macos")))]
@@ -3352,6 +3649,7 @@ mod tests {
         );
     }
     use super::*;
+    use std::io::{Seek, SeekFrom};
 
     fn test_budget(limit: usize) -> Arc<WorkerBudget> {
         Arc::new(WorkerBudget {
@@ -3360,13 +3658,31 @@ mod tests {
         })
     }
 
+    /// Take every worker the budget will still grant.
+    fn exhaust(budget: &Arc<WorkerBudget>) -> Vec<WorkerPermit> {
+        let mut held = Vec::new();
+        loop {
+            let permit = budget.acquire(usize::MAX);
+            if permit.count == 0 {
+                return held;
+            }
+            held.push(permit);
+        }
+    }
+
     #[test]
     fn checkpoint_worker_reservations_share_a_process_bound() {
         let budget = test_budget(3);
         let first = budget.acquire(2);
         let second = budget.acquire(2);
         assert_eq!((first.count, second.count), (2, 1));
+        let third = budget.acquire(32);
+        assert_eq!(third.count, 1);
+        let rest = exhaust(&budget);
+        assert_eq!(budget.used.load(Ordering::Acquire), 6);
         assert_eq!(budget.acquire(32).count, 0);
+        drop(rest);
+        drop(third);
         drop(first);
         assert_eq!(budget.used.load(Ordering::Acquire), 1);
         drop(second);
@@ -3380,7 +3696,7 @@ mod tests {
                     for _ in 0..1000 {
                         let permit = budget.acquire(2);
                         assert!(permit.count <= 2);
-                        assert!(budget.used.load(Ordering::Acquire) <= 3);
+                        assert!(budget.used.load(Ordering::Acquire) <= 6);
                         thread::yield_now();
                     }
                 });
@@ -3390,9 +3706,52 @@ mod tests {
     }
 
     #[test]
+    fn an_operation_started_during_a_capture_still_gets_workers() {
+        let budget = test_budget(32);
+        let capture = budget.acquire(32);
+        assert_eq!(capture.count, 32);
+        let later: Vec<_> = (0..4).map(|_| budget.acquire(32)).collect();
+        assert_eq!(
+            later.iter().map(|p| p.count).collect::<Vec<_>>(),
+            [8, 8, 8, 8]
+        );
+        assert_eq!(budget.acquire(32).count, 0);
+        assert_eq!(budget.used.load(Ordering::Acquire), 64);
+        // A request for fewer than the share takes only what it asked for.
+        drop(capture);
+        drop(later);
+        let small = budget.acquire(2);
+        assert_eq!(small.count, 2);
+    }
+
+    #[test]
+    fn a_shut_down_pool_returns_its_workers_and_stores_inline() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let objects = root.path().join("objects");
+        fs::create_dir(&cache).unwrap();
+        fs::create_dir(&objects).unwrap();
+        let budget = test_budget(4);
+        let mut pool = Pool::start_with_budget(&cache, &objects, Arc::clone(&budget)).unwrap();
+        assert_eq!(budget.used.load(Ordering::Acquire), worker_threads().min(4));
+        pool.shutdown();
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+        assert!(pool.workers.is_empty());
+        let bytes = vec![7; CHUNK_SIZE];
+        let (done, results) = mpsc::channel();
+        pool.submit(1, bytes.clone(), None, done).unwrap();
+        let result = results
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .unwrap();
+        assert_eq!(result.result.unwrap().0, Some(digest(&bytes)));
+        drop(pool);
+        assert_eq!(budget.used.load(Ordering::Acquire), 0);
+    }
+
+    #[test]
     fn restore_uses_caller_when_capture_holds_worker_budget() {
         let budget = test_budget(2);
-        let held = budget.acquire(2);
+        let held = exhaust(&budget);
         let caller = thread::current().id();
         let count = AtomicUsize::new(0);
         for_each_with_budget(
@@ -3407,7 +3766,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(count.load(Ordering::Relaxed), 16);
-        assert_eq!(budget.used.load(Ordering::Acquire), 2);
+        assert_eq!(budget.used.load(Ordering::Acquire), 4);
         drop(held);
         assert_eq!(budget.used.load(Ordering::Acquire), 0);
     }
@@ -3441,14 +3800,14 @@ mod tests {
         fs::create_dir(&cache).unwrap();
         fs::create_dir(&objects).unwrap();
         let budget = test_budget(2);
-        let held = budget.acquire(2);
+        let held = exhaust(&budget);
         let pool = Pool::start_with_budget(&cache, &objects, Arc::clone(&budget)).unwrap();
         assert!(pool.workers.is_empty());
         assert_eq!(pool.window, 1);
         let bytes = vec![31; CHUNK_SIZE];
         let hash = digest(&bytes);
         let (done, results) = mpsc::channel();
-        pool.submit(7, bytes.clone(), done).unwrap();
+        pool.submit(7, bytes.clone(), None, done).unwrap();
         let result = results
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap();
@@ -3457,7 +3816,7 @@ mod tests {
         verify_object_matches(&objects.join(&hash), &bytes).unwrap();
         fs::write(cache.join(&hash), b"invalid compressed object").unwrap();
         let (done, results) = mpsc::channel();
-        pool.submit(8, bytes, done).unwrap();
+        pool.submit(8, bytes, None, done).unwrap();
         assert!(results
             .recv_timeout(std::time::Duration::from_secs(5))
             .unwrap()
@@ -3565,6 +3924,95 @@ mod tests {
         assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 0);
     }
 
+    #[test]
+    #[cfg(unix)]
+    fn batched_prune_reclaims_only_what_a_removed_checkpoint_held_alone() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let shared = vec![7u8; CHUNK_SIZE];
+        let mut first = shared.clone();
+        first.extend(vec![1u8; CHUNK_SIZE]);
+        first.extend(vec![2u8; CHUNK_SIZE]);
+        let mut second = shared.clone();
+        second.extend(vec![3u8; CHUNK_SIZE]);
+        let old = root.path().join("old");
+        let new = root.path().join("new");
+        capture(&cache, &old, &first);
+        capture(&cache, &new, &second);
+        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 4);
+        // Two chunks only the old checkpoint holds; the shared one is linked
+        // by both and stays.
+        let (count, bytes) = exclusive_objects(&old).unwrap();
+        assert_eq!(count, 2);
+        assert!(bytes > 0);
+        let staged = |name: &str, age: std::time::Duration| {
+            let path = cache
+                .join("objects")
+                .join(format!("{OBJECT_STAGING_PREFIX}{name}"));
+            fs::write(&path, b"partial").unwrap();
+            File::options()
+                .write(true)
+                .open(&path)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now() - age)
+                .unwrap();
+            path
+        };
+        let abandoned = staged("abandoned", ABANDONED_OBJECT_WRITE * 2);
+        let in_flight = staged("in-flight", std::time::Duration::ZERO);
+
+        let before = prune_in_batches(&cache, 1).unwrap();
+        assert_eq!(before.removed_objects, 1, "only the abandoned write");
+        assert!(!abandoned.exists());
+        assert!(
+            in_flight.exists(),
+            "a recent write may still be a capture's"
+        );
+        fs::remove_file(&in_flight).unwrap();
+        assert_eq!(before.kept_objects, 4);
+
+        fs::remove_dir_all(&old).unwrap();
+        let after = prune_in_batches(&cache, 1).unwrap();
+        assert_eq!(after.removed_objects, 2);
+        assert_eq!(after.removed_bytes, bytes);
+        assert_eq!(after.kept_objects, 2);
+        assert_eq!(fs::read_dir(cache.join("objects")).unwrap().count(), 2);
+
+        let restored = root.path().join("restored");
+        materialize(&new, &restored).unwrap();
+        assert_eq!(
+            fs::read(restored.join("checkpoint/memory.bin")).unwrap(),
+            second
+        );
+        // Nothing left to reclaim, and a missing store is empty.
+        assert_eq!(prune_in_batches(&cache, 1000).unwrap().removed_objects, 0);
+        assert_eq!(
+            prune_in_batches(&root.path().join("absent"), 10).unwrap(),
+            PruneStats::default()
+        );
+    }
+
+    #[test]
+    fn removing_lineage_forgets_only_that_checkpoint() {
+        let root = tempfile::tempdir().unwrap();
+        let record = |id: &str| LineageRecord {
+            id: id.into(),
+            parent: None,
+            machine: "vm".into(),
+            created_at: "2026-10-24T00:00:00Z".into(),
+            path: root.path().join(id).to_string_lossy().into_owned(),
+        };
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        record_lineage(root.path(), &record(&a)).unwrap();
+        record_lineage(root.path(), &record(&b)).unwrap();
+        assert!(remove_lineage(root.path(), &a).unwrap());
+        assert!(!remove_lineage(root.path(), &a).unwrap());
+        assert!(!remove_lineage(root.path(), "../escape").unwrap());
+        assert!(find_lineage(root.path(), &a).unwrap().is_none());
+        assert_eq!(find_lineage(root.path(), &b).unwrap(), Some(record(&b)));
+    }
+
     fn manifest() -> PackManifest {
         PackManifest::new(
             "vm://test".into(),
@@ -3651,6 +4099,7 @@ mod tests {
             sha256: String::new(),
         };
         manifest.checkpoint = Some(PortableCheckpointManifest {
+            host_mounts: Vec::new(),
             version: 1,
             runtime_abi: "test".into(),
             host_platform: "linux/amd64".into(),
@@ -3659,6 +4108,7 @@ mod tests {
             memory_mib: 64,
             storage_gib: None,
             overlay_gib: None,
+            disk_durability: None,
             device_profile: "test".into(),
             state: asset("checkpoint/checkpoint.bin"),
             memory: asset("checkpoint/memory.bin"),
@@ -3681,6 +4131,9 @@ mod tests {
             clock: None,
             guest_cpu_features: None,
             cache_disk: None,
+            agent_rootfs_digest: None,
+            nested_virt: false,
+            settings: Default::default(),
         });
         manifest
     }
@@ -4558,6 +5011,47 @@ mod tests {
         assert_eq!(
             fs::read(source_path).unwrap(),
             fs::read(root.path().join("restore/disk.bin")).unwrap()
+        );
+    }
+
+    #[test]
+    fn chunks_workers_read_themselves_restore_in_file_order() {
+        let root = tempfile::tempdir().unwrap();
+        let source_path = root.path().join("disk.bin");
+        let mut source = File::options()
+            .create_new(true)
+            .read(true)
+            .write(true)
+            .open(&source_path)
+            .unwrap();
+        // Every chunk distinct, a hole in the middle and a short last chunk, so
+        // a chunk put back out of order or read at the wrong offset shows.
+        let chunks = 48;
+        for index in 0..chunks {
+            if (20..24).contains(&index) {
+                continue;
+            }
+            let bytes: Vec<u8> = (0..CHUNK_SIZE)
+                .map(|offset| (index * 31 + offset / 4096) as u8 | 1)
+                .collect();
+            source
+                .seek(SeekFrom::Start((index * CHUNK_SIZE) as u64))
+                .unwrap();
+            source.write_all(&bytes).unwrap();
+        }
+        source.write_all(b"short tail").unwrap();
+        let saved = root.path().join("saved");
+        fs::create_dir(&saved).unwrap();
+        let mut writer = Writer::new(&root.path().join("cache"), &saved).unwrap();
+        let entry = writer.ingest_file("disk.bin", 0o600, &mut source).unwrap();
+        assert_eq!(entry.chunks.len(), chunks + 1);
+        assert!(entry.chunks[20..24].iter().all(Option::is_none));
+        writer.finish(&saved, manifest(), vec![entry]).unwrap();
+        materialize(&saved, &root.path().join("restore")).unwrap();
+        assert!(
+            fs::read(&source_path).unwrap()
+                == fs::read(root.path().join("restore/disk.bin")).unwrap(),
+            "restored disk differs from its source"
         );
     }
 

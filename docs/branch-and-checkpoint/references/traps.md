@@ -180,3 +180,17 @@ This packet's cleanup stops only names still listed.
 `machine create --from <checkpoint> -e ROLE=seven`: `machine exec` saw `ROLE=seven`, and the resumed
 workload's own environment did not have it. The workload is the process that was running when the
 checkpoint was taken, and its environment came with it.
+
+## Corrections
+
+- **2026-10-15, v1.29.0 run.** "Read PID 1 instead, which is the workload" above stopped holding
+  in v1.25.4 (#1632): PID 1 is now `/run/smolvm/init container-init` and the workload is its child,
+  so the check never saw a parked source and `branch-point.sh --count` failed with `the source
+  never parked`. Read every process instead:
+
+  ```bash
+  smolvm machine exec --name src -- sh -c 'for f in /proc/[0-9]*/cmdline; do tr "\0" " " < "$f"; echo; done' | grep -q '^smolvm-branch-ready'
+  ```
+
+  `scripts/branch-point.sh` does this, and on v1.29.0 a batch of two then branched with the same
+  RAM token in both children and in a restore of the branch point.

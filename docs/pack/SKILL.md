@@ -5,7 +5,10 @@ description: Turns an image, or a machine already provisioned, into a single sel
 
 # Packing a machine into a portable artifact
 
-Verified on **smolvm v1.22.2** on macOS arm64, 2026-10-03, and on **v1.14.6** on Linux aarch64,
+For macOS first-import performance, storage seed behavior and a file-heavy
+reproduction, see [macOS storage seeds](references/macos-storage-seeds.md).
+
+Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.14.6** on Linux aarch64,
 2026-09-11; the Linux host could not run the packing steps on v1.18.2 or v1.22.2, for the reason in
 "Platform arms". Done means the artifact runs a command in a real VM and, for a machine pack, **the state you installed is still
 inside it**.
@@ -25,20 +28,15 @@ the artifact afterwards, which is what `pack-machine.sh` and `verify-pack.sh` do
 scripts/preflight.sh
 ```
 
-The lines to read are `exporter_memory_ok` and `image_vm_memory_ok`. Both pack paths boot a
-helper VM before they write anything. `pack create --image` pulls the image in a VM fixed at 4
-vCPUs and 8192 MiB on every release here. `pack create --from-vm` boots an export helper: fixed at
-8192 MiB through v1.16.1, when a host that could not seat it failed with `agent did not become
-ready within 30 seconds`, which mentions neither memory nor the helper; from v1.16.2 it asks for
-4096 MiB (on Linux half of the available memory when that is less, never under 1024),
-`SMOLVM_EXPORT_HELPER_MEMORY_MIB=<MiB>` sets it, and a failed start says `The export helper asked
-for N MiB of memory` and names the variable. `exporter_memory_mib` is the figure this binary will
-ask for, except under a cgroup memory limit on Linux, where smolvm asks for less. Both lines are
-warnings and not gates, because the figures are caps rather than reservations: see "What the
-memory lines do and do not promise". From v1.16.1 the export helper reuses the machine's cached
-image layers instead of pulling the image again and prints `Reusing
-the machine's cached image layers...`; on macOS arm64 on v1.16.1 that export completed in 1.2 s
-with `exporter_memory_ok=no` reported by the same preflight moments earlier, 2026-09-15.
+The lines to read are `exporter_memory_ok` and `image_vm_memory_ok`: both pack paths boot a helper VM before they
+write anything. `pack create --image` pulls in a VM fixed at 4 vCPUs and 8192 MiB on every release here.
+`pack create --from-vm` boots an export helper fixed at 8192 MiB through v1.16.1, whose failure was a bare `agent did
+not become ready within 30 seconds`; from v1.16.2 it asks for 4096 MiB (on Linux half the available memory when that
+is less, never under 1024), `SMOLVM_EXPORT_HELPER_MEMORY_MIB=<MiB>` sets it, and a failed start says `The export helper
+asked for N MiB of memory` and names the variable. `exporter_memory_mib` is the figure this binary will ask for, except
+under a cgroup memory limit on Linux, where smolvm asks for less. From v1.16.1 the helper reuses the machine's cached
+image layers (`Reusing the machine's cached image layers...`); on macOS arm64 on v1.16.1, 2026-09-15, that export took
+1.2 s with `exporter_memory_ok=no`. Both lines warn and do not gate: see "What the memory lines do and do not promise".
 
 **2. Pack from an image**, when you want a runnable artifact of a stock image.
 
@@ -144,9 +142,6 @@ as it runs, and an artifact is a filesystem somebody else prepared.
 
 ## What an artifact is, and what it carries
 
-A pack is **two files**: a stub binary and a `<stub>.smolmachine` sidecar. `--output` names the
-**stub**; the sidecar is created for you. Keep them together.
-
 ```
 Mode:       container
 Image:      python:3.12-alpine
@@ -162,8 +157,10 @@ image pull VM's, which is fixed at 8192 MiB.
 
 A machine pack carries the root filesystem and the workload settings. It does not carry
 `/workspace`, which lives on the storage disk, unless `pack create --from-vm --include-workspace`
-is passed, nor host mounts, remote volumes, credential bindings (`pack create` warns about the
-last two), or the source machine's CPU and memory sizes.
+is passed, nor host mounts, remote volumes or credential bindings (`pack create` warns about the
+last two). From v1.29.0 ([#1693](https://github.com/smol-machines/smolvm/pull/1693)) it carries
+the source machine's CPU and memory caps, unless `--cpus` or `--mem` on `pack create`, or the
+Smolfile, override them; before v1.29.0 it did not.
 
 ## What the memory lines do and do not promise
 
@@ -211,6 +208,15 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
   aarch64 took one without it on v1.18.2. A machine created from a pack can be checkpointed from
   v1.18.0, and `create --from` restores the newest generation a checkpoint carries; `--at ~N` picks an earlier
   one, which `branch-and-checkpoint` covers.
+- **`machine create --from` takes every option `--image` takes, and a Smolfile (`-s`).** The pack's
+  CPUs, memory, command, environment, working directory, user, network, GPU and CUDA are defaults: a
+  flag replaces them, `-e` merges by name, and a command after `--` replaces the packed entrypoint and
+  command together. A secret the pack names has to be bound with `--secret-*` of the same name. A live
+  checkpoint fixes its CPUs, memory, disks, devices, mounts, guest ports, DNS and workload, and a flag
+  asking for something else fails naming it (`cpus cannot be set when restoring a live checkpoint`);
+  its egress policy, host ports, labels, environment, stop, health and restart settings can be set.
+  The same rules apply to the serve API and to the SDKs' `.smolmachine` images. Before v1.34 several
+  flags were dropped on `--from` without an error.
 - **On Linux, `SMOLVM_DATA_DIR` moves where the agent rootfs is looked up and the installer does
   not write it there**, so an isolated data root needs the rootfs copied in before the first boot.
 
@@ -237,7 +243,7 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
 
 ## Platform arms
 
-- **macOS arm64**: verified on v1.22.2, including the SSH agent forwarding, a branched source, and
+- **macOS arm64**: verified on v1.29.0, the SSH agent forwarding included; on v1.22.2 also a branched source, and
   a pack of a restored machine on v1.18.2. An extra `Signing binary with hypervisor entitlements`
   step runs here that does not on Linux.
 - **Linux aarch64**: verified on v1.14.6. Not run on v1.18.2 or v1.22.2: `pack create --image`
@@ -313,6 +319,19 @@ That is the v1.14.6 output, when the export helper was fixed at 8192 MiB. From v
 failure names the figure it asked for and `SMOLVM_EXPORT_HELPER_MEMORY_MIB`, and
 `exporter_memory_mib` is what the binary will ask for, 4096 or less. The recorded note's last
 sentence was never right: `pack create --image` boots its own 8192 MiB VM on every release here.
+
+## Re-verified on v1.29.0
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, the scripts twice, the second time from a fresh `HOME`, and
+the checks beyond them once. Linux was not run, so the Linux stamp stays on its earlier release.
+
+The preflight said `image_vm_memory_ok=no` with 4308 MiB free, and the image pack still
+succeeded: `pack-image.sh` `result=packed` in 79 s, `stub_understated_kb=10821`. `pack-machine.sh`
+gave `result=packed`, and `verify-pack.sh` `machine_pack_carried_rootfs=ok (PACKED_STATE_PRESENT)`
+and `result=artifacts_good (2 of 2 artifacts)`. The artifact's `run --ssh-agent` listed a throwaway
+key's fingerprint, a run without the flag had `SSH_AUTH_SOCK` empty, and with the host variable
+empty the flag stopped with `--ssh-agent: SSH_AUTH_SOCK is not set`.
 
 ## Re-verified on v1.22.2
 

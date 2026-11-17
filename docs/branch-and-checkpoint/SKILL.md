@@ -5,7 +5,7 @@ description: Saves a running smolvm machine as checkpoints on a schedule, keeps 
 
 # Checkpoints, restores, pauses and branches
 
-Verified on **smolvm v1.23.0** on macOS arm64, 2026-10-04, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
+Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
 brings back both the disk and the memory you left, the schedule keeps exactly the checkpoints you
 asked for and no fewer, and every child of a branch starts from a state you still hold as a
 checkpoint after the children are gone.
@@ -22,11 +22,9 @@ on Linux aarch64 on v1.22.2 on 2026-10-03.
 - **A branch's captured state stays on this host and cannot be exported.** So a branch point is
   paired with a checkpoint taken at the same moment, which is the copy you keep.
 - **`--branchable` at `start` decides what a machine can do later.** A branch source needs it on
-  every host. On macOS a stored capture, which is what the scripts here take, needs it too, and the
-  error when it was not, `deferred durable save requires file-backed guest RAM` on v1.22.2, names
-  neither the flag nor the operation. Before v1.20.0 macOS also refused a checkpoint file and a
-  pause without it, with `guest RAM has no file-backed regions`. Linux checkpoints and pauses
-  without it. The scripts always start with it.
+  every host, and on macOS so does a stored capture, which is what the scripts here take; Linux
+  checkpoints and pauses without it. `README.md` has the errors when it is missing. The scripts
+  always start with it.
 
 ## Procedure
 
@@ -59,7 +57,7 @@ scripts/create-source.sh smolskill-src                 # for checkpoints and res
 scripts/create-source.sh smolskill-bp --branch-ready   # for a batch branch
 ```
 
-The workload writes a counter into `/tmp` every second, which is tmpfs and so RAM, and a marker to
+The workload writes a counter into `/dev/shm` every second, which is tmpfs and so RAM, and a marker to
 `/root/setup.txt` on disk. A restore that brings the counter back proves memory came back, not only
 the disk. `--branch-ready` makes the workload park in `smolvm-branch-ready` after its setup, which a
 batch branch waits for.
@@ -81,7 +79,9 @@ then on for it to stay checkpointable.
 A capture also refuses a machine with resources bound to this host: a host mount (`-v`), a
 published socket, a remote volume, a host secret reference, custom DNS, a named network, a GPU,
 CUDA, Rosetta, `--ssh-agent` or a Docker socket. The error, `the initial portable checkpoint
-profile does not support ...; stop or detach these resources before capture`, names which.
+profile does not support ...; stop or detach these resources before capture`, names which. From
+v1.29.0 `machine checkpoint --host-mounts` captures a machine with host mounts, and the checkpoint
+restores only on a host where the same paths exist.
 
 **3. Capture, once or on a schedule.**
 
@@ -155,7 +155,7 @@ scripts/branch-point.sh --from smolskill-bp --store ./store --count 2 --name-pre
 scripts/branch-point.sh --from smolskill-src --store ./store --name smolskill-one
 ```
 
-For a batch it waits until the source's PID 1 is `smolvm-branch-ready`, takes the checkpoint while
+For a batch it waits until a process in the source runs `smolvm-branch-ready`, takes the checkpoint while
 the source is parked there, then branches. Every child and that checkpoint then hold the same
 state: a random value the source wrote to RAM before parking came back identical in both children
 and in a restore of the checkpoint.
@@ -193,22 +193,20 @@ says so, because an ephemeral entry retires after its run returns.
 
 Full detail in `references/traps.md`. The ones that cost the most:
 
-- **`--branchable` is decided at `start` and cannot be added later.** Branching needs it
-  everywhere; on macOS a stored capture needs it as well.
 - **`--output` must end in `.checkpoint` or `.smolcheckpoint`**, with `--store` too, where it names
   a directory. `.checkpoint` is the name from v1.19.1, and the scripts use `.smolcheckpoint`, which
   every release accepts.
 - **`pgrep -f smolvm-branch-ready` inside the guest always matches**, because the `sh -c` running it
-  contains the string. Read `/proc/1/cmdline`.
+  contains the string. Read each `/proc/<pid>/cmdline`: from v1.25.4 the workload is not PID 1.
 - **`smolvm machine list | grep -q` under `pipefail` can report a machine missing that exists**:
   `grep -q` closes the pipe early and the failed write fails the pipeline. Read the list into a
   variable first.
 - **`machine stop --name` on a name that does not exist leaves an empty directory** under the VM
   cache on v1.18.2, and a second stop of it on v1.22.2 leaves the name inside, which reads as a
   leak. `cleanup.sh` stops only names still listed.
-- **smolvm keeps restored checkpoints** in its VM cache, memory included: `vms/_restore-base` on
-  macOS, 243 MB on v1.18.2, and from v1.22.0 `vms/_restore-checkpoints`, the last three restored,
-  258 MB after this procedure on macOS on v1.23.0. Deleting the checkpoint does not delete them.
+- **smolvm keeps restored checkpoints**, memory included, after the checkpoint is deleted
+  (`_restore-base` was 243 MB on macOS on v1.18.2); `README.md` has the rest, and step 7's
+  `--restore-base` removes them.
 
 ## Security defaults, and why they are the defaults
 
@@ -226,7 +224,7 @@ Full detail in `references/traps.md`. The ones that cost the most:
 
 ## Platform arms
 
-`references/platforms.md` has each arm. In short: **macOS arm64** ran every step here on v1.23.0,
+`references/platforms.md` has each arm. In short: **macOS arm64** ran every step here on v1.29.0,
 and **Linux aarch64** on v1.18.2 and once on v1.22.2, with the one difference that Linux needs no
 `--branchable`. On v1.16.1 Linux aarch64 refused `--store` and froze a branch source; from v1.18.2
 it does neither. **Linux x86_64**
@@ -267,6 +265,20 @@ Linux, across a 10 s pause. Separately, on macOS a restored machine paused while
 full failed its first resume with `extract paused checkpoint: failed to unpack ...`, and the same
 `machine resume` succeeded once space was freed: counter 8 before the pause, 14 after, still
 counting.
+
+## Re-verified on v1.29.0
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, the scripts twice, the second time from a fresh `HOME`, and
+the checks beyond them once. Linux was not run, so the Linux stamp stays on its earlier release.
+
+`schedule.sh` gave `captures_ok=4` and `longest_capture_s=1`, `checkpoint-log` listed `~0` to `~2`,
+and restores of `~2` and the newest gave `result=restored`. The RAM counter read 32 before a 5 s
+pause and 33 after the resume. A batch of two branched with the same RAM token in both children
+and in a restore of the branch point, once `branch-point.sh` read every process for the parked
+helper (`references/traps.md`, Corrections); before that fix it reported `the source never parked`.
+One child with `--name` branched. A capture of a machine with a host mount failed with the profile
+error above, and with `--host-mounts` it succeeded.
 
 ## Re-verified on v1.23.0
 

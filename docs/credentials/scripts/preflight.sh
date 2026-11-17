@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.22.2"
+VERIFIED_VERSION="1.29.0"
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 
@@ -87,7 +87,7 @@ case "$kernel" in
         if [ "$len" -gt 100 ]; then
             emit socket_path_status too_long
             blocked=1
-            note "HOME is too deep: every VM start will fail with krun_start_enter -22, whose text blames disks and device options. Install under a shorter HOME."
+            note "HOME is too deep: every VM start will fail. From v1.28.0 the error names the socket path and its length; before it, krun_start_enter -22, whose text blames disks and device options. Install under a shorter HOME."
         else
             emit socket_path_status ok
         fi
@@ -121,7 +121,8 @@ esac
 
 if [ -n "$SMOLVM" ]; then
     createhelp="$("$SMOLVM" machine create --help 2>&1)"
-    if grep -q -- '--credential <NAME=ENV_VAR@HOST>' <<<"$createhelp"; then
+    # v1.27.0 prints the value as <NAME=ENV_VAR@HOST[:body]>, so match the prefix.
+    if grep -q -- '--credential <NAME=ENV_VAR@HOST' <<<"$createhelp"; then
         emit has_credential_flag yes
     else
         emit has_credential_flag no
@@ -160,11 +161,18 @@ if [ -n "$VAR" ]; then
     fi
 fi
 if [ -n "$HOST" ]; then
-    case "$HOST" in
-        *[!a-z0-9.-]*|*..*|.*|*.|[0-9]*[0-9]) emit host_form rejected; blocked=1
-            note "a credential host must be an exact lowercase DNS name: no wildcard, scheme, port or IP address" ;;
-        *) emit host_form ok ;;
+    # From v1.26.0 a host may also be `*.` plus a name of at least two labels.
+    name="${HOST#\*.}"
+    case "$name" in
+        *[!a-z0-9.-]*|*..*|.*|*.|[0-9]*[0-9]) form=rejected ;;
+        *) form=ok ;;
     esac
+    case "$HOST:$name" in \*.*:*.*|[!*]*) ;; *) form=rejected ;; esac
+    emit host_form "$form"
+    if [ "$form" = rejected ]; then
+        blocked=1
+        note "a credential host must be a lowercase DNS name, or *. plus a name with at least two labels: no scheme, port or IP address"
+    fi
 fi
 
 emit memory_required_mib 1024

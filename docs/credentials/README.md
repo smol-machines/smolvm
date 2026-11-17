@@ -8,9 +8,9 @@ reference.
 
 ## When a value from the environment is read
 
-[Credential substitution](../credential-substitution.md#where-the-value-comes-from) says an
-environment value is read at `machine start` and `machine exec` time. Observed on v1.18.2:
-unsetting the variable for a later `machine exec` did not stop substitution, and starting the
+An environment value is the one `machine start` saw
+([Credential substitution](../credential-substitution.md#where-the-value-comes-from)). Observed on v1.18.2:
+unsetting or changing the variable for a later `machine exec` changed nothing, and starting the
 machine with it unset gave `502 smolvm credentials: credential unavailable`. So rotate a value from
 the environment by restarting the machine, and use a file reference for one that has to rotate
 under a running machine.

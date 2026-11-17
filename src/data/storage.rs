@@ -31,6 +31,48 @@ pub type StoredHostMount = (String, String, bool);
 /// Persisted staged-mount tuple: original position, host source, guest target.
 pub type StoredStagedMount = (usize, String, String);
 
+/// Split raw `-v` specs into the rest (returned untouched for the host and
+/// remote parsers) and disk volumes: a lone guest path with no host side, as in
+/// Docker's anonymous volume `-v /var/lib/docker`. Disk volume targets come back
+/// normalized, and must not repeat.
+pub fn split_disk_volume_specs(specs: &[String]) -> Result<(Vec<String>, Vec<String>)> {
+    let mut rest = Vec::new();
+    let mut disk = Vec::new();
+    for spec in specs {
+        if !spec.starts_with('/') || spec.contains(':') {
+            rest.push(spec.clone());
+            continue;
+        }
+        let target = smolvm_protocol::disk_volume::normalize_target(spec)
+            .map_err(|reason| Error::mount("validate disk volume", reason))?;
+        if disk.contains(&target) {
+            return Err(Error::mount(
+                "validate mounts",
+                format!("duplicate mount target: {target} is specified more than once"),
+            ));
+        }
+        disk.push(target);
+    }
+    Ok((rest, disk))
+}
+
+/// Reject a disk volume whose target is also a host or remote mount target.
+pub fn ensure_disk_volumes_distinct<'a>(
+    disk_volumes: &[String],
+    other_targets: impl IntoIterator<Item = &'a str>,
+) -> Result<()> {
+    for target in other_targets {
+        let target = target.trim_end_matches('/');
+        if disk_volumes.iter().any(|d| d == target) {
+            return Err(Error::mount(
+                "validate mounts",
+                format!("duplicate mount target: {target} is specified more than once"),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Host directory mount.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct HostMount {
@@ -49,6 +91,14 @@ pub struct HostMount {
     /// host/guest coherence for metadata-heavy workload performance.
     #[serde(default)]
     pub staged: bool,
+
+    /// Keep the guest's view of file ownership and mode in an extended
+    /// attribute on the host file instead of the host inode, so a guest's
+    /// `chown` and `chmod` succeed on a host that cannot apply them (an
+    /// unprivileged Linux host; macOS always does this). A container engine
+    /// asks for it, as a container's root expects to own its volumes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
 }
 
 impl HostMount {
@@ -123,6 +173,7 @@ impl HostMount {
             target: target.into(),
             read_only,
             staged: false,
+            recorded_ownership: false,
         };
 
         if !mount.source.exists() {
@@ -352,6 +403,7 @@ impl HostMount {
             target: PathBuf::from(target),
             read_only,
             staged: false,
+            recorded_ownership: false,
         }
     }
 
@@ -362,6 +414,7 @@ impl HostMount {
             target: PathBuf::from(target),
             read_only: false,
             staged: true,
+            recorded_ownership: false,
         }
     }
 
@@ -403,6 +456,26 @@ impl HostMount {
 mod tests {
     use super::*;
     use std::path::PathBuf;
+
+    #[test]
+    fn a_lone_guest_path_is_a_disk_volume() {
+        let specs: Vec<String> = ["/var/lib/docker/", "/tmp:/data", "s3://b:/s", "rel"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (rest, disk) = split_disk_volume_specs(&specs).unwrap();
+        assert_eq!(disk, vec!["/var/lib/docker".to_string()]);
+        assert_eq!(rest, specs[1..].to_vec());
+
+        let dup = [
+            "/var/lib/docker".to_string(),
+            "/var/lib/docker/".to_string(),
+        ];
+        assert!(split_disk_volume_specs(&dup).is_err());
+        assert!(split_disk_volume_specs(&["/proc/x".to_string()]).is_err());
+        assert!(ensure_disk_volumes_distinct(&disk, ["/var/lib/docker/"]).is_err());
+        assert!(ensure_disk_volumes_distinct(&disk, ["/data"]).is_ok());
+    }
 
     #[test]
     fn parse_rejects_duplicate_target() {
@@ -573,6 +646,7 @@ mod tests {
                 target: PathBuf::from("/guest/path"),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
             };
             let err = HostMount::validate(&mount).unwrap_err().to_string();
             assert!(

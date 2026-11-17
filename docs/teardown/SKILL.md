@@ -5,7 +5,7 @@ description: "Stops every smolvm machine a session started, removes smolvm's sta
 
 # Leaving nothing running and nothing behind
 
-Verified on **smolvm v1.23.0** on macOS arm64, 2026-10-04, and on **v1.18.2** on Linux aarch64,
+Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64,
 2026-09-24. This packet exists on its own because **the obvious cleanup steps fail here**: the
 obvious assertion gives a false failure, the obvious reaper matches the wrong process or nothing
 at all, and killing a wrapper around a run does not stop its machine. Anything that starts machines
@@ -178,7 +178,7 @@ session's; delete it by name with `--force`.
 
 ## Platform arms
 
-- **macOS arm64**: the scripts were run here on v1.23.0. **Linux aarch64**: on v1.18.2, and once
+- **macOS arm64**: the scripts were run here on v1.29.0. **Linux aarch64**: on v1.18.2, and once
   on v1.22.2.
 - **Linux x86_64**: the procedure was verified on v1.14.2 on an NVIDIA A10 cloud host. The
   scripts themselves were not re-run there.
@@ -212,6 +212,22 @@ vm_process=89092 config=/tmp/u23/Library/Caches/smolvm/vms/ea8c396d10b0f0b9/boot
 $HOME/.smolvm` against the real installation beside the isolated one:
 `protected_untouched_since_2026-10-04:<dir>=ok` for each `--protected` directory, and
 `result=clean`.
+
+## Re-verified on v1.29.0
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, the scripts twice, the second time from a fresh `HOME`, and
+the checks beyond them once. Linux was not run, so the Linux stamp stays on its earlier release.
+
+Eval 1 gave `result=clean`. With a wrapper killed, `cleanup.sh` named two processes, the orphaned
+CLI as `config=orphaned-under <HOME>/.smolvm` and the VM by its boot config, and `--reap` killed
+both. A delete without `--force` exited 1 with the confirmation message. Eval 3 gave
+`protected_untouched_since_<time>:<dir>=ok` for each of the real installation's three directories
+while another session's machine ran from it. A `machine stop` of a missing name now exits 1 with
+`vm not found`, and `verify-clean.sh` reports `empty_vm_dirs=1 (no state in them; not counted)`.
+The preflight sizes `image_archives`. `--uninstall` still left `Library/Caches/smolvm-image-archives`,
+24 MB. New since v1.23.0 is the usage journal, `Library/Application Support/smolvm/usage/`, on by
+default and removed with the data directory ([usage-journal.md](../usage-journal.md)).
 
 ## Re-verified on v1.23.0
 

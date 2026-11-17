@@ -49,9 +49,10 @@ pub enum PullAuth {
 /// This is the single credential-resolution path shared by the pack tooling and
 /// the OCI image cache, so a pull authorizes the same way whoever drives it.
 pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth) -> RegistryClient {
-    // Resolve the config-key hostname to its Distribution API endpoint. The config
-    // key stays the user-facing name so credential lookup is consistent — only the
-    // HTTP endpoint changes:
+    // Resolve the requested hostname to its Distribution API endpoint. When a
+    // mirror is configured, credentials must follow the destination registry;
+    // the upstream registry's secret must never be forwarded to a different host.
+    // Without a mirror, only the HTTP endpoint changes:
     //   * Docker Hub is "docker.io" to users but serves the API at
     //     "registry-1.docker.io".
     //   * The smol registry's apex "smolmachines.com" (what the guest's
@@ -60,7 +61,7 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
     let effective = config.get_mirror(registry).unwrap_or(registry);
     let api_host = match effective {
         "docker.io" => "registry-1.docker.io",
-        h if h.ends_with("smolmachines.com") => SMOLMACHINES_REGISTRY,
+        h if h == "smolmachines.com" || h.ends_with(".smolmachines.com") => SMOLMACHINES_REGISTRY,
         h => h,
     };
     let base_url = if smolvm_registry::is_local_registry(api_host) {
@@ -75,8 +76,9 @@ pub fn registry_client(registry: &str, config: &RegistryConfig, auth: &PullAuth)
     // are stored under the canonical `registry.smolmachines.com` — looking up the
     // raw name there degrades an authorized user to an anonymous client, and
     // their private image 401s at the gate.
-    let cred_key = match registry {
-        h if h.ends_with("smolmachines.com") => SMOLMACHINES_REGISTRY,
+    let cred_key = match effective {
+        "docker.io" | "index.docker.io" | "registry-1.docker.io" => "docker.io",
+        h if h == "smolmachines.com" || h.ends_with(".smolmachines.com") => SMOLMACHINES_REGISTRY,
         h => h,
     };
 
@@ -363,6 +365,10 @@ pub fn registry_pull_hosts(image: &str) -> Vec<String> {
         "docker.io" | "index.docker.io" | "registry-1.docker.io" => {
             vec!["docker.io".to_string(), "docker.com".to_string()]
         }
+        // GHCR answers manifests itself but redirects blob downloads to
+        // pkg-containers.githubusercontent.com, so a list naming only ghcr.io
+        // fails part-way through the first pull.
+        "ghcr.io" => vec!["ghcr.io".to_string(), "githubusercontent.com".to_string()],
         host if host.ends_with("smolmachines.com") => vec!["smolmachines.com".to_string()],
         host => vec![host.to_string()],
     }
@@ -723,9 +729,17 @@ mod tests {
     }
 
     #[test]
+    fn test_registry_pull_hosts_ghcr_needs_its_blob_host() {
+        assert_eq!(
+            registry_pull_hosts("ghcr.io/acme/app:1"),
+            vec!["ghcr.io", "githubusercontent.com"]
+        );
+    }
+
+    #[test]
     fn test_registry_pull_hosts_explicit_registry() {
         // A single apex covers the registry's sub-hosts via subdomain matching.
-        assert_eq!(registry_pull_hosts("ghcr.io/acme/app:1"), vec!["ghcr.io"]);
+        assert_eq!(registry_pull_hosts("quay.io/acme/app:1"), vec!["quay.io"]);
         assert_eq!(
             registry_pull_hosts("registry.example.com:5000/img"),
             vec!["registry.example.com:5000"]
@@ -1337,6 +1351,34 @@ mirror = "ghcr-mirror.example.com"
         // An unrelated host still gets no credentials.
         let other = registry_client("ghcr.io", &config, &PullAuth::FromConfig);
         assert_eq!(other.identity_token(), None);
+    }
+
+    #[test]
+    fn registry_mirror_uses_only_its_own_credentials() {
+        let mut config = RegistryConfig::default();
+        config.registries.insert(
+            "origin.example.invalid".to_string(),
+            RegistryEntry {
+                mirror: Some("mirror.example.invalid".to_string()),
+                identity_token: Some("upstream-secret".to_string()),
+                ..Default::default()
+            },
+        );
+        config.registries.insert(
+            "mirror.example.invalid".to_string(),
+            RegistryEntry {
+                identity_token: Some("mirror-secret".to_string()),
+                ..Default::default()
+            },
+        );
+
+        let mirrored = registry_client("origin.example.invalid", &config, &PullAuth::FromConfig);
+        assert_eq!(mirrored.base_url(), "https://mirror.example.invalid");
+        assert_eq!(mirrored.identity_token(), Some("mirror-secret"));
+
+        config.registries.remove("mirror.example.invalid");
+        let anonymous = registry_client("origin.example.invalid", &config, &PullAuth::FromConfig);
+        assert_eq!(anonymous.identity_token(), None);
     }
 
     #[test]

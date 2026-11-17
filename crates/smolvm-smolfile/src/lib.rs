@@ -29,9 +29,11 @@
 //! | `disk_durability` | `"full"` or `"deferred"` | No | Whether a guest `fsync` waits for the host disk (`full`, default) or guest writes reach it on the host's schedule (`deferred`; a host crash can lose recent writes). |
 //! | `storage` | int | No | Storage disk size in GiB. |
 //! | `overlay` | int | No | Overlay disk size in GiB. |
+//! | `auto_ports` | bool | No | Publish every TCP port the guest listens on at the same port on host loopback while it listens (default: false). |
+//! | `auto_ports_exclude` | int[] | No | Guest ports `auto_ports` never publishes; implies `auto_ports`. |
 //! | `ports` | string[] | No | Port mappings (`"host:guest"` or equal-length `"host-start-host-end:guest-start-guest-end"` ranges). Prefer `[dev] ports`. |
 //! | `volumes` | string[] | No | Volume mounts (`"host:guest[:ro|rw|staged]"`). Prefer `[dev] volumes`. |
-//! | `init` | string[] | No | Commands run on every VM start. Prefer `[dev] init`. |
+//! | `init` | string[] | No | Commands run once, on the machine's first start. Prefer `[dev] init`. |
 //!
 //! ## Sections
 //!
@@ -70,6 +72,7 @@
 //! | `allow_hosts` | string[] | Legacy hostname and subdomain entries |
 //! | `allow_host_patterns` | string[] | Exact hostnames or `*.` subdomain patterns |
 //! | `allow_cidrs` | string[] | Allowed CIDR ranges (`"10.0.0.0/8"`) |
+//! | `deny_cidrs` | string[] | Denied CIDR ranges, checked before any allow |
 //! | `credentials` | table[] | Credential bindings (see below) |
 //!
 //! #### `[[network.credentials]]` — Credential substitution
@@ -248,7 +251,7 @@ pub enum SmolfileError {
 ///
 /// - `entrypoint`: the executable and its fixed leading arguments (like Dockerfile ENTRYPOINT)
 /// - `cmd`: default arguments appended to entrypoint (like Dockerfile CMD)
-/// - `init`: dev bootstrap commands run on every VM start (like RUN at boot, NOT like CMD)
+/// - `init`: dev bootstrap commands run once, on the machine's first start (like RUN at boot, NOT like CMD)
 ///
 /// When set, `entrypoint` and `cmd` override the base image's OCI config values.
 /// If neither is set, the image's built-in entrypoint and cmd are used.
@@ -312,6 +315,13 @@ pub struct Smolfile {
     /// Expose the guest's Docker daemon socket to the host as a Unix socket
     /// (`DOCKER_HOST=unix://…`). Requires dockerd running inside the VM.
     pub docker_socket: Option<bool>,
+    /// Publish every TCP port the guest listens on at the same port on the
+    /// host's loopback while it listens, like `--auto-ports`.
+    pub auto_ports: Option<bool>,
+    /// Guest ports `auto_ports` never publishes; setting any implies
+    /// `auto_ports = true`.
+    #[serde(default)]
+    pub auto_ports_exclude: Vec<u16>,
     /// Storage disk size in GiB.
     pub storage: Option<u64>,
     /// Overlay disk size in GiB.
@@ -328,7 +338,7 @@ pub struct Smolfile {
     /// Volume mounts (e.g., `["./src:/app"]`).
     #[serde(default)]
     pub volumes: Vec<String>,
-    /// Init commands run on every VM start.
+    /// Init commands run once, on the machine's first start.
     #[serde(default)]
     pub init: Vec<String>,
 
@@ -356,6 +366,12 @@ pub struct Smolfile {
     /// Stop the machine once its workload exits, whatever the exit status.
     #[serde(default)]
     pub stop_on_exit: bool,
+    /// Signal the workload is sent when the machine stops (`SIGTERM` when
+    /// unset), as a name (`SIGINT`, `SIGRTMIN+3`) or a number.
+    pub stop_signal: Option<String>,
+    /// Seconds the workload gets to exit after its stop signal before it is
+    /// killed (10 when unset).
+    pub stop_timeout: Option<u64>,
     /// Credential forwarding.
     pub auth: Option<AuthConfig>,
     /// Service metadata for deployment.
@@ -375,6 +391,18 @@ pub struct NetworkConfig {
     /// Allowed egress CIDR ranges (e.g., `["10.0.0.0/8", "1.1.1.1"]`).
     #[serde(default)]
     pub allow_cidrs: Vec<String>,
+    /// Block private, internal and link-local destinations while the public
+    /// internet stays open. Cloud metadata is blocked either way.
+    #[serde(default)]
+    pub block_private: bool,
+    /// Private ranges to re-open under `block_private` (implies it).
+    #[serde(default)]
+    pub allow_private: Vec<String>,
+    /// Denied egress CIDR ranges, checked before anything is allowed.
+    #[serde(default)]
+    pub deny_cidrs: Vec<String>,
+    #[serde(default)]
+    pub allow_udp: Vec<String>,
     /// Credential bindings (`[[network.credentials]]`). The guest receives a
     /// placeholder in each `environment_variable`; the host substitutes the
     /// real value on HTTPS requests to the binding's `allowed_hosts` only.
@@ -434,7 +462,7 @@ pub struct DevConfig {
     /// Development-only environment variables.
     #[serde(default)]
     pub env: Vec<String>,
-    /// Init commands run on every VM start.
+    /// Init commands run once, on the machine's first start.
     #[serde(default)]
     pub init: Vec<String>,
     /// Development working directory override.
@@ -769,6 +797,19 @@ enabled = true
 "#,
         )
         .is_err());
+    }
+
+    #[test]
+    fn parse_auto_ports_fields() {
+        let sf = parse("auto_ports = true\nauto_ports_exclude = [5432, 6379]").unwrap();
+        assert_eq!(sf.auto_ports, Some(true));
+        assert_eq!(sf.auto_ports_exclude, [5432, 6379]);
+
+        let sf = parse("").unwrap();
+        assert_eq!(sf.auto_ports, None);
+        assert!(sf.auto_ports_exclude.is_empty());
+
+        assert!(parse("auto_ports_exclude = [70000]").is_err());
     }
 
     #[test]

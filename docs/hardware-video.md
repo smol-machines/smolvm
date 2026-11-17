@@ -3,11 +3,12 @@
 SmolVM can encode its browser display as H.264 instead of sending raw
 framebuffer pixels. It uses a host hardware encoder when available and a
 bounded software encoder on CPU-only Linux hosts. Keyboard and pointer input
-continue over RFB, and native VNC clients are unchanged.
+continue over RFB, and native VNC clients are unchanged. It builds on the
+[browser display](browser-display.md), which requires a machine created with
+`--gpu`.
 
-The path is on by default whenever an `ffmpeg` binary is on the host's PATH, and
-falls back to Raw RFB if the selected encoder is missing; set `SMOLVM_VIDEO=off` to
-disable it. It requires an FFmpeg build exposing the selected encoder:
+The path is on by default whenever an `ffmpeg` binary is on the host's PATH; set
+`SMOLVM_VIDEO=off` to disable it. It requires an FFmpeg build exposing the selected encoder:
 
 ```console
 SMOLVM_DISPLAY=1920x1080 \

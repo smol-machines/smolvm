@@ -45,7 +45,12 @@ use std::process::{Command, Stdio};
 /// argv marker selecting the namespace helper instead of the PID-1 agent.
 const HELPER_ARG: &str = "ns-file";
 /// This binary, re-executed for the helper.
-const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+pub(crate) const AGENT_BINARY: &str = "/usr/local/bin/smolvm-agent";
+/// argv after the binary for the helper that only waits on its stdin: started
+/// in a new user namespace, it is the process that namespace exists through
+/// while the agent sets it up (see [`crate::mount_owner`]).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) const USERNS_HOLD_ARGS: [&str; 2] = [HELPER_ARG, "userns-hold"];
 
 /// Whether this invocation is the namespace file helper.
 ///
@@ -77,6 +82,24 @@ pub fn run_helper() -> i32 {
             }
         };
     }
+    // argv: [bin, "ns-file", "attach-mount", pid, target, source, ro] — takes
+    // the source mount here, in the caller's namespace, before entering the
+    // container's, where the source path does not exist.
+    if args.get(2).map(String::as_str) == Some("attach-mount") {
+        return match helper_attach_mount(&args) {
+            Ok(()) => 0,
+            Err(e) => {
+                let _ = std::io::stdout().write_all(format!("ERR {e}\n").as_bytes());
+                1
+            }
+        };
+    }
+    // argv: [bin, "ns-file", "userns-hold"] — exits when the agent closes
+    // its stdin.
+    if args.get(2).map(String::as_str) == Some(USERNS_HOLD_ARGS[1]) {
+        let _ = std::io::copy(&mut std::io::stdin(), &mut std::io::sink());
+        return 0;
+    }
     // argv: [bin, "ns-file", op, pid, path, (mode), (uid), (gid)]
     if args.len() < 5 {
         eprintln!("ns-file: usage: ns-file <read|write> <pid> <path> [mode [uid gid]]");
@@ -105,6 +128,8 @@ pub fn run_helper() -> i32 {
         "write" => helper_write(&path, mode, uid, gid),
         "connect" => helper_connect(&path),
         "mount-cache" => helper_mount_cache(&path, &args),
+        "remount-shm" => helper_remount_shm(&path, &args),
+        "detach-mount" => helper_detach_mount(&path),
         _ => Err("unknown op".to_string()),
     };
     match result {
@@ -114,6 +139,220 @@ pub fn run_helper() -> i32 {
             1
         }
     }
+}
+
+/// `open_tree(2)` and `move_mount(2)`: the same numbers on x86_64 and aarch64
+/// (asm-generic). Named here because the musl `libc` the agent builds against
+/// does not export them.
+#[cfg(target_os = "linux")]
+pub(crate) const SYS_OPEN_TREE: libc::c_long = 428;
+#[cfg(target_os = "linux")]
+pub(crate) const SYS_MOVE_MOUNT: libc::c_long = 429;
+#[cfg(target_os = "linux")]
+pub(crate) const OPEN_TREE_CLONE: libc::c_uint = 1;
+#[cfg(target_os = "linux")]
+pub(crate) const MOVE_MOUNT_F_EMPTY_PATH: libc::c_uint = 0x4;
+
+/// Clone the attached share at `source` as a detached mount, enter the
+/// container's mount namespace, and attach the clone at `target` there. The
+/// clone carries the mount across: `source` is not a path inside the container.
+#[cfg(target_os = "linux")]
+fn helper_attach_mount(args: &[String]) -> Result<(), String> {
+    use std::os::unix::io::FromRawFd as _;
+
+    let (Some(pid), Some(target), Some(source), Some(ro)) =
+        (args.get(3), args.get(4), args.get(5), args.get(6))
+    else {
+        return Err("usage: attach-mount <pid> <target> <source> <ro|rw>".to_string());
+    };
+    let pid: u32 = pid.parse().map_err(|_| "bad pid".to_string())?;
+    let c = |s: &str| std::ffi::CString::new(s).map_err(|e| e.to_string());
+    let source_c = c(source)?;
+    // SAFETY: a NUL-terminated path; the result is checked before use.
+    let fd = unsafe {
+        libc::syscall(
+            SYS_OPEN_TREE,
+            libc::AT_FDCWD,
+            source_c.as_ptr(),
+            OPEN_TREE_CLONE | libc::O_CLOEXEC as libc::c_uint,
+        )
+    };
+    if fd < 0 {
+        return Err(format!(
+            "open_tree {source}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    // SAFETY: open_tree returned a new descriptor this helper owns.
+    let tree = unsafe { std::fs::File::from_raw_fd(fd as libc::c_int) };
+    enter_mount_namespace(pid)?;
+    std::fs::create_dir_all(target).map_err(|e| format!("create {target}: {e}"))?;
+    let target_c = c(target)?;
+    let empty = c("")?;
+    // SAFETY: `tree` is a live detached mount; the paths are NUL-terminated.
+    let rc = unsafe {
+        libc::syscall(
+            SYS_MOVE_MOUNT,
+            std::os::unix::io::AsRawFd::as_raw_fd(&tree),
+            empty.as_ptr(),
+            libc::AT_FDCWD,
+            target_c.as_ptr(),
+            MOVE_MOUNT_F_EMPTY_PATH,
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "move_mount {target}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if ro == "ro" {
+        // The host already refuses writes; this reports them as a read-only
+        // filesystem instead of failed writes.
+        // SAFETY: a NUL-terminated path for a mount this helper just made.
+        let rc = unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target_c.as_ptr(),
+                std::ptr::null(),
+                // A bind remount replaces every per-mount flag, so
+                // keep the ones the device was mounted with.
+                libc::MS_REMOUNT
+                    | libc::MS_BIND
+                    | libc::MS_RDONLY
+                    | libc::MS_NOSUID
+                    | libc::MS_NODEV,
+                std::ptr::null(),
+            )
+        };
+        if rc != 0 {
+            let error = std::io::Error::last_os_error();
+            // SAFETY: as above.
+            unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) };
+            return Err(format!("make {target} read-only: {error}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_attach_mount(_args: &[String]) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Lazily unmount `target` in the namespace just joined.
+#[cfg(target_os = "linux")]
+fn helper_detach_mount(target: &str) -> Result<(), String> {
+    let target_c = std::ffi::CString::new(target).map_err(|e| e.to_string())?;
+    // SAFETY: a NUL-terminated path.
+    if unsafe { libc::umount2(target_c.as_ptr(), libc::MNT_DETACH) } != 0 {
+        let error = std::io::Error::last_os_error();
+        // Not mounted in this container: nothing to undo.
+        if !matches!(
+            error.raw_os_error(),
+            Some(libc::EINVAL) | Some(libc::ENOENT)
+        ) {
+            return Err(format!("unmount {target}: {error}"));
+        }
+    }
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_detach_mount(_target: &str) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Whether any workload container runs in a mount namespace of its own.
+#[cfg(target_os = "linux")]
+pub(crate) fn has_live_containers() -> bool {
+    let own = std::fs::read_link("/proc/self/ns/mnt").ok();
+    let skip = [own, std::fs::read_link("/proc/1/ns/mnt").ok()];
+    let containers = live_containers().into_iter().filter_map(|pid| {
+        std::fs::read_link(format!("/proc/{pid}/ns/mnt"))
+            .ok()
+            .map(|ns| (pid, ns))
+    });
+    !namespaces_to_enter(containers, &skip).is_empty()
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn has_live_containers() -> bool {
+    false
+}
+
+/// Attach the share at `source` onto `target` in every workload container.
+#[cfg(target_os = "linux")]
+pub(crate) fn attach_in_every_container(
+    source: &Path,
+    target: &str,
+    read_only: bool,
+) -> Result<(), String> {
+    let mode = if read_only { "ro" } else { "rw" };
+    in_every_container(|pid| {
+        // Each container gets the share as a new container of its user would
+        // (see `storage::add_volume_bind_mounts`).
+        let source = match container_user(Path::new(crate::paths::CRUN_ROOT_DIR), pid) {
+            Some((uid, gid)) => crate::mount_owner::bind_source(source, uid, gid),
+            None => source.to_path_buf(),
+        };
+        [
+            "ns-file",
+            "attach-mount",
+            &pid.to_string(),
+            target,
+            &source.to_string_lossy(),
+            mode,
+        ]
+        .map(String::from)
+        .to_vec()
+    })
+}
+
+/// The uid and gid the workload of the container whose first process is `pid`
+/// runs as, read from the container's bundle: that process may be the
+/// keep-alive init, which runs as root whatever the workload's user is. The
+/// bundle is found through the `status` file crun keeps for each container
+/// under `state_root`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn container_user(state_root: &Path, pid: u32) -> Option<(u32, u32)> {
+    std::fs::read_dir(state_root)
+        .ok()?
+        .flatten()
+        .find_map(|container| {
+            let status = std::fs::read(container.path().join("status")).ok()?;
+            let status: serde_json::Value = serde_json::from_slice(&status).ok()?;
+            if status["pid"].as_u64() != Some(u64::from(pid)) {
+                return None;
+            }
+            let bundle = Path::new(status["bundle"].as_str()?);
+            let config = std::fs::read(bundle.join("config.json")).ok()?;
+            crate::oci::workload_user_of_config(&serde_json::from_slice(&config).ok()?)
+        })
+}
+
+/// Unmount `target` in every workload container.
+#[cfg(target_os = "linux")]
+pub(crate) fn detach_in_every_container(target: &str) -> Result<(), String> {
+    in_every_container(|pid| {
+        ["ns-file", "detach-mount", &pid.to_string(), target]
+            .map(String::from)
+            .to_vec()
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn attach_in_every_container(
+    _source: &Path,
+    _target: &str,
+    _read_only: bool,
+) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn detach_in_every_container(_target: &str) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
 }
 
 /// Mount the cache slot's filesystem at `path` in the namespace just joined:
@@ -185,18 +424,121 @@ fn helper_mount_cache(_path: &str, _args: &[String]) -> Result<(), String> {
     Err("mount namespaces are Linux-only".to_string())
 }
 
+/// Resize the tmpfs at `path` in the namespace just joined to the size after
+/// the path (`50%` and the like, resolved against the RAM online now). Anything
+/// other than a tmpfs there is left alone.
+#[cfg(target_os = "linux")]
+fn helper_remount_shm(path: &str, args: &[String]) -> Result<(), String> {
+    let size = args
+        .get(5)
+        .ok_or_else(|| "remount-shm: usage: remount-shm <pid> <path> <size>".to_string())?;
+    let c = |s: &str| std::ffi::CString::new(s).map_err(|e| e.to_string());
+    let (target, data) = (c(path)?, c(&format!("size={size}"))?);
+    // statfs rather than /proc/self/mountinfo: the container's /proc belongs to
+    // its own PID namespace, where this helper has no `self`.
+    // SAFETY: `target` is NUL-terminated and `fs` is a properly sized buffer.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(target.as_ptr(), &mut fs) } != 0 || !is_tmpfs(&fs) {
+        return Ok(());
+    }
+    // A remount clears the per-mount flags it is not given, so the mount's
+    // own are passed back (ST_* and MS_* share these bit values).
+    // SAFETY: as for statfs above.
+    let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statvfs(target.as_ptr(), &mut vfs) } != 0 {
+        return Err(format!(
+            "statvfs {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    let kept = vfs.f_flag & (libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC);
+    // SAFETY: valid NUL-terminated strings that outlive the call.
+    let rc = unsafe {
+        libc::mount(
+            std::ptr::null(),
+            target.as_ptr(),
+            std::ptr::null(),
+            libc::MS_REMOUNT | kept,
+            data.as_ptr().cast(),
+        )
+    };
+    if rc != 0 {
+        return Err(format!(
+            "remount {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    Ok(())
+}
+
+/// Whether `fs` describes a tmpfs. The type of `f_type` differs between glibc
+/// and musl, so both sides are widened to one type.
+#[cfg(target_os = "linux")]
+#[allow(clippy::unnecessary_cast)]
+fn is_tmpfs(fs: &libc::statfs) -> bool {
+    fs.f_type as i64 == libc::TMPFS_MAGIC as i64
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_remount_shm(_path: &str, _args: &[String]) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+/// Regrow /dev/shm in every container after the machine gained RAM. Its size
+/// is a share of memory resolved when the tmpfs was mounted, so without this a
+/// live grow left it at the boot size. A machine started with `--shm-size`
+/// keeps the size it asked for.
+#[cfg(target_os = "linux")]
+pub(crate) fn regrow_shm_everywhere() -> Result<(), String> {
+    if std::env::var_os(smolvm_protocol::guest_env::SHM_SIZE).is_some() {
+        return Ok(());
+    }
+    in_every_container(|pid| {
+        vec![
+            "ns-file".into(),
+            "remount-shm".into(),
+            pid.to_string(),
+            "/dev/shm".into(),
+            "50%".into(),
+        ]
+    })
+}
+
+#[cfg(not(target_os = "linux"))]
+pub(crate) fn regrow_shm_everywhere() -> Result<(), String> {
+    Ok(())
+}
+
 /// Mount the cache slot into the mount namespace of every container this
-/// machine runs, one child per distinct namespace. Only crun's own containers
-/// are entered: a container the user runs inside one (Docker in the machine,
-/// an `unshare`) has a namespace of its own and never asked for the cache.
-/// Every container is tried, and all failures are reported together, so one
-/// namespace that refuses the mount does not leave the rest without it.
+/// machine runs, one child per distinct namespace (see [`in_every_container`]),
+/// so one namespace that refuses the mount does not leave the rest without it.
 #[cfg(target_os = "linux")]
 fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
     let (path, major, minor) = match (args.get(3), args.get(4), args.get(5)) {
         (Some(p), Some(a), Some(b)) => (p.clone(), a.clone(), b.clone()),
         _ => return Err("usage: mount-cache-all <path> <major> <minor>".to_string()),
     };
+    in_every_container(|pid| {
+        [
+            "ns-file",
+            "mount-cache",
+            &pid.to_string(),
+            &path,
+            &major,
+            &minor,
+        ]
+        .map(String::from)
+        .to_vec()
+    })
+}
+
+/// Run this binary with `helper_args(pid)` once per distinct mount namespace
+/// among the machine's crun containers. Only crun's own containers are entered:
+/// a container the user runs inside one (Docker in the machine, an `unshare`)
+/// has a namespace of its own and is left to its owner. Every container is
+/// tried, and all failures are reported together.
+#[cfg(target_os = "linux")]
+fn in_every_container(helper_args: impl Fn(u32) -> Vec<String>) -> Result<(), String> {
     let own = std::fs::read_link("/proc/self/ns/mnt").map_err(|e| format!("own namespace: {e}"))?;
     let skip = [Some(own), std::fs::read_link("/proc/1/ns/mnt").ok()];
     let containers = live_containers().into_iter().filter_map(|pid| {
@@ -204,12 +546,13 @@ fn mount_cache_everywhere(args: &[String]) -> Result<(), String> {
             .ok()
             .map(|ns| (pid, ns))
     });
-    let exe = std::env::current_exe().map_err(|e| format!("own binary: {e}"))?;
+    // The fixed path, not current_exe(): the agent pivot_roots during boot, so
+    // its own /proc/self/exe no longer resolves when PID 1 calls this.
+    let exe = AGENT_BINARY;
     let mut failures = Vec::new();
     for pid in namespaces_to_enter(containers, &skip) {
-        let pid = pid.to_string();
-        match std::process::Command::new(&exe)
-            .args(["ns-file", "mount-cache", &pid, &path, &major, &minor])
+        match std::process::Command::new(exe)
+            .args(helper_args(pid))
             .output()
         {
             Ok(output) if output.status.success() => {}
@@ -465,6 +808,8 @@ fn send_fd(sock: libc::c_int, fd: libc::c_int) -> Result<(), String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 pub enum RootReason {
+    /// The request named the VM's own filesystem.
+    VmTarget,
     /// Nothing is running: no container to enter.
     NoWorkload,
     /// Several unrelated workloads (a pod). Picking one would write into an
@@ -475,6 +820,7 @@ pub enum RootReason {
 impl std::fmt::Display for RootReason {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
+            Self::VmTarget => write!(f, "the request targets the VM's own filesystem"),
             Self::NoWorkload => write!(f, "no running workload container"),
             Self::Ambiguous(n) => write!(f, "{n} running workload containers; cannot choose"),
         }
@@ -516,6 +862,40 @@ impl GuestNs {
             }
         }
     }
+
+    /// The namespace of a container running on persistent overlay
+    /// `workload_id`, whose mounted root is `merged`: its recorded main
+    /// container when that runs there, else any container rooted on it. With
+    /// none running, I/O goes through `merged` directly.
+    pub fn on_overlay(workload_id: &str, merged: &Path) -> Self {
+        match overlay_container(workload_id, merged) {
+            Some(pid) => Self::Container(ContainerNs { pid }),
+            None => Self::Root(RootReason::NoWorkload),
+        }
+    }
+}
+
+/// A running container whose root filesystem is the overlay mounted at
+/// `merged`. A container's root is that very mount, so the two report the
+/// same device and inode; nothing else does.
+#[cfg(target_os = "linux")]
+fn overlay_container(workload_id: &str, merged: &Path) -> Option<u32> {
+    use std::os::unix::fs::MetadataExt;
+    let root = std::fs::metadata(merged).ok()?;
+    let rooted_here = |pid: u32| {
+        std::fs::metadata(format!("/proc/{pid}/root"))
+            .is_ok_and(|m| m.dev() == root.dev() && m.ino() == root.ino())
+    };
+    let main = std::fs::read_to_string(crate::paths::main_container_id_path(workload_id))
+        .ok()
+        .and_then(|cid| crate::crun_container_pid(cid.trim()))
+        .filter(|pid| rooted_here(*pid));
+    main.or_else(|| live_containers().into_iter().find(|pid| rooted_here(*pid)))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn overlay_container(_workload_id: &str, _merged: &Path) -> Option<u32> {
+    None
 }
 
 /// The init PID of the container this machine's guest I/O belongs in.
@@ -802,6 +1182,36 @@ fn parse_ok_reply(reply: &str) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_container_user_is_the_workload_user_its_bundle_records() {
+        let temp = tempfile::tempdir().unwrap();
+        let state_root = temp.path().join("crun");
+        let bundle = temp.path().join("bundle");
+        std::fs::create_dir_all(state_root.join("smolvm-a")).unwrap();
+        std::fs::create_dir_all(state_root.join("smolvm-b")).unwrap();
+        std::fs::create_dir_all(&bundle).unwrap();
+        // The keep-alive init (the container's process) runs as root.
+        std::fs::write(
+            bundle.join("config.json"),
+            serde_json::json!({
+                "process": { "user": { "uid": 0, "gid": 0 } },
+                "annotations": { crate::oci::WORKLOAD_USER_ANNOTATION: "405:100" },
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let status = |pid: u32| {
+            serde_json::json!({ "pid": pid, "bundle": bundle.to_str().unwrap() }).to_string()
+        };
+        std::fs::write(state_root.join("smolvm-a/status"), status(7)).unwrap();
+        std::fs::write(state_root.join("smolvm-b/status"), status(42)).unwrap();
+
+        assert_eq!(container_user(&state_root, 42), Some((405, 100)));
+        // No container with that pid, or no crun state at all.
+        assert_eq!(container_user(&state_root, 9), None);
+        assert_eq!(container_user(&temp.path().join("none"), 42), None);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]

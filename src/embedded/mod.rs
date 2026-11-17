@@ -1,15 +1,16 @@
 //! Language-neutral embedded runtime support for SDK bindings.
 
 pub mod bundle;
-mod control;
+pub(crate) mod control;
 mod exec;
-mod handle;
+pub(crate) mod handle;
+mod inflight;
 mod runtime;
 
 pub use crate::agent::fork::ForkSourcePolicy;
 pub use control::MachineSpec;
 pub use exec::{ExecCancel, ExecOptions};
-pub use runtime::{runtime, EmbeddedRuntime, ResizeSpec, RestoreOptions};
+pub use runtime::{runtime, EmbeddedRuntime, ForkOptions, ResizeSpec, RestoreOptions, StopOptions};
 
 /// Parse the trusted loopback interceptor binding supplied by an SDK caller.
 /// The token is per launch and is never written to a machine record.

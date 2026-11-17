@@ -42,6 +42,23 @@ host.
 A bare `--` is rejected: the stub takes a subcommand first, and the tip it prints does not mention
 `run`. `smolvm pack run` takes `--sidecar <PATH>`, not a positional path.
 
+## A named machine from the artifact
+
+```bash
+smolvm machine create --name my-vm --from my-app.smolmachine
+smolvm machine start --name my-vm            # agent ready in ~150ms (v1.29.0), no image pull
+smolvm machine exec --name my-vm -- pip install x   # fully persistent
+smolvm machine stop --name my-vm
+smolvm machine ls                            # shows my-vm
+```
+
+That gives the artifact the full machine lifecycle: it boots from the payload's pre-extracted
+layers, and package installs and file writes survive `exec` sessions and a stop and start.
+
+The `.smolmachine` manifest also records `host_platform`, the host OS and architecture the stub
+runs on (`darwin/arm64`, distinct from `platform`, the guest's), `created`, an RFC 3339 timestamp of
+the pack, and `smolvm_version`, the release that built it.
+
 ## Assert a value, not a boot
 
 **A pack that lost its rootfs still boots, still prints a guest kernel and still exits zero.** Write
@@ -58,10 +75,7 @@ checkpoint of a machine needed it to have been started `--branchable`, and the e
 not names neither the flag nor the precondition. From v1.20.0 a checkpoint file does not need it;
 a stored checkpoint, `--store`, still does.
 
-Both pack paths boot a helper VM first. `pack create --image` pulls the image in one fixed at
-8192 MiB, which `--mem` does not change: `--mem` is the artifact's. `pack create --from-vm` boots
-an export helper, fixed at 8192 MiB through v1.16.1, when a host that could not seat it failed
-with a bare `agent did not become ready within 30 seconds`. From v1.16.2 it asks for 4096 MiB,
-less on a Linux host with less available, `SMOLVM_EXPORT_HELPER_MEMORY_MIB` sets it, and its
-failure names both. From v1.16.1 the helper reuses the machine's cached image layers instead of
-pulling the image again, and an export finished in 1.2 s here.
+Both pack paths boot a helper VM first. `pack create --image` pulls in one fixed at 8192 MiB, which `--mem` does not
+change (`--mem` is the artifact's). `pack create --from-vm` boots an export helper: 8192 MiB through v1.16.1, and from
+v1.16.2 4096 MiB, less on a Linux host with less available, set by `SMOLVM_EXPORT_HELPER_MEMORY_MIB`. `SKILL.md` step 1
+has the failure messages and the cached-layer reuse.

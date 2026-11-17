@@ -18,6 +18,15 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::token_store;
 
+/// Every manifest type an image pull understands, OCI and Docker. A registry
+/// matches its answer to this list, and `distribution` (the stock self-hosted
+/// registry) given only the OCI types downgrades a Docker-pushed image to the
+/// legacy schema 1 manifest, which has no config and cannot be pulled.
+const IMAGE_MANIFEST_ACCEPT: &str = "application/vnd.oci.image.index.v1+json, \
+     application/vnd.oci.image.manifest.v1+json, \
+     application/vnd.docker.distribution.manifest.list.v2+json, \
+     application/vnd.docker.distribution.manifest.v2+json";
+
 /// Maximum bytes buffered in memory for a manifest / image-index document.
 /// A hostile or MITM'd registry could otherwise stream a multi-GB (or endless)
 /// body that the client buffers entirely BEFORE the digest is checked, OOMing
@@ -720,6 +729,64 @@ impl RegistryClient {
         Ok((resp.bytes_stream(), resumed_at))
     }
 
+    /// Download bytes `start..=end` of a blob.
+    ///
+    /// Returns `None` when the registry ignored the range and answered with the
+    /// whole blob (200), so the caller can fall back to one stream instead of
+    /// reading gigabytes it did not ask for. A 206 whose `Content-Range` starts
+    /// anywhere but `start`, or whose body is not exactly the requested length,
+    /// is an error: writing it at `start` would corrupt the file.
+    pub async fn pull_blob_range(
+        &self,
+        repo: &str,
+        digest: &str,
+        start: u64,
+        end: u64,
+    ) -> Result<Option<bytes::Bytes>> {
+        validate_digest(digest)?;
+        let url = format!("{}/v2/{}/blobs/{}", self.base_url, repo, digest);
+        let req = self
+            .request(reqwest::Method::GET, &url)
+            .header(RANGE, format!("bytes={start}-{end}"));
+        let resp = self.send_replayable(req).await?;
+
+        if resp.status() == reqwest::StatusCode::NOT_FOUND {
+            return Err(RegistryError::BlobNotFound(digest.to_string()));
+        }
+        if resp.status() == reqwest::StatusCode::OK {
+            return Ok(None);
+        }
+        if resp.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+            return Err(RegistryError::ApiError {
+                status: resp.status().as_u16(),
+                body: resp.text().await.unwrap_or_default(),
+            });
+        }
+
+        let served_start = resp
+            .headers()
+            .get(CONTENT_RANGE)
+            .and_then(|v| v.to_str().ok())
+            .and_then(|v| v.strip_prefix("bytes "))
+            .and_then(|v| v.split('-').next())
+            .and_then(|v| v.parse::<u64>().ok());
+        if served_start != Some(start) {
+            return Err(RegistryError::ApiError {
+                status: 206,
+                body: format!("asked for bytes from {start}, registry served {served_start:?}"),
+            });
+        }
+        let body = resp.bytes().await?;
+        if body.len() as u64 != end - start + 1 {
+            return Err(RegistryError::DownloadStalled {
+                digest: digest.to_string(),
+                received: body.len() as u64,
+                total: end - start + 1,
+            });
+        }
+        Ok(Some(body))
+    }
+
     /// Download a blob as a byte stream from the beginning.
     ///
     /// Returns the stream after verifying the response status. The caller is
@@ -831,14 +898,10 @@ impl RegistryClient {
     pub async fn head_manifest_digest(&self, repo: &str, reference: &str) -> Result<String> {
         let url = format!("{}/v2/{}/manifests/{}", self.base_url, repo, reference);
         let resp = self
-            .send_replayable(self.request(reqwest::Method::HEAD, &url).header(
-                ACCEPT,
-                format!(
-                    "{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}, \
-                     application/vnd.docker.distribution.manifest.list.v2+json, \
-                     application/vnd.docker.distribution.manifest.v2+json"
-                ),
-            ))
+            .send_replayable(
+                self.request(reqwest::Method::HEAD, &url)
+                    .header(ACCEPT, IMAGE_MANIFEST_ACCEPT),
+            )
             .await?;
         if resp.status() == reqwest::StatusCode::NOT_FOUND {
             return Err(RegistryError::BlobNotFound(format!("{repo}:{reference}")));
@@ -879,9 +942,11 @@ impl RegistryClient {
         let resp = self
             .send_replayable(
                 self.request(reqwest::Method::GET, &url)
-                    // Advertise BOTH so the registry hands back an index as an
-                    // index (not a server-side-selected manifest).
-                    .header(ACCEPT, format!("{INDEX_MEDIA_TYPE}, {MANIFEST_MEDIA_TYPE}")),
+                    // Advertise the index types so the registry hands back an
+                    // index as an index (not a server-side-selected manifest),
+                    // and the Docker types so a Docker-pushed image is not
+                    // downgraded to schema 1.
+                    .header(ACCEPT, IMAGE_MANIFEST_ACCEPT),
             )
             .await?;
 
@@ -2469,6 +2534,54 @@ mod http_tests {
     // digest must be rejected (registry tamper / MITM on index→manifest
     // resolution), mirroring the blob-digest check `pull_blob` performs.
     // -----------------------------------------------------------------------
+    #[tokio::test]
+    async fn a_docker_image_resolves_to_its_schema_2_manifest() {
+        use wiremock::{Request, Respond};
+        // Answers like `distribution`: schema 2 only to a client that accepts
+        // it, the legacy schema 1 (no config) to one that does not.
+        struct Distribution;
+        impl Respond for Distribution {
+            fn respond(&self, req: &Request) -> ResponseTemplate {
+                let accept = req
+                    .headers
+                    .get("accept")
+                    .and_then(|v| v.to_str().ok())
+                    .unwrap_or("");
+                if accept.contains("application/vnd.docker.distribution.manifest.v2+json") {
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "content-type",
+                            "application/vnd.docker.distribution.manifest.v2+json",
+                        )
+                        .set_body_string(
+                            r#"{"schemaVersion":2,"mediaType":"application/vnd.docker.distribution.manifest.v2+json","config":{"mediaType":"application/vnd.docker.container.image.v1+json","digest":"sha256:1111111111111111111111111111111111111111111111111111111111111111","size":1},"layers":[]}"#,
+                        )
+                } else {
+                    ResponseTemplate::new(200)
+                        .insert_header(
+                            "content-type",
+                            "application/vnd.docker.distribution.manifest.v1+prettyjws",
+                        )
+                        .set_body_string(r#"{"schemaVersion":1,"fsLayers":[],"history":[]}"#)
+                }
+            }
+        }
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/acct/app/manifests/dock"))
+            .respond_with(Distribution)
+            .mount(&server)
+            .await;
+        let client = RegistryClient::new(server.uri());
+        let bytes = client
+            .get_manifest_resolved("acct/app", "dock")
+            .await
+            .unwrap();
+        let manifest: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(manifest["schemaVersion"], 2);
+        assert!(manifest["config"]["digest"].is_string());
+    }
+
     #[tokio::test]
     async fn test_manifest_digest_mismatch_rejected() {
         let server = MockServer::start().await;

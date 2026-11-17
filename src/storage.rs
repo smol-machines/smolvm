@@ -1490,31 +1490,22 @@ mod tests {
         file.sync_all().unwrap();
     }
 
-    /// Check if a disk file appears to be a valid ext4 filesystem.
+    /// Whether the image carries an ext2/3/4 superblock: the magic 0xEF53 sits at
+    /// byte 1080 (superblock at 1024, `s_magic` at offset 56). Read directly so the
+    /// check means the same on every machine; the `file` tool is not on every CI
+    /// image, and a missing tool used to make this answer "valid".
     fn disk_appears_valid_ext4(disk_path: &Path) -> bool {
-        let output = std::process::Command::new("file")
-            .arg("-b")
-            .arg(disk_path)
-            .output();
-
-        match output {
-            Ok(output) if output.status.success() => {
-                let desc = String::from_utf8_lossy(&output.stdout);
-                let is_ext4 =
-                    desc.contains("ext4") || desc.contains("ext2") || desc.contains("ext3");
-                if !is_ext4 {
-                    tracing::debug!(
-                        path = %disk_path.display(),
-                        file_type = %desc.trim(),
-                        "disk is not ext4"
-                    );
-                }
-                is_ext4
-            }
-            _ => {
-                tracing::debug!(path = %disk_path.display(), "could not verify disk type, assuming valid");
-                true
-            }
+        use std::io::{Read, Seek, SeekFrom};
+        let Ok(mut f) = std::fs::File::open(disk_path) else {
+            return false;
+        };
+        if f.seek(SeekFrom::Start(1080)).is_err() {
+            return false;
         }
+        let mut magic = [0u8; 2];
+        if f.read_exact(&mut magic).is_err() {
+            return false;
+        }
+        magic == [0x53, 0xEF]
     }
 }

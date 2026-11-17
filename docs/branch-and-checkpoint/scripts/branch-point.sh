@@ -44,11 +44,13 @@ SMOLVM="${SMOLVM:-$(command -v smolvm 2>/dev/null)}"
 [ -n "$SMOLVM" ] || { printf 'smolvm not found; set SMOLVM to its path\n' >&2; exit 2; }
 
 if [ -n "$COUNT" ]; then
-    # Parked means PID 1 of the workload is the helper. pgrep -f is not a test
-    # for it: it matches the sh -c that runs the check, whose text names the helper.
+    # Parked means a process's command line starts with the helper. pgrep -f is
+    # not a test for it: it matches the sh -c that runs the check, whose text
+    # names the helper. From v1.25.4 the workload runs under smolvm's own init
+    # rather than as PID 1, so read every process.
     parked=no
     for i in $(seq 1 120); do
-        if "$SMOLVM" machine exec --name "$FROM" -- sh -c 'tr "\0" " " < /proc/1/cmdline' 2>/dev/null | grep -q '^smolvm-branch-ready'; then
+        if "$SMOLVM" machine exec --name "$FROM" -- sh -c 'for f in /proc/[0-9]*/cmdline; do tr "\0" " " < "$f"; echo; done' 2>/dev/null | grep -q '^smolvm-branch-ready'; then
             parked=yes; printf 'source_parked_after_s=%s\n' "$i"; break
         fi
         sleep 1

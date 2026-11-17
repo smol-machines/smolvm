@@ -5,7 +5,7 @@ description: Installs smolvm from a published release and proves the host can ac
 
 # Installing smolvm and proving it works
 
-Verified on **smolvm v1.23.0** on macOS arm64, 2026-10-04, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means `smolvm --version` prints the release version **and** a throwaway VM has run
+Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means `smolvm --version` prints the release version **and** a throwaway VM has run
 one command and exited. A version number alone proves nothing: on every
 platform here there is at least one way for the install to succeed and every VM start to fail.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
@@ -30,7 +30,7 @@ two that block a fresh host are
 `accel_access=denied` on Linux (your user cannot open `/dev/kvm`) and `socket_path_status=too_long`
 on macOS (the install path is too deep for a VM's Unix socket). Both have a fix in
 `references/traps.md`, and neither announces itself later: the installer warns about KVM and
-continues, and the path limit surfaces as an error about disks.
+continues, and before v1.28.0 the path limit surfaces as an error about disks.
 
 **2. Install from the published release.**
 
@@ -104,40 +104,40 @@ included, so read the plain report first.
 | key | meaning |
 |---|---|
 | `smolvm_installed`, `smolvm_path`, `smolvm_version` | whether the binary is on `PATH`, which one, and what it says; a `note=` when that binary is not under the `HOME` being checked |
-| `verified_version`, `version_status` | `match`, `newer`, `older` or `unknown` against the version this packet was last verified on. `newer` is the expected state on a current host and is not a failure |
+| `verified_version`, `version_status` | `match`, `newer`, `older` or `unknown` against the version this packet was last verified on. `newer` is the expected state on a current host and a warning, not a failure: flags and messages move every release, so check each step's output against the binary |
 | `platform` | `darwin-aarch64`, `linux-aarch64`, `linux-x86_64` |
 | `accel`, `accel_access` | `hvf` and `kern.hv_support`, or `kvm` and whether `/dev/kvm` is readable and writable |
-| `macos_version`, `hardware_verified` | `hardware_verified=no` and `result=blocked` on an Intel Mac: no `darwin-x86_64` archive is published for v1.23.0 |
+| `macos_version`, `hardware_verified` | `hardware_verified=no` and `result=blocked` on an Intel Mac: no `darwin-x86_64` archive is published for v1.29.0 |
 | `socket_path_bytes`, `socket_path_status` | macOS only, and the single most common cause of "macOS is broken" |
 | `unsupported` | features this platform does not have |
 | `result` | `ready`, `not_installed` (the host is fit and smolvm is missing) or `blocked` |
 
-`version_status=newer` is a warning, not a failure. smolvm's flags and messages move every
-release, so on a newer binary check each step's output against the binary before trusting the
-text here.
-
 ## Security defaults, and why they are the defaults
 
-- **The installer is a user-level install and needs no root.** Everything lands under `$HOME`,
-  which is what lets an agent or a CI job install a private copy and remove it without a
-  privileged step. Nothing in this packet escalates privilege.
+- **Run as your own user, the installer is a user-level install and needs no root.** Everything
+  lands under `$HOME`, which is what lets an agent or a CI job install a private copy and remove it
+  without a privileged step. Nothing in this packet escalates privilege. Run as root on Linux
+  without `--prefix`, it installs system-wide instead: the binary and the agent rootfs in
+  `/opt/smolvm`, the launcher in `/usr/local/bin`, no `PATH` line. A `smolvm serve` run as root needs
+  that layout, because it gives each VM its own unprivileged uid and those uids cannot read anything
+  under `/root`.
 - **`sudo usermod -aG kvm` is the one privileged step, and it is yours to run.** Group membership
   on `/dev/kvm` is the host's boundary between users who can start VMs and users who cannot, so a
   script should report `accel_access=denied` and stop rather than widen it for you. `sg kvm -c`
   then applies the group to a single command instead of your whole session.
 - **The uninstaller leaves `~/.config/smolvm` and your `PATH` line on purpose.** Those hold
   registry credentials and a change you made to your own shell profile, so removing them is a
-  separate, deliberate act. `references/layout.md` has both commands.
+  separate, deliberate act. The `teardown` packet's `references/locations.md` has both commands.
 
 ## Platform arms
 
-- **macOS arm64**: verified on v1.23.0. The path-length rule in `references/traps.md` applies to
+- **macOS arm64**: verified on v1.29.0. The path-length rule in `references/traps.md` applies to
   every install.
 - **Linux aarch64**: verified on v1.18.2, and run once on v1.22.2. **Linux x86_64**: verified on
   v1.14.2, and installed on v1.14.6 for the gpu-cuda run. The `kvm` group check applies to every
   fresh host.
 - **Intel Mac**: the installer accepts macOS 11 or later on Intel and then stops at the download,
-  because no `darwin-x86_64` archive is published for v1.23.0; `preflight.sh` says so.
+  because no `darwin-x86_64` archive is published for v1.29.0; `preflight.sh` says so.
 - **Windows x86_64**: `references/windows.md`, **re-run on 2026-10-03 against v1.22.2** on
   Windows 11 Home build 10.0.26200 UBR 9457, where it confirmed. The
   three facts that break a Unix-shaped script are there: the zip unpacks into a nested versioned
@@ -166,6 +166,20 @@ disks and device options.
 **3. "Set up smolvm somewhere throwaway so it does not touch my existing install, then remove
 it."** Install under a scratch `HOME`, then `install.sh --uninstall`; on v1.22.2 it printed
 `success: smolvm has been uninstalled`, and `find "$HOME" -iname '*smolvm*'` was empty afterwards.
+
+## Re-verified on v1.29.0
+
+Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.0.1 arm64, twice, the second time from a fresh `HOME`. Linux was not
+run.
+
+`result=not_installed`, the installer printed `Installing version: 1.29.0` and `Checksum verified`,
+then `version_status=match`, `result=ready`, `guest_kernel=Linux 6.18.55`, `result=boot_ok` and a
+clean cleanup. Eval 2 changed in v1.28.0: in a 53-character `HOME` the preflight still gave
+`socket_path_bytes=107`, `socket_path_status=too_long` and `result=blocked`, and the boot failed
+with `socket path is 107 bytes, over the 103-byte limit for Unix sockets on this host`, naming the
+path, instead of `-22`. Eval 3 repeated: after `--uninstall`, `find` printed nothing. Evals 2 and 3
+ran in the first pass only.
 
 ## Re-verified on v1.23.0
 
@@ -213,8 +227,8 @@ verified on v1.18.2.
   Windows run whose account already held the privilege. The failure it guards against has been
   reported from outside and reproduced by forcing the state, but the unprivileged install itself
   has not been run.
-- **Linux x86_64** was verified for install and boot on v1.14.2, and installed on v1.14.6 for the
-  gpu-cuda run. The scripts here were re-run on macOS arm64 and Linux aarch64 only.
+- **The scripts on Linux x86_64**; that arm was last verified on v1.14.2 (install and boot) and
+  installed on v1.14.6 for the gpu-cuda run.
 
 ## Related packets
 

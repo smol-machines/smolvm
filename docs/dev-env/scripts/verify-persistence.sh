@@ -91,7 +91,7 @@ check package_version "$after" "$before"
 check home_file    "$(exec_in sh -c 'cat "$HOME/keep.txt" 2>/dev/null')" SURVIVES
 check storage_file "$(exec_in cat /storage/keep/disk.txt)" SURVIVES
 
-# /tmp is tmpfs and is wiped by a stop. Anything a provisioning step leaves
+# /tmp is emptied by a stop. Anything a provisioning step leaves
 # there is gone on the next start, while the same step's writes to $HOME or /
 # persist. This is the asymmetry that surprises people.
 check tmp_file "$(exec_in sh -c 'cat /tmp/scratch.txt 2>/dev/null || echo WIPED')" WIPED

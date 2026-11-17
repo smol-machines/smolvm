@@ -165,3 +165,12 @@ so the stripping is harmless and tells you nothing about a library problem.
   `HOME`'s smolvm state, or whose executable is under the install prefix, so another session's VM
   is left alone. On macOS it scopes by the executable path under the prefix and the parent chain
   over `ps -axo pid=,ppid=,command=`.
+
+## Corrections
+
+- **2026-10-15, v1.29.0 run.** From v1.28.0 an agent socket path of 104 bytes or more fails with a
+  message that names it, such as `socket path is 107 bytes, over the 103-byte limit for Unix
+  sockets on this host` (#1770), instead of `krun_start_enter returned: -22`. At 102 and 103 bytes
+  it still fails as `-22`, measured on v1.29.0, most likely because `control.sock` in the same
+  directory is two bytes longer and is not checked. Keep `agent.sock` at 101 bytes or less; the
+  preflight's `socket_path_status` check is unchanged.
