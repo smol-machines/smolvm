@@ -135,11 +135,14 @@ pub fn build_create_spec(
     use smolvm::machine_spec::CreateSpec;
     let cidrs_to_option = |v: Vec<String>| if v.is_empty() { None } else { Some(v) };
     let env_pairs = |env: Vec<String>| -> Vec<(String, String)> {
-        smolvm::util::parse_env_list(
+        let pairs = smolvm::util::parse_env_list(
             &env.into_iter()
                 .map(|e| e.trim().to_string())
                 .collect::<Vec<_>>(),
-        )
+        );
+        let mut deduped: Vec<(String, String)> = Vec::new();
+        smolvm::util::layer_env(&mut deduped, pairs);
+        deduped
     };
 
     let Some(path) = smolfile_path else {
@@ -994,7 +997,7 @@ init = ["echo init"]
         // each one it gives.
         use crate::cli::pack_run::resolve_packed_launch;
         let no_secrets = std::collections::BTreeMap::new();
-        let launch = resolve_packed_launch(&manifest, &[], &[], &no_secrets, None, None).unwrap();
+        let launch = resolve_packed_launch(&manifest, &[], &[], &[], &no_secrets, None, None).unwrap();
         assert_eq!(launch.command, vec!["/bin/sh", "-c", "sleep infinity"]);
         assert!(launch
             .env
@@ -1005,6 +1008,7 @@ init = ["echo init"]
             &manifest,
             &["id".to_string()],
             &["GREETING=bye".to_string()],
+            &[],
             &no_secrets,
             Some("/tmp".to_string()),
             Some("0".to_string()),

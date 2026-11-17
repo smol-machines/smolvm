@@ -615,6 +615,14 @@ pub struct RunCmd {
     )]
     pub env: Vec<String>,
 
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(
+        long = "env-file",
+        value_name = "PATH",
+        help_heading = "Container"
+    )]
+    pub env_file: Vec<PathBuf>,
+
     /// Target OCI platform for multi-arch images
     #[arg(
         long = "oci-platform",
@@ -1405,6 +1413,14 @@ impl RunCmd {
     pub fn run(mut self) -> smolvm::Result<()> {
         use smolvm::Error;
 
+        let env_file_vars = smolvm::util::load_env_files(&self.env_file)?;
+        let mut file_specs: Vec<String> = env_file_vars
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        file_specs.extend(std::mem::take(&mut self.env));
+        self.env = file_specs;
+
         let host = crate::cli::host_network::HostNetwork::resolve(
             self.use_host_proxy,
             self.trust_host_certs,
@@ -1454,6 +1470,7 @@ impl RunCmd {
                 workdir: self.workdir,
                 user: self.user,
                 env,
+                env_file: vec![],
                 volume: self.volume,
                 allow_system_mounts: self.allow_system_mounts,
                 port: port.into_iter().map(PortMappingSpec::from).collect(),
@@ -1650,6 +1667,7 @@ impl RunCmd {
                     workdir: params.workdir.clone(),
                     user: params.user.clone(),
                     env: params.env.clone(),
+                    env_file: vec![],
                     volume: params.volume.clone(),
                     allow_system_mounts: params.allow_system_mounts,
                     port: params
@@ -1810,6 +1828,7 @@ impl RunCmd {
                 workdir: params.workdir.clone(),
                 user: params.user.clone(),
                 env: params.env.clone(),
+                env_file: vec![],
                 volume: params.volume.clone(),
                 allow_system_mounts: params.allow_system_mounts,
                 port: params
@@ -4197,6 +4216,93 @@ mod tests {
         assert!(cold.exists(), "a touched (recently-used) entry survives");
         assert!(!mid.exists(), "the least-recently-used entry is evicted");
     }
+
+    #[test]
+    fn parses_env_file_flags_and_merges_in_order() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env_path = temp_dir.path().join("test.env");
+        std::fs::write(&env_path, "FROM_FILE=1\nOVERRIDDEN=from_file\n").unwrap();
+
+        let cli = TestMachineCli::parse_from([
+            "machine",
+            "run",
+            "--env-file",
+            env_path.to_str().unwrap(),
+            "-e",
+            "OVERRIDDEN=from_cli",
+            "-e",
+            "DIRECT=2",
+            "--image",
+            "alpine",
+        ]);
+        let MachineCmd::Run(cmd) = cli.command else {
+            panic!("expected machine run");
+        };
+        assert_eq!(cmd.env_file, vec![env_path.clone()]);
+        assert_eq!(cmd.env, vec!["OVERRIDDEN=from_cli", "DIRECT=2"]);
+
+        // Create command
+        let cli_create = TestMachineCli::parse_from([
+            "machine",
+            "create",
+            "--name",
+            "test-create-vm",
+            "--env-file",
+            env_path.to_str().unwrap(),
+            "-e",
+            "OVERRIDDEN=from_cli",
+        ]);
+        let MachineCmd::Create(create_cmd) = cli_create.command else {
+            panic!("expected machine create");
+        };
+        assert_eq!(create_cmd.env_file, vec![env_path.clone()]);
+        assert_eq!(create_cmd.env, vec!["OVERRIDDEN=from_cli"]);
+
+        let (_, spec, _) = create_cmd.create_spec().unwrap();
+        let spec_map: std::collections::BTreeMap<_, _> = spec.env.into_iter().collect();
+        assert_eq!(spec_map.get("FROM_FILE").map(String::as_str), Some("1"));
+        assert_eq!(
+            spec_map.get("OVERRIDDEN").map(String::as_str),
+            Some("from_cli")
+        );
+
+        // Exec command
+        let cli_exec = TestMachineCli::parse_from([
+            "machine",
+            "exec",
+            "--name",
+            "test-vm",
+            "--env-file",
+            env_path.to_str().unwrap(),
+            "-e",
+            "EXEC_VAR=val",
+            "--",
+            "echo",
+            "hi",
+        ]);
+        let MachineCmd::Exec(exec_cmd) = cli_exec.command else {
+            panic!("expected machine exec");
+        };
+        assert_eq!(exec_cmd.env_file, vec![env_path.clone()]);
+        assert_eq!(exec_cmd.env, vec!["EXEC_VAR=val"]);
+
+        // Update command
+        let cli_update = TestMachineCli::parse_from([
+            "machine",
+            "update",
+            "--name",
+            "test-vm",
+            "--env-file",
+            env_path.to_str().unwrap(),
+            "-e",
+            "UPDATE_VAR=val",
+        ]);
+        let MachineCmd::Update(update_cmd) = cli_update.command else {
+            panic!("expected machine update");
+        };
+        assert_eq!(update_cmd.env_file, vec![env_path]);
+        assert_eq!(update_cmd.env, vec!["UPDATE_VAR=val"]);
+    }
 }
 
 // ============================================================================
@@ -4251,6 +4357,10 @@ pub struct ExecCmd {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_file: Vec<PathBuf>,
+
     /// Inject a secret from a host env var (GUEST_VAR=HOST_VAR) for this exec,
     /// resolved on the host. The value never persists to the record.
     #[arg(long = "secret-env", value_name = "GUEST_VAR=HOST_VAR")]
@@ -4304,7 +4414,9 @@ impl ExecCmd {
         // AgentManager::Drop which calls stop() and kills the VM.
         manager.detach();
 
-        let env = parse_env_list(&self.env);
+        let env_file_vars = smolvm::util::load_env_files(&self.env_file)?;
+        let mut env = env_file_vars;
+        smolvm::util::layer_env(&mut env, parse_env_list(&self.env));
 
         // Load machine record for workdir and image info
         let name = self.name.clone().unwrap_or_else(|| "default".to_string());
@@ -4573,6 +4685,7 @@ impl ShellCmd {
             workdir: None,
             user: None,
             env: vec![],
+            env_file: vec![],
             secret_env: vec![],
             secret_file: vec![],
             secret_keychain: vec![],
@@ -4868,6 +4981,10 @@ pub struct CreateCmd {
     /// Set environment variable (can be used multiple times)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
+
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_file: Vec<PathBuf>,
 
     /// Set working directory inside the machine
     #[arg(short = 'w', long = "workdir", value_name = "DIR")]
@@ -5210,6 +5327,7 @@ impl CreateCmd {
             mount_socket,
             init,
             env,
+            env_file,
             workdir,
             user,
             ssh_agent,
@@ -5231,6 +5349,13 @@ impl CreateCmd {
             at: _,
             command,
         } = self;
+
+        let env_file_vars = smolvm::util::load_env_files(env_file)?;
+        let mut cli_env_specs: Vec<String> = env_file_vars
+            .into_iter()
+            .map(|(k, v)| format!("{k}={v}"))
+            .collect();
+        cli_env_specs.extend(env.clone());
 
         let (cli_allow_cidrs, cli_net, cli_dns_filter_hosts) = resolve_egress_flags(
             allow_cidr.clone(),
@@ -5256,7 +5381,7 @@ impl CreateCmd {
             *dns,
             network_name.clone(),
             init.clone(),
-            env.clone(),
+            cli_env_specs,
             workdir.clone(),
             user.clone(),
             smolfile.clone(),
@@ -6799,6 +6924,10 @@ pub struct UpdateCmd {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     pub env: Vec<String>,
 
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(long = "env-file", value_name = "PATH")]
+    pub env_file: Vec<PathBuf>,
+
     /// Remove environment variable by key
     #[arg(long, value_name = "KEY")]
     pub remove_env: Vec<String>,
@@ -6983,6 +7112,7 @@ impl UpdateCmd {
             remove_allow_udp,
             reset_allow_list,
             env,
+            env_file,
             remove_env,
             workdir,
             gpu,
@@ -7020,6 +7150,7 @@ impl UpdateCmd {
             || *no_net
             || *no_egress_interceptor
             || !env.is_empty()
+            || !env_file.is_empty()
             || !remove_env.is_empty()
             || workdir.is_some()
             || *gpu
@@ -7307,6 +7438,7 @@ impl UpdateCmd {
         // Expand physical disk files before the DB write. If expansion fails,
         // no DB changes are made — the record stays consistent.
         let mut changes: Vec<String> = Vec::new();
+        let env_file_vars = smolvm::util::load_env_files(&self.env_file)?;
         if self.storage.is_some() || self.overlay.is_some() {
             let disk_changes =
                 vm_common::expand_disks(&self.name, &record, self.storage, self.overlay)?;
@@ -7503,6 +7635,11 @@ impl UpdateCmd {
             }
 
             // Env vars
+            for (key, val) in &env_file_vars {
+                r.env.retain(|(k, _)| k != key);
+                r.env.push((key.clone(), val.clone()));
+                changes.push(format!("  env: {}={}", key, val));
+            }
             for rm_key in &self.remove_env {
                 let before = r.env.len();
                 r.env.retain(|(k, _)| k != rm_key);

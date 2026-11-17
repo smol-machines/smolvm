@@ -314,6 +314,14 @@ pub struct PackRunCmd {
     )]
     pub env: Vec<String>,
 
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(
+        long = "env-file",
+        value_name = "PATH",
+        help_heading = "Container"
+    )]
+    pub env_file: Vec<PathBuf>,
+
     /// Mount host directory into container (can be used multiple times)
     #[arg(
         short = 'v',
@@ -1222,13 +1230,14 @@ pub(crate) fn resolve_packed_launch(
     manifest: &smolvm_pack::PackManifest,
     cli_command: &[String],
     cli_env: &[String],
+    cli_env_file: &[PathBuf],
     cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
     cli_workdir: Option<String>,
     cli_user: Option<String>,
 ) -> smolvm::Result<PackedLaunch> {
     Ok(PackedLaunch {
         command: build_command(manifest, cli_command),
-        env: build_env(manifest, cli_env, cli_secret_refs)?,
+        env: build_env(manifest, cli_env, cli_env_file, cli_secret_refs)?,
         workdir: cli_workdir.or_else(|| manifest.workdir.clone()),
         user: cli_user.or_else(|| manifest.user.clone()),
     })
@@ -1238,6 +1247,7 @@ pub(crate) fn resolve_packed_launch(
 fn build_env(
     manifest: &smolvm_pack::PackManifest,
     cli_env: &[String],
+    cli_env_file: &[PathBuf],
     cli_secret_refs: &std::collections::BTreeMap<String, smolvm::secrets::SecretRef>,
 ) -> smolvm::Result<Vec<(String, String)>> {
     let mut env: Vec<(String, String)> = manifest
@@ -1285,6 +1295,13 @@ fn build_env(
         env.push((key, value));
     }
 
+    // Env file overrides manifest and secrets
+    let env_file_vars = smolvm::util::load_env_files(cli_env_file)?;
+    for (key, value) in env_file_vars {
+        env.retain(|(k, _)| k != &key);
+        env.push((key, value));
+    }
+
     // CLI env overrides manifest env and resolved secrets
     for spec in cli_env {
         if let Some((key, value)) = parse_env_spec(spec) {
@@ -1316,6 +1333,7 @@ fn execute_command(
         manifest,
         &args.command,
         &args.env,
+        &args.env_file,
         &args.secret_refs,
         args.workdir.clone(),
         args.user.clone(),
@@ -1501,6 +1519,10 @@ struct PackedRunArgs {
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
 
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Vec<PathBuf>,
+
     /// Mount a volume (HOST:GUEST[:ro|rw|staged])
     #[arg(short = 'v', long = "volume", value_name = "HOST:GUEST[:ro|rw|staged]")]
     volume: Vec<String>,
@@ -1652,6 +1674,10 @@ struct PackedExecArgs {
     /// Set environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
     env: Vec<String>,
+
+    /// Read environment variables from a file (can be used multiple times)
+    #[arg(long = "env-file", value_name = "PATH")]
+    env_file: Vec<PathBuf>,
     // Note: -v/--volume is intentionally absent from exec. Virtiofs devices
     // are fixed at VM boot time, so mounts must be specified on `start`.
 }
@@ -1764,6 +1790,7 @@ fn run_ephemeral(
                 workdir: args.workdir,
                 user: args.user,
                 env: args.env,
+                env_file: args.env_file,
                 volume: args.volume,
                 allow_system_mounts: args.allow_system_mounts,
                 port: args.port,
@@ -2101,6 +2128,7 @@ fn run_from_cache(
             manifest,
             &args.command,
             &args.env,
+            &args.env_file,
             &std::collections::BTreeMap::new(),
             args.workdir,
             args.user,
@@ -2602,6 +2630,7 @@ fn daemon_exec(
             manifest,
             &args.command,
             &args.env,
+            &args.env_file,
             &std::collections::BTreeMap::new(),
             args.workdir,
             args.user,
@@ -2746,7 +2775,7 @@ mod tests {
         let mut cli_secret_refs: BTreeMap<String, smolvm::secrets::SecretRef> = BTreeMap::new();
         cli_secret_refs.insert("KEK".to_string(), smolvm::secrets::env_ref(src));
 
-        let env = build_env(&manifest, &[], &cli_secret_refs).expect("build_env");
+        let env = build_env(&manifest, &[], &[], &cli_secret_refs).expect("build_env");
         let kek: Vec<&String> = env
             .iter()
             .filter(|(k, _)| k == "KEK")
@@ -2762,6 +2791,7 @@ mod tests {
         let env2 = build_env(
             &manifest,
             &["KEK=from-cli-env".to_string()],
+            &[],
             &cli_secret_refs,
         )
         .expect("build_env");
@@ -2777,6 +2807,38 @@ mod tests {
         );
 
         std::env::remove_var(src);
+    }
+
+    #[test]
+    fn env_file_overrides_manifest_and_is_overridden_by_cli_env() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let env_file = temp_dir.path().join("vars.env");
+        std::fs::write(&env_file, "FROM_FILE=file_val\nOVERRIDDEN=file_val\n").unwrap();
+
+        let mut manifest = smolvm_pack::PackManifest::new(
+            String::new(),
+            String::new(),
+            String::new(),
+            String::new(),
+        );
+        manifest.env = vec![
+            "OVERRIDDEN=manifest_val".to_string(),
+            "BASE=base_val".to_string(),
+        ];
+
+        let no_secrets = std::collections::BTreeMap::new();
+        let env = build_env(
+            &manifest,
+            &["OVERRIDDEN=cli_val".to_string()],
+            &[env_file],
+            &no_secrets,
+        )
+        .expect("build_env");
+
+        let map: std::collections::BTreeMap<_, _> = env.into_iter().collect();
+        assert_eq!(map.get("BASE").map(String::as_str), Some("base_val"));
+        assert_eq!(map.get("FROM_FILE").map(String::as_str), Some("file_val"));
+        assert_eq!(map.get("OVERRIDDEN").map(String::as_str), Some("cli_val"));
     }
 
     #[test]

@@ -125,6 +125,124 @@ pub fn parse_env_list(env_args: &[String]) -> Vec<(String, String)> {
     env_args.iter().filter_map(|e| parse_env_spec(e)).collect()
 }
 
+fn unescape_double_quotes(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut chars = s.chars();
+    while let Some(c) = chars.next() {
+        if c == '\\' {
+            match chars.next() {
+                Some('n') => out.push('\n'),
+                Some('r') => out.push('\r'),
+                Some('t') => out.push('\t'),
+                Some('\\') => out.push('\\'),
+                Some('"') => out.push('"'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn strip_inline_comment(s: &str) -> &str {
+    let bytes = s.as_bytes();
+    for (i, &b) in bytes.iter().enumerate() {
+        if b == b'#' && i > 0 && (bytes[i - 1] == b' ' || bytes[i - 1] == b'\t') {
+            return s[..i].trim_end();
+        }
+    }
+    s.trim_end()
+}
+
+/// Parse the contents of an environment file into `(key, value)` pairs.
+///
+/// Follows standard dotenv conventions (Docker / 12-factor):
+/// - Blank lines and comment lines (starting with `#`) are ignored.
+/// - An optional leading `export ` prefix is stripped (e.g. `export KEY=VALUE`).
+/// - Splits on the first `=`:
+///   - `KEY=VALUE`: `KEY` is trimmed of whitespace.
+///     - Single-quoted values (`'...'`): contents are taken literally.
+///     - Double-quoted values (`"..."`): unescapes `\n`, `\r`, `\t`, `\\`, and `\"`.
+///     - Unquoted values: whitespace is trimmed, and trailing unquoted comments
+///       (preceded by whitespace, e.g. `foo # comment`) are stripped.
+///   - `KEY` (no `=`): forwards the current value from the host environment
+///     (matching Docker's `--env-file` and [`parse_env_spec`]); skipped if unset.
+/// - Duplicate keys keep the last occurrence.
+pub fn parse_env_file_contents(contents: &str) -> Vec<(String, String)> {
+    let mut pairs: Vec<(String, String)> = Vec::new();
+
+    for raw_line in contents.lines() {
+        let line = raw_line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        let line = line.strip_prefix("export ").unwrap_or(line).trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+
+        if let Some((raw_key, raw_val)) = line.split_once('=') {
+            let key = raw_key.trim();
+            if key.is_empty() {
+                continue;
+            }
+            let val = raw_val.trim();
+            let value = if val.starts_with('"') && val.ends_with('"') && val.len() >= 2 {
+                unescape_double_quotes(&val[1..val.len() - 1])
+            } else if val.starts_with('\'') && val.ends_with('\'') && val.len() >= 2 {
+                val[1..val.len() - 1].to_string()
+            } else {
+                strip_inline_comment(val).trim().to_string()
+            };
+
+            pairs.retain(|(k, _)| k != key);
+            pairs.push((key.to_string(), value));
+        } else {
+            // Key-only form: resolve from host environment
+            let key = line.trim();
+            if !key.is_empty() {
+                if let Ok(host_val) = std::env::var(key) {
+                    pairs.retain(|(k, _)| k != key);
+                    pairs.push((key.to_string(), host_val));
+                }
+            }
+        }
+    }
+
+    pairs
+}
+
+/// Read and parse an environment file at `path`.
+pub fn parse_env_file(path: impl AsRef<std::path::Path>) -> crate::Result<Vec<(String, String)>> {
+    let path = path.as_ref();
+    let contents = std::fs::read_to_string(path).map_err(|e| {
+        crate::Error::config(
+            "--env-file",
+            format!("failed to read '{}': {e}", path.display()),
+        )
+    })?;
+    Ok(parse_env_file_contents(&contents))
+}
+
+/// Read and merge multiple environment files in order.
+/// Later files override earlier files for matching keys.
+pub fn load_env_files(
+    paths: &[impl AsRef<std::path::Path>],
+) -> crate::Result<Vec<(String, String)>> {
+    let mut merged: Vec<(String, String)> = Vec::new();
+    for path in paths {
+        let entries = parse_env_file(path)?;
+        layer_env(&mut merged, entries);
+    }
+    Ok(merged)
+}
+
 /// Enable best-effort CUDA graphs in a parsed workload environment.
 ///
 /// Existing values are replaced so an explicit auto-graph request has one
@@ -405,5 +523,89 @@ mod layer_env_tests {
                 ("C".to_string(), "4".to_string()),
             ]
         );
+    }
+}
+
+#[cfg(test)]
+mod env_file_tests {
+    use super::*;
+
+    #[test]
+    fn parses_dotenv_contents_with_quotes_comments_and_exports() {
+        let text = r#"
+# Comment line
+FOO=bar
+export BAZ=qux
+EMPTY=
+SPACED = hello world 
+SINGLE='literal $VAR # not comment'
+DOUBLE="quoted with \"quotes\", \n newline and \t tab"
+INLINE_COMMENT=normal_value # this is stripped
+URL=https://example.com/page#anchor
+export OVERRIDE=initial
+OVERRIDE=final
+"#;
+        let parsed = parse_env_file_contents(text);
+        let map: std::collections::BTreeMap<_, _> = parsed.into_iter().collect();
+
+        assert_eq!(map.get("FOO").map(String::as_str), Some("bar"));
+        assert_eq!(map.get("BAZ").map(String::as_str), Some("qux"));
+        assert_eq!(map.get("EMPTY").map(String::as_str), Some(""));
+        assert_eq!(map.get("SPACED").map(String::as_str), Some("hello world"));
+        assert_eq!(
+            map.get("SINGLE").map(String::as_str),
+            Some("literal $VAR # not comment")
+        );
+        assert_eq!(
+            map.get("DOUBLE").map(String::as_str),
+            Some("quoted with \"quotes\", \n newline and \t tab")
+        );
+        assert_eq!(
+            map.get("INLINE_COMMENT").map(String::as_str),
+            Some("normal_value")
+        );
+        assert_eq!(
+            map.get("URL").map(String::as_str),
+            Some("https://example.com/page#anchor")
+        );
+        assert_eq!(map.get("OVERRIDE").map(String::as_str), Some("final"));
+    }
+
+    #[test]
+    fn forwards_bare_keys_from_host_environment() {
+        let key = "SMOLVM_TEST_DOTENV_KEY";
+        std::env::set_var(key, "host_secret");
+        let text = format!("{key}\nUNSET_HOST_VAR_XYZ\nOTHER=123");
+        let parsed = parse_env_file_contents(&text);
+        std::env::remove_var(key);
+
+        let map: std::collections::BTreeMap<_, _> = parsed.into_iter().collect();
+        assert_eq!(map.get(key).map(String::as_str), Some("host_secret"));
+        assert_eq!(map.get("UNSET_HOST_VAR_XYZ"), None);
+        assert_eq!(map.get("OTHER").map(String::as_str), Some("123"));
+    }
+
+    #[test]
+    fn load_env_files_merges_in_order() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let file1 = temp_dir.path().join("base.env");
+        let file2 = temp_dir.path().join("override.env");
+
+        std::fs::write(&file1, "A=1\nB=2\n").unwrap();
+        std::fs::write(&file2, "B=override\nC=3\n").unwrap();
+
+        let merged = load_env_files(&[&file1, &file2]).unwrap();
+        assert_eq!(
+            merged,
+            vec![
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "override".to_string()),
+                ("C".to_string(), "3".to_string()),
+            ]
+        );
+
+        // Missing file returns an error
+        let missing = temp_dir.path().join("missing.env");
+        assert!(load_env_files(&[&file1, &missing]).is_err());
     }
 }
