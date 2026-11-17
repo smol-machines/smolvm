@@ -1421,14 +1421,12 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
                 // A machine on a container switch boots with its primary
                 // network's address; the engine adds the others once it runs.
-                #[cfg(unix)]
                 let switch_endpoint = resources.switch.as_ref().map(|attachment| {
                     smolvm_network::switch::SwitchEndpoint {
                         dir: attachment.dir.clone(),
                         id: attachment.endpoint.clone(),
                     }
                 });
-                #[cfg(unix)]
                 if let Some((primary, ip)) = switch_endpoint.as_ref().and_then(|endpoint| {
                     endpoint
                         .read_members()
@@ -1602,7 +1600,6 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                                         ports,
                                         egress,
                                         fabric_lease,
-                                        #[cfg(unix)]
                                         switch_endpoint,
                                     )
                                 }) {
@@ -1708,12 +1705,13 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     let spawn = std::thread::Builder::new()
                         .name("smolvm-net-accept".into())
                         .spawn(move || match listener.accept() {
-                            Ok((sock, _)) => match smolvm_network::start_virtio_network(
+                            Ok((sock, _)) => match smolvm_network::start_virtio_network_on(
                                 sock,
                                 guest_network,
                                 published_ports,
                                 egress,
                                 fabric_lease,
+                                switch_endpoint,
                             ) {
                                 Ok(runtime) => {
                                     if let Some(path) = egress_path {
@@ -2907,8 +2905,9 @@ pub(crate) fn bind_unix_listener(path: &Path) -> std::io::Result<Socket> {
     // A leftover socket file from a previous run would make bind fail with
     // EADDRINUSE, so clear it first (ignore "not found").
     let _ = std::fs::remove_file(path);
+    let address = krun_socket::SocketPath::new(path)?;
     let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
-    listener.bind(&SockAddr::unix(path)?)?;
+    listener.bind(&SockAddr::unix(address.path())?)?;
     listener.listen(1)?;
     Ok(listener)
 }
@@ -3410,6 +3409,29 @@ pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(windows)]
+    #[test]
+    fn windows_virtio_listener_accepts_deep_state_paths() {
+        use std::io::{Read, Write};
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("machine-state-".repeat(12));
+        std::fs::create_dir(&dir).unwrap();
+        let path = dir.join("agent.net");
+        let listener = super::bind_unix_listener(&path).unwrap();
+        let mut client = crate::platform::uds::UdsStream::connect_timeout(
+            &path,
+            std::time::Duration::from_secs(2),
+        )
+        .unwrap();
+        let (server, _) = listener.accept().unwrap();
+        server
+            .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"frame").unwrap();
+        let mut frame = [0; 5];
+        (&server).read_exact(&mut frame).unwrap();
+        assert_eq!(&frame, b"frame");
+    }
     /// A VM-mode pack has no image layers, so launching its machines must not
     /// treat the empty `layers/` as evicted and re-extract the pack (#1454).
     #[test]

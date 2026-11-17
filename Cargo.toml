@@ -143,6 +143,9 @@ landlock = "0.4"
 # kill/waitpid/dlopen primitives on the Windows host build. IpHelper reads the
 # host's DNS servers (GetNetworkParams), which Windows keeps in place of resolv.conf.
 [target.'cfg(windows)'.dependencies]
+# Older Mio named-pipe completion handling can truncate message-mode reads and
+# free outstanding I/O state (tokio-rs/mio#2014); keep downstream lockfiles safe.
+mio = { version = "1.2.5", default-features = false }
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
     "Win32_System_Threading",
@@ -151,6 +154,8 @@ windows-sys = { version = "0.60", features = [
     "Win32_System_LibraryLoader",
     "Win32_System_Console",
     "Win32_System_IO",
+    "Win32_System_Pipes",
+    "Win32_Security_Authorization",
     "Win32_Storage_FileSystem",
     "Win32_Networking_WinSock",
     "Win32_NetworkManagement_IpHelper",

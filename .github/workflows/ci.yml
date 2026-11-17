@@ -423,9 +423,13 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --lib copy_paths
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p smolvm-network --lib fragment
+          cargo test --lib platform::async_uds::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p smolvm-network --lib maximum_datagrams
+          cargo test --lib platform::named_pipe::tests
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --lib windows_virtio_listener_accepts_deep_state_paths
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p smolvm-network --lib
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
 
   # ==========================================================================

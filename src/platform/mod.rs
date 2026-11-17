@@ -37,7 +37,11 @@
 
 mod traits;
 
+pub mod async_uds;
 pub mod uds;
+
+#[cfg(windows)]
+pub mod named_pipe;
 
 #[cfg(target_os = "macos")]
 pub mod macos;

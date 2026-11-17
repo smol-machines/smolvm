@@ -78,7 +78,6 @@ pub mod publish_bind;
 pub mod netns_tap;
 pub mod queues;
 pub mod stack;
-#[cfg(unix)]
 pub mod switch;
 pub mod tcp_listeners;
 pub mod tcp_reactor;
@@ -647,7 +646,6 @@ pub fn start_virtio_network(
         published_ports,
         egress,
         fabric_lease,
-        #[cfg(unix)]
         None,
     )
 }
@@ -661,7 +659,7 @@ pub fn start_virtio_network_on(
     mut published_ports: BoundPublishedPorts,
     egress: EgressPolicy,
     fabric_lease: Option<fabric::FabricLease>,
-    #[cfg(unix)] switch_endpoint: Option<switch::SwitchEndpoint>,
+    switch_endpoint: Option<switch::SwitchEndpoint>,
 ) -> io::Result<VirtioNetworkRuntime> {
     if guest_network.intercept.is_some_and(|mode| mode.all_tcp()) && fabric_lease.is_some() {
         return Err(io::Error::new(
@@ -685,7 +683,6 @@ pub fn start_virtio_network_on(
         )?),
         None => None,
     };
-    #[cfg(unix)]
     let switch = match switch_endpoint {
         Some(endpoint) => Some(switch::start_switch(
             endpoint,
@@ -735,7 +732,6 @@ pub fn start_virtio_network_on(
         udp_publish,
         egress,
         fabric,
-        #[cfg(unix)]
         switch,
     )?;
 
