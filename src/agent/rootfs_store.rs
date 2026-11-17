@@ -20,7 +20,7 @@
 
 use crate::{Error, Result};
 use std::collections::HashSet;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 /// The store at one root directory.
 pub struct Store {
@@ -216,6 +216,31 @@ impl Store {
         let unpacked = self.staging_dir("unknown", "unpack")?;
         let result = (|| -> Result<String> {
             std::fs::create_dir(&unpacked)?;
+            // Reject paths containing parent traversal components before unpacking.
+            let mut archive = tar::Archive::new(std::fs::File::open(tar)?);
+            for entry in archive
+                .entries()
+                .map_err(|e| Error::agent("read agent rootfs archive", e.to_string()))?
+            {
+                let entry =
+                    entry.map_err(|e| Error::agent("read agent rootfs entry", e.to_string()))?;
+                let path = entry
+                    .path()
+                    .map_err(|e| Error::agent("read agent rootfs path", e.to_string()))?;
+                for component in path.components() {
+                    if let Component::ParentDir = component {
+                        return Err(Error::agent(
+                            "unpack agent rootfs",
+                            format!(
+                                "refusing path '{}' containing parent traversal component",
+                                path.display()
+                            ),
+                        ));
+                    }
+                }
+            }
+            drop(archive);
+
             let mut archive = tar::Archive::new(std::fs::File::open(tar)?);
             archive.set_preserve_permissions(true);
             archive.set_overwrite(true);
@@ -496,5 +521,28 @@ mod tests {
         assert!(store
             .path_for(&format!("sha256:{}", "a".repeat(64)))
             .is_ok());
+    }
+
+    #[test]
+    fn install_tar_rejects_path_traversal() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let tar_path = temp.path().join("traversal.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
+
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Regular);
+        header.set_size(4);
+        header.set_mode(0o644);
+        let path_bytes = b"../../etc/passwd";
+        header.as_mut_bytes()[..path_bytes.len()].copy_from_slice(path_bytes);
+        header.set_cksum();
+        builder.append(&header, &b"pwn\n"[..]).unwrap();
+        builder.finish().unwrap();
+
+        let result = store.install_tar(&tar_path);
+        assert!(result.is_err());
+        let err = result.unwrap_err().to_string();
+        assert!(err.contains("parent traversal component"), "{err}");
     }
 }
