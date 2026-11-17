@@ -421,6 +421,13 @@ jobs:
       - name: Pack unit tests (native NTFS)
         run: cargo test -p smolvm-pack --lib
 
+      - name: Test IPv4 UDP fragmentation and host socket buffers
+        run: |
+          cargo test -p smolvm-network --lib fragment
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p smolvm-network --lib maximum_datagrams
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
   # ==========================================================================
   # Build agent (Linux musl for static binary)
   # ==========================================================================
