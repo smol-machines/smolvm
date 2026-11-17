@@ -59,6 +59,41 @@ pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
 }
 
+/// The error for reaching a paused machine: it has no agent to connect to, and
+/// `machine start` refuses it rather than discard its saved execution, so the
+/// command to name is resume.
+fn paused_machine_error(label: &str, record: &VmRecord) -> Option<smolvm::Error> {
+    record.paused_checkpoint.as_ref()?;
+    Some(smolvm::Error::agent(
+        "connect",
+        format!(
+            "machine '{label}' is paused. Resume it with 'smolvm machine resume --name {label}'; if a resume is already in progress, retry once it finishes."
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod paused_machine_error_tests {
+    use super::paused_machine_error;
+    use smolvm::config::VmRecord;
+
+    #[test]
+    fn a_paused_machine_is_pointed_at_resume_not_start() {
+        let mut record = VmRecord::new("worker".to_string(), 1, 256, vec![], vec![], false);
+        assert!(paused_machine_error("worker", &record).is_none());
+
+        record.paused_checkpoint = Some("saved.smolcheckpoint".into());
+        let message = paused_machine_error("worker", &record)
+            .expect("a paused machine gets its own error")
+            .to_string();
+        assert!(
+            message.contains("smolvm machine resume --name worker"),
+            "{message}"
+        );
+        assert!(!message.contains("machine start"), "{message}");
+    }
+}
+
 /// Ensure a VM is running and return a connected client.
 ///
 /// This is the common pattern used by exec commands in the machine subcommand.
@@ -74,6 +109,16 @@ pub fn ensure_running_and_connect(
     };
 
     if manager.try_connect_existing().is_none() {
+        // A paused machine would otherwise get the start hint below, and
+        // `machine start` refuses it.
+        let paused = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&label).ok().flatten())
+            .and_then(|record| paused_machine_error(&label, &record));
+        if let Some(error) = paused {
+            return Err(error);
+        }
+
         // Distinguish "machine not found" from "machine stopped"
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
@@ -1940,6 +1985,9 @@ fn start_vm_named_with_db(
     // the pre-extracted layers instead of pulling, with no dependency on the
     // original bundle file. Shared with the API and embedded start paths.
     let mut features = smolvm::agent::LaunchFeatures {
+        // `machine start` leaves the VM running after this CLI exits, even
+        // when a wrapper selects its boot executable with SMOLVM_BOOT_BINARY.
+        watch_parent: Some(false),
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
@@ -2404,7 +2452,15 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     cli_recover_if_unreachable("default")?;
 
     eprintln!("Starting machine 'default'...");
-    manager.ensure_running()?;
+    manager.ensure_running_with_full_config(
+        Vec::new(),
+        Vec::new(),
+        smolvm::agent::VmResources::default(),
+        smolvm::agent::LaunchFeatures {
+            watch_parent: Some(false),
+            ..Default::default()
+        },
+    )?;
 
     let mut config = SmolvmConfig::load()?;
     persist_named_running(&mut config, "default", manager.child_pid(), None)?;

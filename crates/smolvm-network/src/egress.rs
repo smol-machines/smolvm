@@ -127,6 +127,14 @@ impl Rules {
             Some(hosts) => dns::hostname_allowed(hostname, hosts),
         }
     }
+
+    /// Whether addresses learned for `name` may be kept. Unlike a DNS query,
+    /// which a list with no hosts lets through, an answer needs a host to match.
+    fn keeps_learned(&self, name: &str) -> bool {
+        self.allowed_hosts
+            .as_deref()
+            .is_some_and(|hosts| dns::hostname_allowed(name, hosts))
+    }
 }
 
 /// An IP learned from an allowed DNS answer.
@@ -531,7 +539,7 @@ impl EgressPolicy {
                 entry
                     .name
                     .as_deref()
-                    .is_none_or(|name| next.hostname_allowed(name))
+                    .is_none_or(|name| next.keeps_learned(name))
             });
         }
         *list.rules.write().unwrap_or_else(|e| e.into_inner()) = next;
@@ -948,7 +956,7 @@ impl EgressPolicy {
     pub fn learn_dns_answer(&self, answer: &[u8]) {
         let name = dns::question_name(answer).and_then(|n| dns::normalize_hostname(&n));
         if let (Some(list), Some(name)) = (&self.inner, name.as_deref()) {
-            if !list.rules().hostname_allowed(name) {
+            if !list.rules().keeps_learned(name) {
                 return;
             }
         }
@@ -1040,6 +1048,36 @@ mod tests {
             .unwrap();
         assert!(!policy.allows(github));
         assert!(policy.allows(pypi));
+    }
+
+    /// A list left with no hosts has no name filter, which passes every name.
+    #[test]
+    fn replacing_the_last_host_revokes_the_addresses_learned_for_it() {
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let github = IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6));
+        policy.learn(Some("api.github.com".into()), &[(github, 300)]);
+        assert!(policy.allows(github));
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        assert!(!policy.allows(github));
+    }
+
+    #[test]
+    fn an_answer_arriving_after_the_last_host_is_removed_is_not_learned() {
+        use crate::dns_cache::tests::{answer, query};
+        let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
+        let late = answer(
+            &query(1, "api.github.com", 1, false),
+            &[(300, [140, 82, 112, 6])],
+        );
+
+        policy
+            .replace_allow_list(&render_live_policy(&["127.0.0.0/8".into()], &[]))
+            .unwrap();
+        policy.learn_dns_answer(&late);
+        assert!(!policy.allows(IpAddr::V4(Ipv4Addr::new(140, 82, 112, 6))));
     }
 
     #[test]
