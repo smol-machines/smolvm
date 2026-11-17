@@ -626,9 +626,9 @@ fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf
         match materialize_template(compressed, &dest) {
             Ok(()) => return Ok(dest),
             Err(e) => {
-                // A partial file would be mistaken for a good template by the
-                // plain-file lookup, so remove it before trying the next root.
-                let _ = fs::remove_file(&dest);
+                // materialize_template owns and removes its private staging
+                // file. Never remove dest here: another VM may have completed
+                // an expansion while this attempt failed.
                 last_err = Some(e);
             }
         }
@@ -647,20 +647,23 @@ fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf
 /// or a full disk cannot leave a truncated template behind for the next run to
 /// treat as valid.
 fn materialize_template(src: &Path, dest: &Path) -> std::io::Result<()> {
-    let tmp = dest.with_extension("partial");
-    let _ = fs::remove_file(&tmp);
-    let result = decompress_sparse(src, &tmp);
-    if result.is_ok() {
-        if let Err(e) = fs::rename(&tmp, dest) {
-            let _ = fs::remove_file(&tmp);
-            return Err(e);
-        }
-        return Ok(());
+    // Several machines can need the same template on first launch. Each owns
+    // a separate staging file, so none can unlink or truncate another's work.
+    // Keep it beside dest so publication is an atomic same-filesystem rename.
+    let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
+    let tmp = tempfile::Builder::new()
+        .prefix(".smolvm-template-")
+        .tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?
+        .into_temp_path();
+    decompress_sparse(src, &tmp)?;
+    // A completed cache entry is immutable. Keep the first publisher's file
+    // instead of replacing it underneath readers or another Windows rename.
+    // Close our file handle before publication as well.
+    match tmp.persist_noclobber(dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists && dest.is_file() => Ok(()),
+        Err(e) => Err(e.error),
     }
-    // Leave nothing behind on failure: a stray scratch file wastes space, and a
-    // renamed partial would be picked up as a valid template by the next run.
-    let _ = fs::remove_file(&tmp);
-    result
 }
 
 /// Stream `src` into `dest`, skipping the zero runs so they stay holes.
@@ -680,6 +683,10 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
 
     let mut decoder = zstd::Decoder::new(File::open(src)?)?;
     let mut buf = vec![0u8; 512 * 1024];
+    // Slice equality uses the platform's bulk comparison instead of branching
+    // on every byte of the multi-GiB zero runs in a disk template. This scratch
+    // buffer is released when first-use expansion finishes.
+    let zeros = vec![0u8; buf.len()];
     let mut offset: u64 = 0;
     loop {
         let mut filled = 0;
@@ -695,7 +702,7 @@ fn decompress_sparse(src: &Path, dest: &Path) -> std::io::Result<()> {
             break;
         }
         let chunk = &buf[..filled];
-        if chunk.iter().any(|&b| b != 0) {
+        if chunk != &zeros[..filled] {
             out.seek(SeekFrom::Start(offset))?;
             out.write_all(chunk)?;
         }
@@ -2711,6 +2718,85 @@ mod template_expand_tests {
         assert_eq!(fs::read(&dest).expect("read"), data);
     }
 
+    #[test]
+    fn expansion_preserves_isolated_bytes_at_chunk_and_partial_tail_boundaries() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("boundaries.ext4.zst");
+        let dest = tmp.path().join("boundaries.ext4");
+        let chunk = 512 * 1024;
+        let mut data = vec![0; 3 * chunk + 17];
+        for offset in [
+            0,
+            chunk - 1,
+            chunk,
+            2 * chunk - 1,
+            3 * chunk,
+            3 * chunk + 16,
+        ] {
+            data[offset] = 0x80;
+        }
+        compress_to(&src, &data);
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        assert_eq!(fs::read(&dest).expect("read"), data);
+    }
+
+    #[test]
+    fn simultaneous_expansions_publish_complete_templates_without_interference() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("concurrent.ext4.zst");
+        let dest = tmp.path().join("concurrent.ext4");
+        let data = template_bytes();
+        compress_to(&src, &data);
+        let barrier = std::sync::Barrier::new(8);
+
+        std::thread::scope(|scope| {
+            let workers: Vec<_> = (0..8)
+                .map(|_| {
+                    scope.spawn(|| {
+                        barrier.wait();
+                        materialize_template(&src, &dest)
+                    })
+                })
+                .collect();
+            for worker in workers {
+                worker.join().expect("worker").expect("materialize");
+            }
+        });
+
+        assert_eq!(fs::read(&dest).expect("read"), data);
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn a_failed_expansion_preserves_an_already_published_template() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("bad.ext4.zst");
+        let dest = tmp.path().join("valid.ext4");
+        fs::write(&src, b"not a zstd archive").unwrap();
+        fs::write(&dest, b"existing template").unwrap();
+
+        assert!(materialize_template(&src, &dest).is_err());
+
+        assert_eq!(fs::read(&dest).unwrap(), b"existing template");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn publication_keeps_the_first_complete_template() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("second.ext4.zst");
+        let dest = tmp.path().join("first.ext4");
+        compress_to(&src, b"second template");
+        fs::write(&dest, b"first template").unwrap();
+
+        materialize_template(&src, &dest).expect("reuse first published template");
+
+        assert_eq!(fs::read(&dest).unwrap(), b"first template");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
     /// The point of the exercise: the hole must not be written out.
     #[cfg(unix)]
     #[test]
@@ -2834,9 +2920,10 @@ mod template_expand_tests {
 
         assert!(materialize_template(&src, &dest).is_err());
         assert!(!dest.exists(), "no template should be left behind");
-        assert!(
-            !dest.with_extension("partial").exists(),
-            "no scratch file should be left behind"
+        assert_eq!(
+            fs::read_dir(tmp.path()).unwrap().count(),
+            1,
+            "only the source archive should remain after failure"
         );
     }
 }
