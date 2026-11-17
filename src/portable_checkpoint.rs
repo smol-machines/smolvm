@@ -1495,7 +1495,7 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
         .staging_dir
         .clone()
         .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
+        .or_else(|| smolvm_paths::cache_dir().map(|cache| cache.join("smolvm")))
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&root)
         .map_err(|error| Error::agent("create checkpoint staging root", error.to_string()))?;
@@ -1515,7 +1515,7 @@ const ABANDONED_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_sec
 pub fn sweep_abandoned_checkpoint_scratch() -> usize {
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(PathBuf::from)
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")));
+        .or_else(|| smolvm_paths::cache_dir().map(|cache| cache.join("smolvm")));
     let mut removed = 0;
     if let Some(root) = root {
         removed += sweep_abandoned_scratch_in(

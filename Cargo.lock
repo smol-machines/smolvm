@@ -1055,7 +1055,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "39cab71617ae0d63f51a36d69f866391735b51691dbda63cf6f96d042b63efeb"
 dependencies = [
  "libc",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -1809,6 +1809,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "junction"
+version = "2.1.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "cde48f36530cbd91b65f050101e6c056d6eb743cea2a8f0f19beef69c6742ff8"
+dependencies = [
+ "scopeguard",
+ "windows-sys 0.61.2",
+]
+
+[[package]]
 name = "konst"
 version = "0.2.20"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1841,6 +1851,17 @@ checksum = "07293a4e297ac234359b510362495713f75ea345d5307140414f20c69ffeb087"
 dependencies = [
  "bitflags 2.13.0",
  "libc",
+]
+
+[[package]]
+name = "krun-socket"
+version = "0.1.0"
+source = "git+https://github.com/smol-machines/libkrun?rev=4d910e78891e657072abf9c5de7c7c9af2b63f08#4d910e78891e657072abf9c5de7c7c9af2b63f08"
+dependencies = [
+ "getrandom 0.3.4",
+ "junction",
+ "tempfile",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2663,7 +2684,7 @@ dependencies = [
  "once_cell",
  "socket2",
  "tracing",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -2958,7 +2979,7 @@ dependencies = [
  "errno",
  "libc",
  "linux-raw-sys 0.12.1",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -3304,7 +3325,6 @@ dependencies = [
  "base64 0.22.1",
  "clap",
  "clap_complete",
- "dirs",
  "flate2",
  "futures-util",
  "getrandom 0.3.4",
@@ -3315,6 +3335,7 @@ dependencies = [
  "hyper-util",
  "imago",
  "ipnet",
+ "krun-socket",
  "landlock",
  "libc",
  "libloading",
@@ -3344,6 +3365,7 @@ dependencies = [
  "smolvm-network",
  "smolvm-oci-layer",
  "smolvm-pack",
+ "smolvm-paths",
  "smolvm-protocol",
  "smolvm-registry",
  "socket2",
@@ -3518,12 +3540,12 @@ name = "smolvm-pack"
 version = "1.35.0"
 dependencies = [
  "crc32fast",
- "dirs",
  "libc",
  "ring",
  "serde",
  "serde_json",
  "sha2",
+ "smolvm-paths",
  "smolvm-protocol",
  "tar",
  "tempfile",
@@ -3531,6 +3553,14 @@ dependencies = [
  "time",
  "windows-sys 0.60.2",
  "zstd",
+]
+
+[[package]]
+name = "smolvm-paths"
+version = "1.35.0"
+dependencies = [
+ "dirs",
+ "tempfile",
 ]
 
 [[package]]
@@ -3548,7 +3578,6 @@ name = "smolvm-registry"
 version = "1.35.0"
 dependencies = [
  "bytes",
- "dirs",
  "filetime",
  "futures-util",
  "hex",
@@ -3560,6 +3589,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "smolvm-pack",
+ "smolvm-paths",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -3740,7 +3770,7 @@ dependencies = [
  "getrandom 0.4.2",
  "once_cell",
  "rustix 1.1.4",
- "windows-sys 0.52.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
@@ -4636,7 +4666,7 @@ version = "0.1.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c2a7b1c03c876122aa43f3020e6c3c3ee5c05081c9a00739faf7503aeba10d22"
 dependencies = [
- "windows-sys 0.48.0",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]
