@@ -244,20 +244,26 @@ fn migrate_legacy_credential_networks(conn: &Connection) -> Result<()> {
         rows.collect::<std::result::Result<_, _>>()
             .db_err("list machines to migrate")
     };
-    if pending(conn)?.is_empty() {
+    // Only a record that reads and still lacks the mark is worth a write:
+    // one this version cannot read is left as it is, and never makes every
+    // open take the write lock for nothing.
+    let unsettled = |rows: Vec<(String, Vec<u8>)>| -> Vec<(String, VmRecord)> {
+        rows.into_iter()
+            .filter_map(|(name, data)| {
+                serde_json::from_slice::<VmRecord>(&data)
+                    .ok()
+                    .filter(|record| !record.bindings_network_settled)
+                    .map(|record| (name, record))
+            })
+            .collect()
+    };
+    if unsettled(pending(conn)?).is_empty() {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .db_err("begin credential network migration")?;
     // Another process may have migrated them meanwhile.
-    for (name, data) in pending(&tx)? {
-        // A record this version cannot read is left exactly as it is.
-        let Ok(mut record) = serde_json::from_slice::<VmRecord>(&data) else {
-            continue;
-        };
-        if record.bindings_network_settled {
-            continue;
-        }
+    for (name, mut record) in unsettled(pending(&tx)?) {
         if record.restore_legacy_credential_network() {
             tracing::info!(machine = %name, "machine whose bindings implied networking keeps its network");
         }
@@ -917,6 +923,23 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
+        self.update_vm_with_durability(
+            name,
+            |record| {
+                f(record);
+                Ok(())
+            },
+            false,
+            false,
+        )
+    }
+
+    /// [`Self::update_vm`] with a change that may refuse: an error from `f`
+    /// writes nothing and is returned.
+    pub fn try_update_vm<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
         self.update_vm_with_durability(name, f, false, false)
     }
 
@@ -925,7 +948,15 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true, false)
+        self.update_vm_with_durability(
+            name,
+            |record| {
+                f(record);
+                Ok(())
+            },
+            true,
+            false,
+        )
     }
 
     /// Commit resumed execution and retire retry keys in the same transaction.
@@ -933,7 +964,15 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true, true)
+        self.update_vm_with_durability(
+            name,
+            |record| {
+                f(record);
+                Ok(())
+            },
+            true,
+            true,
+        )
     }
 
     /// A consumed key can never initiate a second pause after a successful resume.
@@ -989,7 +1028,7 @@ impl SmolvmDb {
         finish_pause: bool,
     ) -> Result<Option<VmRecord>>
     where
-        F: FnOnce(&mut VmRecord),
+        F: FnOnce(&mut VmRecord) -> Result<()>,
     {
         self.with_conn(|conn| {
             if durable {
@@ -1018,7 +1057,8 @@ impl SmolvmDb {
                         let mut record: VmRecord = serde_json::from_slice(&bytes)
                             .db_err(format!("deserialize vm record '{}'", name))?;
                         let before = record.clone();
-                        f(&mut record);
+                        // A refused change rolls the transaction back.
+                        f(&mut record)?;
                         transition = Some((before, record.clone()));
                         if finish_pause {
                             tx.execute(
@@ -2570,6 +2610,55 @@ mod tests {
             .unwrap()
             .remove("bindings_network_settled");
         serde_json::to_vec(&value).unwrap()
+    }
+
+    /// A refused change writes nothing; a record this version cannot read
+    /// is left alone by the migration; every write of bindings marks the
+    /// record settled.
+    #[test]
+    fn refused_updates_and_unreadable_records_write_nothing() {
+        let (dir, db) = temp_db();
+        let record = VmRecord::new("m".into(), 1, 512, vec![], vec![], true);
+        db.insert_vm("m", &record).unwrap();
+        let refused = db.try_update_vm("m", |r| {
+            r.cpus = 9;
+            Err(Error::config("update", "no"))
+        });
+        assert!(refused.is_err());
+        assert_eq!(db.get_vm("m").unwrap().unwrap().cpus, 1);
+
+        let unreadable =
+            br#"{"name":"future","credential_policy":{"credentials":[]},"cpus":"many"}"#;
+        db.with_conn(|conn| {
+            conn.execute(
+                "INSERT INTO vms (name, data) VALUES ('future', ?1)",
+                params![&unreadable[..]],
+            )
+            .db_err("insert")
+        })
+        .unwrap();
+        drop(db);
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let data: Vec<u8> = db
+            .with_conn(|conn| {
+                conn.query_row("SELECT data FROM vms WHERE name = 'future'", [], |row| {
+                    row.get(0)
+                })
+                .db_err("read")
+            })
+            .unwrap();
+        assert_eq!(data, unreadable.to_vec(), "left exactly as it was");
+
+        let mut unmarked = record.clone();
+        unmarked.bindings_network_settled = false;
+        let mut next = unmarked.clone();
+        next.credential_policy = Some(smolvm_protocol::CredentialPolicy {
+            credentials: vec![
+                crate::credentials::parse_credential_flag("gh=GH_TOKEN@github.com").unwrap(),
+            ],
+        });
+        unmarked.take_credential_bindings(&next);
+        assert!(unmarked.bindings_network_settled);
     }
 
     #[test]

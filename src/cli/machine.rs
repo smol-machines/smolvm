@@ -7912,14 +7912,24 @@ impl UpdateCmd {
         } else {
             // What this update leaves must still reach every bound host:
             // `--no-net` beside bindings is refused unless it removes them.
-            let mut staged = record.clone();
+            // Checked under the bindings' lock, against the record as the
+            // write finds it, so bindings set meanwhile count.
+            let _bindings = smolvm::credentials::lock_bindings(&self.name)?;
+            let current = db.get_vm(&self.name)?.ok_or_else(|| {
+                smolvm::Error::config("update", format!("machine '{}' not found", self.name))
+            })?;
+            let mut staged = current.clone();
             apply(&mut staged, egress.as_ref(), &mut Vec::new());
             staged.check_bindings_reachable()?;
             // Expand physical disk files before the DB write. If expansion
             // fails, no DB changes are made — the record stays consistent.
             changes.extend(grow_disks(&record)?);
-            // Single DB transaction: all settings + disk sizes together.
-            db.update_vm(&self.name, |r| apply(r, egress.as_ref(), &mut changes))?;
+            // Single DB transaction: all settings + disk sizes together,
+            // refused whole if the record it finds would strand a binding.
+            db.try_update_vm(&self.name, |r| {
+                apply(r, egress.as_ref(), &mut changes);
+                r.check_bindings_reachable()
+            })?;
         }
 
         if changes.is_empty() {

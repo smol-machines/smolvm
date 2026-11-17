@@ -125,6 +125,18 @@ impl UdsStream {
 
 #[cfg(unix)]
 impl UdsStream {
+    /// The path the process at the other end bound its listening socket to
+    /// (which its accepted connections carry), or `None` for an unnamed one.
+    /// Read from the connected socket itself, so it names what was actually
+    /// reached, whatever links the connect followed.
+    pub fn peer_path(&self) -> io::Result<Option<std::path::PathBuf>> {
+        Ok(self
+            .inner
+            .peer_addr()?
+            .as_pathname()
+            .map(std::path::Path::to_path_buf))
+    }
+
     /// The user id of the process at the other end: the one that was
     /// listening when this stream connected.
     #[cfg(any(target_os = "linux", target_os = "android"))]

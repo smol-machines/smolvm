@@ -805,6 +805,21 @@ fn credentials_query(
     let mut stream =
         crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2))
             .map_err(|e| unreached(e.to_string()))?;
+    // What was reached is read off the connected socket, not the path: a
+    // link swapped in after the check above still cannot route this to a
+    // socket bound anywhere but this machine's own path.
+    #[cfg(unix)]
+    match stream.peer_path() {
+        Ok(Some(bound)) if bound == path => {}
+        Ok(bound) => {
+            return Err(unreached(format!(
+                "{} reached a socket bound at {}, not the machine's own",
+                path.display(),
+                bound.map_or("no path".into(), |b| b.display().to_string())
+            )))
+        }
+        Err(e) => return Err(unreached(e.to_string())),
+    }
     #[cfg(unix)]
     {
         use std::os::unix::fs::MetadataExt;
@@ -835,8 +850,10 @@ fn credentials_query(
 }
 
 /// Whether a process running as `peer` may answer for a machine whose data
-/// directory `owner` owns, asked by a process running as `me`: the machine's
-/// own user, or one at least as trusted as the asker (itself, or root) —
+/// directory `owner` owns, asked by a process running as `me`, once the
+/// socket it serves is known to be bound at the machine's own path (which
+/// only the machine's user and root can bind): the machine's own user, or
+/// one at least as trusted as the asker (itself, or root) —
 /// a boot process run without the per-VM user drop (`SMOLVM_VM_UID_DROP=off`)
 /// keeps the host's user while its directory may still belong to the uid an
 /// earlier boot dropped to. Any other user is another machine's.
@@ -6284,6 +6301,44 @@ mod tests {
         );
         assert!(refused.changed_nothing());
         assert!(!credentials_reply("").unwrap_err().changed_nothing());
+    }
+
+    /// What the host reached is judged by the connected socket: a socket of
+    /// another machine linked in at this machine's path (as a link swapped
+    /// in after the check would) is refused, the machine's own is talked to.
+    #[cfg(unix)]
+    #[test]
+    fn the_credentials_socket_reached_must_be_bound_at_the_machines_path() {
+        use std::io::{Read, Write};
+        let name = format!(
+            "cred-peer-{}",
+            crate::db::SmolvmDb::create_reservation_token()
+        );
+        let dir = vm_data_dir(&name);
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+        // Another machine's socket, on the same filesystem.
+        let other_dir = vm_data_dir(&format!("{name}-other"));
+        std::fs::create_dir_all(&other_dir).unwrap();
+        let other = other_dir.join(crate::credentials::CREDENTIALS_SOCKET);
+        let _other = std::os::unix::net::UnixListener::bind(&other).unwrap();
+        std::fs::hard_link(&other, &ours).unwrap();
+        let refused = credentials_query(&name, "{}").unwrap_err();
+        assert!(refused.changed_nothing());
+        assert!(refused.reason().contains("bound at"), "{refused}");
+
+        std::fs::remove_file(&ours).unwrap();
+        let listener = std::os::unix::net::UnixListener::bind(&ours).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"ok\n").unwrap();
+        });
+        assert_eq!(credentials_query(&name, "{}").unwrap(), "");
+        server.join().unwrap();
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&other_dir);
     }
 
     /// The process answering a machine's credentials socket must be the

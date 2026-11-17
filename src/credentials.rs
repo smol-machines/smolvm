@@ -317,6 +317,7 @@ impl CredentialLaunch {
                     _owned: None,
                 }),
                 previous: None,
+                replaced: false,
             }),
         });
         Ok((interceptor, live))
@@ -506,6 +507,7 @@ pub fn serve_without_bindings(
             supplied_only: false,
             running: None,
             previous: None,
+            replaced: false,
         }),
     })
     .serve(vm_dir);
@@ -838,14 +840,15 @@ fn set_bindings_with(
             Err(error) => return Err(error),
         }
     }
-    // One write: the other settings and the bindings land together.
-    let saved = match db.update_vm(name, |r| {
+    // One write: the other settings and the bindings land together, or,
+    // when a setting no longer applies to the record the write finds,
+    // neither does.
+    let saved = match db.try_update_vm(name, |r| {
         if let Some(apply) = apply {
-            if let Err(error) = apply(r, &policy) {
-                tracing::warn!(machine = name, %error, "a setting checked a moment ago no longer applies");
-            }
+            apply(r, &policy)?;
         }
-        r.take_credential_bindings(&next)
+        r.take_credential_bindings(&next);
+        Ok(())
     }) {
         Ok(Some(saved)) => saved,
         failed => {
@@ -1432,6 +1435,32 @@ struct LiveState {
     running: Option<Running>,
     /// What the last `bindings` message replaced.
     previous: Option<Previous>,
+    /// Bindings were ever replaced in this process. Until then every value
+    /// can only be meant for the bindings it booted with, so one sent
+    /// without `expect` (by a host from before bindings could change) is
+    /// taken; from then on, never.
+    replaced: bool,
+}
+
+/// What a value was sent for: the variable and placeholder of its binding,
+/// and whether values came from this host. The same rule decides whether a
+/// binding keeps its secret across a change.
+#[derive(Clone, PartialEq, Eq)]
+struct SecretIdentity {
+    environment_variable: String,
+    placeholder: Option<String>,
+    supplied_only: bool,
+}
+
+impl LiveState {
+    /// The secret binding `name` holds now, if it is bound.
+    fn identity_of(&self, name: &str) -> Option<SecretIdentity> {
+        self.policy.binding(name).map(|b| SecretIdentity {
+            environment_variable: b.environment_variable.clone(),
+            placeholder: self.placeholders.get(name).cloned(),
+            supplied_only: self.supplied_only,
+        })
+    }
 }
 
 struct Previous {
@@ -1443,7 +1472,7 @@ struct Previous {
     /// Bindings the replacement kept with their secret.
     kept: Vec<String>,
     /// Values sent after the replacement, with the binding each was sent for.
-    values_since: BTreeMap<String, (Option<CredentialBinding>, zeroize::Zeroizing<String>)>,
+    values_since: BTreeMap<String, (Option<SecretIdentity>, zeroize::Zeroizing<String>)>,
 }
 
 struct Running {
@@ -1520,12 +1549,16 @@ impl LiveCredentials {
             return Err(format!("no credential binding '{unknown}'"));
         }
         // Every value names the binding it was read for, and is refused if
-        // that is no longer the binding of its name: a value without one is
-        // never taken, whoever sends it.
+        // that is no longer the binding of its name. One without it is taken
+        // only while this process still enforces the bindings it booted
+        // with (a host from before bindings could change sends none): then
+        // no change can have come between reading it and sending it.
         let none = BTreeMap::new();
+        let legacy = expect.is_none() && !state.replaced;
         let expect = expect.unwrap_or(&none);
         if let Some(name) = values
             .keys()
+            .filter(|_| !legacy)
             .find(|name| state.policy.binding(name) != expect.get(*name))
         {
             return Err(if expect.contains_key(name) {
@@ -1539,10 +1572,8 @@ impl LiveCredentials {
         }
         // A rollback of the bindings these values were sent for keeps them,
         // for the bindings it restores that take them.
-        let bound: Vec<Option<CredentialBinding>> = values
-            .keys()
-            .map(|name| state.policy.binding(name).cloned())
-            .collect();
+        let bound: Vec<Option<SecretIdentity>> =
+            values.keys().map(|name| state.identity_of(name)).collect();
         if let Some(previous) = state.previous.as_mut() {
             for ((name, value), binding) in values.iter().zip(bound) {
                 previous.values_since.insert(
@@ -1598,6 +1629,7 @@ impl LiveCredentials {
                 values_since: BTreeMap::new(),
             });
             state.supplied_only = message.supplied_only;
+            state.replaced = true;
             return Ok(BindingsReply {
                 ca_pem: String::new(),
             });
@@ -1735,6 +1767,7 @@ impl LiveCredentials {
         state.policy = message.policy;
         state.placeholders = message.placeholders;
         state.supplied_only = supplied_only;
+        state.replaced = true;
         Ok(reply)
     }
 
@@ -1745,10 +1778,17 @@ impl LiveCredentials {
         };
         match previous.resolver {
             Some(mut resolver_state) => {
-                // Values sent since serve the restored bindings that are the
-                // very ones they were sent for.
-                for (name, (binding, value)) in previous.values_since {
-                    if binding.is_some() && previous.policy.binding(&name) == binding.as_ref() {
+                // A value sent since serves a restored binding that has the
+                // same secret it was sent for (variable, placeholder, where
+                // values come from), as a change keeps a secret by: a value
+                // rotated after a hosts-only change replaces the older one.
+                for (name, (identity, value)) in previous.values_since {
+                    let restored = previous.policy.binding(&name).map(|b| SecretIdentity {
+                        environment_variable: b.environment_variable.clone(),
+                        placeholder: previous.placeholders.get(&name).cloned(),
+                        supplied_only: previous.supplied_only,
+                    });
+                    if identity.is_some() && restored == identity {
                         resolver_state.live.insert(name, value);
                     }
                 }
@@ -2110,24 +2150,38 @@ mod tests {
         }
     }
 
-    /// A value is taken only with the binding it was read for: one sent
-    /// without it is refused, so no host can fall back to the shape a boot
-    /// process from before binding changes takes. A message this process
-    /// cannot read is answered as unreadable, never as the old process's
-    /// "malformed request" that a host falls back on.
+    /// A value sent without the binding it was read for (by a host from
+    /// before bindings could change) is taken only while the boot process
+    /// still enforces the bindings it booted with; once they were replaced,
+    /// never. A message this process cannot read is answered as unreadable,
+    /// never as the old process's "malformed request" a host falls back on.
     #[test]
-    fn values_without_their_binding_are_never_taken() {
+    fn values_without_their_binding_are_taken_only_before_any_change() {
         let dir = tempfile::tempdir().unwrap();
         let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
         launch.ensure_ca().unwrap();
         let (_interceptor, live) = launch.spawn_interceptor(BTreeMap::new()).unwrap();
         live.clone().serve(dir.path());
+        assert_eq!(
+            send(dir.path(), r#"{"values":{"gh":"from-an-older-host"}}"#),
+            "ok"
+        );
+        assert_eq!(
+            resolver_of(&live).lock().live["gh"].as_str(),
+            "from-an-older-host"
+        );
+
+        // Replaced (even with the same bindings): `expect` is required now.
+        assert!(send(dir.path(), &bindings_message(&launch)).starts_with("ok"));
         let refused = send(dir.path(), r#"{"values":{"gh":"v"}}"#);
         assert!(
             refused.contains("without the binding it was read for"),
             "{refused}"
         );
-        assert!(resolver_of(&live).lock().live.is_empty());
+        assert_eq!(
+            resolver_of(&live).lock().live["gh"].as_str(),
+            "from-an-older-host"
+        );
         let unreadable = send(dir.path(), r#"{"values":{},"expect":{},"future":1}"#);
         assert!(
             unreadable.starts_with(&format!("error: {UNREADABLE_REQUEST}")),
@@ -2138,6 +2192,56 @@ mod tests {
             send(dir.path(), &values_for(&launch.policy, r#"{"gh":"v"}"#)),
             "ok"
         );
+    }
+
+    /// A value rotated after a hosts-only change has the secret of the
+    /// binding a rollback restores (same variable and placeholder), so the
+    /// rollback keeps it instead of bringing back the older one.
+    #[test]
+    fn a_rollback_keeps_a_value_rotated_after_a_hosts_only_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+        launch.ensure_ca().unwrap();
+        let (_interceptor, live) = launch.spawn_interceptor(BTreeMap::new()).unwrap();
+        live.clone().serve(dir.path());
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&launch.policy, r#"{"gh":"old-revoked"}"#)
+            ),
+            "ok"
+        );
+        let mut rescoped = launch_in(
+            dir.path(),
+            &["gh=GH_TOKEN@github.com,api.github.com"],
+            false,
+        );
+        rescoped.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&rescoped)).starts_with("ok"));
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&rescoped.policy, r#"{"gh":"rotated"}"#)
+            ),
+            "ok"
+        );
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+        assert_eq!(resolver_of(&live).lock().live["gh"].as_str(), "rotated");
+
+        // A value sent for another variable does not serve the restored one.
+        assert!(send(dir.path(), &bindings_message(&rescoped)).starts_with("ok"));
+        let mut renamed = launch_in(dir.path(), &["gh=OTHER_TOKEN@github.com"], false);
+        renamed.placeholders = launch.placeholders.clone();
+        assert!(send(dir.path(), &bindings_message(&renamed)).starts_with("ok"));
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&renamed.policy, r#"{"gh":"for-other"}"#)
+            ),
+            "ok"
+        );
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+        assert_eq!(resolver_of(&live).lock().live["gh"].as_str(), "rotated");
     }
 
     /// New bindings reach a running machine whole: a binding unchanged in
@@ -2596,6 +2700,7 @@ mod tests {
                 supplied_only: false,
                 running: None,
                 previous: None,
+                replaced: false,
             }),
         });
         live.clone().serve(dir);
@@ -3224,6 +3329,46 @@ mod tests {
         )
         .unwrap();
         assert!(saved.network && saved.cpus == 3 && saved.credential_policy.is_some());
+        db.remove_vm(&name).unwrap();
+    }
+
+    /// A setting that applied to the record as the lock found it but no
+    /// longer applies to the record the write finds refuses the write: the
+    /// bindings are not written without it, and the error is reported.
+    #[test]
+    fn a_setting_refused_in_the_write_writes_nothing() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, record) = machine_in(&db, "write-refused", false);
+        let calls = std::sync::atomic::AtomicUsize::new(0);
+        let apply = |r: &mut VmRecord, _: &CredentialPolicy| -> Result<()> {
+            if calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst) > 0 {
+                return Err(Error::config("update", "the allow list changed meanwhile"));
+            }
+            r.cpus = 3;
+            Ok(())
+        };
+        let live = FakeBootProcess::default();
+        let refused = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["gh".to_string()].into()),
+            |_| Ok(bindings_of(&["gh=GH_TOKEN@github.com"])),
+            Some(OtherSettings {
+                apply: &apply,
+                prepare: Box::new(|_| Ok(())),
+            }),
+            &live,
+            |_, _, _| panic!("nothing runs after a refused write"),
+        );
+        let Err(BindingsError::Failed(error)) = refused else {
+            panic!("expected the write to fail, got {refused:?}");
+        };
+        assert!(error.to_string().contains("changed meanwhile"), "{error}");
+        let after = db.get_vm(&name).unwrap().unwrap();
+        assert!(after.credential_policy.is_none());
+        assert_eq!(after.cpus, record.cpus);
         db.remove_vm(&name).unwrap();
     }
 

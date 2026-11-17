@@ -192,6 +192,16 @@ On a running machine the change applies from its next request, with no restart:
   when an API caller or embedder takes the bindings over. A reference no
   binding ever read stays: removing an API caller's binding on a variable the
   operator gave a `--secret-env` only stops withholding it from the guest.
+  The values kept for such hosts are bounded (the oldest of 256 goes first);
+  the hosts themselves stay intercepted for as long as the machine runs.
+- A connection the guest opened before a binding covered its host was relayed
+  untouched, and nothing on it is checked. A change that binds that host
+  resets such a connection before the new bindings take effect, so a value
+  injected on a new connection can never be read back on an old one; the
+  guest reconnects. A connection without a server name is reset by any change
+  that binds a new host. Responses are checked for every value bound to their
+  host when each part of them arrives, so a value bound while a long poll or
+  event stream is open is removed from the rest of it.
 - A host outside the machine's CA widens the CA: it is re-certified with the
   same key, so processes that loaded the earlier certificate keep trusting the
   hosts it covered, and the guest agent installs the wider one in the machine
@@ -202,7 +212,9 @@ A machine that booted without bindings gains them live when it runs on
 virtio-net with outbound access (every networked machine under `serve`, and
 any networked machine with an allow list or published ports): the first
 bindings start the interceptor in its host process, and the guest agent
-installs the CA. A machine without egress (no network device, or published
+installs the CA. Every HTTPS connection the guest opened before the
+interceptor started is reset first, before any connection reaches it, for the
+same reason. A machine without egress (no network device, or published
 ports only) is refused with `400`, as above. A running machine with egress is
 refused with `409`, nothing changed, when:
 

@@ -2111,6 +2111,8 @@ impl VmRecord {
         self.credential_placeholders = next.credential_placeholders.clone();
         self.credentials_supplied_by_api = next.credentials_supplied_by_api;
         self.credential_bindings_unsettled = next.credential_bindings_unsettled;
+        // Written by a version whose bindings never imply networking.
+        self.bindings_network_settled = true;
         self.credential_ca_device = next.credential_ca_device;
         self.credential_ca_trusted = next.credential_ca_trusted.clone();
         self.secret_refs = next.secret_refs.clone();
