@@ -1076,6 +1076,16 @@ pub enum AgentRequest {
         target: Option<WorkloadTarget>,
     },
 
+    /// Read metadata without following the final symlink, in the selected
+    /// filesystem. Returns a [`PathMetadata`] object as the response data.
+    StatPath {
+        /// Absolute guest path; trailing slash/dot retains directory semantics.
+        path: String,
+        /// Filesystem to inspect; absent means infer the active workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
+    },
+
     /// Stream a tar archive of a guest directory without creating a guest-side
     /// temporary file. Used by staged mounts to batch many small files across
     /// vsock instead of paying one virtiofs round trip per file.
@@ -1475,6 +1485,7 @@ impl AgentRequest {
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::StatPath { .. } => "StatPath".into(),
             AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
             AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
@@ -1556,6 +1567,29 @@ pub struct DirectoryEntry {
     /// Size in bytes. Zero for anything that is not a regular file.
     #[serde(default)]
     pub size: u64,
+}
+
+/// Guest filesystem metadata; modes use POSIX permission bits, not host modes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathMetadata {
+    /// `file`, `dir`, `symlink`, or `other` (devices, sockets and FIFOs).
+    pub kind: String,
+    /// Guest lstat size in bytes; a symlink's size describes its target text.
+    pub size: u64,
+    /// POSIX permission and special bits, masked to 07777.
+    pub mode: u32,
+    /// Owner's guest user ID.
+    pub uid: u32,
+    /// Owner's guest group ID.
+    pub gid: u32,
+    /// Modification time in whole seconds since the Unix epoch, rounded down.
+    pub modified_secs: i64,
+    /// Fractional nanoseconds within the modification second, below one billion.
+    pub modified_nanos: u32,
+    /// Literal symlink target; empty for other entry types.
+    pub link_target: String,
+    /// Absolute ultimate target for Docker-style follow-link requests.
+    pub resolved_link_target: String,
 }
 
 /// Agent response types.

@@ -124,6 +124,16 @@ pub fn run_helper() -> i32 {
     let result = match op {
         "read" => helper_read(&path),
         "list" => helper_list(&path),
+        "stat" => {
+            // JSON escapes literal newlines in filenames and error messages.
+            let mut output = std::io::stdout().lock();
+            serde_json::to_writer(
+                &mut output,
+                &crate::file_metadata::response(Path::new(&path)),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|_| output.write_all(b"\n").map_err(|e| e.to_string()))
+        }
         "write" => helper_write(&path, mode, uid, gid),
         "unpack" => helper_unpack(&path),
         "archive" => helper_archive(&path),
@@ -1195,6 +1205,31 @@ impl ContainerNs {
             size,
             reader: reader.take(size),
         })
+    }
+
+    pub(crate) fn stat(&self, path: &str) -> smolvm_protocol::AgentResponse {
+        let result = Command::new(AGENT_BINARY)
+            .args([HELPER_ARG, "stat", &self.pid.to_string(), path])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        match result {
+            Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|e| {
+                    smolvm_protocol::AgentResponse::error(
+                        format!("invalid stat helper response: {e}"),
+                        smolvm_protocol::error_codes::FILE_IO_FAILED,
+                    )
+                }),
+            Ok(output) => smolvm_protocol::AgentResponse::error(
+                format!("stat helper failed: {}", output.status),
+                smolvm_protocol::error_codes::FILE_IO_FAILED,
+            ),
+            Err(error) => smolvm_protocol::AgentResponse::error(
+                format!("start stat helper: {error}"),
+                smolvm_protocol::error_codes::FILE_IO_FAILED,
+            ),
+        }
     }
 
     /// List a directory inside the container.
