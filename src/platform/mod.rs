@@ -37,6 +37,7 @@
 
 mod traits;
 
+pub mod async_uds;
 pub mod uds;
 
 #[cfg(target_os = "macos")]

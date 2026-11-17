@@ -433,6 +433,9 @@ jobs:
       - name: Windows file copy paths
         run: cargo test --lib copy_paths
 
+      - name: Asynchronous Windows agent sockets
+        run: cargo test --lib platform::async_uds::tests
+
       - name: Test IPv4 UDP fragmentation and host socket buffers
         run: |
           cargo test -p smolvm-network --lib fragment

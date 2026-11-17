@@ -8,10 +8,9 @@ use std::sync::{
     Arc,
 };
 
+use crate::platform::async_uds::{self, OwnedReadHalf, OwnedWriteHalf};
 use smolvm_protocol::{AgentRequest, AgentResponse};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
-use tokio::net::UnixStream;
 
 /// Largest response frame accepted from an agent.
 const MAX_FRAME: usize = 64 << 20;
@@ -24,7 +23,7 @@ pub(crate) struct AgentWriter(OwnedWriteHalf, Arc<AtomicBool>);
 
 /// Open a connection to the agent listening on `socket`.
 pub(crate) async fn connect(socket: &Path) -> std::io::Result<(AgentReader, AgentWriter)> {
-    let stream = UnixStream::connect(socket).await?;
+    let stream = async_uds::connect(socket).await?;
     let (r, w) = stream.into_split();
     let binary = Arc::new(AtomicBool::new(false));
     Ok((AgentReader(r, binary.clone()), AgentWriter(w, binary)))
