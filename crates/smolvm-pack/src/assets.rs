@@ -653,10 +653,17 @@ fn materialize_template(src: &Path, dest: &Path) -> std::io::Result<()> {
     let parent = dest.parent().filter(|p| !p.as_os_str().is_empty());
     let tmp = tempfile::Builder::new()
         .prefix(".smolvm-template-")
-        .tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?;
-    decompress_sparse(src, tmp.path())?;
-    tmp.persist(dest).map_err(|e| e.error)?;
-    Ok(())
+        .tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?
+        .into_temp_path();
+    decompress_sparse(src, &tmp)?;
+    // A completed cache entry is immutable. Keep the first publisher's file
+    // instead of replacing it underneath readers or another Windows rename.
+    // Close our file handle before publication as well.
+    match tmp.persist_noclobber(dest) {
+        Ok(()) => Ok(()),
+        Err(e) if e.error.kind() == std::io::ErrorKind::AlreadyExists && dest.is_file() => Ok(()),
+        Err(e) => Err(e.error),
+    }
 }
 
 /// Stream `src` into `dest`, skipping the zero runs so they stay holes.
@@ -2773,6 +2780,20 @@ mod template_expand_tests {
         assert!(materialize_template(&src, &dest).is_err());
 
         assert_eq!(fs::read(&dest).unwrap(), b"existing template");
+        assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    #[test]
+    fn publication_keeps_the_first_complete_template() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("second.ext4.zst");
+        let dest = tmp.path().join("first.ext4");
+        compress_to(&src, b"second template");
+        fs::write(&dest, b"first template").unwrap();
+
+        materialize_template(&src, &dest).expect("reuse first published template");
+
+        assert_eq!(fs::read(&dest).unwrap(), b"first template");
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
     }
 
