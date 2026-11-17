@@ -659,7 +659,7 @@ dependencies = [
  "go-flag",
  "libc",
  "log",
- "mio 1.2.1",
+ "mio 1.2.5",
  "nix 0.31.3",
  "oci-spec",
  "serde",
@@ -1889,9 +1889,9 @@ checksum = "09edd9e8b54e49e587e4f6295a7d29c3ea94d469cb40ab8ca70b288248a81db2"
 
 [[package]]
 name = "libc"
-version = "0.2.186"
+version = "0.2.191"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68ab91017fe16c622486840e4c83c9a37afeff978bd239b5293d61ece587de66"
+checksum = "65cd87c9a6d60536580b316ad985726104730a5151c99845f2490428ef91240a"
 
 [[package]]
 name = "libloading"
@@ -2107,9 +2107,9 @@ dependencies = [
 
 [[package]]
 name = "mio"
-version = "1.2.1"
+version = "1.2.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "02bd0af71c67b473010cbbc60715ee815645a4dc942899111f494b4b737d6fda"
+checksum = "20521a903f02b0a573cd6840e9d0a5a0cc043d361fe924092cd70f8556cc9c4a"
 dependencies = [
  "libc",
  "wasi",
@@ -3341,6 +3341,7 @@ dependencies = [
  "libloading",
  "metrics",
  "metrics-exporter-prometheus",
+ "mio 1.2.5",
  "notify",
  "parking_lot",
  "pkg-config",
@@ -3886,7 +3887,7 @@ checksum = "b52fd3255258d26fac7264ab5a76b53c13367136dc011d3d6ad4f8ed070396a3"
 dependencies = [
  "bytes",
  "libc",
- "mio 1.2.1",
+ "mio 1.2.5",
  "parking_lot",
  "pin-project-lite",
  "signal-hook-registry",

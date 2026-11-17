@@ -436,6 +436,9 @@ jobs:
       - name: Asynchronous Windows agent sockets
         run: cargo test --lib platform::async_uds::tests
 
+      - name: Private Windows API pipes
+        run: cargo test --lib platform::named_pipe::tests
+
       - name: Test IPv4 UDP fragmentation and host socket buffers
         run: |
           cargo test -p smolvm-network --lib fragment
