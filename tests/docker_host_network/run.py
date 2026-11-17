@@ -3,7 +3,7 @@
 # Optional compose selects the plugin installed into the private Docker config.
 # Build guest.rs for the guest architecture with rustc --edition=2021
 # --target <arch>-unknown-linux-musl -C linker=rust-lld -o /path/to/probe.
-# Requires KVM or an HVF-entitled engine and ABI-3 host-network firmware.
+# Requires KVM or an HVF-entitled engine and ABI-4 host-network firmware.
 # Uses only a private engine socket, Docker config, and temporary state directory.
 import hashlib, json, os, pathlib, socket, sqlite3, subprocess, sys, tarfile, tempfile, time, traceback
 
@@ -114,6 +114,9 @@ try:
     d('run','--rm','--network','host',image,'tcp',tcp6)
     d('run','--rm','--network','host',image,'udp',udp6)
     check('IPv6 host TCP and UDP work from host and another container')
+    p=d('run','--rm','--network','host',image,'socket-options',tcp,udp)
+    assert 'SOCKET_OPTIONS_PASS' in p.stdout.decode()
+    check('connected TCP_NODELAY and UDP TTL options round-trip without a guest crash')
     peer4=create('host');d('start',peer4);_,second_udp=ready(peer4)
     d('run','--rm','--network','host',image,'udp-connected',udp,second_udp)
     mapped=lambda value:'[::ffff:'+value.rsplit(':',1)[0]+']:'+value.rsplit(':',1)[1]

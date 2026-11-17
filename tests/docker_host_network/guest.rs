@@ -123,6 +123,29 @@ fn main() {
             }
             println!("UDP_PASS");
         }
+        "socket-options" => {
+            let stream = TcpStream::connect(&args[2]).unwrap();
+            for enabled in [true, false] {
+                stream.set_nodelay(enabled).unwrap();
+                assert_eq!(stream.nodelay().unwrap(), enabled);
+            }
+            let mut stream = stream;
+            stream.write_all(b"PING").unwrap();
+            let mut reply = [0; 4];
+            stream.read_exact(&mut reply).unwrap();
+            assert_eq!(&reply, b"PONG");
+            let socket = UdpSocket::bind("0.0.0.0:0").unwrap();
+            socket.connect(&args[3]).unwrap();
+            socket.set_ttl(37).unwrap();
+            assert_eq!(socket.ttl().unwrap(), 37);
+            socket
+                .set_read_timeout(Some(Duration::from_secs(3)))
+                .unwrap();
+            socket.send(b"PING").unwrap();
+            assert_eq!(socket.recv(&mut reply).unwrap(), 4);
+            assert_eq!(&reply, b"PING");
+            println!("SOCKET_OPTIONS_PASS");
+        }
         "udp-connected" => udp_connected(args[2].parse().unwrap(), args[3].parse().unwrap()),
         "udp-error" => {
             let peer: std::net::SocketAddr = args[2].parse().unwrap();
