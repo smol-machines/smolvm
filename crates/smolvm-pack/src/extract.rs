@@ -1042,6 +1042,9 @@ fn safe_unpack_skipping<R: Read>(
     // directory must keep `user.overlay.opaque=y` rather than being downgraded
     // to the xwhiteouts marker below.
     let mut opaque_dirs: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // Whiteouts affect lower layers, never entries added by this same tar.
+    // Defer their materialization until all ordinary entries are available.
+    let mut whiteouts: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
 
     for entry_result in archive.entries()? {
         let mut entry = entry_result?;
@@ -1145,6 +1148,7 @@ fn safe_unpack_skipping<R: Read>(
                             ),
                         ));
                     }
+                    verify_parent_within_dest(&dir.join(".wh..wh..opq"), &real_dest)?;
                     fs::create_dir_all(&dir)?;
                     opaque_dirs.insert(normalize_path(&dir));
                     set_user_xattr(&dir, OVERLAY_OPAQUE_XATTR, b"y")?;
@@ -1152,6 +1156,12 @@ fn safe_unpack_skipping<R: Read>(
                     continue;
                 }
                 if let Some(victim) = name.strip_prefix(".wh.") {
+                    if matches!(victim, "" | "." | "..") {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::InvalidData,
+                            "whiteout must name a file or directory",
+                        ));
+                    }
                     let target = dest.join(parent_rel).join(victim);
                     if !normalize_path(&target).starts_with(&canonical_dest) {
                         return Err(std::io::Error::new(
@@ -1162,22 +1172,7 @@ fn safe_unpack_skipping<R: Read>(
                             ),
                         ));
                     }
-                    let parent_dir = target
-                        .parent()
-                        .map(Path::to_path_buf)
-                        .unwrap_or_else(|| dest.join(parent_rel));
-                    fs::create_dir_all(&parent_dir)?;
-                    set_mode(&parent_dir, 0o755);
-                    let _ = fs::remove_file(&target);
-                    let _ = fs::remove_dir_all(&target);
-                    File::create(&target)?;
-                    record_override_stat(&target, 0, 0, WHITEOUT_MODE)?;
-                    // An opaque directory already hides every lower entry, so
-                    // its whiteouts are redundant and `y` must win over `x`
-                    // regardless of the order the tar lists them in.
-                    if !opaque_dirs.contains(&normalize_path(&parent_dir)) {
-                        set_user_xattr(&parent_dir, OVERLAY_OPAQUE_XATTR, b"x")?;
-                    }
+                    whiteouts.insert(normalize_path(&target));
                     report.entries += 1;
                     continue;
                 }
@@ -1481,6 +1476,41 @@ fn safe_unpack_skipping<R: Read>(
             std::io::ErrorKind::InvalidData,
             "checkpoint archive is missing required assets",
         ));
+    }
+
+    // A directory recreated in the same layer keeps its new children while
+    // the whiteout hides its old lower-layer contents, irrespective of order.
+    for target in &whiteouts {
+        verify_parent_within_dest(target, &real_dest)?;
+        match fs::symlink_metadata(target) {
+            Ok(metadata) if metadata.is_dir() => {
+                opaque_dirs.insert(target.clone());
+                set_user_xattr(target, OVERLAY_OPAQUE_XATTR, b"y")?;
+            }
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    for target in whiteouts {
+        let parent = target.parent().expect("validated whiteout has a parent");
+        // Opaque ancestors already hide these lower entries. Keeping a fake
+        // whiteout would expose a DT_REG entry in an unmerged readdir, where
+        // the x marker cannot make overlayfs verify its overridden type.
+        if parent.ancestors().any(|dir| opaque_dirs.contains(dir)) {
+            continue;
+        }
+        match fs::symlink_metadata(&target) {
+            Ok(_) => continue, // An ordinary entry in this layer wins.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        verify_parent_within_dest(&target, &real_dest)?;
+        fs::create_dir_all(parent)?;
+        set_mode(parent, 0o755);
+        File::create_new(&target)?;
+        record_override_stat(&target, 0, 0, WHITEOUT_MODE)?;
+        set_user_xattr(parent, OVERLAY_OPAQUE_XATTR, b"x")?;
     }
 
     // Before the directory modes below: setting a directory's xattr needs
@@ -8181,6 +8211,136 @@ mod tests {
         );
     }
 
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn opaque_layers_omit_redundant_whiteouts_and_preserve_same_layer_files() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            eprintln!("SKIP: whiteout extraction requires user xattrs");
+            return;
+        }
+        for reverse in [false, true] {
+            let mut entries = vec![
+                ("opaque/.wh..wh..opq", ""),
+                ("opaque/.wh.gone", ""),
+                ("opaque/.wh.kept", ""),
+                ("opaque/kept", "opaque layer data"),
+                ("opaque/sub/.wh.gone", ""),
+                ("opaque/sub/kept", "nested layer data"),
+                ("plain/.wh.kept", ""),
+                ("plain/kept", "plain layer data"),
+                ("plain/.wh.gone", ""),
+                (".wh.recreated", ""),
+                ("recreated/new", "recreated directory data"),
+            ];
+            if reverse {
+                entries.reverse();
+            }
+            let mut builder = tar::Builder::new(Vec::new());
+            for (path, contents) in entries {
+                let mut header = tar::Header::new_gnu();
+                header.set_entry_type(tar::EntryType::Regular);
+                header.set_mode(0o644);
+                header.set_size(contents.len() as u64);
+                header.set_cksum();
+                builder
+                    .append_data(&mut header, path, contents.as_bytes())
+                    .unwrap();
+            }
+            let bytes = builder.into_inner().unwrap();
+            let dest = root
+                .path()
+                .join(if reverse { "reverse" } else { "forward" });
+            fs::create_dir(&dest).unwrap();
+            safe_unpack_with_policy(
+                &mut tar::Archive::new(bytes.as_slice()),
+                &dest,
+                &SafeUnpackLimits::from_env(),
+                false,
+                true,
+            )
+            .unwrap();
+            assert!(
+                !dest.join("opaque/gone").exists(),
+                "opaque whiteouts leak through readdir"
+            );
+            assert_eq!(
+                fs::read_to_string(dest.join("opaque/kept")).unwrap(),
+                "opaque layer data"
+            );
+            assert_eq!(
+                fs::read_to_string(dest.join("plain/kept")).unwrap(),
+                "plain layer data"
+            );
+            assert!(!dest.join("opaque/sub/gone").exists());
+            assert_eq!(
+                fs::read_to_string(dest.join("opaque/sub/kept")).unwrap(),
+                "nested layer data"
+            );
+            assert_eq!(
+                fs::read_to_string(dest.join("recreated/new")).unwrap(),
+                "recreated directory data"
+            );
+            assert_eq!(
+                read_user_xattr(&dest.join("recreated"), OVERLAY_OPAQUE_XATTR).as_deref(),
+                Some("y")
+            );
+            assert_eq!(
+                read_user_xattr(&dest.join("opaque"), OVERLAY_OPAQUE_XATTR).as_deref(),
+                Some("y")
+            );
+            assert_eq!(
+                read_user_xattr(&dest.join("plain"), OVERLAY_OPAQUE_XATTR).as_deref(),
+                Some("x")
+            );
+            assert_eq!(
+                read_user_xattr(&dest.join("plain/gone"), OVERRIDE_STAT_XATTR).as_deref(),
+                Some("0:0:020000")
+            );
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn translated_whiteouts_reject_symlink_parent_escape() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep"), b"preserved").unwrap();
+        for (index, marker) in [".wh.keep", ".wh..wh..opq"].iter().enumerate() {
+            let dest = root.path().join(format!("layer-{index}"));
+            fs::create_dir(&dest).unwrap();
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_mode(0o777);
+            link.set_size(0);
+            link.set_link_name(&outside).unwrap();
+            link.set_cksum();
+            builder.append_data(&mut link, "escape", &b""[..]).unwrap();
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, format!("escape/{marker}"), &b""[..])
+                .unwrap();
+            let bytes = builder.into_inner().unwrap();
+            let error = safe_unpack_with_policy(
+                &mut tar::Archive::new(bytes.as_slice()),
+                &dest,
+                &SafeUnpackLimits::from_env(),
+                false,
+                true,
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+            assert_eq!(fs::read(outside.join("keep")).unwrap(), b"preserved");
+            assert_eq!(read_user_xattr(&outside, OVERLAY_OPAQUE_XATTR), None);
+        }
+    }
+
     /// Host-side extraction that describes ownership to the guest: every
     /// entry's archived owner and mode land in libkrun's override xattr, the
     /// host copy stays readable, OCI whiteouts become faked 0:0 character
@@ -8337,7 +8497,7 @@ mod tests {
         assert_eq!(fs::metadata(dest.join("bin/gone")).unwrap().len(), 0);
         assert!(!dest.join("bin/.wh.gone").exists());
         assert!(!dest.join("private/.wh..wh..opq").exists());
-        assert_eq!(xattr("private/gone-private").as_deref(), Some("0:0:020000"));
+        assert!(!dest.join("private/gone-private").exists());
         assert_eq!(
             read_user_xattr(&dest.join("private"), OVERLAY_OPAQUE_XATTR).as_deref(),
             Some("y")
