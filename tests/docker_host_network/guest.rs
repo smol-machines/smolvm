@@ -7,7 +7,21 @@ use std::{
     time::Duration,
 };
 unsafe extern "C" {
+    fn setsockopt(fd: i32, level: i32, option: i32, value: *const i32, length: u32) -> i32;
+    fn getsockopt(fd: i32, level: i32, option: i32, value: *mut i32, length: *mut u32) -> i32;
     fn connect(fd: i32, address: *const u8, length: u32) -> i32;
+}
+
+fn tcp_options(stream: &TcpStream) {
+    stream.set_nodelay(true).unwrap();
+    assert!(stream.nodelay().unwrap());
+    for (level, option, value) in [(1, 9, 0), (6, 4, 17), (6, 5, 7), (6, 6, 3), (1, 9, 1)] {
+        assert_eq!(unsafe { setsockopt(stream.as_raw_fd(), level, option, &value, 4) }, 0);
+        let mut actual = 0;
+        let mut length = 4;
+        assert_eq!(unsafe { getsockopt(stream.as_raw_fd(), level, option, &mut actual, &mut length) }, 0);
+        assert_eq!(actual, value);
+    }
 }
 
 fn udp_connected(first: std::net::SocketAddr, second: std::net::SocketAddr) {
@@ -79,6 +93,7 @@ fn main() {
             thread::spawn(move || {
                 for connection in tcp.incoming() {
                     let mut stream = connection.unwrap();
+                    tcp_options(&stream);
                     let mut data = [0; 4];
                     stream.read_exact(&mut data).unwrap();
                     assert_eq!(&data, b"PING");
@@ -125,6 +140,7 @@ fn main() {
         }
         "socket-options" => {
             let stream = TcpStream::connect(&args[2]).unwrap();
+            tcp_options(&stream);
             for enabled in [true, false] {
                 stream.set_nodelay(enabled).unwrap();
                 assert_eq!(stream.nodelay().unwrap(), enabled);
