@@ -80,6 +80,11 @@ pub fn main_container_id_path(workload_id: &str) -> PathBuf {
     overlay_dir(workload_id).join("main_container_id")
 }
 
+/// A created, unstarted OCI container used only for temporary file access.
+pub fn files_container_id_path(workload_id: &str) -> PathBuf {
+    overlay_dir(workload_id).join("files_container_id")
+}
+
 // =============================================================================
 // Filesystem Helpers
 // =============================================================================

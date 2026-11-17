@@ -54,6 +54,7 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
                 .put(super::archive::put_archive),
         )
         .route("/containers/{id}/export", get(super::archive::export))
+        .route("/containers/{id}/smol/files", get(super::files::list))
         .route("/containers/{id}", axum::routing::delete(container_remove))
         .route("/commit", post(container_commit))
         .route("/exec/{id}/start", post(exec_start))

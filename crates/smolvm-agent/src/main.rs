@@ -94,6 +94,7 @@ mod cuda;
 mod dirwatch;
 mod disk_trim;
 mod docker_bridge;
+mod file_metadata;
 mod forkpoint;
 mod io_target;
 #[cfg(target_os = "linux")]
@@ -2377,6 +2378,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut files_session: Option<container::FilesSession> = None;
 
     loop {
         // Read length header
@@ -2437,6 +2439,23 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                     continue;
                 }
             };
+
+        if let Some(session) = files_session.take() {
+            let response = match request {
+                AgentRequest::ContainerEndFiles { overlay_id, id }
+                    if overlay_id == session.overlay_id && id == session.id =>
+                {
+                    session.finish()
+                }
+                _ => AgentResponse::error(
+                    "inspection connection requires its matching end request",
+                    error_codes::INVALID_REQUEST,
+                ),
+            };
+            drop(session);
+            send_response(stream, &response)?;
+            return Ok(());
+        }
 
         // Work around serde flatten + internally-tagged enum limitation:
         // fields with #[serde(default)] can be silently dropped during
@@ -2584,6 +2603,20 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         } = request
         {
             handle_streaming_export_layer(stream, image_digest, layer_index)?;
+            continue;
+        }
+
+        if let AgentRequest::ContainerBeginFiles(spec) = request {
+            let response = match container::FilesSession::begin(*spec) {
+                Ok(session) => {
+                    let response =
+                        AgentResponse::ok_with_data(serde_json::json!({"id": session.id}));
+                    files_session = Some(session);
+                    response
+                }
+                Err(error) => error,
+            };
+            send_response(stream, &response)?;
             continue;
         }
 
@@ -3057,6 +3090,8 @@ fn handle_request(
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
 
+        AgentRequest::StatPath { path, target } => file_metadata::handle(&path, target.as_ref()),
+
         AgentRequest::FileWrite {
             path,
             data,
@@ -3122,6 +3157,19 @@ fn handle_request(
             "ContainerStart is a streaming request",
             error_codes::INVALID_REQUEST,
         ),
+
+        AgentRequest::ContainerPrepareFiles {
+            image,
+            overlay_id,
+            image_source,
+        } => container::handle_prepare_files(&image, &overlay_id, image_source.as_ref()),
+        AgentRequest::ContainerBeginFiles(_) => AgentResponse::error(
+            "inspection requires a held connection",
+            error_codes::INVALID_REQUEST,
+        ),
+        AgentRequest::ContainerEndFiles { overlay_id, id } => {
+            container::handle_end_files(&overlay_id, &id)
+        }
 
         AgentRequest::ContainerSignal {
             overlay_id,
@@ -3203,6 +3251,7 @@ fn apply_mode_best_effort(_path: &std::path::Path, _mode: u32) {}
 #[derive(Clone, Copy, Debug)]
 enum FilePathAccess {
     Read,
+    Metadata,
     Write,
 }
 
@@ -3318,6 +3367,31 @@ fn ensure_descendant_after_canonicalize(
                 return Err(invalid_guest_path_error(
                     original_path,
                     "resolved path escapes allowed root",
+                ));
+            }
+        }
+        FilePathAccess::Metadata => {
+            // Describe the final link without following it, including a dangling
+            // link. Its parent must still resolve within the selected root.
+            let parent = if path == root {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            let parent = parent.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    e.to_string(),
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        error_codes::NOT_FOUND
+                    } else {
+                        error_codes::FILE_IO_FAILED
+                    },
+                )
+            })?;
+            if !parent.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved parent escapes allowed root",
                 ));
             }
         }
@@ -4143,6 +4217,33 @@ fn handle_streaming_archive_directory(
             return Ok(());
         }
     };
+    if let nsfile::GuestNs::Container(namespace) = root.namespace() {
+        let mut archive = match namespace.archive(path) {
+            Ok(archive) => archive,
+            Err(message) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+        send_data_chunks_body(
+            stream,
+            &mut archive,
+            smolvm_protocol::LAYER_CHUNK_SIZE,
+            "failed to read container archive",
+            error_codes::FILE_IO_FAILED,
+        )?;
+        let response = match archive.finish() {
+            Ok(()) => AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+            Err(message) => AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+        };
+        return send_response(stream, &response);
+    }
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a
@@ -5168,7 +5269,9 @@ fn write_exec_process_file(
     spec: &oci::OciProcess,
 ) -> Result<std::path::PathBuf, String> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = std::env::temp_dir().join("smolvm-exec-process");
+    // A caller can bind a read-only directory at /tmp. Keep crun's private
+    // launch files with its runtime state, outside workload mount targets.
+    let dir = std::path::Path::new(paths::CONTAINERS_RUN_DIR).join("exec-process");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
@@ -5186,7 +5289,15 @@ fn write_exec_process_file(
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!("{container_id}-{}-{n}.json", std::process::id()));
     let json = serde_json::to_vec(spec).map_err(|e| format!("encode exec process: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    file.write_all(&json)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
 }
 

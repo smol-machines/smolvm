@@ -1,0 +1,36 @@
+[package]
+name = "tar"
+version = "0.4.46"
+edition = "2021"
+rust-version = "1.63"
+authors = ["Alex Crichton <alex@alexcrichton.com>"]
+license = "MIT OR Apache-2.0"
+description = "Rust TAR reader/writer with length-delimited PAX records"
+repository = "https://github.com/composefs/tar-rs"
+readme = false
+
+# Keep the upstream implementation; the only source patch is src/pax.rs.
+[package.metadata.smol]
+upstream-version = "0.4.46"
+upstream-revision = "fc459c149f83bf4daceaa52e17d351989002e1a9"
+upstream-issue = "https://github.com/composefs/tar-rs/issues/452"
+
+[features]
+default = ["xattr"]
+
+[dependencies]
+filetime = "0.2.8"
+
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"
+xattr = { version = "1.1.3", optional = true }
+
+[dev-dependencies]
+tempfile = "3"
+
+# Preserve upstream source outside pax.rs while accepting its existing lint
+# baseline under the newer compiler used by this workspace.
+[lints.clippy]
+manual_clear = "allow"
+needless_late_init = "allow"
+incompatible_msrv = "allow"

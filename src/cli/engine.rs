@@ -16,6 +16,8 @@ use clap::{Args, Subcommand};
 
 use super::engine_integration as integration;
 
+mod files;
+
 /// `/var/run/docker.sock`, the path tools fall back to when nothing names
 /// another.
 const DEFAULT_SOCKET: &str = "/var/run/docker.sock";
@@ -29,6 +31,8 @@ pub struct EngineCmd {
 
 #[derive(Subcommand, Debug)]
 enum EngineAction {
+    /// Browse a container's filesystem without a shell
+    Files(files::FilesCmd),
     /// Register the on-demand Docker socket and point docker at it
     #[command(hide = true)]
     Start(SocketArg),
@@ -102,6 +106,7 @@ impl EngineCmd {
             root: None,
         }));
         match action {
+            EngineAction::Files(files) => files.run(),
             EngineAction::Supervise { socket, id } => {
                 let config = socket.config()?;
                 let runtime = tokio::runtime::Builder::new_multi_thread()

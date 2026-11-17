@@ -19,6 +19,7 @@ members = [
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
+exclude = ["vendor/tar"]
 resolver = "2"
 
 [package]
@@ -88,7 +89,7 @@ base64 = { workspace = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
-tar = "0.4"
+tar = { path = "vendor/tar", version = "0.4.46" }
 # Inspect and safely rebase qcow2 backing chains in portable checkpoints.
 imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
