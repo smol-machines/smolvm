@@ -303,6 +303,7 @@ pub fn set_egress_policy(
         r.network = updated.network;
         r.allowed_cidrs = updated.allowed_cidrs.clone();
         r.dns_filter_hosts = updated.dns_filter_hosts.clone();
+        r.egress_rules = updated.egress_rules.clone();
     })?;
     Ok(())
 }
@@ -1091,6 +1092,49 @@ mod tests {
         r.state = state;
         r.pid = pid;
         db.insert_vm_if_not_exists(name, &r).unwrap();
+    }
+
+    #[test]
+    fn create_policy_is_validated_before_publication_without_deleting_existing_records() {
+        use crate::data::network::EgressPolicy;
+        use crate::machine_spec::CreateSpec;
+        let db = test_db();
+        let invalid = CreateSpec {
+            egress: Some(EgressPolicy::hosts(["https://invalid.test"])),
+            ..Default::default()
+        };
+        assert!(create_vm_from_spec(&db, "absent", None, invalid.clone()).is_err());
+        assert!(db.get_vm("absent").unwrap().is_none());
+        insert(
+            &db,
+            "existing",
+            false,
+            RecordState::Running,
+            Some(std::process::id() as i32),
+        );
+        let before = serde_json::to_value(db.get_vm("existing").unwrap()).unwrap();
+        assert!(create_vm_from_spec(&db, "existing", None, invalid).is_err());
+        assert_eq!(
+            before,
+            serde_json::to_value(db.get_vm("existing").unwrap()).unwrap()
+        );
+        create_vm_from_spec(
+            &db,
+            "restricted",
+            None,
+            CreateSpec {
+                net: true,
+                egress: Some(EgressPolicy::hosts(["only.test"])),
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let record = db.get_vm("restricted").unwrap().unwrap();
+        assert_eq!(record.dns_filter_hosts, Some(vec!["=only.test".into()]));
+        assert_eq!(
+            record.launch_network_plan().backend,
+            crate::network::EffectiveNetworkBackend::VirtioNet
+        );
     }
 
     #[test]
