@@ -3,7 +3,7 @@
 # Optional compose selects the plugin installed into the private Docker config.
 # Build guest.rs for the guest architecture with rustc --edition=2021
 # --target <arch>-unknown-linux-musl -C linker=rust-lld -o /path/to/probe.
-# Requires KVM or an HVF-entitled engine and ABI-6 host-network firmware.
+# Requires KVM or an HVF-entitled engine and ABI-7 host-network firmware.
 # Uses only a private engine socket, Docker config, and temporary state directory.
 from concurrent.futures import ThreadPoolExecutor
 import hashlib, json, os, pathlib, socket, sqlite3, subprocess, sys, tarfile, tempfile, threading, time, traceback
