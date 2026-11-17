@@ -71,7 +71,7 @@ jobs:
             echo "::group::$name $ver"
 
             if [ "${DRY_RUN:-false}" = "true" ]; then
-              cargo publish -p "$name" --dry-run
+              cargo publish --manifest-path "$c/Cargo.toml" --dry-run
               echo "::endgroup::"
               continue
             fi
@@ -87,7 +87,7 @@ jobs:
 
             # `cargo publish` blocks until the new version is in the registry
             # index, so the next (dependent) crate can resolve it.
-            cargo publish -p "$name"
+            cargo publish --manifest-path "$c/Cargo.toml"
             echo "published $name $ver"
             echo "::endgroup::"
           done

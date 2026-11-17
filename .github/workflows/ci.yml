@@ -167,6 +167,11 @@ jobs:
           cargo test -p smolvm-network --lib tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets -- --exact
           cargo test -p smolvm-network --lib tcp_relay::tests::guest_relay_sockets_disable_nagle_for_outbound_and_published_connections -- --exact
 
+      - name: Test IPv4 UDP fragmentation and host socket buffers
+        run: |
+          cargo test -p smolvm-network --lib fragment
+          cargo test -p smolvm-network --lib maximum_datagrams
+
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins
         env:
@@ -298,6 +303,14 @@ jobs:
         run: |
           cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets -- --exact
           cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::guest_relay_sockets_disable_nagle_for_outbound_and_published_connections -- --exact
+
+      - name: Test IPv4 UDP fragmentation and host socket buffers
+        run: |
+          cargo test -p smolvm-network --lib --target ${{ matrix.target }} fragment
+          cargo test -p smolvm-network --lib --target ${{ matrix.target }} maximum_datagrams
+
+      - name: Test patched stack against upstream unit suite
+        run: python3 scripts/test-smoltcp.py
 
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins --target ${{ matrix.target }}
