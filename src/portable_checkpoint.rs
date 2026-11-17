@@ -2282,6 +2282,8 @@ fn capture_with_completion(
     if !frozen {
         crate::agent::fork::sync_fork_source(name)?;
         log_phase(name, "capture_sync", &mut phase);
+        crate::agent::fork::trim_guest_disks(name);
+        log_phase(name, "capture_trim", &mut phase);
         release_free_guest_memory(name, &control);
         log_phase(name, "capture_free_memory_hint", &mut phase);
     }

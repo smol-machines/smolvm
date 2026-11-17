@@ -2382,6 +2382,39 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
     }
 }
 
+/// Selects one mount point per writable virtio disk from `/proc/mounts`; a disk
+/// mounted twice is trimmed once.
+const WRITABLE_GUEST_DISKS: &str =
+    r#"$1 ~ "^/dev/vd" && $4 ~ /(^|,)rw(,|$)/ && !seen[$1]++ { print $2 }"#;
+
+/// Tell the guest's writable disks which blocks its filesystems no longer use.
+///
+/// A deleted file's blocks stay written in the host's disk image until the
+/// guest discards them, so a checkpoint would save them and the host would keep
+/// the space. A trim punches them out of the image, which the capture then
+/// skips as holes. Best effort: an older agent or a disk without discard just
+/// keeps its blocks.
+pub fn trim_guest_disks(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "awk '{WRITABLE_GUEST_DISKS}' /proc/mounts | \
+                 while read -r mount; do fstrim \"$mount\"; done"
+            ),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
+}
+
 /// Join the guest's scattered free pages into the large blocks free page
 /// hinting can hand over. Best effort: an older agent or a kernel without
 /// compaction just leaves memory as it is.
@@ -4683,6 +4716,31 @@ fn check_pinned_ports_keep_network_backend(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_trim_reaches_each_writable_guest_disk_once() {
+        let mounts = "\
+/dev/vda /storage ext4 rw,noatime 0 0
+/dev/vdb /oldroot/mnt/overlay ext4 rw,noatime 0 0
+/dev/vda /storage/workspace ext4 rw,noatime 0 0
+/dev/vdc /mnt/layers ext4 ro,noatime 0 0
+none / overlay rw,relatime 0 0
+tmpfs /tmp tmpfs rw 0 0
+";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), mounts).unwrap();
+        let output = std::process::Command::new("awk")
+            .arg(super::WRITABLE_GUEST_DISKS)
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "/storage\n/oldroot/mnt/overlay\n"
+        );
+    }
+
     #[test]
     fn clone_labels_override_inherited_ones_and_keep_the_rest() {
         let mut labels = std::collections::BTreeMap::from([
