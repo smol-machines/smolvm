@@ -68,6 +68,7 @@ pub mod fabric;
 // The libkrun frame bridge speaks over an AF_UNIX stream socket, available on
 // both Unix and Windows (10 1809+), so the whole stack is cross-platform.
 pub mod frame_stream;
+mod host_udp;
 pub mod icmp_relay;
 pub mod opening;
 pub mod publish_bind;

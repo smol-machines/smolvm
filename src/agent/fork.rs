@@ -4703,6 +4703,7 @@ fn check_pinned_ports_keep_network_backend(
     }
     let runs = match golden_backend {
         EffectiveNetworkBackend::None => "has no network",
+        EffectiveNetworkBackend::Host => "shares host ports directly",
         EffectiveNetworkBackend::Tsi => "runs on TSI networking because it publishes no ports",
         EffectiveNetworkBackend::VirtioNet => "runs on virtio-net networking",
     };

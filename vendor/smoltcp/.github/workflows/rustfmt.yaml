@@ -1,0 +1,12 @@
+on:
+  pull_request:
+  merge_group:
+
+name: Rustfmt check
+jobs:
+  fmt:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check fmt
+        run: cargo fmt -- --check

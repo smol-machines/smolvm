@@ -409,7 +409,7 @@ fn rootfs_digest(rootfs_dir: &Path, symlink_own_mode: bool) -> std::io::Result<S
 /// a few hundred milliseconds. Any change to the tree misses the cache.
 pub fn cached_agent_rootfs_digest(rootfs_dir: &Path) -> std::io::Result<String> {
     let cached = rootfs_metadata_hash(rootfs_dir).and_then(|hash| {
-        let dir = dirs::cache_dir()?
+        let dir = smolvm_paths::cache_dir()?
             .join("smolvm")
             // v2: symlinks count with one fixed mode (see agent_rootfs_digest),
             // so a value cached before that change may be wrong on macOS.
@@ -504,7 +504,9 @@ fn rootfs_metadata_hash(rootfs_dir: &Path) -> Option<String> {
 /// change to the tree gives a new name. `None` when the tree cannot be read.
 fn agent_rootfs_tar_cache(rootfs_dir: &Path) -> Option<PathBuf> {
     let hash = rootfs_metadata_hash(rootfs_dir)?;
-    let cache = dirs::cache_dir()?.join("smolvm").join("agent-rootfs-tars");
+    let cache = smolvm_paths::cache_dir()?
+        .join("smolvm")
+        .join("agent-rootfs-tars");
     fs::create_dir_all(&cache).ok()?;
     Some(cache.join(format!("{hash}.tar")))
 }
@@ -556,7 +558,7 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
         .lock()
         .map(|roots| roots.clone())
         .unwrap_or_default();
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = smolvm_paths::home_dir() {
         roots.push(home.join(".smolvm"));
     }
     if let Ok(exe) = std::env::current_exe() {
@@ -611,7 +613,7 @@ pub fn add_template_root(dir: PathBuf) {
 /// above finds it first, so expansion happens once per install.
 fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf> {
     let beside = compressed.parent().map(|d| d.join(filename));
-    let cached = dirs::cache_dir().map(|c| c.join("smolvm").join(filename));
+    let cached = smolvm_paths::cache_dir().map(|c| c.join("smolvm").join(filename));
 
     let mut last_err = None;
     for dest in [beside, cached].into_iter().flatten() {
@@ -1364,7 +1366,7 @@ impl AssetCollector {
         // The permit also covers finish(), which drains outstanding zstd jobs.
         let parallelism =
             std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get);
-        let cache = dirs::cache_dir()
+        let cache = smolvm_paths::cache_dir()
             .ok_or_else(|| PackError::Compression("cannot locate compression cache".into()))?
             .join("smolvm");
         let _permit =

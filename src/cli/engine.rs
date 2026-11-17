@@ -236,8 +236,8 @@ fn start(config: smolvm::engine::EngineConfig) -> smolvm::Result<()> {
         );
         return Ok(());
     }
-    let home =
-        dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
+    let home = smolvm_paths::home_dir()
+        .ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
     let docker_dir =
         integration::docker_config_dir(&home, std::env::var("DOCKER_CONFIG").ok().as_deref());
     match integration::install_context(

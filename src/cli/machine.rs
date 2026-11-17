@@ -2818,6 +2818,31 @@ mod tests {
         assert!(super::parse_octal_mode("77777").is_err());
     }
 
+    #[test]
+    fn copy_paths_keep_explicit_host_paths_local() {
+        assert_eq!(
+            super::machine_copy_path("vm:/workspace/a:b"),
+            Some(("vm", "/workspace/a:b"))
+        );
+        for path in ["./a:b", "/tmp/a:b", "folder/file:name", "plain-file"] {
+            assert_eq!(super::machine_copy_path(path), None, "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_paths_keep_windows_drive_and_unc_prefixes_local() {
+        for path in [
+            r"C:\folder\file.bin",
+            "C:/folder/file.bin",
+            r"C:relative.bin",
+            r"\\?\C:\folder\file.bin",
+            r"\\server\share\file:stream",
+        ] {
+            assert_eq!(super::machine_copy_path(path), None, "{path}");
+        }
+    }
+
     use super::*;
     use clap::Parser;
 
@@ -7972,14 +7997,30 @@ fn parse_octal_mode(s: &str) -> smolvm::Result<u32> {
         })
 }
 
+/// A Windows drive prefix belongs to the host path, not a machine named C.
+/// Explicit local paths also keep colons in their filenames literal.
+fn machine_copy_path(value: &str) -> Option<(&str, &str)> {
+    if matches!(
+        Path::new(value).components().next(),
+        Some(std::path::Component::Prefix(_))
+    ) {
+        return None;
+    }
+    let (name, path) = value.split_once(':')?;
+    if name.contains(['/', '\\']) {
+        return None;
+    }
+    Some((name, path))
+}
+
 impl CpCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // Parse src/dst to determine direction
         let (machine_name, guest_path, local_path, is_upload) =
-            if let Some((name, path)) = self.src.split_once(':') {
+            if let Some((name, path)) = machine_copy_path(&self.src) {
                 // Download: machine:path -> local
                 (name.to_string(), path.to_string(), self.dst.clone(), false)
-            } else if let Some((name, path)) = self.dst.split_once(':') {
+            } else if let Some((name, path)) = machine_copy_path(&self.dst) {
                 // Upload: local -> machine:path
                 (name.to_string(), path.to_string(), self.src.clone(), true)
             } else {

@@ -61,7 +61,7 @@ const FULL_WARNING_INTERVAL: Duration = Duration::from_secs(10);
 const UDP_PACKET_SLOTS: usize = 16;
 /// Payload bytes per destination socket buffer (per direction).
 const UDP_BUFFER_BYTES: usize = 64 * 1024;
-/// Largest datagram we relay (gateway MTU bounds guest->host anyway).
+/// Largest host datagram buffer (the interface reassembles guest fragments).
 const MAX_DATAGRAM_BYTES: usize = 65_535;
 /// Drop a flow's host socket after this much inactivity.
 const FLOW_IDLE_TIMEOUT: Duration = Duration::from_secs(60);
@@ -314,6 +314,7 @@ fn create_flow_socket(destination: SocketAddr) -> std::io::Result<HostUdpSocket>
         (Ipv6Addr::UNSPECIFIED, 0).into()
     };
     let socket = HostUdpSocket::bind(bind_addr)?;
+    crate::host_udp::configure(&socket2::SockRef::from(&socket))?;
     socket.connect(destination)?;
     socket.set_nonblocking(true)?;
     Ok(socket)
@@ -508,6 +509,13 @@ fn endpoint_to_socket_addr(endpoint: smoltcp::wire::IpEndpoint) -> SocketAddr {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    #[test]
+    fn relay_udp_socket_carries_maximum_datagrams() {
+        let peer = crate::host_udp::peer();
+        let flow = create_flow_socket(peer.local_addr().unwrap()).unwrap();
+        crate::host_udp::assert_maximum_datagram_round_trip(flow, peer);
+    }
 
     #[test]
     fn flow_socket_round_trip() {

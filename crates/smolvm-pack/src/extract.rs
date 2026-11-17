@@ -1570,7 +1570,7 @@ const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 /// the cache key to a SHA-256 digest; tracked separately as it changes the
 /// on-disk cache layout and footer format.
 pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
-    let base = dirs::cache_dir()
+    let base = smolvm_paths::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
 
     Ok(base.join("smolvm-pack").join(format!("{:08x}", checksum)))
@@ -5500,7 +5500,7 @@ fn cs_template_dir() -> Option<PathBuf> {
         );
     }
     Some(
-        dirs::cache_dir()?
+        smolvm_paths::cache_dir()?
             .join("smolvm")
             .join("cs-volume-templates"),
     )
@@ -5595,7 +5595,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
     }
     let libs_checksum = hasher.finalize();
 
-    let cache_base = dirs::cache_dir()
+    let cache_base = smolvm_paths::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
     let libs_cache_dir = cache_base
         .join("smolvm-libs")
