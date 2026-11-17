@@ -195,9 +195,11 @@ On a running machine the change applies from its next request, with no restart:
   The values kept for such hosts are bounded (see the limits below); the hosts
   themselves stay intercepted for as long as the machine runs. This holds when
   the change that removed the binding is rolled back too: the first bindings
-  of a machine that booted without any start an interceptor, and if that
-  interceptor resolved a value before the change failed, it keeps running
-  with no binding instead of stopping.
+  of a machine that booted without any start an interceptor, and when the
+  change fails that interceptor keeps running with no binding for as long as
+  the machine runs, never stopped, whether or not it resolved a value yet. A
+  request resolving a value as the change is rolled back is answered `503`
+  as above; a host a value was resolved for before then stays intercepted.
 - A connection the guest opened before a binding covered its host was relayed
   untouched, and nothing on it is checked. A change that binds that host
   resets such a connection before the new bindings take effect, so a value

@@ -1784,28 +1784,21 @@ impl LiveCredentials {
         };
         // Connections spliced to hosts the restored bindings intercept end
         // first; if one will not, nothing is restored, and the rollback can
-        // be asked for again.
-        // An interceptor started since that resolved a value is kept, with
-        // no binding (see below).
-        let sent = previous.resolver.is_none()
-            && state
-                .running
-                .as_ref()
-                .is_some_and(|running| running.resolver.resolved_any());
+        // be asked for again. An interceptor started since is kept, with no
+        // binding (see below).
         let target = match &previous.resolver {
-            Some(_) => Some(previous.policy.clone()),
-            None if sent => Some(CredentialPolicy::default()),
-            None => None,
+            Some(_) => previous.policy.clone(),
+            None => CredentialPolicy::default(),
         };
-        let prepared = match (target, &state.running) {
-            (Some(target), Some(running)) => match running.control.prepare_bindings(&target) {
+        let prepared = match &state.running {
+            Some(running) => match running.control.prepare_bindings(&target) {
                 Ok(prepared) => Some(prepared),
                 Err(reason) => {
                     state.previous = Some(previous);
                     return Err(reason);
                 }
             },
-            _ => None,
+            None => None,
         };
         match previous.resolver {
             Some(mut resolver_state) => {
@@ -1835,27 +1828,29 @@ impl LiveCredentials {
                 }
             }
             None => {
-                // No interceptor ran before the one started since. One that
-                // never resolved a value is stopped. One that did may have
-                // sent it to a host that stored it: it keeps running with no
-                // binding, so those hosts stay intercepted and scrubbed of
-                // what was sent there (and inject nothing) for as long as the
-                // machine runs, never relayed directly again.
-                if sent {
-                    if let (Some(running), Some(prepared)) = (&state.running, prepared) {
-                        let empty = CredentialPolicy::default();
-                        let mut resolver = running.resolver.lock();
-                        running
-                            .control
-                            .commit_bindings(prepared, empty, &BTreeMap::new(), &[]);
-                        *resolver = ResolverState::default();
-                    }
-                    tracing::warn!("credential bindings removed; their interceptor keeps running because it already resolved a value");
-                } else {
-                    if let Some(slot) = self.late {
-                        slot.clear();
-                    }
-                    state.running = None;
+                // No interceptor ran before the one started since (none was
+                // started if the bindings sent were none). It keeps running
+                // with no binding, still published, for as long as the
+                // machine runs, whether or not it resolved a value yet: a
+                // request may be resolving one as this runs, and only a
+                // running interceptor keeps it from being sent. Under the
+                // empty bindings that request injects nothing (its binding
+                // is no longer the one it was checked against), and a host a
+                // value was resolved for before they took effect stays
+                // intercepted and scrubbed of it, never relayed directly
+                // again.
+                if let (Some(running), Some(prepared)) = (&state.running, prepared) {
+                    let mut resolver = running.resolver.lock();
+                    running.control.commit_bindings(
+                        prepared,
+                        CredentialPolicy::default(),
+                        &BTreeMap::new(),
+                        &[],
+                    );
+                    *resolver = ResolverState::default();
+                    tracing::info!(
+                        "credential bindings removed; their interceptor keeps running with none"
+                    );
                 }
             }
         }
@@ -1881,8 +1876,6 @@ struct ResolverState {
 /// to the running machine through [`CREDENTIALS_SOCKET`] takes precedence.
 struct SecretRefResolver {
     state: Mutex<ResolverState>,
-    /// It has handed the interceptor a value, which may have been sent on.
-    resolved: std::sync::atomic::AtomicBool,
 }
 
 impl SecretRefResolver {
@@ -1892,13 +1885,7 @@ impl SecretRefResolver {
                 sources,
                 live: BTreeMap::new(),
             }),
-            resolved: std::sync::atomic::AtomicBool::new(false),
         }
-    }
-
-    /// Whether it ever handed the interceptor a value.
-    fn resolved_any(&self) -> bool {
-        self.resolved.load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn lock(&self) -> std::sync::MutexGuard<'_, ResolverState> {
@@ -1919,8 +1906,6 @@ impl CredentialResolver for SecretRefResolver {
         let source = {
             let state = self.lock();
             if let Some(value) = state.live.get(&request.binding) {
-                self.resolved
-                    .store(true, std::sync::atomic::Ordering::Release);
                 return Ok(value.clone());
             }
             state
@@ -1935,8 +1920,6 @@ impl CredentialResolver for SecretRefResolver {
             crate::secrets::ResolutionScope::RecordReplay,
         )
         .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))?;
-        self.resolved
-            .store(true, std::sync::atomic::Ordering::Release);
         Ok(value)
     }
 }
@@ -2575,7 +2558,8 @@ mod tests {
     /// A machine that booted without bindings serves the socket too. Its
     /// first bindings make the boot process (the machine's own user) create
     /// the CA in the machine's own directory and start the interceptor; a
-    /// rollback stops it again.
+    /// rollback leaves it running with no binding, never stopped while the
+    /// machine runs.
     #[test]
     fn the_first_bindings_start_an_interceptor_on_a_running_machine() {
         let dir = tempfile::tempdir().unwrap();
@@ -2619,8 +2603,13 @@ mod tests {
             "ok"
         );
 
+        let published = slot.get().unwrap().addr;
         assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
-        assert!(slot.get().is_none(), "back to relaying directly");
+        assert_eq!(
+            slot.get().map(|endpoint| endpoint.addr),
+            Some(published),
+            "the same interceptor stays published"
+        );
         assert!(send(dir.path(), r#"{"values":{"a":"x"}}"#).contains("no credential binding 'a'"));
     }
 
@@ -2648,7 +2637,7 @@ mod tests {
     /// CA, say) after that interceptor already resolved a value, the
     /// rollback keeps it running with no binding, still published, instead of
     /// stopping it: a host the value went to stays intercepted and scrubbed,
-    /// never relayed directly again. One that resolved nothing is stopped.
+    /// never relayed directly again.
     #[test]
     fn a_rollback_keeps_a_late_interceptor_that_already_resolved_a_value() {
         let dir = tempfile::tempdir().unwrap();
@@ -2684,6 +2673,194 @@ mod tests {
             Err(ResolveError::Unknown)
         ));
         assert!(send(dir.path(), r#"{"values":{"gh":"x"}}"#).contains("no credential binding 'gh'"));
+    }
+
+    /// Wait until a resolution opens FIFO `fifo` to read it, then return the
+    /// writing end, which holds that resolution mid-read until it is written
+    /// and dropped.
+    #[cfg(unix)]
+    fn writer_once_read(fifo: &Path) -> std::fs::File {
+        use std::os::unix::fs::OpenOptionsExt;
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+        loop {
+            // Refused (ENXIO) until a reader has the FIFO open.
+            match std::fs::OpenOptions::new()
+                .write(true)
+                .custom_flags(libc::O_NONBLOCK)
+                .open(fifo)
+            {
+                Ok(writer) => return writer,
+                Err(e) if e.raw_os_error() == Some(libc::ENXIO) => {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "nothing resolved the binding"
+                    );
+                    std::thread::sleep(std::time::Duration::from_millis(10));
+                }
+                Err(e) => panic!("open {}: {e}", fifo.display()),
+            }
+        }
+    }
+
+    /// Speak TLS through interceptor `endpoint` to `host` at `destination`,
+    /// as the guest, trusting `ca_pem`, and return the raw response.
+    #[cfg(unix)]
+    fn guest_request(
+        endpoint: smolvm_protocol::intercept::InterceptEndpoint,
+        destination: std::net::SocketAddr,
+        ca_pem: &str,
+        host: &str,
+        request: &str,
+    ) -> std::io::Result<String> {
+        use std::io::{Read, Write};
+        let mut tcp = std::net::TcpStream::connect(endpoint.addr)?;
+        tcp.set_read_timeout(Some(std::time::Duration::from_secs(30)))?;
+        tcp.set_write_timeout(Some(std::time::Duration::from_secs(30)))?;
+        tcp.write_all(&endpoint.preamble(destination))?;
+        let mut verdict = [0xffu8; 1];
+        tcp.read_exact(&mut verdict)?;
+        assert_eq!(
+            verdict[0], 0,
+            "the interceptor could not reach the upstream"
+        );
+        let mut roots = rustls::RootCertStore::empty();
+        for cert in rustls_pemfile::certs(&mut ca_pem.as_bytes()) {
+            roots.add(cert?).map_err(std::io::Error::other)?;
+        }
+        let config = rustls::ClientConfig::builder_with_provider(Arc::new(
+            rustls::crypto::ring::default_provider(),
+        ))
+        .with_safe_default_protocol_versions()
+        .map_err(std::io::Error::other)?
+        .with_root_certificates(roots)
+        .with_no_client_auth();
+        let name = rustls::pki_types::ServerName::try_from(host.to_string())
+            .map_err(std::io::Error::other)?;
+        let connection =
+            rustls::ClientConnection::new(Arc::new(config), name).map_err(std::io::Error::other)?;
+        let mut tls = rustls::StreamOwned::new(connection, tcp);
+        tls.write_all(request.as_bytes())?;
+        let mut out = Vec::new();
+        // The interceptor may close without a TLS close_notify.
+        let _ = tls.read_to_end(&mut out);
+        Ok(String::from_utf8_lossy(&out).into_owned())
+    }
+
+    /// A rollback of a machine's first bindings never stops their
+    /// interceptor, even one that has not resolved a value yet: a request may
+    /// be resolving one at that moment. Here one is held mid-read of its
+    /// source while the rollback runs. Released after it, the request injects
+    /// nothing (its binding is gone), and the interceptor is still the one
+    /// published, running with no binding. A host a value was resolved for
+    /// before the rollback stays intercepted; one only the held request
+    /// resolved for, after it, is relayed directly again, the value never
+    /// having left this process.
+    #[cfg(unix)]
+    #[test]
+    fn a_rollback_never_stops_a_late_interceptor_a_request_is_resolving_for() {
+        use std::io::Write;
+        // An upstream the interceptor reaches but cannot complete TLS with.
+        let upstream = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let destination = upstream.local_addr().unwrap();
+        std::thread::spawn(move || {
+            for connection in upstream.incoming() {
+                drop(connection);
+            }
+        });
+        for resolved_before in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let fifo = dir.path().join("token");
+            let path = std::ffi::CString::new(fifo.to_str().unwrap()).unwrap();
+            // SAFETY: a NUL-terminated path.
+            assert_eq!(unsafe { libc::mkfifo(path.as_ptr(), 0o600) }, 0);
+            let live = serve_unbound(dir.path());
+            let slot = live.late.unwrap();
+            let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+            let refs: BTreeMap<String, SecretRef> = [(
+                "GH_TOKEN".to_string(),
+                crate::secrets::file_ref(fifo.clone()),
+            )]
+            .into();
+            let reply = send(dir.path(), &bindings_message_with(&launch, refs));
+            let (ok, data) = reply.split_once('\n').expect("ok and the reply");
+            assert_eq!(ok, "ok");
+            let ca_pem = serde_json::from_str::<BindingsReply>(data).unwrap().ca_pem;
+            let endpoint = slot.get().expect("published");
+            let with_placeholder = format!(
+                "GET / HTTP/1.1\r\nHost: github.com\r\nAuthorization: Bearer {}\r\n\
+                 Connection: close\r\n\r\n",
+                launch.placeholders["gh"]
+            );
+            let plain = "GET / HTTP/1.1\r\nHost: github.com\r\nConnection: close\r\n\r\n";
+
+            if resolved_before {
+                // A request resolves the value and sends it on (the upstream
+                // then fails it) before the bindings change.
+                let feeder = {
+                    let fifo = fifo.clone();
+                    std::thread::spawn(move || {
+                        writer_once_read(&fifo)
+                            .write_all(b"ghp_sentbefore")
+                            .unwrap()
+                    })
+                };
+                let sent = guest_request(
+                    endpoint,
+                    destination,
+                    &ca_pem,
+                    "github.com",
+                    &with_placeholder,
+                )
+                .unwrap();
+                feeder.join().unwrap();
+                assert!(sent.starts_with("HTTP/1.1 502"), "{sent}");
+            }
+
+            // A request is held reading its value...
+            let held = {
+                let ca_pem = ca_pem.clone();
+                let request = with_placeholder.clone();
+                std::thread::spawn(move || {
+                    guest_request(endpoint, destination, &ca_pem, "github.com", &request)
+                })
+            };
+            let mut writer = writer_once_read(&fifo);
+            // ...while the guest refuses the CA and the host rolls back.
+            assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+            assert_eq!(
+                slot.get().map(|e| e.addr),
+                Some(endpoint.addr),
+                "the same interceptor stays published"
+            );
+            let state = live.state.lock().unwrap();
+            assert!(state.running.is_some(), "still running");
+            assert!(state.policy.is_empty());
+            drop(state);
+            let after = resolver_of(&live).lock().clone();
+            assert!(after.sources.is_empty() && after.live.is_empty());
+
+            // Released, the held request has its value and sends nothing.
+            writer.write_all(b"ghp_resolvedlate").unwrap();
+            drop(writer);
+            let response = held.join().unwrap().unwrap();
+            assert!(response.starts_with("HTTP/1.1 503"), "{response}");
+            assert!(
+                response.contains("changed during the request"),
+                "{response}"
+            );
+            assert!(slot.get().is_some_and(|e| e.addr == endpoint.addr));
+
+            let next = guest_request(endpoint, destination, &ca_pem, "github.com", plain);
+            if resolved_before {
+                // Terminated by the interceptor (its response would be
+                // scrubbed of the value), which then fails to reach upstream.
+                let next = next.unwrap();
+                assert!(next.starts_with("HTTP/1.1 502"), "intercepted: {next}");
+            } else {
+                // Spliced to the upstream, which is not the machine CA.
+                assert!(next.is_err(), "relayed directly: {next:?}");
+            }
+        }
     }
 
     /// A value is sent tagged with the binding it was read for, and refused
