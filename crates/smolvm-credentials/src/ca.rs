@@ -147,20 +147,40 @@ impl MachineCa {
     /// beside a `guest/ca.pem` copy of the public certificate, which is the
     /// only path ever mounted into the machine.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        let guest = Self::guest_dir(dir);
-        std::fs::create_dir_all(&guest).with_context(|| format!("create {}", guest.display()))?;
+        std::fs::create_dir_all(Self::guest_dir(dir))
+            .with_context(|| format!("create {}", Self::guest_dir(dir).display()))?;
+        self.save_with(|path, bytes, mode| {
+            let path = path.iter().fold(dir.to_path_buf(), |p, c| p.join(c));
+            write_replacing(&path, bytes, mode).map_err(std::io::Error::other)
+        })
+    }
+
+    /// [`MachineCa::save`], handing each file to `write` as its path relative
+    /// to the CA directory (`["ca.key"]`, `["guest", "ca.pem"]`, …), its
+    /// contents and its mode, in the order a reader relies on. A process
+    /// writing into a directory another user owns passes a writer that never
+    /// follows a link.
+    pub fn save_with(
+        &self,
+        mut write: impl FnMut(&[&str], &[u8], u32) -> std::io::Result<()>,
+    ) -> Result<()> {
         // The key first: a reader that finds a certificate must find its key.
-        let key_path = dir.join(CA_KEY_FILE);
-        write_replacing(
-            &key_path,
+        write(
+            &[CA_KEY_FILE],
             Zeroizing::new(self.key.serialize_pem()).as_bytes(),
             0o600,
-        )?;
-        write_replacing(&dir.join(CA_NAME_FILE), self.name.as_bytes(), 0o644)?;
-        write_replacing(&dir.join(GUEST_CA_FILE), self.cert_pem.as_bytes(), 0o644)?;
+        )
+        .context("write ca.key")?;
+        write(&[CA_NAME_FILE], self.name.as_bytes(), 0o644).context("write ca.name")?;
+        write(&[GUEST_CA_FILE], self.cert_pem.as_bytes(), 0o644).context("write ca.pem")?;
         // A running guest may be reading this one through its mount: replace
         // it whole, never truncate it in place.
-        write_replacing(&guest.join(GUEST_CA_FILE), self.cert_pem.as_bytes(), 0o644)?;
+        write(
+            &[GUEST_SUBDIR, GUEST_CA_FILE],
+            self.cert_pem.as_bytes(),
+            0o644,
+        )
+        .context("write guest/ca.pem")?;
         Ok(())
     }
 

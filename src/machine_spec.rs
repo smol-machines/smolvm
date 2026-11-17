@@ -1795,6 +1795,7 @@ impl ResolvedSpec {
             mediated_egress_required: restored.mediated_egress_required,
             credential_placeholders,
             credentials_supplied_by_api,
+            credential_bindings_unsettled: false,
             // A fresh boot decides; a restore recreates the captured devices.
             credential_ca_device: restored.credential_ca_device,
             // Unknown for a restore: its guest is handed the CA once it runs.

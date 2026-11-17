@@ -190,7 +190,7 @@ fn explain_fork_reply(golden: &str, reply: &str) -> String {
 /// instead of waiting for it. Lets a cleanup sweep tell "no fork is running for
 /// this machine" from "one is in flight" without ever stalling behind a fork.
 #[cfg(unix)]
-fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
 
     let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
@@ -202,7 +202,7 @@ fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
 }
 
 #[cfg(windows)]
-fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
+pub(crate) fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     use std::os::windows::io::AsRawHandle;
     use windows_sys::Win32::Storage::FileSystem::{
         LockFileEx, LOCKFILE_EXCLUSIVE_LOCK, LOCKFILE_FAIL_IMMEDIATELY,
@@ -320,6 +320,12 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             continue;
         };
         if try_lock_file_exclusive(&file).is_err() {
+            continue;
+        }
+        // Another sweep may have removed this file since it was opened, and a
+        // locker made and holds a new one under the same name: unlink only the
+        // file this sweep holds locked.
+        if !crate::credentials::still_named(&file, &path) {
             continue;
         }
         let _ = std::fs::remove_file(&path);

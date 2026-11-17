@@ -6490,6 +6490,9 @@ pub async fn set_machine_credentials(
         crate::credentials::BindingsError::Invalid(e) => ApiError::BadRequest(e.to_string()),
         crate::credentials::BindingsError::Conflict(e) => ApiError::Conflict(e.to_string()),
         crate::credentials::BindingsError::Failed(e) => ApiError::from(e),
+        // Neither the caller's input nor the machine's state: the server
+        // could not keep the machine consistent, and says how to recover.
+        crate::credentials::BindingsError::Unsettled(e) => ApiError::internal(e.to_string()),
     })?;
     // Commands started through this server read the bindings from here.
     if let Ok(entry) = state.get_machine(&name) {

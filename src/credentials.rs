@@ -468,65 +468,25 @@ fn pem_certificate(der: &[u8]) -> String {
     pem
 }
 
-/// Read `base/<components…>`: `base` itself and every component below it
-/// opened without following a link, each directory with `O_DIRECTORY` and the
-/// file required to be regular.
-#[cfg(unix)]
+/// Largest CA file the host reads: a name, a certificate or a key.
+const MAX_CA_FILE_BYTES: u64 = 64 * 1024;
+
+/// Read a file of a CA directory from the host without following links.
 fn read_without_links(base: &Path, components: &[&str]) -> std::io::Result<Vec<u8>> {
-    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
-    use std::os::unix::ffi::OsStrExt;
-    let open_at = |dir: Option<&OwnedFd>, name: &std::ffi::OsStr, flags: i32| {
-        let name = std::ffi::CString::new(name.as_bytes())
-            .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-        let at = dir.map_or(libc::AT_FDCWD, |d| d.as_raw_fd());
-        // SAFETY: a NUL-terminated path and a live directory descriptor.
-        let fd = unsafe {
-            libc::openat(
-                at,
-                name.as_ptr(),
-                flags | libc::O_NOFOLLOW | libc::O_CLOEXEC,
-            )
-        };
-        if fd < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        // SAFETY: openat returned a descriptor this function now owns.
-        Ok(unsafe { OwnedFd::from_raw_fd(fd) })
-    };
-    let mut dir = open_at(None, base.as_os_str(), libc::O_RDONLY | libc::O_DIRECTORY)?;
-    let (file, dirs) = components
-        .split_last()
-        .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    for name in dirs {
-        dir = open_at(
-            Some(&dir),
-            std::ffi::OsStr::new(name),
-            libc::O_RDONLY | libc::O_DIRECTORY,
-        )?;
-    }
-    let file = std::fs::File::from(open_at(
-        Some(&dir),
-        std::ffi::OsStr::new(file),
-        libc::O_RDONLY | libc::O_NONBLOCK,
-    )?);
-    if !file.metadata()?.is_file() {
-        return Err(std::io::Error::other("not a regular file"));
-    }
-    let mut bytes = Vec::new();
-    std::io::Read::read_to_end(&mut std::io::Read::take(&file, 64 * 1024), &mut bytes)?;
-    Ok(bytes)
+    crate::nofollow::read(base, components, MAX_CA_FILE_BYTES)
 }
 
-#[cfg(not(unix))]
-fn read_without_links(base: &Path, components: &[&str]) -> std::io::Result<Vec<u8>> {
-    let mut path = base.to_path_buf();
-    for name in components {
-        path.push(name);
-        if std::fs::symlink_metadata(&path)?.file_type().is_symlink() {
-            return Err(std::io::Error::other("is a link"));
-        }
-    }
-    std::fs::read(path)
+/// Save `ca` as the CA in `<vm_data_dir>/credentials`, as [`MachineCa::save`]
+/// does, but writing every file without following a link: for a host process
+/// writing into a machine's directory, which the machine's user may own (a
+/// checkpoint restored into a paused machine's directory).
+pub fn save_ca_without_links(ca: &MachineCa, vm_data_dir: &Path) -> Result<()> {
+    ca.save_with(|path, bytes, mode| {
+        let mut components = vec![CA_DIR_NAME];
+        components.extend_from_slice(path);
+        crate::nofollow::write_replacing(vm_data_dir, &components, bytes, mode)
+    })
+    .map_err(|e| Error::config("credentials", format!("save machine CA: {e:#}")))
 }
 
 /// Serve [`CREDENTIALS_SOCKET`] in `vm_dir` for a machine that booted without
@@ -560,12 +520,21 @@ pub enum BindingsError {
     Conflict(Error),
     /// Anything else (the database, the machine vanishing).
     Failed(Error),
+    /// The change failed and undoing it failed too: the running machine may
+    /// enforce other bindings than its record holds until its bindings are
+    /// set again or it restarts. The record says so
+    /// ([`VmRecord::credential_bindings_unsettled`]), so the next change
+    /// reaches the machine even if it changes nothing in the record.
+    Unsettled(Error),
 }
 
 impl From<BindingsError> for Error {
     fn from(error: BindingsError) -> Self {
         match error {
-            BindingsError::Invalid(e) | BindingsError::Conflict(e) | BindingsError::Failed(e) => e,
+            BindingsError::Invalid(e)
+            | BindingsError::Conflict(e)
+            | BindingsError::Failed(e)
+            | BindingsError::Unsettled(e) => e,
         }
     }
 }
@@ -573,11 +542,29 @@ impl From<BindingsError> for Error {
 impl std::fmt::Display for BindingsError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            BindingsError::Invalid(e) | BindingsError::Conflict(e) | BindingsError::Failed(e) => {
-                e.fmt(f)
-            }
+            BindingsError::Invalid(e)
+            | BindingsError::Conflict(e)
+            | BindingsError::Failed(e)
+            | BindingsError::Unsettled(e) => e.fmt(f),
         }
     }
+}
+
+/// The error for a change that failed with `cause` and could not be undone
+/// (`undo`): says the machine may be inconsistent, and how to bring it back.
+fn unsettled(name: &str, cause: &dyn std::fmt::Display, undo: &[String]) -> BindingsError {
+    BindingsError::Unsettled(Error::config(
+        "credentials",
+        format!(
+            "changing machine '{name}''s credential bindings failed ({cause}), and restoring the \
+             previous ones failed too ({}); its record and the running machine may now hold \
+             different bindings. Set its bindings again (`smolvm machine update --name {name} \
+             --credential …` or `--remove-credential …`, or PUT \
+             /api/v1/machines/{name}/credentials), which reaches the running machine even if \
+             the record already holds them, or restart it",
+            undo.join("; ")
+        ),
+    ))
 }
 
 /// Replace machine `name`'s credential bindings with `policy`, exactly: the
@@ -596,25 +583,49 @@ pub fn set_bindings(
     policy: CredentialPolicy,
     caller: crate::machine_spec::Caller,
 ) -> std::result::Result<VmRecord, BindingsError> {
-    set_bindings_then(db, name, policy, caller, |_, _, _| Ok(()))
+    set_bindings_with(
+        db,
+        name,
+        caller,
+        None,
+        |_| Ok(policy),
+        &BootProcess,
+        |_, _, _| Ok(()),
+    )
 }
 
-/// [`set_bindings`], then `then(before, saved, running)` while the change is
-/// still exclusive: no other binding change, and no start, can land between
-/// the two (the CLI hands a running machine values for the bindings it just
-/// set this way, so none can reach a binding someone else set meanwhile).
+/// The CLI's `machine update --credential` / `--remove-credential`: `edit`
+/// builds the new bindings from the machine's record as it is under the
+/// change's lock, never from one read before it, so a change someone else
+/// made meanwhile is neither lost nor undone; then `then(before, saved,
+/// running)` runs while the change is still exclusive (the CLI hands a
+/// running machine values for the bindings it just set, so none can reach a
+/// binding someone else set meanwhile).
+///
+/// `named` are the bindings this command names. A binding becomes one whose
+/// values come from this host only if it is named, or already was one: when
+/// the record was emptied by an API caller meanwhile, nothing it once held
+/// can come back reading this host's environment.
 ///
 /// A `then` that fails undoes the change: the record and, on a running
 /// machine, the boot process get back exactly the bindings they had, so a
 /// command that reports failure has changed nothing.
-pub fn set_bindings_then(
+pub fn edit_bindings_from_cli(
     db: &crate::db::SmolvmDb,
     name: &str,
-    policy: CredentialPolicy,
-    caller: crate::machine_spec::Caller,
+    named: &std::collections::BTreeSet<String>,
+    edit: impl FnOnce(&VmRecord) -> Result<CredentialPolicy>,
     then: impl FnOnce(&VmRecord, &VmRecord, bool) -> Result<()>,
 ) -> std::result::Result<VmRecord, BindingsError> {
-    set_bindings_with(db, name, policy, caller, &BootProcess, then)
+    set_bindings_with(
+        db,
+        name,
+        crate::machine_spec::Caller::Cli,
+        Some(named),
+        edit,
+        &BootProcess,
+        then,
+    )
 }
 
 /// Where [`set_bindings_with`] sends a running machine its new bindings: the
@@ -628,7 +639,7 @@ trait LiveBindings {
         next: &VmRecord,
     ) -> std::result::Result<Option<String>, BindingsError>;
     /// [`roll_back_live_bindings`].
-    fn roll_back(&self, name: &str);
+    fn roll_back(&self, name: &str) -> Result<()>;
 }
 
 /// The running machine's boot process, over its [`CREDENTIALS_SOCKET`].
@@ -644,16 +655,55 @@ impl LiveBindings for BootProcess {
         apply_live_bindings(name, before, next)
     }
 
-    fn roll_back(&self, name: &str) {
-        roll_back_live_bindings(name);
+    fn roll_back(&self, name: &str) -> Result<()> {
+        roll_back_live_bindings(name)
     }
+}
+
+/// Refuse to make a binding read this host's values unless the operator
+/// names it now, or it already read them: `named` are the bindings this CLI
+/// command names; `before` is the record as the change found it.
+fn check_named_host_bindings(
+    before: &VmRecord,
+    next: &VmRecord,
+    named: &std::collections::BTreeSet<String>,
+) -> Result<()> {
+    if next.credentials_supplied_by_api {
+        return Ok(());
+    }
+    let was_host_sourced = !before.credentials_supplied_by_api;
+    for binding in next
+        .credential_policy
+        .iter()
+        .flat_map(|p| p.credentials.iter())
+    {
+        let already = was_host_sourced
+            && before
+                .credential_policy
+                .as_ref()
+                .and_then(|p| p.binding(&binding.name))
+                == Some(binding);
+        if !already && !named.contains(&binding.name) {
+            return Err(Error::config(
+                "credentials",
+                format!(
+                    "credential binding '{}' of machine '{}' was not set from this host and this \
+                     command does not name it, so it cannot start reading this host's values; \
+                     name it with --credential to bind it here",
+                    binding.name, before.name
+                ),
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn set_bindings_with(
     db: &crate::db::SmolvmDb,
     name: &str,
-    policy: CredentialPolicy,
     caller: crate::machine_spec::Caller,
+    named: Option<&std::collections::BTreeSet<String>>,
+    build: impl FnOnce(&VmRecord) -> Result<CredentialPolicy>,
     live: &dyn LiveBindings,
     then: impl FnOnce(&VmRecord, &VmRecord, bool) -> Result<()>,
 ) -> std::result::Result<VmRecord, BindingsError> {
@@ -684,6 +734,8 @@ fn set_bindings_with(
             }))
         }
     };
+    // Built from the record as it is now, under the lock.
+    let policy = build(&record).map_err(BindingsError::Invalid)?;
     let mut next =
         record
             .with_credential_bindings(policy, caller)
@@ -691,38 +743,65 @@ fn set_bindings_with(
                 Error::Agent { .. } => BindingsError::Conflict(error),
                 other => BindingsError::Invalid(other),
             })?;
+    if let Some(named) = named {
+        check_named_host_bindings(&record, &next, named).map_err(BindingsError::Conflict)?;
+    }
+    // A change that lands settles the machine: the record holds what the
+    // machine runs, or what it boots next.
+    next.credential_bindings_unsettled = false;
+    let mark_unsettled = || {
+        if let Err(error) = db.update_vm(name, |r| r.credential_bindings_unsettled = true) {
+            tracing::warn!(machine = name, %error, "could not record that the machine's credential bindings are unsettled");
+        }
+    };
     if running {
-        if let Some(trusted) = live.apply(name, &record, &next)? {
-            next.credential_ca_trusted = Some(trusted);
+        match live.apply(name, &record, &next) {
+            Ok(Some(trusted)) => next.credential_ca_trusted = Some(trusted),
+            Ok(None) => {}
+            Err(error @ BindingsError::Unsettled(_)) => {
+                mark_unsettled();
+                return Err(error);
+            }
+            Err(error) => return Err(error),
         }
     }
     let saved = match db.update_vm(name, |r| r.take_credential_bindings(&next)) {
         Ok(Some(saved)) => saved,
         failed => {
-            // The record keeps the old bindings, so the running machine must too.
-            if running {
-                live.roll_back(name);
-            }
-            return Err(BindingsError::Failed(match failed {
+            let cause = match failed {
                 Err(e) => e,
                 _ => Error::vm_not_found(name),
-            }));
+            };
+            // The record keeps the old bindings, so the running machine must too.
+            if running {
+                if let Err(undo) = live.roll_back(name) {
+                    mark_unsettled();
+                    return Err(unsettled(name, &cause, &[undo.to_string()]));
+                }
+            }
+            return Err(BindingsError::Failed(cause));
         }
     };
     if let Err(error) = then(&record, &saved, running) {
         // Undo the change, so the command that fails has changed nothing.
         // The guest keeps any CA it was handed (the CA never narrows), and
         // the record keeps saying which one that is.
-        let restored = db.update_vm(name, |r| {
+        let mut undo = Vec::new();
+        if let Err(restore) = db.update_vm(name, |r| {
             let trusted = r.credential_ca_trusted.clone();
             r.take_credential_bindings(&record);
             r.credential_ca_trusted = trusted;
-        });
-        if let Err(restore) = &restored {
-            tracing::warn!(machine = name, error = %restore, "could not restore the previous credential bindings in the record");
+        }) {
+            undo.push(format!("the record: {restore}"));
         }
         if running {
-            live.roll_back(name);
+            if let Err(roll_back) = live.roll_back(name) {
+                undo.push(format!("the running machine: {roll_back}"));
+            }
+        }
+        if !undo.is_empty() {
+            mark_unsettled();
+            return Err(unsettled(name, &error, &undo));
         }
         return Err(BindingsError::Conflict(error));
     }
@@ -829,9 +908,10 @@ fn open_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
         .open(path)
 }
 
-/// Whether `path` still names the open `file`.
+/// Whether `path` still names the open `file`: the same file on the same
+/// device, not one made under its name after it was removed.
 #[cfg(unix)]
-fn still_named(file: &std::fs::File, path: &Path) -> bool {
+pub(crate) fn still_named(file: &std::fs::File, path: &Path) -> bool {
     use std::os::unix::fs::MetadataExt;
     match (file.metadata(), std::fs::symlink_metadata(path)) {
         (Ok(open), Ok(named)) => open.dev() == named.dev() && open.ino() == named.ino(),
@@ -839,10 +919,75 @@ fn still_named(file: &std::fs::File, path: &Path) -> bool {
     }
 }
 
-/// Windows refuses to remove a file that is open, so the path always names it.
+/// Whether `path` still names the open `file`, by volume and file index:
+/// Rust opens files with `FILE_SHARE_DELETE`, so an open file can be removed
+/// and another made under its name.
+#[cfg(windows)]
+pub(crate) fn still_named(file: &std::fs::File, path: &Path) -> bool {
+    use std::os::windows::io::AsRawHandle;
+    use windows_sys::Win32::Storage::FileSystem::{
+        GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+    };
+    fn id(file: &std::fs::File) -> Option<(u32, u32, u32)> {
+        // SAFETY: zeroed plain data the call fills in.
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        let handle = file.as_raw_handle() as windows_sys::Win32::Foundation::HANDLE;
+        // SAFETY: a live handle and a valid out pointer.
+        let ok = unsafe { GetFileInformationByHandle(handle, &mut info) };
+        (ok != 0).then_some((
+            info.dwVolumeSerialNumber,
+            info.nFileIndexHigh,
+            info.nFileIndexLow,
+        ))
+    }
+    // A file pending deletion can no longer be opened by name.
+    let Ok(named) = std::fs::File::open(path) else {
+        return false;
+    };
+    matches!((id(file), id(&named)), (Some(open), Some(now)) if open == now)
+}
+
+/// Remove machine `name`'s bindings lock, once its record is gone. A lock
+/// someone holds is left for the sweep of orphaned locks
+/// ([`crate::agent::fork::prune_orphaned_fork_source_locks`]); the file is
+/// unlinked only while held here, and only if the path still names it, so
+/// a locker never ends up holding a file another holder does not see.
+pub(crate) fn remove_bindings_lock(name: &str) {
+    remove_bindings_lock_at(&bindings_lock_path(name));
+}
+
+fn remove_bindings_lock_at(path: &Path) {
+    let Ok(file) = open_existing_lock_file(path) else {
+        return;
+    };
+    if crate::agent::fork::try_lock_file_exclusive(&file).is_err() {
+        return;
+    }
+    if still_named(&file, path) {
+        let _ = std::fs::remove_file(path);
+    }
+}
+
+#[cfg(unix)]
+fn open_existing_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
+}
+
 #[cfg(not(unix))]
-fn still_named(_file: &std::fs::File, _path: &Path) -> bool {
-    true
+fn open_existing_lock_file(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
 }
 
 /// Apply `next`'s bindings to running machine `name`, whose record is
@@ -865,7 +1010,12 @@ pub fn apply_live_bindings(
         .check_live_credentials(next, crate::agent::running_on_pod_network(name))
         .map_err(BindingsError::Conflict)?;
     // Removing every binding still reaches the boot process, as an empty set.
-    if before.credential_policy.is_none() && next.credential_policy.is_none() {
+    // Nothing to nothing changes nothing, unless an undo failed earlier and
+    // the boot process may hold bindings the record does not: then it is
+    // sent the record's (none), if it serves its socket at all. One that
+    // does not has no interceptor, so holds no bindings.
+    let socket = crate::agent::vm_data_dir(name).join(CREDENTIALS_SOCKET);
+    if !reaches_boot_process(before, next, || std::fs::symlink_metadata(&socket).is_ok()) {
         return Ok(None);
     }
     let policy = next.credential_policy.clone().unwrap_or_default();
@@ -882,26 +1032,37 @@ pub fn apply_live_bindings(
             next.secret_refs.clone()
         },
     };
+    // Undo what the boot process took, and say what failed: plainly when
+    // the undo worked, as unsettled when it did not.
+    let undo = |cause: Error, kind: fn(Error) -> BindingsError| match roll_back_live_bindings(name)
+    {
+        Ok(()) => kind(cause),
+        Err(undo) => unsettled(name, &cause, &[undo.to_string()]),
+    };
     let reply = match crate::agent::apply_live_credential_policy(name, &message) {
         Ok(reply) => reply,
-        Err(error) => {
-            // The boot process may have applied it and only the answer was
-            // lost (a timeout): put back what it had. One that refused it
-            // kept nothing to roll back to, and says so.
-            roll_back_live_bindings(name);
-            return Err(BindingsError::Conflict(error));
-        }
+        // The boot process may have applied it and only the answer was
+        // lost (a timeout): put back what it had. One that refused it kept
+        // nothing to roll back to, and says so.
+        Err(error) => return Err(undo(error, BindingsError::Conflict)),
     };
     let pem = rustls_pemfile::certs(&mut reply.ca_pem.as_bytes())
         .next()
         .and_then(|der| der.ok())
         .map(|der| pem_certificate(&der));
     let Some(pem) = pem else {
-        roll_back_live_bindings(name);
-        return Err(BindingsError::Failed(Error::config(
-            "credentials",
-            "the boot process answered without a CA certificate",
-        )));
+        // A boot process that never had bindings and is given none has no
+        // CA to answer with, and the guest needs none.
+        if next.credential_policy.is_none() && reply.ca_pem.is_empty() {
+            return Ok(None);
+        }
+        return Err(undo(
+            Error::config(
+                "credentials",
+                "the boot process answered without a CA certificate",
+            ),
+            BindingsError::Failed,
+        ));
     };
     let fingerprint = CredentialLaunch::ca_fingerprint(&pem);
     if !guest_needs_ca(before, &pem) {
@@ -920,11 +1081,23 @@ pub fn apply_live_bindings(
     };
     match installed {
         Ok(()) => Ok(Some(fingerprint)),
-        Err(error) => {
-            roll_back_live_bindings(name);
-            Err(BindingsError::Conflict(error))
-        }
+        Err(error) => Err(undo(error, BindingsError::Conflict)),
     }
+}
+
+/// Whether a change from `before` to `next` must be sent to the running
+/// machine's boot process: any that has or had a binding, and one from none
+/// to none only while the record is unsettled and the boot process serves
+/// its socket (`serves_socket`); one that does not has no interceptor, so
+/// holds no binding.
+fn reaches_boot_process(
+    before: &VmRecord,
+    next: &VmRecord,
+    serves_socket: impl FnOnce() -> bool,
+) -> bool {
+    before.credential_policy.is_some()
+        || next.credential_policy.is_some()
+        || (before.credential_bindings_unsettled && serves_socket())
 }
 
 /// Whether a running machine's guest must be handed CA certificate `pem`:
@@ -935,12 +1108,22 @@ fn guest_needs_ca(before: &VmRecord, pem: &str) -> bool {
     before.credential_ca_trusted.as_deref() != Some(CredentialLaunch::ca_fingerprint(pem).as_str())
 }
 
+/// What a boot process answers to a rollback when the last bindings it was
+/// sent were refused, or none were: it holds what it held, so there is
+/// nothing to undo.
+pub const NOTHING_TO_ROLL_BACK: &str = "there are no replaced bindings to restore";
+
 /// Return running machine `name`'s boot process to the bindings, sources and
-/// values it had before the last bindings it was sent. Best effort: the error
-/// that caused it is what the caller reports.
-fn roll_back_live_bindings(name: &str) {
-    if let Err(error) = crate::agent::roll_back_live_credential_policy(name) {
-        tracing::warn!(machine = name, %error, "could not restore the previous credential bindings");
+/// values it had before the last bindings it was sent. A boot process with
+/// nothing to undo (it refused them) is already there.
+fn roll_back_live_bindings(name: &str) -> Result<()> {
+    match crate::agent::roll_back_live_credential_policy(name) {
+        Ok(()) => Ok(()),
+        Err(error) if error.to_string().contains(NOTHING_TO_ROLL_BACK) => Ok(()),
+        Err(error) => {
+            tracing::warn!(machine = name, %error, "could not restore the previous credential bindings");
+            Err(error)
+        }
     }
 }
 
@@ -1287,6 +1470,23 @@ impl LiveCredentials {
                 missing.name
             ));
         }
+        if state.running.is_none() && message.policy.credentials.is_empty() {
+            // No bindings before and none now: no interceptor to start and
+            // no CA to make. Accepted (a host settling a machine whose undo
+            // failed sends exactly this), and undone like any other.
+            state.previous = Some(Previous {
+                policy: std::mem::take(&mut state.policy),
+                placeholders: std::mem::take(&mut state.placeholders),
+                supplied_only: state.supplied_only,
+                resolver: None,
+                kept: Vec::new(),
+                values_since: BTreeMap::new(),
+            });
+            state.supplied_only = message.supplied_only;
+            return Ok(BindingsReply {
+                ca_pem: String::new(),
+            });
+        }
         let (ca, _) =
             ensure_lineage_ca(&self.identity, &message.policy).map_err(|e| e.to_string())?;
         let reply = BindingsReply {
@@ -1426,7 +1626,7 @@ impl LiveCredentials {
     fn roll_back(&self) -> std::result::Result<(), String> {
         let mut state = self.state.lock().unwrap_or_else(|e| e.into_inner());
         let Some(previous) = state.previous.take() else {
-            return Err("there are no replaced bindings to restore".to_string());
+            return Err(NOTHING_TO_ROLL_BACK.to_string());
         };
         match previous.resolver {
             Some(mut resolver_state) => {
@@ -2057,6 +2257,25 @@ mod tests {
         assert!(send(dir.path(), r#"{"values":{"a":"x"}}"#).contains("no credential binding 'a'"));
     }
 
+    /// A machine with no bindings, sent none (a host settling it after a
+    /// failed undo), takes them without starting an interceptor or making a
+    /// CA, answers with no certificate, and can be rolled back.
+    #[test]
+    fn no_bindings_sent_to_a_machine_without_any_change_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let live = serve_unbound(dir.path());
+        let none = launch_in(dir.path(), &[], false);
+        let reply = send(dir.path(), &bindings_message(&none));
+        let (ok, data) = reply.split_once('\n').expect("ok and the reply");
+        assert_eq!(ok, "ok");
+        let reply: BindingsReply = serde_json::from_str(data).unwrap();
+        assert!(reply.ca_pem.is_empty());
+        assert!(!dir.path().join("ca").exists(), "no CA made");
+        assert!(live.state.lock().unwrap().running.is_none());
+        assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
+        assert!(send(dir.path(), r#"{"rollback":true}"#).contains(NOTHING_TO_ROLL_BACK));
+    }
+
     /// A value is sent tagged with the binding it was read for, and refused
     /// when the boot process has another binding of that name by then.
     #[test]
@@ -2308,10 +2527,12 @@ mod tests {
         assert!(still_named(&held, &lock));
     }
 
-    /// A stand-in for a running machine's boot process.
+    /// A stand-in for a running machine's boot process, whose undo can be
+    /// made to fail.
     #[derive(Default)]
     struct FakeBootProcess {
         calls: Mutex<Vec<&'static str>>,
+        undo_fails: bool,
     }
 
     impl LiveBindings for FakeBootProcess {
@@ -2325,8 +2546,12 @@ mod tests {
             Ok(Some("new-ca-fingerprint".into()))
         }
 
-        fn roll_back(&self, _name: &str) {
+        fn roll_back(&self, _name: &str) -> Result<()> {
             self.calls.lock().unwrap().push("roll_back");
+            if self.undo_fails {
+                return Err(Error::config("credentials", "the socket is gone"));
+            }
+            Ok(())
         }
     }
 
@@ -2343,6 +2568,38 @@ mod tests {
         )
     }
 
+    /// Replace `name`'s bindings with exactly `policy`, as `caller`.
+    fn put(
+        db: &crate::db::SmolvmDb,
+        name: &str,
+        policy: CredentialPolicy,
+        caller: crate::machine_spec::Caller,
+        live: &FakeBootProcess,
+    ) -> std::result::Result<VmRecord, BindingsError> {
+        set_bindings_with(
+            db,
+            name,
+            caller,
+            None,
+            |_| Ok(policy),
+            live,
+            |_, _, _| Ok(()),
+        )
+    }
+
+    /// A machine record in `db`: running (this process) or stopped.
+    fn machine_in(db: &crate::db::SmolvmDb, tag: &str, running: bool) -> (String, VmRecord) {
+        let name = unique_machine(tag);
+        let mut record = VmRecord::new(name.clone(), 1, 512, vec![], vec![], true);
+        if running {
+            record.state = crate::config::RecordState::Running;
+            record.pid = Some(std::process::id() as i32);
+            record.pid_start_time = None;
+        }
+        db.insert_vm(&name, &record).unwrap();
+        (name, record)
+    }
+
     /// When what runs after the change fails (the CLI handing a running
     /// machine its values), the change is undone: the record and the boot
     /// process are back to the bindings they had, so the failed command has
@@ -2352,29 +2609,23 @@ mod tests {
         use crate::machine_spec::Caller;
         let (_dir, db) = test_db();
         for running in [true, false] {
-            let name = unique_machine(if running {
-                "then-running"
-            } else {
-                "then-stopped"
-            });
-            let mut record = VmRecord::new(name.clone(), 1, 512, vec![], vec![], true);
+            let (name, mut record) = machine_in(
+                &db,
+                if running {
+                    "then-running"
+                } else {
+                    "then-stopped"
+                },
+                running,
+            );
             record.secret_refs.insert(
                 "GH_TOKEN".into(),
                 crate::secrets::file_ref("/operator/gh-token"),
             );
-            if running {
-                record.state = crate::config::RecordState::Running;
-                record.pid = Some(std::process::id() as i32);
-                record.pid_start_time = None;
-            }
             db.insert_vm(&name, &record).unwrap();
             let first = bindings_of(&["gh=GH_TOKEN@github.com"]);
             let fake = FakeBootProcess::default();
-            let bound =
-                set_bindings_with(&db, &name, first.clone(), Caller::Cli, &fake, |_, _, _| {
-                    Ok(())
-                })
-                .unwrap();
+            let bound = put(&db, &name, first.clone(), Caller::Cli, &fake).unwrap();
             assert_eq!(bound.credential_policy.as_ref(), Some(&first));
             supply_values(
                 &name,
@@ -2387,8 +2638,9 @@ mod tests {
             let failed = set_bindings_with(
                 &db,
                 &name,
-                CredentialPolicy::default(),
                 Caller::Cli,
+                Some(&Default::default()),
+                |_| Ok(CredentialPolicy::default()),
                 &fake,
                 |_, saved, _| {
                     assert!(saved.credential_policy.is_none(), "runs after the change");
@@ -2399,6 +2651,7 @@ mod tests {
             let after = db.get_vm(&name).unwrap().unwrap();
             assert_eq!(after.credential_policy.as_ref(), Some(&first));
             assert_eq!(after.credential_placeholders, bound.credential_placeholders);
+            assert!(!after.credential_bindings_unsettled);
             assert!(
                 after.secret_refs.contains_key("GH_TOKEN"),
                 "the reference the removal would have dropped is back"
@@ -2420,8 +2673,194 @@ mod tests {
                 "a value for a binding that stays is kept"
             );
             forget_values(&name);
-            let _ = std::fs::remove_file(bindings_lock_path(&name));
+            db.remove_vm(&name).unwrap();
         }
+    }
+
+    /// An undo that fails is reported as such, not as a plain conflict: the
+    /// error says the machine may be inconsistent and how to recover, the
+    /// record says so too, and the next change, even one that leaves the
+    /// record as it is, reaches the machine and settles it.
+    #[test]
+    fn a_failed_undo_is_reported_and_the_next_change_settles_it() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, _) = machine_in(&db, "unsettled", true);
+        let broken = FakeBootProcess {
+            undo_fails: true,
+            ..Default::default()
+        };
+        let failed = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["gh".to_string()].into()),
+            |_| Ok(bindings_of(&["gh=GH_TOKEN@github.com"])),
+            &broken,
+            |_, _, _| Err(Error::config("credentials", "could not hand over values")),
+        );
+        let Err(BindingsError::Unsettled(error)) = failed else {
+            panic!("expected an unsettled error, got {failed:?}");
+        };
+        let message = error.to_string();
+        assert!(message.contains("could not hand over values"), "{message}");
+        assert!(message.contains("the socket is gone"), "{message}");
+        assert!(
+            message.contains("may now hold different bindings"),
+            "{message}"
+        );
+        assert!(message.contains("--credential"), "{message}");
+        let record = db.get_vm(&name).unwrap().unwrap();
+        assert!(record.credential_bindings_unsettled);
+        assert_eq!(record.credential_policy, None, "the record was restored");
+
+        // Setting what the record already holds (nothing) still reaches the
+        // machine, and settles it.
+        let live = FakeBootProcess::default();
+        let settled = put(&db, &name, CredentialPolicy::default(), Caller::Api, &live).unwrap();
+        assert_eq!(*live.calls.lock().unwrap(), vec!["apply"]);
+        assert!(!settled.credential_bindings_unsettled);
+        assert!(
+            !db.get_vm(&name)
+                .unwrap()
+                .unwrap()
+                .credential_bindings_unsettled
+        );
+        db.remove_vm(&name).unwrap();
+    }
+
+    /// Nothing to nothing reaches the boot process only while the record is
+    /// unsettled and the boot process serves its socket.
+    #[test]
+    fn an_unsettled_machine_is_sent_even_an_unchanged_set() {
+        let mut before = VmRecord::new("settle".into(), 1, 512, vec![], vec![], true);
+        let none = before.clone();
+        assert!(!reaches_boot_process(&before, &none, || true));
+        before.credential_bindings_unsettled = true;
+        assert!(reaches_boot_process(&before, &none, || true));
+        assert!(!reaches_boot_process(&before, &none, || false));
+        let mut bound = none.clone();
+        bound.credential_policy = Some(bindings_of(&["a=A@api.a.com"]));
+        assert!(reaches_boot_process(&none, &bound, || false));
+        assert!(reaches_boot_process(&bound, &none, || false));
+    }
+
+    /// The CLI builds its change from the record under the change's lock:
+    /// a binding someone revoked while the command was starting stays
+    /// revoked, and one an API caller set stays theirs.
+    #[test]
+    fn the_cli_edits_the_record_as_the_lock_finds_it() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, _) = machine_in(&db, "cli-edit", false);
+        let live = FakeBootProcess::default();
+        put(
+            &db,
+            &name,
+            bindings_of(&["a=A_KEY@api.a.com", "b=B_KEY@api.b.com"]),
+            Caller::Cli,
+            &live,
+        )
+        .unwrap();
+        // The CLI read the record here, then someone revoked `b`.
+        let stale = db.get_vm(&name).unwrap().unwrap();
+        put(
+            &db,
+            &name,
+            bindings_of(&["a=A_KEY@api.a.com"]),
+            Caller::Cli,
+            &live,
+        )
+        .unwrap();
+        let edited = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["c".to_string()].into()),
+            |locked| {
+                assert_ne!(locked.credential_policy, stale.credential_policy);
+                let mut policy = locked.credential_policy.clone().unwrap_or_default();
+                policy
+                    .credentials
+                    .push(parse_credential_flag("c=C_KEY@api.c.com").unwrap());
+                Ok(policy)
+            },
+            &live,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        let names: Vec<&str> = edited
+            .credential_policy
+            .iter()
+            .flat_map(|p| p.credentials.iter().map(|b| b.name.as_str()))
+            .collect();
+        assert_eq!(names, ["a", "c"], "the revoked binding does not come back");
+        db.remove_vm(&name).unwrap();
+    }
+
+    /// The race the lock closes, replayed with the CLI's stale view: an API
+    /// caller sets `evil` to read `AWS_SECRET_ACCESS_KEY` for its own host,
+    /// then clears every binding, which makes the machine's values come from
+    /// this host again. A CLI command that names only `gh` but carries
+    /// `evil` from an earlier read is refused, and nothing changes: no
+    /// binding the operator did not name ever reads this host's values.
+    #[test]
+    fn a_binding_the_operator_did_not_name_never_reads_this_host() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, _) = machine_in(&db, "unnamed", false);
+        let live = FakeBootProcess::default();
+        let evil = "evil=AWS_SECRET_ACCESS_KEY@attacker.example";
+        put(&db, &name, bindings_of(&[evil]), Caller::Api, &live).unwrap();
+        let stale = db.get_vm(&name).unwrap().unwrap();
+        assert!(stale.credentials_supplied_by_api);
+        put(&db, &name, CredentialPolicy::default(), Caller::Api, &live).unwrap();
+        assert!(
+            !db.get_vm(&name)
+                .unwrap()
+                .unwrap()
+                .credentials_supplied_by_api
+        );
+
+        let refused = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["gh".to_string()].into()),
+            |_| Ok(bindings_of(&[evil, "gh=GH_TOKEN@github.com"])),
+            &live,
+            |_, _, _| panic!("nothing runs after a refused change"),
+        );
+        let Err(BindingsError::Conflict(error)) = refused else {
+            panic!("expected a conflict, got {refused:?}");
+        };
+        assert!(error.to_string().contains("'evil'"), "{error}");
+        assert_eq!(db.get_vm(&name).unwrap().unwrap().credential_policy, None);
+
+        // Named, it is the operator's own binding.
+        let named = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["evil".to_string(), "gh".to_string()].into()),
+            |_| Ok(bindings_of(&[evil, "gh=GH_TOKEN@github.com"])),
+            &live,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(!named.credentials_supplied_by_api);
+        // A host-sourced binding left as it was needs no naming again.
+        set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&Default::default()),
+            |locked| Ok(locked.credential_policy.clone().unwrap_or_default()),
+            &live,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        db.remove_vm(&name).unwrap();
     }
 
     /// Bindings of a machine that does not exist are refused before anything
@@ -2432,16 +2871,36 @@ mod tests {
         let (_dir, db) = test_db();
         let name = unique_machine("unknown");
         let fake = FakeBootProcess::default();
-        let refused = set_bindings_with(
+        let refused = put(
             &db,
             &name,
             bindings_of(&["gh=GH_TOKEN@github.com"]),
             Caller::Api,
             &fake,
-            |_, _, _| Ok(()),
         );
         assert!(matches!(refused, Err(BindingsError::Failed(_))));
         assert!(!crate::agent::vm_data_dir(&name).exists());
+        assert!(!bindings_lock_path(&name).exists());
+    }
+
+    /// Deleting a machine's record removes its bindings lock, unless someone
+    /// holds it (then the sweep of orphaned locks takes it later).
+    #[test]
+    fn deleting_a_machine_removes_its_bindings_lock() {
+        let (_dir, db) = test_db();
+        let (name, _) = machine_in(&db, "delete-lock", false);
+        drop(lock_bindings(&name).unwrap());
+        assert!(bindings_lock_path(&name).exists());
+        db.remove_vm(&name).unwrap();
+        assert!(!bindings_lock_path(&name).exists());
+
+        let (name, _) = machine_in(&db, "delete-held", false);
+        let held = lock_bindings(&name).unwrap();
+        // Another process's view: flock conflicts across descriptions.
+        remove_bindings_lock(&name);
+        assert!(bindings_lock_path(&name).exists(), "a held lock stays");
+        drop(held);
+        db.remove_vm(&name).unwrap();
         assert!(!bindings_lock_path(&name).exists());
     }
 

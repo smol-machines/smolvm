@@ -817,6 +817,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credentials_supplied_by_api: bool,
 
+    /// A change to the bindings of this running machine failed and could not
+    /// be undone, so its boot process may hold other bindings than this
+    /// record. The next change is sent to the machine even when it leaves the
+    /// record as it is, and a fresh start, which boots this record, clears it.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub credential_bindings_unsettled: bool,
+
     /// Whether the machine's last fresh boot mounted the credential CA as a
     /// boot device, which a checkpoint or pause taken from that boot holds in
     /// its device set and needs again on restore. `None` on records from
@@ -1112,6 +1119,7 @@ impl VmRecord {
             mediated_egress_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
+            credential_bindings_unsettled: false,
             credential_ca_device: None,
             credential_ca_trusted: None,
             guest_credential_trust: None,
@@ -1225,6 +1233,7 @@ impl VmRecord {
             mediated_egress_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
+            credential_bindings_unsettled: false,
             credential_ca_device: None,
             credential_ca_trusted: None,
             guest_credential_trust: None,
@@ -2051,6 +2060,7 @@ impl VmRecord {
         self.credential_policy = next.credential_policy.clone();
         self.credential_placeholders = next.credential_placeholders.clone();
         self.credentials_supplied_by_api = next.credentials_supplied_by_api;
+        self.credential_bindings_unsettled = next.credential_bindings_unsettled;
         self.credential_ca_device = next.credential_ca_device;
         self.credential_ca_trusted = next.credential_ca_trusted.clone();
         self.secret_refs = next.secret_refs.clone();

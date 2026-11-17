@@ -723,6 +723,10 @@ impl SmolvmDb {
         .inspect(|removed| {
             if let Some(record) = removed {
                 crate::usage::on_remove(name, record);
+                // The machine's bindings lock sits beside its data directory,
+                // so removing that directory never takes it: every delete
+                // path removes the record, so this is where it goes.
+                crate::credentials::remove_bindings_lock(name);
             }
         })
     }

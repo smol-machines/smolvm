@@ -412,8 +412,33 @@ fn forkable_in_running_config(path: &Path) -> Option<bool> {
 }
 
 fn running_config_at(path: &Path) -> Option<RunningVmConfig> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<RunningVmConfig>(&content).ok()
+    serde_json::from_slice::<RunningVmConfig>(&read_running_config(path).ok()?).ok()
+}
+
+/// Largest running configuration read back: mounts, ports and resources.
+const MAX_RUNNING_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a running configuration from the machine's data directory, which the
+/// machine's own user owns under per-VM uid isolation while the reader may be
+/// root: never through a link, never blocking on a FIFO, never past
+/// [`MAX_RUNNING_CONFIG_BYTES`].
+fn read_running_config(path: &Path) -> std::io::Result<Vec<u8>> {
+    let (dir, name) = split_file_path(path)?;
+    crate::nofollow::read(dir, &[name], MAX_RUNNING_CONFIG_BYTES)
+}
+
+/// Replace a running configuration in the machine's data directory, never
+/// writing through a link left there.
+fn write_running_config(path: &Path, json: &[u8]) -> std::io::Result<()> {
+    let (dir, name) = split_file_path(path)?;
+    crate::nofollow::write_replacing(dir, &[name], json, 0o644)
+}
+
+fn split_file_path(path: &Path) -> std::io::Result<(&Path, &str)> {
+    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) => Ok((dir, name)),
+        _ => Err(std::io::Error::from(std::io::ErrorKind::InvalidInput)),
+    }
 }
 
 /// Whether the VM named `name` is running on a Kubernetes pod network, as its
@@ -2569,13 +2594,8 @@ impl AgentManager {
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
-                let tmp = self.config_file.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp, &json) {
-                    tracing::warn!(error = %e, "failed to write VM config tmp file");
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp, &self.config_file) {
-                    tracing::warn!(error = %e, "failed to rename VM config file");
+                if let Err(e) = write_running_config(&self.config_file, json.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to write VM config file");
                 }
             }
             Err(e) => {
@@ -2589,9 +2609,9 @@ impl AgentManager {
     /// Returns an error string describing why the load failed, so callers
     /// can log it and treat the config as unknown (fail-closed).
     fn load_running_config(&self) -> std::result::Result<RunningVmConfig, String> {
-        let content = std::fs::read_to_string(&self.config_file)
+        let content = read_running_config(&self.config_file)
             .map_err(|e| format!("config file {}: {}", self.config_file.display(), e))?;
-        serde_json::from_str(&content)
+        serde_json::from_slice(&content)
             .map_err(|e| format!("invalid JSON in {}: {}", self.config_file.display(), e))
     }
 
@@ -3337,13 +3357,22 @@ impl AgentManager {
         // Held until this boot is up: a change to the machine's bindings
         // waits for it, and this boot never reads bindings a change is
         // replacing.
+        // Only a machine with a record has bindings to change, so only one
+        // takes the lock: a helper or an unregistered run leaves no lock file.
         let _bindings_lock = match self.name() {
-            Some(name) => Some(crate::credentials::lock_bindings(name)?),
-            None => None,
+            Some(name) if crate::db::SmolvmDb::open()?.get_vm(name)?.is_some() => {
+                Some(crate::credentials::lock_bindings(name)?)
+            }
+            _ => None,
         };
         if let Some(name) = self.name() {
             let db = crate::db::SmolvmDb::open()?;
             if let Some(record) = db.get_vm(name)? {
+                // This boot enforces the record's bindings, whatever a failed
+                // undo left in the boot process it replaces.
+                if record.credential_bindings_unsettled {
+                    db.update_vm(name, |r| r.credential_bindings_unsettled = false)?;
+                }
                 // The userland this boot runs on, for the checkpoints and pauses
                 // taken from it. A branch boots its golden's live snapshot, so
                 // it runs on the golden's rootfs: after a roll that installed a
@@ -5316,6 +5345,34 @@ mod tests {
         assert_eq!(super::forkable_in_running_config(&path), Some(false));
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(super::forkable_in_running_config(&path), None);
+    }
+
+    /// The host reads and writes a machine's running configuration without
+    /// following links: a link to `/dev/zero` or a FIFO left in its place is
+    /// refused at once, not read forever or waited on, and a write replaces
+    /// the link instead of writing through it.
+    #[cfg(unix)]
+    #[test]
+    fn the_running_configuration_is_read_and_written_without_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+        assert!(read_running_config(&path).is_err());
+        assert_eq!(super::forkable_in_running_config(&path), None);
+        std::fs::remove_file(&path).unwrap();
+        let c = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(c.as_ptr(), 0o600) }, 0);
+        assert!(read_running_config(&path).is_err(), "refused, not blocked");
+        std::fs::remove_file(&path).unwrap();
+
+        let elsewhere = tempfile::tempdir().unwrap();
+        let target = elsewhere.path().join("root-file");
+        std::fs::write(&target, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        write_running_config(&path, br#"{"x":1}"#).unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"untouched");
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_file());
     }
 
     #[test]

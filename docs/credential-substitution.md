@@ -213,6 +213,11 @@ what is supplied, as at create; so do the bindings a machine already had from
 such a caller, even when the CLI edits them later. When an API caller or
 embedder replaces bindings of a machine whose values came from this host, no
 binding keeps a host variable, file or value; their placeholders stay.
+`machine update --credential` builds the new set from the machine's bindings
+as they are when the change takes its lock, so a binding someone revoked
+meanwhile stays revoked; and a binding starts reading this host's values only
+if the command names it (or it already read them), so a binding an API caller
+set never does, even when the bindings were cleared in between.
 
 The machine's boot process, running as the machine's own user, creates and
 widens the CA itself; the server or CLI never writes credential state into the
@@ -231,8 +236,14 @@ change that fails part-way (the guest cannot take the new CA, the answer is
 lost, the record cannot be saved, or the CLI cannot hand the machine the
 values for its new bindings) is rolled back, in the record and in the running
 machine, to exactly the previous bindings, sources and values, keeping values
-sent since for the bindings it restores. Changes to one machine's bindings, and its starts, are serialized
-across processes, and every start enforces the bindings its record holds.
+sent since for the bindings it restores. If that undo itself fails, the
+change is reported as such (`500` over the API): the error says the record and
+the running machine may hold different bindings, and to set the bindings again
+or restart the machine. The record remembers it, so the next change is sent to
+the machine even when it leaves the record as it is, and a start, which boots
+the record, settles it too. Changes to one machine's bindings, and its starts,
+are serialized across processes, and every start enforces the bindings its
+record holds. The lock file goes with the machine's record.
 
 ## Setting a header
 

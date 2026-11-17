@@ -6894,6 +6894,7 @@ pub struct UpdateCmd {
 fn host_values_for_new_bindings(
     before: &smolvm::config::VmRecord,
     saved: &smolvm::config::VmRecord,
+    named: &std::collections::BTreeSet<String>,
 ) -> std::collections::BTreeMap<String, zeroize::Zeroizing<String>> {
     let previous = before.credential_policy.clone().unwrap_or_default();
     let mut values = std::collections::BTreeMap::new();
@@ -6905,7 +6906,9 @@ fn host_values_for_new_bindings(
         let unchanged = previous
             .binding(&binding.name)
             .is_some_and(|old| old.environment_variable == binding.environment_variable);
+        // Only a binding this command names is read from this environment.
         if unchanged
+            || !named.contains(&binding.name)
             || saved
                 .secret_refs
                 .contains_key(&binding.environment_variable)
@@ -7133,28 +7136,39 @@ impl UpdateCmd {
 
     /// Replace the machine's credential bindings, in any state; a running
     /// machine enforces them at once.
-    fn update_credentials(
-        &self,
-        db: &smolvm::db::SmolvmDb,
-        record: &smolvm::config::VmRecord,
-    ) -> smolvm::Result<()> {
-        let policy = self.next_credentials(record)?;
+    fn update_credentials(&self, db: &smolvm::db::SmolvmDb) -> smolvm::Result<()> {
+        // The bindings this command names; only they may start reading this
+        // host's values.
+        let named: std::collections::BTreeSet<String> = self
+            .credential
+            .iter()
+            .filter_map(|spec| smolvm::credentials::parse_credential_flag(spec).ok())
+            .map(|binding| binding.name)
+            .collect();
         let mut running = false;
-        // The values go to the boot process before the change's lock is
-        // released, tagged with the bindings they were read for: no other
-        // change can land between, and the boot process refuses them if one
-        // somehow did.
-        let saved = smolvm::credentials::set_bindings_then(
+        let mut before: Vec<String> = Vec::new();
+        // The new bindings are built from the record as the change's lock
+        // finds it, never from one read earlier, so a change made meanwhile
+        // is neither lost nor undone. The values go to the boot process
+        // before the lock is released, tagged with the bindings they were
+        // read for: no other change can land between, and the boot process
+        // refuses them if one somehow did.
+        let saved = smolvm::credentials::edit_bindings_from_cli(
             db,
             &self.name,
-            policy,
-            smolvm::machine_spec::Caller::Cli,
-            |before, saved, is_running| {
+            &named,
+            |record| self.next_credentials(record),
+            |locked, saved, is_running| {
                 running = is_running;
+                before = locked
+                    .credential_policy
+                    .iter()
+                    .flat_map(|p| p.credentials.iter().map(|b| b.name.clone()))
+                    .collect();
                 if !is_running || saved.credentials_supplied_by_api {
                     return Ok(());
                 }
-                let values = host_values_for_new_bindings(before, saved);
+                let values = host_values_for_new_bindings(locked, saved, &named);
                 if values.is_empty() {
                     return Ok(());
                 }
@@ -7168,11 +7182,6 @@ impl UpdateCmd {
                 )
             },
         )?;
-        let before: Vec<&str> = record
-            .credential_policy
-            .iter()
-            .flat_map(|p| p.credentials.iter().map(|b| b.name.as_str()))
-            .collect();
         let after = saved.credential_policy.clone().unwrap_or_default();
         println!(
             "Updated machine '{}'{}:",
@@ -7189,7 +7198,7 @@ impl UpdateCmd {
             }
         }
         for binding in &after.credentials {
-            let verb = if before.contains(&binding.name.as_str()) {
+            let verb = if before.contains(&binding.name) {
                 "credential"
             } else {
                 "added credential"
@@ -7363,7 +7372,7 @@ impl UpdateCmd {
                      run the other changes separately",
                 ));
             }
-            self.update_credentials(&db, &record)?;
+            self.update_credentials(&db)?;
             if !(egress || ports || other) {
                 return if labels {
                     self.update_labels(&db, &set_labels)

@@ -4196,18 +4196,13 @@ fn install_credential_ca(
             .map_err(|e| Error::agent("read checkpoint credential CA", e.to_string()))?,
     );
     let _ = std::fs::remove_file(&staged);
-    // Never write the key through a link someone left in the machine's
-    // directory.
-    let ca_dir = vm_data_dir.join(crate::credentials::CA_DIR_NAME);
-    if std::fs::symlink_metadata(&ca_dir).is_ok_and(|meta| !meta.is_dir()) {
-        return Err(Error::agent(
-            "install checkpoint credential CA",
-            format!("{} is not a directory", ca_dir.display()),
-        ));
-    }
-    smolvm_credentials::MachineCa::import(&document)
-        .and_then(|ca| ca.save(&ca_dir))
-        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))
+    let ca = smolvm_credentials::MachineCa::import(&document)
+        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))?;
+    // The machine's directory may be its user's (a paused machine resumed
+    // from this checkpoint): never write the key, or anything else, through
+    // a link left in it.
+    crate::credentials::save_ca_without_links(&ca, vm_data_dir)
+        .map_err(|e| Error::agent("install checkpoint credential CA", e.to_string()))
 }
 
 fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
@@ -7979,6 +7974,30 @@ mod tests {
             .unwrap()
             .next()
             .is_none());
+
+        // Nor through a link below it: `credentials/guest` linked elsewhere,
+        // or the key itself linked to a file root owns.
+        let machine = tempfile::tempdir().unwrap();
+        let ca_dir = machine.path().join(crate::credentials::CA_DIR_NAME);
+        std::fs::create_dir(&ca_dir).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), ca_dir.join("guest")).unwrap();
+        let root_file = elsewhere.path().join("root-owned");
+        std::fs::write(&root_file, b"untouched").unwrap();
+        std::os::unix::fs::symlink(&root_file, ca_dir.join("ca.key")).unwrap();
+        assert!(
+            install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset)
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&root_file).unwrap(), b"untouched");
+        assert_eq!(
+            std::fs::read_dir(elsewhere.path()).unwrap().count(),
+            1,
+            "nothing written into the linked directory"
+        );
+        // The key's link was replaced, not followed.
+        assert!(std::fs::symlink_metadata(ca_dir.join("ca.key"))
+            .unwrap()
+            .is_file());
     }
 
     /// An extracted checkpoint with raw storage and overlay disks, ready to install.
