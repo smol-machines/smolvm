@@ -51,8 +51,7 @@ use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
 use crate::data::validate_vm_name;
 use crate::process::{
-    is_alive, is_our_process_strict, process_start_time, stop_vm_process, VM_SIGKILL_TIMEOUT,
-    VM_SIGTERM_TIMEOUT,
+    is_alive, is_our_process_strict, process_start_time, VM_SIGKILL_TIMEOUT, VM_SIGTERM_TIMEOUT,
 };
 use crate::storage::{expand_disk, DEFAULT_OVERLAY_SIZE_GIB, DEFAULT_STORAGE_SIZE_GIB};
 use crate::util::generate_machine_name;
@@ -1575,33 +1574,89 @@ async fn upload_checkpoint_file(
                 let file = file.clone();
                 let progress = progress.clone();
                 async move {
-                    let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
-                        file, start, length, progress,
-                    ));
-                    let response = client
-                        .put(url)
-                        .header(header::CONTENT_TYPE, "application/octet-stream")
-                        .header(header::CONTENT_LENGTH, length)
-                        .body(body)
-                        .send()
-                        .await
-                        .map_err(|error| {
-                            ApiError::internal(format!(
-                                "upload checkpoint part {index} to object store: {}",
-                                error.without_url()
-                            ))
-                        })?;
-                    if !response.status().is_success() {
-                        return Err(ApiError::internal(format!(
-                            "object store refused checkpoint part {index}: {}",
-                            response.status()
-                        )));
-                    }
-                    Ok(())
+                    put_checkpoint_part(
+                        &client,
+                        url,
+                        file,
+                        (index, start, length),
+                        progress,
+                        PART_RETRY_BACKOFF,
+                    )
+                    .await
                 }
             });
     futures_util::future::try_join_all(uploads).await?;
     Ok(size)
+}
+
+/// Tries per checkpoint part. Each part is a whole PUT to its own pre-signed
+/// URL, so sending it again replaces the object and is safe to repeat. Object
+/// stores answer a small share of PUTs with 503 or 429 and expect the client
+/// to retry. Without retries, one refused part threw away minutes of upload
+/// work and failed the whole publish.
+const PART_UPLOAD_ATTEMPTS: u32 = 5;
+
+/// First wait before retrying a part; it doubles on each later try.
+const PART_RETRY_BACKOFF: Duration = Duration::from_secs(1);
+
+/// Whether the object store's answer to a part is worth sending again.
+fn retryable_part_status(status: reqwest::StatusCode) -> bool {
+    status.is_server_error()
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status == reqwest::StatusCode::REQUEST_TIMEOUT
+}
+
+/// PUT one part of a checkpoint artifact, retrying transient failures.
+async fn put_checkpoint_part(
+    client: &reqwest::Client,
+    url: reqwest::Url,
+    file: Arc<std::fs::File>,
+    (index, start, length): (usize, u64, u64),
+    progress: crate::api::progress::Progress,
+    backoff: Duration,
+) -> Result<(), ApiError> {
+    let mut wait = backoff;
+    for attempt in 1..=PART_UPLOAD_ATTEMPTS {
+        let body = reqwest::Body::wrap_stream(checkpoint_part_stream(
+            file.clone(),
+            start,
+            length,
+            progress.clone(),
+        ));
+        let failure = match client
+            .put(url.clone())
+            .header(header::CONTENT_TYPE, "application/octet-stream")
+            .header(header::CONTENT_LENGTH, length)
+            .body(body)
+            .send()
+            .await
+        {
+            Ok(response) if response.status().is_success() => return Ok(()),
+            Ok(response) if retryable_part_status(response.status()) => format!(
+                "object store refused checkpoint part {index}: {}",
+                response.status()
+            ),
+            Ok(response) => {
+                return Err(ApiError::internal(format!(
+                    "object store refused checkpoint part {index}: {}",
+                    response.status()
+                )))
+            }
+            Err(error) => format!(
+                "upload checkpoint part {index} to object store: {}",
+                error.without_url()
+            ),
+        };
+        if attempt == PART_UPLOAD_ATTEMPTS {
+            return Err(ApiError::internal(format!(
+                "{failure} (after {attempt} attempts)"
+            )));
+        }
+        tracing::warn!(part = index, attempt, error = %failure, "retrying checkpoint part upload");
+        tokio::time::sleep(wait).await;
+        wait *= 2;
+    }
+    unreachable!("the last attempt returns")
 }
 
 /// Create a machine by streaming a `.checkpoint` into this node.
@@ -1668,7 +1723,126 @@ fn checked_checkpoint_source(raw: &str) -> Result<reqwest::Url, ApiError> {
 
 #[cfg(test)]
 mod checkpoint_upload_tests {
-    use super::{checked_upload_urls, checkpoint_part_stream, upload_part_ranges};
+    use super::{
+        checked_upload_urls, checkpoint_part_stream, put_checkpoint_part, upload_part_ranges,
+    };
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    /// Serve PUTs on loopback, answering the first `refusals` with `status` and
+    /// later ones with 200 after checking the body. Returns the URL and a
+    /// count of requests seen.
+    async fn flaky_store(
+        refusals: usize,
+        status: u16,
+        expect: Vec<u8>,
+    ) -> (reqwest::Url, Arc<AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let seen = Arc::new(AtomicUsize::new(0));
+        let count = seen.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut sock, _) = listener.accept().await.unwrap();
+                let n = count.fetch_add(1, Ordering::SeqCst);
+                let expect = expect.clone();
+                let mut raw = Vec::new();
+                let mut buf = [0_u8; 65536];
+                let head_end = loop {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    raw.extend_from_slice(&buf[..read]);
+                    if let Some(i) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        break i + 4;
+                    }
+                };
+                while raw.len() - head_end < expect.len() {
+                    let read = sock.read(&mut buf).await.unwrap();
+                    if read == 0 {
+                        break;
+                    }
+                    raw.extend_from_slice(&buf[..read]);
+                }
+                assert_eq!(
+                    &raw[head_end..],
+                    &expect[..],
+                    "attempt {n} sent the whole part"
+                );
+                let code = if n < refusals { status } else { 200 };
+                let reply =
+                    format!("HTTP/1.1 {code} X\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+                sock.write_all(reply.as_bytes()).await.unwrap();
+            }
+        });
+        (format!("http://{addr}/part").parse().unwrap(), seen)
+    }
+
+    fn part_file(content: &[u8]) -> (tempfile::TempDir, Arc<std::fs::File>) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("artifact");
+        std::fs::write(&path, content).unwrap();
+        let file = Arc::new(std::fs::File::open(&path).unwrap());
+        (dir, file)
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_refuses_once_is_sent_again() {
+        let content: Vec<u8> = (0..300_000_u32).map(|i| (i % 253) as u8).collect();
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(2, 503, content[1000..201_000].to_vec()).await;
+        put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (14, 1000, 200_000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap();
+        assert_eq!(seen.load(Ordering::SeqCst), 3);
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_rejects_outright_is_not_retried() {
+        let content = vec![7_u8; 1000];
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(usize::MAX, 403, content.clone()).await;
+        let error = put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (0, 0, 1000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(format!("{error:?}").contains("403"), "{error:?}");
+        assert_eq!(seen.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn a_part_the_store_keeps_refusing_fails_after_the_last_attempt() {
+        let content = vec![9_u8; 1000];
+        let (_dir, file) = part_file(&content);
+        let (url, seen) = flaky_store(usize::MAX, 503, content.clone()).await;
+        let error = put_checkpoint_part(
+            &reqwest::Client::new(),
+            url,
+            file,
+            (3, 0, 1000),
+            crate::api::progress::Progress::default(),
+            std::time::Duration::from_millis(1),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{error:?}").contains("after 5 attempts"),
+            "{error:?}"
+        );
+        assert_eq!(seen.load(Ordering::SeqCst), 5);
+    }
 
     /// Parts read at once from one descriptor reassemble the file exactly, even
     /// after its name is gone, as when a resume consumes a paused checkpoint.
@@ -2433,9 +2607,10 @@ async fn reconcile_confirmed_stopped_machine(
 
     state
         .update_vm(name, move |record| {
-            record.state = RecordState::Stopped;
-            record.pid = None;
-            record.pid_start_time = None;
+            // Keeps the PID of a process the kernel is holding after SIGKILL,
+            // as the CLI and the embedded runtime do, so a later start is
+            // refused while that process has the machine's disks open.
+            record.mark_process_stopped();
             if explicitly_stopped {
                 // An explicit stop must suppress the restart supervisor even when
                 // the process had already exited before this request arrived.
@@ -2448,6 +2623,33 @@ async fn reconcile_confirmed_stopped_machine(
                 "machine '{name}' disappeared from database while reconciling its stopped state"
             ))
         })
+}
+
+/// The machine's recorded process, when it is this machine's and the kernel is
+/// holding it after SIGKILL.
+fn held_machine_process(
+    pid: Option<i32>,
+    pid_start_time: Option<u64>,
+) -> Option<crate::process::HeldProcess> {
+    let pid = pid?;
+    if !crate::process::is_our_process(pid, pid_start_time) {
+        return None;
+    }
+    crate::process::held_after_kill(pid)
+}
+
+/// Refuse an API start while the kernel still holds the machine's previous
+/// process, with the text the CLI and the embedded runtime use, and forget
+/// that process once it is gone.
+async fn refuse_start_while_held(state: &Arc<ApiState>, name: &str) -> Result<(), ApiError> {
+    let db = state.db().clone();
+    let machine = name.to_string();
+    tokio::task::spawn_blocking(move || {
+        crate::agent::state_probe::refuse_start_while_held(&db, &machine)
+    })
+    .await
+    .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+    .map_err(|error| ApiError::Conflict(error.to_string()))
 }
 
 /// How long to wait for a SIGKILLed VM process to exit before a delete gives up.
@@ -2490,6 +2692,12 @@ fn shutdown_machine_process(
             sweep_machine_scope(name);
             return true;
         }
+        // A process already killed and held by the kernel has no guest left
+        // to acknowledge anything, and no later request can stop it either.
+        if let Some(held) = held_machine_process(pid, pid_start_time) {
+            tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+            return true;
+        }
         tracing::warn!(
             name,
             "guest shutdown was not acknowledged; preserving the live VM and its disks"
@@ -2515,7 +2723,15 @@ fn shutdown_machine_process(
                 Duration::ZERO
             };
             crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(name), pid);
-            let _ = stop_vm_process(pid, sigterm, VM_SIGKILL_TIMEOUT);
+            if let Ok(crate::process::VmStop::Held(held)) =
+                crate::process::stop_vm_process_bounded(pid, sigterm, VM_SIGKILL_TIMEOUT)
+            {
+                // The kernel will not let the process exit and it runs no
+                // more code. Report the machine stopped instead of failing
+                // every later stop and delete until the host reboots.
+                tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+                return true;
+            }
         } else {
             tracing::debug!(pid, name, "PID already dead");
         }
@@ -2525,6 +2741,10 @@ fn shutdown_machine_process(
         // killing the systemd transient scope — its cgroup owns every process the
         // VM spawned — then wait briefly for the SIGKILL to land. Only give up if
         // STILL alive.
+        if let Some(held) = held_machine_process(Some(pid), pid_start_time) {
+            tracing::warn!("machine '{name}' is stopped, but {}", held.explain());
+            return true;
+        }
         if is_alive(pid) {
             let _ = crate::systemd_scope::kill_scope(name);
             let deadline = std::time::Instant::now() + KILLED_VM_EXIT_TIMEOUT;
@@ -3245,6 +3465,9 @@ async fn create_machine_to_end(
             source_smolmachine
         },
         packed_storage_gib,
+        checkpoint_without_host_layers: manifest_checkpoint
+            .as_ref()
+            .is_some_and(crate::portable_checkpoint::carries_no_host_layers),
     });
     if let Err(e) = complete_result {
         let data_dir = vm_data_dir(&name);
@@ -3750,6 +3973,10 @@ pub async fn start_machine(
         }
     }
 
+    // A stop, or the recovery above, can end with the machine's process held
+    // by the kernel. The machine is not started on top of it.
+    refuse_start_while_held(&state, &name).await?;
+
     // A successful unreachable recovery, a Running record resolved Stopped by
     // PID+agent probing, or a durable Stopped record written by an out-of-process
     // CLI stop all prove that no VMM should still own this machine. Reconcile the
@@ -3870,6 +4097,8 @@ pub async fn start_machine(
         && record.golden.is_none())
     .then(|| record.image.clone())
     .flatten();
+    let pull_platform = record.image_platform().map(str::to_owned);
+    let seeds_platform = crate::image_seed::serves_platform(pull_platform.as_deref());
     let start_has_credentials = registry_auth.is_some();
     let seed_auth = match &registry_auth {
         Some(auth) => crate::registry::PullAuth::Basic {
@@ -3879,18 +4108,27 @@ pub async fn start_machine(
         None => crate::registry::PullAuth::FromConfig,
     };
     let (manager, pid) = tokio::task::spawn_blocking(move || {
+        crate::network::private_floor::log_record_hosts_blocked_by_private_floor(
+            &name_clone,
+            &restore_record,
+        );
         let mut seed_image = seed_image;
+        let seedable_image = |image: &str| {
+            seeds_platform
+                .then(|| crate::image_seed::seedable_image(&name_clone, Some(image), storage_gb))
+                .flatten()
+        };
         if let Some(image) = preseeded_image {
             match crate::image_seed::revalidate_seed(&name_clone, &image, &seed_auth) {
                 Ok(true) => {}
                 Ok(false) => {
-                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                    seed_image = seedable_image(&image);
                 }
                 Err(error) => {
                     // The rejected disk is gone, so the machine can take a seed
                     // of the image it boots now, such as its host-fetched archive.
                     tracing::warn!(machine = %name_clone, %error, "pre-created image seed rejected");
-                    seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                    seed_image = seedable_image(&image);
                 }
             }
             // A fresh machine still has the blank disk its create made. When
@@ -3904,7 +4142,7 @@ pub async fn start_machine(
                     start_has_credentials,
                 )
             {
-                seed_image = crate::image_seed::seedable_image(&name_clone, Some(&image), storage_gb);
+                seed_image = seedable_image(&image);
             }
         }
         if let Some(image) = seed_image {
@@ -4043,6 +4281,9 @@ pub async fn start_machine(
                 let mut opts = crate::agent::PullOptions::new().use_registry_config(true);
                 if let Some(auth) = pull_auth {
                     opts = opts.auth(auth);
+                }
+                if let Some(platform) = pull_platform {
+                    opts = opts.oci_platform(platform);
                 }
                 c.pull(&image_pull, opts)?;
             }
@@ -5751,9 +5992,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                 }
                 let _ = state
                     .update_vm(&name, |r| {
-                        r.state = RecordState::Stopped;
-                        r.pid = None;
-                        r.pid_start_time = None;
+                        r.mark_process_stopped();
                         // A drain is a deliberate decommission: mark the machine
                         // user-stopped so the restart supervisor does not resurrect it
                         // in the window before the host is terminated (or if drain is
@@ -8685,5 +8924,173 @@ mod tests {
             Err(ApiError::BadRequest(_))
         ));
         assert!(require_mediated_interceptor(&record, true).is_ok());
+    }
+}
+
+/// The API server's stop, start and delete around a process the kernel holds
+/// after SIGKILL, stood in for by `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::db::SmolvmDb;
+    use crate::process::fake_held;
+    use tempfile::TempDir;
+
+    fn state() -> (TempDir, Arc<ApiState>) {
+        let dir = TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, Arc::new(ApiState::with_db(db)))
+    }
+
+    fn running(state: &ApiState, name: &str, pid: i32, start_time: Option<u64>) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = start_time;
+        state.db().insert_vm(name, &record).unwrap();
+    }
+
+    /// The two steps of the stop handler: end the process, then record it.
+    async fn api_stop(state: &Arc<ApiState>, name: &str) -> VmRecord {
+        let record = state.db().get_vm(name).unwrap().unwrap();
+        let machine = name.to_string();
+        let started = std::time::Instant::now();
+        let stopped = tokio::task::spawn_blocking(move || {
+            shutdown_machine_process(&machine, record.pid, record.pid_start_time, true)
+        })
+        .await
+        .unwrap();
+        assert!(stopped, "the stop must complete around a held process");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        reconcile_confirmed_stopped_machine(state, name, true)
+            .await
+            .unwrap()
+    }
+
+    #[tokio::test]
+    async fn api_stop_of_a_held_machine_records_it_stopped_and_keeps_its_pid() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-stop";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+
+        let record = api_stop(&state, name).await;
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        assert_eq!(record.pid_start_time, Some(fake_held::START_TIME));
+        assert!(record.restart.user_stopped);
+        assert_eq!(record_to_info(name, &record).state, "stopped");
+    }
+
+    /// A second stop takes the handler's "not running" branch, which
+    /// reconciles again. That is where the PID used to be cleared.
+    #[tokio::test]
+    async fn api_stop_repeated_on_a_held_machine_still_keeps_its_pid() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-stop-twice";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+
+        let record = reconcile_confirmed_stopped_machine(&state, name, true)
+            .await
+            .unwrap();
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, Some(held.pid));
+        assert_eq!(
+            state.db().get_vm(name).unwrap().unwrap().pid,
+            Some(held.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_start_is_refused_while_held_with_the_text_the_cli_uses() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-start";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+
+        let error = refuse_start_while_held(&state, name).await.unwrap_err();
+
+        match error {
+            ApiError::Conflict(message) => assert!(
+                message.contains(&fake_held::held(held.pid).start_refusal()),
+                "{message}"
+            ),
+            other => panic!("expected a conflict, got {other:?}"),
+        }
+        assert_eq!(
+            state.db().get_vm(name).unwrap().unwrap().pid,
+            Some(held.pid)
+        );
+    }
+
+    #[tokio::test]
+    async fn api_start_is_allowed_and_the_pid_forgotten_once_the_process_is_gone() {
+        let (_dir, state) = state();
+        let held = fake_held::hold();
+        let name = "api-held-then-gone";
+        running(&state, name, held.pid, Some(fake_held::START_TIME));
+        api_stop(&state, name).await;
+        assert!(refuse_start_while_held(&state, name).await.is_err());
+
+        held.disappear();
+
+        refuse_start_while_held(&state, name).await.unwrap();
+        let stored = state.db().get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    /// Delete discards the disks, so it kills at once. A held process must
+    /// not make it wait or fail, with or without a recorded start time.
+    #[tokio::test]
+    async fn api_delete_of_a_held_machine_completes_without_waiting_for_the_process() {
+        for start_time in [Some(fake_held::START_TIME), None] {
+            let held = fake_held::hold();
+            let pid = held.pid;
+            let started = std::time::Instant::now();
+            let stopped = tokio::task::spawn_blocking(move || {
+                shutdown_machine_process("api-held-delete", Some(pid), start_time, false)
+            })
+            .await
+            .unwrap();
+            assert!(stopped);
+            assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        }
+    }
+
+    #[tokio::test]
+    async fn api_stop_of_an_exited_machine_forgets_its_pid() {
+        let (_dir, state) = state();
+        let name = "api-exited-stop";
+        // No such process: Linux pids never reach 2^31.
+        running(&state, name, 0x7fff_fff0, Some(1));
+
+        let record = reconcile_confirmed_stopped_machine(&state, name, true)
+            .await
+            .unwrap();
+
+        assert_eq!(record.state, RecordState::Stopped);
+        assert_eq!(record.pid, None);
+        assert_eq!(record.pid_start_time, None);
+    }
+
+    /// A held process is not counted as a running machine or a live worker.
+    #[test]
+    fn a_held_process_does_not_count_as_running() {
+        let held = fake_held::hold();
+        let mut record = VmRecord::new("api-held-count".to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Stopped;
+        record.pid = Some(held.pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        assert!(record.is_process_alive());
+        assert!(!record.process_can_run());
+        held.disappear();
+        assert!(!record.is_process_alive());
     }
 }

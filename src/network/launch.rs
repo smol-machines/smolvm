@@ -134,7 +134,8 @@ pub fn plan_launch_network_with(
         || resources.block_private.is_some();
     let has_dns_filter = dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
-    let has_fabric = resources.network_name.is_some();
+    // A container switch is fabric-like routing in the host-side stack too.
+    let has_fabric = resources.network_name.is_some() || resources.switch.is_some();
     // A custom guest subnet shapes the virtio-net link, so like a named
     // network it implies networking and picks virtio-net.
     let has_guest_subnet = resources.guest_subnet.is_some();
@@ -263,28 +264,48 @@ pub fn serve_egress_control(
 /// complete set of `host:guest` mappings to publish and gets back `ok` or
 /// `error: <reason>`.
 pub fn serve_ports_control(ports: smolvm_network::PublishedPorts, vm_dir: &std::path::Path) {
-    serve_ports_requests(vm_dir, move |next| {
-        ports.replace(next).map_err(|error| error.to_string())
-    });
+    let allocator = ports.clone();
+    serve_ports_requests(
+        vm_dir,
+        move |guest| {
+            allocator
+                .publish_atomic(guest)
+                .map_err(|error| error.to_string())
+        },
+        move |next| ports.replace(next).map_err(|error| error.to_string()),
+    );
 }
 
 /// Serve the ports control socket in `vm_dir`, handing each request's parsed
 /// mappings to `replace`; shared by virtio-net and the TSI port forwarder.
 pub(crate) fn serve_ports_requests(
     vm_dir: &std::path::Path,
+    allocate: impl Fn(u16) -> Result<smolvm_network::PortMapping, String> + Send + 'static,
     replace: impl Fn(&[smolvm_network::PortMapping]) -> Result<(), String> + Send + 'static,
 ) {
     let path = vm_dir.join(smolvm_network::PORTS_SOCKET);
     let _ = std::fs::remove_file(&path);
-    serve_control_socket(
+    serve_control_socket_with_reply(
         path,
         "ports-control",
         MAX_PORTS_REQUEST_BYTES,
         move |request| {
+            if let Some(guest) = request.trim().strip_prefix("allocate ") {
+                let guest: u16 = guest
+                    .parse()
+                    .map_err(|_| "invalid guest port".to_string())?;
+                if guest == 0 {
+                    return Err("guest port must be positive".into());
+                }
+                let mapping = allocate(guest)?;
+                return Ok(format!("ok {}:{}\n", mapping.host, mapping.guest));
+            }
             let next = smolvm_network::parse_port_mappings(request)?;
             replace(&next)?;
+            // Auto ports leave a port `-p` now publishes to that mapping.
+            super::auto_ports::note_declared_ports(&next);
             tracing::info!(ports = %smolvm_network::render_port_mappings(&next).trim_end(), "published ports replaced");
-            Ok(())
+            Ok("ok\n".to_string())
         },
     );
 }
@@ -294,6 +315,17 @@ pub(crate) fn serve_control_socket(
     thread_name: &str,
     max_request_bytes: u64,
     apply: impl Fn(&str) -> Result<(), String> + Send + 'static,
+) {
+    serve_control_socket_with_reply(path, thread_name, max_request_bytes, move |request| {
+        apply(request).map(|()| "ok\n".to_string())
+    });
+}
+
+fn serve_control_socket_with_reply(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<String, String> + Send + 'static,
 ) {
     use std::io::{Read, Write};
     let listener = match crate::platform::uds::UdsListener::bind(&path) {
@@ -317,7 +349,7 @@ pub(crate) fn serve_control_socket(
                     .read_to_string(&mut request)
                 {
                     Ok(_) => match apply(&request) {
-                        Ok(()) => "ok\n".to_string(),
+                        Ok(reply) => reply,
                         Err(reason) => format!("error: {reason}\n"),
                     },
                     Err(error) => format!("error: {error}\n"),

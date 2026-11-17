@@ -120,6 +120,7 @@ impl MachineSpec {
             shm_size,
             network_name,
             guest_subnet,
+            switch,
         } = resources;
         crate::machine_spec::CreateSpec {
             cmd: (!command.is_empty()).then_some(command),
@@ -141,6 +142,7 @@ impl MachineSpec {
             dns_options,
             network_name,
             guest_subnet,
+            switch,
             ports,
             allowed_cidrs,
             allowed_hosts: (!allowed_hosts.is_empty()).then_some(allowed_hosts),
@@ -323,6 +325,7 @@ pub(crate) fn start_vm_with_interceptor(
     name: &str,
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
+    crate::agent::state_probe::refuse_start_while_held(db, name)?;
     // A machine with no network cannot pull its registry image in-guest; the
     // host fetches it instead.
     let record = crate::image_store::pin_for_start(
@@ -331,6 +334,7 @@ pub(crate) fn start_vm_with_interceptor(
         get_record(db, name)?,
         &crate::registry::PullAuth::FromConfig,
     )?;
+    crate::network::private_floor::log_record_hosts_blocked_by_private_floor(name, &record);
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
@@ -378,6 +382,11 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
 fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures) -> LaunchFeatures {
     if features.dns_filter_hosts.is_none() {
         features.dns_filter_hosts = record.dns_filter_hosts.clone();
+    }
+    // Socket bridges are part of the machine, as on the CLI start path; a
+    // launch that dropped them left the guest path empty.
+    if features.published_sockets.is_empty() {
+        features.published_sockets = record.published_sockets.clone();
     }
     // A detached machine stays detached on every launch — a plain start after
     // a stop, a resume, a fork clone (which copies the golden's record) — not
@@ -518,6 +527,7 @@ pub fn start_vm_with_netns(
     name: &str,
     netns: std::path::PathBuf,
 ) -> Result<VmHandle> {
+    crate::agent::state_probe::refuse_start_while_held(db, name)?;
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         pod_netns: Some(netns),
@@ -572,6 +582,38 @@ pub(crate) fn fork_vm_with_options(
         None,
         keep_machine_id,
     )
+}
+
+/// Branch the frozen `golden` into a new machine `clone` and boot it, after
+/// `adjust` has changed the clone's record (its ports, network attachment,
+/// labels). The golden stays paused as a base for further branches.
+#[cfg(unix)]
+pub(crate) fn fork_vm_adjusted(
+    db: &SmolvmDb,
+    golden: &str,
+    clone: &str,
+    adjust: impl FnOnce(&mut VmRecord),
+) -> Result<VmHandle> {
+    let _source_lock = crate::agent::fork::lock_fork_source(golden)?;
+    let mut prep = crate::agent::fork::prepare_fork(
+        db,
+        golden,
+        clone,
+        &[],
+        false,
+        &[],
+        &std::collections::BTreeMap::new(),
+        &[],
+        crate::agent::fork::ForkSourcePolicy::Freeze,
+    )?;
+    adjust(&mut prep.clone_record);
+    let record = prep.clone_record.clone();
+    if let Err(error) = db.update_vm(clone, |r| *r = record) {
+        let _ = db.remove_vm(clone);
+        let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
+        return Err(error);
+    }
+    boot_prepared_fork(db, clone, prep, false, None, None, false)
 }
 
 fn boot_prepared_fork(
@@ -982,12 +1024,8 @@ pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
 
 /// Mark a machine record as stopped.
 pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
-    db.update_vm(name, |record| {
-        record.state = RecordState::Stopped;
-        record.pid = None;
-        record.pid_start_time = None;
-    })?
-    .ok_or_else(|| Error::vm_not_found(name))?;
+    db.update_vm(name, VmRecord::mark_process_stopped)?
+        .ok_or_else(|| Error::vm_not_found(name))?;
     Ok(())
 }
 
@@ -1449,5 +1487,85 @@ mod tests {
                 .contains("duplicate clone name")
         );
         assert!(db.get_vm("duplicate").unwrap().is_none());
+    }
+}
+
+/// The embedded runtime's stop and start around a process the kernel holds
+/// after SIGKILL, stood in for by `process::fake_held`.
+#[cfg(all(test, target_os = "linux"))]
+mod held_process_tests {
+    use super::*;
+    use crate::process::fake_held;
+
+    fn db() -> (tempfile::TempDir, SmolvmDb) {
+        let dir = tempfile::TempDir::new().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        (dir, db)
+    }
+
+    fn running(db: &SmolvmDb, name: &str, pid: i32) {
+        let mut record = VmRecord::new(name.to_string(), 1, 512, vec![], vec![], false);
+        record.state = RecordState::Running;
+        record.pid = Some(pid);
+        record.pid_start_time = Some(fake_held::START_TIME);
+        db.insert_vm(name, &record).unwrap();
+    }
+
+    #[test]
+    fn embedded_stop_of_a_held_machine_keeps_its_pid() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "embedded-held-stop";
+        running(&db, name, held.pid);
+
+        mark_stopped(&db, name).unwrap();
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, Some(held.pid));
+    }
+
+    #[test]
+    fn embedded_stop_of_an_exited_machine_forgets_its_pid() {
+        let (_dir, db) = db();
+        let name = "embedded-exited-stop";
+        // No such process: Linux pids never reach 2^31.
+        running(&db, name, 0x7fff_fff0);
+
+        mark_stopped(&db, name).unwrap();
+
+        let stored = db.get_vm(name).unwrap().unwrap();
+        assert_eq!(stored.state, RecordState::Stopped);
+        assert_eq!(stored.pid, None);
+        assert_eq!(stored.pid_start_time, None);
+    }
+
+    #[test]
+    fn embedded_start_is_refused_while_held_and_allowed_once_the_process_is_gone() {
+        let (_dir, db) = db();
+        let held = fake_held::hold();
+        let name = "embedded-held-start";
+        running(&db, name, held.pid);
+        mark_stopped(&db, name).unwrap();
+
+        for attempt in [
+            start_vm(&db, name).map(|_| ()),
+            start_vm_with_netns(&db, name, std::path::PathBuf::from("/nonexistent/netns"))
+                .map(|_| ()),
+        ] {
+            let error = attempt.unwrap_err().to_string();
+            assert!(error.contains(&held_refusal(held.pid)), "{error}");
+        }
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, Some(held.pid));
+
+        held.disappear();
+
+        // The check every start runs first now passes and forgets the PID.
+        crate::agent::state_probe::refuse_start_while_held(&db, name).unwrap();
+        assert_eq!(db.get_vm(name).unwrap().unwrap().pid, None);
+    }
+
+    fn held_refusal(pid: i32) -> String {
+        fake_held::held(pid).start_refusal()
     }
 }

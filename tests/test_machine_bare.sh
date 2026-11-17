@@ -316,6 +316,36 @@ test_machine_create_prints_named_start_hint() {
     ensure_data_dir_deleted "$vm_name"
 }
 
+# A delete that is refused must change nothing. It used to stop the machine
+# before asking, so a delete refused for want of a terminal (or answered "n")
+# still killed the workload it then kept on disk.
+test_refused_delete_leaves_machine_running() {
+    local vm_name="delete-refused-$$"
+    local output still
+    local rc=0
+
+    $SMOLVM machine stop --name "$vm_name" 2>/dev/null || true
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    $SMOLVM machine create --name "$vm_name" 2>&1 || return 1
+    $SMOLVM machine start --name "$vm_name" 2>&1 || { $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null; return 1; }
+
+    output=$($SMOLVM machine delete --name "$vm_name" 2>&1 </dev/null) || rc=$?
+    still=$($SMOLVM machine exec --name "$vm_name" -- echo still-running 2>&1) || true
+
+    $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
+
+    [[ $rc -ne 0 && "$output" == *"not a terminal"* ]] || {
+        echo "expected a refusal, got (rc=$rc): $output"
+        return 1
+    }
+    [[ "$still" == *"still-running"* ]] || {
+        echo "the refused delete stopped the machine: $output / $still"
+        return 1
+    }
+    ensure_data_dir_deleted "$vm_name"
+}
+
 test_machine_exec_when_stopped() {
     cleanup_machine
 
@@ -770,6 +800,7 @@ run_test "SIGTERM during exec does not stall VM" test_sigterm_during_exec_does_n
 run_test "Exec timeout does not stall VM" test_exec_timeout_does_not_stall_vm || true
 run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
+run_test "Refused delete leaves a running machine running" test_refused_delete_leaves_machine_running || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "File upload and download" test_file_upload_download || true

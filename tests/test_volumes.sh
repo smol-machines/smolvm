@@ -379,6 +379,43 @@ test_image_volume_targets_resolve_inside_guest() {
 # enclosing volume's), a new top-level one stays root, and an owner set inside
 # the machine survives a restart rather than being reset to the image's. The
 # nested volume is listed before its parent, which must not cover it.
+# A host directory, mounted at create or into the running machine, belongs to
+# a non-root workload user so it can write there. The keep-alive init that
+# every exec joins runs as root; the mapping must follow the workload's user,
+# not the init's.
+test_volume_owned_by_non_root_workload_user() {
+    local vm_name="test-vm-vol-owner-$$"
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+
+    local boot live
+    boot=$(mktemp -d)
+    live=$(mktemp -d)
+    # alpine's `guest` user is 405:100.
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest -u guest \
+        -v "$boot:/boot-share" >/dev/null 2>&1 || { rm -rf "$boot" "$live"; return 1; }
+    run_with_timeout 90 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 &&
+        $SMOLVM machine mount add --name "$vm_name" -v "$live:/live-share" >/dev/null 2>&1
+
+    local check='for d in /boot-share /live-share; do
+        echo "$d $(stat -c %u:%g "$d") $(touch "$d/x" 2>/dev/null && echo write-ok || echo write-denied)"
+    done'
+    local out
+    out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- sh -c "$check" 2>&1)
+    # On the host the new files stay the host user's own.
+    local host_owner=""
+    [[ -O "$boot/x" && -O "$live/x" ]] && host_owner="ok"
+
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    rm -rf "$boot" "$live"
+
+    local expected=$'/boot-share 405:100 write-ok\n/live-share 405:100 write-ok'
+    if [[ "$out" != "$expected" ]]; then
+        log_fail "inside the machine: $out"
+        return 1
+    fi
+    [[ "$host_owner" == "ok" ]] || { log_fail "host does not own the files the workload created"; return 1; }
+}
+
 test_disk_volume_takes_image_ownership() {
     local vm_name="test-vm-diskvol-owner"
     $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
@@ -423,5 +460,6 @@ run_test "Create with --image: Smolfile volumes visible to exec" test_image_exec
 run_test "Create with --image: volume targets at/below /workspace resolve in guest" test_image_volume_targets_resolve_inside_guest || true
 run_test "Volume: staged sync and restart persistence" test_staged_volume_sync_and_restart || true
 run_test "Volume: new disk volume takes the image's ownership" test_disk_volume_takes_image_ownership || true
+run_test "Volume: host directory belongs to a non-root workload user" test_volume_owned_by_non_root_workload_user || true
 
 print_summary "Volume Tests"

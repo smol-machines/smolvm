@@ -7,8 +7,9 @@
 //! Once the chain reaches [`COMPACT_AT_DEPTH`], the newest immutable generation is
 //! flattened: its content, and everything beneath it, is written into one new file
 //! backed by the disk the machine started from, or standalone when that inherited
-//! disk is itself deep, which then replaces it at the same path by an atomic
-//! rename. A child may also flatten its ancestor's immutable generation. Every
+//! disk is itself deep (a cache disk's chain never: it is merged onto its
+//! shared base, see [`kept_floor`]), which then replaces it at the same path by
+//! an atomic rename. A child may also flatten its ancestor's immutable generation. Every
 //! chain that names that path reads the same bytes
 //! through a short chain from then on, and nothing ever copies a layer a VMM can
 //! still write. A process that already opened the old file keeps reading it, and
@@ -247,6 +248,21 @@ fn generation_owner(id: &str, layer: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(directory.parent()?.to_path_buf())
+}
+
+/// The layer a flatten of `id`'s chain keeps beneath it instead of folding in.
+///
+/// A cache disk's chain bottoms out on its shared base, the file the machine
+/// records and every checkpoint of it names instead of carrying. Folding that
+/// base into a standalone layer keeps the bytes but drops the name: the machine
+/// can no longer be checkpointed, and the copy costs the whole base. So a cache
+/// chain is only ever merged down onto its bottom. Other disks have no such
+/// base and may be flattened standalone.
+fn kept_floor(id: &str, layers: &[PathBuf]) -> Option<PathBuf> {
+    if id != crate::agent::launcher::CACHE_BLOCK_ID || layers.len() < 2 {
+        return None;
+    }
+    layers.last().cloned()
 }
 
 fn compaction_key(gdir: &Path, id: &str, target: &Path) -> PathBuf {
@@ -851,9 +867,14 @@ fn build_clone_base_copy(gdir: &Path, id: &str, base: &Path, copy: &Path) -> Res
         .unwrap_or_default();
     let _busy = Busy::announce(dir.join(format!("{id}.{}.{stamp}.busy", std::process::id())))?;
     let partial = dir.join(format!("{id}.{}.{stamp}.base.partial", std::process::id()));
-    let depth = chain(base)?.len() - 1;
+    let layers = chain(base)?;
+    let depth = layers.len() - 1;
+    let floor = kept_floor(id, &layers);
     let result = (|| -> Result<()> {
-        flatten_standalone(base, &partial, &|| {})?;
+        match &floor {
+            Some(floor) => merge_onto(base, floor, floor, &partial)?,
+            None => flatten_standalone(base, &partial, &|| {})?,
+        }
         let meta = std::fs::metadata(base).map_err(|e| compact_err("stat clone base", e))?;
         std::fs::set_permissions(&partial, meta.permissions())
             .map_err(|e| compact_err("copy mode", e))?;
@@ -895,7 +916,8 @@ fn build_clone_base_copy(gdir: &Path, id: &str, base: &Path, copy: &Path) -> Res
 }
 
 /// Replace the immutable `target` with one file holding the same bytes, backed
-/// directly by `root`, or standalone: given its owner and mode, synced, then
+/// directly by `root`, or standalone (a cache chain by its base instead, see
+/// [`kept_floor`]): given its owner and mode, synced, then
 /// renamed over it. Readers that already opened `target` keep the old file.
 fn flatten_in_place(
     gdir: &Path,
@@ -912,7 +934,10 @@ fn flatten_in_place(
     if layers.len() == 1 {
         return Ok(());
     }
-    let root = root.filter(|root| layers.iter().any(|layer| layer == root));
+    let floor = kept_floor(id, &layers);
+    let root = root
+        .filter(|root| layers.iter().any(|layer| layer == root))
+        .or(floor.as_deref());
     if root.is_some_and(|root| layers.get(1).is_some_and(|backing| backing == root)) {
         return Ok(());
     }
@@ -2231,6 +2256,115 @@ mod tests {
         );
         assert!(generation.exists() && !below_branch.exists());
         assert!(base.exists());
+    }
+
+    /// A published cache base the way a node holds one: a standalone qcow2 in
+    /// the cache disk directory, every cluster written.
+    fn cache_base(dir: &Path) -> PathBuf {
+        let raw = raw_root(dir);
+        let over = dir.join("publish.qcow2");
+        create_overlay(&over, SIZE, &raw).unwrap();
+        let base = dir.join("cache-disks/cdisk-v87.qcow2");
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        flatten_standalone(&over, &base, &|| {}).unwrap();
+        std::fs::remove_file(over).unwrap();
+        std::fs::remove_file(raw).unwrap();
+        base.canonicalize().unwrap()
+    }
+
+    /// A layer at `path` over `below` that writes one cluster of its own.
+    fn cache_layer(path: &Path, below: &Path, n: u64) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        create_overlay(path, SIZE, below).unwrap();
+        let access = writable(path);
+        let at = (n * 3 % (SIZE / CLUSTER)) * CLUSTER;
+        access
+            .write(&vec![0x50 + n as u8; 4096][..], at + 1024)
+            .unwrap();
+        access.flush().unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    /// The 2026-11-11 Specific lineage: a cache-disk machine branched live
+    /// (one generation), then frozen and branched again and again. A clone of
+    /// the deep end used to fold the root's generation standalone and copy
+    /// the whole chain, base included, into its short base: the bytes stayed,
+    /// but no chain reached the recorded base, and every checkpoint of a
+    /// branch failed with "the cache disk's layers do not sit on its recorded
+    /// base". Cache chains now merge down onto their base instead.
+    #[test]
+    fn a_cache_chain_keeps_its_shared_base_when_a_frozen_lineage_is_shortened() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = cache_base(dir.path());
+        let root = dir.path().join("root");
+        let generation = cache_layer(&root.join("d/1d64752a/cache.base.qcow2"), &base, 0);
+        let mut below = cache_layer(&root.join("cache.qcow2"), &generation, 1);
+        let mut machines = vec![root];
+        for n in 1..10 {
+            let machine = dir.path().join(format!("frozen-{n}"));
+            below = cache_layer(&machine.join("cache.qcow2"), &below, n + 1);
+            machines.push(machine);
+        }
+        let source = machines.last().unwrap();
+        let active = below;
+        let frozen: Vec<_> = machines
+            .iter()
+            .map(|machine| {
+                let disk = machine.join("cache.qcow2");
+                (disk.clone(), std::fs::metadata(&disk).unwrap().ino())
+            })
+            .collect();
+        let expected = read_all(&active);
+        assert!(chain(&active).unwrap().len() > CLONE_BASE_COMPACT_AT_DEPTH);
+
+        let (short, guard) = shallow_clone_base(source, "cache", &active).unwrap();
+        drop(guard);
+        assert_eq!(read_all(&short), expected);
+        assert_eq!(chain(&short).unwrap(), [short.clone(), base.clone()]);
+        // Every chain still ends on the base: the generation was not folded.
+        assert_eq!(
+            chain(&generation).unwrap(),
+            [generation.clone(), base.clone()]
+        );
+        assert_eq!(chain(&active).unwrap().last(), Some(&base));
+        assert_eq!(read_all(&active), expected);
+        for (disk, inode) in frozen {
+            assert_eq!(std::fs::metadata(&disk).unwrap().ino(), inode);
+        }
+
+        // Storage disks are still copied standalone.
+        let storage = source.join("storage.qcow2");
+        create_overlay(&storage, SIZE, &active).unwrap();
+        let (copy, _) = shallow_clone_base(source, "storage", &storage).unwrap();
+        assert_eq!(chain(&copy).unwrap().len(), 1);
+    }
+
+    /// A cache generation over a deep inherited cache chain is merged onto the
+    /// base rather than made standalone, and reads the same.
+    #[test]
+    fn a_cache_generation_on_a_deep_inherited_chain_stays_on_its_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = cache_base(dir.path());
+        let parent = dir.path().join("parent");
+        let mut below = base.clone();
+        for n in 0..25 {
+            below = cache_layer(
+                &parent.join(format!("d/{n:08x}/cache.base.qcow2")),
+                &below,
+                n,
+            );
+        }
+        let child = dir.path().join("child");
+        let target = cache_layer(&child.join("d/00000001/cache.base.qcow2"), &below, 30);
+        let live = cache_layer(&child.join("cache.qcow2"), &target, 31);
+        let before = read_all(&live);
+        compact_if_near_limit(&child, None).unwrap();
+        assert_eq!(chain(&live).unwrap(), [live.clone(), target, base]);
+        assert_eq!(read_all(&live), before);
     }
 
     /// A second claim on a disk whose merge is running is refused, and the

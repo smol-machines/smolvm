@@ -76,8 +76,23 @@ address other hosts can reach.
 
 ## Ports
 
-Declare host-to-guest ports at create time. Dynamic ports chosen later by Compose or Testcontainers
-are not published through the outer VM boundary automatically, so pin the ones the host must reach.
+Create the machine with `--auto-ports` (Smolfile `auto_ports = true`) and the ports Compose or
+Testcontainers choose later appear on the host at the same number while they listen: `docker run -p
+8080:80 nginx` inside the machine makes `curl http://127.0.0.1:8080` work on the host. Docker's
+userland proxy listens in the guest's own network namespace, which is what auto ports watch, so
+keep it on (the default); with `"userland-proxy": false` Docker publishes through iptables only
+and nothing appears. A host port already in use is skipped rather than moved, and ports below 1024
+need `-p`. Without `--auto-ports`, declare host-to-guest ports at create time and pin the ones the
+host must reach. Rules and limits: "Ports that appear on their own" in
+[`throwaway-machine`](../throwaway-machine/README.md).
+
+## x86_64 images on Apple silicon
+
+Create the machine with `--rosetta` and `docker run --platform linux/amd64` runs x86_64 images
+through Rosetta in every container Docker starts, with nothing to configure in the daemon:
+`docker run --rm --platform linux/amd64 alpine uname -m` prints `x86_64`, and amd64 `node`,
+`python` and `postgres` images run. The program keeps the PID it was started with, so PID 1
+semantics, `pg_ctl -w` and `docker stop` behave as on a native image.
 
 ## Platforms
 

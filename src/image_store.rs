@@ -119,6 +119,68 @@ pub async fn authorized_image_config(reference: &str, auth: &PullAuth) -> Result
     })
 }
 
+/// An image's identity and full config, as a container engine reports it.
+#[derive(Debug, Clone)]
+pub struct ImageMetadata {
+    /// Digest of the resolved single-platform manifest.
+    pub manifest_digest: String,
+    /// Digest of the config blob: the image id.
+    pub config_digest: String,
+    /// The whole config blob (`architecture`, `os`, `config`, `rootfs`,
+    /// `history`, ...).
+    pub config: serde_json::Value,
+    /// Sum of the compressed layer sizes.
+    pub compressed_size: u64,
+}
+
+/// Resolve `reference` (for `oci_platform`, or this host's platform) and
+/// fetch its config blob, authorized with `auth`. Same authorization as
+/// [`authorized_digest`]; no image layers are pulled.
+pub async fn authorized_image_metadata(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<ImageMetadata> {
+    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform).await?;
+    let manifest_digest = manifest_digest(&manifest_bytes);
+    let manifest: serde_json::Value = serde_json::from_slice(&manifest_bytes)
+        .map_err(|e| Error::agent("parse image manifest", e.to_string()))?;
+    let config_digest = manifest["config"]["digest"]
+        .as_str()
+        .ok_or_else(|| Error::agent("parse image manifest", "manifest has no config"))?
+        .to_string();
+    let compressed_size = manifest["layers"]
+        .as_array()
+        .map(|layers| layers.iter().map(|l| l["size"].as_u64().unwrap_or(0)).sum())
+        .unwrap_or(0);
+    let config_bytes = client
+        .pull_blob(&repo, &config_digest)
+        .await
+        .map_err(|e| Error::agent("fetch image config", e.to_string()))?;
+    if manifest_digest_matches(&config_bytes, &config_digest).is_err() {
+        return Err(Error::agent(
+            "fetch image config",
+            format!("config blob does not match {config_digest}"),
+        ));
+    }
+    let config = serde_json::from_slice(&config_bytes)
+        .map_err(|e| Error::agent("parse image config", e.to_string()))?;
+    Ok(ImageMetadata {
+        manifest_digest,
+        config_digest,
+        config,
+        compressed_size,
+    })
+}
+
+fn manifest_digest_matches(bytes: &[u8], digest: &str) -> std::result::Result<(), ()> {
+    if manifest_digest(bytes) == digest {
+        Ok(())
+    } else {
+        Err(())
+    }
+}
+
 /// Resolve `reference` to its platform manifest and return the summed
 /// `layers[].size` — the image's total COMPRESSED footprint, authorized with
 /// `auth`. `oci_platform` selects the index entry the way the guest's pull

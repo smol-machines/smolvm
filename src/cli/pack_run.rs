@@ -648,7 +648,7 @@ impl PackRunCmd {
             .map_err(|e| Error::config("pack run ports", e))?;
         let port_mappings = ports.clone();
 
-        let resources = VmResources {
+        let mut resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: effective_network(
@@ -663,6 +663,7 @@ impl PackRunCmd {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             gpu: manifest.gpu,
             nested_virt: false,
             cuda: cuda_enabled,
@@ -689,6 +690,14 @@ impl PackRunCmd {
                 .map(|policy| policy.egress_rules.clone())
                 .unwrap_or_default(),
         };
+        // A packed machine that asked for the host GPU only gets it when the
+        // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+        smolvm::agent::host_gpu::resolve_for_boot(
+            "packed machine",
+            &mut resources,
+            smolvm::agent::requested_display().is_some(),
+            false,
+        )?;
         validate_requested_network_backend(
             &resources,
             self.egress
@@ -827,6 +836,7 @@ impl PackRunCmd {
                 ssh_agent_socket,
                 cuda: false,
                 expose_docker: false,
+                auto_ports: None,
                 published_sockets: Vec::new(),
                 dns_filter_hosts: self
                     .egress
@@ -1907,7 +1917,7 @@ fn run_from_cache(
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed run ports", e))?;
     let port_mappings = ports.clone();
-    let resources = VmResources {
+    let mut resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
@@ -1917,6 +1927,7 @@ fn run_from_cache(
         shm_size: None,
         network_name: None,
         guest_subnet: None,
+        switch: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
@@ -1933,6 +1944,14 @@ fn run_from_cache(
         allowed_cidrs: None,
         egress_rules: Vec::new(),
     };
+    // A packed machine that asked for the host GPU only gets it when the
+    // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+    smolvm::agent::host_gpu::resolve_for_boot(
+        "packed machine",
+        &mut resources,
+        smolvm::agent::requested_display().is_some(),
+        false,
+    )?;
     validate_requested_network_backend(&resources, None, ports.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
@@ -2022,6 +2041,7 @@ fn run_from_cache(
             ssh_agent_socket,
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
@@ -2337,7 +2357,7 @@ fn daemon_start(
     let ports = PortMappingSpec::expand_all(&args.port)
         .map_err(|e| Error::config("packed start ports", e))?;
     let port_mappings = ports.clone();
-    let resources = VmResources {
+    let mut resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: args.net || manifest.network || !ports.is_empty(),
@@ -2347,6 +2367,7 @@ fn daemon_start(
         shm_size: None,
         network_name: None,
         guest_subnet: None,
+        switch: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
@@ -2363,6 +2384,14 @@ fn daemon_start(
         allowed_cidrs: None,
         egress_rules: Vec::new(),
     };
+    // A packed machine that asked for the host GPU only gets it when the
+    // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+    smolvm::agent::host_gpu::resolve_for_boot(
+        "packed machine",
+        &mut resources,
+        smolvm::agent::requested_display().is_some(),
+        false,
+    )?;
     validate_requested_network_backend(&resources, None, ports.len())?;
 
     let packed_mounts = mounts_to_packed(&mounts);
@@ -2420,6 +2449,7 @@ fn daemon_start(
             ssh_agent_socket: ssh_agent_socket.clone(),
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
             dns_filter_hosts: None,
             packed_layers_dir: Some(layers_dir.to_path_buf()),

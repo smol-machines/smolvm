@@ -88,6 +88,7 @@ pub async fn capacity(State(state): State<Arc<ApiState>>) -> Response {
         host_memory_available_mb: host_memory.map(|memory| memory.available_bytes / (1024 * 1024)),
         branch_reserve_mb: branch_admission.map(|params| params.reserve_mib),
         branch_child_overhead_mb: branch_admission.map(|params| params.child_overhead_mib),
+        branch_child_growth_fraction: branch_admission.map(|params| params.child_growth_fraction),
         used_disk_gb: utilization.disk_gb,
         checkpoint_store_bytes: crate::checkpoint_retention::store_bytes(),
         boot_id: boot_id().to_string(),

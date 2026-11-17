@@ -686,17 +686,11 @@ impl Reactor {
 }
 
 fn connect_in_progress(err: &io::Error) -> bool {
-    if err.kind() == io::ErrorKind::WouldBlock {
-        return true;
-    }
     #[cfg(unix)]
-    {
-        err.raw_os_error() == Some(libc::EINPROGRESS)
-    }
+    let in_progress = err.raw_os_error() == Some(libc::EINPROGRESS);
     #[cfg(not(unix))]
-    {
-        false
-    }
+    let in_progress = false;
+    err.kind() == io::ErrorKind::WouldBlock || in_progress
 }
 
 /// Out of file descriptors, kernel buffers or local ports, as opposed to a

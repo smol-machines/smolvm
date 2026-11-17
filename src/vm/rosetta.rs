@@ -6,11 +6,16 @@
 //! # How it works
 //!
 //! When Rosetta is available and enabled, smolvm mounts the Rosetta runtime
-//! directory into the guest VM via virtiofs. A ptrace wrapper
-//! (`/usr/bin/rosetta-wrapper`) intercepts Rosetta's Virtualization.framework
-//! validation ioctl — required because libkrun uses Hypervisor.framework, not
-//! Virtualization.framework — and registers as the binfmt_misc interpreter for
-//! x86_64 ELF binaries.
+//! directory into the guest VM via virtiofs and the guest agent registers an
+//! interpreter for x86_64 ELF binaries with binfmt_misc (see the agent's
+//! `rosetta` module). Rosetta asks the share it was started from a start-up
+//! question that Virtualization.framework answers; smolvm runs on
+//! Hypervisor.framework, so either libkrun's virtiofs server answers it, and
+//! the translator itself is the interpreter, or a ptrace wrapper
+//! (`/usr/bin/rosetta-wrapper`) answers it in the guest.
+//!
+//! A Rosetta machine pulls its image for `linux/amd64` unless another platform
+//! is asked for; see [`image_platform`].
 //!
 //! # Requirements
 //!
@@ -42,6 +47,18 @@ if [ -d /mnt/rosetta ] && [ -f /mnt/rosetta/rosetta ] && [ -x /usr/bin/rosetta-w
     fi
 fi
 "#;
+
+/// The image platform Rosetta translates.
+pub const TRANSLATED_PLATFORM: &str = "linux/amd64";
+
+/// The platform to pull a machine's image for, or `None` for the guest's own
+/// architecture. The platform asked for wins. Otherwise a machine with Rosetta
+/// pulls [`TRANSLATED_PLATFORM`]: a multi-arch reference would resolve to the
+/// arm64 variant and leave Rosetta nothing to translate, and an amd64-only one
+/// would not resolve at all.
+pub fn image_platform(asked: Option<&str>, rosetta: bool) -> Option<&str> {
+    asked.or_else(|| rosetta.then_some(TRANSLATED_PLATFORM))
+}
 
 /// Check if Rosetta 2 is available on this system.
 ///
@@ -89,6 +106,20 @@ mod tests {
         assert!(needs_rosetta("LINUX/AMD64"));
         assert!(!needs_rosetta("linux/arm64"));
         assert!(!needs_rosetta("linux/aarch64"));
+    }
+
+    #[test]
+    fn a_rosetta_machine_pulls_amd64_unless_a_platform_is_asked_for() {
+        assert_eq!(image_platform(None, false), None);
+        assert_eq!(image_platform(None, true), Some("linux/amd64"));
+        assert_eq!(
+            image_platform(Some("linux/arm64"), true),
+            Some("linux/arm64")
+        );
+        assert_eq!(
+            image_platform(Some("linux/amd64"), false),
+            Some("linux/amd64")
+        );
     }
 
     #[test]

@@ -102,7 +102,8 @@ impl Shim for Service {
 
 pub fn run_shim() {
     let body = async {
-        run::<Service>(RUNTIME_ID, None).await;
+        let _reaper = crate::reaper::VmReaper::start();
+        run::<Service>(RUNTIME_ID, Some(crate::reaper::configuration())).await;
     };
     tokio::runtime::Builder::new_multi_thread()
         .enable_all()

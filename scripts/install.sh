@@ -635,6 +635,13 @@ install_smolvm() {
         done
     fi
 
+    # The Docker Engine API is opt-in: `smolvm engine` selects the `smol` Docker
+    # context, which would redirect a user's existing docker CLI, so an install
+    # or upgrade never runs it. It only says how.
+    if [[ "$SYSTEM_INSTALL" != true ]] && "$prefix/smolvm" engine --help 2>/dev/null | grep -q 'automatic Docker API activation'; then
+        info "To run docker, Compose and Testcontainers on smolvm, run 'smolvm engine' (it switches your Docker context to 'smol')."
+    fi
+
     # Create symlinks in bin directory. `smol` is the primary, user-facing CLI;
     # `smolvm` remains available as the lower-level engine command.
     mkdir -p "$BIN_DIR"
@@ -697,6 +704,9 @@ modify_path() {
 
 # Uninstall smolvm
 uninstall_smolvm() {
+    if [[ -x "$1/smolvm" ]]; then
+        "$1/smolvm" engine unregister >/dev/null 2>&1 || true
+    fi
     local prefix="$1"
 
     info "Uninstalling smolvm..."

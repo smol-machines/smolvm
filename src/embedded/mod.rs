@@ -1,9 +1,9 @@
 //! Language-neutral embedded runtime support for SDK bindings.
 
 pub mod bundle;
-mod control;
+pub(crate) mod control;
 mod exec;
-mod handle;
+pub(crate) mod handle;
 mod inflight;
 mod runtime;
 
