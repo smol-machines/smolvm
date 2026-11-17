@@ -409,11 +409,10 @@ fn builtin_id(name: &str) -> String {
 }
 
 /// The network a container's `NetworkMode` names: `bridge` for the default,
-/// `none`, or a network by name or id. `host` falls back to the default
-/// network: a container is its own machine and has no host network to share.
+/// `host`, `none`, or a network by name or id.
 fn mode_network(mode: &str) -> &str {
     match mode {
-        "" | "default" | "host" => "bridge",
+        "" | "default" => "bridge",
         other => other,
     }
 }
@@ -448,6 +447,19 @@ pub(crate) fn attach_at_create(
         } else {
             wanted.push((network, settings.clone()));
         }
+    }
+    if primary.driver == "host" {
+        if !wanted.is_empty()
+            || !primary_settings.aliases.is_empty()
+            || primary_settings.ipam_config.is_some()
+        {
+            return Err(ApiError::bad_request("host networking cannot join private networks or configure network aliases or addresses"));
+        }
+        out.insert(
+            primary.name.clone(),
+            endpoint_for(&primary, &primary_settings, name),
+        );
+        return Ok(out);
     }
     wanted.insert(0, (primary, primary_settings));
     for (network, settings) in wanted {
@@ -491,6 +503,21 @@ fn endpoint_for(
         mac: String::new(),
         links: settings.links.clone(),
     }
+}
+
+/// Host-mode membership has no private IP, gateway, MAC or switch endpoint.
+pub(crate) fn host_membership(
+    engine: &Engine,
+    name: &str,
+) -> ApiResult<BTreeMap<String, EndpointRecord>> {
+    let host = engine
+        .networks
+        .find("host")
+        .ok_or_else(|| ApiError::not_found("host network not found"))?;
+    Ok(BTreeMap::from([(
+        "host".into(),
+        endpoint_for(&host, &EndpointSettings::default(), name),
+    )]))
 }
 
 /// Whether every network of the container is internal (no way out).
@@ -646,6 +673,9 @@ fn allocate6(
 pub(crate) async fn before_start(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<()> {
     let _lock = lock_network(engine).await?;
     let record = c.record();
+    if record.host_config.network_mode == "host" {
+        return Ok(());
+    }
     let mut assigned: Vec<(String, EndpointRecord)> = Vec::new();
     for (name, mut ep) in ordered(&record) {
         let Some(network) = engine.networks.find(&name) else {
@@ -972,6 +1002,9 @@ pub(crate) fn hosts_entries(engine: &Engine, record: &ContainerRecord) -> Vec<(S
 /// What `host-gateway` in `--add-host` resolves to: the gateway, which a
 /// container's stack answers for the host.
 pub(crate) fn host_gateway(record: &ContainerRecord) -> String {
+    if record.host_config.network_mode == "host" {
+        return "127.0.0.1".into();
+    }
     ordered(record)
         .into_iter()
         .next()
@@ -987,7 +1020,7 @@ pub(crate) fn settings_view(
     running: bool,
 ) -> serde_json::Value {
     let mut ports = serde_json::Map::new();
-    if running {
+    if running && record.host_config.network_mode != "host" {
         for key in record.config.exposed_ports.keys() {
             let (port, proto) = key.split_once('/').unwrap_or((key, "tcp"));
             let bindings: Vec<serde_json::Value> = record
@@ -1024,7 +1057,7 @@ pub(crate) fn settings_view(
             let dns = engine
                 .networks
                 .find(name)
-                .filter(|n| !(n.builtin && n.name == "bridge"))
+                .filter(|n| n.routable() && !(n.builtin && n.name == "bridge"))
                 .map(|_| serde_json::json!(dns_names(record, ep)))
                 .unwrap_or(serde_json::Value::Null);
             (
@@ -1100,7 +1133,7 @@ fn view(engine: &Engine, n: &NetworkRecord, with_containers: bool) -> serde_json
         for c in engine.containers.read().values() {
             let r = c.record();
             if let Some(ep) = r.networks.get(&n.name) {
-                if ep.ip.is_empty() {
+                if ep.ip.is_empty() && !(n.driver == "host" && c.is_running()) {
                     continue;
                 }
                 containers.insert(
@@ -1109,7 +1142,7 @@ fn view(engine: &Engine, n: &NetworkRecord, with_containers: bool) -> serde_json
                         "Name": r.name,
                         "EndpointID": ep.endpoint_id,
                         "MacAddress": ep.mac,
-                        "IPv4Address": format!("{}/{}", ep.ip, ep.prefix_len),
+                        "IPv4Address": if ep.ip.is_empty() { String::new() } else { format!("{}/{}", ep.ip, ep.prefix_len) },
                         "IPv6Address": if ep.ip6.is_empty() { String::new() } else { format!("{}/{}", ep.ip6, ep.prefix_len6) },
                     }),
                 );
@@ -1303,7 +1336,10 @@ async fn connect(
             ),
         ));
     }
-    if record.host_config.network_mode == "none" || !n.routable() {
+    if matches!(record.host_config.network_mode.as_str(), "none" | "host")
+        || record.network_host().is_some()
+        || !n.routable()
+    {
         return Err(ApiError::bad_request(format!(
             "container {} cannot be connected to network {}",
             record.name, n.name
@@ -1359,6 +1395,11 @@ async fn disconnect(
         None => return Err(ApiError::no_such_container(&req.container)),
     };
     let record = c.record();
+    if record.host_config.network_mode == "host" {
+        return Err(ApiError::bad_request(
+            "a host-network container cannot disconnect from its host network",
+        ));
+    }
     if !record.networks.contains_key(&n.name) {
         return Err(ApiError::new(
             axum::http::StatusCode::FORBIDDEN,
@@ -1451,9 +1492,10 @@ mod tests {
     }
 
     #[test]
-    fn host_mode_falls_back_to_the_default_network() {
+    fn host_mode_remains_distinct_from_the_default_network() {
         assert_eq!(mode_network(""), "bridge");
-        assert_eq!(mode_network("host"), "bridge");
+        assert_eq!(mode_network("default"), "bridge");
+        assert_eq!(mode_network("host"), "host");
         assert_eq!(mode_network("proj_default"), "proj_default");
     }
 

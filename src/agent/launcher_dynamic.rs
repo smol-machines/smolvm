@@ -441,6 +441,27 @@ pub fn launch_agent_vm_dynamic(
             tracing::info!("network backend: tsi");
             None
         }
+        EffectiveNetworkBackend::Host => {
+            if let Err(reason) = krun.ensure_host_network() {
+                free_ctx_on_err!(reason);
+            }
+            if unsafe {
+                (krun.add_vsock)(
+                    ctx,
+                    TSI_FEATURE_HIJACK_INET | crate::network::backend::TSI_FEATURE_HOST_BIND,
+                )
+            } < 0
+            {
+                free_ctx_on_err!("krun_add_vsock rejected host networking");
+            }
+            crate::agent::launcher::start_tsi_dns_forwarder(
+                ctx,
+                krun.set_dns_forwarder,
+                config.resources.dns,
+            );
+            tracing::info!("network backend: host");
+            None
+        }
         EffectiveNetworkBackend::VirtioNet => {
             let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                 "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"

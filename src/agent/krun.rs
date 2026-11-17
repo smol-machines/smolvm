@@ -97,6 +97,7 @@ pub struct KrunFunctions {
     pub start_enter: unsafe extern "C" fn(u32) -> i32,
     pub get_last_error: Option<unsafe extern "C" fn() -> *const libc::c_char>,
     pub add_vsock: unsafe extern "C" fn(u32, u32) -> i32,
+    pub get_host_network_abi: Option<unsafe extern "C" fn() -> u32>,
     /// Add a virtio-console device (the upstream replacement for the removed
     /// `krun_set_console_output`). Unix: input/output/err file descriptors.
     #[cfg(unix)]
@@ -253,6 +254,7 @@ impl KrunFunctions {
         let start_enter = load_sym!(krun_start_enter);
         let get_last_error = load_optional_sym!("krun_get_last_error");
         let add_vsock = load_sym!(krun_add_vsock);
+        let get_host_network_abi = load_optional_sym!("krun_get_host_network_abi");
         let add_virtio_console_default = load_sym!(krun_add_virtio_console_default);
         let set_egress_policy = load_optional_sym!("krun_set_egress_policy");
         let set_stream_intercept = load_optional_sym!("krun_set_stream_intercept");
@@ -294,6 +296,7 @@ impl KrunFunctions {
             start_enter,
             get_last_error,
             add_vsock,
+            get_host_network_abi,
             add_virtio_console_default,
             set_egress_policy,
             set_stream_intercept,
@@ -317,6 +320,17 @@ impl KrunFunctions {
 }
 
 impl KrunFunctions {
+    /// Require the runtime's host socket protocol. The runtime separately
+    /// checks the actual guest kernel before executing it.
+    pub fn ensure_host_network(&self) -> Result<(), String> {
+        let abi = self.get_host_network_abi.map(|get| unsafe { get() });
+        if abi == Some(1) {
+            Ok(())
+        } else {
+            Err("host networking requires a runtime and guest kernel with host-network ABI 1; update the bundled runtime".into())
+        }
+    }
+
     /// Enable supported fresh-boot hotplug topology without process-global switches.
     /// Older runtimes retain their existing boot behavior and reject growth later.
     ///

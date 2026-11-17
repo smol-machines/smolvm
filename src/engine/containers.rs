@@ -455,10 +455,17 @@ pub(crate) async fn create(
         }
         host_config.network_mode = format!("container:{}", target.id());
     }
-    if host_config.network_mode == "host" {
-        warnings.push(
-            "host networking is not available: each container is its own machine; it uses the default network instead".into(),
-        );
+    if engine
+        .networks
+        .find(&host_config.network_mode)
+        .is_some_and(|n| n.driver == "host")
+    {
+        host_config.network_mode = "host".into();
+    }
+    if host_config.network_mode == "host"
+        && (!host_config.port_bindings.is_empty() || host_config.publish_all_ports)
+    {
+        warnings.push("Published ports are discarded when using host network mode".into());
     }
 
     let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
@@ -496,8 +503,11 @@ pub(crate) async fn create(
     labels.insert(MACHINE_LABEL.to_string(), id.clone());
     let spec = crate::machine_spec::CreateSpec {
         net: host_config.network_mode != "none",
-        network_backend: (host_config.network_mode != "none")
-            .then_some(crate::network::NetworkBackend::VirtioNet),
+        network_backend: match host_config.network_mode.as_str() {
+            "none" => None,
+            "host" => Some(crate::network::NetworkBackend::Host),
+            _ => Some(crate::network::NetworkBackend::VirtioNet),
+        },
         mounts: shares,
         published_sockets: sockets,
         ports: ports
@@ -522,7 +532,8 @@ pub(crate) async fn create(
         dns_options: host_config.dns_options.clone(),
         // On an internal network only, a container has no way out.
         allowed_cidrs: super::network::internal_only(engine, &networks).then(Vec::new),
-        switch: (!networks.is_empty()).then(|| super::network::attachment(engine, &id)),
+        switch: (!networks.is_empty() && host_config.network_mode != "host")
+            .then(|| super::network::attachment(engine, &id)),
         labels,
         ..Default::default()
     };
@@ -1094,6 +1105,9 @@ fn resolve_ports(
     config: &mut ContainerConfig,
     host: &HostConfig,
 ) -> ApiResult<Vec<PublishedPort>> {
+    if host.network_mode == "host" {
+        return Ok(Vec::new());
+    }
     let taken: BTreeSet<(u16, String)> = engine
         .containers
         .read()
@@ -1253,6 +1267,35 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
     let record = c.record();
     if record.state.status == "removing" {
         return Err(ApiError::conflict("container is being removed"));
+    }
+    if record.host_config.network_mode == "host" {
+        // Older versions stored host mode while creating a bridge VM. Correct
+        // that stopped machine in place, preserving its image and disk data.
+        let stored = engine
+            .db
+            .get_vm(&record.machine)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::internal("host-network container machine is missing"))?;
+        if stored.network_backend != Some(crate::network::NetworkBackend::Host) {
+            engine
+                .db
+                .update_vm_durable(&record.machine, |vm| {
+                    vm.network = true;
+                    vm.network_backend = Some(crate::network::NetworkBackend::Host);
+                    vm.switch = None;
+                    vm.ports.clear();
+                    vm.udp_ports.clear();
+                    vm.listen_addresses.clear();
+                })
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        }
+        if !record.networks.contains_key("host") || !record.ports.is_empty() {
+            let networks = super::network::host_membership(engine, &record.name)?;
+            c.update(engine, |r| {
+                r.networks = networks;
+                r.ports.clear();
+            });
+        }
     }
     super::network::before_start(engine, c).await?;
     let record = c.record();
