@@ -86,7 +86,9 @@ fn boot_log(level: &str, msg: &str) {
     }
 }
 mod attach;
+mod auto_ports;
 mod branchpoint;
+mod container;
 mod credentials;
 mod cuda;
 mod dirwatch;
@@ -96,6 +98,7 @@ mod forkpoint;
 mod io_target;
 #[cfg(target_os = "linux")]
 mod memory_trim;
+mod mount_owner;
 mod network;
 mod nsfile;
 mod oci;
@@ -109,6 +112,7 @@ mod publish_socket;
 mod relay;
 mod retry;
 mod rosetta;
+mod rosetta_tracer;
 mod s3mount;
 mod ssh_agent;
 mod storage;
@@ -130,7 +134,9 @@ const REQUEST_BUFFER_SIZE: usize = 64 * 1024; // 64KB
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
 /// Buffer size for streaming stdout/stderr in interactive mode.
-const IO_BUFFER_SIZE: usize = 4096;
+/// Read larger ready chunks to amortize framing and socket writes; a short
+/// read is sent immediately, without waiting for the buffer to fill.
+const IO_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Default poll timeout in milliseconds for interactive I/O loop.
 const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
@@ -346,6 +352,12 @@ fn main() {
     }
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
+    }
+    if rosetta_tracer::requested() {
+        std::process::exit(rosetta_tracer::run());
+    }
+    if process::exec_as_requested() {
+        std::process::exit(process::run_exec_as());
     }
     if forkpoint::worker_ready_helper_requested() {
         std::process::exit(forkpoint::run_worker_ready_helper());
@@ -637,6 +649,11 @@ fn main() {
     // Forward ports published while the machine runs (no virtio-net).
     if port_forward::is_enabled() {
         port_forward::start();
+    }
+
+    // Report listening TCP ports so the host publishes them (`--auto-ports`).
+    if auto_ports::is_enabled() {
+        auto_ports::start();
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /
@@ -2179,7 +2196,12 @@ static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
 /// Whether a request waits for a work slot. Liveness pings and shutdown never
 /// queue behind real work.
 fn needs_work_slot(request: &AgentRequest) -> bool {
-    !matches!(request, AgentRequest::Ping | AgentRequest::Shutdown { .. })
+    // A container's init holds its connection for the container's whole life,
+    // like a daemon, not like a unit of work.
+    !matches!(
+        request,
+        AgentRequest::Ping | AgentRequest::Shutdown { .. } | AgentRequest::ContainerStart(_)
+    )
 }
 
 /// A counting semaphore for bounding concurrent connection handlers.
@@ -2346,6 +2368,8 @@ fn handle_fsnotify(events: &[FsNotifyEvent]) -> AgentResponse {
 }
 
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wire = WireStream::new(stream);
+    let stream = &mut wire;
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
 
     // Per-connection streaming-upload session. `Option<WriteSession>`
@@ -2395,27 +2419,23 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
         let (mut request, trace_id) =
-            match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
-                Ok(env) => (env.body, env.trace_id),
-                Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
-                    Ok(req) => (req, None),
-                    Err(e) => {
-                        warn!(error = %e, "invalid request");
-                        // Keep the "invalid request: " prefix stable: the host
-                        // recognizes "invalid request: unknown variant `…`" as
-                        // a protocol-version skew and rewrites it into an
-                        // update-the-agent message (client.rs
-                        // `describe_agent_error`).
-                        send_response(
-                            stream,
-                            &AgentResponse::error(
-                                format!("invalid request: {}", e),
-                                error_codes::INVALID_REQUEST,
-                            ),
-                        )?;
-                        continue;
+            match smolvm_protocol::binary_stream::decode_request(&buf[..len]) {
+                Ok(env) => {
+                    if env.binary_stream == Some(smolvm_protocol::binary_stream::VERSION) {
+                        stream.binary = true;
                     }
-                },
+                    (env.body, env.trace_id)
+                }
+                Err(e) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::error(
+                            format!("invalid request: {e}"),
+                            error_codes::INVALID_REQUEST,
+                        ),
+                    )?;
+                    continue;
+                }
             };
 
         // Work around serde flatten + internally-tagged enum limitation:
@@ -2520,6 +2540,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        // ContainerStart runs a container's command as its init and streams
+        // its I/O on this connection until it exits.
+        if let AgentRequest::ContainerStart(spec) = request {
+            container::handle_container_start(stream, *spec)?;
+            continue;
+        }
+
         // PodStart streams the pod container's (or exec process's) I/O on
         // this connection — Started → Stdout/Stderr → Exited, with Stdin and
         // Resize handled by the interactive pumps — like interactive Run.
@@ -2577,6 +2604,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         } = request
         {
             handle_streaming_archive_directory(stream, path, target.as_ref())?;
+            continue;
+        }
+
+        if let AgentRequest::ContainerDiff { ref overlay_id } = request {
+            handle_streaming_container_diff(stream, overlay_id)?;
             continue;
         }
 
@@ -3045,12 +3077,12 @@ fn handle_request(
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
-            AgentResponse::error(
-                "streaming read must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileRead { .. }
+        | AgentRequest::ArchiveDirectory { .. }
+        | AgentRequest::ContainerDiff { .. } => AgentResponse::error(
+            "streaming read must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
         AgentRequest::PodCreate {
@@ -3085,6 +3117,44 @@ fn handle_request(
         AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
+
+        AgentRequest::ContainerStart(_) => AgentResponse::error(
+            "ContainerStart is a streaming request",
+            error_codes::INVALID_REQUEST,
+        ),
+
+        AgentRequest::ContainerSignal {
+            overlay_id,
+            signal,
+            all,
+        } => container::handle_container_signal(&overlay_id, &signal, all),
+
+        AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
+
+        AgentRequest::ContainerArchive {
+            image,
+            overlay_id,
+            archive,
+            destination,
+            image_source,
+        } => container::handle_container_archive(
+            &image,
+            &overlay_id,
+            &archive,
+            &destination,
+            image_source.as_ref(),
+        ),
+
+        AgentRequest::SetInterfaceAddresses { addresses } => {
+            container::handle_set_interface_addresses(&addresses)
+        }
+
+        AgentRequest::SetPrimaryAddress {
+            address,
+            gateway,
+            dns,
+            dns_options,
+        } => container::handle_set_primary_address(&address, &gateway, &dns, &dns_options),
     }
 }
 
@@ -3431,6 +3501,11 @@ fn install_file_atomic(
 /// An upload with no explicit owner is given to that user, so a non-root
 /// workload (an image with `USER`) can read and replace what was uploaded;
 /// root workloads and VM-level writes are left as written.
+///
+/// The workload's user is the bundle's [`oci::WORKLOAD_USER_ANNOTATION`]: the
+/// container's own `process.user` is the keep-alive init's, root. A bundle
+/// written before the annotation existed ran its init as the workload user, so
+/// `process.user` is the answer there.
 fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Some(merged) = root.overlay_merged_root() else {
         return (None, None);
@@ -3447,11 +3522,9 @@ fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Ok(spec) = serde_json::from_str::<serde_json::Value>(&text) else {
         return (None, None);
     };
-    let uid = spec["process"]["user"]["uid"].as_u64().map(|u| u as u32);
-    let gid = spec["process"]["user"]["gid"].as_u64().map(|g| g as u32);
-    match uid {
-        Some(0) | None => (None, None),
-        Some(uid) => (Some(uid), gid),
+    match oci::workload_user_of_config(&spec) {
+        Some((uid, gid)) if uid != 0 => (Some(uid), Some(gid)),
+        _ => (None, None),
     }
 }
 
@@ -3803,7 +3876,7 @@ const FILE_FINALIZE_KEEPALIVE: std::time::Duration = std::time::Duration::from_s
 /// sends a progress frame every `period` until it returns, so a slow step
 /// never leaves the host with a silent connection.
 fn with_keepalive<S: Write, T: Send>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     period: std::time::Duration,
     work: impl FnOnce() -> T + Send,
 ) -> T {
@@ -3874,7 +3947,7 @@ fn handle_file_write_chunk(
 /// and returns the `io::Error` to the caller for producer-specific
 /// cleanup (e.g., killing a child process).
 fn send_data_chunks<R: Read>(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     reader: &mut R,
     chunk_size: usize,
     error_context: &str,
@@ -3894,7 +3967,7 @@ fn send_data_chunks<R: Read>(
 /// Send data chunks without the terminal frame so a producer can verify its
 /// final status before reporting a successful end-of-stream.
 fn send_data_chunks_body<R: Read>(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     reader: &mut R,
     chunk_size: usize,
     error_context: &str,
@@ -3941,7 +4014,7 @@ fn send_data_chunks_body<R: Read>(
 /// loop (not the generic `handle_request` match) so it can emit
 /// multiple responses per request.
 fn handle_streaming_file_read(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     path: &str,
     target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4059,7 +4132,7 @@ fn handle_streaming_file_read(
 /// visible there even when an image workload is active, and no temporary
 /// archive needs to traverse virtiofs or occupy the guest disk.
 fn handle_streaming_archive_directory(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     path: &str,
     target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4153,9 +4226,58 @@ fn handle_streaming_archive_directory(
     }
 }
 
+/// Stream a container's changes as one image layer (`ContainerDiff`): the
+/// layer is written to a file on the storage disk first, since building it
+/// walks the whole upper directory, then sent in chunks.
+fn handle_streaming_container_diff(
+    stream: &mut WireStream<impl ReadWrite>,
+    overlay_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let built = container::build_container_diff(overlay_id);
+    let path = match built {
+        Ok(path) => path,
+        Err(message) => {
+            send_response(
+                stream,
+                &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+    let file = std::fs::File::open(&path);
+    let _ = std::fs::remove_file(&path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("open container diff: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    send_data_chunks_body(
+        stream,
+        &mut file,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read container diff",
+        error_codes::FILE_IO_FAILED,
+    )?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: Vec::new(),
+            done: true,
+        },
+    )
+}
+
 /// Handle an interactive run session with streaming I/O.
 fn handle_interactive_run(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
@@ -4272,6 +4394,33 @@ fn handle_interactive_run(
             }
         };
 
+    // A command that is not there fails the request, with the text a
+    // container engine reports, rather than starting and exiting at once.
+    if let Some(program) = launch.command.first() {
+        let path = launch
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+            });
+        #[cfg(target_os = "linux")]
+        if let Err(e) = container::check_executable(
+            std::path::Path::new(&prepared.rootfs_path),
+            program,
+            launch.workdir.as_deref(),
+            &path,
+        ) {
+            maybe_cleanup(&prepared.workload_id);
+            send_response(stream, &AgentResponse::error(e, error_codes::SPAWN_FAILED))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (program, path);
+    }
+
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
         &prepared.rootfs_path,
@@ -4364,9 +4513,16 @@ impl ResolvedLaunch {
         user: Option<String>,
         s3_volumes: Vec<smolvm_protocol::S3Volume>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!("image not found: {image}").into()
-        })?;
+        let info = match storage::query_image(image)? {
+            Some(info) => info,
+            // An image this machine's store does not hold, with the command
+            // given: a session joining a container started from an image
+            // shared into the machine (the Docker engine's containers in
+            // another container's machine), whose settings the caller already
+            // merged. Preparing its overlay still fails for anything else.
+            None if !command.is_empty() => smolvm_protocol::ImageInfo::default(),
+            None => return Err(format!("image not found: {image}").into()),
+        };
         let command = if command.is_empty() {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
@@ -4406,6 +4562,27 @@ impl ResolvedLaunch {
     }
 }
 
+/// The user the agent's keep-alive init runs as: root, like PID 1 on any Linux
+/// machine. The image's `USER` is the workload's user, not the init's, and
+/// every exec names its own user (see [`oci::resolve_exec_user_spec`]), so
+/// nothing inherits this one.
+pub(crate) const KEEPALIVE_USER: &str = "0:0";
+
+impl ResolvedLaunch {
+    /// The launch for the keep-alive init that is PID 1 in front of this
+    /// workload: the same env and workdir, the init as its command, and root
+    /// ([`KEEPALIVE_USER`]) as its user whatever user the workload runs as.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn keepalive(&self) -> Self {
+        Self {
+            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
+            env: self.env.clone(),
+            workdir: self.workdir.clone(),
+            user: Some(KEEPALIVE_USER.to_string()),
+        }
+    }
+}
+
 /// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
 /// request wins on key conflicts, image entries fill in the rest — matching how
 /// a container runtime composes image + run-time environment.
@@ -4425,11 +4602,47 @@ fn merge_image_env(
     merged
 }
 
+/// The OCI spec for a container whose workload is `launch`. With
+/// `container_init` the container's own process is the keep-alive init
+/// ([`ResolvedLaunch::keepalive`], root) and the workload is exec'd into it
+/// later; otherwise the workload is the container's process. Either way the
+/// workload's `uid:gid` is recorded in [`oci::WORKLOAD_USER_ANNOTATION`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn container_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, String> {
+    let workload = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
+    let keepalive;
+    let (process, identity) = if container_init {
+        keepalive = launch.keepalive();
+        let identity = oci::resolve_process_identity(rootfs_path, keepalive.user.as_deref())?;
+        (&keepalive, identity)
+    } else {
+        (launch, workload.clone())
+    };
+    let mut spec = oci::OciSpec::new(
+        &process.command,
+        &process.env,
+        process.workdir.as_deref().unwrap_or("/"),
+        tty,
+        &identity,
+        unprivileged,
+    );
+    spec.set_workload_user(&workload);
+    Ok(spec)
+}
+
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
 /// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
 /// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
-/// The only caller-controlled variation is `tty` (detached: always `false`).
+/// The caller-controlled variations are `tty` (detached: always `false`) and
+/// `container_init`, which puts the keep-alive init in front of `launch` (see
+/// [`container_spec`]).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn write_oci_bundle(
@@ -4441,16 +4654,31 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let workdir_str = launch.workdir.as_deref().unwrap_or("/");
-    let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
-    let mut spec = oci::OciSpec::new(
-        &launch.command,
-        &launch.env,
-        workdir_str,
+    let spec = build_oci_spec(
+        rootfs_path,
+        launch,
+        mounts,
         tty,
-        &identity,
         unprivileged,
-    );
+        container_init,
+    )?;
+    spec.write_to(bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    Ok(oci::generate_container_id())
+}
+
+/// The OCI spec [`write_oci_bundle`] writes, for callers that add to it first.
+#[cfg(target_os = "linux")]
+fn build_oci_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, Box<dyn std::error::Error>> {
+    let mut spec = container_spec(rootfs_path, launch, tty, unprivileged, container_init)?;
 
     if tty {
         // Give the PTY a non-zero starting size. The host follows up with a
@@ -4486,10 +4714,7 @@ fn write_oci_bundle(
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
     credentials::inject_into_container(&mut spec, rootfs_path, mounts);
-    spec.write_to(bundle_path)
-        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
-
-    Ok(oci::generate_container_id())
+    Ok(spec)
 }
 
 /// Handle a detached run request: start a container in the background and
@@ -4503,7 +4728,7 @@ fn write_oci_bundle(
 /// persist across exec sessions, which requires a named overlay.
 #[cfg(target_os = "linux")]
 fn handle_run_detached(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::path::Path;
@@ -4693,22 +4918,12 @@ fn handle_run_detached(
     // tear down the PID namespace and SIGKILL every exec still running in the
     // machine. Init systems are the exception: they only work as PID 1.
     let workload_is_pid1 = workload_needs_pid1(&launch.command);
-    let container_launch = if workload_is_pid1 {
-        None
-    } else {
-        Some(ResolvedLaunch {
-            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
-            env: launch.env.clone(),
-            workdir: launch.workdir.clone(),
-            user: launch.user.clone(),
-        })
-    };
 
     // Detached containers always run non-interactively (tty: false).
     let container_id = match write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        container_launch.as_ref().unwrap_or(&launch),
+        &launch,
         &mounts,
         false,
         unprivileged,
@@ -4924,7 +5139,7 @@ fn exec_process_spec(
     terminal: bool,
 ) -> Result<Option<oci::OciProcess>, String> {
     let identity = oci::resolve_process_identity(rootfs, launch.user.as_deref())?;
-    if identity.user.additional_gids.is_empty() {
+    if !identity.user.has_supplementary_groups() {
         return Ok(None);
     }
     Ok(Some(oci::OciProcess {
@@ -5049,7 +5264,7 @@ fn launch_workload(
             Some(&pid_file),
             Some(&log),
         )
-        .user(user.as_deref())
+        .user(Some(&user))
         .stdin_null(),
     };
     let status = match workload::output_pipe() {
@@ -5202,7 +5417,7 @@ mod stop_on_exit_tests {
 /// `cargo check` on macOS compiles the dispatch in `handle_connection`.
 #[cfg(not(target_os = "linux"))]
 fn handle_run_detached(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     _request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     send_response(
@@ -5608,30 +5823,33 @@ fn restored_container_exec_command(
     let environment = crun::augmented_exec_env(&environment, container_id);
 
     // The uid:gid plus the user's supplementary groups from the container's own
-    // passwd/group (a `runner` in `docker` keeps `docker`; this path used to call
-    // setgroups(0) and drop every extra group). A rootfs whose passwd cannot be
-    // read falls back to the resolved uid:gid alone.
-    let (uid, gid, groups): (u32, u32, Vec<libc::gid_t>) =
+    // passwd/group (a `runner` in `docker` keeps `docker`). A rootfs whose
+    // passwd cannot be read falls back to the resolved uid:gid alone.
+    let (uid, gid, groups): (u32, u32, Vec<u32>) =
         match oci::resolve_process_identity(&root, launch.user.as_deref()) {
             Ok(identity) => (
                 identity.user.uid,
                 identity.user.gid,
-                identity
-                    .user
-                    .additional_gids
-                    .iter()
-                    .map(|g| *g as libc::gid_t)
-                    .collect(),
+                identity.user.additional_gids,
             ),
             Err(_) => {
-                let user = launch.user.as_deref().unwrap_or("0:0");
+                let user = launch.user.as_deref().unwrap_or(KEEPALIVE_USER);
                 let (uid, gid) = user
                     .split_once(':')
                     .ok_or_else(|| format!("resolved container user is not uid:gid: {user}"))?;
-                (uid.parse()?, gid.parse()?, Vec::new())
+                let gid = gid.parse()?;
+                (uid.parse()?, gid, vec![gid])
             }
         };
 
+    // nsenter enters the namespaces as root and runs this agent's own binary,
+    // passed as an inherited descriptor (it is not inside the container), to
+    // take on the user: `nsenter --setgid` would drop the groups set here.
+    let exe = std::fs::File::open("/proc/self/exe")?;
+    let exe_fd = {
+        use std::os::unix::io::AsRawFd as _;
+        exe.as_raw_fd()
+    };
     let mut command = Command::new("/usr/bin/nsenter");
     command
         .arg("--target")
@@ -5639,19 +5857,25 @@ fn restored_container_exec_command(
         .args(["--mount", "--uts", "--ipc", "--pid"])
         .arg(format!("--root={}", root.display()))
         .arg(format!("--wd={}", host_workdir.display()))
-        .arg(format!("--setgid={gid}"))
-        .arg(format!("--setuid={uid}"))
         .arg("--")
-        .args(&launch.command)
+        .args(process::exec_as_args(
+            &format!("/proc/self/fd/{exe_fd}"),
+            uid,
+            gid,
+            &groups,
+            &launch.command,
+        ))
         .env_clear()
         .envs(environment);
 
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: setgroups is async-signal-safe and touches only child credentials;
-    // `groups` is moved into the closure and outlives the call.
+    // SAFETY: fcntl is async-signal-safe and only clears close-on-exec on the
+    // child's copy of `exe`, which the closure owns, so it stays open until
+    // the command is spawned.
     unsafe {
         command.pre_exec(move || {
-            if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            use std::os::unix::io::AsRawFd as _;
+            if libc::fcntl(exe.as_raw_fd(), libc::F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -5779,8 +6003,9 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// Establish the long-lived "main" container for a persistent overlay and return
 /// its id. PID 1 is smolvm's image-independent keepalive and child reaper, so
 /// processes a later `crun exec` backgrounds inside it survive across exec calls
-/// for the machine's lifetime without accumulating orphan zombies. Env / workdir /
-/// user are inherited from the image so exec'd commands see the right environment.
+/// for the machine's lifetime without accumulating orphan zombies. Env and workdir
+/// are inherited from the image; PID 1 runs as root, and each exec into it names
+/// its user (the image's, or the request's) explicitly.
 /// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
 /// (`crun run --detach` hangs in the smolvm VM environment).
 #[cfg(target_os = "linux")]
@@ -5795,13 +6020,6 @@ fn ensure_main_container(
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    let keepalive = ResolvedLaunch {
-        command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
-        env: base_launch.env.clone(),
-        workdir: base_launch.workdir.clone(),
-        user: base_launch.user.clone(),
-    };
-
     let rootfs_path = Path::new(rootfs);
     let bundle_path = rootfs_path
         .parent()
@@ -5814,7 +6032,7 @@ fn ensure_main_container(
     let container_id = write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        &keepalive,
+        base_launch,
         mounts,
         false,
         unprivileged,
@@ -5897,7 +6115,10 @@ fn spawn_interactive_command(
         command: launch.command.clone(),
         env: exec_env,
         workdir: launch.workdir.clone(),
-        user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
+        user: Some(oci::resolve_exec_user_spec(
+            Path::new(rootfs),
+            launch.user.as_deref(),
+        )?),
     };
     let launch = &launch_owned;
 
@@ -6207,8 +6428,7 @@ impl InteractiveFrame {
                     self.body.resize(len, 0);
                     continue;
                 }
-                let request = serde_json::from_slice(&self.body)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                let request = smolvm_protocol::binary_stream::decode_request(&self.body)?.body;
                 *self = Self::default();
                 return Ok(Some(request));
             }
@@ -6242,7 +6462,7 @@ impl InteractiveFrame {
 }
 
 fn run_interactive_loop(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
@@ -6264,7 +6484,7 @@ fn run_interactive_loop(
 }
 
 fn run_interactive_loop_io(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
     child_stdout: &mut Option<std::process::ChildStdout>,
@@ -6569,7 +6789,7 @@ fn run_interactive_loop_io(
 /// (PTY merges stdout and stderr) and supports terminal resize.
 #[cfg(unix)]
 fn run_interactive_loop_pty(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     pty_master: pty::PtyMaster,
     timeout_ms: Option<u64>,
@@ -6821,7 +7041,7 @@ fn run_interactive_loop_pty(
 
 /// Drain any remaining output from stdout/stderr after child exits.
 fn drain_remaining_output(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     child_stdout: &mut Option<std::process::ChildStdout>,
     child_stderr: &mut Option<std::process::ChildStderr>,
     stdout_buf: &mut [u8],
@@ -7269,8 +7489,10 @@ fn run_background_in_keepalive(
     // `crun exec --user` needs a numeric uid[:gid]; resolve any username
     // against the container's /etc/passwd, same as the foreground path.
     oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
-    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    launch.user = Some(
+        oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
 
     // Capture the detached process's PID via a pid-file so the response
     // honors the run-background contract (the host client parses a PID from
@@ -7500,8 +7722,10 @@ fn run_in_keepalive_container(
     // request user) is rejected with "invalid USERSPEC specified". Resolve it
     // against the container's /etc/passwd, matching the `crun run` path (#632).
     oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
-    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    launch.user = Some(
+        oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
 
     // Spawn the exec, wire stdin, then wait with the SAME timeout + client
     // liveness contract every other exec path uses. The keep-alive path
@@ -7726,7 +7950,7 @@ fn handle_run(
 
 /// Handle image pull request with progress streaming.
 fn handle_streaming_pull<S: Read + Write>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     image: &str,
     cache_as: Option<&str>,
     oci_platform: Option<&str>,
@@ -7769,7 +7993,7 @@ const PULL_PROGRESS_HEARTBEAT: std::time::Duration = std::time::Duration::from_s
 /// host's frame timeout, so while the pull is quiet this thread (the stream's
 /// only writer) repeats the latest update every `heartbeat`.
 fn pull_with_heartbeat<S: Write, T: Send>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     heartbeat: std::time::Duration,
     pull: impl FnOnce(&mut dyn FnMut(usize, usize, &str)) -> T + Send,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -7923,7 +8147,7 @@ fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
 /// image runs the helper out of space partway through. Streaming keeps the
 /// archive off the disk entirely, so only the source rootfs has to fit.
 fn handle_streaming_flatten_layers(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     lowerdirs: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
@@ -8020,7 +8244,7 @@ fn handle_format_storage() -> AgentResponse {
 /// chunks. No temp tar file is created — this allows exporting layers of any
 /// size without filling the storage disk.
 fn handle_streaming_export_layer(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     image_digest: &str,
     layer_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8675,7 +8899,7 @@ fn handle_vm_exec(
 
 /// Handle interactive VM-level exec with streaming I/O.
 fn handle_interactive_vm_exec(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (command, env, workdir, timeout_ms, tty) = match request {
@@ -8842,10 +9066,19 @@ fn spawn_direct_interactive_command(
 
 /// Send a response to the client.
 fn send_response(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     response: &AgentResponse,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_vec(response)?;
+    if stream.binary && smolvm_protocol::binary_stream::write_response(&mut stream.inner, response)?
+    {
+        stream.flush()?;
+        return Ok(());
+    }
+    let mut envelope = Envelope::new(response);
+    if stream.binary {
+        envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
+    }
+    let json = serde_json::to_vec(&envelope)?;
     let len = json.len() as u32;
 
     stream.write_all(&len.to_be_bytes())?;
@@ -8854,6 +9087,39 @@ fn send_response(
 
     debug!(?response, "sent response");
     Ok(())
+}
+
+/// Negotiation belongs to this connection, never to a process or worker thread.
+struct WireStream<'a, T> {
+    inner: &'a mut T,
+    binary: bool,
+}
+
+impl<'a, T> WireStream<'a, T> {
+    fn new(inner: &'a mut T) -> Self {
+        Self {
+            inner,
+            binary: false,
+        }
+    }
+}
+impl<T: Read> Read for WireStream<'_, T> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(bytes)
+    }
+}
+impl<T: Write> Write for WireStream<'_, T> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl<T: AsRawFd> AsRawFd for WireStream<'_, T> {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.inner.as_raw_fd()
+    }
 }
 
 /// Trait for read+write streams with raw fd access.
@@ -8934,7 +9200,8 @@ mod work_slot_tests {
             .unwrap();
 
         let before = thread_cpu();
-        let code = run_interactive_loop(&mut guest, &mut child, None).unwrap();
+        let code =
+            run_interactive_loop(&mut WireStream::new(&mut guest), &mut child, None).unwrap();
         let spent = thread_cpu() - before;
 
         assert_eq!(code, 0);
@@ -9808,8 +10075,10 @@ mod tests {
                 )
                 .unwrap();
                 assert!(pty.is_none());
-                send_response(&mut agent, &AgentResponse::Started).unwrap();
-                let code = run_interactive_loop(&mut agent, &mut child, Some(500)).unwrap();
+                send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+                let code =
+                    run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(500))
+                        .unwrap();
                 finished.send(code).unwrap();
             });
 
@@ -9848,7 +10117,7 @@ mod tests {
         .unwrap();
         assert!(pty.is_none());
         assert_eq!(
-            run_interactive_loop(&mut agent, &mut child, Some(100)).unwrap(),
+            run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(100)).unwrap(),
             124
         );
 
@@ -9881,7 +10150,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100)).unwrap(),
+            run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty.unwrap(),
+                Some(100)
+            )
+            .unwrap(),
             124
         );
 
@@ -9900,6 +10175,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn streamed_cat_drains_stdout_while_writing_large_stdin() {
+        for binary in [false, true] {
+            streamed_cat_with_encoding(binary);
+        }
+    }
+
+    fn streamed_cat_with_encoding(binary: bool) {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -9911,6 +10192,8 @@ mod tests {
             .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let guest = std::thread::spawn(move || {
+            let mut agent = WireStream::new(&mut agent);
+            agent.binary = binary;
             let (mut child, pty) =
                 spawn_direct_interactive_command(&["cat".to_string()], &[], None, false).unwrap();
             assert!(pty.is_none());
@@ -9926,15 +10209,23 @@ mod tests {
             .unwrap();
         });
 
-        let input = vec![b'x'; 512 * 1024];
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
         let mut writer = client.try_clone().unwrap();
         let payload = input.clone();
         let sender = std::thread::spawn(move || {
+            let encode = |request: &AgentRequest| {
+                if binary {
+                    smolvm_protocol::binary_stream::encode_request(request, None)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    smolvm_protocol::encode_message(request).unwrap()
+                }
+            };
             for chunk in payload.chunks(32 * 1024) {
-                let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                let frame = encode(&AgentRequest::Stdin {
                     data: chunk.to_vec(),
-                })
-                .unwrap();
+                });
                 if chunk.as_ptr() == payload.as_ptr() {
                     // Fragments across both the prefix and payload must be
                     // assembled without losing the command's streamed output.
@@ -9948,10 +10239,7 @@ mod tests {
                 }
             }
             writer
-                .write_all(
-                    &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: Vec::new() })
-                        .unwrap(),
-                )
+                .write_all(&encode(&AgentRequest::Stdin { data: Vec::new() }))
                 .unwrap();
         });
 
@@ -9961,7 +10249,10 @@ mod tests {
             client.read_exact(&mut header).unwrap();
             let mut body = vec![0; u32::from_be_bytes(header) as usize];
             client.read_exact(&mut body).unwrap();
-            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+            match smolvm_protocol::binary_stream::decode_response(&body)
+                .unwrap()
+                .0
+            {
                 AgentResponse::Started => {}
                 AgentResponse::Stdout { data } => stdout.extend(data),
                 AgentResponse::Exited { exit_code, .. } => {
@@ -10002,10 +10293,16 @@ mod tests {
             )
             .unwrap();
             let pty = pty.unwrap();
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
-            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(5000)).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+            let code = run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty,
+                Some(5000),
+            )
+            .unwrap();
             send_response(
-                &mut agent,
+                &mut WireStream::new(&mut agent),
                 &AgentResponse::Exited {
                     exit_code: code,
                     oom: false,
@@ -10113,10 +10410,14 @@ mod tests {
                     true,
                 )
                 .unwrap();
-                send_response(&mut agent, &AgentResponse::Started).unwrap();
-                let code =
-                    run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100))
-                        .unwrap();
+                send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+                let code = run_interactive_loop_pty(
+                    &mut WireStream::new(&mut agent),
+                    &mut child,
+                    pty.unwrap(),
+                    Some(100),
+                )
+                .unwrap();
                 tx.send(code).unwrap();
             });
 
@@ -10156,9 +10457,15 @@ mod tests {
             )
             .unwrap();
             let pty = pty.unwrap();
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(2000)).unwrap();
+            let code = run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty,
+                Some(2000),
+            )
+            .unwrap();
             (code, started.elapsed())
         });
 
@@ -10209,9 +10516,11 @@ mod tests {
             )
             .unwrap();
             assert!(pty.is_none());
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            let code =
+                run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(2000))
+                    .unwrap();
             (code, started.elapsed())
         });
 
@@ -10264,9 +10573,11 @@ mod tests {
             )
             .unwrap();
             assert!(pty.is_none());
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            let code =
+                run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(2000))
+                    .unwrap();
             (code, started.elapsed())
         });
 
@@ -10446,7 +10757,7 @@ mod tests {
         .unwrap();
         assert!(pty.is_none());
         assert_eq!(
-            run_interactive_loop(&mut agent, &mut child, None).unwrap(),
+            run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, None).unwrap(),
             0
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -10527,7 +10838,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let absent = tmp.path().join("absent");
         let (mut agent, mut client) = UnixStream::pair().unwrap();
-        handle_streaming_file_read(&mut agent, absent.to_str().unwrap(), None).unwrap();
+        handle_streaming_file_read(
+            &mut WireStream::new(&mut agent),
+            absent.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
         let mut header = [0u8; 4];
         client.read_exact(&mut header).unwrap();
         let mut frame = vec![0u8; u32::from_be_bytes(header) as usize];
@@ -10545,7 +10861,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut empty: &[u8] = &[];
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut empty,
             4096,
             "test",
@@ -10574,7 +10890,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut src = std::io::Cursor::new(payload.clone());
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut src,
             256,
             "test",
@@ -10613,7 +10929,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut src = std::io::Cursor::new(payload.clone());
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut src,
             256,
             "test",
@@ -11398,13 +11714,14 @@ mod pull_heartbeat_tests {
     fn a_quiet_pull_keeps_sending_its_latest_progress() {
         let heartbeat = Duration::from_millis(40);
         let mut stream = Vec::new();
-        let result = pull_with_heartbeat(&mut stream, heartbeat, |progress| {
-            std::thread::sleep(heartbeat * 5);
-            progress(1, 2, "sha256:big");
-            std::thread::sleep(heartbeat * 5);
-            "pulled"
-        })
-        .unwrap();
+        let result =
+            pull_with_heartbeat(&mut WireStream::new(&mut stream), heartbeat, |progress| {
+                std::thread::sleep(heartbeat * 5);
+                progress(1, 2, "sha256:big");
+                std::thread::sleep(heartbeat * 5);
+                "pulled"
+            })
+            .unwrap();
         assert_eq!(result, "pulled");
         let frames = progress_frames(&stream);
         let before = frames
@@ -11423,10 +11740,14 @@ mod pull_heartbeat_tests {
     #[test]
     fn a_pull_that_finishes_at_once_sends_nothing_extra() {
         let mut stream = Vec::new();
-        let result = pull_with_heartbeat(&mut stream, Duration::from_secs(60), |progress| {
-            progress(1, 1, "sha256:small");
-            7
-        })
+        let result = pull_with_heartbeat(
+            &mut WireStream::new(&mut stream),
+            Duration::from_secs(60),
+            |progress| {
+                progress(1, 1, "sha256:small");
+                7
+            },
+        )
         .unwrap();
         assert_eq!(result, 7);
         assert_eq!(
@@ -11483,6 +11804,163 @@ mod workload_owner_tests {
     }
 }
 
+#[cfg(test)]
+mod workload_owner_annotation_tests {
+    use super::*;
+
+    fn root_with_spec(dir: &std::path::Path, spec: &str) -> io_target::IoRoot {
+        let merged = dir.join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(dir.join("bundle")).unwrap();
+        std::fs::write(dir.join("bundle").join("config.json"), spec).unwrap();
+        io_target::IoRoot::Overlay {
+            workload_id: "persistent-test".into(),
+            merged,
+        }
+    }
+
+    #[test]
+    fn uploads_go_to_the_annotated_workload_user_not_the_root_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_spec(
+            dir.path(),
+            &format!(
+                r#"{{"process":{{"user":{{"uid":0,"gid":0}},"args":["/run/smolvm/init"]}},"annotations":{{"{}":"1001:123"}}}}"#,
+                oci::WORKLOAD_USER_ANNOTATION
+            ),
+        );
+        assert_eq!(workload_owner(&root), (Some(1001), Some(123)));
+    }
+
+    #[test]
+    fn an_annotated_root_workload_leaves_ownership_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_spec(
+            dir.path(),
+            &format!(
+                r#"{{"process":{{"user":{{"uid":0,"gid":0}},"args":["sh"]}},"annotations":{{"{}":"0:0"}}}}"#,
+                oci::WORKLOAD_USER_ANNOTATION
+            ),
+        );
+        assert_eq!(workload_owner(&root), (None, None));
+    }
+}
+
+/// The keep-alive init is root; the workload, and so every exec, is the
+/// image's (or the request's) user.
+#[cfg(test)]
+mod keepalive_user_tests {
+    use super::*;
+
+    fn rootfs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+        std::fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001::/home/runner:/bin/bash\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("etc/group"),
+            "root:x:0:\nrunner:x:1001:\ndocker:x:123:runner\nsudo:x:27:runner\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn launch(user: Option<&str>) -> ResolvedLaunch {
+        ResolvedLaunch {
+            command: vec!["./run.sh".into()],
+            env: vec![("RUNNER_ALLOW_RUNASROOT".into(), "0".into())],
+            workdir: Some("/home/runner".into()),
+            user: user.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_keepalive_launch_is_root_and_keeps_the_workload_env() {
+        let workload = launch(Some("runner"));
+        let init = workload.keepalive();
+        assert_eq!(init.user.as_deref(), Some(KEEPALIVE_USER));
+        assert_eq!(init.command, ["/run/smolvm/init", "container-init"]);
+        assert_eq!(init.env, workload.env);
+        assert_eq!(init.workdir, workload.workdir);
+        // the workload itself is untouched
+        assert_eq!(workload.user.as_deref(), Some("runner"));
+    }
+
+    #[test]
+    fn a_keepalive_container_runs_its_init_as_root_and_records_the_workload_user() {
+        let root = rootfs();
+        let spec =
+            container_spec(root.path(), &launch(Some("runner")), false, false, true).unwrap();
+        assert_eq!(spec.process.args, ["/run/smolvm/init", "container-init"]);
+        assert_eq!((spec.process.user.uid, spec.process.user.gid), (0, 0));
+        assert!(spec.process.env.iter().any(|e| e == "HOME=/root"));
+        assert_eq!(
+            spec.annotations
+                .get(oci::WORKLOAD_USER_ANNOTATION)
+                .map(String::as_str),
+            Some("1001:1001")
+        );
+    }
+
+    #[test]
+    fn a_workload_that_is_its_own_pid1_keeps_its_user_and_groups() {
+        let root = rootfs();
+        let spec =
+            container_spec(root.path(), &launch(Some("runner")), false, false, false).unwrap();
+        assert_eq!(spec.process.args, ["./run.sh"]);
+        assert_eq!((spec.process.user.uid, spec.process.user.gid), (1001, 1001));
+        assert_eq!(spec.process.user.additional_gids, vec![1001, 123, 27]);
+        assert!(spec.process.env.iter().any(|e| e == "HOME=/home/runner"));
+        assert_eq!(
+            spec.annotations
+                .get(oci::WORKLOAD_USER_ANNOTATION)
+                .map(String::as_str),
+            Some("1001:1001")
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_user_is_root_everywhere() {
+        let root = rootfs();
+        for init in [true, false] {
+            let spec = container_spec(root.path(), &launch(None), false, false, init).unwrap();
+            assert_eq!((spec.process.user.uid, spec.process.user.gid), (0, 0));
+            assert_eq!(
+                spec.annotations
+                    .get(oci::WORKLOAD_USER_ANNOTATION)
+                    .map(String::as_str),
+                Some("0:0")
+            );
+        }
+        assert_eq!(
+            oci::resolve_exec_user_spec(root.path(), None).unwrap(),
+            "0:0"
+        );
+    }
+
+    #[test]
+    fn every_exec_names_its_user_whatever_the_container_runs_as() {
+        let root = rootfs();
+        // The image's USER, a request's numeric override and no user at all all
+        // resolve to an explicit uid:gid for `crun exec --user`.
+        for (user, expected) in [
+            (Some("runner"), "1001:1001"),
+            (Some("1001"), "1001:1001"),
+            (Some("root"), "0:0"),
+            (None, "0:0"),
+        ] {
+            assert_eq!(
+                oci::resolve_exec_user_spec(root.path(), user).unwrap(),
+                expected,
+                "{user:?}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod exec_process_spec_tests {
     use super::{exec_process_spec, ResolvedLaunch};
@@ -11522,17 +12000,17 @@ mod exec_process_spec_tests {
             .unwrap()
             .expect("runner is in docker and sudo");
         assert_eq!((spec.user.uid, spec.user.gid), (1001, 1001));
-        assert_eq!(spec.user.additional_gids, vec![999, 27]);
+        assert_eq!(spec.user.additional_gids, vec![1001, 999, 27]);
         assert_eq!(spec.cwd, "/home/runner");
         assert!(!spec.terminal);
         let json = serde_json::to_string(&spec).unwrap();
-        assert!(json.contains("\"additionalGids\":[999,27]"), "{json}");
+        assert!(json.contains("\"additionalGids\":[1001,999,27]"), "{json}");
         assert!(json.contains("\"env\":[\"PATH=/usr/bin\"]"), "{json}");
         let by_name = exec_process_spec(root.path(), &launch(Some("runner")), &env, true)
             .unwrap()
             .unwrap();
         assert!(by_name.terminal);
-        assert_eq!(by_name.user.additional_gids, vec![999, 27]);
+        assert_eq!(by_name.user.additional_gids, vec![1001, 999, 27]);
     }
 
     #[test]

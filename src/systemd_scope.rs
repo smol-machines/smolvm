@@ -90,6 +90,13 @@ fn busctl_bounded(mut cmd: Command, timeout: Duration) -> Result<Output> {
 /// the slice on demand the first time a scope names it.
 pub const VM_SLICE: &str = "smolvm.slice";
 
+/// Share of the [`VM_SLICE`] memory limit that page cache is kept below by
+/// proactive reclaim. Cache above this line counts as free headroom for
+/// branch admission; cache below it does not, because the kernel enforces the
+/// limit on all of `memory.current` and reaching it makes VM threads reclaim
+/// synchronously while they hold filesystem locks.
+pub const VM_SLICE_RECLAIM_TARGET_PERCENT: u64 = 85;
+
 /// Online CPUs on hosts at least this large keep a few CPUs free of VMs by
 /// default (see [`host_reserved_cpus`]). Smaller hosts (laptops, CI runners)
 /// cannot spare a whole core.
@@ -243,9 +250,12 @@ const MEMORY_LIMIT_INFINITY: u64 = u64::MAX;
 /// ([`MEMORY_LIMIT_INFINITY`] = no limit).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VmSliceMemoryLimits {
-    /// `MemoryHigh`: above it the kernel throttles VM allocations and reclaims
-    /// their page cache, which also shows up as memory pressure the pressure
-    /// guard acts on.
+    /// `MemoryHigh`: always [`MEMORY_LIMIT_INFINITY`]. A finite one (v1.34.1)
+    /// made the kernel throttle a VMM over it with sleeps inside the
+    /// allocation, which on 2026-11-12 happened inside an XFS inode create
+    /// holding the AGI buffer lock; every other VMM and serve itself then
+    /// queued on that lock and the node stopped answering. The memory
+    /// pressure guard reclaims the slice from its own thread instead.
     pub high_bytes: u64,
     /// `MemoryMax`: the hard cap. An OOM at it kills a VM inside the slice
     /// instead of starving the host's own services.
@@ -259,8 +269,8 @@ pub struct VmSliceMemoryLimits {
 
 /// The [`VM_SLICE`] memory limits for a host with `total_bytes` of memory that
 /// keeps `reserved_bytes` for itself, given what the slice holds now
-/// (`current_bytes`, when known). `MemoryHigh` sits 2% of the cap (at most
-/// 8 GiB) below `MemoryMax` so reclaim and pressure start before the hard cap.
+/// (`current_bytes`, when known). `MemoryHigh` is always infinity, set
+/// explicitly so a finite one left by v1.34.1 is cleared on upgrade.
 fn vm_slice_memory_limits(
     total_bytes: u64,
     reserved_bytes: u64,
@@ -274,19 +284,20 @@ fn vm_slice_memory_limits(
         };
     }
     let max_bytes = total_bytes - reserved_bytes;
+    // Headroom kept above what the slice already holds when the cap would
+    // otherwise land at or below it.
     let gap = (max_bytes / 50).min(8 * 1024 * 1024 * 1024);
-    let high_bytes = max_bytes - gap;
     match current_bytes {
-        // Lowering a limit below what the slice holds makes the kernel reclaim
-        // at once, and guest RAM (shared memory, no swap) cannot be reclaimed:
-        // it would throttle or OOM-kill running VMs the moment serve restarts.
-        Some(current) if current >= high_bytes => VmSliceMemoryLimits {
-            high_bytes: current,
-            max_bytes: max_bytes.max(current.saturating_add(gap)),
+        // Lowering the cap to what the slice holds makes the kernel reclaim at
+        // once, and guest RAM (shared memory, no swap) cannot be reclaimed: it
+        // would OOM-kill running VMs the moment serve restarts.
+        Some(current) if current.saturating_add(gap) > max_bytes => VmSliceMemoryLimits {
+            high_bytes: MEMORY_LIMIT_INFINITY,
+            max_bytes: current.saturating_add(gap),
             raised_to_current: true,
         },
         _ => VmSliceMemoryLimits {
-            high_bytes,
+            high_bytes: MEMORY_LIMIT_INFINITY,
             max_bytes,
             raised_to_current: false,
         },
@@ -954,17 +965,19 @@ mod tests {
     }
 
     #[test]
-    fn the_vm_slice_memory_cap_is_host_minus_reserve_with_high_just_below() {
+    fn the_vm_slice_memory_cap_is_host_minus_reserve_and_never_throttles() {
         const GIB: u64 = 1024 * 1024 * 1024;
         let limits = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(100 * GIB));
         assert_eq!(limits.max_bytes, 710 * GIB);
-        // 2% of 710 GiB is above 8 GiB, so the gap is 8 GiB.
-        assert_eq!(limits.high_bytes, 702 * GIB);
+        // MemoryHigh is infinity, always written, so v1.34.1's finite one
+        // (702 GiB on a 755 GiB host) is cleared on upgrade.
+        assert_eq!(limits.high_bytes, MEMORY_LIMIT_INFINITY);
         assert!(!limits.raised_to_current);
-        // A small cap keeps high 2% below max.
         let small = vm_slice_memory_limits(16 * GIB, 4 * GIB, None);
-        assert_eq!(small.max_bytes, 12 * GIB);
-        assert_eq!(small.high_bytes, 12 * GIB - 12 * GIB / 50);
+        assert_eq!(
+            (small.high_bytes, small.max_bytes),
+            (MEMORY_LIMIT_INFINITY, 12 * GIB)
+        );
         // No reserve clears any earlier cap.
         let off = vm_slice_memory_limits(755 * GIB, 0, None);
         assert_eq!(
@@ -974,15 +987,26 @@ mod tests {
     }
 
     #[test]
-    fn a_slice_already_over_the_cap_is_not_squeezed_on_serve_restart() {
+    fn a_slice_already_near_the_cap_is_not_squeezed_on_serve_restart() {
         const GIB: u64 = 1024 * 1024 * 1024;
-        let limits = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(705 * GIB));
-        assert!(limits.raised_to_current);
-        assert_eq!(limits.high_bytes, 705 * GIB);
-        assert_eq!(limits.max_bytes, 713 * GIB);
+        // 700 GiB + the 8 GiB gap still fits under 710: the real cap applies.
+        let fits = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(700 * GIB));
+        assert!(!fits.raised_to_current);
+        assert_eq!(fits.max_bytes, 710 * GIB);
+        let near = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(705 * GIB));
+        assert!(near.raised_to_current);
+        assert_eq!(near.max_bytes, 713 * GIB);
+        assert_eq!(near.high_bytes, MEMORY_LIMIT_INFINITY);
         let over = vm_slice_memory_limits(755 * GIB, 45 * GIB, Some(740 * GIB));
-        assert_eq!(over.high_bytes, 740 * GIB);
         assert_eq!(over.max_bytes, 748 * GIB);
+    }
+
+    #[test]
+    fn slice_memory_args_clear_memory_high_with_infinity() {
+        let limits = vm_slice_memory_limits(64 << 30, 8 << 30, None);
+        let args = slice_memory_args(&limits);
+        let at = args.iter().position(|a| a == "MemoryHigh").unwrap();
+        assert_eq!(&args[at + 1..at + 3], &["t", &u64::MAX.to_string()]);
     }
 
     #[test]

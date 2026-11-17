@@ -17,6 +17,7 @@ pub mod ca;
 pub mod intercept;
 pub mod policy;
 pub mod resolver;
+mod scrub;
 pub use smolvm_protocol::sni;
 
 pub use ca::MachineCa;

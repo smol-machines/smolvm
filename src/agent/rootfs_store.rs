@@ -57,14 +57,27 @@ pub fn resolve(digest: &str) -> Result<PathBuf> {
 /// the store's copy. `None` when the host has neither.
 pub fn golden_rootfs(booted: Option<&Path>, digest: &str, store: &Store) -> Option<PathBuf> {
     booted
-        .filter(|path| {
-            smolvm_pack::assets::cached_agent_rootfs_digest(path)
-                .ok()
-                .as_deref()
-                == Some(digest)
-        })
+        .filter(|path| tree_has_digest(path, digest))
         .map(Path::to_path_buf)
         .or_else(|| store.installed(digest))
+}
+
+/// Whether the rootfs at `path` has `digest`. On macOS a machine started by
+/// smolvm 1.34.3 or older recorded the legacy digest, which counts symlink
+/// modes, so that one matches too; on Linux the two are always equal.
+fn tree_has_digest(path: &Path, digest: &str) -> bool {
+    if smolvm_pack::assets::cached_agent_rootfs_digest(path)
+        .ok()
+        .as_deref()
+        == Some(digest)
+    {
+        return true;
+    }
+    cfg!(target_os = "macos")
+        && smolvm_pack::assets::legacy_agent_rootfs_digest(path)
+            .ok()
+            .as_deref()
+            == Some(digest)
 }
 
 /// The hex part of a `sha256:<hex>` digest, refusing anything that could name
@@ -108,11 +121,7 @@ impl Store {
     /// The rootfs a machine pinned to `digest` boots: `default` when its digest
     /// matches, else this store's copy.
     pub fn resolve_with(&self, digest: &str, default: &Path) -> Result<PathBuf> {
-        if smolvm_pack::assets::cached_agent_rootfs_digest(default)
-            .ok()
-            .as_deref()
-            == Some(digest)
-        {
+        if tree_has_digest(default, digest) {
             return Ok(default.to_path_buf());
         }
         self.installed(digest).ok_or_else(|| {

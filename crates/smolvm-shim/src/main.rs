@@ -10,6 +10,8 @@ mod bundle;
 #[cfg(target_os = "linux")]
 mod engine;
 #[cfg(target_os = "linux")]
+mod reaper;
+#[cfg(target_os = "linux")]
 mod service;
 #[cfg(target_os = "linux")]
 mod task;

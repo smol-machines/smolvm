@@ -221,8 +221,25 @@ pub fn launch_agent_vm_dynamic(
     // Enable GPU (virtio-gpu / Venus Vulkan) when requested by the manifest.
     // Flag logic lives in super::gpu_virgl_flags() — see mod.rs for the full
     // explanation of each flag's purpose on Linux vs macOS.
-    if config.resources.gpu {
-        let virgl_flags = super::gpu_virgl_flags();
+    //
+    // A display without `--gpu` also needs the virtio-gpu device, set up so
+    // that nothing on the host GPU is touched (see `GpuDevice`).
+    let display = super::requested_display();
+    let mut gpu_device = super::gpu_device(config.resources.gpu, display);
+    if gpu_device == super::GpuDevice::SoftwareDisplay
+        && (krun.set_gpu_options2.is_none()
+            || krun.add_display.is_none()
+            || krun.set_display_backend.is_none())
+    {
+        tracing::warn!(
+            "SMOLVM_DISPLAY is set but this libkrun has no display support; \
+             starting without a display"
+        );
+        gpu_device = super::GpuDevice::None;
+    }
+    if gpu_device != super::GpuDevice::None {
+        super::select_gpu_backend(gpu_device, display.is_some());
+        let virgl_flags = super::virgl_flags_for(gpu_device);
         let vram_mib = config.resources.effective_gpu_vram_mib();
         let vram_bytes: u64 = (vram_mib as u64) * crate::data::consts::BYTES_PER_MIB;
 
@@ -235,7 +252,9 @@ pub fn launch_agent_vm_dynamic(
                         ret
                     ));
                 }
-                tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                if gpu_device == super::GpuDevice::Accelerated {
+                    tracing::info!("GPU enabled (Venus/Vulkan via virtio-gpu)");
+                }
 
                 // Optional virtio-gpu scanout. Venus gives the guest GPU
                 // *rendering*; a scanout gives it a *display*. Without one the
@@ -244,10 +263,7 @@ pub fn launch_agent_vm_dynamic(
                 // compositors fail with "not a KMS device". Opt-in for now:
                 // adding a connector changes guest topology, and existing GPU
                 // workloads (CUDA, headless Vulkan) neither need nor want one.
-                if let Some((w, h)) =
-                    super::parse_display_size(std::env::var("SMOLVM_DISPLAY").ok().as_deref())
-                {
-                    super::default_gpu_backend_for_display();
+                if let Some((w, h)) = display {
                     match krun.add_display {
                         Some(add_display) => {
                             let ret = unsafe { add_display(ctx, w, h) };
@@ -722,6 +738,7 @@ pub fn launch_agent_vm_dynamic(
         cuda_socket: config.cuda_socket,
         docker_socket: None,
         port_forward_socket: None,
+        auto_ports_socket: None,
         workload_log_socket: None,
     };
     let active_vsock: Vec<_> = vsock_service::registry()

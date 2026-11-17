@@ -106,9 +106,7 @@ pub fn lock_fork_source(source: &str) -> Result<ForkSourceLock> {
 pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
     validate_vm_name(source, "saved execution")
         .map_err(|error| Error::config("saved execution", error))?;
-    ForkSourceLock::acquire_at(
-        &fork_source_lock_path(source).with_extension("pause-operation.lock"),
-    )
+    ForkSourceLock::acquire_at(&saved_execution_lock_path(source))
 }
 
 pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
@@ -122,6 +120,12 @@ fn fork_source_lock_path(source: &str) -> PathBuf {
         .parent()
         .expect("a VM data directory always has a parent")
         .join(format!(".{source}.fork-operation.lock"))
+}
+
+/// The pause/resume lock of [`lock_saved_execution`]: a sibling of the
+/// machine's fork-source lock, for the same reason.
+fn saved_execution_lock_path(source: &str) -> PathBuf {
+    fork_source_lock_path(source).with_extension("pause-operation.lock")
 }
 
 #[cfg(unix)]
@@ -230,17 +234,19 @@ fn try_lock_file_exclusive(file: &File) -> std::io::Result<()> {
     }
 }
 
-/// The machine name a fork-source lock file belongs to, or `None` when the path
-/// is not one. The inverse of the name [`fork_source_lock_path`] builds.
+/// The machine name a fork-source or pause-operation lock file belongs to, or
+/// `None` when the path is neither. The inverse of the names
+/// [`fork_source_lock_path`] and [`saved_execution_lock_path`] build.
 fn fork_source_lock_owner(path: &Path) -> Option<String> {
-    let file_name = path.file_name()?.to_str()?;
+    let file_name = path.file_name()?.to_str()?.strip_prefix('.')?;
     let source = file_name
-        .strip_prefix('.')?
-        .strip_suffix(".fork-operation.lock")?;
+        .strip_suffix(".fork-operation.pause-operation.lock")
+        .or_else(|| file_name.strip_suffix(".fork-operation.lock"))?;
     (!source.is_empty()).then(|| source.to_string())
 }
 
-/// Remove fork-source lock files whose machine no longer exists.
+/// Remove fork-source and pause-operation lock files whose machine no longer
+/// exists.
 ///
 /// [`fork_source_lock_path`] deliberately puts the lock file *beside* the
 /// machine's data directory rather than inside it, so deleting a machine cannot
@@ -251,8 +257,9 @@ fn fork_source_lock_owner(path: &Path) -> Option<String> {
 ///
 /// Sweeping is safe here only because both conditions must hold: the machine's
 /// data directory is gone, *and* the lock can be taken without blocking, which
-/// no in-flight fork or checkpoint would permit. A file failing either check is
-/// left for a later sweep rather than raced against.
+/// no in-flight fork, checkpoint, pause, resume or saved-execution download
+/// would permit. A file failing either check is left for a later sweep rather
+/// than raced against.
 ///
 /// Best-effort by design, like [`crate::agent::prune_orphaned_ready_markers`]:
 /// a lock this process cannot open or unlink is simply left in place.
@@ -2375,6 +2382,39 @@ pub fn sync_fork_source(name: &str) -> Result<()> {
     }
 }
 
+/// Selects one mount point per writable virtio disk from `/proc/mounts`; a disk
+/// mounted twice is trimmed once.
+const WRITABLE_GUEST_DISKS: &str =
+    r#"$1 ~ "^/dev/vd" && $4 ~ /(^|,)rw(,|$)/ && !seen[$1]++ { print $2 }"#;
+
+/// Tell the guest's writable disks which blocks its filesystems no longer use.
+///
+/// A deleted file's blocks stay written in the host's disk image until the
+/// guest discards them, so a checkpoint would save them and the host would keep
+/// the space. A trim punches them out of the image, which the capture then
+/// skips as holes. Best effort: an older agent or a disk without discard just
+/// keeps its blocks.
+pub fn trim_guest_disks(name: &str) {
+    let socket = vm_data_dir(name).join("agent.sock");
+    let Ok(mut client) = AgentClient::connect_with_retry(&socket) else {
+        return;
+    };
+    let _ = client.vm_exec(
+        vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            format!(
+                "awk '{WRITABLE_GUEST_DISKS}' /proc/mounts | \
+                 while read -r mount; do fstrim \"$mount\"; done"
+            ),
+        ],
+        Vec::new(),
+        None,
+        Some(SYNC_FORK_SOURCE_TIMEOUT),
+        None,
+    );
+}
+
 /// Join the guest's scattered free pages into the large blocks free page
 /// hinting can hand over. Best effort: an older agent or a kernel without
 /// compaction just leaves memory as it is.
@@ -3355,6 +3395,8 @@ fn prepare_clone_from_snapshot(
         }
         apply_clone_labels(&mut clone_rec.labels, spec.labels);
 
+        // Ports the source's run picked for itself stay with that run.
+        clone_rec.allocated_ports.clear();
         let mut port_remaps = Vec::new();
         if !spec.pinned_ports.is_empty() {
             clone_rec.ports = spec.pinned_ports.to_vec();
@@ -4674,6 +4716,31 @@ fn check_pinned_ports_keep_network_backend(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn the_trim_reaches_each_writable_guest_disk_once() {
+        let mounts = "\
+/dev/vda /storage ext4 rw,noatime 0 0
+/dev/vdb /oldroot/mnt/overlay ext4 rw,noatime 0 0
+/dev/vda /storage/workspace ext4 rw,noatime 0 0
+/dev/vdc /mnt/layers ext4 ro,noatime 0 0
+none / overlay rw,relatime 0 0
+tmpfs /tmp tmpfs rw 0 0
+";
+        let file = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), mounts).unwrap();
+        let output = std::process::Command::new("awk")
+            .arg(super::WRITABLE_GUEST_DISKS)
+            .arg(file.path())
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        assert_eq!(
+            String::from_utf8(output.stdout).unwrap(),
+            "/storage\n/oldroot/mnt/overlay\n"
+        );
+    }
+
     #[test]
     fn clone_labels_override_inherited_ones_and_keep_the_rest() {
         let mut labels = std::collections::BTreeMap::from([
@@ -5250,9 +5317,20 @@ mod tests {
     /// `.<name>.fork-operation.lock` shape makes ambiguous to a naive split.
     #[test]
     fn a_lock_files_owner_round_trips_through_its_path() {
-        for source in ["golden", "worker.one", "a.b.c", "trailing.lock"] {
+        for source in [
+            "golden",
+            "worker.one",
+            "a.b.c",
+            "trailing.lock",
+            "odd.fork-operation",
+            "odd.fork-operation.pause-operation",
+        ] {
             assert_eq!(
                 fork_source_lock_owner(&fork_source_lock_path(source)).as_deref(),
+                Some(source)
+            );
+            assert_eq!(
+                fork_source_lock_owner(&saved_execution_lock_path(source)).as_deref(),
                 Some(source)
             );
         }
@@ -5281,6 +5359,55 @@ mod tests {
             !lock.exists(),
             "a lock whose machine is gone must be removed"
         );
+    }
+
+    /// Pausing a machine takes a second sibling lock, which its deletion must
+    /// not leave behind either.
+    #[test]
+    fn an_orphaned_pause_operation_lock_is_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join(".gone.fork-operation.pause-operation.lock");
+        let alive = dir
+            .path()
+            .join(".alive.fork-operation.pause-operation.lock");
+        std::fs::write(&gone, b"").unwrap();
+        std::fs::write(&alive, b"").unwrap();
+        std::fs::create_dir_all(dir.path().join(crate::agent::vm_dir_hash("alive"))).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(
+            !gone.exists(),
+            "a pause lock whose machine is gone must be removed"
+        );
+        assert!(
+            alive.exists(),
+            "a live machine's pause lock must not be swept"
+        );
+    }
+
+    /// An in-flight pause or resume holds its lock after the machine is gone
+    /// as well, and the sweep must leave it to them.
+    #[cfg(unix)]
+    #[test]
+    fn a_held_pause_operation_lock_is_never_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let lock = dir.path().join(".busy.fork-operation.pause-operation.lock");
+        std::fs::write(&lock, b"").unwrap();
+        let held = ForkSourceLock::acquire_at(&lock).unwrap();
+
+        prune_orphaned_fork_source_locks_in(dir.path());
+
+        assert!(lock.exists(), "an in-flight pause's lock must not be swept");
+        drop(held);
+        prune_orphaned_fork_source_locks_in(dir.path());
+        assert!(!lock.exists(), "once released it is sweepable");
     }
 
     /// A machine that still exists is still forkable, so its lock must survive.

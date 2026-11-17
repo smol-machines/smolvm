@@ -46,9 +46,10 @@ inside it. The runs recorded in this packet were isolated that way, and `scripts
 with a `--protected` for each of the real installation's prefix, data and cache directories is the
 assertion that proves it.
 
-`SMOLVM_DATA_DIR` moves the data root on **Linux only**: the function that applies it is compiled
-in for Linux and does not exist on macOS or Windows. On macOS `HOME` is still enough. On Windows
-neither works, which is what makes that platform's teardown a manual removal. See
+`SMOLVM_DATA_DIR` (or `--state-dir`) moves the data root on Linux and macOS, for `smolvm` and
+`smol` alike, and carries the installed agent rootfs into it. Older releases honor it on Linux only,
+and `smol` ignored it everywhere; on those, point `HOME` at the scratch directory instead. On
+Windows neither works, which is what makes that platform's teardown a manual removal. See
 `references/windows.md`.
 
 ## Full removal

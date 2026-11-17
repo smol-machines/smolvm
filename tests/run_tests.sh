@@ -32,6 +32,7 @@
 #   pack            test_pack.sh
 #   pack-quick      test_pack.sh --quick
 #   gpu             test_gpu.sh  (requires GPU hardware)
+#   engine          test_engine.sh  (Docker API; requires the docker CLI)
 #
 # Non-pass/fail:
 #   bench           bench_vm_startup.sh (prints timing, always exits 0)
@@ -73,6 +74,10 @@ get_suite() {
         pack)        echo "$SCRIPT_DIR/test_pack.sh" ;;
         pack-quick)  echo "$SCRIPT_DIR/test_pack.sh --quick" ;;
         gpu)         echo "$SCRIPT_DIR/test_gpu.sh" ;;
+        engine)      echo "$SCRIPT_DIR/test_engine.sh" ;;
+        engine-inventory) echo "$SCRIPT_DIR/test_engine_inventory.sh" ;;
+        engine-seeded-start) echo "$SCRIPT_DIR/test_engine_seeded_start.sh" ;;
+        engine-builder) echo "$SCRIPT_DIR/test_engine_builder.sh" ;;
         scale)       echo "$SCRIPT_DIR/test_scale.sh" ;;
         connections) echo "$SCRIPT_DIR/test_connections.sh" ;;
         *)           return 1 ;;

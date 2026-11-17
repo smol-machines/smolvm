@@ -739,7 +739,7 @@ impl PackRunCmd {
             .map_err(|e| Error::config("pack run ports", e))?;
         let port_mappings = ports.clone();
 
-        let resources = VmResources {
+        let mut resources = VmResources {
             cpus: self.cpus.unwrap_or(manifest.cpus),
             memory_mib: self.mem.unwrap_or(manifest.mem),
             network: network_enabled,
@@ -749,6 +749,7 @@ impl PackRunCmd {
             shm_size: None,
             network_name: None,
             guest_subnet: None,
+            switch: None,
             gpu: manifest.gpu,
             nested_virt: false,
             cuda: cuda_enabled,
@@ -768,6 +769,14 @@ impl PackRunCmd {
             allowed_cidrs: effective_allowed_cidrs,
             egress_rules: effective_egress_rules,
         };
+        // A packed machine that asked for the host GPU only gets it when the
+        // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+        smolvm::agent::host_gpu::resolve_for_boot(
+            "packed machine",
+            &mut resources,
+            smolvm::agent::requested_display().is_some(),
+            false,
+        )?;
         validate_requested_network_backend(
             &resources,
             effective_dns_filter_hosts.as_deref(),
@@ -901,6 +910,7 @@ impl PackRunCmd {
                 ssh_agent_socket,
                 cuda: false,
                 expose_docker: false,
+                auto_ports: None,
                 published_sockets: Vec::new(),
                 dns_filter_hosts: effective_dns_filter_hosts,
                 packed_layers_dir: Some(layers_dir.to_path_buf()),
@@ -1995,7 +2005,7 @@ fn run_from_cache(
             effective_dns_filter_hosts.as_deref(),
         );
     }
-    let resources = VmResources {
+    let mut resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: network_enabled,
@@ -2005,6 +2015,7 @@ fn run_from_cache(
         shm_size: None,
         network_name: None,
         guest_subnet: None,
+        switch: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
@@ -2021,6 +2032,14 @@ fn run_from_cache(
         allowed_cidrs: effective_allowed_cidrs,
         egress_rules: effective_egress_rules,
     };
+    // A packed machine that asked for the host GPU only gets it when the
+    // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+    smolvm::agent::host_gpu::resolve_for_boot(
+        "packed machine",
+        &mut resources,
+        smolvm::agent::requested_display().is_some(),
+        false,
+    )?;
     validate_requested_network_backend(
         &resources,
         effective_dns_filter_hosts.as_deref(),
@@ -2115,6 +2134,7 @@ fn run_from_cache(
             ssh_agent_socket,
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
             dns_filter_hosts: effective_dns_filter_hosts,
             packed_layers_dir: Some(layers_dir.to_path_buf()),
@@ -2447,7 +2467,7 @@ fn daemon_start(
             effective_dns_filter_hosts.as_deref(),
         );
     }
-    let resources = VmResources {
+    let mut resources = VmResources {
         cpus: args.cpus.unwrap_or(manifest.cpus),
         memory_mib: args.mem.unwrap_or(manifest.mem),
         network: network_enabled,
@@ -2457,6 +2477,7 @@ fn daemon_start(
         shm_size: None,
         network_name: None,
         guest_subnet: None,
+        switch: None,
         gpu: manifest.gpu,
         nested_virt: false,
         cuda: manifest.cuda,
@@ -2473,6 +2494,14 @@ fn daemon_start(
         allowed_cidrs: effective_allowed_cidrs,
         egress_rules: effective_egress_rules,
     };
+    // A packed machine that asked for the host GPU only gets it when the
+    // host's device nodes answer; see `host_gpu::resolve_for_boot`.
+    smolvm::agent::host_gpu::resolve_for_boot(
+        "packed machine",
+        &mut resources,
+        smolvm::agent::requested_display().is_some(),
+        false,
+    )?;
     validate_requested_network_backend(
         &resources,
         effective_dns_filter_hosts.as_deref(),
@@ -2534,6 +2563,7 @@ fn daemon_start(
             ssh_agent_socket: ssh_agent_socket.clone(),
             cuda: false,
             expose_docker: false,
+            auto_ports: None,
             published_sockets: Vec::new(),
             dns_filter_hosts: effective_dns_filter_hosts,
             packed_layers_dir: Some(layers_dir.to_path_buf()),

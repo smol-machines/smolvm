@@ -612,6 +612,7 @@ jobs:
     name: Update Nix flake
     needs: release
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     uses: ./.github/workflows/update-nix-flake.yml
