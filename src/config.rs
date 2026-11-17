@@ -824,6 +824,14 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credential_bindings_unsettled: bool,
 
+    /// Written by every version whose bindings never imply networking: the
+    /// record's network says all there is. A record with bindings and
+    /// without this mark was written by an earlier version (or rewritten by
+    /// one after a downgrade), whose bindings implied networking, and is
+    /// given that network once (`migrate_legacy_credential_networks`).
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bindings_network_settled: bool,
+
     /// Whether the machine's last fresh boot mounted the credential CA as a
     /// boot device, which a checkpoint or pause taken from that boot holds in
     /// its device set and needs again on restore. `None` on records from
@@ -1120,6 +1128,7 @@ impl VmRecord {
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
             credential_bindings_unsettled: false,
+            bindings_network_settled: true,
             credential_ca_device: None,
             credential_ca_trusted: None,
             guest_credential_trust: None,
@@ -1234,6 +1243,7 @@ impl VmRecord {
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
             credential_bindings_unsettled: false,
+            bindings_network_settled: true,
             credential_ca_device: None,
             credential_ca_trusted: None,
             guest_credential_trust: None,
@@ -2001,6 +2011,29 @@ impl VmRecord {
         }
         self.network = true;
         true
+    }
+
+    /// Refuse a record whose bindings its own settings no longer let reach
+    /// their hosts: no egress at all (`--no-net`), or an allow list that
+    /// leaves a bound host out.
+    pub fn check_bindings_reachable(&self) -> Result<()> {
+        let Some(policy) = self.credential_policy.as_ref().filter(|p| !p.is_empty()) else {
+            return Ok(());
+        };
+        if !self.has_own_egress() {
+            return Err(crate::Error::config(
+                "credentials",
+                format!(
+                    "machine '{}' has credential bindings, which need network egress, and this \
+                     change leaves it none; remove the bindings in the same command \
+                     (--remove-credential NAME) or first",
+                    self.name
+                ),
+            ));
+        }
+        policy
+            .validate(self.dns_filter_hosts.as_deref())
+            .map_err(|e| crate::Error::config("credentials", e.to_string()))
     }
 
     /// Whether the machine's own settings give it outbound access: its

@@ -213,9 +213,6 @@ impl std::fmt::Debug for SmolvmDb {
     }
 }
 
-/// `config` key recording that [`migrate_legacy_credential_networks`] ran.
-const CREDENTIAL_NETWORK_MIGRATION: &str = "migration.credentials-imply-network";
-
 /// Give each machine whose credential bindings were its only source of
 /// egress the network it has always booted with.
 ///
@@ -226,63 +223,51 @@ const CREDENTIAL_NETWORK_MIGRATION: &str = "migration.credentials-imply-network"
 /// machine would boot offline and refuse every binding change. It is given
 /// `network = true`, which launches exactly what its bindings used to imply;
 /// a machine with an allow list already had its egress from that list and is
-/// left as it is. Runs once per database; a machine recorded without network
-/// after that (`machine update --no-net`) stays so.
+/// left as it is.
+///
+/// Every record this version writes carries
+/// [`VmRecord::bindings_network_settled`]; only a record with bindings and
+/// without it (written by an earlier version, including one downgraded to
+/// and back) is looked at, and is marked once it has been, so a machine
+/// taken offline later stays so.
 fn migrate_legacy_credential_networks(conn: &Connection) -> Result<()> {
-    let done: Option<String> = conn
-        .query_row(
-            "SELECT value FROM config WHERE key = ?1",
-            params![CREDENTIAL_NETWORK_MIGRATION],
-            |row| row.get(0),
-        )
-        .optional()
-        .db_err("read credential network migration")?;
-    if done.is_some() {
+    // A cheap textual filter first: most records have no bindings, and
+    // every record this version wrote with bindings carries the mark.
+    const UNSETTLED: &str = "SELECT name, data FROM vms \
+         WHERE instr(CAST(data AS TEXT), '\"credential_policy\"') > 0 \
+         AND instr(CAST(data AS TEXT), '\"bindings_network_settled\":true') = 0";
+    let pending = |conn: &Connection| -> Result<Vec<(String, Vec<u8>)>> {
+        let mut statement = conn.prepare(UNSETTLED).db_err("list machines to migrate")?;
+        let rows = statement
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .db_err("list machines to migrate")?;
+        rows.collect::<std::result::Result<_, _>>()
+            .db_err("list machines to migrate")
+    };
+    if pending(conn)?.is_empty() {
         return Ok(());
     }
     let tx = rusqlite::Transaction::new_unchecked(conn, TransactionBehavior::Immediate)
         .db_err("begin credential network migration")?;
-    // Another process may have run it meanwhile.
-    let done: Option<String> = tx
-        .query_row(
-            "SELECT value FROM config WHERE key = ?1",
-            params![CREDENTIAL_NETWORK_MIGRATION],
-            |row| row.get(0),
-        )
-        .optional()
-        .db_err("read credential network migration")?;
-    if done.is_none() {
-        let rows: Vec<(String, Vec<u8>)> = {
-            let mut statement = tx
-                .prepare("SELECT name, data FROM vms")
-                .db_err("list machines to migrate")?;
-            let rows = statement
-                .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
-                .db_err("list machines to migrate")?;
-            rows.collect::<std::result::Result<_, _>>()
-                .db_err("list machines to migrate")?
+    // Another process may have migrated them meanwhile.
+    for (name, data) in pending(&tx)? {
+        // A record this version cannot read is left exactly as it is.
+        let Ok(mut record) = serde_json::from_slice::<VmRecord>(&data) else {
+            continue;
         };
-        for (name, data) in rows {
-            // A record this version cannot read is left exactly as it is.
-            let Ok(mut record) = serde_json::from_slice::<VmRecord>(&data) else {
-                continue;
-            };
-            if !record.restore_legacy_credential_network() {
-                continue;
-            }
-            tracing::info!(machine = %name, "machine whose bindings implied networking keeps its network");
-            let json = serde_json::to_vec(&record).db_err("serialize migrated machine")?;
-            tx.execute(
-                "UPDATE vms SET data = ?2 WHERE name = ?1",
-                params![name, json],
-            )
-            .db_err("migrate machine network")?;
+        if record.bindings_network_settled {
+            continue;
         }
+        if record.restore_legacy_credential_network() {
+            tracing::info!(machine = %name, "machine whose bindings implied networking keeps its network");
+        }
+        record.bindings_network_settled = true;
+        let json = serde_json::to_vec(&record).db_err("serialize migrated machine")?;
         tx.execute(
-            "INSERT OR IGNORE INTO config (key, value) VALUES (?1, '1')",
-            params![CREDENTIAL_NETWORK_MIGRATION],
+            "UPDATE vms SET data = ?2 WHERE name = ?1",
+            params![name, json],
         )
-        .db_err("record credential network migration")?;
+        .db_err("migrate machine network")?;
     }
     tx.commit().db_err("commit credential network migration")
 }
@@ -2515,7 +2500,7 @@ mod tests {
             )
             .unwrap()],
         };
-        // Records as v1.33 wrote them, in a database it made.
+        // Records as v1.33 wrote them (no mark), in a database it made.
         let mut legacy = VmRecord::new("legacy".into(), 1, 512, vec![], vec![(8080, 80)], false);
         legacy.credential_policy = Some(bindings.clone());
         legacy.credentials_supplied_by_api = true;
@@ -2532,7 +2517,7 @@ mod tests {
             for record in [&legacy, &listed, &plain] {
                 old.execute(
                     "INSERT INTO vms (name, data) VALUES (?1, ?2)",
-                    params![record.name, serde_json::to_vec(record).unwrap()],
+                    params![record.name, as_written_before(record)],
                 )
                 .unwrap();
             }
@@ -2557,6 +2542,34 @@ mod tests {
         drop(db);
         let db = SmolvmDb::open_at(&path).unwrap();
         assert!(!db.get_vm("legacy").unwrap().unwrap().network);
+
+        // Downgraded and upgraded again: an earlier version rewrote the
+        // record without the mark (and, to it, bindings implied the network
+        // anyway). It is looked at again, though the database was migrated.
+        let mut rewritten = legacy.clone();
+        rewritten.network = false;
+        db.with_conn(|conn| {
+            conn.execute(
+                "UPDATE vms SET data = ?2 WHERE name = ?1",
+                params!["legacy", as_written_before(&rewritten)],
+            )
+            .db_err("rewrite")
+        })
+        .unwrap();
+        drop(db);
+        let db = SmolvmDb::open_at(&path).unwrap();
+        let again = db.get_vm("legacy").unwrap().unwrap();
+        assert!(again.network && again.bindings_network_settled);
+    }
+
+    /// A record serialized as a version before the mark wrote it.
+    fn as_written_before(record: &VmRecord) -> Vec<u8> {
+        let mut value = serde_json::to_value(record).unwrap();
+        value
+            .as_object_mut()
+            .unwrap()
+            .remove("bindings_network_settled");
+        serde_json::to_vec(&value).unwrap()
     }
 
     #[test]

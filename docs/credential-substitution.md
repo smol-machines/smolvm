@@ -104,10 +104,19 @@ binding never keeps networking that the machine turns off (`machine update
 
 A machine created by an earlier version with bindings and no network flag (over
 the API, or from a Smolfile without `net = true`) booted with outbound
-networking because its bindings implied it. The first time this version opens
-the machine database it records that network on such a machine, once, so it
-boots as it always has and its bindings can change; a machine with an allow
-list keeps it, and one taken offline later stays offline.
+networking because its bindings implied it. When this version opens the
+machine database it records that network on such a machine, so it boots as it
+always has and its bindings can change; a machine with an allow list keeps it.
+Every record this version writes is marked as settled, so this happens once
+per record (again only if an earlier version rewrote it), and a machine taken
+offline later stays offline.
+
+`machine update` checks new bindings against the settings the same command
+leaves: `--net` or an allow-list entry beside `--credential` gives the binding
+the egress it needs, and bindings and every other setting are written together
+or not at all. While a machine has bindings, `--no-net`, or an allow-list
+change that leaves a bound host out, is refused unless the same command
+removes those bindings.
 
 `machine update --credential` on a machine whose values are supplied by an API
 caller or embedder (or that was restored from a checkpoint) is refused: no

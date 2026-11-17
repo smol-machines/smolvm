@@ -589,6 +589,7 @@ pub fn set_bindings(
         caller,
         None,
         |_| Ok(policy),
+        None,
         &BootProcess,
         |_, _, _| Ok(()),
     )
@@ -610,11 +611,18 @@ pub fn set_bindings(
 /// A `then` that fails undoes the change: the record and, on a running
 /// machine, the boot process get back exactly the bindings they had, so a
 /// command that reports failure has changed nothing.
+///
+/// `other` carries the command's other settings, when it changes any: they
+/// are applied to the record as the lock finds it, the new bindings are
+/// checked against the result (a network or allow list the same command
+/// adds counts, one it removes no longer does), and bindings and settings
+/// are written to the record together, once.
 pub fn edit_bindings_from_cli(
     db: &crate::db::SmolvmDb,
     name: &str,
     named: &std::collections::BTreeSet<String>,
     edit: impl FnOnce(&VmRecord) -> Result<CredentialPolicy>,
+    other: Option<OtherSettings<'_>>,
     then: impl FnOnce(&VmRecord, &VmRecord, bool) -> Result<()>,
 ) -> std::result::Result<VmRecord, BindingsError> {
     set_bindings_with(
@@ -623,10 +631,27 @@ pub fn edit_bindings_from_cli(
         crate::machine_spec::Caller::Cli,
         Some(named),
         edit,
+        other,
         &BootProcess,
         then,
     )
 }
+
+/// Changes to a stopped machine's other settings, written in the same record
+/// write as its new bindings (`machine update` with other flags beside
+/// `--credential`).
+pub struct OtherSettings<'a> {
+    /// Apply the settings to a record, given its new bindings: to a copy of
+    /// the record as the lock finds it, which the bindings are then checked
+    /// against, and again in the write. An error refuses the whole change.
+    pub apply: &'a dyn Fn(&mut VmRecord, &CredentialPolicy) -> Result<()>,
+    /// Work outside the record (growing disks) once everything is checked
+    /// and before anything is written: an error leaves the record as it was.
+    pub prepare: PrepareSettings<'a>,
+}
+
+/// [`OtherSettings::prepare`].
+pub type PrepareSettings<'a> = Box<dyn FnOnce(&VmRecord) -> Result<()> + 'a>;
 
 /// Where [`set_bindings_with`] sends a running machine its new bindings: the
 /// machine's boot process, or a stand-in in tests.
@@ -714,12 +739,14 @@ fn check_named_host_bindings(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn set_bindings_with(
     db: &crate::db::SmolvmDb,
     name: &str,
     caller: crate::machine_spec::Caller,
     named: Option<&std::collections::BTreeSet<String>>,
     build: impl FnOnce(&VmRecord) -> Result<CredentialPolicy>,
+    other: Option<OtherSettings<'_>>,
     live: &dyn LiveBindings,
     then: impl FnOnce(&VmRecord, &VmRecord, bool) -> Result<()>,
 ) -> std::result::Result<VmRecord, BindingsError> {
@@ -752,13 +779,31 @@ fn set_bindings_with(
     };
     // Built from the record as it is now, under the lock.
     let policy = build(&record).map_err(BindingsError::Invalid)?;
-    let mut next =
-        record
-            .with_credential_bindings(policy, caller)
-            .map_err(|error| match error {
-                Error::Agent { .. } => BindingsError::Conflict(error),
-                other => BindingsError::Invalid(other),
-            })?;
+    // Other settings go with the bindings only on a stopped machine: a
+    // running one takes bindings live and nothing else with them.
+    if running && other.is_some() {
+        return Err(BindingsError::Conflict(Error::config(
+            "credentials",
+            "a running machine takes credential binding changes on their own; run the other \
+             changes separately",
+        )));
+    }
+    let (apply, prepare) = match other {
+        Some(other) => (Some(other.apply), Some(other.prepare)),
+        None => (None, None),
+    };
+    // The bindings are checked against the record as the other settings
+    // leave it.
+    let mut staged = record.clone();
+    if let Some(apply) = apply {
+        apply(&mut staged, &policy).map_err(BindingsError::Invalid)?;
+    }
+    let mut next = staged
+        .with_credential_bindings(policy.clone(), caller)
+        .map_err(|error| match error {
+            Error::Agent { .. } => BindingsError::Conflict(error),
+            other => BindingsError::Invalid(other),
+        })?;
     if let Some(named) = named {
         check_named_host_bindings(&record, &next, named).map_err(BindingsError::Conflict)?;
     }
@@ -770,6 +815,11 @@ fn set_bindings_with(
             tracing::warn!(machine = name, %error, "could not record that the machine's credential bindings are unsettled");
         }
     };
+    // Work outside the record, now that everything is checked: a failure
+    // here leaves the record untouched.
+    if let Some(prepare) = prepare {
+        prepare(&next).map_err(BindingsError::Failed)?;
+    }
     // Whether the running machine's boot process took the change, and so
     // must be told to undo it if the change fails from here on.
     let mut sent = false;
@@ -788,7 +838,15 @@ fn set_bindings_with(
             Err(error) => return Err(error),
         }
     }
-    let saved = match db.update_vm(name, |r| r.take_credential_bindings(&next)) {
+    // One write: the other settings and the bindings land together.
+    let saved = match db.update_vm(name, |r| {
+        if let Some(apply) = apply {
+            if let Err(error) = apply(r, &policy) {
+                tracing::warn!(machine = name, %error, "a setting checked a moment ago no longer applies");
+            }
+        }
+        r.take_credential_bindings(&next)
+    }) {
         Ok(Some(saved)) => saved,
         failed => {
             let cause = match failed {
@@ -1149,6 +1207,9 @@ fn guest_needs_ca(before: &VmRecord, pem: &str) -> bool {
     before.credential_ca_trusted.as_deref() != Some(CredentialLaunch::ca_fingerprint(pem).as_str())
 }
 
+/// The start of what a boot process answers to a message it cannot read.
+pub const UNREADABLE_REQUEST: &str = "unreadable request";
+
 /// What a boot process answers to a rollback when the last bindings it was
 /// sent were refused, or none were: it holds what it held, so there is
 /// nothing to undo.
@@ -1336,9 +1397,11 @@ pub struct BindingsReply {
 /// connection sends one JSON object and reads back `ok` (followed, for
 /// `bindings`, by one line of JSON) or `error: <reason>`:
 ///
-/// - `{"values":{"<binding>":"<value>",…}}` replaces the values the machine
-///   resolves for the bindings named, from its next request on. A name that is
-///   not a current binding refuses the whole message.
+/// - `{"values":{"<binding>":"<value>",…},"expect":{"<binding>":{…},…}}`
+///   replaces the values the machine resolves for the bindings named, from its
+///   next request on. A name that is not a current binding, or whose binding
+///   is not the one `expect` names for it (or that `expect` leaves out),
+///   refuses the whole message.
 /// - `{"bindings":{"policy":{…},"placeholders":{…},"supplied_only":bool,
 ///   "host_sources":{…}}}` replaces the bindings. The boot process creates or
 ///   widens the CA itself and answers `ok` plus `{"ca_pem":"…"}`. A binding
@@ -1427,8 +1490,11 @@ impl LiveCredentials {
     }
 
     fn handle(&self, request: &str) -> std::result::Result<String, String> {
+        // Not "malformed request", which is what a boot process from before
+        // binding changes answers: a host retries values without `expect`
+        // only for that one, and this process never takes them so.
         let request: LiveRequest =
-            serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
+            serde_json::from_str(request).map_err(|e| format!("{UNREADABLE_REQUEST}: {e}"))?;
         if request.expect.is_some() && request.values.is_none() {
             return Err("`expect` goes with `values`".to_string());
         }
@@ -1453,15 +1519,23 @@ impl LiveCredentials {
         if let Some(unknown) = values.keys().find(|k| state.policy.binding(k).is_none()) {
             return Err(format!("no credential binding '{unknown}'"));
         }
-        if let Some(expect) = expect {
-            if let Some(name) = values
-                .keys()
-                .find(|name| state.policy.binding(name) != expect.get(*name))
-            {
-                return Err(format!(
-                    "credential binding '{name}' changed since this value was read for it"
-                ));
-            }
+        // Every value names the binding it was read for, and is refused if
+        // that is no longer the binding of its name: a value without one is
+        // never taken, whoever sends it.
+        let none = BTreeMap::new();
+        let expect = expect.unwrap_or(&none);
+        if let Some(name) = values
+            .keys()
+            .find(|name| state.policy.binding(name) != expect.get(*name))
+        {
+            return Err(if expect.contains_key(name) {
+                format!("credential binding '{name}' changed since this value was read for it")
+            } else {
+                format!(
+                    "the value for credential binding '{name}' was sent without the binding it \
+                     was read for"
+                )
+            });
         }
         // A rollback of the bindings these values were sent for keeps them,
         // for the bindings it restores that take them.
@@ -1917,6 +1991,17 @@ mod tests {
         reply.trim().to_string()
     }
 
+    /// A values message naming, for each value whose binding `policy` has,
+    /// that binding (`expect`), as a host sends it.
+    fn values_for(policy: &CredentialPolicy, values: &str) -> String {
+        let values: BTreeMap<String, String> = serde_json::from_str(values).unwrap();
+        let expect: BTreeMap<&String, &CredentialBinding> = values
+            .keys()
+            .filter_map(|name| policy.binding(name).map(|b| (name, b)))
+            .collect();
+        serde_json::json!({ "values": values, "expect": expect }).to_string()
+    }
+
     fn request(binding: &str, host: &str) -> CredentialRequest {
         CredentialRequest {
             machine: "live-test".into(),
@@ -1991,7 +2076,13 @@ mod tests {
         let github = request("github", "github.com");
         assert_eq!(resolver.resolve(&github).unwrap().as_str(), "booted");
 
-        assert_eq!(send(dir.path(), r#"{"values":{"github":"rotated"}}"#), "ok");
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&launch.policy, r#"{"github":"rotated"}"#)
+            ),
+            "ok"
+        );
         assert_eq!(resolver.resolve(&github).unwrap().as_str(), "rotated");
 
         let refused = send(dir.path(), r#"{"values":{"other":"x"}}"#);
@@ -2017,6 +2108,36 @@ mod tests {
                 .mode();
             assert_eq!(mode & 0o777, 0o600, "only the machine's user reaches it");
         }
+    }
+
+    /// A value is taken only with the binding it was read for: one sent
+    /// without it is refused, so no host can fall back to the shape a boot
+    /// process from before binding changes takes. A message this process
+    /// cannot read is answered as unreadable, never as the old process's
+    /// "malformed request" that a host falls back on.
+    #[test]
+    fn values_without_their_binding_are_never_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let launch = launch_in(dir.path(), &["gh=GH_TOKEN@github.com"], false);
+        launch.ensure_ca().unwrap();
+        let (_interceptor, live) = launch.spawn_interceptor(BTreeMap::new()).unwrap();
+        live.clone().serve(dir.path());
+        let refused = send(dir.path(), r#"{"values":{"gh":"v"}}"#);
+        assert!(
+            refused.contains("without the binding it was read for"),
+            "{refused}"
+        );
+        assert!(resolver_of(&live).lock().live.is_empty());
+        let unreadable = send(dir.path(), r#"{"values":{},"expect":{},"future":1}"#);
+        assert!(
+            unreadable.starts_with(&format!("error: {UNREADABLE_REQUEST}")),
+            "{unreadable}"
+        );
+        assert!(!unreadable.contains("malformed request"));
+        assert_eq!(
+            send(dir.path(), &values_for(&launch.policy, r#"{"gh":"v"}"#)),
+            "ok"
+        );
     }
 
     /// New bindings reach a running machine whole: a binding unchanged in
@@ -2046,7 +2167,13 @@ mod tests {
             .into();
             let (_interceptor, live) = launch.spawn_interceptor(boot_sources).unwrap();
             live.clone().serve(dir.path());
-            assert_eq!(send(dir.path(), r#"{"values":{"a":"va","b":"vb"}}"#), "ok");
+            assert_eq!(
+                send(
+                    dir.path(),
+                    &values_for(&launch.policy, r#"{"a":"va","b":"vb"}"#)
+                ),
+                "ok"
+            );
 
             let mut next = launch_in(
                 dir.path(),
@@ -2089,7 +2216,10 @@ mod tests {
             assert!(
                 send(dir.path(), r#"{"values":{"b":"x"}}"#).contains("no credential binding 'b'")
             );
-            assert_eq!(send(dir.path(), r#"{"values":{"c":"vc"}}"#), "ok");
+            assert_eq!(
+                send(dir.path(), &values_for(&next.policy, r#"{"c":"vc"}"#)),
+                "ok"
+            );
             assert_eq!(
                 resolver
                     .resolve(&request("c", "api.c.com"))
@@ -2117,7 +2247,13 @@ mod tests {
             .spawn_interceptor([("key".into(), file.clone())].into())
             .unwrap();
         live.clone().serve(dir.path());
-        assert_eq!(send(dir.path(), r#"{"values":{"key":"sk-live"}}"#), "ok");
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&launch.policy, r#"{"key":"sk-live"}"#)
+            ),
+            "ok"
+        );
 
         let mut rescoped = launch_in(
             dir.path(),
@@ -2160,7 +2296,13 @@ mod tests {
             .spawn_interceptor([("gh".into(), crate::secrets::file_ref(path))].into())
             .unwrap();
         live.clone().serve(dir.path());
-        assert_eq!(send(dir.path(), r#"{"values":{"gh":"ghp_cli"}}"#), "ok");
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&launch.policy, r#"{"gh":"ghp_cli"}"#)
+            ),
+            "ok"
+        );
 
         let mut hijack = launch_in(dir.path(), &["gh=GH_TOKEN@attacker.example"], true);
         hijack.placeholders = launch.placeholders.clone();
@@ -2178,7 +2320,13 @@ mod tests {
         same.placeholders = launch.placeholders.clone();
         assert!(send(dir.path(), &bindings_message(&same)).starts_with("ok"));
         assert!(resolver.lock().sources.is_empty());
-        assert_eq!(send(dir.path(), r#"{"values":{"gh":"api-value"}}"#), "ok");
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&same.policy, r#"{"gh":"api-value"}"#)
+            ),
+            "ok"
+        );
         // Back to the operator (the record cleared its supplied bindings and
         // the CLI added this one): the API caller's value is dropped too, and
         // the binding reads its own source again.
@@ -2193,7 +2341,10 @@ mod tests {
         assert_eq!(state.sources["gh"].from_env.as_deref(), Some("GH_TOKEN"));
         // And a later API takeover of the operator's binding drops that again.
         assert_eq!(
-            send(dir.path(), r#"{"values":{"gh":"operator-pushed"}}"#),
+            send(
+                dir.path(),
+                &values_for(&back.policy, r#"{"gh":"operator-pushed"}"#)
+            ),
             "ok"
         );
         assert!(send(dir.path(), &bindings_message(&hijack)).starts_with("ok"));
@@ -2219,7 +2370,13 @@ mod tests {
         .into();
         let (_interceptor, live) = launch.spawn_interceptor(boot.clone()).unwrap();
         live.clone().serve(dir.path());
-        assert_eq!(send(dir.path(), r#"{"values":{"a":"va","b":"vb"}}"#), "ok");
+        assert_eq!(
+            send(
+                dir.path(),
+                &values_for(&launch.policy, r#"{"a":"va","b":"vb"}"#)
+            ),
+            "ok"
+        );
         let before = resolver_of(&live).lock().clone();
 
         let next = launch_in(dir.path(), &["c=C_KEY@api.c.com"], true);
@@ -2291,7 +2448,10 @@ mod tests {
             slot.get().is_some(),
             "HTTPS now goes through the interceptor"
         );
-        assert_eq!(send(dir.path(), r#"{"values":{"a":"x"}}"#), "ok");
+        assert_eq!(
+            send(dir.path(), &values_for(&launch.policy, r#"{"a":"x"}"#)),
+            "ok"
+        );
 
         assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
         assert!(slot.get().is_none(), "back to relaying directly");
@@ -2396,7 +2556,10 @@ mod tests {
             .insert("a".into(), launch.placeholders["a"].clone());
         assert!(send(dir.path(), &bindings_message(&more)).starts_with("ok"));
         assert_eq!(
-            send(dir.path(), r#"{"values":{"a":"sent-after","b":"vb"}}"#),
+            send(
+                dir.path(),
+                &values_for(&more.policy, r#"{"a":"sent-after","b":"vb"}"#)
+            ),
             "ok"
         );
         assert_eq!(send(dir.path(), r#"{"rollback":true}"#), "ok");
@@ -2628,6 +2791,7 @@ mod tests {
             caller,
             None,
             |_| Ok(policy),
+            None,
             live,
             |_, _, _| Ok(()),
         )
@@ -2687,6 +2851,7 @@ mod tests {
                 Caller::Cli,
                 Some(&Default::default()),
                 |_| Ok(CredentialPolicy::default()),
+                None,
                 &fake,
                 |_, saved, _| {
                     assert!(saved.credential_policy.is_none(), "runs after the change");
@@ -2742,6 +2907,7 @@ mod tests {
             Caller::Cli,
             Some(&["gh".to_string()].into()),
             |_| Ok(bindings_of(&["gh=GH_TOKEN@github.com"])),
+            None,
             &broken,
             |_, _, _| Err(Error::config("credentials", "could not hand over values")),
         );
@@ -2831,6 +2997,7 @@ mod tests {
                     .push(parse_credential_flag("c=C_KEY@api.c.com").unwrap());
                 Ok(policy)
             },
+            None,
             &live,
             |_, _, _| Ok(()),
         )
@@ -2874,6 +3041,7 @@ mod tests {
             Caller::Cli,
             Some(&["gh".to_string()].into()),
             |_| Ok(bindings_of(&[evil, "gh=GH_TOKEN@github.com"])),
+            None,
             &live,
             |_, _, _| panic!("nothing runs after a refused change"),
         );
@@ -2890,6 +3058,7 @@ mod tests {
             Caller::Cli,
             Some(&["evil".to_string(), "gh".to_string()].into()),
             |_| Ok(bindings_of(&[evil, "gh=GH_TOKEN@github.com"])),
+            None,
             &live,
             |_, _, _| Ok(()),
         )
@@ -2902,6 +3071,7 @@ mod tests {
             Caller::Cli,
             Some(&Default::default()),
             |locked| Ok(locked.credential_policy.clone().unwrap_or_default()),
+            None,
             &live,
             |_, _, _| Ok(()),
         )
@@ -2928,6 +3098,7 @@ mod tests {
             Caller::Cli,
             Some(&Default::default()),
             |_| Ok(CredentialPolicy::default()),
+            None,
             &live,
             |_, _, _| Err(Error::config("credentials", "then failed")),
         );
@@ -2974,6 +3145,7 @@ mod tests {
                     .push(parse_credential_flag("gh=GH_TOKEN@github.com").unwrap());
                 Ok(policy)
             },
+            None,
             &live,
             |_, _, _| Ok(()),
         );
@@ -2988,11 +3160,70 @@ mod tests {
             Caller::Cli,
             Some(&Default::default()),
             |_| Ok(bindings_of(&["a=A_KEY@api.a.com"])),
+            None,
             &live,
             |_, _, _| Ok(()),
         )
         .unwrap();
         assert!(removed.credentials_supplied_by_api);
+        db.remove_vm(&name).unwrap();
+    }
+
+    /// Other settings changed beside the bindings land in the same write,
+    /// the bindings checked against them; work before the write that fails
+    /// (growing a disk) leaves the record exactly as it was.
+    #[test]
+    fn other_settings_and_bindings_land_together_or_not_at_all() {
+        use crate::machine_spec::Caller;
+        let (_dir, db) = test_db();
+        let (name, mut record) = machine_in(&db, "together", false);
+        record.network = false;
+        db.insert_vm(&name, &record).unwrap();
+        let live = FakeBootProcess::default();
+        let turn_on = |r: &mut VmRecord, _: &CredentialPolicy| -> Result<()> {
+            r.network = true;
+            r.cpus = 3;
+            Ok(())
+        };
+        let failed = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["gh".to_string()].into()),
+            |_| Ok(bindings_of(&["gh=GH_TOKEN@github.com"])),
+            Some(OtherSettings {
+                apply: &turn_on,
+                prepare: Box::new(|_| Err(Error::config("resize", "disk is busy"))),
+            }),
+            &live,
+            |_, _, _| Ok(()),
+        );
+        assert!(
+            matches!(failed, Err(BindingsError::Failed(_))),
+            "{failed:?}"
+        );
+        let unchanged = db.get_vm(&name).unwrap().unwrap();
+        assert!(unchanged.credential_policy.is_none() && !unchanged.network);
+        assert_eq!(unchanged.cpus, record.cpus);
+
+        let saved = set_bindings_with(
+            &db,
+            &name,
+            Caller::Cli,
+            Some(&["gh".to_string()].into()),
+            |_| Ok(bindings_of(&["gh=GH_TOKEN@github.com"])),
+            Some(OtherSettings {
+                apply: &turn_on,
+                prepare: Box::new(|next| {
+                    assert!(next.network, "checked against the settings");
+                    Ok(())
+                }),
+            }),
+            &live,
+            |_, _, _| Ok(()),
+        )
+        .unwrap();
+        assert!(saved.network && saved.cpus == 3 && saved.credential_policy.is_some());
         db.remove_vm(&name).unwrap();
     }
 

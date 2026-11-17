@@ -766,7 +766,8 @@ impl std::fmt::Display for LiveCredentialError {
     }
 }
 
-/// A boot process from before a message's shape answers this to it.
+/// What a boot process from before binding changes, and only one, answers
+/// to a message it cannot parse.
 const MALFORMED_REQUEST: &str = "malformed request";
 
 /// Send `rendered` to running machine `name`'s credentials socket and return
@@ -811,7 +812,9 @@ fn credentials_query(
             .map_err(|e| unreached(e.to_string()))?
             .uid();
         let peer = stream.peer_uid().map_err(|e| unreached(e.to_string()))?;
-        if peer != owner {
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !peer_may_serve(peer, owner, me) {
             return Err(unreached(format!(
                 "{} is served by uid {peer}, not by the machine's own process (uid {owner})",
                 path.display()
@@ -829,6 +832,16 @@ fn credentials_query(
     let mut reply = String::new();
     stream.read_to_string(&mut reply).map_err(lost)?;
     credentials_reply(&reply)
+}
+
+/// Whether a process running as `peer` may answer for a machine whose data
+/// directory `owner` owns, asked by a process running as `me`: the machine's
+/// own user, or one at least as trusted as the asker (itself, or root) —
+/// a boot process run without the per-VM user drop (`SMOLVM_VM_UID_DROP=off`)
+/// keeps the host's user while its directory may still belong to the uid an
+/// earlier boot dropped to. Any other user is another machine's.
+fn peer_may_serve(peer: u32, owner: u32, me: u32) -> bool {
+    peer == owner || peer == me || peer == 0
 }
 
 /// The data of an `ok` answer from a credentials socket, or why not.
@@ -872,9 +885,12 @@ pub fn apply_live_credential_values(
 }
 
 /// [`apply_live_credential_values`] through `send`. A boot process from
-/// before bindings could change knows values without `expect`, and refuses
-/// a message carrying it: it is sent the values alone, which is safe because
-/// such a process never changes its bindings while it runs.
+/// before bindings could change knows values without `expect`, and answers a
+/// message carrying it with exactly "malformed request": only then are the
+/// values sent alone, which is safe because such a process never changes its
+/// bindings while it runs. A current boot process answers a message it cannot
+/// read otherwise ([`crate::credentials::UNREADABLE_REQUEST`]) and never takes
+/// values without `expect`, so a fallback can never reach one.
 fn send_credential_values(
     values: &std::collections::BTreeMap<String, zeroize::Zeroizing<String>>,
     expect: &crate::credentials::CredentialPolicy,
@@ -6240,6 +6256,18 @@ mod tests {
             refused,
             Err(LiveCredentialError::Refused("changed since".into()))
         );
+        // A current boot process that cannot read the message is not taken
+        // for an old one: no retry without `expect`.
+        let mut sent = 0;
+        let unreadable = send_credential_values(&values, &expect, |_| {
+            sent += 1;
+            Err(LiveCredentialError::Refused(format!(
+                "{}: unknown field",
+                crate::credentials::UNREADABLE_REQUEST
+            )))
+        });
+        assert!(unreadable.is_err());
+        assert_eq!(sent, 1);
     }
 
     /// Answers are classified by what they prove: a refusal changed nothing,
@@ -6255,6 +6283,23 @@ mod tests {
         );
         assert!(refused.changed_nothing());
         assert!(!credentials_reply("").unwrap_err().changed_nothing());
+    }
+
+    /// The process answering a machine's credentials socket must be the
+    /// machine's own user, the asker's, or root; another machine's is refused.
+    #[test]
+    fn only_the_machines_own_or_a_trusted_user_serves_its_socket() {
+        // A dropped boot process: the machine's uid owns the directory.
+        assert!(peer_may_serve(5001, 5001, 0));
+        // Started without the drop after one with it: root serves, the
+        // directory still belongs to the uid of the earlier boot.
+        assert!(peer_may_serve(0, 5001, 0));
+        // A plain user's CLI and its own boot process.
+        assert!(peer_may_serve(1000, 1000, 1000));
+        assert!(peer_may_serve(1000, 5001, 1000));
+        // Another machine's process, linked or listening in its place.
+        assert!(!peer_may_serve(5002, 5001, 0));
+        assert!(!peer_may_serve(5002, 1000, 1000));
     }
 
     /// The host talks to a machine's credentials socket only if the path is

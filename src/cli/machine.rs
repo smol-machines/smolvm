@@ -3742,6 +3742,86 @@ mod tests {
         }
     }
 
+    /// `machine update` for machine `name` with `extra` flags.
+    fn parse_update_of(name: &str, extra: &[&str]) -> UpdateCmd {
+        let mut argv: Vec<String> = ["machine", "update", "--name", name]
+            .iter()
+            .map(|a| a.to_string())
+            .collect();
+        argv.extend(extra.iter().map(|a| a.to_string()));
+        let MachineCmd::Update(cmd) = TestMachineCli::parse_from(argv).command else {
+            panic!("expected machine update command");
+        };
+        cmd
+    }
+
+    /// The new bindings are checked against what the same command leaves:
+    /// `--net` or an allow-list entry beside `--credential` gives them the
+    /// egress they need, and `--no-net` beside bindings is refused unless the
+    /// command removes them. Bindings and settings land in one write.
+    #[test]
+    fn update_checks_bindings_against_the_settings_it_leaves() {
+        use smolvm::config::VmRecord;
+        let dir = tempfile::tempdir().unwrap();
+        let db = smolvm::db::SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
+        let name = format!("upd-{}", smolvm::db::SmolvmDb::create_reservation_token());
+        let gh = "gh=GH_TOKEN@api.github.com";
+
+        // Offline: `--net` in the same command is what the binding needs.
+        db.insert_vm(
+            &name,
+            &VmRecord::new(name.clone(), 1, 512, vec![], vec![], false),
+        )
+        .unwrap();
+        parse_update_of(&name, &["--net", "--credential", gh, "--cpus", "2"])
+            .run_in(&db)
+            .unwrap();
+        let after = db.get_vm(&name).unwrap().unwrap();
+        assert!(after.network);
+        assert_eq!(after.cpus, 2, "the other settings landed with it");
+        assert!(after.credential_policy.unwrap().binding("gh").is_some());
+
+        // Taking the network away while the binding stays is refused, and
+        // changes nothing; taking both is fine.
+        let refused = parse_update_of(&name, &["--no-net"])
+            .run_in(&db)
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("--remove-credential"),
+            "{refused}"
+        );
+        let refused = parse_update_of(&name, &["--no-net", "--cpus", "3"])
+            .run_in(&db)
+            .unwrap_err();
+        assert!(refused.to_string().contains("egress"), "{refused}");
+        let kept = db.get_vm(&name).unwrap().unwrap();
+        assert!(kept.network && kept.cpus == 2);
+        parse_update_of(&name, &["--no-net", "--remove-credential", "gh"])
+            .run_in(&db)
+            .unwrap();
+        let off = db.get_vm(&name).unwrap().unwrap();
+        assert!(!off.network && off.credential_policy.is_none());
+
+        // An allow list: the pattern added beside the binding covers its host.
+        let mut listed = VmRecord::new(name.clone(), 1, 512, vec![], vec![], false);
+        listed.dns_filter_hosts = Some(vec!["pypi.org".into()]);
+        db.insert_vm(&name, &listed).unwrap();
+        parse_update_of(
+            &name,
+            &["--allow-host-pattern", "api.github.com", "--credential", gh],
+        )
+        .run_in(&db)
+        .unwrap();
+        let after = db.get_vm(&name).unwrap().unwrap();
+        assert!(after
+            .dns_filter_hosts
+            .unwrap()
+            .iter()
+            .any(|h| h.contains("api.github.com")));
+        assert!(after.credential_policy.is_some());
+        db.remove_vm(&name).unwrap();
+    }
+
     #[test]
     fn update_sets_and_removes_labels() {
         let apply = |extra: &[&'static str], labels: &mut _| {
@@ -7165,7 +7245,11 @@ impl UpdateCmd {
 
     /// Replace the machine's credential bindings, in any state; a running
     /// machine enforces them at once.
-    fn update_credentials(&self, db: &smolvm::db::SmolvmDb) -> smolvm::Result<()> {
+    fn update_credentials(
+        &self,
+        db: &smolvm::db::SmolvmDb,
+        other: Option<smolvm::credentials::OtherSettings<'_>>,
+    ) -> smolvm::Result<()> {
         // The bindings this command names; only they may start reading this
         // host's values.
         let named: std::collections::BTreeSet<String> = self
@@ -7187,7 +7271,10 @@ impl UpdateCmd {
             &self.name,
             &named,
             |record| self.next_credentials(record),
-            |locked, saved, is_running| {
+            other,
+            |locked: &smolvm::config::VmRecord,
+             saved: &smolvm::config::VmRecord,
+             is_running: bool| {
                 running = is_running;
                 before = locked
                     .credential_policy
@@ -7398,7 +7485,7 @@ impl UpdateCmd {
         let (egress, ports, labels, credentials, other) = self.changed_settings();
         if credentials && !(egress || ports || other) {
             // Bindings change in every state, a running machine's at once.
-            self.update_credentials(db)?;
+            self.update_credentials(db, None)?;
             return if labels {
                 self.update_labels(db, &set_labels)
             } else {
@@ -7459,8 +7546,13 @@ impl UpdateCmd {
         }
 
         // The egress allow list after this update, validated as a whole before
-        // anything is written (#1299).
-        let egress = self.next_egress(&record)?;
+        // anything is written (#1299). With binding changes beside it, it is
+        // checked against the new bindings instead, under their lock.
+        let egress = if credentials {
+            None
+        } else {
+            self.next_egress(&record)?
+        };
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
@@ -7529,24 +7621,11 @@ impl UpdateCmd {
             final_mounts.iter().filter_map(|m| m.target.to_str()),
         )?;
 
-        // Every state check and every validation of the other settings has
-        // passed: only now do the bindings change, so a command refused for
-        // any of them changes nothing.
-        if credentials {
-            self.update_credentials(db)?;
-        }
-
-        // Expand physical disk files before the DB write. If expansion fails,
-        // no DB changes are made — the record stays consistent.
-        let mut changes: Vec<String> = Vec::new();
-        if self.storage.is_some() || self.overlay.is_some() {
-            let disk_changes =
-                vm_common::expand_disks(&self.name, &record, self.storage, self.overlay)?;
-            changes.extend(disk_changes);
-        }
-
-        // Single DB transaction: all settings + disk sizes together.
-        db.update_vm(&self.name, |r| {
+        // Every setting but the bindings, applied to a record. Run on copies
+        // to check what the update leaves, and once in the write.
+        let apply = |r: &mut smolvm::config::VmRecord,
+                     egress: Option<&smolvm::config::VmRecord>,
+                     changes: &mut Vec<String>| {
             // Disk sizes (must match the physical expansion above)
             if let Some(s) = self.storage {
                 r.storage_gb = Some(s);
@@ -7682,7 +7761,7 @@ impl UpdateCmd {
                     r.network_backend = None;
                 }
             }
-            if let Some(ref next) = egress {
+            if let Some(next) = egress {
                 if r.allowed_cidrs != next.allowed_cidrs {
                     changes.push(format!(
                         "  allowed CIDRs: {}",
@@ -7790,7 +7869,58 @@ impl UpdateCmd {
                 changes.push("  rosetta: disabled".to_string());
                 r.rosetta = Some(false);
             }
-        })?;
+        };
+
+        let mut changes: Vec<String> = Vec::new();
+        let grow_disks = |record: &smolvm::config::VmRecord| -> smolvm::Result<Vec<String>> {
+            if self.storage.is_some() || self.overlay.is_some() {
+                vm_common::expand_disks(&self.name, record, self.storage, self.overlay)
+            } else {
+                Ok(Vec::new())
+            }
+        };
+        if credentials {
+            // Bindings and every other setting in one write, under the
+            // bindings' lock: the bindings are checked against the network
+            // and allow list this update leaves, and the disks grow only
+            // once everything is checked.
+            let applied = std::cell::RefCell::new(Vec::new());
+            let grown = std::cell::RefCell::new(Vec::new());
+            let settings = |r: &mut smolvm::config::VmRecord,
+                            policy: &smolvm::credentials::CredentialPolicy|
+             -> smolvm::Result<()> {
+                let mut probe = r.clone();
+                probe.credential_policy = (!policy.is_empty()).then(|| policy.clone());
+                let egress = self.next_egress(&probe)?;
+                let mut changes = applied.borrow_mut();
+                changes.clear();
+                apply(r, egress.as_ref(), &mut changes);
+                Ok(())
+            };
+            self.update_credentials(
+                db,
+                Some(smolvm::credentials::OtherSettings {
+                    apply: &settings,
+                    prepare: Box::new(|_| {
+                        *grown.borrow_mut() = grow_disks(&record)?;
+                        Ok(())
+                    }),
+                }),
+            )?;
+            changes.extend(grown.into_inner());
+            changes.extend(applied.into_inner());
+        } else {
+            // What this update leaves must still reach every bound host:
+            // `--no-net` beside bindings is refused unless it removes them.
+            let mut staged = record.clone();
+            apply(&mut staged, egress.as_ref(), &mut Vec::new());
+            staged.check_bindings_reachable()?;
+            // Expand physical disk files before the DB write. If expansion
+            // fails, no DB changes are made — the record stays consistent.
+            changes.extend(grow_disks(&record)?);
+            // Single DB transaction: all settings + disk sizes together.
+            db.update_vm(&self.name, |r| apply(r, egress.as_ref(), &mut changes))?;
+        }
 
         if changes.is_empty() {
             println!("No changes specified.");

@@ -1796,6 +1796,7 @@ impl ResolvedSpec {
             credential_placeholders,
             credentials_supplied_by_api,
             credential_bindings_unsettled: false,
+            bindings_network_settled: true,
             // A fresh boot decides; a restore recreates the captured devices.
             credential_ca_device: restored.credential_ca_device,
             // Unknown for a restore: its guest is handed the CA once it runs.
