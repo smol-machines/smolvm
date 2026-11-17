@@ -1745,6 +1745,26 @@ impl EmbeddedRuntime {
         self.create_machine_from_pack_with(name, pack, &crate::machine_spec::CreateSpec::default())
     }
 
+    /// Create the stopped machine `name` from a `.smolmachine` artifact,
+    /// optionally applying an explicit caller outbound network policy before
+    /// the machine is published. Invalid policy fails before creation, so no
+    /// unrestricted intermediate record can be started by another process.
+    pub fn create_machine_from_pack_with_egress(
+        &self,
+        name: &str,
+        pack: &std::path::Path,
+        egress: Option<&crate::data::network::EgressPolicy>,
+    ) -> Result<()> {
+        self.create_machine_from_pack_with(
+            name,
+            pack,
+            &crate::machine_spec::CreateSpec {
+                egress: egress.cloned(),
+                ..Default::default()
+            },
+        )
+    }
+
     /// [`Self::create_machine_from_pack`] with options for the machine. The
     /// pack supplies defaults (resources, command, environment, ...) and
     /// `spec` overrides them by the rules every creation path uses
