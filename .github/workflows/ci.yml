@@ -439,12 +439,11 @@ jobs:
       - name: Private Windows API pipes
         run: cargo test --lib platform::named_pipe::tests
 
-      - name: Test IPv4 UDP fragmentation and host socket buffers
-        run: |
-          cargo test -p smolvm-network --lib fragment
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-          cargo test -p smolvm-network --lib maximum_datagrams
-          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+      - name: Windows virtual network socket paths
+        run: cargo test --lib windows_virtio_listener_accepts_deep_state_paths
+
+      - name: Native container networking
+        run: cargo test -p smolvm-network --lib
 
   # ==========================================================================
   # Build agent (Linux musl for static binary)

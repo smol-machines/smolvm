@@ -1749,6 +1749,11 @@ impl RelayPump {
         if let Some(err) = self.stream.take_error()? {
             return Err(err);
         }
+        // Winsock can keep reporting read EOF and SO_ERROR=0 after a reset
+        // following FIN. TCP_INFO still distinguishes CLOSED from the valid
+        // CLOSE_WAIT half-close, without sending any application bytes.
+        #[cfg(windows)]
+        let hung_up = hung_up || windows_tcp_closed(&self.stream)?;
         if hung_up {
             return Err(io::Error::new(
                 io::ErrorKind::ConnectionReset,
@@ -1924,6 +1929,41 @@ impl RelayPump {
         }
         Ok(PumpOutcome::Busy)
     }
+}
+
+#[cfg(windows)]
+fn windows_tcp_closed(stream: &TcpStream) -> io::Result<bool> {
+    use std::os::windows::io::AsRawSocket;
+    use windows_sys::Win32::Networking::WinSock::{
+        TCP_INFO_v0, WSAGetLastError, WSAIoctl, SIO_TCP_INFO, SOCKET_ERROR, TCPSTATE_CLOSED,
+    };
+    let version = 0u32;
+    // SAFETY: TCP_INFO_v0 contains integer fields only; zero is valid for each.
+    let mut info: TCP_INFO_v0 = unsafe { std::mem::zeroed() };
+    let mut written = 0;
+    // SAFETY: borrowed live TCP socket, valid input/output buffers and sizes;
+    // null OVERLAPPED and callback make the call synchronous.
+    let result = unsafe {
+        WSAIoctl(
+            stream.as_raw_socket() as usize,
+            SIO_TCP_INFO,
+            (&version as *const u32).cast(),
+            std::mem::size_of_val(&version) as u32,
+            (&mut info as *mut TCP_INFO_v0).cast(),
+            std::mem::size_of_val(&info) as u32,
+            &mut written,
+            std::ptr::null_mut(),
+            None,
+        )
+    };
+    if result == SOCKET_ERROR {
+        // SAFETY: reads this thread's most recent Winsock failure.
+        return Err(io::Error::from_raw_os_error(unsafe { WSAGetLastError() }));
+    }
+    if written < std::mem::size_of_val(&info) as u32 {
+        return Err(io::Error::other("incomplete TCP state from Winsock"));
+    }
+    Ok(info.State == TCPSTATE_CLOSED)
 }
 
 /// Drive one flow's pump on its own thread until the flow ends, waiting on
@@ -2499,14 +2539,26 @@ mod tests {
     #[test]
     fn a_host_reset_after_its_half_close_ends_a_relay_whose_guest_is_silent() {
         let (reset_tx, reset_rx) = mpsc::channel::<()>();
-        let destination = half_closing_server(move |stream| {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let destination = listener.local_addr().unwrap();
+        thread::spawn(move || {
+            let (stream, _) = listener.accept().unwrap();
+            stream
+                .set_read_timeout(Some(Duration::from_secs(2)))
+                .unwrap();
+            // Leave a request unread: Winsock otherwise closes an already
+            // half-closed socket gracefully even with zero linger, so there
+            // would be no reset for the relay to observe.
+            assert!(stream.peek(&mut [0; 4]).unwrap() > 0);
+            stream.shutdown(Shutdown::Write).unwrap();
             reset_rx.recv().unwrap();
             socket2::SockRef::from(&stream)
                 .set_linger(Some(Duration::ZERO))
                 .unwrap();
         });
-        // The guest side stays open and sends nothing.
-        let (_to_proxy, _from_proxy, exit_state) = spawn_test_relay(destination);
+        // The guest side stays open and sends nothing after its request.
+        let (to_proxy, _from_proxy, exit_state) = spawn_test_relay(destination);
+        to_proxy.try_send(b"request".to_vec()).unwrap();
         wait_for_exit_mode(
             &exit_state,
             RelayExitMode::HalfClosed,

@@ -701,7 +701,7 @@ pub(crate) async fn before_start(engine: &Arc<Engine>, c: &Arc<Container>) -> Ap
     });
     let record = c.record();
     write_endpoint(engine, &record)?;
-    link_all(engine, &record);
+    link_all(engine, &record)?;
     refresh_names(
         engine,
         &assigned.iter().map(|(n, _)| n.clone()).collect::<Vec<_>>(),
@@ -836,14 +836,6 @@ fn mac_for(ip: Ipv4Addr) -> String {
     format!("02:42:{:02x}:{:02x}:{:02x}:{:02x}", o[0], o[1], o[2], o[3])
 }
 
-fn endpoint_socket(engine: &Engine, record: &ContainerRecord) -> PathBuf {
-    engine
-        .networks
-        .switch_dir()
-        .join("ep")
-        .join(format!("{}.sock", &record.id[..12]))
-}
-
 fn write_endpoint(engine: &Engine, record: &ContainerRecord) -> ApiResult<()> {
     // IPv4 first, primary first: the machine boots with the first address.
     let all = ordered(record);
@@ -875,41 +867,45 @@ fn write_endpoint(engine: &Engine, record: &ContainerRecord) -> ApiResult<()> {
         .map_err(|e| ApiError::internal(format!("write the container's switch endpoint: {e}")))
 }
 
-fn link_all(engine: &Engine, record: &ContainerRecord) {
-    let socket = endpoint_socket(engine, record);
-    for (name, ep) in &record.networks {
-        if ep.ip.is_empty() {
-            continue;
-        }
-        if let Some(network) = engine.networks.find(name) {
-            let dir = engine.networks.switch_dir().join("n").join(network.short());
-            let _ = std::fs::create_dir_all(&dir);
-            for ip in [&ep.ip, &ep.ip6].into_iter().filter(|ip| !ip.is_empty()) {
-                let link = dir.join(ip);
-                let _ = std::fs::remove_file(&link);
-                let _ = std::os::unix::fs::symlink(&socket, &link);
-            }
-        }
-    }
+fn link_all(engine: &Engine, record: &ContainerRecord) -> ApiResult<()> {
+    update_routes(engine, record, true)
+        .map_err(|e| ApiError::internal(format!("publish container route: {e}")))
 }
 
 fn unlink_all(engine: &Engine, record: &ContainerRecord) {
-    let socket = endpoint_socket(engine, record);
+    if let Err(error) = update_routes(engine, record, false) {
+        tracing::warn!(%error, "remove container switch routes");
+    }
+}
+
+fn update_routes(engine: &Engine, record: &ContainerRecord, publish: bool) -> std::io::Result<()> {
+    use smolvm_network::switch::{publish_route, unpublish_route, NetworkName, SwitchEndpoint};
+    let endpoint = SwitchEndpoint {
+        dir: engine.networks.switch_dir().to_path_buf(),
+        id: record.id[..12].to_string(),
+    };
     for (name, ep) in &record.networks {
         if ep.ip.is_empty() {
             continue;
         }
         if let Some(network) = engine.networks.find(name) {
-            let dir = engine.networks.switch_dir().join("n").join(network.short());
-            for ip in [&ep.ip, &ep.ip6].into_iter().filter(|ip| !ip.is_empty()) {
-                let link = dir.join(ip);
-                // Only our own link: the address may be someone else's by now.
-                if std::fs::read_link(&link).is_ok_and(|t| t == socket) {
-                    let _ = std::fs::remove_file(&link);
-                }
+            let Some(network) = NetworkName::new(network.short()) else {
+                continue;
+            };
+            for ip in [&ep.ip, &ep.ip6]
+                .into_iter()
+                .filter_map(|ip| ip.parse().ok())
+            {
+                let result = if publish {
+                    publish_route(&endpoint, network, ip)
+                } else {
+                    unpublish_route(&endpoint, network, ip)
+                };
+                result?;
             }
         }
     }
+    Ok(())
 }
 
 /// Rewrite the names files of `networks` from the running containers on them.
@@ -1363,7 +1359,7 @@ async fn connect(
             });
             let record = c.record();
             write_endpoint(&engine, &record)?;
-            link_all(&engine, &record);
+            link_all(&engine, &record)?;
             refresh_names(&engine, std::slice::from_ref(&n.name));
             record
         };
@@ -1418,7 +1414,7 @@ async fn disconnect(
         let record = c.record();
         if c.is_running() {
             write_endpoint(&engine, &record)?;
-            link_all(&engine, &record);
+            link_all(&engine, &record)?;
         }
         refresh_names(&engine, std::slice::from_ref(&n.name));
     }

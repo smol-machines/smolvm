@@ -3505,6 +3505,7 @@ dependencies = [
  "crossbeam-queue",
  "getrandom 0.3.4",
  "humantime",
+ "krun-socket",
  "libc",
  "polling",
  "serde_json",
@@ -3514,6 +3515,7 @@ dependencies = [
  "socket2",
  "tempfile",
  "tracing",
+ "windows-sys 0.60.2",
 ]
 
 [[package]]

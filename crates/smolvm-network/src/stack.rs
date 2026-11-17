@@ -228,7 +228,7 @@ pub fn start_network_stack(
     udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
-    #[cfg(unix)] switch: Option<crate::switch::SwitchHandle>,
+    switch: Option<crate::switch::SwitchHandle>,
 ) -> std::io::Result<JoinHandle<()>> {
     // A restored guest retains TCP state, but this host-side stack is new.
     // Replaying both the port and ISN sequence collides with saved connections
@@ -255,7 +255,6 @@ pub fn start_network_stack(
                 udp_publish,
                 egress,
                 fabric,
-                #[cfg(unix)]
                 switch,
                 sequence_seed,
                 port_seed,
@@ -271,7 +270,7 @@ fn run_network_stack(
     udp_publish: Option<crate::udp_publish::UdpPublishChannels>,
     egress: EgressPolicy,
     fabric: Option<crate::fabric::FabricHandle>,
-    #[cfg(unix)] switch: Option<crate::switch::SwitchHandle>,
+    switch: Option<crate::switch::SwitchHandle>,
     sequence_seed: u64,
     port_seed: u16,
 ) {
@@ -300,7 +299,6 @@ fn run_network_stack(
     let dns_routing = DnsRouting {
         upstream: config.upstream_dns,
         gateway: config.gateway_ipv4,
-        #[cfg(unix)]
         switch: switch.clone(),
     };
     let dns_socket_handle = add_dns_socket(&mut sockets);
@@ -405,7 +403,6 @@ fn run_network_stack(
         while let Some(frame) = device.stage_next_frame() {
             // The container switch takes packets for other machines on this
             // machine's networks, and answers the guest's ARP for them.
-            #[cfg(unix)]
             if let Some(handle) = switch.as_ref() {
                 match switch_action(frame, handle, config.gateway_mac) {
                     Some(SwitchAction::Forward { src, dst, packet }) => {
@@ -1080,7 +1077,6 @@ struct DnsRouting {
     upstream: Ipv4Addr,
     gateway: Ipv4Addr,
     /// The container switch, whose networks' names this machine resolves.
-    #[cfg(unix)]
     switch: Option<crate::switch::SwitchHandle>,
 }
 
@@ -1129,7 +1125,6 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, routing: &DnsRouting)
     }
     // Names of the machines on this machine's networks are the switch's to
     // answer, before any upstream resolver: they exist only here.
-    #[cfg(unix)]
     if let Some(switch) = routing.switch.as_ref() {
         if let Some(ips) = dns::question_name(query)
             .and_then(|n| dns::normalize_hostname(&n))
@@ -1497,7 +1492,6 @@ fn smoltcp_now(clock: StdInstant) -> Instant {
 }
 
 /// What the container switch does with one guest frame.
-#[cfg(unix)]
 enum SwitchAction {
     /// An IP packet for another machine on one of this machine's networks.
     Forward {
@@ -1510,7 +1504,6 @@ enum SwitchAction {
     Reply(Vec<u8>),
 }
 
-#[cfg(unix)]
 fn switch_action(
     frame: &[u8],
     switch: &crate::switch::SwitchHandle,

@@ -13,14 +13,14 @@
 //! <dir>/ep/<endpoint>.json      the machine's addresses, written by the engine:
 //!                               {"members":[{"network":"n1","ip":"172.18.0.2","prefix":16}]}
 //!                               (a network with IPv6 adds a member with its IPv6 address)
-//! <dir>/n/<network>/<ip>        symlink to the member's endpoint socket
+//! <dir>/n/<network>/<ip>        route to the member's endpoint socket
 //! <dir>/n/<network>/names       "name ip" lines: the names that resolve on the network
 //! ```
 //!
 //! The data path is peer to peer: a guest packet for another member's address
 //! leaves the guest through its own stack, which writes the raw IP packet to
-//! `<dir>/n/<network>/<dst>`, a connect that the symlink takes to the
-//! destination's endpoint socket. The destination stack wraps it in an
+//! the endpoint resolved by `<dir>/n/<network>/<dst>` (a socket symlink on
+//! Unix, an endpoint-name record on Windows). The destination stack wraps it in an
 //! Ethernet frame for its guest. A guest reaches its peers' link addresses
 //! through its own stack, which answers ARP and IPv6 neighbor solicitation
 //! for them with its own MAC. Framing between stacks is
@@ -35,7 +35,7 @@
 //! "inside the subnet" means "on the same network".
 //!
 //! Membership changes are file changes: the engine rewrites the endpoint
-//! file and the symlinks, and the stack picks the new addresses up within a
+//! file and the routes, and the stack picks the new addresses up within a
 //! quarter second. Nothing here needs the engine to be running for packets
 //! already routed to keep flowing.
 
@@ -48,6 +48,7 @@ use std::sync::{Arc, RwLock};
 use std::time::{Duration, SystemTime};
 
 use crate::queues::NetworkFrameQueues;
+use socket2::{Domain, SockAddr, Socket, Type};
 
 /// Largest packet a peer may send.
 const MAX_PACKET: usize = 65536;
@@ -86,6 +87,100 @@ impl SwitchEndpoint {
             .map(|bytes| parse_endpoint_file(&bytes))
             .unwrap_or_default()
     }
+}
+
+fn route_path(dir: &Path, network: NetworkName, ip: IpAddr) -> PathBuf {
+    // Colons are not legal in Windows file names (they select NTFS streams).
+    #[cfg(windows)]
+    let name = ip.to_string().replace(':', "_");
+    #[cfg(unix)]
+    let name = ip.to_string();
+    dir.join("n").join(network.as_str()).join(name)
+}
+
+fn validate_endpoint(id: &str) -> io::Result<()> {
+    if id.is_empty()
+        || id.len() > 64
+        || !id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "invalid switch endpoint",
+        ));
+    }
+    Ok(())
+}
+
+/// Publish an address without requiring Windows symlink privileges.
+/// Unix keeps its existing socket links; Windows records a validated endpoint
+/// name, resolved only within this switch's endpoint directory.
+pub fn publish_route(
+    endpoint: &SwitchEndpoint,
+    network: NetworkName,
+    ip: IpAddr,
+) -> io::Result<()> {
+    validate_endpoint(&endpoint.id)?;
+    let path = route_path(&endpoint.dir, network, ip);
+    std::fs::create_dir_all(path.parent().unwrap())?;
+    #[cfg(unix)]
+    {
+        match std::fs::remove_file(&path) {
+            Ok(()) => {}
+            Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+        std::os::unix::fs::symlink(endpoint.socket_path(), path)
+    }
+    #[cfg(windows)]
+    {
+        let mut random = [0u8; 8];
+        getrandom::fill(&mut random).map_err(|e| io::Error::other(e.to_string()))?;
+        let tmp = path.with_extension(format!("{:016x}.tmp", u64::from_ne_bytes(random)));
+        let result = (|| {
+            let mut file = std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&tmp)?;
+            file.write_all(endpoint.id.as_bytes())?;
+            drop(file);
+            std::fs::rename(&tmp, &path)
+        })();
+        if result.is_err() {
+            let _ = std::fs::remove_file(tmp);
+        }
+        result
+    }
+}
+
+fn resolve_route(dir: &Path, network: NetworkName, ip: IpAddr) -> io::Result<PathBuf> {
+    let path = route_path(dir, network, ip);
+    #[cfg(unix)]
+    {
+        std::fs::read_link(path)
+    }
+    #[cfg(windows)]
+    {
+        let mut name = String::new();
+        std::fs::File::open(path)?
+            .take(65)
+            .read_to_string(&mut name)?;
+        validate_endpoint(&name)?;
+        Ok(dir.join("ep").join(format!("{name}.sock")))
+    }
+}
+
+/// Remove only the route still owned by this endpoint, preserving a reassigned address.
+pub fn unpublish_route(
+    endpoint: &SwitchEndpoint,
+    network: NetworkName,
+    ip: IpAddr,
+) -> io::Result<()> {
+    if resolve_route(&endpoint.dir, network, ip).is_ok_and(|path| path == endpoint.socket_path()) {
+        std::fs::remove_file(route_path(&endpoint.dir, network, ip))?;
+    }
+    Ok(())
 }
 
 /// One address of a machine, on one network.
@@ -394,14 +489,17 @@ pub fn start_switch(
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
 ) -> io::Result<SwitchHandle> {
-    use std::os::unix::net::UnixListener;
+    validate_endpoint(&endpoint.id)?;
     let socket = endpoint.socket_path();
     if let Some(parent) = socket.parent() {
         std::fs::create_dir_all(parent)?;
     }
     // A machine that died left its socket behind; the endpoint is ours.
     let _ = std::fs::remove_file(&socket);
-    let listener = UnixListener::bind(&socket)?;
+    let address = krun_socket::SocketPath::new(&socket)?;
+    let listener = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+    listener.bind(&SockAddr::unix(address.path())?)?;
+    listener.listen(128)?;
     listener.set_nonblocking(true)?;
     let seen = Arc::new(std::sync::Mutex::new(
         std::fs::metadata(endpoint.config_path())
@@ -452,47 +550,61 @@ pub fn start_switch(
 }
 
 fn accept_loop(
-    listener: std::os::unix::net::UnixListener,
+    listener: Socket,
     socket: PathBuf,
     queues: Arc<NetworkFrameQueues>,
     members: Arc<RwLock<Vec<Member>>>,
     gateway_mac: [u8; 6],
     guest_mac: [u8; 6],
 ) {
-    loop {
-        if queues.is_shutting_down() {
-            let _ = std::fs::remove_file(&socket);
-            return;
-        }
-        match listener.accept() {
-            Ok((stream, _)) => {
-                let _ = stream.set_nonblocking(false);
-                let queues = queues.clone();
-                let members = members.clone();
-                let _ = std::thread::Builder::new()
-                    .name("smolvm-switch-recv".into())
-                    .spawn(move || peer_reader(stream, queues, members, gateway_mac, guest_mac));
-            }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => wait_readable(&listener),
-            Err(_) => {
-                let _ = std::fs::remove_file(&socket);
-                return;
-            }
-        }
+    let result = accept_peers(&listener, &queues, &members, gateway_mac, guest_mac);
+    if let Err(error) = result {
+        tracing::warn!(%error, "container switch listener stopped");
     }
+    // Windows cannot remove a live AF_UNIX socket file.
+    drop(listener);
+    let _ = std::fs::remove_file(&socket);
 }
 
-/// Block until `listener` has a connection to accept, or the shutdown poll
-/// interval passes.
-fn wait_readable(listener: &std::os::unix::net::UnixListener) {
-    use std::os::unix::io::AsRawFd;
-    let mut fd = libc::pollfd {
-        fd: listener.as_raw_fd(),
-        events: libc::POLLIN,
-        revents: 0,
-    };
-    // SAFETY: one valid pollfd for the duration of the call.
-    unsafe { libc::poll(&mut fd, 1, SHUTDOWN_POLL.as_millis() as libc::c_int) };
+fn accept_peers(
+    listener: &Socket,
+    queues: &Arc<NetworkFrameQueues>,
+    members: &Arc<RwLock<Vec<Member>>>,
+    gateway_mac: [u8; 6],
+    guest_mac: [u8; 6],
+) -> io::Result<()> {
+    let poller = polling::Poller::new()?;
+    // SAFETY: listener outlives poller and is deregistered before returning.
+    unsafe {
+        poller.add(listener, polling::Event::readable(0))?;
+    }
+    let result = (|| {
+        let mut events = polling::Events::new();
+        while !queues.is_shutting_down() {
+            match listener.accept() {
+                Ok((stream, _)) => {
+                    stream.set_nonblocking(false)?;
+                    let queues = queues.clone();
+                    let members = members.clone();
+                    std::thread::Builder::new()
+                        .name("smolvm-switch-recv".into())
+                        .spawn(move || {
+                            peer_reader(stream, queues, members, gateway_mac, guest_mac)
+                        })?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    poller.modify(listener, polling::Event::readable(0))?;
+                    events.clear();
+                    poller.wait(&mut events, Some(SHUTDOWN_POLL))?;
+                }
+                Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                Err(error) => return Err(error),
+            }
+        }
+        Ok(())
+    })();
+    poller.delete(listener)?;
+    result
 }
 
 /// Whether a packet from a peer may reach this guest: for one of its
@@ -536,7 +648,7 @@ pub fn ip_endpoints(packet: &[u8]) -> Option<(IpAddr, IpAddr)> {
 }
 
 fn peer_reader(
-    mut stream: std::os::unix::net::UnixStream,
+    mut stream: Socket,
     queues: Arc<NetworkFrameQueues>,
     members: Arc<RwLock<Vec<Member>>>,
     gateway_mac: [u8; 6],
@@ -578,17 +690,13 @@ fn peer_reader(
 
 /// Fill `buf`, riding out the shutdown-poll timeouts; `false` at EOF, on an
 /// error, or at shutdown.
-fn read_full(
-    stream: &mut std::os::unix::net::UnixStream,
-    buf: &mut [u8],
-    queues: &NetworkFrameQueues,
-) -> bool {
+fn read_full(stream: &mut Socket, buf: &mut [u8], queues: &NetworkFrameQueues) -> bool {
     let mut filled = 0;
     while filled < buf.len() {
         if queues.is_shutting_down() {
             return false;
         }
-        match stream.read(&mut buf[filled..]) {
+        match (&*stream).read(&mut buf[filled..]) {
             Ok(0) => return false,
             Ok(n) => filled += n,
             Err(e)
@@ -606,7 +714,7 @@ fn send_loop(
     members: Arc<RwLock<Vec<Member>>>,
     queues: Arc<NetworkFrameQueues>,
 ) {
-    let mut connections: HashMap<IpAddr, std::os::unix::net::UnixStream> = HashMap::new();
+    let mut connections: HashMap<IpAddr, Socket> = HashMap::new();
     let mut generation: Vec<Member> = Vec::new();
     for (dst, packet) in receiver.iter() {
         if queues.is_shutting_down() {
@@ -634,7 +742,7 @@ fn send_loop(
 fn send(
     dir: &Path,
     network: NetworkName,
-    connections: &mut HashMap<IpAddr, std::os::unix::net::UnixStream>,
+    connections: &mut HashMap<IpAddr, Socket>,
     dst: IpAddr,
     packet: &[u8],
 ) -> io::Result<()> {
@@ -642,8 +750,10 @@ fn send(
     let stream = match connections.entry(dst) {
         Entry::Occupied(e) => e.into_mut(),
         Entry::Vacant(slot) => {
-            let path = dir.join("n").join(network.as_str()).join(dst.to_string());
-            let stream = std::os::unix::net::UnixStream::connect(path)?;
+            let path = resolve_route(dir, network, dst)?;
+            let address = krun_socket::SocketPath::new(path)?;
+            let stream = Socket::new(Domain::UNIX, Type::STREAM, None)?;
+            stream.connect_timeout(&SockAddr::unix(address.path())?, Duration::from_secs(5))?;
             stream.set_write_timeout(Some(Duration::from_secs(5)))?;
             slot.insert(stream)
         }
@@ -651,7 +761,7 @@ fn send(
     let mut frame = Vec::with_capacity(4 + packet.len());
     frame.extend_from_slice(&(packet.len() as u32).to_be_bytes());
     frame.extend_from_slice(packet);
-    stream.write_all(&frame)
+    (&*stream).write_all(&frame)
 }
 
 /// An ARP reply telling `requester` that `target` is at `mac`, for a request
@@ -757,6 +867,154 @@ fn icmpv6_checksum(src: Ipv6Addr, dst: Ipv6Addr, body: &[u8]) -> u16 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wait_frame(queues: &NetworkFrameQueues) -> Vec<u8> {
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(frame) = queues.host_to_guest.pop() {
+                return frame;
+            }
+            assert!(
+                std::time::Instant::now() < until,
+                "switch packet was not delivered"
+            );
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn native_switch_delivers_dual_stack_packets_and_revokes_membership() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("long-container-workspace-".repeat(7));
+        std::fs::create_dir_all(dir.join("ep")).unwrap();
+        let a = SwitchEndpoint {
+            dir: dir.clone(),
+            id: "sender".into(),
+        };
+        let b = SwitchEndpoint {
+            dir: dir.clone(),
+            id: "receiver".into(),
+        };
+        let ma = vec![
+            member("shared", "172.18.0.2", 16),
+            member("shared", "fd00:1::2", 64),
+        ];
+        let mb = vec![
+            member("shared", "172.18.0.3", 16),
+            member("shared", "fd00:1::3", 64),
+        ];
+        for (ep, members) in [(&a, &ma), (&b, &mb)] {
+            std::fs::write(ep.config_path(), render_endpoint_file(members)).unwrap();
+            for m in members {
+                publish_route(ep, m.network, m.ip).unwrap();
+            }
+        }
+        let qa = NetworkFrameQueues::shared(16);
+        let qb = NetworkFrameQueues::shared(16);
+        // Shut down even when an assertion fails, so a failing test cannot leak listeners.
+        struct Stop(Arc<NetworkFrameQueues>, Arc<NetworkFrameQueues>);
+        impl Drop for Stop {
+            fn drop(&mut self) {
+                self.0.begin_shutdown();
+                self.1.begin_shutdown();
+            }
+        }
+        let stop = Stop(qa.clone(), qb.clone());
+        let ha = start_switch(a.clone(), qa.clone(), [2; 6], [3; 6]).unwrap();
+        let hb = start_switch(b.clone(), qb.clone(), [4; 6], [5; 6]).unwrap();
+        let mut packet = ipv4("172.18.0.2", "172.18.0.3");
+        packet.resize(65535, 0xa5);
+        ha.forward(ma[0].ip, mb[0].ip, packet.clone());
+        let frame = wait_frame(&qb);
+        assert_eq!(&frame[14..], packet);
+        assert_eq!(&frame[..6], &[5; 6]);
+        let mut v6 = vec![0u8; 40];
+        v6[0] = 0x60;
+        v6[8..24].copy_from_slice(&"fd00:1::3".parse::<Ipv6Addr>().unwrap().octets());
+        v6[24..40].copy_from_slice(&"fd00:1::2".parse::<Ipv6Addr>().unwrap().octets());
+        v6.resize(65536, 0x5a);
+        hb.forward(mb[1].ip, ma[1].ip, v6.clone());
+        let frame = wait_frame(&qa);
+        assert_eq!(&frame[12..14], &[0x86, 0xdd]);
+        assert_eq!(&frame[14..], v6);
+        // A guest cannot claim a sibling's source address.
+        ha.forward(
+            "172.18.0.9".parse().unwrap(),
+            mb[0].ip,
+            ipv4("172.18.0.9", "172.18.0.3"),
+        );
+        // Receiver-side membership changes reject even an existing peer stream.
+        std::fs::write(
+            b.config_path(),
+            render_endpoint_file(&[member("other", "172.19.0.3", 16)]),
+        )
+        .unwrap();
+        *hb.seen.lock().unwrap() = None;
+        hb.refresh_members();
+        ha.forward(ma[0].ip, mb[0].ip, packet);
+        std::thread::sleep(Duration::from_millis(350));
+        assert!(qb.host_to_guest.is_empty());
+        drop(stop);
+        drop((ha, hb));
+        let until = std::time::Instant::now() + Duration::from_secs(5);
+        while a.socket_path().exists() || b.socket_path().exists() {
+            assert!(
+                std::time::Instant::now() < until,
+                "switch listener survived shutdown"
+            );
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn route_reassignment_preserves_the_new_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let a = SwitchEndpoint {
+            dir: root.path().into(),
+            id: "first".into(),
+        };
+        let b = SwitchEndpoint {
+            dir: root.path().into(),
+            id: "second".into(),
+        };
+        let net = NetworkName::new("shared").unwrap();
+        for ip in ["172.18.0.2", "fd00:1::2"] {
+            let ip = ip.parse().unwrap();
+            publish_route(&a, net, ip).unwrap();
+            publish_route(&b, net, ip).unwrap();
+            unpublish_route(&a, net, ip).unwrap();
+            assert_eq!(
+                resolve_route(root.path(), net, ip).unwrap(),
+                b.socket_path()
+            );
+            unpublish_route(&b, net, ip).unwrap();
+            assert!(!route_path(root.path(), net, ip).exists());
+        }
+        let bad = SwitchEndpoint {
+            dir: root.path().into(),
+            id: "../escape".into(),
+        };
+        assert!(publish_route(&bad, net, "172.18.0.2".parse().unwrap()).is_err());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_routes_reject_paths_and_oversized_records() {
+        let root = tempfile::tempdir().unwrap();
+        let network = NetworkName::new("shared").unwrap();
+        let ip = "fd00:1::2".parse().unwrap();
+        let path = route_path(root.path(), network, ip);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        for invalid in [
+            "../escape",
+            "C:\\outside",
+            "endpoint\\socket",
+            &"a".repeat(65),
+        ] {
+            std::fs::write(&path, invalid).unwrap();
+            assert!(resolve_route(root.path(), network, ip).is_err());
+        }
+    }
 
     fn member(net: &str, ip: &str, prefix: u8) -> Member {
         Member {
