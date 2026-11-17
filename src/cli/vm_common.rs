@@ -1990,10 +1990,6 @@ fn start_vm_named_with_db(
         // when a wrapper selects its boot executable with SMOLVM_BOOT_BINARY.
         watch_parent: Some(false),
         ssh_agent_socket,
-        // This path starts a persistent named machine and detaches it below.
-        // An embedding CLI may use a separate boot helper; its exit must not
-        // trigger the SDK-style parent-death watchdog for this machine.
-        watch_parent: Some(false),
         cuda: record.cuda,
         expose_docker: record.docker_socket,
         // Only here, the CLI's own start: `smolvm serve` and the SDK runtime
