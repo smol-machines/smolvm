@@ -1171,78 +1171,66 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
         );
     }
 
-    // Entitled but still EINVAL: probe `hv_vm_create` directly. On a host that
-    // cannot run VMs at all — a VM on a physical host without nested
-    // virtualization (hosted CI runners are VMs; nested HVF needs Apple M3+
-    // silicon) — the probe fails the same way the boot did, and the generic
-    // "disk/overlay" hint would send the user debugging the wrong layer.
+    // Confirm unsupported virtualization before replacing the generic EINVAL
+    // hint: permission and resource errors do not establish host incapacity.
     #[cfg(target_os = "macos")]
     if -ret == 22 && hypervisor_vm_create_probe() == Some(false) {
         return format!(
-            "krun_start_enter returned: {ret} (Hypervisor.framework cannot create a \
-             VM on this host — a direct hv_vm_create probe fails identically, so the \
-             host itself lacks virtualization support rather than this VM's config \
-             being invalid. This machine is likely itself a VM on a host without \
-             nested virtualization (hosted CI runners are; nested HVF requires \
-             Apple M3+ silicon). Run on bare metal or a host with nested \
-             virtualization enabled)"
+            "krun_start_enter returned: {ret} (Hypervisor.framework reports \
+             virtualization is unsupported on this host; if this is a virtual \
+             machine, use a host with nested virtualization support)"
         );
     }
 
     describe_start_error_with_probe(ret, kvm_error.as_deref())
 }
 
-/// Whether `hv_vm_create` can create a VM on this host right now.
-///
-/// Mirrors libkrun's `HvfVm::new` exactly — `hv_vm_config_create` then
-/// `hv_vm_create` — so the probe fails where the real boot fails. `Some(true)`
-/// the hypervisor works (the boot failure is config-specific); `Some(false)`
-/// it does not; `None` the probe itself could not run (framework/symbols
-/// missing) and says nothing either way.
+/// Whether Hypervisor.framework confirms virtualization support.
+/// `Some(false)` means explicitly unsupported; missing APIs, permissions and
+/// resource failures are inconclusive. A VM already in this process is retained.
 #[cfg(target_os = "macos")]
 fn hypervisor_vm_create_probe() -> Option<bool> {
-    type ConfigCreate = unsafe extern "C" fn() -> *mut std::ffi::c_void;
     type VmCreate = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
     type VmDestroy = unsafe extern "C" fn() -> u32;
-    const HV_SUCCESS: u32 = 0;
-
     let lib = unsafe {
         libloading::Library::new(
             "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
         )
     }
     .ok()?;
-    let config_create: libloading::Symbol<ConfigCreate> =
-        unsafe { lib.get(b"hv_vm_config_create") }.ok()?;
     let vm_create: libloading::Symbol<VmCreate> = unsafe { lib.get(b"hv_vm_create") }.ok()?;
-
-    let config = unsafe { config_create() };
-    if config.is_null() {
-        return Some(false);
-    }
-    let ret = unsafe { vm_create(config) };
-    if ret == HV_SUCCESS {
-        // Don't leak the probe VM.
-        if let Ok(destroy) = unsafe { lib.get::<VmDestroy>(b"hv_vm_destroy") } {
-            unsafe { destroy() };
-        }
-    }
-    Some(hv_probe_verdict(ret))
+    // Resolve cleanup before creating anything. A NULL configuration is the
+    // documented default and needs no retained configuration object to release.
+    let vm_destroy: libloading::Symbol<VmDestroy> = unsafe { lib.get(b"hv_vm_destroy") }.ok()?;
+    probe_hypervisor_vm(
+        || unsafe { vm_create(std::ptr::null_mut()) },
+        || unsafe { vm_destroy() },
+    )
 }
 
-/// Map an `hv_vm_create` return to the probe verdict. `HV_BUSY` means a VM
-/// already exists in this process — only possible if an earlier create
-/// succeeded, so the host can virtualize. That case is real: libkrun never
-/// calls `hv_vm_destroy`, so a `build_microvm` failure after `hv_vm_create`
-/// (memory map, GIC, device init — all reported as -EINVAL) leaves the VM
-/// occupying the process, and the probe's own create then answers HV_BUSY.
-/// Reading it as incapacity would invert the diagnosis exactly when the real
-/// failure is post-create.
-#[cfg(target_os = "macos")]
-fn hv_probe_verdict(ret: u32) -> bool {
+#[cfg(any(target_os = "macos", test))]
+fn probe_hypervisor_vm(
+    create: impl FnOnce() -> u32,
+    destroy: impl FnOnce() -> u32,
+) -> Option<bool> {
+    let result = create();
+    // Only destroy the VM this probe created, never an existing caller's VM.
+    if result == 0 && destroy() != 0 {
+        return None;
+    }
+    hv_probe_verdict(result)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn hv_probe_verdict(ret: u32) -> Option<bool> {
     const HV_SUCCESS: u32 = 0;
     const HV_BUSY: u32 = 0xfae9_4002;
-    ret == HV_SUCCESS || ret == HV_BUSY
+    const HV_UNSUPPORTED: u32 = 0xfae9_400f;
+    match ret {
+        HV_SUCCESS | HV_BUSY => Some(true),
+        HV_UNSUPPORTED => Some(false),
+        _ => None,
+    }
 }
 
 pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
@@ -1530,31 +1518,83 @@ mod tests {
         ));
     }
 
-    // The verdict mapping is the part that can silently lie: HV_BUSY means a
-    // VM already occupies this process — proof the host CAN virtualize — not
-    // that it cannot. libkrun never destroys a created VM, so a post-create
-    // build failure (still -EINVAL) leaves the probe's own hv_vm_create
-    // answering HV_BUSY.
-    #[cfg(target_os = "macos")]
     #[test]
-    fn hv_probe_verdict_treats_busy_as_capable() {
-        const HV_SUCCESS: u32 = 0;
-        const HV_BUSY: u32 = 0xfae9_4002;
-        const HV_UNSUPPORTED: u32 = 0xfae9_400f;
-        const HV_ERROR: u32 = 0xfae9_4000;
-        assert!(hv_probe_verdict(HV_SUCCESS));
-        assert!(hv_probe_verdict(HV_BUSY));
-        assert!(!hv_probe_verdict(HV_UNSUPPORTED));
-        assert!(!hv_probe_verdict(HV_ERROR));
+    fn hv_probe_does_not_misdiagnose_resource_or_permission_failures() {
+        for code in [
+            0xfae9_4001,
+            0xfae9_4003,
+            0xfae9_4005,
+            0xfae9_4007,
+            0xfae9_4008,
+        ] {
+            assert_eq!(hv_probe_verdict(code), None, "error {code:#x}");
+        }
     }
 
-    // The probe must answer on any host where Hypervisor.framework loads, and
-    // its verdict must be stable across calls (each probe creates and destroys
-    // its own VM, so a second call sees the same host state).
+    #[test]
+    fn hv_probe_cleans_up_only_a_vm_it_created() {
+        for (code, expected) in [
+            (0, Some(true)),
+            (0xfae9_4002, Some(true)),
+            (0xfae9_400f, Some(false)),
+            (0xfae9_4005, None),
+        ] {
+            let mut destroyed = false;
+            assert_eq!(
+                probe_hypervisor_vm(
+                    || code,
+                    || {
+                        destroyed = true;
+                        0
+                    }
+                ),
+                expected
+            );
+            assert_eq!(destroyed, code == 0);
+        }
+        assert_eq!(probe_hypervisor_vm(|| 0, || 0xfae9_4001), None);
+    }
+
     #[cfg(target_os = "macos")]
     #[test]
     fn hypervisor_probe_verdict_is_stable() {
-        assert_eq!(hypervisor_vm_create_probe(), hypervisor_vm_create_probe());
+        let first = hypervisor_vm_create_probe();
+        let second = hypervisor_vm_create_probe();
+        eprintln!("HVF probe verdicts: {first:?}, {second:?}");
+        assert_eq!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_preserves_an_existing_vm() {
+        type Create = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+        type Destroy = unsafe extern "C" fn() -> u32;
+        struct OwnedVm(Destroy);
+        impl Drop for OwnedVm {
+            fn drop(&mut self) {
+                unsafe {
+                    (self.0)();
+                }
+            }
+        }
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+            )
+        }
+        .unwrap();
+        let create: libloading::Symbol<Create> = unsafe { lib.get(b"hv_vm_create") }.unwrap();
+        let destroy: libloading::Symbol<Destroy> = unsafe { lib.get(b"hv_vm_destroy") }.unwrap();
+        let result = unsafe { create(std::ptr::null_mut()) };
+        if result != 0 {
+            eprintln!("SKIP: test binary cannot create a VM: {result:#x}");
+            return;
+        }
+        let owned = OwnedVm(*destroy);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
+        assert_eq!(unsafe { create(std::ptr::null_mut()) }, 0xfae9_4002);
+        drop(owned);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
     }
 
     #[test]
