@@ -2,9 +2,60 @@ use std::{
     env, fs,
     io::{Read, Write},
     net::{TcpListener, TcpStream, UdpSocket},
+    os::fd::AsRawFd,
     thread,
     time::Duration,
 };
+unsafe extern "C" {
+    fn connect(fd: i32, address: *const u8, length: u32) -> i32;
+}
+
+fn udp_connected(first: std::net::SocketAddr, second: std::net::SocketAddr) {
+    let local = if first.is_ipv4() {
+        "0.0.0.0:0"
+    } else {
+        "[::]:0"
+    };
+    let socket = UdpSocket::bind(local).unwrap();
+    socket
+        .set_read_timeout(Some(Duration::from_secs(3)))
+        .unwrap();
+    socket.connect(first).unwrap();
+    let bound = socket.local_addr().unwrap();
+    let mut received = [0; 65535];
+    for size in [0, 1, 4096, 65507] {
+        let data = vec![71; size];
+        socket.send(&data).unwrap();
+        let (length, peer) = socket.recv_from(&mut received).unwrap();
+        assert_eq!(peer, first);
+        assert_eq!(&received[..length], data.as_slice());
+    }
+    socket.send_to(b"alternate", second).unwrap();
+    socket.send(b"connected").unwrap();
+    let (length, peer) = socket.recv_from(&mut received).unwrap();
+    assert_eq!(peer, first);
+    assert_eq!(&received[..length], b"connected");
+    assert_eq!(socket.peer_addr().unwrap(), first);
+    assert_eq!(socket.local_addr().unwrap(), bound);
+    let address = [0u8; 2];
+    assert_eq!(
+        unsafe { connect(socket.as_raw_fd(), address.as_ptr(), 2) },
+        0
+    );
+    assert_eq!(socket.peer_addr().unwrap_err().raw_os_error(), Some(107));
+    assert_eq!(socket.local_addr().unwrap(), local.parse().unwrap());
+    socket.send_to(b"disconnected", second).unwrap();
+    let (length, peer) = socket.recv_from(&mut received).unwrap();
+    assert_eq!(peer, second);
+    assert_eq!(&received[..length], b"disconnected");
+    socket.connect(first).unwrap();
+    socket.send(b"reconnected").unwrap();
+    let (length, peer) = socket.recv_from(&mut received).unwrap();
+    assert_eq!(peer, first);
+    assert_eq!(&received[..length], b"reconnected");
+    println!("UDP_CONNECTED_PASS");
+}
+
 fn main() {
     let args: Vec<String> = env::args().collect();
     match args[1].as_str() {
@@ -72,6 +123,7 @@ fn main() {
             }
             println!("UDP_PASS");
         }
+        "udp-connected" => udp_connected(args[2].parse().unwrap(), args[3].parse().unwrap()),
         "bind" => match TcpListener::bind(&args[2]) {
             Ok(_socket) => println!("BIND_PASS"),
             Err(error) => {
