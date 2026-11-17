@@ -194,13 +194,18 @@ mod tests {
         symlink("link", &chain).unwrap();
         assert_eq!(
             read(&chain).unwrap().resolved_link_target,
-            dir.path().join("missing 雪\nfile").to_str().unwrap()
+            dir.path()
+                .canonicalize()
+                .unwrap()
+                .join("missing 雪\nfile")
+                .to_str()
+                .unwrap()
         );
         std::fs::remove_file(&link).unwrap();
         symlink(path.file_name().unwrap(), &link).unwrap();
         assert_eq!(
             read(&chain).unwrap().resolved_link_target,
-            path.to_str().unwrap()
+            path.canonicalize().unwrap().to_str().unwrap()
         );
         let loop_path = dir.path().join("loop");
         symlink("loop", &loop_path).unwrap();
