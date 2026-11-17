@@ -729,6 +729,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts.as_deref(),
         port_mappings.len(),
     )?;
+    if resources.network_backend == Some(crate::network::NetworkBackend::Host)
+        && (auto_ports.is_some()
+            || credentials.is_some()
+            || external_interceptor.is_some()
+            || pod_net.is_some())
+    {
+        return Err(Error::config("host network", "host networking cannot use automatic port publishing, credentials, interception or pod networks"));
+    }
     if let Some(endpoint) = external_interceptor {
         validate_external_interceptor(
             endpoint,
@@ -1281,6 +1289,27 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 tracing::info!("network backend: tsi");
+                None
+            }
+            EffectiveNetworkBackend::Host => {
+                krun.ensure_host_network().map_err(|reason| {
+                    krun_free_ctx(ctx);
+                    Error::agent("configure host network", reason)
+                })?;
+                if krun_add_vsock(
+                    ctx,
+                    TSI_FEATURE_HIJACK_INET | crate::network::backend::TSI_FEATURE_HOST_BIND,
+                ) < 0
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure host network",
+                        "krun_add_vsock rejected host networking",
+                    ));
+                }
+                // A port map, even empty, intentionally forbids direct host binds.
+                start_tsi_dns_forwarder(ctx, krun.set_dns_forwarder, resources.dns);
+                tracing::info!("network backend: host");
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
@@ -1913,7 +1942,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // ports use the forwarder on every backend: it reaches a guest port at
         // the guest's loopback, where dev servers often listen. A socket path
         // too long for the platform only costs those live changes.
-        let live_ports_via_forwarder = network_plan.backend != EffectiveNetworkBackend::VirtioNet;
+        let live_ports_via_forwarder = matches!(
+            network_plan.backend,
+            EffectiveNetworkBackend::None | EffectiveNetworkBackend::Tsi
+        );
         let port_forward_socket = if live_ports_via_forwarder || auto_ports.is_some() {
             vsock_socket
                 .parent()
@@ -2895,7 +2927,10 @@ pub fn validate_external_interceptor(
         Some(
             "interceptor requires a loopback address, nonzero port and random authentication token",
         )
-    } else if resources.network_backend == Some(crate::network::NetworkBackend::Tsi) {
+    } else if matches!(
+        resources.network_backend,
+        Some(crate::network::NetworkBackend::Tsi | crate::network::NetworkBackend::Host)
+    ) {
         Some("external interception requires virtio-net")
     } else if resources.network_name.is_some() || has_pod_network {
         Some("external interception cannot use named or pod networks")

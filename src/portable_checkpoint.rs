@@ -1495,7 +1495,7 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
         .staging_dir
         .clone()
         .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
+        .or_else(|| smolvm_paths::cache_dir().map(|cache| cache.join("smolvm")))
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&root)
         .map_err(|error| Error::agent("create checkpoint staging root", error.to_string()))?;
@@ -1515,7 +1515,7 @@ const ABANDONED_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_sec
 pub fn sweep_abandoned_checkpoint_scratch() -> usize {
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(PathBuf::from)
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")));
+        .or_else(|| smolvm_paths::cache_dir().map(|cache| cache.join("smolvm")));
     let mut removed = 0;
     if let Some(root) = root {
         removed += sweep_abandoned_scratch_in(
@@ -3986,6 +3986,9 @@ pub fn attach_cached_checkpoint_pack(
 /// where they exist. Staged mounts stay unsupported either way.
 pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> {
     let mut unsupported = Vec::new();
+    if vm.network_backend == Some(crate::network::NetworkBackend::Host) {
+        unsupported.push("host networking");
+    }
     if (!vm.mounts.is_empty() && !host_mounts) || !vm.staged_mounts.is_empty() {
         unsupported.push("host mounts");
     }
@@ -4120,6 +4123,10 @@ pub fn restored_network_backend(
         return Ok(None);
     };
     match label {
+        "host" => Err(Error::agent(
+            "restore checkpoint",
+            "host-network checkpoints are not supported",
+        )),
         "tsi" => Ok(Some(crate::network::NetworkBackend::Tsi)),
         "virtio-net" => Ok(Some(crate::network::NetworkBackend::VirtioNet)),
         other => Err(Error::agent(
@@ -4202,6 +4209,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
     let effective = vm.launch_network_plan();
     let backend = match effective.backend {
         crate::network::EffectiveNetworkBackend::None => None,
+        crate::network::EffectiveNetworkBackend::Host => Some("host".to_string()),
         crate::network::EffectiveNetworkBackend::Tsi => Some("tsi".to_string()),
         crate::network::EffectiveNetworkBackend::VirtioNet => Some("virtio-net".to_string()),
     };

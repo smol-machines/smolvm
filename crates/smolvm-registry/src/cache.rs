@@ -141,7 +141,7 @@ pub struct BlobCache {
 impl BlobCache {
     /// Open or create a cache at the default location.
     pub fn open_default() -> std::io::Result<Self> {
-        let cache_dir = dirs::cache_dir()
+        let cache_dir = smolvm_paths::cache_dir()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache dir"))?
             .join("smolvm-registry")
             .join("blobs");
