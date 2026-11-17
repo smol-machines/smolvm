@@ -66,10 +66,10 @@ jobs:
       # A libkrun linked against a newer glibc (> 2.31) loads there but fails on
       # Ubuntu 20.04 / Debian 11 with "GLIBC_x.y not found" before the VM boots
       # (issue #636). Gate every push so a wrong-host lib can't ship again.
-      - name: Bundled libkrun keeps a glibc floor <= 2.31
-        run: ./scripts/check-libkrun-glibc-floor.sh
-      - name: Bundled macOS libraries support macOS 11
-        run: python3 ./scripts/check-macos-deployment-target.py
+      - name: Bundled libraries support the minimum host versions
+        run: |
+          ./scripts/check-libkrun-glibc-floor.sh
+          python3 ./scripts/check-macos-deployment-target.py
       # The guest has no dynamic loader: a libkrun embedding a glibc-linked
       # krun-init boots no VM at all, exiting before the agent with an empty
       # console (issue #1437, the v1.19.0 Windows krun.dll).
@@ -126,9 +126,6 @@ jobs:
           git lfs install
           git lfs pull
 
-      - name: Test the macOS deployment target gate
-        run: python3 -m unittest discover -s tests -p test_macos_deployment_target.py
-
       - name: Verify LFS dylibs
         run: |
           ls -la lib/
@@ -163,7 +160,9 @@ jobs:
       # is Linux ping-socket behaviour, so it times out on macOS. Linux runs the
       # reliable member-crate suites listed below.
       - name: Run unit tests
-        run: cargo test --lib
+        run: |
+          cargo test --lib
+          python3 -m unittest discover -s tests -p test_macos_deployment_target.py
         env:
           LIBRARY_PATH: ${{ github.workspace }}/lib
           DYLD_LIBRARY_PATH: ${{ github.workspace }}/lib
@@ -172,9 +171,6 @@ jobs:
         run: |
           cargo test -p smolvm-network --lib tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets -- --exact
           cargo test -p smolvm-network --lib tcp_relay::tests::guest_relay_sockets_disable_nagle_for_outbound_and_published_connections -- --exact
-
-      - name: Test IPv4 UDP fragmentation and host socket buffers
-        run: |
           cargo test -p smolvm-network --lib fragment
           cargo test -p smolvm-network --lib maximum_datagrams
 
@@ -309,14 +305,9 @@ jobs:
         run: |
           cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::registered_relay_stream_disables_nagle_for_outbound_and_accepted_sockets -- --exact
           cargo test -p smolvm-network --lib --target ${{ matrix.target }} tcp_relay::tests::guest_relay_sockets_disable_nagle_for_outbound_and_published_connections -- --exact
-
-      - name: Test IPv4 UDP fragmentation and host socket buffers
-        run: |
           cargo test -p smolvm-network --lib --target ${{ matrix.target }} fragment
           cargo test -p smolvm-network --lib --target ${{ matrix.target }} maximum_datagrams
-
-      - name: Test patched stack against upstream unit suite
-        run: python3 scripts/test-smoltcp.py
+          python3 scripts/test-smoltcp.py
 
       - name: Run agent unit tests
         run: cargo test -p smolvm-agent --bins --target ${{ matrix.target }}
@@ -424,17 +415,14 @@ jobs:
           key: windows-msvc-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
           restore-keys: windows-msvc-cargo-
 
-      - name: Pack unit tests (native NTFS)
-        run: cargo test -p smolvm-pack --lib
-
-      - name: State directory isolation (native Windows)
-        run: cargo test -p smolvm-paths --lib
-
-      - name: Windows file copy paths
-        run: cargo test --lib copy_paths
-
-      - name: Windows sockets and container networking
+      - name: Native Windows unit tests
         run: |
+          cargo test -p smolvm-pack --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test -p smolvm-paths --lib
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --lib copy_paths
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --lib platform::async_uds::tests
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --lib platform::named_pipe::tests
