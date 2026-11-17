@@ -375,6 +375,22 @@ test_paused_machine_points_exec_and_cp_at_resume() {
     ensure_data_dir_deleted "$vm_name"
 }
 
+test_started_machine_outlives_boot_helper_cli() {
+    local vm_name="boot-helper-owner-$$"
+    local rc=0
+    "$SMOLVM" machine create --name "$vm_name" 2>&1 || return 1
+    SMOLVM_BOOT_BINARY="$SMOLVM" "$SMOLVM" machine start --name "$vm_name" --branchable 2>&1 || rc=$?
+    if [[ $rc -eq 0 ]]; then
+        # The parent-death watcher polls every 500 ms; the persistent machine
+        # must remain usable after the CLI that started it has exited.
+        sleep 1
+        "$SMOLVM" machine exec --name "$vm_name" -- true 2>&1 || rc=$?
+    fi
+    "$SMOLVM" machine delete --name "$vm_name" -f 2>/dev/null || true
+    [[ $rc -eq 0 ]] || return "$rc"
+    ensure_data_dir_deleted "$vm_name"
+}
+
 test_machine_exec_when_stopped() {
     cleanup_machine
 
@@ -831,6 +847,7 @@ run_test "Named machine" test_machine_named_vm || true
 run_test "Create prints named start hint" test_machine_create_prints_named_start_hint || true
 run_test "Refused delete leaves a running machine running" test_refused_delete_leaves_machine_running || true
 run_test "Paused machine points exec and cp at resume" test_paused_machine_points_exec_and_cp_at_resume || true
+run_test "CLI-started machine outlives its boot helper parent" test_started_machine_outlives_boot_helper_cli || true
 run_test "Exec when stopped fails" test_machine_exec_when_stopped || true
 run_test "Bare VM: /workspace exists" test_bare_vm_workspace || true
 run_test "File upload and download" test_file_upload_download || true
