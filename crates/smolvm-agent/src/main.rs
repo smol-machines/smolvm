@@ -4155,9 +4155,9 @@ fn handle_streaming_file_read(
 
 /// Stream a tar archive of a directory directly over vsock.
 ///
-/// This deliberately runs in the agent namespace: boot-time staged mounts are
-/// visible there even when an image workload is active, and no temporary
-/// archive needs to traverse virtiofs or occupy the guest disk.
+/// Use the selected workload namespace so its mounted folders are visible;
+/// bare machines retain the agent namespace and its boot-time staged mounts.
+/// Neither path writes a temporary archive to the guest disk.
 fn handle_streaming_archive_directory(
     stream: &mut WireStream<impl ReadWrite>,
     path: &str,
@@ -4170,6 +4170,33 @@ fn handle_streaming_archive_directory(
             return Ok(());
         }
     };
+    if let nsfile::GuestNs::Container(namespace) = root.namespace() {
+        let mut archive = match namespace.archive(path) {
+            Ok(archive) => archive,
+            Err(message) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+        send_data_chunks_body(
+            stream,
+            &mut archive,
+            smolvm_protocol::LAYER_CHUNK_SIZE,
+            "failed to read container archive",
+            error_codes::FILE_IO_FAILED,
+        )?;
+        let response = match archive.finish() {
+            Ok(()) => AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+            Err(message) => AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+        };
+        return send_response(stream, &response);
+    }
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a

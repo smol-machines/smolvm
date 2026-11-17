@@ -127,6 +127,7 @@ pub fn run_helper() -> i32 {
         "list" => helper_list(&path),
         "write" => helper_write(&path, mode, uid, gid),
         "unpack-directory" => crate::directory_write::helper(&path, uid, gid),
+        "archive" => helper_archive(&path),
         "connect" => helper_connect(&path),
         "mount-cache" => helper_mount_cache(&path, &args),
         "remount-shm" => helper_remount_shm(&path, &args),
@@ -642,6 +643,21 @@ pub(crate) fn open_file_for_read(path: &Path) -> std::io::Result<std::fs::File> 
         .open(path)
 }
 
+fn helper_archive(path: &str) -> Result<(), String> {
+    if !Path::new(path).is_dir() {
+        return Err(format!("not a directory: {path}"));
+    }
+    let mut output = std::io::stdout().lock();
+    output.write_all(b"OK\n").map_err(|e| e.to_string())?;
+    output.flush().map_err(|e| e.to_string())?;
+    let mut archive = tar::Builder::new(output);
+    archive.follow_symlinks(false);
+    archive
+        .append_dir_all(".", path)
+        .map_err(|e| e.to_string())?;
+    archive.finish().map_err(|e| e.to_string())
+}
+
 fn helper_read(path: &str) -> Result<(), String> {
     let mut file = open_file_for_read(Path::new(path)).map_err(|e| format!("open {path}: {e}"))?;
     let meta = file.metadata().map_err(|e| format!("stat {path}: {e}"))?;
@@ -975,6 +991,63 @@ pub struct ContainerFile {
     pub size: u64,
     /// Payload, capped at `size` so a misbehaving helper cannot overrun.
     pub reader: std::io::Take<std::io::BufReader<std::process::ChildStdout>>,
+}
+
+/// A streaming archive helper whose lifetime follows its consumer.
+pub(crate) struct ContainerArchive {
+    child: std::process::Child,
+    reader: std::io::BufReader<std::process::ChildStdout>,
+}
+impl Read for ContainerArchive {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.reader.read(bytes)
+    }
+}
+impl ContainerArchive {
+    pub(crate) fn finish(&mut self) -> Result<(), String> {
+        let status = self.child.wait().map_err(|e| e.to_string())?;
+        if status.success() {
+            Ok(())
+        } else {
+            Err(format!("directory archive failed: {status}"))
+        }
+    }
+}
+impl Drop for ContainerArchive {
+    fn drop(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+impl ContainerNs {
+    pub(crate) fn archive(&self, path: &str) -> Result<ContainerArchive, String> {
+        let mut child = Command::new(AGENT_BINARY)
+            .args([HELPER_ARG, "archive", &self.pid.to_string(), path])
+            .stdin(Stdio::null())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn archive helper: {e}"))?;
+        let stdout = child.stdout.take().expect("piped archive");
+        let mut archive = ContainerArchive {
+            child,
+            reader: std::io::BufReader::new(stdout),
+        };
+        let mut header = String::new();
+        archive
+            .reader
+            .read_line(&mut header)
+            .map_err(|e| e.to_string())?;
+        if header.trim() != "OK" {
+            return Err(header
+                .trim()
+                .strip_prefix("ERR ")
+                .unwrap_or(header.trim())
+                .to_owned());
+        }
+        Ok(archive)
+    }
 }
 
 // Reachable only on Linux: `workload_container` yields a `ContainerNs` only

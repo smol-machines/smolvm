@@ -321,5 +321,16 @@ mod tests {
                 .unwrap(),
             bytes
         );
+        // Folder downloads must resolve through the same workload mounts as
+        // uploads and single-file reads, including an image's /workspace bind.
+        let archive = source.path().join("saved.tar");
+        client
+            .archive_directory_to_path(destination, &archive, |_| {})
+            .unwrap();
+        let saved = source.path().join("saved");
+        tar::Archive::new(std::fs::File::open(archive).unwrap())
+            .unpack(&saved)
+            .unwrap();
+        assert_eq!(std::fs::read(saved.join("file")).unwrap(), bytes);
     }
 }
