@@ -70,10 +70,10 @@ async fn read_early<R: AsyncRead + Unpin>(input: &mut R, buffered: &mut Vec<u8>)
 }
 
 #[cfg(not(unix))]
-async fn acquire(file: &std::fs::File) -> Result<()> {
+async fn acquire(file: std::fs::File) -> Result<std::fs::File> {
     loop {
         match file.try_lock() {
-            Ok(()) => return Ok(()),
+            Ok(()) => return Ok(file),
             Err(std::fs::TryLockError::WouldBlock) => {
                 tokio::time::sleep(Duration::from_millis(25)).await
             }
@@ -202,11 +202,11 @@ pub(super) async fn prepare_owned<R: AsyncRead + Unpin>(
     #[cfg(not(unix))]
     let lock = super::identity::startup_lock(machine)?;
     let mut buffered = Vec::new();
-    let locks = {
+    let _locks = {
         #[cfg(unix)]
         let locked = operation_locks(machine);
         #[cfg(not(unix))]
-        let locked = acquire(&lock);
+        let locked = acquire(lock);
         tokio::pin!(locked);
         loop {
             tokio::select! {
@@ -234,9 +234,7 @@ pub(super) async fn prepare_owned<R: AsyncRead + Unpin>(
         .stdout(Stdio::null())
         .stderr(Stdio::inherit());
     #[cfg(unix)]
-    crate::agent::fork::inherit_operation_locks(command.as_std_mut(), &[&locks.0, &locks.1])?;
-    #[cfg(not(unix))]
-    let _ = locks;
+    crate::agent::fork::inherit_operation_locks(command.as_std_mut(), &[&_locks.0, &_locks.1])?;
     // Keep the locks until wait_start has cleaned up every unfinished boot.
     wait_start(
         command,

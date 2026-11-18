@@ -62,12 +62,14 @@ fn directory(machine: &str, create: bool) -> Result<PathBuf> {
     let root = crate::agent::vm_data_dir(machine).join("ssh");
     if create {
         fs::create_dir_all(root.parent().context("missing machine directory")?)?;
-        let mut builder = fs::DirBuilder::new();
+        let builder = fs::DirBuilder::new();
         #[cfg(unix)]
-        {
+        let builder = {
             use std::os::unix::fs::DirBuilderExt;
+            let mut builder = builder;
             builder.mode(0o700);
-        }
+            builder
+        };
         match builder.create(&root) {
             Ok(()) => (),
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => (),
