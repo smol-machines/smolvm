@@ -31,6 +31,14 @@ fn materialized_record(store: &Path, id: &str) -> PathBuf {
     store.join("materialized").join(id)
 }
 
+/// Materialized trees a restore can build over, whatever their lineage.
+fn restore_bases(store: &Path) -> PathBuf {
+    store.join("restore-bases")
+}
+
+/// How many trees [`restore_bases`] keeps; each costs a copy of its index.
+const RESTORE_BASES_KEPT: usize = 128;
+
 fn io(context: &'static str) -> impl Fn(std::io::Error) -> Error {
     move |error| Error::agent(context, error.to_string())
 }
@@ -393,6 +401,23 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             .map_err(io("read checkpoint lineage"))?
             .and_then(|record| record.parent);
     }
+    // Without a held ancestor, the tree that shares the most chunks: a
+    // branch of the same machine shares nearly all of its disks.
+    let mut similarity = None;
+    if base_tree.is_none() {
+        match store::closest_base(
+            &restore_bases(&store),
+            &imported.directory,
+            smolvm_pack::extract::is_extracted,
+        ) {
+            Ok(Some((entry, tree, score))) => {
+                base_tree = Some((entry, tree));
+                similarity = Some(score);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not look for a restore base"),
+        }
+    }
     let partial = shared_root.join(format!(
         ".{:08x}-materialize-{}",
         footer.checksum,
@@ -403,12 +428,22 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     // RAM written below reaches the disk later, as for a deferred extraction.
     smolvm_pack::extract::mark_unsynced(&smolvm_pack::extract::unsynced_marker_path(&shared))
         .map_err(io("mark checkpoint memory unsynced"))?;
-    let stats = store::materialize_over(
+    let materialized = store::materialize_over(
         &imported.directory,
         &partial,
         base_tree.as_ref().map(|(s, t)| (s.as_path(), t.as_path())),
-    )
-    .map_err(|error| {
+    );
+    // A base is only a shortcut: if it fails, build the tree from the objects.
+    let materialized = match materialized {
+        Err(error) if base_tree.is_some() => {
+            tracing::warn!(%error, "building over a restore base failed; materializing in full");
+            let _ = std::fs::remove_dir_all(&partial);
+            base_tree = None;
+            store::materialize_over(&imported.directory, &partial, None)
+        }
+        other => other,
+    };
+    let stats = materialized.map_err(|error| {
         let _ = std::fs::remove_dir_all(&partial);
         Error::agent("materialize checkpoint", error.to_string())
     })?;
@@ -433,12 +468,21 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         let _ = std::fs::create_dir_all(parent);
     }
     let _ = std::fs::write(&record, shared.to_string_lossy().as_bytes());
+    if let Err(error) = store::remember_base(
+        &restore_bases(&store),
+        &imported.directory,
+        &shared,
+        RESTORE_BASES_KEPT,
+    ) {
+        tracing::warn!(%error, "could not keep the restored tree as a base");
+    }
     tracing::info!(
         id = %imported.id,
         delta_base = ?imported.base,
         already_held = imported.already_held,
         base_objects = imported.base_objects,
         materialize_base = ?base_tree.as_ref().map(|(_, tree)| tree.display().to_string()),
+        base_similarity = ?similarity,
         linked_files = stats.linked_files,
         linked_bytes = stats.linked_bytes,
         copied_chunks = stats.copied_chunks,
