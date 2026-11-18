@@ -126,6 +126,7 @@ use state::ApiState;
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
         handlers::machines::put_credential_values,
+        handlers::machines::put_credential_bindings,
         handlers::machines::export_machine,
         // Pools
         handlers::pools::create_pool,
@@ -174,6 +175,8 @@ use state::ApiState;
         types::PublishCacheDiskResponse,
         types::UpdateEgressRequest,
         types::CredentialValuesRequest,
+        types::CredentialBindingsRequest,
+        types::CredentialBindingsResponse,
         types::ForkRequest,
         types::ForkReleaseRequest,
         types::ExportRequest,
@@ -423,6 +426,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
+        )
+        .route(
+            "/{id}/credential-bindings",
+            put(handlers::machines::put_credential_bindings),
         )
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))

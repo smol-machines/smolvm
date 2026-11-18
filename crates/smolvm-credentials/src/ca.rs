@@ -23,6 +23,9 @@ const CA_KEY_FILE: &str = "ca.key";
 /// Machine name the CA was generated for. Part of its subject, so a CA that
 /// moves to another machine (a restored checkpoint) still signs as itself.
 const CA_NAME_FILE: &str = "ca.name";
+/// The hosts the CA's name constraint permits, one per line. A CA saved before this file existed permits the hosts
+/// of the policy its machine booted with ([`MachineCa::with_permitted`]).
+const CA_HOSTS_FILE: &str = "ca.hosts";
 /// Subdirectory holding only what the guest may see. Mount this, never the
 /// directory that also holds the signing key.
 pub const GUEST_SUBDIR: &str = "guest";
@@ -39,6 +42,8 @@ pub struct MachineCa {
     /// parsed, which is all signing a leaf needs.
     issuer: Certificate,
     key: KeyPair,
+    /// The DNS subtrees its name constraint permits.
+    permitted: Vec<String>,
 }
 
 fn ca_params(machine: &str) -> CertificateParams {
@@ -82,6 +87,7 @@ impl MachineCa {
             cert_der: cert.der().clone(),
             issuer: cert,
             key,
+            permitted: permitted_hosts.to_vec(),
         })
     }
 
@@ -94,6 +100,7 @@ impl MachineCa {
         std::fs::write(dir.join(GUEST_CA_FILE), &self.cert_pem)?;
         std::fs::write(guest.join(GUEST_CA_FILE), &self.cert_pem)?;
         std::fs::write(dir.join(CA_NAME_FILE), &self.name)?;
+        std::fs::write(dir.join(CA_HOSTS_FILE), self.permitted.join("\n"))?;
         let key_path = dir.join(CA_KEY_FILE);
         std::fs::write(&key_path, Zeroizing::new(self.key.serialize_pem()))?;
         #[cfg(unix)]
@@ -123,13 +130,34 @@ impl MachineCa {
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
+        let permitted = std::fs::read_to_string(dir.join(CA_HOSTS_FILE))
+            .map(|hosts| {
+                hosts
+                    .lines()
+                    .map(str::trim)
+                    .filter(|h| !h.is_empty())
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             name,
             cert_pem,
             cert_der,
             issuer,
             key,
+            permitted,
         })
+    }
+
+    /// Record the hosts a CA saved in `dir` permits, when it was saved before they were recorded. Called with the
+    /// bindings it was generated for, before they change, so a later policy is never mistaken for what it permits.
+    pub fn record_permitted_if_missing(dir: &Path, hosts: &[String]) -> Result<()> {
+        let path = dir.join(CA_HOSTS_FILE);
+        if Self::exists(dir) && !path.exists() {
+            std::fs::write(&path, hosts.join("\n"))?;
+        }
+        Ok(())
     }
 
     /// Whether `dir` already holds a saved CA.
@@ -152,6 +180,7 @@ impl MachineCa {
             serde_json::json!({
                 "name": self.name,
                 "certificate": self.cert_pem,
+                "permitted": self.permitted,
                 "key": *Zeroizing::new(self.key.serialize_pem()),
             })
             .to_string(),
@@ -175,12 +204,44 @@ impl MachineCa {
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
+        let permitted = value
+            .get("permitted")
+            .and_then(serde_json::Value::as_array)
+            .map(|hosts| {
+                hosts
+                    .iter()
+                    .filter_map(|h| h.as_str().map(str::to_string))
+                    .collect()
+            })
+            .unwrap_or_default();
         Ok(Self {
             name,
             cert_pem,
             cert_der,
             issuer,
             key,
+            permitted,
+        })
+    }
+
+    /// The hosts it permits, for a CA saved before they were recorded: those its machine's boot policy bound, which
+    /// are the hosts it was generated for.
+    pub fn with_permitted(mut self, hosts: impl IntoIterator<Item = String>) -> Self {
+        if self.permitted.is_empty() {
+            self.permitted = hosts.into_iter().collect();
+        }
+        self
+    }
+
+    /// Whether its name constraint lets it sign a leaf for `host`: the host is a permitted subtree or inside one.
+    pub fn permits(&self, host: &str) -> bool {
+        let host = host.trim_end_matches('.').to_ascii_lowercase();
+        self.permitted.iter().any(|p| {
+            let p = p
+                .trim_start_matches("*.")
+                .trim_end_matches('.')
+                .to_ascii_lowercase();
+            host == p || host.ends_with(&format!(".{p}"))
         })
     }
 

@@ -689,6 +689,38 @@ fn published_set(
     mappings
 }
 
+/// Hand a running machine its new credential bindings ([`crate::credentials::plan_binding_change`]): from its next
+/// request an added binding is substituted and a removed one is not. When the plan added a CA for a new host, the
+/// guest is asked to rebuild its trust too; a guest whose agent predates that refuses, and the host stays
+/// unreachable until the machine restarts (its other bindings change anyway).
+pub fn apply_live_credential_bindings(
+    name: &str,
+    change: &crate::credentials::BindingChange,
+) -> Result<()> {
+    let request = serde_json::json!({
+        "bindings": { "policy": change.policy, "placeholders": change.placeholders }
+    })
+    .to_string();
+    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
+        Error::config(
+            "credentials",
+            format!("could not hand machine '{name}' its new credential bindings while it runs: {reason}"),
+        )
+    })?;
+    if change.trust_changed {
+        AgentManager::for_vm(name)
+            .and_then(|manager| crate::agent::AgentClient::connect(manager.vsock_socket()))
+            .and_then(|mut client| client.refresh_credential_trust())
+            .map_err(|e| {
+                Error::config(
+                    "credentials",
+                    format!("machine '{name}' has its new bindings, but its guest could not trust the new host yet: {e}"),
+                )
+            })?;
+    }
+    Ok(())
+}
+
 /// Hand running machine `name` new values for its credential bindings, by
 /// binding name: its next request to a bound host uses them.
 pub fn apply_live_credential_values(

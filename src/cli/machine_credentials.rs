@@ -20,6 +20,106 @@ pub enum CredentialsSub {
     /// Hand a running machine the current values of its credential bindings, read now from this
     /// shell's environment (each binding's ENV_VAR), without restarting it
     Refresh(RefreshCmd),
+
+    /// Add credential bindings to a machine, live when it runs: each value is read now from this shell
+    Add(AddCmd),
+
+    /// Remove credential bindings from a machine, live when it runs
+    Remove(RemoveCmd),
+}
+
+#[derive(Args, Debug)]
+pub struct AddCmd {
+    /// Machine to change (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// A binding to add, as on `machine create`: NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER]. A binding of
+    /// the same name is replaced.
+    #[arg(long = "credential", value_name = "SPEC", required = true)]
+    pub credentials: Vec<String>,
+}
+
+#[derive(Args, Debug)]
+pub struct RemoveCmd {
+    /// Machine to change (default: "default")
+    #[arg(short = 'n', long, value_name = "NAME", env = smolvm::data::consts::ENV_SMOLVM_MACHINE_NAME)]
+    pub name: Option<String>,
+
+    /// Bindings to remove
+    #[arg(value_name = "BINDING", required = true)]
+    pub bindings: Vec<String>,
+}
+
+/// Say what a bindings change did.
+fn report(name: &str, set: &smolvm::credentials::BindingsSet) {
+    if set.live {
+        eprintln!("machine '{name}' uses its new credential bindings from its next request");
+    } else if set.at_next_start {
+        eprintln!(
+            "machine '{name}' booted without credential bindings: they apply from its next start"
+        );
+    } else {
+        eprintln!("machine '{name}' uses its new credential bindings from its next start");
+    }
+}
+
+impl AddCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+        let record = smolvm::db::SmolvmDb::open()?
+            .get_vm(&name)?
+            .ok_or_else(|| {
+                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
+            })?;
+        let mut policy = record.credential_policy.clone().unwrap_or_default();
+        let mut added = Vec::new();
+        for spec in &self.credentials {
+            let binding = smolvm::credentials::parse_credential_flag(spec)
+                .map_err(|why| smolvm::Error::config("credentials", why))?;
+            policy.credentials.retain(|b| b.name != binding.name);
+            added.push((binding.name.clone(), binding.environment_variable.clone()));
+            policy.credentials.push(binding);
+        }
+        // read before anything changes, so an unset variable changes nothing
+        let names: Vec<String> = added.iter().map(|(n, _)| n.clone()).collect();
+        let values = refresh_values(&added, &names, |var| std::env::var(var).ok())
+            .map_err(|why| smolvm::Error::config("credentials", why))?;
+        let set = smolvm::credentials::set_bindings(&name, policy)?;
+        if set.live && !record.credentials_supplied_by_api {
+            smolvm::agent::apply_live_credential_values(&name, &values)?;
+        }
+        report(&name, &set);
+        Ok(())
+    }
+}
+
+impl RemoveCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let name = self.name.unwrap_or_else(|| "default".to_string());
+        let record = smolvm::db::SmolvmDb::open()?
+            .get_vm(&name)?
+            .ok_or_else(|| {
+                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
+            })?;
+        let mut policy = record.credential_policy.clone().unwrap_or_default();
+        if let Some(unknown) = self
+            .bindings
+            .iter()
+            .find(|b| !policy.credentials.iter().any(|c| &c.name == *b))
+        {
+            return Err(smolvm::Error::config(
+                "credentials",
+                format!("no credential binding '{unknown}'"),
+            ));
+        }
+        policy
+            .credentials
+            .retain(|b| !self.bindings.contains(&b.name));
+        let set = smolvm::credentials::set_bindings(&name, policy)?;
+        report(&name, &set);
+        Ok(())
+    }
 }
 
 #[derive(Args, Debug)]
@@ -37,6 +137,8 @@ impl CredentialsCmd {
     pub fn run(self) -> smolvm::Result<()> {
         match self.cmd {
             CredentialsSub::Refresh(cmd) => cmd.run(),
+            CredentialsSub::Add(cmd) => cmd.run(),
+            CredentialsSub::Remove(cmd) => cmd.run(),
         }
     }
 }

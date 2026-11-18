@@ -1625,6 +1625,26 @@ impl ExternalInterceptorSpec {
         })
     }
 }
+/// Request to replace a machine's credential bindings (`PUT /api/v1/machines/{name}/credential-bindings`).
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct CredentialBindingsRequest {
+    /// The machine's bindings after the change: kept ones keep their placeholders, added ones get new ones, and any
+    /// left out are removed.
+    #[schema(value_type = Vec<Object>)]
+    pub credentials: Vec<smolvm_protocol::credentials::CredentialBinding>,
+}
+
+/// What a bindings change did.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialBindingsResponse {
+    /// The machine's binding names now.
+    pub bindings: Vec<String>,
+    /// The running machine uses them from its next request.
+    pub live: bool,
+    /// The machine runs but booted without bindings: they apply from its next start.
+    pub at_next_start: bool,
+}
 
 /// Values for a machine's credential bindings, by binding name.
 ///

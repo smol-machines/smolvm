@@ -38,6 +38,169 @@ type LiveValues = Arc<Mutex<BTreeMap<String, zeroize::Zeroizing<String>>>>;
 /// credential CA.
 pub const CA_DIR_NAME: &str = "credentials";
 
+/// Subdirectory of a CA directory holding the CAs added for hosts the machine CA does not permit, one per directory
+/// (`0`, `1`, …), each name-constrained to the hosts it was added for.
+const EXTRA_CA_DIR: &str = "extra";
+
+/// The DNS subtrees `policy`'s bindings need a CA to permit, as the machine CA is generated for.
+fn binding_subtrees(policy: &CredentialPolicy) -> Vec<String> {
+    policy
+        .credentials
+        .iter()
+        .flat_map(|binding| binding.allowed_hosts.iter())
+        .map(|host| smolvm_protocol::credentials::host_subtree(host).to_string())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect()
+}
+
+/// The CAs added to `ca_dir` for hosts its machine CA does not permit, oldest first.
+pub fn load_extra_cas(ca_dir: &Path, owner: &str) -> Vec<MachineCa> {
+    let mut dirs: Vec<(u32, PathBuf)> = std::fs::read_dir(ca_dir.join(EXTRA_CA_DIR))
+        .into_iter()
+        .flatten()
+        .flatten()
+        .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
+        .collect();
+    dirs.sort();
+    dirs.into_iter()
+        .filter_map(|(_, dir)| MachineCa::load(&dir, owner).ok())
+        .collect()
+}
+
+/// Make every host `policy` binds signable by a CA the guest trusts: a host no CA in `ca_dir` permits gets a new CA
+/// of its own, name-constrained to just the uncovered hosts (the machine CA's constraint is never widened), and the
+/// guest's `ca.pem` becomes the machine CA followed by every added one. A machine CA saved before it recorded its
+/// hosts permits the hosts `generated_for` binds. True when a CA was added, so a running guest must rebuild its trust.
+pub fn ensure_cas_for(
+    ca_dir: &Path,
+    owner: &str,
+    policy: &CredentialPolicy,
+    generated_for: &CredentialPolicy,
+) -> Result<bool> {
+    if !MachineCa::exists(ca_dir) {
+        return Ok(false);
+    }
+    fn ca_err(e: impl std::fmt::Display) -> Error {
+        Error::config("credentials", format!("machine CA: {e:#}"))
+    }
+    MachineCa::record_permitted_if_missing(ca_dir, &binding_subtrees(generated_for))
+        .map_err(ca_err)?;
+    let primary = MachineCa::load(ca_dir, owner).map_err(ca_err)?;
+    let mut extras = load_extra_cas(ca_dir, owner);
+    let uncovered: Vec<String> = binding_subtrees(policy)
+        .into_iter()
+        .filter(|host| !primary.permits(host) && !extras.iter().any(|ca| ca.permits(host)))
+        .collect();
+    let added = !uncovered.is_empty();
+    if added {
+        let ca = MachineCa::generate(owner, &uncovered).map_err(ca_err)?;
+        let dir = ca_dir.join(EXTRA_CA_DIR).join(extras.len().to_string());
+        ca.save(&dir).map_err(ca_err)?;
+        extras.push(ca);
+    }
+    if !extras.is_empty() {
+        let mut bundle = primary.certificate_pem().to_string();
+        for ca in &extras {
+            if !bundle.ends_with('\n') {
+                bundle.push('\n');
+            }
+            bundle.push_str(ca.certificate_pem());
+        }
+        // in place: the guest reads it through its read-only mount
+        std::fs::write(
+            MachineCa::guest_dir(ca_dir).join(smolvm_credentials::ca::GUEST_CA_FILE),
+            bundle,
+        )
+        .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))?;
+    }
+    Ok(added)
+}
+
+/// A machine's credential bindings after a change ([`plan_binding_change`]).
+pub struct BindingChange {
+    /// The bindings after the change.
+    pub policy: CredentialPolicy,
+    /// Binding name → placeholder: those of kept bindings unchanged, a new one for each added binding.
+    pub placeholders: BTreeMap<String, String>,
+    /// A CA was added for a new host: a running guest must rebuild its trust before it reaches that host.
+    pub trust_changed: bool,
+}
+
+/// Plan replacing `record`'s bindings with `policy`: validated against the machine's DNS allow-list as at create,
+/// placeholders kept for bindings that stay (the guest already holds them) and minted for added ones, and a CA added
+/// for any host no CA of the machine's lineage permits. Writes CA files only; the caller persists the record and
+/// hands a running machine the change.
+pub fn plan_binding_change(
+    machine: &str,
+    record: &VmRecord,
+    policy: CredentialPolicy,
+) -> Result<BindingChange> {
+    policy
+        .validate(record.dns_filter_hosts.as_deref())
+        .map_err(|e| Error::config("credentials", e.to_string()))?;
+    let minted = smolvm_credentials::generate_placeholders(&policy);
+    let placeholders: BTreeMap<String, String> = policy
+        .credentials
+        .iter()
+        .filter_map(|b| {
+            let kept = record.credential_placeholders.get(&b.name).cloned();
+            kept.or_else(|| minted.get(&b.name).cloned())
+                .map(|p| (b.name.clone(), p))
+        })
+        .collect();
+    let owner = record.golden.as_deref().unwrap_or(machine);
+    let before = record.credential_policy.clone().unwrap_or_default();
+    let trust_changed = ensure_cas_for(&ca_dir(owner), owner, &policy, &before)?;
+    Ok(BindingChange {
+        policy,
+        placeholders,
+        trust_changed,
+    })
+}
+
+/// What [`set_bindings`] did.
+pub struct BindingsSet {
+    /// The record as saved, with the new bindings.
+    pub record: VmRecord,
+    /// The running machine took them at once (it booted with bindings, so its interceptor runs).
+    pub live: bool,
+    /// The machine runs but booted without bindings: they apply from its next start.
+    pub at_next_start: bool,
+}
+
+/// Replace `name`'s credential bindings with `policy` ([`plan_binding_change`]), saved for its next start and handed
+/// at once to the machine when it runs. A machine that booted without bindings runs no interceptor, so it takes them
+/// from its next start. An added binding resolves from its variable, or from a value handed over after it
+/// (`machine credentials refresh`, `PUT …/credential-values`).
+pub fn set_bindings(name: &str, policy: CredentialPolicy) -> Result<BindingsSet> {
+    let db = crate::db::SmolvmDb::open()?;
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    let change = plan_binding_change(name, &record, policy)?;
+    let saved = db
+        .update_vm_durable(name, |r| {
+            r.credential_policy = (!change.policy.is_empty()).then(|| change.policy.clone());
+            r.credential_placeholders = change.placeholders.clone();
+        })?
+        .ok_or_else(|| Error::vm_not_found(name))?;
+    let running = crate::agent::state_probe::resolve_state(name, &saved)
+        == crate::config::RecordState::Running;
+    // whether its interceptor runs, not whether the record has bindings now: removing a machine's last binding leaves
+    // the interceptor serving, and adding one back must reach it
+    let interceptor = crate::agent::vm_data_dir(name)
+        .join(CREDENTIALS_SOCKET)
+        .exists();
+    let live = running && interceptor;
+    if live {
+        crate::agent::apply_live_credential_bindings(name, &change)?;
+    }
+    Ok(BindingsSet {
+        record: saved,
+        live,
+        at_next_start: running && !interceptor,
+    })
+}
+
 /// Per-machine directory holding the credential CA (`ca.key` + `guest/ca.pem`).
 pub fn ca_dir(machine: &str) -> PathBuf {
     crate::agent::vm_data_dir(machine).join(CA_DIR_NAME)
@@ -192,7 +355,9 @@ impl CredentialLaunch {
     /// guest CA directory is mounted.
     pub fn ensure_ca(&self) -> Result<()> {
         if MachineCa::exists(&self.ca_dir) {
-            return Ok(());
+            // a binding changed while the machine was stopped may name a host no CA permits yet
+            return ensure_cas_for(&self.ca_dir, &self.ca_owner, &self.policy, &self.policy)
+                .map(|_| ());
         }
         // A wildcard's parent is the subtree the CA may sign in; the name
         // constraint on it already covers every subdomain.
@@ -226,25 +391,39 @@ impl CredentialLaunch {
     /// data directory, it also serves [`CREDENTIALS_SOCKET`] there.
     pub fn start_interceptor(&self, vm_dir: Option<&Path>) -> Result<Interceptor> {
         let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
-            .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?;
+            .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?
+            .with_permitted(binding_subtrees(&self.policy));
         let live = LiveValues::default();
-        if let Some(dir) = vm_dir {
-            serve_live_values(dir, &self.policy, live.clone());
-        }
-        Interceptor::spawn(
+        let sources = Arc::new(std::sync::RwLock::new(self.sources.clone()));
+        let interceptor = Interceptor::spawn(
             InterceptorConfig {
                 machine: self.machine.clone(),
                 policy: self.policy.clone(),
                 placeholders: self.placeholders.clone(),
                 ca,
+                extra_cas: load_extra_cas(&self.ca_dir, &self.ca_owner),
                 upstream_roots_pem: Vec::new(),
             },
             Arc::new(SecretRefResolver {
-                sources: self.sources.clone(),
-                live,
+                sources: sources.clone(),
+                live: live.clone(),
             }),
         )
-        .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))
+        .map_err(|e| Error::config("credentials", format!("start interceptor: {e:#}")))?;
+        if let Some(dir) = vm_dir {
+            serve_live_values(
+                dir,
+                &self.policy,
+                live,
+                Some(LiveBindings {
+                    control: interceptor.control(),
+                    sources,
+                    ca_dir: self.ca_dir.clone(),
+                    ca_owner: self.ca_owner.clone(),
+                }),
+            );
+        }
+        Ok(interceptor)
     }
 }
 
@@ -308,18 +487,43 @@ impl CredentialLaunch {
     }
 }
 
+/// What a bindings change reaches in the machine's process: the interceptor, the sources its resolver reads, and the
+/// CA directory the caller added a CA to.
+struct LiveBindings {
+    control: smolvm_credentials::InterceptorControl,
+    sources: Arc<std::sync::RwLock<BTreeMap<String, SecretRef>>>,
+    ca_dir: PathBuf,
+    ca_owner: String,
+}
+
 /// Serve [`CREDENTIALS_SOCKET`] in `vm_dir`: each connection sends
-/// `{"values":{"<binding>":"<value>",…}}` and gets back `ok` or `error:
-/// <reason>`. The values replace those the machine resolves for the bindings
-/// named, from its next request on; a name that is not a binding changes
-/// nothing.
-fn serve_live_values(vm_dir: &Path, policy: &CredentialPolicy, live: LiveValues) {
+/// `{"values":{"<binding>":"<value>",…}}` or `{"bindings":{"policy":…,"placeholders":…}}` and gets back `ok` or
+/// `error: <reason>`. Values replace those the machine resolves for the bindings named, from its next request on; a
+/// name that is not a binding changes nothing. Bindings replace the machine's bindings: an added one resolves from
+/// its variable (or a value handed over after it), a removed one is no longer intercepted and its values are
+/// dropped, and a CA the caller added for a new host signs that host from the next connection.
+fn serve_live_values(
+    vm_dir: &Path,
+    policy: &CredentialPolicy,
+    live: LiveValues,
+    change: Option<LiveBindings>,
+) {
+    #[derive(Deserialize)]
+    struct Bindings {
+        policy: CredentialPolicy,
+        placeholders: BTreeMap<String, String>,
+    }
     #[derive(Deserialize)]
     #[serde(deny_unknown_fields)]
     struct Request {
+        #[serde(default)]
         values: BTreeMap<String, String>,
+        #[serde(default)]
+        bindings: Option<Bindings>,
     }
-    let bindings: Vec<String> = policy.credentials.iter().map(|b| b.name.clone()).collect();
+    let bindings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(
+        policy.credentials.iter().map(|b| b.name.clone()).collect(),
+    ));
     let path = vm_dir.join(CREDENTIALS_SOCKET);
     let _ = std::fs::remove_file(&path);
     crate::network::launch::serve_control_socket(
@@ -329,8 +533,42 @@ fn serve_live_values(vm_dir: &Path, policy: &CredentialPolicy, live: LiveValues)
         move |request| {
             let request: Request =
                 serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
-            if let Some(unknown) = request.values.keys().find(|k| !bindings.contains(k)) {
+            if let Some(next) = request.bindings {
+                let Some(change) = change.as_ref() else {
+                    return Err("this machine cannot change its bindings while it runs".to_string());
+                };
+                let names: Vec<String> = next
+                    .policy
+                    .credentials
+                    .iter()
+                    .map(|b| b.name.clone())
+                    .collect();
+                {
+                    let mut sources = change.sources.write().unwrap_or_else(|e| e.into_inner());
+                    sources.retain(|name, _| names.contains(name));
+                    for b in &next.policy.credentials {
+                        sources.entry(b.name.clone()).or_insert_with(|| {
+                            crate::secrets::env_ref(b.environment_variable.clone())
+                        });
+                    }
+                }
+                live.lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .retain(|name, _| names.contains(name));
+                change.control.update(
+                    next.policy,
+                    next.placeholders,
+                    load_extra_cas(&change.ca_dir, &change.ca_owner),
+                );
+                *bindings.lock().unwrap_or_else(|e| e.into_inner()) = names.clone();
+                tracing::info!(bindings = ?names, "credential bindings replaced");
+            }
+            let known = bindings.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            if let Some(unknown) = request.values.keys().find(|k| !known.contains(k)) {
                 return Err(format!("no credential binding '{unknown}'"));
+            }
+            if request.values.is_empty() {
+                return Ok(());
             }
             let names: Vec<String> = request.values.keys().cloned().collect();
             live.lock().unwrap_or_else(|e| e.into_inner()).extend(
@@ -350,7 +588,7 @@ fn serve_live_values(vm_dir: &Path, policy: &CredentialPolicy, live: LiveValues)
 /// rotated file or variable takes effect on the next request. A value handed
 /// to the running machine through [`CREDENTIALS_SOCKET`] takes precedence.
 struct SecretRefResolver {
-    sources: BTreeMap<String, SecretRef>,
+    sources: Arc<std::sync::RwLock<BTreeMap<String, SecretRef>>>,
     live: LiveValues,
 }
 
@@ -369,11 +607,14 @@ impl CredentialResolver for SecretRefResolver {
         }
         let source = self
             .sources
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
             .get(&request.binding)
+            .cloned()
             .ok_or(ResolveError::Unknown)?;
         crate::secrets::resolve_secret_ref_classified(
             &request.binding,
-            source,
+            &source,
             crate::secrets::ResolutionScope::RecordReplay,
         )
         .map_err(|failure| ResolveError::Unavailable(failure.as_str().to_string()))
@@ -450,6 +691,99 @@ pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBindin
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn binding(name: &str, host: &str) -> CredentialBinding {
+        CredentialBinding {
+            name: name.into(),
+            environment_variable: format!("{}_KEY", name.to_uppercase()),
+            allowed_hosts: vec![host.into()],
+            injection_location: Default::default(),
+            methods: smolvm_credentials::policy::DEFAULT_METHODS
+                .iter()
+                .map(|m| m.to_string())
+                .collect(),
+            set_header: None,
+        }
+    }
+
+    /// A binding for a host no CA permits gets a CA of its own (the machine CA is never widened), a binding inside a
+    /// permitted host needs none, and the guest's CA file holds every CA.
+    #[test]
+    fn a_new_host_gets_a_ca_of_its_own_and_a_covered_one_none() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CredentialPolicy {
+            credentials: vec![binding("notion", "api.notion.com")],
+        };
+        MachineCa::generate("m", &binding_subtrees(&first))
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+        let guest = MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
+        let certs = |p: &Path| {
+            std::fs::read_to_string(p)
+                .unwrap()
+                .matches("BEGIN CERTIFICATE")
+                .count()
+        };
+        assert!(
+            !ensure_cas_for(dir.path(), "m", &first, &first).unwrap(),
+            "nothing new"
+        );
+        let grown = CredentialPolicy {
+            credentials: vec![
+                binding("notion", "api.notion.com"),
+                binding("gh", "api.github.com"),
+            ],
+        };
+        assert!(
+            ensure_cas_for(dir.path(), "m", &grown, &first).unwrap(),
+            "a CA for api.github.com"
+        );
+        assert_eq!(load_extra_cas(dir.path(), "m").len(), 1);
+        assert_eq!(certs(&guest), 2);
+        let extra = &load_extra_cas(dir.path(), "m")[0];
+        assert!(
+            extra.permits("api.github.com") && !extra.permits("api.notion.com"),
+            "constrained to the new host only"
+        );
+        let primary = MachineCa::load(dir.path(), "m").unwrap();
+        assert!(
+            !primary.permits("api.github.com"),
+            "the machine CA is not widened"
+        );
+        assert!(
+            !ensure_cas_for(dir.path(), "m", &grown, &first).unwrap(),
+            "covered now: no second CA"
+        );
+        assert_eq!(load_extra_cas(dir.path(), "m").len(), 1);
+    }
+
+    /// A CA saved before it recorded its hosts permits those it was generated for, not those a later policy names.
+    #[test]
+    fn a_ca_saved_before_hosts_were_recorded_permits_its_first_policy_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = CredentialPolicy {
+            credentials: vec![binding("notion", "api.notion.com")],
+        };
+        MachineCa::generate("m", &binding_subtrees(&first))
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+        std::fs::remove_file(dir.path().join("ca.hosts")).unwrap();
+        let grown = CredentialPolicy {
+            credentials: vec![
+                binding("notion", "api.notion.com"),
+                binding("gh", "api.github.com"),
+            ],
+        };
+        assert!(
+            ensure_cas_for(dir.path(), "m", &grown, &first).unwrap(),
+            "api.github.com is new to it"
+        );
+        assert!(MachineCa::load(dir.path(), "m")
+            .unwrap()
+            .permits("api.notion.com"));
+    }
 
     #[test]
     fn credential_flag_parses_name_variable_and_hosts() {
@@ -533,9 +867,11 @@ mod tests {
             credentials: vec![parse_credential_flag("github=GH_TOKEN@github.com").unwrap()],
         };
         let live = LiveValues::default();
-        serve_live_values(dir.path(), &policy, live.clone());
+        serve_live_values(dir.path(), &policy, live.clone(), None);
         let resolver = SecretRefResolver {
-            sources: [("github".into(), crate::secrets::file_ref(path))].into(),
+            sources: Arc::new(std::sync::RwLock::new(
+                [("github".into(), crate::secrets::file_ref(path))].into(),
+            )),
             live,
         };
         let request = CredentialRequest {
@@ -575,7 +911,7 @@ mod tests {
         let path = dir.path().join("refresh-token");
         let source = crate::secrets::file_ref(path.clone());
         let resolver = SecretRefResolver {
-            sources: [("refresh".into(), source)].into(),
+            sources: Arc::new(std::sync::RwLock::new([("refresh".into(), source)].into())),
             live: LiveValues::default(),
         };
         let request = CredentialRequest {
