@@ -37,13 +37,19 @@ pub fn handle_container_start(
             return Ok(());
         }
     };
-    crate::send_response(stream, &AgentResponse::Started)?;
-
     let oom_before = oom_kills();
-    let result = match started.pty.take() {
-        Some(pty) => crate::run_interactive_loop_pty(stream, &mut started.child, pty, None),
-        None => crate::run_interactive_loop(stream, &mut started.child, None),
-    };
+    let result = (|| {
+        crate::send_response(stream, &AgentResponse::Started)?;
+        match started.pty.take() {
+            Some(pty) => crate::run_interactive_loop_pty(stream, &mut started.child, pty, None),
+            None => crate::run_interactive_loop(stream, &mut started.child, None),
+        }
+    })();
+    if result.is_err() {
+        // Also cover a failed Started write: the spawned init must never
+        // survive an owner which could not establish or service its I/O.
+        crate::process::kill_child_tree(&mut started.child);
+    }
     // The container is gone however the loop ended (exit, or the host went
     // away and the loop killed it); clear its runtime state so the overlay's
     // next start or exec does not find a dead main container.

@@ -11,7 +11,7 @@ use serde::{Deserialize, Serialize};
 use super::filters::Filters;
 use super::images::ImageRecord;
 use super::model::{ContainerConfig, CreateRequest, HealthConfig, HostConfig};
-use super::runtime::{Exit, Input, InputQueue, Output};
+use super::runtime::{Exit, InputQueue, Output};
 use super::util::{ApiError, ApiResult};
 use super::Engine;
 
@@ -176,6 +176,9 @@ pub(crate) struct ContainerRecord {
     pub args: Vec<String>,
     pub state: StateRecord,
     pub restart_count: u32,
+    /// Monotonic host start order; raw VM checkpoints do not roll it back.
+    #[serde(default)]
+    pub execution_generation: u64,
     pub ports: Vec<PublishedPort>,
     pub mounts: Vec<MountRecord>,
     /// Stopped by a user, so `unless-stopped` and `always` keep it down.
@@ -222,7 +225,7 @@ impl ContainerRecord {
     /// The share a local image archive is added to the host container's
     /// machine under, for a container that runs there.
     fn guest_image_share(&self) -> String {
-        format!("g{}img", &self.id[..12])
+        super::image_share::name(&self.pull_ref)
     }
 
     /// Where the image's layers come from in the machine the container runs
@@ -352,6 +355,23 @@ impl Container {
         if let Err(e) = engine.store.save_container(&record) {
             tracing::warn!(container = %record.id, error = %e, "could not save container record");
         }
+    }
+
+    fn reserve_execution_generation(&self, engine: &Engine) -> ApiResult<u64> {
+        let mut record = self.record.lock();
+        let mut updated = record.clone();
+        updated.execution_generation = updated
+            .execution_generation
+            .checked_add(1)
+            .ok_or_else(|| ApiError::internal("container execution generation exhausted"))?;
+        // Refuse the start if its lineage cannot be persisted. A failed attempt
+        // may consume a generation, but must never reuse one for a new process.
+        engine
+            .store
+            .save_container(&updated)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        *record = updated;
+        Ok(record.execution_generation)
     }
 
     pub(crate) fn subscribe_exits(&self) -> tokio::sync::watch::Receiver<ExitState> {
@@ -554,6 +574,7 @@ pub(crate) async fn create(
         args,
         state: StateRecord::default(),
         restart_count: 0,
+        execution_generation: 0,
         ports,
         mounts,
         user_stopped: false,
@@ -1268,6 +1289,7 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
     if record.state.status == "removing" {
         return Err(ApiError::conflict("container is being removed"));
     }
+    let execution_generation = c.reserve_execution_generation(engine)?;
     if record.host_config.network_mode == "host" {
         // Older versions stored host mode while creating a bridge VM. Correct
         // that stopped machine in place, preserving its image and disk data.
@@ -1302,15 +1324,24 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
 
     // A container that shares another's network runs in its machine.
     if let Some(host) = record.network_host().map(str::to_string) {
-        let socket = match guest_machine(engine, &record, &host).await {
-            Ok(socket) => socket,
+        let (socket, image_lease) = match guest_machine(engine, &record, &host).await {
+            Ok(prepared) => prepared,
             Err(e) => {
                 c.update(engine, |r| r.state.error = e.message.clone());
                 remove_after_failed_start(engine, c);
                 return Err(e);
             }
         };
-        return run_container(engine, c, &record, None, socket).await;
+        return run_container(
+            engine,
+            c,
+            &record,
+            None,
+            socket,
+            image_lease,
+            execution_generation,
+        )
+        .await;
     }
 
     // Boot the machine and make sure the image is in its storage.
@@ -1366,7 +1397,16 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
         remove_after_failed_start(engine, c);
         return Err(e);
     }
-    run_container(engine, c, &record, Some(handle), socket).await
+    run_container(
+        engine,
+        c,
+        &record,
+        Some(handle),
+        socket,
+        None,
+        execution_generation,
+    )
+    .await
 }
 
 /// Run the container's command in the booted machine behind `socket`
@@ -1378,6 +1418,8 @@ async fn run_container(
     record: &ContainerRecord,
     handle: Option<crate::embedded::handle::VmHandle>,
     socket: PathBuf,
+    mut image_lease: Option<super::image_share::Lease>,
+    execution_generation: u64,
 ) -> ApiResult<bool> {
     let record = record.clone();
     // Files uploaded before the first start go in now, before the command.
@@ -1393,24 +1435,29 @@ async fn run_container(
     }
 
     let spec = start_spec(engine, &record);
-    let started = async {
-        let (mut reader, mut writer) = super::runtime::connect(&socket).await?;
-        writer
-            .send(&smolvm_protocol::AgentRequest::ContainerStart(Box::new(
-                spec,
-            )))
-            .await?;
-        match reader.recv().await? {
-            smolvm_protocol::AgentResponse::Started => Ok((reader, writer)),
-            other => Err(std::io::Error::other(
-                super::runtime::error_text(&other).unwrap_or_else(|| format!("{other:?}")),
-            )),
+    let origin = smolvm_protocol::container_session::Origin {
+        generation: execution_generation,
+        started_at: super::util::now_rfc3339(),
+    };
+    let mut session = super::container_session::Session::new(
+        socket.clone(),
+        spec.overlay_id.clone(),
+        origin.clone(),
+    );
+    match session.start(spec).await {
+        Ok(()) => {
+            if let Some(lease) = &mut image_lease {
+                lease.prepared();
+            }
         }
-    }
-    .await;
-    let (reader, writer) = match started {
-        Ok(rw) => rw,
         Err(err) => {
+            c.input.finish();
+            if let Err(cleanup) = session.cancel_and_forget().await {
+                tracing::warn!(container = %record.id, error = %cleanup, "could not release failed container session");
+            }
+            if let Some(lease) = image_lease {
+                lease.release().await;
+            }
             let msg = format!(
                 "failed to create task for container: failed to create shim task: OCI runtime create failed: {err}"
             );
@@ -1458,7 +1505,7 @@ async fn run_container(
         r.state.exit_code = 0;
         r.state.error.clear();
         r.state.oom_killed = false;
-        r.state.started_at = super::util::now_rfc3339();
+        r.state.started_at = origin.started_at.clone();
         r.state.finished_at = super::util::ZERO_TIME.into();
         r.pending_archives.clear();
         if r.config.healthcheck.as_ref().is_some_and(health_enabled) {
@@ -1475,6 +1522,7 @@ async fn run_container(
         .clone()
         .filter(health_enabled)
         .map(|h| tokio::spawn(health_loop(engine.clone(), c.clone(), h)).abort_handle());
+    let process_started = crate::process::process_start_time(pid as i32);
     *c.running.lock() = Some(Running {
         socket,
         vm: handle,
@@ -1489,20 +1537,62 @@ async fn run_container(
     let log_path = super::logs::path(&engine.store, &record.id);
     tokio::spawn(async move {
         let mut log = super::logs::LogWriter::open(&log_path, tty).ok();
-        let exit = super::runtime::pump(reader, writer, &container.input, |stream, data| {
-            if let Some(log) = log.as_mut() {
-                log.write(stream, &data);
+        let alive = || {
+            crate::process::reap_vm_children();
+            pid > 0 && crate::process::is_our_process(pid as i32, process_started)
+        };
+        let result = session
+            .pump(
+                &container.input,
+                |stream, data| {
+                    if let Some(log) = log.as_mut() {
+                        log.write(stream, &data);
+                    }
+                    container.log_written.notify_waiters();
+                    let _ = container
+                        .output
+                        .send(Output::Data(stream, axum::body::Bytes::from(data)));
+                },
+                |message| {
+                    tracing::warn!(container = %record.id, message, "container session recovery");
+                    container.update(&e, |r| r.state.error = message.to_string());
+                    container.emit(&e, "smol-recovery", &[("message", message.to_string())]);
+                },
+                |origin| {
+                    container.update(&e, |r| r.state.started_at = origin.started_at.clone());
+                },
+                alive,
+            )
+            .await;
+        let exit = match result {
+            Ok(exit) => {
+                if let Err(error) = session.forget().await {
+                    tracing::warn!(container = %record.id, error = %error, "could not release completed container session");
+                }
+                exit
             }
-            container.log_written.notify_waiters();
-            let _ = container
-                .output
-                .send(Output::Data(stream, axum::body::Bytes::from(data)));
-        })
-        .await;
+            Err(error) => {
+                // This is an execution-management failure, not an observed
+                // process status or OOM kill. Keep the reason in Docker inspect.
+                container.update(&e, |r| {
+                    r.state.error = format!("Container execution lost: {error}")
+                });
+                if alive() {
+                    let _ = session.cancel_and_forget().await;
+                }
+                Exit {
+                    code: 255,
+                    oom: false,
+                }
+            }
+        };
         if let Some(log) = log.as_mut() {
             log.flush();
         }
         container.log_written.notify_waiters();
+        if let Some(lease) = image_lease {
+            lease.release().await;
+        }
         on_exit(e, container, exit).await;
     });
     Ok(true)
@@ -1631,6 +1721,7 @@ async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
     let vm_guard = c.vm.clone().lock_owned().await;
     let running = c.running.lock().take();
     let started_at = c.record().state.started_at;
+    c.input.finish();
     c.update(&engine, |r| {
         r.state.status = "exited".into();
         r.state.pid = 0;
@@ -1729,7 +1820,7 @@ async fn guest_machine(
     engine: &Arc<Engine>,
     record: &ContainerRecord,
     host: &str,
-) -> ApiResult<PathBuf> {
+) -> ApiResult<(PathBuf, Option<super::image_share::Lease>)> {
     let host = engine
         .find_container(host)
         .ok_or_else(|| ApiError::no_such_container(host))?;
@@ -1739,7 +1830,12 @@ async fn guest_machine(
             host.id()
         ))
     })?;
-    let machine = host.record().machine;
+    let host_record = host.record();
+    let machine = host_record.machine;
+    let host_id = host_record.id;
+    let generation = host_record.state.started_at;
+    let owner = record.id.clone();
+    let root = engine.store.root().to_path_buf();
     let shares: Vec<(String, GuestShare)> = record
         .guest_shares
         .iter()
@@ -1749,26 +1845,36 @@ async fn guest_machine(
     let pull_ref = record.pull_ref.clone();
     let image_share = record.guest_image_share();
     let agent_socket = socket.clone();
-    tokio::task::spawn_blocking(move || -> crate::Result<()> {
-        for (name, share) in &shares {
-            // A share left by an earlier run of this container goes first.
-            let _ = crate::attach::remove_share(&machine, name, share.read_only);
-            crate::attach::add_share(&machine, name, &share.source, share.read_only)?;
-        }
-        if crate::data::image_source::is_local_ref(&pull_ref) {
-            // A local image goes in as its archive, which the guest unpacks.
-            let dir = crate::data::image_source::packed_layers_dir_for_ref(&pull_ref)
-                .ok_or_else(|| crate::Error::config("image", format!("{pull_ref} is gone")))?;
-            let _ = crate::attach::remove_share(&machine, &image_share, true);
-            crate::attach::add_share(&machine, &image_share, &dir, true)?;
-        } else {
-            let mut client = crate::agent::AgentClient::connect_with_retry(&agent_socket)?;
-            if client.query(&pull_ref)?.is_none() {
-                client.pull_with_registry_config(&pull_ref)?;
+    let lease = tokio::task::spawn_blocking(
+        move || -> crate::Result<Option<super::image_share::Lease>> {
+            for (name, share) in &shares {
+                // A share left by an earlier run of this container goes first.
+                let _ = crate::attach::remove_share(&machine, name, share.read_only);
+                crate::attach::add_share(&machine, name, &share.source, share.read_only)?;
             }
-        }
-        Ok(())
-    })
+            if crate::data::image_source::is_local_ref(&pull_ref) {
+                // A local image goes in as its archive, which the guest unpacks.
+                let dir = crate::data::image_source::packed_layers_dir_for_ref(&pull_ref)
+                    .ok_or_else(|| crate::Error::config("image", format!("{pull_ref} is gone")))?;
+                return super::image_share::Lease::acquire(
+                    &root,
+                    machine,
+                    &host_id,
+                    generation,
+                    owner,
+                    image_share,
+                    &dir,
+                )
+                .map(Some);
+            } else {
+                let mut client = crate::agent::AgentClient::connect_with_retry(&agent_socket)?;
+                if client.query(&pull_ref)?.is_none() {
+                    client.pull_with_registry_config(&pull_ref)?;
+                }
+            }
+            Ok(None)
+        },
+    )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(|e| {
@@ -1777,7 +1883,7 @@ async fn guest_machine(
             host.name()
         ))
     })?;
-    Ok(socket)
+    Ok((socket, lease))
 }
 
 /// Take a container's host directories back out of the machine it ran in.
@@ -1789,15 +1895,12 @@ async fn release_guest_shares(engine: &Arc<Engine>, record: &ContainerRecord) {
         return;
     }
     let machine = host.record().machine;
-    let mut shares: Vec<(String, bool)> = record
+    let shares: Vec<(String, bool)> = record
         .guest_shares
         .iter()
         .enumerate()
         .map(|(i, s)| (record.guest_share_name(i), s.read_only))
         .collect();
-    if crate::data::image_source::is_local_ref(&record.pull_ref) {
-        shares.push((record.guest_image_share(), true));
-    }
     let _ = tokio::task::spawn_blocking(move || {
         for (name, read_only) in shares {
             let _ = crate::attach::remove_share(&machine, &name, read_only);
@@ -2019,6 +2122,7 @@ pub(crate) async fn remove(
         }
         stop_locked(engine, c, Some(0), Some("SIGKILL".into())).await?;
     }
+    c.input.finish();
     c.update(engine, |r| r.state.status = "removing".into());
     let _vm = c.vm.lock().await;
     let e = engine.clone();
@@ -2709,11 +2813,6 @@ pub(crate) fn matches(engine: &Engine, c: &Container, filters: &Filters) -> bool
             || filters.get("status").iter().any(|s| s != "running"))
 }
 
-/// Push `input` to a running container's process.
-pub(crate) fn send_input(c: &Container, input: Input) {
-    c.input.push(input);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2737,6 +2836,52 @@ mod tests {
             cmd: cmd.map(|v| v.into_iter().map(String::from).collect()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn execution_generations_survive_reload_and_fail_closed_on_storage_error() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id": "a".repeat(64), "name": "generation", "created": "", "image": "", "image_id": "",
+            "pull_ref": "", "machine": "", "config": {}, "host_config": {}, "host_config_raw": {},
+            "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+            "restart_count": 0, "ports": [], "mounts": []
+        }))
+        .unwrap();
+        // Records written by older engines begin at generation zero.
+        assert_eq!(record.execution_generation, 0);
+        let container = Container::from_record(record);
+        assert_eq!(container.reserve_execution_generation(&engine).unwrap(), 1);
+        let restored = Container::from_record(
+            engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(restored.reserve_execution_generation(&engine).unwrap(), 2);
+        let directory = engine.store.container_dir(&container.id());
+        let backup = root.path().join("saved-container");
+        std::fs::rename(&directory, &backup).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        assert!(restored.reserve_execution_generation(&engine).is_err());
+        assert_eq!(restored.record.lock().execution_generation, 2);
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::rename(&backup, &directory).unwrap();
+        assert_eq!(restored.reserve_execution_generation(&engine).unwrap(), 3);
+        assert_eq!(
+            engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .unwrap()
+                .execution_generation,
+            3
+        );
+        restored.update(&engine, |r| r.execution_generation = u64::MAX);
+        assert!(restored.reserve_execution_generation(&engine).is_err());
+        assert_eq!(restored.record.lock().execution_generation, u64::MAX);
     }
 
     #[test]

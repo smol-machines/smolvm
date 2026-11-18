@@ -219,6 +219,25 @@ pub fn remove_share(name: &str, share: &str, read_only: bool) -> Result<()> {
     control(name, &format!("SHARE_REMOVE {} {share}", tag(read_only))).map(|_| ())
 }
 
+/// Live device exports, including shares bound by the container engine.
+#[cfg(unix)]
+pub(crate) fn shared_directories(name: &str, read_only: bool) -> Result<Vec<(String, PathBuf)>> {
+    let reply = control(name, &format!("SHARE_LIST {}", tag(read_only)))?;
+    let entries = reply.strip_prefix("OK").unwrap_or("").trim();
+    if entries.is_empty() {
+        return Ok(Vec::new());
+    }
+    entries
+        .split('\t')
+        .map(|entry| {
+            let (share, source) = entry
+                .split_once('=')
+                .ok_or_else(|| Error::config("attach share", "invalid live share listing"))?;
+            Ok((share.to_owned(), PathBuf::from(source)))
+        })
+        .collect()
+}
+
 /// Unmount the attached mount at `target` from the running machine `name`.
 pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
     let target = normalize_target(target)?;

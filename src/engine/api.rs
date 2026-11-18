@@ -32,6 +32,11 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .route("/containers/json", get(container_list))
         .route("/containers/prune", post(container_prune))
         .route("/containers/{id}/json", get(container_inspect))
+        .route("/containers/{id}/smol/ports", get(super::app_ports::list))
+        .route(
+            "/containers/{id}/smol/ports/{port}/connect",
+            post(super::app_ports::connect),
+        )
         .route("/containers/{id}/start", post(container_start))
         .route("/containers/{id}/stop", post(container_stop))
         .route("/containers/{id}/restart", post(container_restart))
@@ -500,20 +505,34 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
             })?)
         };
     let (tx, body) = super::stream::json_lines();
+    let mut app_updates = if q.get("smol_apps").is_some_and(|value| value == "true")
+        && until.is_none_or(|until| until > now)
+    {
+        Some(super::app_ports::subscribe(&engine).map_err(|error| {
+            ApiError::internal(format!("Cannot observe app listeners: {error}"))
+        })?)
+    } else {
+        None
+    };
     tokio::spawn(async move {
         let mut seen = std::collections::BTreeSet::new();
+        // Ephemeral listener changes do not modify persisted Docker history.
+        let mut history_changed = true;
         loop {
-            for e in engine.events.pending(start, &mut seen) {
-                if until_nanos.is_some_and(|u| e.time_nano > u) {
-                    return;
-                }
-                if super::events::matches(&e, &f)
-                    && tx
-                        .send(serde_json::to_value(&e).unwrap_or_default())
-                        .await
-                        .is_err()
-                {
-                    return;
+            if history_changed {
+                history_changed = false;
+                for e in engine.events.pending(start, &mut seen) {
+                    if until_nanos.is_some_and(|u| e.time_nano > u) {
+                        return;
+                    }
+                    if super::events::matches(&e, &f)
+                        && tx
+                            .send(serde_json::to_value(&e).unwrap_or_default())
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
                 }
             }
             if until.is_some_and(|u| std::time::SystemTime::now() >= u) {
@@ -521,6 +540,18 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
             }
             tokio::select! {
                 _ = tx.closed() => return,
+                result = async {
+                    match &mut app_updates {
+                        Some(updates) => updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if result.is_err() || tx.send(serde_json::json!({
+                        "Type":"smol", "Action":"app_ports", "Actor":{"ID":""}
+                    })).await.is_err() {
+                        return;
+                    }
+                },
                 result = async {
                     match &mut subscription {
                         Some(subscription) => subscription.changed().await,
@@ -531,6 +562,7 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
                         tracing::warn!(%error, "Engine event watch failed; closing stream");
                         return;
                     }
+                    history_changed = true;
                 }
                 _ = async {
                     match until {
@@ -539,7 +571,11 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
                         ).await,
                         None => std::future::pending().await,
                     }
-                } => {}
+                } => {
+                    // Preserve the final inclusive history read at `until`,
+                    // even if its filesystem notification is still queued.
+                    history_changed = true;
+                }
             }
         }
     });
@@ -796,6 +832,9 @@ async fn container_attach(
     let logs = q_bool(&q, "logs");
     // Subscribe before anything else so no output after this point is lost.
     let mut live = c.output.subscribe();
+    // Capture the execution before awaiting the HTTP upgrade, so a delayed
+    // old attachment cannot acquire the next run's input queue.
+    let stdin = c.input.sender();
     let content_type = if tty {
         super::stream::RAW
     } else {
@@ -803,7 +842,6 @@ async fn container_attach(
     };
     let (response, session) = super::stream::hijack(req, content_type);
     let eng = engine.clone();
-    let c2 = c.clone();
     tokio::spawn(async move {
         let Some(session) = session.await else { return };
         let super::stream::Session {
@@ -815,19 +853,15 @@ async fn container_attach(
         attrs.remove("__");
         eng.events
             .emit("container", "attach", &record.id, record.event_attributes());
-        if let (true, Some(input)) = (want_stdin, input) {
-            let c3 = c2.clone();
-            let stdin_once = record.config.stdin_once;
-            tokio::spawn(async move {
-                super::stream::read_input(input, |data| {
-                    super::containers::send_input(&c3, super::runtime::Input::Data(data))
-                })
-                .await;
-                if stdin_once {
-                    super::containers::send_input(&c3, super::runtime::Input::Eof);
-                }
-            });
-        }
+        let _stdin = if let (true, Some(input)) = (want_stdin, input) {
+            Some(super::stream::forward_input(
+                input,
+                stdin,
+                record.config.stdin_once,
+            ))
+        } else {
+            None
+        };
         let query = super::logs::LogQuery {
             stdout: want_stdout,
             stderr: want_stderr,
@@ -891,7 +925,7 @@ async fn container_resize(
             c.id()
         )));
     }
-    super::containers::send_input(&c, super::runtime::Input::Resize { cols: w, rows: h });
+    c.input.resize(w, h);
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1542,6 +1576,82 @@ mod event_tests {
     use super::*;
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
     use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn listener_changes_do_not_rescan_history_but_lifecycle_events_still_arrive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let socket = root.path().join("guest.sock");
+        let record = serde_json::from_value(serde_json::json!({
+            "id":"a".repeat(64),"name":"web","created":"2026-11-18T00:00:00Z","image":"fixture","image_id":"fixture","pull_ref":"","machine":"fixture","agent_socket":socket,
+            "config":{},"host_config":{},"host_config_raw":{},"networks":{},"path":"/web","args":[],"restart_count":0,"ports":[],"mounts":[],
+            "state":{"status":"running","pid":123,"exit_code":0,"error":"","started_at":"2026-11-18T00:00:01Z","finished_at":"","oom_killed":false}
+        })).unwrap();
+        engine.store.save_container(&record).unwrap();
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let response = request(engine.clone(), &[("smol_apps", "true".into())]).await;
+        let mut stream = response.into_body().into_data_stream();
+        let (mut guest, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let length = guest.read_u32().await.unwrap();
+        let mut bytes = vec![0; length as usize];
+        guest.read_exact(&mut bytes).await.unwrap();
+        assert!(matches!(
+            smolvm_protocol::binary_stream::decode_request(&bytes)
+                .unwrap()
+                .body,
+            smolvm_protocol::AgentRequest::WatchListeners
+        ));
+        guest
+            .write_all(
+                &smolvm_protocol::encode_message(&smolvm_protocol::AgentResponse::ok_with_data(
+                    serde_json::json!({"protocol":"smol-listener-watch-v1"}),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The initial scan is complete before the watch handshake arrives.
+        let scans = engine.events.history_reads();
+        assert!(scans > 0);
+        for generation in 1u64..=10 {
+            guest.write_all(&generation.to_le_bytes()).await.unwrap();
+            let line = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(event["Type"], "smol");
+            assert_eq!(event["Action"], "app_ports");
+        }
+        assert_eq!(
+            engine.events.history_reads(),
+            scans,
+            "ephemeral listener events reread persistent history"
+        );
+        let writer = super::super::events::Events::persistent(&engine.config.root).unwrap();
+        writer.emit("container", "start", "external-supervisor", BTreeMap::new());
+        let line = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(event["Actor"]["ID"], "external-supervisor");
+        assert!(engine.events.history_reads() > scans);
+        drop(stream);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), guest.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
 
     async fn request(engine: Arc<Engine>, query: &[(&str, String)]) -> Response {
         events(

@@ -56,6 +56,8 @@ pub(crate) struct Events {
     history: parking_lot::Mutex<VecDeque<Event>>,
     changed: watch::Sender<()>,
     watcher: parking_lot::Mutex<Weak<DirectoryWatch>>,
+    #[cfg(test)]
+    history_reads: std::sync::atomic::AtomicUsize,
 }
 
 /// All HTTP subscribers share one OS watcher, released with the last stream.
@@ -116,6 +118,8 @@ impl Events {
             history: parking_lot::Mutex::new(VecDeque::with_capacity(HISTORY)),
             changed,
             watcher: parking_lot::Mutex::new(Weak::new()),
+            #[cfg(test)]
+            history_reads: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -249,6 +253,9 @@ impl Events {
     /// Remember only identities still in the bounded history.
     pub(crate) fn pending(&self, since_nanos: i64, seen: &mut BTreeSet<String>) -> Vec<Event> {
         if let Some(root) = &self.root {
+            #[cfg(test)]
+            self.history_reads
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             let mut paths: Vec<_> = std::fs::read_dir(root)
                 .into_iter()
                 .flatten()
@@ -310,6 +317,14 @@ impl Events {
             .filter(|e| e.time_nano >= since_nanos && seen.insert(e.cursor.clone()))
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+impl Events {
+    pub(super) fn history_reads(&self) -> usize {
+        self.history_reads
+            .load(std::sync::atomic::Ordering::Relaxed)
     }
 }
 

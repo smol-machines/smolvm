@@ -119,7 +119,7 @@ impl Store {
     }
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
+pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| crate::Error::config("engine record", e.to_string()))?;
     let tmp = path.with_extension(format!("{}.tmp", super::util::new_id()));
@@ -128,7 +128,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     Ok(())
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> crate::Result<Option<T>> {
+pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> crate::Result<Option<T>> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)
