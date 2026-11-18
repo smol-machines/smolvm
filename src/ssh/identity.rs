@@ -16,7 +16,7 @@ mod windows_private;
 /// Standard client connection details; private key bytes are never returned.
 #[derive(Debug, Serialize)]
 pub struct Connection {
-    /// Stable host alias, scoped by the generated configuration file.
+    /// Stable host alias, scoped by this environment's public host identity.
     pub host: String,
     /// OpenSSH config file, suitable for `ssh -F` and editor configuration.
     pub config: PathBuf,
@@ -194,21 +194,30 @@ fn quote_command(path: &Path) -> Result<String> {
         Ok(format!("\"{value}\""))
     }
 }
-pub(super) fn configure(machine: &str) -> Result<Connection> {
-    let root = directory(machine, true)?;
-    let host_key = key(&root, "host_ed25519")?;
-    key(&root, "id_ed25519")?;
-    let hash = crate::agent::vm_dir_hash(machine);
+fn host_alias(machine: &str, host_key: &PublicKey) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    // A user can include several installations' configs in one SSH config.
+    // Names alone collide across data roots; the persisted host key identifies
+    // the actual environment and survives repeated configuration and restarts.
+    let digest = Sha256::digest(host_key.to_bytes()?);
+    let hash = hex::encode(&digest[..8]);
     let label: String = machine
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-')
         .take(32)
         .collect();
-    let host = format!(
+    Ok(format!(
         "{}-{}.smol",
         if label.is_empty() { "machine" } else { &label },
-        &hash[..8]
-    );
+        hash
+    ))
+}
+
+pub(super) fn configure(machine: &str) -> Result<Connection> {
+    let root = directory(machine, true)?;
+    let host_key = key(&root, "host_ed25519")?;
+    key(&root, "id_ed25519")?;
+    let host = host_alias(machine, host_key.public_key())?;
     let known = format!("{host} {}\n", host_key.public_key().to_openssh()?);
     publish(&root, "known_hosts", known.as_bytes(), true)?;
     let executable = quote_command(&std::env::current_exe()?)?;
@@ -240,6 +249,28 @@ pub(super) fn verify(machine: &str, expected: &PublicKey) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn identical_names_in_different_installations_get_distinct_stable_aliases() {
+        let first = tempfile::tempdir().unwrap();
+        let second = tempfile::tempdir().unwrap();
+        let first_key = key(first.path(), "host").unwrap();
+        let second_key = key(second.path(), "host").unwrap();
+        let alias = host_alias("development", first_key.public_key()).unwrap();
+        assert_ne!(
+            alias,
+            host_alias("development", second_key.public_key()).unwrap()
+        );
+        assert_eq!(
+            alias,
+            host_alias(
+                "development",
+                key(first.path(), "host").unwrap().public_key()
+            )
+            .unwrap()
+        );
+        assert!(alias.starts_with("development-") && alias.ends_with(".smol"));
+    }
 
     #[test]
     fn concurrent_creators_reuse_one_key_and_never_rotate_invalid_storage() {
