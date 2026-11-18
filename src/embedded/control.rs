@@ -607,6 +607,7 @@ pub(crate) fn fork_vm_with_options(
         share_weights,
         watch_parent,
         None,
+        None,
         keep_machine_id,
     )
 }
@@ -640,15 +641,17 @@ pub(crate) fn fork_vm_adjusted(
         let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
         return Err(error);
     }
-    boot_prepared_fork(db, clone, prep, false, None, None, false)
+    boot_prepared_fork(db, clone, prep, false, None, None, None, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn boot_prepared_fork(
     db: &SmolvmDb,
     clone: &str,
     prep: crate::agent::fork::PreparedFork,
     share_weights: bool,
     watch_parent: Option<bool>,
+    startup_commit: Option<std::sync::Arc<std::fs::File>>,
     retry_gate: Option<&std::sync::Mutex<()>>,
     keep_machine_id: bool,
 ) -> Result<VmHandle> {
@@ -659,6 +662,7 @@ fn boot_prepared_fork(
         cuda_share_weights: share_weights,
         cuda_preload_modules: prep.clone_record.cuda_preload_modules,
         watch_parent,
+        startup_commit,
         ..LaunchFeatures::default()
     };
     // A restore can reach the agent socket and still fail its first command on
@@ -770,6 +774,15 @@ pub fn fork_vm_batch(
         ));
     }
     let empty_secrets = std::collections::BTreeMap::new();
+    // Even detached children belong to this request until the complete batch
+    // succeeds. Create the anonymous commit before registering any clone.
+    #[cfg(unix)]
+    let transaction = crate::agent::startup_transaction::Transaction::new()
+        .map_err(|error| Error::agent("prepare fork ownership", error.to_string()))?;
+    #[cfg(unix)]
+    let startup_commit = Some(transaction.file());
+    #[cfg(not(unix))]
+    let startup_commit = None;
     let specs: Vec<_> = clones
         .iter()
         .map(|(name, ports)| crate::agent::fork::ForkSpec {
@@ -803,6 +816,7 @@ pub fn fork_vm_batch(
                 let queue = &queue;
                 let stop = &stop;
                 let retry_gate = &retry_gate;
+                let startup_commit = startup_commit.clone();
                 scope.spawn(move || {
                     let mut results = Vec::new();
                     loop {
@@ -824,6 +838,7 @@ pub fn fork_vm_batch(
                                 prep,
                                 false,
                                 watch_parent,
+                                startup_commit.clone(),
                                 Some(retry_gate),
                                 keep_machine_id,
                             )
@@ -898,6 +913,8 @@ pub fn fork_vm_batch(
         .map(|(index, name, result)| result.map(|handle| (index, name, handle)))
         .collect::<Result<Vec<_>>>()?;
     ordered.sort_by_key(|(index, _, _)| *index);
+    #[cfg(unix)]
+    transaction.commit();
     Ok(ordered
         .into_iter()
         .map(|(_, name, handle)| (name, handle))

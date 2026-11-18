@@ -6,6 +6,7 @@
 #![cfg(unix)]
 
 use smolvm::embedded::{EmbeddedRuntime, ForkOptions};
+use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
 use std::time::{Duration, Instant};
@@ -77,7 +78,9 @@ fn fork_owner_process() {
             SOURCE,
             &CHILDREN.map(str::to_owned),
             &[],
-            2,
+            std::env::var("SMOL_TEST_FORK_PARALLEL")
+                .map(|value| value.parse().unwrap())
+                .unwrap_or(2),
             ForkOptions {
                 detached,
                 ..Default::default()
@@ -88,6 +91,117 @@ fn fork_owner_process() {
     // The parent kills us, bypassing Runtime/Handle Drop. Attached machines
     // must still be reaped by the watchdog; detached machines must survive.
     std::thread::sleep(Duration::from_secs(60));
+}
+
+#[test]
+#[ignore = "kills an SDK process while its detached batch is still starting"]
+fn unfinished_detached_batch_does_not_outlive_its_owner() {
+    let binary = PathBuf::from(std::env::var_os("SMOLVM_BOOT_BINARY").expect("boot binary"));
+    let fixture = Fixture {
+        directory: tempfile::Builder::new()
+            .prefix(".fork-cancel-")
+            .tempdir_in(std::env::var_os("HOME").expect("home directory"))
+            .unwrap(),
+        binary: binary.clone(),
+    };
+    fixture.cli(&[
+        "machine",
+        "create",
+        "--name",
+        SOURCE,
+        "--cpus",
+        "1",
+        "--mem",
+        "384",
+        "--storage",
+        "1",
+        "--overlay",
+        "1",
+    ]);
+    fixture.cli(&["machine", "start", "--name", SOURCE, "--forkable"]);
+    let source_pid = fixture.status(SOURCE)["pid"].clone();
+    let blocked = fixture.directory.path().join("blocked");
+    let release = fixture.directory.path().join("release");
+    let ready = fixture.directory.path().join("ready");
+    let wrapper = fixture.directory.path().join("boot-wrapper");
+    std::fs::write(
+        &wrapper,
+        r#"#!/bin/sh
+if [ "$(cat "$(dirname "$2")/name")" = fork-lifetime-b ]; then
+    printf '%s' "$$" > "$SMOL_TEST_FORK_BLOCKED"
+    while [ ! -e "$SMOL_TEST_FORK_RELEASE" ]; do sleep .02; done
+fi
+exec "$SMOL_TEST_REAL_BOOT" "$@"
+"#,
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let mut owner = Owner(
+        fixture
+            .command(&std::env::current_exe().unwrap())
+            .args(["--exact", "fork_owner_process", "--ignored"])
+            .env("SMOLVM_BOOT_BINARY", &wrapper)
+            .env("SMOL_TEST_REAL_BOOT", &binary)
+            .env("SMOL_TEST_FORK_READY", &ready)
+            .env("SMOL_TEST_FORK_BLOCKED", &blocked)
+            .env("SMOL_TEST_FORK_RELEASE", &release)
+            .env("SMOL_TEST_FORK_PARALLEL", "1")
+            .env("SMOL_TEST_FORK_DETACHED", "true")
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(45);
+    while !blocked.exists() {
+        assert!(owner.0.try_wait().unwrap().is_none(), "SDK fork failed");
+        assert!(
+            Instant::now() < deadline,
+            "second boot never reached the gate"
+        );
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let blocked_pid = std::fs::read_to_string(&blocked)
+        .unwrap()
+        .parse::<i32>()
+        .unwrap();
+    struct BlockedBoot(i32, Option<u64>);
+    impl Drop for BlockedBoot {
+        fn drop(&mut self) {
+            smolvm::process::kill_verified(self.0, self.1);
+        }
+    }
+    let _blocked_boot = BlockedBoot(
+        blocked_pid,
+        smolvm::process::process_start_time(blocked_pid),
+    );
+    let first_pid = fixture.status(CHILDREN[0])["pid"].as_i64().unwrap() as i32;
+    assert!(!ready.exists(), "batch must still be uncommitted");
+    owner.0.kill().unwrap();
+    owner.0.wait().unwrap();
+    // The second boot only enters the real helper after its parent is gone.
+    std::fs::write(&release, b"").unwrap();
+    for pid in [first_pid, blocked_pid] {
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while smolvm::process::is_alive(pid) {
+            assert!(
+                Instant::now() < deadline,
+                "uncommitted child {pid} survived its owner"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    }
+    assert_eq!(fixture.status(SOURCE)["pid"], source_pid);
+    assert_eq!(
+        fixture.cli(&[
+            "machine",
+            "exec",
+            "--name",
+            SOURCE,
+            "--",
+            "printf",
+            "preserved"
+        ]),
+        b"preserved"
+    );
 }
 
 #[test]

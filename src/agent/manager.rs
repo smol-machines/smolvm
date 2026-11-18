@@ -3846,6 +3846,19 @@ impl AgentManager {
                 self.ready_marker_name(),
             )
             .stdin(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            cmd.env_remove(super::startup_transaction::PARENT_ENV);
+            if let Some(commit) = &features.startup_commit {
+                cmd.stdin(std::process::Stdio::from(commit.try_clone().map_err(
+                    |error| Error::agent("pass startup commit", error.to_string()),
+                )?));
+                cmd.env(
+                    super::startup_transaction::PARENT_ENV,
+                    std::process::id().to_string(),
+                );
+            }
+        }
         // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
         // embedded-host launch failures can be diagnosed (normally silenced).
         //
