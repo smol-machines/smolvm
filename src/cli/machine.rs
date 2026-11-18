@@ -490,6 +490,9 @@ pub enum MachineCmd {
     /// Copy files between host and machine
     Cp(CpCmd),
 
+    /// Change a running machine's credential values without a restart
+    Credentials(super::machine_credentials::CredentialsCmd),
+
     /// Browse and transfer files in a running machine
     Files(super::machine_files::FilesCmd),
 
@@ -567,6 +570,7 @@ impl MachineCmd {
             MachineCmd::Prune(cmd) => cmd.run(),
             MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
+            MachineCmd::Credentials(cmd) => cmd.run(),
             MachineCmd::Files(cmd) => cmd.run(),
             MachineCmd::Sync(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
