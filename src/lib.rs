@@ -97,6 +97,8 @@ pub mod embedded;
 /// The Docker Engine API, answered by smolvm: every container is a machine.
 #[cfg(unix)]
 pub mod engine;
+/// Local image archives shared with managed Kubernetes clusters.
+pub mod image_feed;
 pub mod image_seed;
 pub mod image_store;
 /// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
