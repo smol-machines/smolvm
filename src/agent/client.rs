@@ -3336,6 +3336,48 @@ impl AgentClient {
         )
     }
 
+    /// Execute a VM command with signal/resize controls on a separate client.
+    /// Use a fresh unique session ID; it is revoked when the data session ends.
+    pub fn vm_exec_controlled_io<S, F>(
+        &mut self,
+        mut session: smolvm_protocol::interactive_control::Session,
+        input: InteractiveInputReceiver,
+        on_started: S,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        S: FnOnce(),
+        F: FnMut(InteractiveOutput),
+    {
+        session.env = with_term_default(session.env, session.tty);
+        self.interactive_session_io_started(
+            AgentRequest::VmExecControlled { session },
+            input,
+            on_started,
+            on_output,
+            "controlled vm exec",
+            POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// Signal or resize a session. Connect a separate client so blocked session
+    /// stdin or stdout cannot delay this request.
+    pub fn interactive_control(
+        &mut self,
+        request: smolvm_protocol::interactive_control::Request,
+    ) -> Result<()> {
+        match self.request(&AgentRequest::InteractiveControl { request })? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("interactive control", message, code.as_deref()))
+            }
+            other => Err(Error::agent(
+                "interactive control",
+                format!("unexpected response: {other:?}"),
+            )),
+        }
+    }
+
     /// [`Self::vm_exec_session_io`] for an image machine: the command runs in
     /// the machine's container, as the configured user, with its timeout.
     pub fn run_session_io<S, F>(

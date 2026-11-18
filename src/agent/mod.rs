@@ -12,6 +12,7 @@ pub mod fork;
 mod fsnotify_watch;
 pub mod host_gpu;
 pub mod input;
+pub use smolvm_protocol::interactive_control;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
