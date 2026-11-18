@@ -1610,21 +1610,71 @@ pub fn is_extracted(cache_dir: &Path) -> bool {
         && !unsynced_before_this_boot(&unsynced_marker_path(cache_dir))
 }
 
-/// The SHA-256 of the artifact a private cache was extracted from, inside it.
+/// What a private cache was extracted from, inside it: the artifact's SHA-256,
+/// and the identity of the file it was read from.
 const EXTRACTED_FROM: &str = ".extracted-from-sha256";
 
-/// Whether `cache_dir` is a complete extraction of exactly the artifact whose
-/// SHA-256 is `sha256`. Private caches are named by the artifact's CRC-32,
-/// which anyone can forge: a pack crafted to share a trusted pack's CRC would
-/// otherwise leave its own agent, rootfs and init for the trusted one to boot.
-pub fn extracted_from(cache_dir: &Path, sha256: &str) -> bool {
-    is_extracted(cache_dir)
-        && fs::read_to_string(cache_dir.join(EXTRACTED_FROM)).is_ok_and(|d| d.trim() == sha256)
+/// The identity of a file as the filesystem reports it: a file replaced,
+/// copied, rewritten or touched gets a new one (`ctime` cannot be set back).
+pub fn file_identity(path: &Path) -> std::io::Result<String> {
+    let meta = fs::metadata(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(format!(
+            "{}:{}:{}:{}.{}:{}.{}",
+            meta.dev(),
+            meta.ino(),
+            meta.len(),
+            meta.mtime(),
+            meta.mtime_nsec(),
+            meta.ctime(),
+            meta.ctime_nsec()
+        ))
+    }
+    #[cfg(not(unix))]
+    {
+        let modified = meta
+            .modified()
+            .ok()
+            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+            .map_or(0, |d| d.as_nanos());
+        Ok(format!("{}:{modified}", meta.len()))
+    }
 }
 
-/// Record that `cache_dir` was just extracted from the artifact `sha256` names.
-pub fn record_extracted_from(cache_dir: &Path, sha256: &str) -> std::io::Result<()> {
-    fs::write(cache_dir.join(EXTRACTED_FROM), sha256)
+/// Whether `cache_dir` is a complete extraction of exactly the artifact
+/// `source` holds, with that artifact's SHA-256. Private caches are named by
+/// the artifact's CRC-32, which anyone can forge: a pack crafted to share a
+/// trusted pack's CRC would otherwise leave its own agent, rootfs and init for
+/// the trusted one to boot. The same unchanged file is known by its identity
+/// without reading it again; any other file is hashed with `digest`.
+pub fn extracted_from(
+    cache_dir: &Path,
+    source: &Path,
+    digest: impl FnOnce() -> std::io::Result<String>,
+) -> std::io::Result<(bool, String)> {
+    let identity = file_identity(source)?;
+    let recorded = fs::read_to_string(cache_dir.join(EXTRACTED_FROM)).unwrap_or_default();
+    let mut lines = recorded.lines();
+    let (recorded_digest, recorded_identity) = (lines.next(), lines.next());
+    let complete = is_extracted(cache_dir);
+    if let (true, Some(d), Some(i)) = (complete, recorded_digest, recorded_identity) {
+        if i == identity && !d.is_empty() {
+            return Ok((true, d.to_string()));
+        }
+    }
+    let actual = digest()?;
+    Ok((complete && recorded_digest == Some(actual.as_str()), actual))
+}
+
+/// Record that `cache_dir` holds the extraction of the artifact `sha256` names,
+/// read from `source`.
+pub fn record_extracted_from(cache_dir: &Path, sha256: &str, source: &Path) -> std::io::Result<()> {
+    fs::write(
+        cache_dir.join(EXTRACTED_FROM),
+        format!("{sha256}\n{}\n", file_identity(source)?),
+    )
 }
 
 /// Empty `cache_dir` before extracting a different artifact into it, so nothing
@@ -7809,20 +7859,33 @@ mod tests {
         let cache = temp.path().join("deadbeef");
         fs::create_dir_all(&cache).unwrap();
         mark_extracted(&cache).unwrap();
-        let (trusted, colliding) = (
-            bytes_sha256(b"trusted pack"),
-            bytes_sha256(b"colliding pack"),
-        );
+        let trusted = temp.path().join("trusted.smolmachine");
+        let colliding = temp.path().join("colliding.smolmachine");
+        fs::write(&trusted, b"trusted pack").unwrap();
+        fs::write(&colliding, b"colliding pack").unwrap();
+        let hashed = std::cell::Cell::new(0);
+        let reuse = |path: &Path| {
+            extracted_from(&cache, path, || {
+                hashed.set(hashed.get() + 1);
+                file_sha256(path)
+            })
+            .unwrap()
+            .0
+        };
+        assert!(!reuse(&trusted), "an unrecorded cache is extracted again");
+        record_extracted_from(&cache, &file_sha256(&colliding).unwrap(), &colliding).unwrap();
         assert!(
-            !extracted_from(&cache, &trusted),
-            "an unrecorded cache is extracted again"
-        );
-        record_extracted_from(&cache, &colliding).unwrap();
-        assert!(
-            !extracted_from(&cache, &trusted),
+            !reuse(&trusted),
             "another artifact's extraction is not reused"
         );
-        assert!(extracted_from(&cache, &colliding));
+        hashed.set(0);
+        assert!(reuse(&colliding));
+        assert_eq!(hashed.get(), 0, "the same unchanged file is not read again");
+        // A copy of the same bytes is another file: hashed, then reused.
+        let copy = temp.path().join("copy.smolmachine");
+        fs::copy(&colliding, &copy).unwrap();
+        assert!(reuse(&copy));
+        assert_eq!(hashed.get(), 1);
         fs::write(cache.join("planted"), b"x").unwrap();
         clear_for_extraction(&cache);
         assert!(!cache.exists(), "nothing the other artifact left survives");
