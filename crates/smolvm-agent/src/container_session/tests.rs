@@ -356,10 +356,15 @@ fn a_partial_client_frame_detaches_without_eof_and_registry_never_forgets_a_live
 #[test]
 fn attached_output_backpressure_releases_on_detach_without_killing_the_owner() {
     let (session, done) = process(
-        "read -r go; head -c 4194304 /dev/zero; printf 'tail' >&2; exit 37",
+        "printf x; read -r go; head -c 4194304 /dev/zero; printf 'tail' >&2; exit 37",
         false,
     );
     let (mut client, handler, _) = attach(&session, resume());
+    // Keep a one-byte record unacknowledged so the remaining capacity is not
+    // an exact multiple of the process owner's output chunks.
+    assert!(
+        matches!(event(&mut client), Event::Output { sequence: 1, bytes, .. } if bytes == b"x")
+    );
     send(
         &mut client,
         Control::Input {
@@ -372,12 +377,29 @@ fn attached_output_backpressure_releases_on_detach_without_killing_the_owner() {
     assert!(matches!(event(&mut client), Event::InputAck { next: 2 }));
     wait_for(|| {
         let state = session.state.lock();
-        state.output.retained_bytes() == smolvm_protocol::container_session::MAX_OUTPUT_BYTES
+        // A whole record must fit: pressure can begin before the byte limit
+        // when the next read is larger than the remaining capacity.
+        state.output.retained_bytes()
+            > smolvm_protocol::container_session::MAX_OUTPUT_BYTES
+                - smolvm_protocol::container_session::MAX_INPUT_BYTES
             || state.output.records_from(1).count()
                 == smolvm_protocol::container_session::MAX_OUTPUT_RECORDS
     });
-    assert!(matches!(done.try_recv(), Err(mpsc::TryRecvError::Empty)));
-    assert_eq!(session.state.lock().output.first(), 1);
+    assert!(matches!(
+        done.recv_timeout(Duration::from_millis(100)),
+        Err(mpsc::RecvTimeoutError::Timeout)
+    ));
+    {
+        let state = session.state.lock();
+        assert_eq!(state.output.first(), 1);
+        assert!(
+            state.output.retained_bytes() <= smolvm_protocol::container_session::MAX_OUTPUT_BYTES
+        );
+        assert!(
+            state.output.records_from(1).count()
+                <= smolvm_protocol::container_session::MAX_OUTPUT_RECORDS
+        );
+    }
     detach(client, handler);
     assert_eq!(done.recv_timeout(Duration::from_secs(5)).unwrap(), 37);
     wait_for(|| session.state.lock().output.exit().is_some());
