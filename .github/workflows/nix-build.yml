@@ -1,0 +1,38 @@
+name: Nix build
+
+# Build the flake's package for every change to it, the release bump PRs
+# included: the flake pinned 1.33.0 with 1.32.2's hashes for weeks, and 1.35.3
+# then failed nixpkgs' broken-symlink check, both found by a user (#2252).
+on:
+  pull_request:
+    paths: ["flake.nix", "flake.lock", "nix/**", ".github/workflows/nix-build.yml"]
+  push:
+    branches: [main]
+    paths: ["flake.nix", "flake.lock", "nix/**", ".github/workflows/nix-build.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    name: nix build (${{ matrix.system }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - system: x86_64-linux
+            runner: ubuntu-24.04
+          - system: aarch64-linux
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: cachix/install-nix-action@v31
+        with:
+          extra_nix_config: experimental-features = nix-command flakes
+      - name: Build the smolvm package
+        run: nix build --print-build-logs .#smolvm
+      - name: Run it
+        run: ./result/bin/smolvm --version
