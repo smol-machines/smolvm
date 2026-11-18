@@ -89,6 +89,8 @@ mod app_ports;
 mod attach;
 mod auto_ports;
 mod branchpoint;
+#[cfg(target_os = "linux")]
+mod builtin_exec;
 mod container;
 #[cfg(target_os = "linux")]
 mod container_session;
@@ -125,6 +127,8 @@ mod retry;
 mod rosetta;
 mod rosetta_tracer;
 mod s3mount;
+#[cfg(target_os = "linux")]
+mod sftp;
 mod ssh_agent;
 mod storage;
 #[cfg(target_os = "linux")]
@@ -359,8 +363,8 @@ fn maybe_set_clock_from_host() {
 
 fn main() {
     #[cfg(target_os = "linux")]
-    if tcp_forward::helper_requested() {
-        std::process::exit(tcp_forward::run_helper());
+    if builtin_exec::requested() {
+        std::process::exit(builtin_exec::run_helper());
     }
     #[cfg(target_os = "linux")]
     if controlled_exec::helper_requested() {
@@ -2844,6 +2848,8 @@ fn handle_request(
             capabilities.push(smolvm_protocol::interactive_control::CAPABILITY.to_string());
             #[cfg(target_os = "linux")]
             capabilities.push(smolvm_protocol::interactive_control::TCP_CAPABILITY.to_string());
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::SFTP_CAPABILITY.to_string());
             if attach::available() {
                 capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
             }
@@ -9102,7 +9108,7 @@ fn handle_interactive_vm_exec(
                     #[cfg(target_os = "linux")]
                     {
                         std::iter::once("/proc/self/exe".to_string())
-                            .chain(tcp_forward::command(builtin))
+                            .chain(builtin_exec::command(builtin))
                             .collect()
                     }
                     #[cfg(not(target_os = "linux"))]

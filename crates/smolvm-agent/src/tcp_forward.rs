@@ -13,27 +13,6 @@ use std::{
 
 const HELPER: &str = "tcp-forward";
 
-#[cfg(target_os = "linux")]
-pub fn command(builtin: &Builtin) -> Vec<String> {
-    match builtin {
-        Builtin::TcpConnect { host, port } => vec![HELPER.into(), host.clone(), port.to_string()],
-    }
-}
-
-pub fn helper_requested() -> bool {
-    std::env::args_os().nth(1).as_deref() == Some(std::ffi::OsStr::new(HELPER))
-}
-
-pub fn run_helper() -> i32 {
-    match run(&std::env::args_os().skip(1).collect::<Vec<_>>()) {
-        Ok(()) => 0,
-        Err(error) => {
-            eprintln!("smolvm TCP connection: {error}");
-            1
-        }
-    }
-}
-
 pub fn run(args: &[std::ffi::OsString]) -> io::Result<()> {
     let invalid = || io::Error::new(io::ErrorKind::InvalidInput, "invalid TCP operation");
     if args.len() != 3 || args[0] != HELPER {

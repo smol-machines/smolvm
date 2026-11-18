@@ -82,7 +82,7 @@ fn helper() -> io::Result<()> {
     drop(socket);
     drop(executable);
     if args[2] == "--builtin" {
-        return crate::tcp_forward::run(&args[3..]);
+        return crate::builtin_exec::run(&args[3..]);
     }
     // No helper process survives: the requested command keeps this PID/group.
     Err(Command::new(&args[3]).args(&args[4..]).exec())
@@ -190,7 +190,7 @@ fn execute(
         session
             .builtin
             .as_ref()
-            .map(crate::tcp_forward::command)
+            .map(crate::builtin_exec::command)
             .unwrap_or(session.command),
         env,
         session.workdir,

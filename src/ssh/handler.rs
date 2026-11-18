@@ -276,12 +276,30 @@ impl server::Handler for Handler {
     async fn subsystem_request(
         &mut self,
         id: ChannelId,
-        _: &str,
+        name: &str,
         session: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        // SFTP requires random-access guest filesystem operations still to be
-        // implemented; reject promptly instead of leaving clients waiting.
-        session.channel_failure(id)
+        let Some(input) = self.inputs.get_mut(&id) else {
+            return Ok(());
+        };
+        if name != "sftp" || input.task.is_some() || input.terminal.is_some() {
+            session.channel_failure(id)?;
+            return Ok(());
+        }
+        session.channel_success(id)?;
+        let (task, _) = guest::start(
+            id,
+            input.receiver.take().unwrap(),
+            input.writer.take().unwrap(),
+            input.queued.clone(),
+            session.handle(),
+            self.machine.clone(),
+            self.expected_host.clone(),
+            guest::Operation::Sftp,
+            self.metrics.guest_threads.clone(),
+        );
+        input.task = Some(task);
+        Ok(())
     }
     #[allow(clippy::too_many_arguments)]
     async fn pty_request(

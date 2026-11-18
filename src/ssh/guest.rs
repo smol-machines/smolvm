@@ -1,6 +1,6 @@
 //! Bridge SSH channels to the actual agent; callbacks never wait on guest I/O.
 use crate::agent::{
-    interactive_control::{Action, Builtin, Request, Session, Terminal, TCP_CAPABILITY},
+    interactive_control::{Action, Builtin, Request, Session, Terminal},
     interactive_input, AgentClient, AgentManager, InteractiveInput, InteractiveOutput,
 };
 use russh::{server, ChannelId, ChannelWriteHalf};
@@ -34,6 +34,7 @@ impl Drop for AbortOnDrop {
 }
 
 pub(super) enum Operation {
+    Sftp,
     Execute {
         command: String,
         terminal: Option<Terminal>,
@@ -61,6 +62,7 @@ pub(super) fn start(
     let (controls, mut requests) = mpsc::channel::<Action>(16);
     let task = tokio::spawn(async move {
         let (command, terminal, env, builtin, reply) = match operation {
+            Operation::Sftp => (Vec::new(), None, Vec::new(), Some(Builtin::Sftp), None),
             Operation::Execute {
                 command,
                 terminal,
@@ -81,6 +83,7 @@ pub(super) fn start(
             ),
         };
         let forwarding = reply.is_some();
+        let capability = builtin.as_ref().map(Builtin::capability);
         let accepted = Arc::new(AtomicBool::new(false));
         let Ok((input, input_rx)) = interactive_input(8) else {
             if let Some(reply) = reply {
@@ -111,17 +114,17 @@ pub(super) fn start(
                         .get_vm(&machine)?
                         .ok_or_else(|| anyhow::anyhow!("selected machine no longer exists"))?;
                     let target = crate::workload::machine_target(&record);
-                    // A TCP relay needs the workload's namespaces and identity,
-                    // but never dereferences its host secrets or credential store.
-                    let mut environment = if forwarding { record.env.clone() } else { crate::secrets::record_env_with_secrets(&record)? };
+                    // Builtins need the workload's namespaces and identity,
+                    // but never dereference its host secrets or credential store.
+                    let mut environment = if capability.is_some() { record.env.clone() } else { crate::secrets::record_env_with_secrets(&record)? };
                     for (key, value) in env {
                         environment.retain(|(existing, _)| existing != &key);
                         environment.push((key, value));
                     }
                     let manager = AgentManager::for_vm(&machine)?;
                     let mut client = AgentClient::connect(manager.vsock_socket())?;
-                    if forwarding {
-                        anyhow::ensure!(client.supports_capability(TCP_CAPABILITY)?, "this running machine needs an updated runtime for SSH forwarding");
+                    if let Some(capability) = capability {
+                        anyhow::ensure!(client.supports_capability(capability)?, "this running machine needs an updated runtime for this SSH operation");
                     }
                     Ok(client.vm_exec_controlled_io(
                         Session {

@@ -7,6 +7,9 @@ pub const CAPABILITY: &str = "vm-exec-control-v1";
 /// Controlled connections originate inside the selected workload's namespaces.
 pub const TCP_CAPABILITY: &str = "vm-exec-tcp-v1";
 
+/// SFTP runs with the selected workload's filesystem and user identity.
+pub const SFTP_CAPABILITY: &str = "vm-exec-sftp-v1";
+
 /// An interactive VM command whose controls do not share its stdin stream.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -42,6 +45,8 @@ pub struct Session {
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
 pub enum Builtin {
+    /// Serve SFTP v3 on standard input/output without image-provided tools.
+    Sftp,
     /// Connect from the guest, reading raw stdin and writing framed TCP events.
     TcpConnect {
         /// Destination resolved by the guest, never by the host.
@@ -54,6 +59,7 @@ impl Builtin {
     /// Reject malformed destinations before acquiring guest resources.
     pub fn validate(&self) -> Result<(), &'static str> {
         match self {
+            Self::Sftp => Ok(()),
             Self::TcpConnect { host, port }
                 if !host.is_empty()
                     && host.len() <= 253
@@ -65,6 +71,14 @@ impl Builtin {
                 Ok(())
             }
             _ => Err("invalid TCP destination"),
+        }
+    }
+
+    /// Capability required before sending this operation to a running guest.
+    pub fn capability(&self) -> &'static str {
+        match self {
+            Self::Sftp => SFTP_CAPABILITY,
+            Self::TcpConnect { .. } => TCP_CAPABILITY,
         }
     }
 }
