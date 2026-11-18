@@ -773,6 +773,7 @@ mod tests {
                 read_only: true,
                 staged: false,
                 recorded_ownership: false,
+                owner: None,
             };
             let err = HostMount::validate(&mount).unwrap_err().to_string();
             assert!(
