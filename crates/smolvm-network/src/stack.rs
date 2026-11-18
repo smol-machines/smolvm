@@ -146,8 +146,9 @@ pub struct VirtioPollConfig {
     pub host_service: Option<crate::GatewayHostService>,
     /// Host interceptor and the outbound streams routed through it.
     pub intercept: Option<crate::StreamInterception>,
-    /// Drop guest UDP to port 443 unless `--allow-udp` admits it.
-    pub deny_quic: bool,
+    /// The machine has HTTPS request rules: drop guest UDP to port 443 unless
+    /// `--allow-udp` admits it, and answer DNS HTTPS-record queries empty.
+    pub request_rules: bool,
     /// IP-level MTU.
     pub mtu: usize,
 }
@@ -302,6 +303,7 @@ fn run_network_stack(
     let dns_routing = DnsRouting {
         upstream: config.upstream_dns,
         gateway: config.gateway_ipv4,
+        hide_https_records: config.request_rules,
         #[cfg(unix)]
         switch: switch.clone(),
     };
@@ -519,7 +521,7 @@ fn run_network_stack(
                     // the machine's egress audit trail (`read_egress_denials`).
                     // QUIC would carry HTTPS past the request-rule interceptor,
                     // so only `--allow-udp` admits it; clients fall back to TCP.
-                    let mut relay_allowed = if config.deny_quic && destination.port() == 443 {
+                    let mut relay_allowed = if config.request_rules && destination.port() == 443 {
                         datagram_egress.udp_rule_allows(destination.ip(), 443)
                     } else {
                         udp_relay::should_relay_udp(destination, &datagram_egress)
@@ -1086,6 +1088,8 @@ impl DnsGateway {
 struct DnsRouting {
     upstream: Ipv4Addr,
     gateway: Ipv4Addr,
+    /// Answer HTTPS-record queries empty (the machine has request rules).
+    hide_https_records: bool,
     /// The container switch, whose networks' names this machine resolves.
     #[cfg(unix)]
     switch: Option<crate::switch::SwitchHandle>,
@@ -1148,6 +1152,11 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, routing: &DnsRouting)
                 crate::switch::NAME_TTL_SECS,
             ));
         }
+    }
+    // Without HTTPS records clients skip Encrypted Client Hello, so request
+    // rules still see the server name.
+    if routing.hide_https_records && dns::question_type(query) == Some(dns::DNS_TYPE_HTTPS) {
+        return DnsDecision::Immediate(dns::error_response(query, 0));
     }
     if !egress.dns_filter_active() {
         let name = dns::question_name(query).unwrap_or_default();
@@ -1729,6 +1738,34 @@ mod fragment_tests;
 mod tests {
     use super::*;
 
+    #[test]
+    fn request_rules_answer_https_records_empty_so_clients_skip_ech() {
+        let routing = |hide_https_records| DnsRouting {
+            upstream: Ipv4Addr::new(1, 1, 1, 1),
+            gateway: Ipv4Addr::new(100, 96, 0, 1),
+            hide_https_records,
+            #[cfg(unix)]
+            switch: None,
+        };
+        // `a.com`, then the question type and class IN.
+        let query = |qtype: u8| {
+            [
+                &[0, 1, 1, 0, 0, 1, 0, 0, 0, 0, 0, 0][..],
+                b"\x01a\x03com\0",
+                &[0, qtype, 0, 1],
+            ]
+            .concat()
+        };
+        let forwarded = |qtype, hide| {
+            let decision =
+                classify_dns_query(&query(qtype), &EgressPolicy::unrestricted(), &routing(hide));
+            matches!(decision, DnsDecision::Forward { .. })
+        };
+        assert!(!forwarded(65, true), "HTTPS records answered empty");
+        assert!(forwarded(1, true), "addresses still resolve");
+        assert!(forwarded(65, false), "unchanged without rules");
+    }
+
     fn initial_tcp_sequence(seed: u64) -> i32 {
         let config = VirtioPollConfig {
             gateway_mac: [2, 0, 0, 0, 0, 1],
@@ -1743,7 +1780,7 @@ mod tests {
             upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
-            deny_quic: false,
+            request_rules: false,
             mtu: 1500,
         };
         let queues = NetworkFrameQueues::shared(32);

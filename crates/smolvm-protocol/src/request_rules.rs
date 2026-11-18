@@ -12,8 +12,9 @@
 //! The request path is canonicalized before matching, so an alternate spelling
 //! cannot slip past a deny: the query and fragment are dropped, `%XX` octets
 //! are decoded once (an encoded `/` splits a segment; an invalid escape stays
-//! literal), `.` and `..` are resolved per RFC 3986 (never above the root),
-//! and repeated slashes are ignored.
+//! literal), `\` splits a segment like `/` and `;` parameters are dropped (as
+//! IIS and Tomcat read them), `.` and `..` are resolved per RFC 3986 (never
+//! above the root), and repeated slashes are ignored.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,7 +88,8 @@ impl RequestRule {
 
     /// Check a rule built from a Smolfile or API body as [`Self::parse`]
     /// checks the CLI form: at least one valid host, method tokens, and paths
-    /// starting with `/`, without `%`, using `*` only as a whole segment.
+    /// starting with `/`, without `%`, `?`, `#`, `;` or `\`, using `*` only as
+    /// a whole segment.
     pub fn validate(&self) -> Result<(), String> {
         if self.hosts.is_empty() {
             return Err("names no host".into());
@@ -113,6 +115,10 @@ impl RequestRule {
                 return Err(format!(
                     "path {path:?} must not contain %; write it decoded, as it is matched"
                 ));
+            }
+            // Matching drops these from a request path, so such a rule never matches.
+            if path.contains(['?', '#', ';', '\\']) {
+                return Err(format!("path {path:?} must not contain ?, #, ; or \\"));
             }
             if let Some(segment) = path
                 .split('/')
@@ -196,8 +202,8 @@ fn percent_decode(s: &str) -> String {
 /// segments resolved.
 fn canonical_segments(decoded: &str) -> Vec<&str> {
     let mut out = Vec::new();
-    for seg in decoded.split('/') {
-        match seg {
+    for seg in decoded.split(['/', '\\']) {
+        match seg.split(';').next().unwrap_or("") {
             "" | "." => {}
             ".." => {
                 out.pop();
@@ -360,6 +366,11 @@ mod tests {
         let rules = [deny("a.com/admin")];
         assert!(is_deny(decide(&rules, "a.com", "GET", "/x/../admin")));
         assert!(is_deny(decide(&rules, "a.com", "GET", "/x/%2e%2e/admin")));
+        assert!(is_deny(decide(&rules, "a.com", "GET", "/admin;x=1")));
+        // Tomcat serves `..;` and IIS `\` as `..`, so neither leaves an allow.
+        let rules = [allow("a.com/public/**")];
+        assert!(is_deny(decide(&rules, "a.com", "GET", "/public/..;/admin")));
+        assert!(is_deny(decide(&rules, "a.com", "GET", "/public/..\\admin")));
     }
 
     #[test]
@@ -491,6 +502,8 @@ mod tests {
             ("a.com/***", "whole segment"),
             ("a.com/admin%2Fusers", "must not contain %"),
             ("a.com/%61dmin", "must not contain %"),
+            ("a.com/x?debug=1", "must not contain ?"),
+            ("a.com/x;v=1", "must not contain ?"),
         ] {
             let error = RequestRule::parse(Action::Deny, bad).unwrap_err();
             assert!(error.contains(why), "{bad}: {error}");
