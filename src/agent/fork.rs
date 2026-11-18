@@ -2664,6 +2664,10 @@ pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<
 /// record + copy-on-write disks exist on disk. The caller boots the clone from
 /// `snapshot_dir`, then calls [`rejuvenate_clone`].
 pub struct PreparedFork {
+    /// Retain through identity reset, readiness publication, and rollback.
+    /// Shared ownership lets batch callers keep every child locked until the
+    /// whole transaction finishes, including children already booted by workers.
+    pub startup_lock: std::sync::Arc<ForkSourceLock>,
     /// Directory holding the golden's checkpoint + memfd manifest. Pass it as the
     /// clone's `LaunchFeatures::snapshot_dir` to boot from it instead of cold.
     pub snapshot_dir: PathBuf,
@@ -2854,6 +2858,7 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut names = HashSet::with_capacity(specs.len());
+    let mut startup_locks = Vec::with_capacity(specs.len());
     let mut reserved_ports = ReservedPorts::default();
     for spec in specs {
         validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
@@ -2876,6 +2881,20 @@ pub(crate) fn prepare_forks_reusing(
                 format!("machine '{}' already exists", spec.clone),
             ));
         }
+        // The caller already owns the source lock. Never block while acquiring
+        // targets: overlapping or reciprocal requests must fail instead of
+        // each waiting for a name held by the other. Reserve every target
+        // before changing the source or publishing any clone record.
+        let lock = try_lock_fork_source(spec.clone)?.ok_or_else(|| {
+            Error::agent_conflict(
+                "prepare fork",
+                format!(
+                    "machine '{}' has an active lifecycle operation; retry the fork",
+                    spec.clone
+                ),
+            )
+        })?;
+        startup_locks.push(std::sync::Arc::new(lock));
         for (host, _) in spec.pinned_ports {
             if !reserved_ports.tcp.insert(*host) {
                 return Err(Error::config(
@@ -3287,7 +3306,9 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut prepared = Vec::with_capacity(specs.len());
-    for spec in specs {
+    // Keep the reservations here as well as in each returned clone: a failed
+    // preparation drops its own guard before removing partial files/records.
+    for (spec, startup_lock) in specs.iter().zip(startup_locks.iter().cloned()) {
         match prepare_clone_from_snapshot(
             db,
             golden,
@@ -3296,6 +3317,7 @@ pub(crate) fn prepare_forks_reusing(
             &snapshot_dir,
             spec,
             &mut reserved_ports,
+            startup_lock,
         ) {
             Ok(clone) => prepared.push(clone),
             Err(error) => {
@@ -3463,6 +3485,7 @@ pub(crate) fn retained_snapshot_matches_golden(
         && reusable_snapshot_path(snapshot_root, &snapshot.path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_clone_from_snapshot(
     db: &SmolvmDb,
     golden: &str,
@@ -3471,6 +3494,7 @@ fn prepare_clone_from_snapshot(
     snapshot_dir: &Path,
     spec: &ForkSpec<'_>,
     reserved_ports: &mut ReservedPorts,
+    startup_lock: std::sync::Arc<ForkSourceLock>,
 ) -> Result<PreparedFork> {
     let clone = spec.clone;
     let clone_dir = vm_data_dir(clone);
@@ -3599,6 +3623,7 @@ fn prepare_clone_from_snapshot(
             "fork: clone disk overlays created"
         );
         Ok(PreparedFork {
+            startup_lock,
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,

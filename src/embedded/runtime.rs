@@ -884,6 +884,7 @@ impl EmbeddedRuntime {
                 parallel,
                 options.source_policy,
                 options.keep_machine_id,
+                if options.detached { Some(false) } else { None },
             )?;
             if options.detached {
                 for (_, handle) in started {

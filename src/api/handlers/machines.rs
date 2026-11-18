@@ -5201,6 +5201,9 @@ async fn boot_prepared_fork_inner(
     prep: crate::agent::fork::PreparedFork,
     boot: PreparedForkBoot,
 ) -> Result<MachineInfo, ApiError> {
+    // The blocking boot owns `prep`, but publication happens after it returns.
+    // Keep other processes out through both phases and any rollback.
+    let _startup_lock = prep.startup_lock.clone();
     let inherited_interceptor = if prep.clone_record.external_interceptor_required {
         let source = prep.clone_record.golden.as_deref().ok_or_else(|| {
             ApiError::BadRequest("intercepted branch has no source machine".into())

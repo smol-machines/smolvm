@@ -1142,6 +1142,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 
     let prep_source_continues = prep.source_continues;
     let snapshot_dir = prep.snapshot_dir.clone();
+    let _startup_lock = prep.startup_lock.clone();
     if let Err(error) = boot_prepared_fork(
         &db,
         clone,
@@ -1151,6 +1152,10 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         None,
         options.external_interceptor,
     ) {
+        return retain_failed_fork(golden, &snapshot_dir, error);
+    }
+    if let Err(error) = persist_batch_clones_running(&db, &[clone.to_owned()]) {
+        teardown_fork_clone(&db, clone);
         return retain_failed_fork(golden, &snapshot_dir, error);
     }
     if options.wait_ready.is_some() && !options.hold {
@@ -1268,6 +1273,10 @@ pub fn fork_vm_batch(
         clones.len()
     );
     let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs, source_policy)?;
+    let _startup_locks: Vec<_> = prepared
+        .iter()
+        .map(|prep| prep.startup_lock.clone())
+        .collect();
     let source_continues = prepared[0].source_continues;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
@@ -1516,7 +1525,7 @@ fn boot_prepared_fork(
     let clone_forkable = prep.clone_record.forkable;
     eprintln!("Booting child '{clone}' from the checkpoint...");
     let mut start = || {
-        start_vm_named_with_db(
+        start_vm_named_locked(
             db,
             clone,
             None,
@@ -1527,7 +1536,7 @@ fn boot_prepared_fork(
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
-                defer_running_persistence: retry_gate.is_some(),
+                defer_running_persistence: true,
                 ..Default::default()
             },
             // A clone inherits the golden's running workload from the snapshot
@@ -1537,7 +1546,9 @@ fn boot_prepared_fork(
                 mediated_egress: prep.clone_record.mediated_egress_required,
                 ..Default::default()
             },
+            &prep.startup_lock,
         )
+        .map(|stop_after_workload| debug_assert!(!stop_after_workload))
     };
     let started = match retry_gate {
         Some(gate) => retry_once_serialized(gate, &mut start, |error| {
@@ -1773,11 +1784,45 @@ fn start_vm_named_with_db(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     from_snapshot: bool,
-    mut fork: ForkLaunch,
+    fork: ForkLaunch,
     options: StartOptions,
 ) -> smolvm::Result<()> {
-    use smolvm::Error;
     let startup_lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let stop_after_workload = start_vm_named_locked(
+        db,
+        name,
+        proxy,
+        no_proxy,
+        from_snapshot,
+        fork,
+        options,
+        &startup_lock,
+    )?;
+    drop(startup_lock);
+    if stop_after_workload {
+        println!(
+            "Workload exited; stopping machine '{}' (stop_on_exit)",
+            name
+        );
+        return stop_vm_named(name);
+    }
+    Ok(())
+}
+
+/// The caller retains its guard through any fork finalization. A bare workload
+/// requests stop separately so stop can acquire the same lock after release.
+#[allow(clippy::too_many_arguments)]
+fn start_vm_named_locked(
+    db: &SmolvmDb,
+    name: &str,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    from_snapshot: bool,
+    mut fork: ForkLaunch,
+    options: StartOptions,
+    _startup_lock: &smolvm::agent::fork::ForkSourceLock,
+) -> smolvm::Result<bool> {
+    use smolvm::Error;
     let StartOptions {
         no_workload,
         external_interceptor,
@@ -1836,7 +1881,7 @@ fn start_vm_named_with_db(
             }
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
-            return Ok(());
+            return Ok(false);
         }
         RecordState::Unreachable => {
             // Zombie VMM: kill it, clear the record, fall through to
@@ -2276,15 +2321,7 @@ fn start_vm_named_with_db(
 
     // Keep VM running (persistent)
     manager.detach();
-    drop(startup_lock);
-    if stop_after_workload {
-        println!(
-            "Workload exited; stopping machine '{}' (stop_on_exit)",
-            name
-        );
-        return stop_vm_named(name);
-    }
-    Ok(())
+    Ok(stop_after_workload)
 }
 
 /// Persist a named VM as running in the database.

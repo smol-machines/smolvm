@@ -745,6 +745,7 @@ pub fn fork_vm_batch(
     parallel: usize,
     source_policy: crate::agent::fork::ForkSourcePolicy,
     keep_machine_id: bool,
+    watch_parent: Option<bool>,
 ) -> Result<Vec<(String, VmHandle)>> {
     if clones.is_empty() {
         return Err(Error::config(
@@ -782,6 +783,12 @@ pub fn fork_vm_batch(
         })
         .collect();
     let prepared = crate::agent::fork::prepare_forks(db, golden, &specs, source_policy)?;
+    // Workers can finish at different times. Keep successful children private
+    // until all boots succeed or the complete batch has been rolled back.
+    let _startup_locks: Vec<_> = prepared
+        .iter()
+        .map(|prep| prep.startup_lock.clone())
+        .collect();
     let width = parallel.max(1).min(prepared.len());
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),
@@ -816,7 +823,7 @@ pub fn fork_vm_batch(
                                 &clone,
                                 prep,
                                 false,
-                                None,
+                                watch_parent,
                                 Some(retry_gate),
                                 keep_machine_id,
                             )
@@ -1538,7 +1545,7 @@ mod tests {
     fn embedded_batch_fork_rejects_empty_and_duplicate_groups_before_boot() {
         let db = test_db();
         assert!(
-            fork_vm_batch(&db, "missing", &[], 4, Default::default(), false)
+            fork_vm_batch(&db, "missing", &[], 4, Default::default(), false, None)
                 .err()
                 .expect("empty batch must fail")
                 .to_string()
@@ -1550,7 +1557,7 @@ mod tests {
             ("duplicate".to_string(), Vec::new()),
         ];
         assert!(
-            fork_vm_batch(&db, "missing", &clones, 4, Default::default(), false)
+            fork_vm_batch(&db, "missing", &clones, 4, Default::default(), false, None)
                 .err()
                 .expect("duplicate batch must fail")
                 .to_string()
