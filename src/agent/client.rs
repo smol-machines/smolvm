@@ -3116,6 +3116,12 @@ impl AgentClient {
         let mut pending: std::collections::VecDeque<Vec<u8>> = std::collections::VecDeque::new();
 
         let exit_code = loop {
+            // Dropping every sender means the remote peer disconnected, even
+            // if stdin is queued. Waiting to dequeue Disconnected can hang
+            // forever when the guest command is not reading its input.
+            if input.rx.is_closed() {
+                return Ok(DISCONNECT_EXIT_CODE);
+            }
             if let Some(e) = writer.take_error() {
                 return Err(Error::agent(op, format!("failed to send to agent: {}", e)));
             }
@@ -3134,6 +3140,12 @@ impl AgentClient {
                 // Every sender is gone; a closed descriptor would report ready
                 // forever. The channel says so below once it has been emptied.
                 wake_fd = -1;
+            }
+
+            // The sender may have closed while poll was asleep. Cancellation
+            // must also take precedence over reading another output frame.
+            if input.rx.is_closed() {
+                return Ok(DISCONNECT_EXIT_CODE);
             }
 
             // Drain agent output first (prevents deadlock when its send buffer fills).
@@ -6283,6 +6295,58 @@ mod interactive_input_tests {
         assert_eq!(session.join().unwrap().unwrap(), DISCONNECT_EXIT_CODE);
         // The guest sees its connection close and kills the command.
         guest.finish();
+    }
+
+    #[test]
+    fn disconnect_cancels_a_session_with_a_full_writer_queue() {
+        let (client_stream, mut peer) = UdsStream::pair().unwrap();
+        client_stream
+            .as_socket()
+            .set_send_buffer_size(4096)
+            .unwrap();
+        peer.set_read_timeout(Some(DEADLINE)).unwrap();
+        let count = WRITER_QUEUE_FRAMES + 16;
+        let (input, receiver) = interactive_input(count).unwrap();
+        let runtime = runtime();
+        for _ in 0..count {
+            runtime
+                .block_on(input.send(InteractiveInput::Stdin(vec![7; 65536])))
+                .unwrap();
+        }
+        let (finished, result) = mpsc::channel();
+        let session = std::thread::spawn(move || {
+            let value = AgentClient::from_stream(client_stream).interactive_session_io(
+                request(&["never-read-stdin"]),
+                receiver,
+                |_| {},
+                "test",
+                NEVER_MS,
+            );
+            let _ = finished.send(value);
+        });
+        let mut header = [0; 4];
+        peer.read_exact(&mut header).unwrap();
+        let mut request = vec![0; u32::from_be_bytes(header) as usize];
+        peer.read_exact(&mut request).unwrap();
+        peer.write_all(&smolvm_protocol::encode_message(&AgentResponse::Started).unwrap())
+            .unwrap();
+        // No stdin is read from the peer: one write blocks, 64 frames fill the
+        // writer queue, and the session retains another pending frame.
+        let deadline = std::time::Instant::now() + DEADLINE;
+        while input.tx.capacity() < WRITER_QUEUE_FRAMES + 2 {
+            assert!(std::time::Instant::now() < deadline, "writer did not fill");
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        drop(input);
+        let ended = result.recv_timeout(WRITER_WRITE_TIMEOUT + Duration::from_secs(2));
+        // Always release the synthetic peer before asserting, including on the
+        // unfixed implementation, so a failing test cannot leave a live worker.
+        drop(peer);
+        session.join().unwrap();
+        assert_eq!(
+            ended.expect("disconnect must bypass queued stdin").unwrap(),
+            DISCONNECT_EXIT_CODE
+        );
     }
 
     #[test]
