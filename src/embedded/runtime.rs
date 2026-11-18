@@ -976,6 +976,9 @@ impl EmbeddedRuntime {
     /// Connect to an already-running machine and cache its handle.
     pub fn connect_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            // A live agent (or cached process handle) does not mean another
+            // process has finished initialization or fork rejuvenation.
+            let _startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
                     return Ok(());

@@ -4404,7 +4404,7 @@ pub struct ExecCmd {
 
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
+        let (manager, mut client) = vm_common::connect_after_startup(&self.name)?;
 
         // Detach immediately — exec never owns the VM lifecycle. Without this,
         // any early return (failed exec, timeout, client signal) triggers
@@ -8096,8 +8096,7 @@ impl CpCmd {
             ));
         }
 
-        let (manager, mut client) =
-            vm_common::ensure_running_and_connect(&Some(machine_name.clone()))?;
+        let (manager, mut client) = vm_common::connect_after_startup(&Some(machine_name.clone()))?;
         // Detach so the VM keeps running after cp exits.
         manager.detach();
 
@@ -8295,7 +8294,7 @@ impl SyncCmd {
         }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
-        let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(name.clone()))?;
+        let (manager, mut client) = vm_common::connect_after_startup(&Some(name.clone()))?;
         // This command observes an existing persistent VM; a failed sync must
         // leave it running so the user can fix the cause and retry.
         manager.detach();

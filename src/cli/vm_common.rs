@@ -94,6 +94,17 @@ mod paused_machine_error_tests {
     }
 }
 
+/// Connect after the current startup or fork transaction has completed.
+/// A listening agent precedes saved init commands and fork rejuvenation;
+/// workload commands and file access must not observe that intermediate state.
+/// Diagnostics may use `ensure_running_and_connect` during initialization.
+pub fn connect_after_startup(
+    name: &Option<String>,
+) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
+    let _startup_lock = smolvm::agent::fork::lock_fork_source(&vm_label(name))?;
+    ensure_running_and_connect(name)
+}
+
 /// Ensure a VM is running and return a connected client.
 ///
 /// This is the common pattern used by exec commands in the machine subcommand.
@@ -102,6 +113,9 @@ pub fn ensure_running_and_connect(
     name: &Option<String>,
 ) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
     let manager = get_vm_manager(name)?;
+    // This path observes an existing process. Failed connection setup must not
+    // stop it when the manager drops before the caller receives the handle.
+    manager.detach();
     let label = vm_label(name);
     let start_hint = match name {
         Some(name) => format!("smolvm machine start --name {}", name),
