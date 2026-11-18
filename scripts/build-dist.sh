@@ -418,7 +418,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # @loader_path so libkrun always loads the dylibs bundled beside it, then
     # re-sign (install_name_tool invalidates the signature).
     RELOCATED=0
+    KRUN_INSTALL_ID="$(otool -D "$DIST_DIR/lib/libkrun.dylib" | sed -n '2p')"
     while read -r dep; do
+        # otool -L includes LC_ID_DYLIB; it is not a dependency to bundle.
+        [[ "$dep" == "$KRUN_INSTALL_ID" ]] && continue
         leaf="$(basename "$dep")"
         if [[ ! -f "$DIST_DIR/lib/$leaf" ]]; then
             echo "Error: libkrun.dylib depends on $dep but $leaf is not bundled in lib/"

@@ -220,6 +220,7 @@ pub fn remove_share(name: &str, share: &str, read_only: bool) -> Result<()> {
 }
 
 /// Live device exports, including shares bound by the container engine.
+#[cfg(unix)]
 pub(crate) fn shared_directories(name: &str, read_only: bool) -> Result<Vec<(String, PathBuf)>> {
     let reply = control(name, &format!("SHARE_LIST {}", tag(read_only)))?;
     let entries = reply.strip_prefix("OK").unwrap_or("").trim();
