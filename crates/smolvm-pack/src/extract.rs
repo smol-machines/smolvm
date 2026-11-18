@@ -1632,14 +1632,23 @@ pub fn file_identity(path: &Path) -> std::io::Result<String> {
             meta.ctime_nsec()
         ))
     }
+    // No inode or ctime here, and a copy keeps its mtime, which a caller can
+    // set anyway: the file's own path stands in for the inode. A file at
+    // another path is hashed, and whoever can replace this one controls it.
     #[cfg(not(unix))]
     {
-        let modified = meta
-            .modified()
-            .ok()
-            .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-            .map_or(0, |d| d.as_nanos());
-        Ok(format!("{}:{modified}", meta.len()))
+        let nanos = |t: std::io::Result<std::time::SystemTime>| {
+            t.ok()
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .map_or(0, |d| d.as_nanos())
+        };
+        Ok(format!(
+            "{}|{}:{}:{}",
+            fs::canonicalize(path)?.display(),
+            meta.len(),
+            nanos(meta.modified()),
+            nanos(meta.created())
+        ))
     }
 }
 
