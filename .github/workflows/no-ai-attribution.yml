@@ -8,9 +8,8 @@ on:
     types: [opened, edited, reopened, synchronize]
   push:
     branches: [main]
-  # A PR opened with the workflow token (the Nix flake bump) triggers no
-  # workflow, so its required check would never report. The bump starts this
-  # run on its branch instead; it checks that branch's commits against main.
+  # A run by hand on a branch checks its commits against main. It does not count
+  # for a PR's required check: the Nix flake bump approves its PR's held run.
   workflow_dispatch:
 
 permissions:
