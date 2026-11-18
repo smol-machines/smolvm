@@ -453,7 +453,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         // be able to open that backing file. Grant the template directory
         // read-only — it is the install dir (same trust level as SMOLVM_LIB_DIR,
         // which lives under it) and holds no secrets. A no-op for the copy path.
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = smolvm_paths::home_dir() {
             read_exec.push(home.join(".smolvm"));
         }
 

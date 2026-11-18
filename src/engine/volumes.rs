@@ -116,11 +116,18 @@ impl Volumes {
 
     /// Remove the volume and its data.
     pub(crate) fn remove(&self, store: &Store, name: &str) -> ApiResult<()> {
-        if self.records.write().remove(name).is_none() {
+        let mut records = self.records.write();
+        if !records.contains_key(name) {
             return Err(ApiError::not_found(format!("get {name}: no such volume")));
         }
-        store.remove_object("volumes", name);
-        remove_tree(&self.root.join(name));
+        // Keep the record discoverable if either deletion fails, so callers can
+        // repair the filesystem and retry. Recursive deletion may be partial.
+        remove_tree(&self.root.join(name))
+            .map_err(|e| ApiError::internal(format!("remove volume data for {name}: {e}")))?;
+        store
+            .remove_object("volumes", name)
+            .map_err(ApiError::from)?;
+        records.remove(name);
         Ok(())
     }
 
@@ -158,9 +165,14 @@ pub(crate) fn matches(volume: &VolumeRecord, filters: &Filters, in_use: bool) ->
 /// Remove a volume's directory even where a container left directories its
 /// owner may not enter (an overlayfs work directory is mode 0): those get
 /// their owner's access back first.
-fn remove_tree(path: &std::path::Path) {
-    if std::fs::remove_dir_all(path).is_ok() || !path.exists() {
-        return;
+fn remove_tree(path: &std::path::Path) -> std::io::Result<()> {
+    if std::fs::remove_dir_all(path).is_ok() {
+        return Ok(());
+    }
+    // `Path::exists` also returns false on permission errors. Check the entry
+    // itself so permission failures and dangling symlinks are not absent paths.
+    if std::fs::symlink_metadata(path).is_err_and(|e| e.kind() == std::io::ErrorKind::NotFound) {
+        return Ok(());
     }
     fn open_up(dir: &std::path::Path) {
         use std::os::unix::fs::PermissionsExt;
@@ -179,14 +191,118 @@ fn remove_tree(path: &std::path::Path) {
         }
     }
     open_up(path);
-    if let Err(e) = std::fs::remove_dir_all(path) {
-        tracing::warn!(path = %path.display(), error = %e, "could not remove a volume's directory");
-    }
+    std::fs::remove_dir_all(path)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Store, Volumes) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let volumes = Volumes::load(&store).unwrap();
+        volumes
+            .create(
+                &store,
+                Some("data"),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                false,
+            )
+            .unwrap();
+        (dir, store, volumes)
+    }
+
+    #[test]
+    fn failed_data_removal_preserves_records_for_retry() {
+        let (_dir, store, volumes) = fixture();
+        let path = volumes.root.join("data");
+        std::fs::remove_dir_all(&path).unwrap();
+        std::fs::write(&path, b"must not be orphaned").unwrap();
+        let error = volumes.remove(&store, "data").unwrap_err();
+        assert!(error.message.contains("remove volume data"));
+        assert!(volumes.get("data").is_some());
+        assert!(Volumes::load(&store).unwrap().get("data").is_some());
+        assert_eq!(std::fs::read(&path).unwrap(), b"must not be orphaned");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir_all(path.join("_data")).unwrap();
+        volumes.remove(&store, "data").unwrap();
+        assert!(volumes.get("data").is_none());
+        assert!(Volumes::load(&store).unwrap().get("data").is_none());
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn missing_volume_data_is_successfully_removed_from_inventory() {
+        let (_dir, store, volumes) = fixture();
+        std::fs::remove_dir_all(volumes.root.join("data")).unwrap();
+        volumes.remove(&store, "data").unwrap();
+        assert!(volumes.get("data").is_none());
+        assert!(Volumes::load(&store).unwrap().get("data").is_none());
+    }
+
+    #[test]
+    fn permission_errors_are_not_mistaken_for_missing_data() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_dir, store, volumes) = fixture();
+        let file = volumes.mountpoint("data").join("payload");
+        std::fs::write(&file, b"retained").unwrap();
+        std::fs::set_permissions(&volumes.root, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let result = volumes.remove(&store, "data");
+        std::fs::set_permissions(&volumes.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), b"retained");
+        assert!(volumes.get("data").is_some());
+        assert!(Volumes::load(&store).unwrap().get("data").is_some());
+        volumes.remove(&store, "data").unwrap();
+    }
+
+    #[test]
+    fn metadata_unlink_failure_preserves_records_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let (_dir, store, volumes) = fixture();
+        std::fs::remove_dir_all(volumes.root.join("data")).unwrap();
+        std::fs::set_permissions(&volumes.root, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = volumes.remove(&store, "data");
+        std::fs::set_permissions(&volumes.root, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(volumes.get("data").is_some());
+        assert!(Volumes::load(&store).unwrap().get("data").is_some());
+        volumes.remove(&store, "data").unwrap();
+        assert!(Volumes::load(&store).unwrap().get("data").is_none());
+    }
+
+    #[test]
+    fn removal_does_not_follow_volume_symlinks() {
+        use std::os::unix::fs::symlink;
+        let (_dir, store, volumes) = fixture();
+        let outside = tempfile::tempdir().unwrap();
+        let payload = outside.path().join("payload");
+        std::fs::write(&payload, b"unrelated data").unwrap();
+        symlink(outside.path(), volumes.mountpoint("data").join("linked")).unwrap();
+        volumes.remove(&store, "data").unwrap();
+        assert_eq!(std::fs::read(&payload).unwrap(), b"unrelated data");
+        volumes
+            .create(
+                &store,
+                Some("data"),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                false,
+            )
+            .unwrap();
+        std::fs::remove_dir_all(volumes.root.join("data")).unwrap();
+        symlink(outside.path(), volumes.root.join("data")).unwrap();
+        volumes.remove(&store, "data").unwrap();
+        assert_eq!(std::fs::read(&payload).unwrap(), b"unrelated data");
+    }
 
     #[test]
     fn a_volume_with_closed_directories_is_removed() {
@@ -201,7 +317,7 @@ mod tests {
         )
         .unwrap();
         std::fs::set_permissions(vol.join("work"), std::fs::Permissions::from_mode(0o000)).unwrap();
-        remove_tree(&vol);
+        remove_tree(&vol).unwrap();
         assert!(!vol.exists());
     }
 

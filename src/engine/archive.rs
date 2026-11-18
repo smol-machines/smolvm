@@ -34,6 +34,15 @@ fn path_param(q: &std::collections::HashMap<String, String>) -> ApiResult<String
     })
 }
 
+/// Docker distinguishes copying a directory from copying its contents (`dir/.`).
+/// Guest paths use `/` on every host; `Path::file_name` would erase the final dot.
+fn archive_basename(path: &str) -> Option<&str> {
+    path.trim_end_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|name| !name.is_empty())
+}
+
 /// A machine to talk to for the container's files: its own when it runs,
 /// otherwise one booted for this copy, which [`FilesMachine::finish`] stops
 /// again. A booted one holds the container's lifecycle lock, so a start
@@ -155,7 +164,7 @@ async fn stat(
     target: &WorkloadTarget,
     path: &str,
 ) -> ApiResult<Option<(String, u64)>> {
-    if path == "/" {
+    if std::path::Path::new(path) == std::path::Path::new("/") {
         return Ok(Some(("dir".into(), 0)));
     }
     let p = std::path::Path::new(path);
@@ -197,10 +206,7 @@ fn stat_header(path: &str, kind: &str, size: u64) -> HeaderValue {
         "symlink" => (1 << 27) | 0o777,
         _ => 0o644,
     };
-    let name = std::path::Path::new(path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| "/".into());
+    let name = archive_basename(path).unwrap_or("/");
     let json = serde_json::json!({
         "name": name, "size": size, "mode": mode,
         "mtime": super::util::now_rfc3339(), "linkTarget": "",
@@ -250,10 +256,7 @@ pub(crate) async fn get_archive(
     let (kind, size) = stat(&machine.socket, &target, &path)
         .await?
         .ok_or_else(|| no_such_path(&path))?;
-    let name = std::path::Path::new(&path)
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_else(|| ".".into());
+    let name = archive_basename(&path).unwrap_or(".").to_owned();
     let request = if kind == "dir" {
         AgentRequest::ArchiveDirectory {
             path: path.clone(),
@@ -582,6 +585,42 @@ pub(crate) async fn export(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn directory_contents_keep_the_trailing_dot_in_metadata_and_archive() {
+        use base64::Engine as _;
+        let mut input = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(2);
+        header.set_mode(0o751);
+        input
+            .append_data(&mut header, "./file", &b"hi"[..])
+            .unwrap();
+        let input = input.into_inner().unwrap();
+        for (path, name, copied_file) in [
+            ("/app/project", "project", "project/file"),
+            ("/app/project/", "project", "project/file"),
+            ("/app/project/.", ".", "file"),
+            ("/app/project/./", ".", "file"),
+            ("/.", ".", "file"),
+        ] {
+            let stat = stat_header(path, "dir", 0);
+            let decoded = base64::engine::general_purpose::STANDARD
+                .decode(stat.as_bytes())
+                .unwrap();
+            let stat: serde_json::Value = serde_json::from_slice(&decoded).unwrap();
+            assert_eq!(stat["name"], name, "{path}");
+            let output = prefix_archive(&input[..], archive_basename(path).unwrap()).unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            tar::Archive::new(&output[..])
+                .unpack(destination.path())
+                .unwrap();
+            assert_eq!(
+                std::fs::read(destination.path().join(copied_file)).unwrap(),
+                b"hi"
+            );
+        }
+    }
 
     #[test]
     fn a_directory_archive_gets_its_name_at_the_top() {

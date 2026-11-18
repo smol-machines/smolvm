@@ -1613,6 +1613,13 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             }
         }
     }
+    if resolved.network_backend == Some(NetworkBackend::Host)
+        && (caller == Caller::Api
+            || resolved.auto_ports.is_some()
+            || resolved.credentials.is_some())
+    {
+        return Err(Error::config("host network", "host networking requires a trusted local caller without automatic port publishing or credential bindings"));
+    }
     let resources = resolved.vm_resources();
     resources.validate()?;
     crate::network::validate_requested_network_backend(

@@ -332,6 +332,12 @@ async fn dispatch_inner(
             *req.uri_mut() = format!("/containers/{id}{suffix}{query}")
                 .parse()
                 .map_err(internal)?;
+            // A workload may still be owned by a pre-upgrade supervisor.
+            // Sample its guest through the current adapter instead of letting
+            // an old supervisor return VM-wide or placeholder counters.
+            if req.method() == axum::http::Method::GET && suffix == "/stats" {
+                return Ok(next.run(req).await);
+            }
             target = Some(id);
         }
     } else {

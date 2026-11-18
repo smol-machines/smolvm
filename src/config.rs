@@ -1603,7 +1603,13 @@ impl VmRecord {
         // cannot take one.
         let restricted =
             next.allowed_cidrs.is_some() || next.dns_filter_hosts.is_some() || adds_rules;
-        if restricted && after == crate::network::EffectiveNetworkBackend::Tsi {
+        if restricted
+            && matches!(
+                after,
+                crate::network::EffectiveNetworkBackend::Tsi
+                    | crate::network::EffectiveNetworkBackend::Host
+            )
+        {
             return Err(crate::Error::config(
                 "egress policy",
                 format!(

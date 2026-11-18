@@ -20,6 +20,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+#[path = "directory_write.rs"]
+mod directory_write;
+
 /// Metadata applied to an uploaded file after it lands: permissions and
 /// ownership. Ownership matters for non-root workload images — a root-owned
 /// upload is unreadable/unwritable to the user the container actually runs as.

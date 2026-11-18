@@ -14,7 +14,8 @@ name: Publish crates to crates.io
 #
 # Publishes in dependency order (a dependency must be on crates.io before a
 # dependent's `version = "x"` requirement can resolve):
-#   smolvm-protocol, smolvm-network  (leaves)
+#   smolvm-smoltcp, smolvm-protocol, smolvm-paths (leaves)
+#   → smolvm-network                 (needs the patched stack)
 #   → smolvm-pack, smolvm-smolfile   (need protocol)
 #   → smolvm-registry                (needs pack)
 #   → smolvm-checkpoint              (needs pack; ships the checkpoint format spec)
@@ -62,15 +63,15 @@ jobs:
 
           # Dependency order: a dep must be published (and indexed) before a
           # dependent, so its `version = "x"` requirement resolves on crates.io.
-          crates=(smolvm-protocol smolvm-network smolvm-pack smolvm-smolfile smolvm-registry smolvm-checkpoint)
+          crate_paths=(vendor/smoltcp crates/smolvm-protocol crates/smolvm-paths crates/smolvm-network crates/smolvm-pack crates/smolvm-smolfile crates/smolvm-registry crates/smolvm-checkpoint)
 
-          for c in "${crates[@]}"; do
-            name="$(grep -m1 '^name' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
-            ver="$(grep -m1 '^version' "crates/$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+          for c in "${crate_paths[@]}"; do
+            name="$(grep -m1 '^name' "$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
+            ver="$(grep -m1 '^version' "$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
             echo "::group::$name $ver"
 
             if [ "${DRY_RUN:-false}" = "true" ]; then
-              cargo publish -p "$name" --dry-run
+              cargo publish --manifest-path "$c/Cargo.toml" --dry-run
               echo "::endgroup::"
               continue
             fi
@@ -86,7 +87,7 @@ jobs:
 
             # `cargo publish` blocks until the new version is in the registry
             # index, so the next (dependent) crate can resolve it.
-            cargo publish -p "$name"
+            cargo publish --manifest-path "$c/Cargo.toml"
             echo "published $name $ver"
             echo "::endgroup::"
           done
