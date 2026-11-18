@@ -97,6 +97,7 @@ pub mod embedded;
 /// The Docker Engine API, answered by smolvm: every container is a machine.
 #[cfg(unix)]
 pub mod engine;
+pub mod engine_cli;
 /// Local image archives shared with managed Kubernetes clusters.
 pub mod image_feed;
 pub mod image_seed;

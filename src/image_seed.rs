@@ -1077,6 +1077,9 @@ mod imp {
             if trust_host_certs {
                 create.push("--trust-host-certs");
             }
+            // Frontends can keep setup work out of the user's environments
+            // list without guessing from a machine's name.
+            create.extend(["--label", "smolvm.internal/image-seed=1"]);
             // A small disk's seed is built on a disk of that size, so the
             // filesystem the guest grows into it fits the machines it seeds.
             let small_size = small_gb.map(|gb| gb.to_string());
@@ -1537,7 +1540,7 @@ mod imp {
         use std::io::Write;
         use std::os::unix::process::CommandExt;
         let seed_error = |e: std::io::Error| Error::config("image seed", e.to_string());
-        let mut command = std::process::Command::new(exe);
+        let mut command = crate::engine_cli::command(exe);
         command
             .args(args)
             .env("SMOLVM_IMAGE_SEEDS", "0")

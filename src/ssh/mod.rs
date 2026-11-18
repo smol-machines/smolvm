@@ -84,22 +84,13 @@ pub fn proxy(machine: &str) -> Result<()> {
 /// Internal one-shot startup owner. EOF means its invoking proxy has gone.
 #[doc(hidden)]
 pub fn start_owned(machine: &str) -> Result<()> {
-    start_owned_with_prefix(machine, &[])
-}
-
-/// Internal startup owner for a CLI embedding the engine under an argument prefix.
-/// The prefix selects the embedding CLI's native engine commands, bypassing any
-/// cloud routing or other interpretation of the already selected local name.
-#[doc(hidden)]
-pub fn start_owned_with_prefix(machine: &str, engine_prefix: &[&str]) -> Result<()> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(4)
         .build()?;
     let result = runtime.block_on(async {
         let mut interrupts = startup::Interrupts::new()?;
-        let _ = startup::prepare_owned(machine, tokio::io::stdin(), &mut interrupts, engine_prefix)
-            .await?;
+        let _ = startup::prepare_owned(machine, tokio::io::stdin(), &mut interrupts).await?;
         Ok(())
     });
     runtime.shutdown_background();

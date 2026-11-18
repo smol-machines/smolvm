@@ -1423,7 +1423,7 @@ fn ensure_init_layer(
 /// user's terminal; on failure the captured stdout and stderr tails are surfaced
 /// in the error.
 fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
-    let out = std::process::Command::new(exe)
+    let out = smolvm::engine_cli::command(exe)
         .args(args)
         .output()
         .map_err(|e| smolvm::Error::config("init-layer bake", e.to_string()))?;

@@ -125,12 +125,12 @@ pub(super) async fn prepare<R: AsyncRead + Unpin>(
                 }
             }
         }
-        let mut command = Command::new(std::env::current_exe()?);
+        let mut command = Command::from(crate::engine_cli::command(&std::env::current_exe()?));
         command.args(["machine", "ssh-start", "--name", machine]);
         supervised_start(command, input, interrupts).await
     }
     #[cfg(not(unix))]
-    prepare_owned(machine, input, interrupts, &[]).await
+    prepare_owned(machine, input, interrupts).await
 }
 
 /// The pipe writer belongs only to the SSH proxy. Even SIGKILL closes it,
@@ -190,7 +190,6 @@ pub(super) async fn prepare_owned<R: AsyncRead + Unpin>(
     machine: &str,
     mut input: R,
     interrupts: &mut Interrupts,
-    engine_prefix: &[&str],
 ) -> Result<Chain<Cursor<Vec<u8>>, R>> {
     let read_record = || {
         crate::db::SmolvmDb::open()?
@@ -228,9 +227,8 @@ pub(super) async fn prepare_owned<R: AsyncRead + Unpin>(
     } else {
         "start"
     };
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::from(crate::engine_cli::command(&std::env::current_exe()?));
     command
-        .args(engine_prefix)
         .args(["machine", action, "--name", machine])
         .stdin(Stdio::null())
         .stdout(Stdio::null())
