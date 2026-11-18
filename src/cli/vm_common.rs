@@ -94,6 +94,17 @@ mod paused_machine_error_tests {
     }
 }
 
+/// Connect after the current startup or fork transaction has completed.
+/// A listening agent precedes saved init commands and fork rejuvenation;
+/// workload commands and file access must not observe that intermediate state.
+/// Diagnostics may use `ensure_running_and_connect` during initialization.
+pub fn connect_after_startup(
+    name: &Option<String>,
+) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
+    let _startup_lock = smolvm::agent::fork::lock_fork_source(&vm_label(name))?;
+    ensure_running_and_connect(name)
+}
+
 /// Ensure a VM is running and return a connected client.
 ///
 /// This is the common pattern used by exec commands in the machine subcommand.
@@ -102,6 +113,9 @@ pub fn ensure_running_and_connect(
     name: &Option<String>,
 ) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
     let manager = get_vm_manager(name)?;
+    // This path observes an existing process. Failed connection setup must not
+    // stop it when the manager drops before the caller receives the handle.
+    manager.detach();
     let label = vm_label(name);
     let start_hint = match name {
         Some(name) => format!("smolvm machine start --name {}", name),
@@ -311,10 +325,31 @@ pub(crate) fn run_init_commands(
     init: &[String],
     context: InitRunContext<'_>,
 ) -> smolvm::Result<()> {
+    run_init_commands_with_output(client, init, context, true)
+}
+
+/// Run the same initialization without writing to the embedding application's
+/// terminal or enabling a PTY; retain command output for failure diagnostics.
+pub(crate) fn run_init_commands_captured(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    context: InitRunContext<'_>,
+) -> smolvm::Result<()> {
+    run_init_commands_with_output(client, init, context, false)
+}
+
+fn run_init_commands_with_output(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    context: InitRunContext<'_>,
+    stream_output: bool,
+) -> smolvm::Result<()> {
     if init.is_empty() {
         return Ok(());
     }
-    println!("Running {} init command(s)...", init.len());
+    if stream_output {
+        println!("Running {} init command(s)...", init.len());
+    }
     for (i, cmd) in init.iter().enumerate() {
         if let Some(image) = context.image {
             let defaults = resolve_image_runtime_defaults(
@@ -329,18 +364,30 @@ pub(crate) fn run_init_commands(
                 &defaults,
                 context.record_mounts,
                 context.overlay_id,
-            )
-            .with_tty(true);
+            );
             // Interactive run streams the command's output live so the user sees
             // progress (a slow compile, apt-get, etc.). The output isn't buffered
             // here, so on a non-zero exit we report just the code — the detail was
             // already printed above. Not checking the exit code would silently
             // ignore a failed init command (e.g. a broken `apt install`).
-            let exit_code = client.run_interactive(config)?;
+            let (exit_code, stdout, stderr) = if stream_output {
+                (
+                    client.run_interactive(config.with_tty(true))?,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                client.run_non_interactive(config)?
+            };
             if exit_code != 0 {
                 return Err(smolvm::Error::agent(
                     "init",
-                    format_init_failure(i, exit_code, "", ""),
+                    format_init_failure(
+                        i,
+                        exit_code,
+                        &String::from_utf8_lossy(&stdout),
+                        &String::from_utf8_lossy(&stderr),
+                    ),
                 ));
             }
         } else {
@@ -620,23 +667,7 @@ pub fn resolve_secret_refs_for_env(
 /// create time. The resolved plaintext stays in the returned vector and never
 /// touches the record or the DB.
 pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
-    let mut env = record.env.clone();
-    // A variable bound to a credential never carries plaintext into the guest:
-    // its secret reference feeds the host interceptor and the guest gets the
-    // placeholder instead.
-    let (refs, credential_env) = smolvm::credentials::workload_env(
-        record.credential_policy.as_ref(),
-        &record.credential_placeholders,
-        &record.secret_refs,
-    );
-    env.extend(smolvm::secrets::expose_into_env(
-        smolvm::secrets::resolve_refs_to_env(
-            &refs,
-            smolvm::secrets::ResolutionScope::RecordReplay,
-        )?,
-    ));
-    env.extend(credential_env);
-    Ok(env)
+    smolvm::secrets::record_env_with_secrets(record)
 }
 
 /// The `run` counterpart of [`record_env_with_secrets`]: resolve the create
@@ -1125,6 +1156,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 
     let prep_source_continues = prep.source_continues;
     let snapshot_dir = prep.snapshot_dir.clone();
+    let _startup_lock = prep.startup_lock.clone();
     if let Err(error) = boot_prepared_fork(
         &db,
         clone,
@@ -1134,6 +1166,10 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         None,
         options.external_interceptor,
     ) {
+        return retain_failed_fork(golden, &snapshot_dir, error);
+    }
+    if let Err(error) = persist_batch_clones_running(&db, &[clone.to_owned()]) {
+        teardown_fork_clone(&db, clone);
         return retain_failed_fork(golden, &snapshot_dir, error);
     }
     if options.wait_ready.is_some() && !options.hold {
@@ -1251,6 +1287,10 @@ pub fn fork_vm_batch(
         clones.len()
     );
     let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs, source_policy)?;
+    let _startup_locks: Vec<_> = prepared
+        .iter()
+        .map(|prep| prep.startup_lock.clone())
+        .collect();
     let source_continues = prepared[0].source_continues;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
@@ -1499,7 +1539,7 @@ fn boot_prepared_fork(
     let clone_forkable = prep.clone_record.forkable;
     eprintln!("Booting child '{clone}' from the checkpoint...");
     let mut start = || {
-        start_vm_named_with_db(
+        start_vm_named_locked(
             db,
             clone,
             None,
@@ -1510,7 +1550,7 @@ fn boot_prepared_fork(
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
-                defer_running_persistence: retry_gate.is_some(),
+                defer_running_persistence: true,
                 ..Default::default()
             },
             // A clone inherits the golden's running workload from the snapshot
@@ -1520,7 +1560,9 @@ fn boot_prepared_fork(
                 mediated_egress: prep.clone_record.mediated_egress_required,
                 ..Default::default()
             },
+            &prep.startup_lock,
         )
+        .map(|stop_after_workload| debug_assert!(!stop_after_workload))
     };
     let started = match retry_gate {
         Some(gate) => retry_once_serialized(gate, &mut start, |error| {
@@ -1756,9 +1798,44 @@ fn start_vm_named_with_db(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     from_snapshot: bool,
-    mut fork: ForkLaunch,
+    fork: ForkLaunch,
     options: StartOptions,
 ) -> smolvm::Result<()> {
+    let startup_lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let stop_after_workload = start_vm_named_locked(
+        db,
+        name,
+        proxy,
+        no_proxy,
+        from_snapshot,
+        fork,
+        options,
+        &startup_lock,
+    )?;
+    drop(startup_lock);
+    if stop_after_workload {
+        println!(
+            "Workload exited; stopping machine '{}' (stop_on_exit)",
+            name
+        );
+        return stop_vm_named(name);
+    }
+    Ok(())
+}
+
+/// The caller retains its guard through any fork finalization. A bare workload
+/// requests stop separately so stop can acquire the same lock after release.
+#[allow(clippy::too_many_arguments)]
+fn start_vm_named_locked(
+    db: &SmolvmDb,
+    name: &str,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    from_snapshot: bool,
+    mut fork: ForkLaunch,
+    options: StartOptions,
+    _startup_lock: &smolvm::agent::fork::ForkSourceLock,
+) -> smolvm::Result<bool> {
     use smolvm::Error;
     let StartOptions {
         no_workload,
@@ -1818,7 +1895,7 @@ fn start_vm_named_with_db(
             }
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
-            return Ok(());
+            return Ok(false);
         }
         RecordState::Unreachable => {
             // Zombie VMM: kill it, clear the record, fall through to
@@ -2258,14 +2335,7 @@ fn start_vm_named_with_db(
 
     // Keep VM running (persistent)
     manager.detach();
-    if stop_after_workload {
-        println!(
-            "Workload exited; stopping machine '{}' (stop_on_exit)",
-            name
-        );
-        return stop_vm_named(name);
-    }
-    Ok(())
+    Ok(stop_after_workload)
 }
 
 /// Persist a named VM as running in the database.

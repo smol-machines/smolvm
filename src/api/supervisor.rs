@@ -253,6 +253,13 @@ impl Supervisor {
         // Linux: the guarded mount is a no-op.
         let lifecycle = self.state.lifecycle_lock(name);
         let _guard = lifecycle.lock().await;
+        let source = name.to_string();
+        let _source_lock =
+            tokio::task::spawn_blocking(move || crate::agent::fork::lock_fork_source(&source))
+                .await
+                .map_err(|error| {
+                    crate::Error::agent("start operation lock", error.to_string())
+                })??;
 
         // Re-check liveness now that we hold the lock. We may have queued this
         // restart while the machine was mid-boot (an API start or an earlier

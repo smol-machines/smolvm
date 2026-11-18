@@ -328,6 +328,10 @@ pub struct LaunchFeatures {
     /// `SMOLVM_BOOT_BINARY` (so `current_exe` need not handle `_boot-vm`) yet
     /// DETACHES the VM to persist after the CLI exits (e.g. `smol start`/`fork`).
     pub watch_parent: Option<bool>,
+    /// Internal batch startup commit file, passed through the boot helper's
+    /// unused stdin on Unix; provisional children exit if their owner dies.
+    #[doc(hidden)]
+    pub startup_commit: Option<std::sync::Arc<std::fs::File>>,
     /// Kubernetes pod network namespace to attach the VM's virtio-net device to
     /// (the CNI-provisioned netns for a shim-booted pod sandbox). When set, the
     /// launcher bridges the guest NIC L2 to a tap inside this netns (tc-redirect

@@ -3847,6 +3847,19 @@ impl AgentManager {
                 self.ready_marker_name(),
             )
             .stdin(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            cmd.env_remove(super::startup_transaction::PARENT_ENV);
+            if let Some(commit) = &features.startup_commit {
+                cmd.stdin(std::process::Stdio::from(commit.try_clone().map_err(
+                    |error| Error::agent("pass startup commit", error.to_string()),
+                )?));
+                cmd.env(
+                    super::startup_transaction::PARENT_ENV,
+                    std::process::id().to_string(),
+                );
+            }
+        }
         // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
         // embedded-host launch failures can be diagnosed (normally silenced).
         //
@@ -3882,7 +3895,16 @@ impl AgentManager {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
+            if crate::ssh::ownership::managed() {
+                // Stay in the startup request's group until _boot-vm registers
+                // its exact process identity with the on-demand SSH proxy.
+                cmd.env(
+                    crate::ssh::ownership::MACHINE_ENV,
+                    self.name().unwrap_or("default"),
+                );
+            } else {
+                cmd.process_group(0);
+            }
         }
         // Windows analogue: detach the VM from the launching process's console so
         // it survives that shell closing (a closing console delivers

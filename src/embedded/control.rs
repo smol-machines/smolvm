@@ -326,6 +326,13 @@ pub(crate) fn start_vm_with_interceptor(
     name: &str,
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
+    let startup_lock = crate::agent::fork::lock_fork_source(name)?;
+    if get_record(db, name)?.paused_checkpoint.is_some() {
+        return Err(Error::agent_conflict(
+            "start machine",
+            "machine is paused; use resume",
+        ));
+    }
     crate::agent::state_probe::refuse_start_while_held(db, name)?;
     // A machine with no network cannot pull its registry image in-guest; the
     // host fetches it instead.
@@ -339,7 +346,7 @@ pub(crate) fn start_vm_with_interceptor(
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
-    let started = launch_from_record(
+    let mut started = launch_from_record(
         &record,
         LaunchFeatures {
             external_interceptor: interceptor,
@@ -347,6 +354,7 @@ pub(crate) fn start_vm_with_interceptor(
         },
     )?;
     mark_running(db, name, started.handle.child_pid())?;
+    started._startup_lock = Some(startup_lock);
     Ok(started)
 }
 
@@ -420,6 +428,7 @@ fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result
 pub(crate) struct StartedVm {
     pub(crate) handle: VmHandle,
     pub(crate) freshly_started: bool,
+    _startup_lock: Option<crate::agent::fork::ForkSourceLock>,
 }
 
 /// Boot `record` with the given launch features and return a handle. Shared by
@@ -491,6 +500,7 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     Ok(StartedVm {
         handle: VmHandle::new(manager, None),
         freshly_started: freshly_started && !restoring_checkpoint,
+        _startup_lock: None,
     })
 }
 
@@ -500,6 +510,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 /// `machine start --forkable`, surfaced for the embedded SDK.
 /// Start or reconnect to a forkable VM and retain the actual launch status.
 pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
+    let startup_lock = crate::agent::fork::lock_fork_source(name)?;
+    if get_record(db, name)?.paused_checkpoint.is_some() {
+        return Err(Error::agent_conflict(
+            "start machine",
+            "machine is paused; use resume",
+        ));
+    }
     db.update_vm(name, |record| record.forkable = true)?
         .ok_or_else(|| Error::vm_not_found(name))?;
     let record = crate::image_store::pin_for_start(
@@ -513,8 +530,9 @@ pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> 
         forkable: true,
         ..LaunchFeatures::default()
     };
-    let started = launch_from_record(&record, features)?;
+    let mut started = launch_from_record(&record, features)?;
     mark_running(db, name, started.handle.child_pid())?;
+    started._startup_lock = Some(startup_lock);
     Ok(started)
 }
 
@@ -528,14 +546,22 @@ pub fn start_vm_with_netns(
     name: &str,
     netns: std::path::PathBuf,
 ) -> Result<VmHandle> {
+    let startup_lock = crate::agent::fork::lock_fork_source(name)?;
+    if get_record(db, name)?.paused_checkpoint.is_some() {
+        return Err(Error::agent_conflict(
+            "start machine",
+            "machine is paused; use resume",
+        ));
+    }
     crate::agent::state_probe::refuse_start_while_held(db, name)?;
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         pod_netns: Some(netns),
         ..LaunchFeatures::default()
     };
-    let started = launch_from_record(&record, features)?;
+    let mut started = launch_from_record(&record, features)?;
     mark_running(db, name, started.handle.child_pid())?;
+    started._startup_lock = Some(startup_lock);
     Ok(started.handle)
 }
 
@@ -581,6 +607,7 @@ pub(crate) fn fork_vm_with_options(
         share_weights,
         watch_parent,
         None,
+        None,
         keep_machine_id,
     )
 }
@@ -614,15 +641,17 @@ pub(crate) fn fork_vm_adjusted(
         let _ = std::fs::remove_dir_all(crate::agent::vm_data_dir(clone));
         return Err(error);
     }
-    boot_prepared_fork(db, clone, prep, false, None, None, false)
+    boot_prepared_fork(db, clone, prep, false, None, None, None, false)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn boot_prepared_fork(
     db: &SmolvmDb,
     clone: &str,
     prep: crate::agent::fork::PreparedFork,
     share_weights: bool,
     watch_parent: Option<bool>,
+    startup_commit: Option<std::sync::Arc<std::fs::File>>,
     retry_gate: Option<&std::sync::Mutex<()>>,
     keep_machine_id: bool,
 ) -> Result<VmHandle> {
@@ -633,6 +662,7 @@ fn boot_prepared_fork(
         cuda_share_weights: share_weights,
         cuda_preload_modules: prep.clone_record.cuda_preload_modules,
         watch_parent,
+        startup_commit,
         ..LaunchFeatures::default()
     };
     // A restore can reach the agent socket and still fail its first command on
@@ -719,6 +749,7 @@ pub fn fork_vm_batch(
     parallel: usize,
     source_policy: crate::agent::fork::ForkSourcePolicy,
     keep_machine_id: bool,
+    watch_parent: Option<bool>,
 ) -> Result<Vec<(String, VmHandle)>> {
     if clones.is_empty() {
         return Err(Error::config(
@@ -743,6 +774,15 @@ pub fn fork_vm_batch(
         ));
     }
     let empty_secrets = std::collections::BTreeMap::new();
+    // Even detached children belong to this request until the complete batch
+    // succeeds. Create the anonymous commit before registering any clone.
+    #[cfg(unix)]
+    let transaction = crate::agent::startup_transaction::Transaction::new()
+        .map_err(|error| Error::agent("prepare fork ownership", error.to_string()))?;
+    #[cfg(unix)]
+    let startup_commit = Some(transaction.file());
+    #[cfg(not(unix))]
+    let startup_commit = None;
     let specs: Vec<_> = clones
         .iter()
         .map(|(name, ports)| crate::agent::fork::ForkSpec {
@@ -756,6 +796,12 @@ pub fn fork_vm_batch(
         })
         .collect();
     let prepared = crate::agent::fork::prepare_forks(db, golden, &specs, source_policy)?;
+    // Workers can finish at different times. Keep successful children private
+    // until all boots succeed or the complete batch has been rolled back.
+    let _startup_locks: Vec<_> = prepared
+        .iter()
+        .map(|prep| prep.startup_lock.clone())
+        .collect();
     let width = parallel.max(1).min(prepared.len());
     let queue = std::sync::Mutex::new(std::collections::VecDeque::from(
         prepared.into_iter().enumerate().collect::<Vec<_>>(),
@@ -770,6 +816,7 @@ pub fn fork_vm_batch(
                 let queue = &queue;
                 let stop = &stop;
                 let retry_gate = &retry_gate;
+                let startup_commit = startup_commit.clone();
                 scope.spawn(move || {
                     let mut results = Vec::new();
                     loop {
@@ -790,7 +837,8 @@ pub fn fork_vm_batch(
                                 &clone,
                                 prep,
                                 false,
-                                None,
+                                watch_parent,
+                                startup_commit.clone(),
                                 Some(retry_gate),
                                 keep_machine_id,
                             )
@@ -865,6 +913,8 @@ pub fn fork_vm_batch(
         .map(|(index, name, result)| result.map(|handle| (index, name, handle)))
         .collect::<Result<Vec<_>>>()?;
     ordered.sort_by_key(|(index, _, _)| *index);
+    #[cfg(unix)]
+    transaction.commit();
     Ok(ordered
         .into_iter()
         .map(|(_, name, handle)| (name, handle))
@@ -876,6 +926,9 @@ pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = get_record(db, name)?;
     let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+    // Reconnection records the existing PID for explicit lifecycle operations,
+    // but this handle did not start that process and must not stop it on Drop.
+    manager.detach();
 
     if manager.try_connect_existing().is_none() {
         return Err(Error::agent_not_found(
@@ -1512,7 +1565,7 @@ mod tests {
     fn embedded_batch_fork_rejects_empty_and_duplicate_groups_before_boot() {
         let db = test_db();
         assert!(
-            fork_vm_batch(&db, "missing", &[], 4, Default::default(), false)
+            fork_vm_batch(&db, "missing", &[], 4, Default::default(), false, None)
                 .err()
                 .expect("empty batch must fail")
                 .to_string()
@@ -1524,7 +1577,7 @@ mod tests {
             ("duplicate".to_string(), Vec::new()),
         ];
         assert!(
-            fork_vm_batch(&db, "missing", &clones, 4, Default::default(), false)
+            fork_vm_batch(&db, "missing", &clones, 4, Default::default(), false, None)
                 .err()
                 .expect("duplicate batch must fail")
                 .to_string()

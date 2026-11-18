@@ -63,6 +63,7 @@ pub mod forkpoint;
 pub mod guest_env;
 pub mod host_pattern;
 pub mod image_ref;
+pub mod interactive_control;
 pub mod intercept;
 pub mod mediated_egress;
 pub mod publish_socket;
@@ -70,6 +71,7 @@ pub mod resolv;
 pub mod retry;
 pub mod secrets;
 pub mod sni;
+pub mod tcp_forward;
 pub mod workload_target;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};
@@ -604,6 +606,16 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Execute a connection-owned command with independently addressable controls.
+    VmExecControlled {
+        /// Command and its caller-generated lifetime identifier.
+        session: interactive_control::Session,
+    },
+    /// Signal or resize an active command over a separate connection.
+    InteractiveControl {
+        /// Lifetime identifier and operation; never a raw PID.
+        request: interactive_control::Request,
+    },
     /// Control a container execution whose lifetime is independent of this connection.
     ContainerSession {
         /// Start, attach, or exchange sequenced container I/O.
@@ -1555,6 +1567,8 @@ impl AgentRequest {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
             AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::VmExecControlled { .. } => "VmExecControlled".into(),
+            AgentRequest::InteractiveControl { .. } => "InteractiveControl".into(),
             AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
             AgentRequest::BranchpointArm => "BranchpointArm".into(),
             AgentRequest::BranchpointPark => "BranchpointPark".into(),

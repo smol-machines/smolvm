@@ -189,6 +189,12 @@ fn main() {
 }
 
 fn run_cli() {
+    if let Err(error) =
+        smolvm::ssh::apply_proxy_context(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        eprintln!("SSH startup failed: {error:#}");
+        std::process::exit(2);
+    }
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
     smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);

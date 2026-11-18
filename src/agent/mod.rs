@@ -12,6 +12,8 @@ pub mod fork;
 mod fsnotify_watch;
 pub mod host_gpu;
 pub mod input;
+mod interactive_start;
+pub use smolvm_protocol::interactive_control;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
@@ -20,6 +22,8 @@ pub mod live_resize;
 mod manager;
 pub mod pod_net;
 pub mod rootfs_store;
+#[cfg(unix)]
+pub(crate) mod startup_transaction;
 pub mod state_probe;
 pub mod terminal;
 #[cfg(all(test, unix))]

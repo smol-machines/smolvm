@@ -34,6 +34,9 @@ pub(crate) use compact::{flatten_standalone, flatten_to_raw};
 /// all stay cheap at this depth.
 const MAX_FORK_LINEAGE_DEPTH: usize = 256;
 
+#[cfg(unix)]
+mod inherited_lock;
+
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
 #[cfg(target_os = "linux")]
@@ -62,12 +65,20 @@ impl ForkSourceLock {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        #[cfg(unix)]
+        let inherited = inherited_lock::take_matching(path)
+            .map_err(|error| Error::agent("inherited operation lock", error.to_string()))?;
+        #[cfg(not(unix))]
+        let inherited: Option<File> = None;
+        let file = match inherited {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?,
+        };
         lock_file_exclusive(&file)
             .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         Ok(Self { _file: file })
@@ -78,12 +89,20 @@ impl ForkSourceLock {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        #[cfg(unix)]
+        let inherited = inherited_lock::take_matching(path)
+            .map_err(|error| Error::agent("inherited operation lock", error.to_string()))?;
+        #[cfg(not(unix))]
+        let inherited: Option<File> = None;
+        let file = match inherited {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?,
+        };
         match try_lock_file_exclusive(&file) {
             Ok(()) => Ok(Some(Self { _file: file })),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -112,6 +131,23 @@ pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
 pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
+}
+
+#[cfg(unix)]
+pub(crate) fn try_lock_saved_execution(source: &str) -> Result<Option<ForkSourceLock>> {
+    validate_vm_name(source, "saved execution")
+        .map_err(|error| Error::config("saved execution", error))?;
+    ForkSourceLock::try_acquire_at(&saved_execution_lock_path(source))
+}
+
+/// Preserve the same locked file descriptions through an owned startup child.
+/// The caller must keep both guards alive through spawn and cleanup.
+#[cfg(unix)]
+pub(crate) fn inherit_operation_locks(
+    command: &mut std::process::Command,
+    locks: &[&ForkSourceLock],
+) -> std::io::Result<()> {
+    inherited_lock::configure(command, locks.iter().map(|lock| &lock._file))
 }
 
 fn fork_source_lock_path(source: &str) -> PathBuf {
@@ -2628,6 +2664,10 @@ pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<
 /// record + copy-on-write disks exist on disk. The caller boots the clone from
 /// `snapshot_dir`, then calls [`rejuvenate_clone`].
 pub struct PreparedFork {
+    /// Retain through identity reset, readiness publication, and rollback.
+    /// Shared ownership lets batch callers keep every child locked until the
+    /// whole transaction finishes, including children already booted by workers.
+    pub startup_lock: std::sync::Arc<ForkSourceLock>,
     /// Directory holding the golden's checkpoint + memfd manifest. Pass it as the
     /// clone's `LaunchFeatures::snapshot_dir` to boot from it instead of cold.
     pub snapshot_dir: PathBuf,
@@ -2818,6 +2858,7 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut names = HashSet::with_capacity(specs.len());
+    let mut startup_locks = Vec::with_capacity(specs.len());
     let mut reserved_ports = ReservedPorts::default();
     for spec in specs {
         validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
@@ -2840,6 +2881,20 @@ pub(crate) fn prepare_forks_reusing(
                 format!("machine '{}' already exists", spec.clone),
             ));
         }
+        // The caller already owns the source lock. Never block while acquiring
+        // targets: overlapping or reciprocal requests must fail instead of
+        // each waiting for a name held by the other. Reserve every target
+        // before changing the source or publishing any clone record.
+        let lock = try_lock_fork_source(spec.clone)?.ok_or_else(|| {
+            Error::agent_conflict(
+                "prepare fork",
+                format!(
+                    "machine '{}' has an active lifecycle operation; retry the fork",
+                    spec.clone
+                ),
+            )
+        })?;
+        startup_locks.push(std::sync::Arc::new(lock));
         for (host, _) in spec.pinned_ports {
             if !reserved_ports.tcp.insert(*host) {
                 return Err(Error::config(
@@ -3251,7 +3306,9 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut prepared = Vec::with_capacity(specs.len());
-    for spec in specs {
+    // Keep the reservations here as well as in each returned clone: a failed
+    // preparation drops its own guard before removing partial files/records.
+    for (spec, startup_lock) in specs.iter().zip(startup_locks.iter().cloned()) {
         match prepare_clone_from_snapshot(
             db,
             golden,
@@ -3260,6 +3317,7 @@ pub(crate) fn prepare_forks_reusing(
             &snapshot_dir,
             spec,
             &mut reserved_ports,
+            startup_lock,
         ) {
             Ok(clone) => prepared.push(clone),
             Err(error) => {
@@ -3427,6 +3485,7 @@ pub(crate) fn retained_snapshot_matches_golden(
         && reusable_snapshot_path(snapshot_root, &snapshot.path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_clone_from_snapshot(
     db: &SmolvmDb,
     golden: &str,
@@ -3435,6 +3494,7 @@ fn prepare_clone_from_snapshot(
     snapshot_dir: &Path,
     spec: &ForkSpec<'_>,
     reserved_ports: &mut ReservedPorts,
+    startup_lock: std::sync::Arc<ForkSourceLock>,
 ) -> Result<PreparedFork> {
     let clone = spec.clone;
     let clone_dir = vm_data_dir(clone);
@@ -3563,6 +3623,7 @@ fn prepare_clone_from_snapshot(
             "fork: clone disk overlays created"
         );
         Ok(PreparedFork {
+            startup_lock,
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,

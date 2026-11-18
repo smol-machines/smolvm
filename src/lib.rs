@@ -97,6 +97,7 @@ pub mod embedded;
 /// The Docker Engine API, answered by smolvm: every container is a machine.
 #[cfg(unix)]
 pub mod engine;
+pub mod engine_cli;
 /// Local image archives shared with managed Kubernetes clusters.
 pub mod image_feed;
 pub mod image_seed;
@@ -180,3 +181,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// executable's path or inode, when another engine asks to branch it: the
 /// same release installed as two files is one build.
 pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOLVM_GIT_COMMIT"));
+
+/// On-demand standard SSH access to local machine environments.
+pub mod ssh;
