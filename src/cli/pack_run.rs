@@ -662,15 +662,27 @@ impl PackRunCmd {
         let cache_dir = extract::get_cache_dir(footer.checksum)
             .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
+        // The cache is named by the CRC-32 anyone can forge: only an extraction
+        // of this very sidecar is reused.
+        let (reusable, sidecar_sha256) = extract::extracted_from(&cache_dir, &sidecar_path, || {
+            extract::file_sha256(&sidecar_path)
+        })
+        .map_err(|e| Error::agent("identify sidecar", e.to_string()))?;
+        let fresh = self.force_extract || !reusable;
+        if fresh {
+            refuse_reextract_under_daemon(footer.checksum)?;
+        }
         extract::extract_sidecar_for_agent(
             &sidecar_path,
             &cache_dir,
             &footer,
-            self.force_extract,
+            fresh,
             self.debug,
             self.local_bake.then_some(smolvm::VERSION),
         )
         .map_err(|e| Error::agent("extract assets", e.to_string()))?;
+        extract::record_extracted_from(&cache_dir, &sidecar_sha256, &sidecar_path)
+            .map_err(|e| Error::agent("record extracted sidecar", e.to_string()))?;
 
         // 7. Set up paths — use a unique runtime directory per invocation so
         //    concurrent runs of the same checksum don't conflict on
@@ -1897,12 +1909,25 @@ fn run_section_mode(
     let cache_dir = extract::get_cache_dir(checksum)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-    let needs_extract = force_extract || !extract::is_extracted(&cache_dir);
+    let exe =
+        std::env::current_exe().map_err(|e| Error::agent("locate executable", e.to_string()))?;
+    // SAFETY: the section's bytes live for the whole process.
+    let (reusable, digest) = extract::extracted_from(&cache_dir, &exe, || {
+        Ok(extract::bytes_sha256(unsafe {
+            std::slice::from_raw_parts(assets_ptr, assets_size)
+        }))
+    })
+    .map_err(|e| Error::agent("identify packed assets", e.to_string()))?;
+    let needs_extract = force_extract || !reusable;
     if needs_extract {
+        refuse_reextract_under_daemon(checksum)?;
+        extract::clear_for_extraction(&cache_dir);
         unsafe {
             extract::extract_from_section(&cache_dir, assets_ptr, assets_size, debug)
                 .map_err(|e| Error::agent("extract section assets", e.to_string()))?;
         }
+        extract::record_extracted_from(&cache_dir, &digest, &exe)
+            .map_err(|e| Error::agent("record extracted assets", e.to_string()))?;
     }
 
     run_from_cache(&cache_dir, &manifest, args, debug)
@@ -1923,10 +1948,17 @@ fn run_embedded_mode(
     let cache_dir = extract::get_cache_dir(footer.checksum)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-    let needs_extract = force_extract || !extract::is_extracted(&cache_dir);
+    let (reusable, digest) =
+        extract::extracted_from(&cache_dir, &exe_path, || extract::file_sha256(&exe_path))
+            .map_err(|e| Error::agent("identify packed binary", e.to_string()))?;
+    let needs_extract = force_extract || !reusable;
     if needs_extract {
+        refuse_reextract_under_daemon(footer.checksum)?;
+        extract::clear_for_extraction(&cache_dir);
         extract::extract_from_binary(&exe_path, &cache_dir, &footer, debug)
             .map_err(|e| Error::agent("extract embedded assets", e.to_string()))?;
+        extract::record_extracted_from(&cache_dir, &digest, &exe_path)
+            .map_err(|e| Error::agent("record extracted assets", e.to_string()))?;
     }
 
     run_from_cache(&cache_dir, &manifest, args, debug)
@@ -2311,14 +2343,61 @@ fn read_manifest_for_mode(mode: &PackedMode) -> smolvm::Result<smolvm_pack::Pack
     }
 }
 
+/// A re-extraction empties the cache dir, which a running daemon of the same
+/// checksum is using: refuse it then rather than pull its files away.
+fn refuse_reextract_under_daemon(checksum: u32) -> smolvm::Result<()> {
+    if is_daemon_running(checksum) {
+        return Err(Error::agent(
+            "extract assets",
+            "this pack's cache must be extracted again, and its daemon is running from it: \
+             stop the daemon first",
+        ));
+    }
+    Ok(())
+}
+
 /// Ensure assets are extracted to the cache directory for the given mode.
 fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Result<PathBuf> {
     let checksum = mode_checksum(mode);
     let cache_dir = extract::get_cache_dir(checksum)
         .map_err(|e| Error::agent("get cache dir", e.to_string()))?;
 
-    let needs_extract = force || !extract::is_extracted(&cache_dir);
+    // The cache is named by the CRC-32 anyone can forge: only an extraction of
+    // this very artifact is reused.
+    let (source, reusable, digest) = match mode {
+        #[cfg(target_os = "macos")]
+        PackedMode::Section {
+            assets_ptr,
+            assets_size,
+            ..
+        } => {
+            let exe = std::env::current_exe()
+                .map_err(|e| Error::agent("locate executable", e.to_string()))?;
+            let (reusable, digest) = extract::extracted_from(&cache_dir, &exe, || {
+                Ok(extract::bytes_sha256(unsafe {
+                    std::slice::from_raw_parts(*assets_ptr, *assets_size)
+                }))
+            })
+            .map_err(|e| Error::agent("identify packed assets", e.to_string()))?;
+            (exe, reusable, digest)
+        }
+        PackedMode::Embedded { exe_path, .. } => {
+            let (reusable, digest) =
+                extract::extracted_from(&cache_dir, exe_path, || extract::file_sha256(exe_path))
+                    .map_err(|e| Error::agent("identify packed binary", e.to_string()))?;
+            (exe_path.clone(), reusable, digest)
+        }
+        PackedMode::Sidecar { sidecar_path, .. } => {
+            let (reusable, digest) = extract::extracted_from(&cache_dir, sidecar_path, || {
+                extract::file_sha256(sidecar_path)
+            })
+            .map_err(|e| Error::agent("identify sidecar", e.to_string()))?;
+            (sidecar_path.clone(), reusable, digest)
+        }
+    };
+    let needs_extract = force || !reusable;
     if needs_extract {
+        extract::clear_for_extraction(&cache_dir);
         match mode {
             #[cfg(target_os = "macos")]
             PackedMode::Section {
@@ -2340,10 +2419,12 @@ fn ensure_extracted(mode: &PackedMode, force: bool, debug: bool) -> smolvm::Resu
                 footer,
                 ..
             } => {
-                extract::extract_sidecar(sidecar_path, &cache_dir, footer, force, debug)
+                extract::extract_sidecar(sidecar_path, &cache_dir, footer, true, debug)
                     .map_err(|e| Error::agent("extract sidecar assets", e.to_string()))?;
             }
         }
+        extract::record_extracted_from(&cache_dir, &digest, &source)
+            .map_err(|e| Error::agent("record extracted assets", e.to_string()))?;
     }
 
     Ok(cache_dir)
@@ -2389,6 +2470,14 @@ fn daemon_start(
     let checksum = mode_checksum(mode);
     let manifest = read_manifest_for_mode(mode)?;
 
+    // Before extracting: a re-extraction empties the cache dir, which a running
+    // daemon is using.
+    if is_daemon_running(checksum) {
+        let (pid, _) = read_daemon_pid(checksum).unwrap();
+        println!("Daemon already running (PID: {})", pid);
+        return Ok(());
+    }
+
     // Extract assets to cache
     let cache_dir = ensure_extracted(mode, force_extract, debug)?;
 
@@ -2396,13 +2485,6 @@ fn daemon_start(
     let daemon = cache_dir.join("daemon");
     std::fs::create_dir_all(&daemon)
         .map_err(|e| Error::agent("create daemon dir", e.to_string()))?;
-
-    // Check if already running
-    if is_daemon_running(checksum) {
-        let (pid, _) = read_daemon_pid(checksum).unwrap();
-        println!("Daemon already running (PID: {})", pid);
-        return Ok(());
-    }
     let ssh_agent_socket = resolve_ssh_agent_socket(args.ssh_agent)?;
 
     // Clean up stale PID/socket files from previous runs
