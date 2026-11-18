@@ -230,9 +230,10 @@ pub struct GuestNetworkConfig {
     /// Host interceptor and the outbound streams routed through it. Each stream
     /// carries an authenticated preamble naming its original destination.
     pub intercept: Option<StreamInterception>,
-    /// Drop guest UDP to port 443 (QUIC) unless `--allow-udp` admits it, so
-    /// HTTPS cannot route around request rules enforced by the interceptor.
-    pub deny_quic: bool,
+    /// The machine has HTTPS request rules, matched by TLS server name: drop
+    /// guest QUIC unless `--allow-udp` admits it, and answer DNS HTTPS records
+    /// empty so clients skip Encrypted Client Hello, which hides the name.
+    pub request_rules: bool,
 }
 
 /// Exact guest gateway port mapped to one smolvm-owned host loopback port.
@@ -264,7 +265,7 @@ impl GuestNetworkConfig {
             upstream_resolvers: [None; MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
-            deny_quic: false,
+            request_rules: false,
         }
     }
 }
@@ -733,7 +734,7 @@ pub fn start_virtio_network_on(
             upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
-            deny_quic: guest_network.deny_quic,
+            request_rules: guest_network.request_rules,
             mtu: usize::from(smolvm_protocol::guest_env::GATEWAY_LINK_MTU),
         },
         Some(tcp_receiver),

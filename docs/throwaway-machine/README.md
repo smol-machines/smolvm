@@ -141,8 +141,8 @@ either way.
 HTTPS. A `SPEC` is `[METHODS ]HOST[/PATH-GLOB]`: `METHODS` is comma-separated and case-insensitive
 (default: every method), `HOST` is an exact name or `*.domain` (subdomains only, not the apex, like
 `--allow-host-pattern`), and the path glob defaults to every path. In a glob, `*` is one whole
-segment and `**` is zero or more segments; a rule path with `*` inside a segment or with `%` is
-refused (write it decoded), and the query is ignored. Both flags can be repeated.
+segment and `**` is zero or more segments; a rule path with `*` inside a segment or with `%`, `?`,
+`#`, `;` or `\` is refused (write it decoded), and the query is ignored. Both flags can be repeated.
 
 ```console
 $ smolvm machine run --net --image curlimages/curl --allow-host httpbin.org \
@@ -153,8 +153,8 @@ smolvm: request denied by request rules (no allow rule matches)     # HTTP 403
 A host with any allow rule needs a match, any matching deny refuses, and a deny wins. Hosts with no
 rules are unchanged. A rule never makes a host reachable (`--allow-host` and the other grants still
 decide) and does not imply `--net`. A request is matched on its canonical path: percent-decoded
-(`%2F` splits a segment), `.` and `..` resolved without rising above the root, repeated slashes
-collapsed. A refused request gets a `403` with a one-line reason. `machine egress-events` lists it
+(`%2F` splits a segment), `\` read as `/`, `;` parameters dropped, `.` and `..` resolved without
+rising above the root, repeated slashes collapsed. A refused request gets a `403` with a one-line reason. `machine egress-events` lists it
 as a `request` with its method and URL (without the query), and the host log records the machine,
 host, method, path and reason.
 
@@ -169,10 +169,11 @@ A host named by any rule, even a deny-only one, goes through the interceptor, so
 HTTP/1.1 to it, WebSocket upgrades get `426`, and request bodies are buffered and capped at 8 MiB
 (`413`); see [backends and limits](../credential-substitution.md#backends-and-limits). A machine
 with rules drops guest UDP to port 443, so HTTP/3 (QUIC) cannot skip them and clients fall back to
-TCP; an `--allow-udp` rule covering the destination and port 443 re-opens it. Plain HTTP and other
-TCP ports to a ruled host are not covered, and origin-side normalizations are not mirrored (double
-encoding, `;params`, backslashes, case-insensitive paths): rules are a guard rail against mistakes,
-not a boundary against a hostile workload.
+TCP; an `--allow-udp` rule covering the destination and port 443 re-opens it. Its DNS also answers
+HTTPS records empty, so clients do not use Encrypted Client Hello, which hides the server name.
+Plain HTTP and other TCP ports to a ruled host are not covered, and other origin-side
+normalizations are not mirrored (double encoding, case-insensitive paths): rules are a guard rail
+against mistakes, not a boundary against a hostile workload.
 
 Prefer allow rules where a host must be pinned down. An allow rule fails closed: a path spelled in
 a way the matcher does not recognize gets a `403`. A deny rule is best-effort: a spelling the origin

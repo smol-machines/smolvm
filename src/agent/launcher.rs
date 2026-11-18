@@ -1277,7 +1277,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         interceptor.endpoint(),
                     ));
                     // HTTP/3 over UDP would skip the rules the interceptor enforces.
-                    guest_network.deny_quic = !credentials.policy.request_rules.is_empty();
+                    guest_network.request_rules = !credentials.policy.request_rules.is_empty();
                     _credential_interceptor = Some(interceptor);
                 }
                 if let Some(endpoint) = external_interceptor {
