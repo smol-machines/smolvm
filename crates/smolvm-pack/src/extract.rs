@@ -1570,7 +1570,7 @@ const EXTRACTION_MARKER: &str = ".smolvm-extracted";
 /// the cache key to a SHA-256 digest; tracked separately as it changes the
 /// on-disk cache layout and footer format.
 pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
-    let base = dirs::cache_dir()
+    let base = smolvm_paths::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
 
     Ok(base.join("smolvm-pack").join(format!("{:08x}", checksum)))
@@ -4642,6 +4642,11 @@ fn post_process_extraction(
                 .collect();
             if !lines.is_empty() {
                 fs::write(extract_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+                // Re-export stages the retained tars from the pack root, not
+                // the macOS case-sensitive volume. Keep its order there too.
+                if extract_dir != layers_dir {
+                    fs::write(layers_dir.join(LAYER_ORDER_FILE), lines.join("\n"))?;
+                }
             }
         }
     }
@@ -5017,12 +5022,97 @@ fn sum_tar_sizes(dir: &Path) -> u64 {
     let Ok(entries) = fs::read_dir(dir) else {
         return 0;
     };
-    entries
+    let layers: u64 = entries
         .filter_map(|e| e.ok())
         .filter(|e| e.path().extension().is_some_and(|ext| ext == "tar"))
         .filter_map(|e| e.metadata().ok())
         .map(|m| m.len())
-        .sum()
+        .sum();
+    // The guest reads the workspace archive from the same mounted volume.
+    let workspace = dir
+        .join(crate::assets::WORKSPACE_SEED_DIR)
+        .join(crate::assets::WORKSPACE_SEED_FILE);
+    layers.saturating_add(fs::metadata(workspace).map(|m| m.len()).unwrap_or(0))
+}
+
+/// Keep the workspace archive beside the layers the guest actually mounts.
+/// On macOS that directory is a separate case-sensitive volume, not `layers/`.
+/// Called on cache hits too, to repair packs extracted before this was copied.
+#[cfg(any(target_os = "macos", test))]
+fn materialize_workspace_seed(cache_dir: &Path, mounted_layers: &Path) -> std::io::Result<()> {
+    use crate::assets::{WORKSPACE_SEED_DIR, WORKSPACE_SEED_FILE};
+
+    let source_dir = cache_dir.join("layers").join(WORKSPACE_SEED_DIR);
+    match fs::symlink_metadata(&source_dir) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => return Err(error),
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(std::io::Error::other(
+                "workspace seed directory is not a directory",
+            ))
+        }
+    }
+    let source = source_dir.join(WORKSPACE_SEED_FILE);
+    let metadata = fs::symlink_metadata(&source)?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other(
+            "workspace seed is not a regular file",
+        ));
+    }
+    if cache_dir
+        .join("layers")
+        .join(format!("{WORKSPACE_SEED_DIR}.tar"))
+        .exists()
+    {
+        return Err(std::io::Error::other(
+            "workspace seed conflicts with an image layer",
+        ));
+    }
+    let destination_dir = mounted_layers.join(WORKSPACE_SEED_DIR);
+    match fs::create_dir(&destination_dir) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            if !fs::symlink_metadata(&destination_dir)?.is_dir() {
+                return Err(std::io::Error::other(
+                    "mounted workspace seed directory is not a directory",
+                ));
+            }
+        }
+        Err(error) => return Err(error),
+    }
+    let destination = destination_dir.join(WORKSPACE_SEED_FILE);
+    match fs::symlink_metadata(&destination) {
+        // Artifact caches are immutable; an already published archive is reused.
+        Ok(existing) if existing.is_file() && existing.len() == metadata.len() => return Ok(()),
+        Ok(existing) if !existing.is_file() => {
+            return Err(std::io::Error::other(
+                "mounted workspace seed is not a regular file",
+            ));
+        }
+        Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error),
+        _ => {}
+    }
+    preflight_free_space(mounted_layers, metadata.len(), "the packed workspace")?;
+    let mut input = fs::OpenOptions::new();
+    input.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        input.custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut input = input.open(source)?;
+    let mut staged = tempfile::NamedTempFile::new_in(&destination_dir)?;
+    if std::io::copy(&mut input, staged.as_file_mut())? != metadata.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "workspace seed changed during copying",
+        ));
+    }
+    staged.as_file().set_permissions(metadata.permissions())?;
+    staged.as_file().sync_all()?;
+    staged.persist(destination).map_err(|error| error.error)?;
+    Ok(())
 }
 
 /// Check whether `path` is a mount point by comparing device IDs with parent.
@@ -5287,9 +5377,9 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
     let image_path = cache_dir.join(CS_IMAGE_NAME);
     let mount_point = cache_dir.join(CS_MOUNT_DIR);
 
-    // Already mounted — nothing to do.
+    // Also repair an existing cache while the caller holds the volume lock.
     if mount_point.exists() && is_mount_point(&mount_point) {
-        return Ok(());
+        return materialize_workspace_seed(cache_dir, &mount_point);
     }
 
     // Create the sparse image if it doesn't exist.
@@ -5311,26 +5401,7 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
                 size_gib, total_tar_bytes
             );
         }
-        let output = std::process::Command::new("hdiutil")
-            .args([
-                "create",
-                "-size",
-                &size_arg,
-                "-fs",
-                "Case-sensitive APFS",
-                "-type",
-                "SPARSE",
-                "-volname",
-                "smolvm-layers",
-            ])
-            .arg(&image_path)
-            .output()?;
-        if !output.status.success() {
-            return Err(std::io::Error::other(format!(
-                "hdiutil create failed: {}",
-                String::from_utf8_lossy(&output.stderr)
-            )));
-        }
+        create_cs_image(&image_path, &size_arg, debug)?;
     }
 
     // Mount it.
@@ -5354,6 +5425,121 @@ fn ensure_cs_volume_mounted(cache_dir: &Path, debug: bool) -> std::io::Result<()
         )));
     }
 
+    materialize_workspace_seed(cache_dir, &mount_point)
+}
+
+/// Create the case-sensitive sparse image at `image_path`.
+///
+/// `hdiutil create` formats a new APFS container every time, which takes about
+/// a second when packed layers need host-side extraction. The blank image
+/// for each size is cached once and each layers volume gets an APFS clone
+/// of it, which attaches as an independent volume. Without a template the
+/// image is created directly, as before.
+#[cfg(target_os = "macos")]
+fn create_cs_image(image_path: &Path, size_arg: &str, debug: bool) -> std::io::Result<()> {
+    create_cs_image_with_cache(image_path, size_arg, debug, cs_template_dir().as_deref())
+}
+
+#[cfg(target_os = "macos")]
+fn create_cs_image_with_cache(
+    image_path: &Path,
+    size_arg: &str,
+    debug: bool,
+    cache_dir: Option<&Path>,
+) -> std::io::Result<()> {
+    if let Some(template) = cache_dir.and_then(|dir| cs_image_template(dir, size_arg, debug)) {
+        if clone_file(&template, image_path).is_ok() {
+            return Ok(());
+        }
+        let _ = fs::remove_file(image_path);
+    }
+    hdiutil_create_cs_image(image_path, size_arg)
+}
+
+/// The blank image of `size_arg` in the shared cache, made on first use.
+#[cfg(target_os = "macos")]
+fn cs_image_template(dir: &Path, size_arg: &str, debug: bool) -> Option<PathBuf> {
+    build_cs_image_template(dir, size_arg, |staging| {
+        if debug {
+            eprintln!("debug: creating {size_arg} case-sensitive volume template...");
+        }
+        hdiutil_create_cs_image(staging, size_arg)
+    })
+    .ok()
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn build_cs_image_template(
+    dir: &Path,
+    size_arg: &str,
+    build: impl FnOnce(&Path) -> std::io::Result<()>,
+) -> std::io::Result<PathBuf> {
+    let template = dir.join(format!("{size_arg}.sparseimage"));
+    if template.is_file() {
+        return Ok(template);
+    }
+    fs::create_dir_all(dir)?;
+    // Each request owns its staging directory, including concurrent calls in
+    // the same process. Publish only after hdiutil has finished formatting.
+    let staging = tempfile::Builder::new()
+        .prefix(".cs-template-")
+        .tempdir_in(dir)?;
+    let image = staging.path().join("blank.sparseimage");
+    build(&image)?;
+    fs::rename(&image, &template)?;
+    Ok(template)
+}
+
+/// Where blank images are kept. Tests use a private directory so they never
+/// write into the user's cache.
+#[cfg(target_os = "macos")]
+fn cs_template_dir() -> Option<PathBuf> {
+    if cfg!(test) {
+        return Some(
+            std::env::temp_dir().join(format!("smolvm-cs-templates-{}", std::process::id())),
+        );
+    }
+    Some(
+        smolvm_paths::cache_dir()?
+            .join("smolvm")
+            .join("cs-volume-templates"),
+    )
+}
+
+#[cfg(target_os = "macos")]
+fn clone_file(source: &Path, destination: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let source = std::ffi::CString::new(source.as_os_str().as_bytes())?;
+    let destination = std::ffi::CString::new(destination.as_os_str().as_bytes())?;
+    // Safety: both are valid NUL-terminated paths for the duration of the call.
+    if unsafe { libc::clonefile(source.as_ptr(), destination.as_ptr(), 0) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "macos")]
+fn hdiutil_create_cs_image(image_path: &Path, size_arg: &str) -> std::io::Result<()> {
+    let output = std::process::Command::new("hdiutil")
+        .args([
+            "create",
+            "-size",
+            size_arg,
+            "-fs",
+            "Case-sensitive APFS",
+            "-type",
+            "SPARSE",
+            "-volname",
+            "smolvm-layers",
+        ])
+        .arg(image_path)
+        .output()?;
+    if !output.status.success() {
+        return Err(std::io::Error::other(format!(
+            "hdiutil create failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        )));
+    }
     Ok(())
 }
 
@@ -5409,7 +5595,7 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
     }
     let libs_checksum = hasher.finalize();
 
-    let cache_base = dirs::cache_dir()
+    let cache_base = smolvm_paths::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
     let libs_cache_dir = cache_base
         .join("smolvm-libs")
@@ -5756,6 +5942,108 @@ pub fn create_or_copy_storage_disk(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn workspace_seed_is_available_in_the_separate_mounted_layers_directory() {
+        let cache = tempfile::tempdir().unwrap();
+        let mounted = tempfile::tempdir().unwrap();
+        let relative =
+            Path::new(crate::assets::WORKSPACE_SEED_DIR).join(crate::assets::WORKSPACE_SEED_FILE);
+        let source = cache.path().join("layers").join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"workspace archive").unwrap();
+        materialize_workspace_seed(cache.path(), mounted.path()).unwrap();
+        assert_eq!(
+            fs::read(mounted.path().join(&relative)).unwrap(),
+            fs::read(&source).unwrap()
+        );
+        fs::write(mounted.path().join(&relative), b"partial").unwrap();
+        materialize_workspace_seed(cache.path(), mounted.path()).unwrap();
+        assert_eq!(
+            fs::read(mounted.path().join(&relative)).unwrap(),
+            fs::read(source).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn workspace_seed_never_follows_a_destination_directory_symlink() {
+        let cache = tempfile::tempdir().unwrap();
+        let mounted = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let source = cache
+            .path()
+            .join("layers")
+            .join(crate::assets::WORKSPACE_SEED_DIR);
+        fs::create_dir_all(&source).unwrap();
+        fs::write(source.join(crate::assets::WORKSPACE_SEED_FILE), b"archive").unwrap();
+        std::os::unix::fs::symlink(
+            outside.path(),
+            mounted.path().join(crate::assets::WORKSPACE_SEED_DIR),
+        )
+        .unwrap();
+        assert!(materialize_workspace_seed(cache.path(), mounted.path()).is_err());
+        assert_eq!(fs::read_dir(outside.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn host_extraction_keeps_tar_order_for_reexport() {
+        struct MountedCache(tempfile::TempDir);
+        impl Drop for MountedCache {
+            fn drop(&mut self) {
+                force_detach_layers_volume(self.0.path());
+            }
+        }
+        let cache = MountedCache(tempfile::tempdir().unwrap());
+        let layers = cache.0.path().join("layers");
+        fs::create_dir(&layers).unwrap();
+        fs::write(layers.join("zzz.tar"), tar_of(&[("file", b"base")])).unwrap();
+        fs::write(layers.join("aaa.tar"), tar_of(&[("file", b"top")])).unwrap();
+        post_process_extraction(
+            cache.0.path(),
+            &["zzz".into(), "aaa".into()],
+            false,
+            false,
+            true,
+        )
+        .unwrap();
+        assert_eq!(
+            fs::read_to_string(layers.join(LAYER_ORDER_FILE)).unwrap(),
+            "zzz\naaa"
+        );
+        let lease = acquire_layers_lease(cache.0.path(), false).unwrap();
+        assert_eq!(
+            fs::read_to_string(lease.path.join(LAYER_ORDER_FILE)).unwrap(),
+            "zzz\naaa"
+        );
+        assert!(layers.join("zzz.tar").is_file());
+        assert!(layers.join("aaa.tar").is_file());
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn workspace_seed_reaches_fresh_and_already_mounted_case_sensitive_volumes() {
+        struct MountedCache(tempfile::TempDir);
+        impl Drop for MountedCache {
+            fn drop(&mut self) {
+                force_detach_layers_volume(self.0.path());
+            }
+        }
+        let cache = MountedCache(tempfile::tempdir().unwrap());
+        let relative =
+            Path::new(crate::assets::WORKSPACE_SEED_DIR).join(crate::assets::WORKSPACE_SEED_FILE);
+        let source = cache.0.path().join("layers").join(&relative);
+        fs::create_dir_all(source.parent().unwrap()).unwrap();
+        fs::write(&source, b"workspace archive").unwrap();
+        ensure_cs_volume_mounted(cache.0.path(), false).unwrap();
+        let visible = cache.0.path().join(CS_MOUNT_DIR).join(&relative);
+        assert_eq!(fs::read(&visible).unwrap(), b"workspace archive");
+        fs::remove_file(&visible).unwrap();
+        ensure_cs_volume_mounted(cache.0.path(), false).unwrap();
+        assert_eq!(fs::read(&visible).unwrap(), b"workspace archive");
+        assert_eq!(sum_tar_sizes(&cache.0.path().join("layers")), 17);
+    }
+
     #[test]
     fn extraction_digest_covers_consumed_bytes_and_trailing_footer() {
         use std::io::Read;
@@ -8583,6 +8871,113 @@ mod tests {
             "staged tars are shared to the guest as-is"
         );
         assert!(!is_mount_point(&lease.path));
+    }
+
+    #[test]
+    fn concurrent_cs_template_builders_never_publish_another_builders_partial_image() {
+        use std::io::Write;
+        use std::sync::mpsc;
+        use std::time::Duration;
+
+        let directory = tempfile::tempdir().unwrap();
+        let spawn_builder = |prefix: &'static [u8]| {
+            let directory = directory.path().to_path_buf();
+            let (ready_tx, ready_rx) = mpsc::channel();
+            let (finish_tx, finish_rx) = mpsc::channel();
+            let thread = std::thread::spawn(move || {
+                build_cs_image_template(&directory, "1g", |staging| {
+                    // Hold the opened file, as hdiutil does during formatting.
+                    let mut image = fs::File::create(staging)?;
+                    image.write_all(prefix)?;
+                    ready_tx.send(()).unwrap();
+                    finish_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+                    image.write_all(b"-complete")?;
+                    image.sync_all()
+                })
+            });
+            (thread, ready_rx, finish_tx)
+        };
+        let (first, first_ready, finish_first) = spawn_builder(b"first");
+        first_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        let (second, second_ready, finish_second) = spawn_builder(b"second");
+        second_ready.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(!directory.path().join("1g.sparseimage").exists());
+        finish_first.send(()).unwrap();
+        let first_result = first.join().unwrap();
+        let first_contents = fs::read(directory.path().join("1g.sparseimage"));
+        // Always release the other builder before checking the result.
+        finish_second.send(()).unwrap();
+        let second_result = second.join().unwrap();
+        first_result.unwrap();
+        assert_eq!(first_contents.unwrap(), b"first-complete");
+        second_result.unwrap();
+        assert_eq!(
+            fs::read(directory.path().join("1g.sparseimage")).unwrap(),
+            b"second-complete"
+        );
+        assert_eq!(fs::read_dir(directory.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn case_sensitive_images_cloned_from_one_template_mount_independently() {
+        struct Mount(PathBuf);
+        impl Drop for Mount {
+            fn drop(&mut self) {
+                let _ = std::process::Command::new("hdiutil")
+                    .args(["detach", "-quiet", "-force"])
+                    .arg(&self.0)
+                    .status();
+            }
+        }
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("templates");
+        let (first, second) = (
+            temp.path().join("a.sparseimage"),
+            temp.path().join("b.sparseimage"),
+        );
+        if let Err(e) = create_cs_image_with_cache(&first, "1g", false, Some(&cache)) {
+            eprintln!("SKIP: hdiutil unavailable: {}", e);
+            return;
+        }
+        let template = cache.join("1g.sparseimage");
+        let before = hash_artifact_sha256(&template).unwrap();
+        create_cs_image_with_cache(&second, "1g", false, Some(&cache)).unwrap();
+
+        let mut mounts = Vec::new();
+        for (image, name) in [(&first, "ma"), (&second, "mb")] {
+            let mount = temp.path().join(name);
+            fs::create_dir_all(&mount).unwrap();
+            let ok = std::process::Command::new("hdiutil")
+                .args(["attach", "-mountpoint"])
+                .arg(&mount)
+                .args(["-nobrowse", "-noautoopen"])
+                .arg(image)
+                .status()
+                .unwrap()
+                .success();
+            assert!(ok, "attach {}", image.display());
+            mounts.push(Mount(mount));
+        }
+        // Both clones are attached at once, keep their own files, and are
+        // case-sensitive.
+        fs::write(mounts[0].0.join("lower"), "a").unwrap();
+        fs::write(mounts[0].0.join("LOWER"), "A").unwrap();
+        fs::write(mounts[1].0.join("lower"), "b").unwrap();
+        assert_eq!(fs::read_to_string(mounts[0].0.join("lower")).unwrap(), "a");
+        assert_eq!(fs::read_to_string(mounts[0].0.join("LOWER")).unwrap(), "A");
+        assert_eq!(fs::read_to_string(mounts[1].0.join("lower")).unwrap(), "b");
+        assert!(!mounts[1].0.join("LOWER").exists());
+        for mount in mounts {
+            let path = mount.0.clone();
+            drop(mount);
+            assert!(!is_mount_point(&path), "test image must detach");
+        }
+        assert_eq!(
+            hash_artifact_sha256(&template).unwrap(),
+            before,
+            "the template is never written"
+        );
     }
 
     #[test]

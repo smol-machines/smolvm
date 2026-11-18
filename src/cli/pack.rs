@@ -673,7 +673,7 @@ impl PackCreateCmd {
             .staging_dir
             .clone()
             .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-            .or_else(|| dirs::cache_dir().map(|c| c.join("smolvm")))
+            .or_else(|| smolvm_paths::cache_dir().map(|c| c.join("smolvm")))
             .unwrap_or_else(std::env::temp_dir);
         std::fs::create_dir_all(&root)
             .map_err(|e| Error::agent("create staging root", e.to_string()))?;
@@ -1025,6 +1025,10 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.block_private = pack_config.block_private;
+        manifest.allowed_cidrs = pack_config.allowed_cidrs;
+        manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
+        manifest.egress_rules = pack_config.egress_rules;
         manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
@@ -1182,7 +1186,23 @@ impl PackCreateCmd {
         // Smolfile > source VM record > default
         if let Some(net) = pack_config.net {
             manifest.network = net;
+            if !net {
+                manifest.block_private = None;
+                manifest.allowed_cidrs = None;
+                manifest.dns_filter_hosts = None;
+                manifest.egress_rules.clear();
+            }
         }
+        let policy = smolvm::pack_export::validated_manifest_egress(&manifest)?.with_cli_overrides(
+            pack_config.allowed_cidrs,
+            pack_config.dns_filter_hosts,
+            pack_config.block_private,
+            pack_config.egress_rules,
+        );
+        manifest.allowed_cidrs = policy.allowed_cidrs;
+        manifest.dns_filter_hosts = policy.dns_filter_hosts;
+        manifest.block_private = policy.block_private;
+        manifest.egress_rules = policy.egress_rules;
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || manifest.gpu;
 
@@ -1480,7 +1500,7 @@ impl PackCreateCmd {
             // The running executable itself
             std::env::current_exe().ok(),
             // User data dir
-            dirs::data_dir().map(|d| d.join("smolvm/smolvm-bin")),
+            smolvm_paths::data_dir().map(|d| d.join("smolvm/smolvm-bin")),
         ];
 
         for candidate in candidates.into_iter().flatten() {
@@ -1733,7 +1753,7 @@ impl PackPruneCmd {
 
         // Clean pack sidecar cache. --artifact stops at the shared extraction: a
         // pack's entry here also holds its daemon's disks, and packs share libs.
-        if let Some(base) = dirs::cache_dir().filter(|_| only.is_none()) {
+        if let Some(base) = smolvm_paths::cache_dir().filter(|_| only.is_none()) {
             let pack_cache = base.join("smolvm-pack");
             let (freed, removed) = self.prune_cache_dir(&pack_cache, keep, "pack cache")?;
             total_freed += freed;

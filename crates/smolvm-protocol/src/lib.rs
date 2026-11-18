@@ -1041,16 +1041,29 @@ pub enum AgentRequest {
         target: Option<WorkloadTarget>,
     },
 
-    /// Append a chunk to the currently open streaming upload.
-    /// If `done` is true, the agent fsyncs and atomically renames the
-    /// staging file onto the target path.
+    /// Begin a streamed directory upload using tar data in [`Self::FileWriteChunk`].
+    /// The archive is bounded by [`FILE_TRANSFER_MAX_TOTAL`] and staged until
+    /// the final chunk, then merged into exactly `path`. Aborting before the
+    /// final chunk leaves the destination untouched; interrupted extraction
+    /// can leave a partial merge. Symbolic links are preserved, not followed.
+    DirectoryWriteBegin {
+        /// Absolute destination directory; its parent must already exist.
+        path: String,
+        /// Filesystem to modify; absent means the agent infers the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
+    },
+
+    /// Append a chunk to the currently open file or directory upload.
+    /// If `done` is true, a file upload fsyncs and atomically renames its
+    /// staging file; a directory upload validates and merges its archive.
     FileWriteChunk {
         /// Chunk bytes. Typically [`FILE_WRITE_CHUNK_SIZE`] except
         /// for the last chunk.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
-        /// True on the final chunk; closes and renames the staging
-        /// file. False on intermediate chunks.
+        /// True on the final chunk, committing the file or extracting the
+        /// directory. False on intermediate chunks.
         done: bool,
     },
 
@@ -1522,6 +1535,7 @@ impl AgentRequest {
             AgentRequest::Resize { .. } => "Resize".into(),
             AgentRequest::FileWrite { .. } => "FileWrite".into(),
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
+            AgentRequest::DirectoryWriteBegin { .. } => "DirectoryWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
             AgentRequest::ListDirectory { .. } => "ListDirectory".into(),

@@ -12,6 +12,7 @@ mod engine_activation;
 pub mod engine_integration;
 pub mod host_network;
 pub mod machine;
+pub mod machine_files;
 pub mod openapi;
 pub mod pack;
 pub mod pack_run;

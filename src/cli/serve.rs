@@ -260,11 +260,11 @@ impl ServeStartCmd {
         if smolvm::process::vm_uid_drop_active() {
             use std::os::unix::fs::PermissionsExt;
             let mut sensitive: Vec<std::path::PathBuf> = Vec::new();
-            if let Some(d) = dirs::data_local_dir().or_else(dirs::data_dir) {
+            if let Some(d) = smolvm_paths::data_local_dir().or_else(smolvm_paths::data_dir) {
                 sensitive.push(d.join("smolvm").join("server"));
                 sensitive.push(d.join("smolvm").join("node-credentials"));
             }
-            if let Some(h) = dirs::home_dir() {
+            if let Some(h) = smolvm_paths::home_dir() {
                 sensitive.push(h.join(".config").join("smolvm"));
             }
             for dir in sensitive {
@@ -973,7 +973,7 @@ impl ListenTarget {
 fn default_listen_value() -> String {
     #[cfg(unix)]
     {
-        let path = dirs::runtime_dir()
+        let path = smolvm_paths::runtime_dir()
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("smolvm.sock")
             .display()

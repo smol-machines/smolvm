@@ -1495,7 +1495,7 @@ fn staging_root(options: &CaptureOptions) -> Result<PathBuf> {
         .staging_dir
         .clone()
         .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")))
+        .or_else(|| smolvm_paths::cache_dir().map(|cache| cache.join("smolvm")))
         .unwrap_or_else(std::env::temp_dir);
     std::fs::create_dir_all(&root)
         .map_err(|error| Error::agent("create checkpoint staging root", error.to_string()))?;
@@ -1515,7 +1515,7 @@ const ABANDONED_SCRATCH_AGE: std::time::Duration = std::time::Duration::from_sec
 pub fn sweep_abandoned_checkpoint_scratch() -> usize {
     let root = std::env::var_os("SMOLVM_PACK_STAGING")
         .map(PathBuf::from)
-        .or_else(|| dirs::cache_dir().map(|cache| cache.join("smolvm")));
+        .or_else(|| smolvm_paths::cache_dir().map(|cache| cache.join("smolvm")));
     let mut removed = 0;
     if let Some(root) = root {
         removed += sweep_abandoned_scratch_in(
@@ -2282,6 +2282,8 @@ fn capture_with_completion(
     if !frozen {
         crate::agent::fork::sync_fork_source(name)?;
         log_phase(name, "capture_sync", &mut phase);
+        crate::agent::fork::trim_guest_disks(name);
+        log_phase(name, "capture_trim", &mut phase);
         release_free_guest_memory(name, &control);
         log_phase(name, "capture_free_memory_hint", &mut phase);
     }
@@ -3661,15 +3663,7 @@ fn describe_failed_save(reply: &str, vmm_alive: Option<bool>) -> String {
 }
 
 fn mounts_image_layers(vm: &VmRecord) -> bool {
-    if vm.packed_image_on_storage {
-        return false;
-    }
-    vm.source_smolmachine.is_some()
-        || vm
-            .image
-            .as_deref()
-            .and_then(crate::data::image_source::packed_layers_dir_for_ref)
-            .is_some()
+    vm.packed_layer_source().is_some() || vm.local_image_layers_dir().is_some()
 }
 
 /// Whether a checkpoint names no host-side image layers: no pack to mount and
@@ -3986,6 +3980,9 @@ pub fn attach_cached_checkpoint_pack(
 /// where they exist. Staged mounts stay unsupported either way.
 pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> {
     let mut unsupported = Vec::new();
+    if vm.network_backend == Some(crate::network::NetworkBackend::Host) {
+        unsupported.push("host networking");
+    }
     if (!vm.mounts.is_empty() && !host_mounts) || !vm.staged_mounts.is_empty() {
         unsupported.push("host mounts");
     }
@@ -4004,11 +4001,7 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
     // are not, so they stay unsupported.
     if vm.source_smolmachine.is_none()
         && vm.host_fetched_origin().is_none()
-        && vm
-            .image
-            .as_deref()
-            .and_then(crate::data::image_source::packed_layers_dir_for_ref)
-            .is_some()
+        && vm.local_image_layers_dir().is_some()
     {
         unsupported.push("host-backed image layers");
     }
@@ -4120,6 +4113,10 @@ pub fn restored_network_backend(
         return Ok(None);
     };
     match label {
+        "host" => Err(Error::agent(
+            "restore checkpoint",
+            "host-network checkpoints are not supported",
+        )),
         "tsi" => Ok(Some(crate::network::NetworkBackend::Tsi)),
         "virtio-net" => Ok(Some(crate::network::NetworkBackend::VirtioNet)),
         other => Err(Error::agent(
@@ -4202,6 +4199,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
     let effective = vm.launch_network_plan();
     let backend = match effective.backend {
         crate::network::EffectiveNetworkBackend::None => None,
+        crate::network::EffectiveNetworkBackend::Host => Some("host".to_string()),
         crate::network::EffectiveNetworkBackend::Tsi => Some("tsi".to_string()),
         crate::network::EffectiveNetworkBackend::VirtioNet => Some("virtio-net".to_string()),
     };
@@ -5541,6 +5539,16 @@ fn max_checkpoint_memory_image(memory_mib: u32, packed_layers: bool) -> Result<u
 /// Whether a checkpoint's machine had the packed-layers virtio-fs device.
 fn mounts_checkpoint_image_layers(checkpoint: &PortableCheckpointManifest) -> bool {
     checkpoint.packed_layers.is_some() || checkpoint.host_image.is_some()
+}
+
+/// Whether a checkpoint's `local:` image is on its storage disk rather than
+/// mounted from a host pack or archive.
+pub fn checkpoint_image_on_storage(checkpoint: &PortableCheckpointManifest) -> bool {
+    !mounts_checkpoint_image_layers(checkpoint)
+        && checkpoint
+            .workload
+            .as_ref()
+            .is_some_and(|workload| crate::data::image_source::is_local_ref(&workload.image))
 }
 
 /// Validate that a checkpoint may be restored by this host and runtime.
@@ -9374,6 +9382,29 @@ mod tests {
         record.packed_image_on_storage = false;
         assert!(mounts_image_layers(&record));
         assert!(checkpoint_packed_layers(&record.name, &record).is_err());
+
+        // A pack prepared on the storage disk from a `local:` image keeps that
+        // reference across checkpoint capture and restore, without mounting the
+        // host's archive on restore or refusing a subsequent capture.
+        let mut local_seed = no_network_machine("local:abc");
+        local_seed.source_smolmachine = Some("missing-pack.smolmachine".into());
+        local_seed.packed_image_on_storage = true;
+        assert!(!mounts_image_layers(&local_seed));
+        validate_capture_profile(&local_seed, false).unwrap();
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.workload = Some(checkpoint_workload(&local_seed.name, &local_seed).unwrap());
+        assert!(checkpoint_image_on_storage(&checkpoint));
+        let manifest = PackManifest::new(
+            "local:abc".into(),
+            "sha256:0".into(),
+            "linux/arm64".into(),
+            "darwin/arm64".into(),
+        );
+        let restored = restored_record("restored", &manifest, &checkpoint).unwrap();
+        assert!(restored.packed_image_on_storage);
+        assert_eq!(restored.local_image_layers_dir(), None);
+        assert!(!mounts_image_layers(&restored));
+        validate_capture_profile(&restored, false).unwrap();
     }
 
     #[test]

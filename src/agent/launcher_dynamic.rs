@@ -441,6 +441,27 @@ pub fn launch_agent_vm_dynamic(
             tracing::info!("network backend: tsi");
             None
         }
+        EffectiveNetworkBackend::Host => {
+            if let Err(reason) = krun.ensure_host_network() {
+                free_ctx_on_err!(reason);
+            }
+            if unsafe {
+                (krun.add_vsock)(
+                    ctx,
+                    TSI_FEATURE_HIJACK_INET | crate::network::backend::TSI_FEATURE_HOST_BIND,
+                )
+            } < 0
+            {
+                free_ctx_on_err!("krun_add_vsock rejected host networking");
+            }
+            crate::agent::launcher::start_tsi_dns_forwarder(
+                ctx,
+                krun.set_dns_forwarder,
+                config.resources.dns,
+            );
+            tracing::info!("network backend: host");
+            None
+        }
         EffectiveNetworkBackend::VirtioNet => {
             let add_net_unixstream = krun.add_net_unixstream.ok_or_else(|| {
                 "libkrun does not expose krun_add_net_unixstream; update libkrun or use --net-backend tsi"
@@ -1171,7 +1192,66 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
         );
     }
 
+    // Confirm unsupported virtualization before replacing the generic EINVAL
+    // hint: permission and resource errors do not establish host incapacity.
+    #[cfg(target_os = "macos")]
+    if -ret == 22 && hypervisor_vm_create_probe() == Some(false) {
+        return format!(
+            "krun_start_enter returned: {ret} (Hypervisor.framework reports \
+             virtualization is unsupported on this host; if this is a virtual \
+             machine, use a host with nested virtualization support)"
+        );
+    }
+
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Whether Hypervisor.framework confirms virtualization support.
+/// `Some(false)` means explicitly unsupported; missing APIs, permissions and
+/// resource failures are inconclusive. A VM already in this process is retained.
+#[cfg(target_os = "macos")]
+fn hypervisor_vm_create_probe() -> Option<bool> {
+    type VmCreate = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+    type VmDestroy = unsafe extern "C" fn() -> u32;
+    let lib = unsafe {
+        libloading::Library::new(
+            "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+        )
+    }
+    .ok()?;
+    let vm_create: libloading::Symbol<VmCreate> = unsafe { lib.get(b"hv_vm_create") }.ok()?;
+    // Resolve cleanup before creating anything. A NULL configuration is the
+    // documented default and needs no retained configuration object to release.
+    let vm_destroy: libloading::Symbol<VmDestroy> = unsafe { lib.get(b"hv_vm_destroy") }.ok()?;
+    probe_hypervisor_vm(
+        || unsafe { vm_create(std::ptr::null_mut()) },
+        || unsafe { vm_destroy() },
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn probe_hypervisor_vm(
+    create: impl FnOnce() -> u32,
+    destroy: impl FnOnce() -> u32,
+) -> Option<bool> {
+    let result = create();
+    // Only destroy the VM this probe created, never an existing caller's VM.
+    if result == 0 && destroy() != 0 {
+        return None;
+    }
+    hv_probe_verdict(result)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn hv_probe_verdict(ret: u32) -> Option<bool> {
+    const HV_SUCCESS: u32 = 0;
+    const HV_BUSY: u32 = 0xfae9_4002;
+    const HV_UNSUPPORTED: u32 = 0xfae9_400f;
+    match ret {
+        HV_SUCCESS | HV_BUSY => Some(true),
+        HV_UNSUPPORTED => Some(false),
+        _ => None,
+    }
 }
 
 pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
@@ -1296,25 +1376,12 @@ pub(crate) fn truncate_console_log(path: &Path) {
     }
 }
 
-/// Longest Unix socket path the host accepts: `sockaddr_un.sun_path` holds 104
-/// bytes on macOS and 108 elsewhere, including the terminating NUL.
-const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
-
-/// libkrun binds the sockets it listens on inside `krun_start_enter` and
-/// reports a path that does not fit only as a bare EINVAL, which reads like a
-/// bad disk. Check the length before handing a socket to libkrun so the error
-/// names the path and the way out.
+/// Check addressability before libkrun starts; the shared socket library uses
+/// a private alias for deep paths while keeping the socket in its original directory.
 pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
-    let len = path.as_os_str().len();
-    if len <= MAX_UNIX_SOCKET_PATH {
-        return Ok(());
-    }
-    Err(format!(
-        "socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte limit for Unix \
-         sockets on this host: {}. smolvm keeps machine sockets under your cache \
-         directory, so run it with a shorter HOME (or XDG_CACHE_HOME on Linux)",
-        path.display()
-    ))
+    krun_socket::SocketPath::new(path)
+        .map(|_| ())
+        .map_err(|error| format!("cannot address Unix socket {}: {error}", path.display()))
 }
 
 /// Convert a Path to a CString.
@@ -1360,14 +1427,14 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_over_the_host_limit_is_named() {
-        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 1)));
-        assert!(check_socket_path_len(&fits).is_ok());
-        let long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH)));
-        let err = check_socket_path_len(&long).unwrap_err();
-        assert!(err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH + 1)));
-        assert!(err.contains(&long.display().to_string()));
-        assert!(err.contains("HOME"));
+    fn deep_socket_paths_are_addressable_and_missing_parents_are_named() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("long-state-root".repeat(10));
+        std::fs::create_dir(&parent).unwrap();
+        assert!(check_socket_path_len(&parent.join("agent.sock")).is_ok());
+        let missing = parent.join("absent").join("agent.sock");
+        let error = check_socket_path_len(&missing).unwrap_err();
+        assert!(error.contains(&missing.display().to_string()));
     }
 
     #[test]
@@ -1457,6 +1524,85 @@ mod tests {
         assert!(!entitlement_enabled(
             "<key>com.apple.security.cs.allow-jit</key><true/>"
         ));
+    }
+
+    #[test]
+    fn hv_probe_does_not_misdiagnose_resource_or_permission_failures() {
+        for code in [
+            0xfae9_4001,
+            0xfae9_4003,
+            0xfae9_4005,
+            0xfae9_4007,
+            0xfae9_4008,
+        ] {
+            assert_eq!(hv_probe_verdict(code), None, "error {code:#x}");
+        }
+    }
+
+    #[test]
+    fn hv_probe_cleans_up_only_a_vm_it_created() {
+        for (code, expected) in [
+            (0, Some(true)),
+            (0xfae9_4002, Some(true)),
+            (0xfae9_400f, Some(false)),
+            (0xfae9_4005, None),
+        ] {
+            let mut destroyed = false;
+            assert_eq!(
+                probe_hypervisor_vm(
+                    || code,
+                    || {
+                        destroyed = true;
+                        0
+                    }
+                ),
+                expected
+            );
+            assert_eq!(destroyed, code == 0);
+        }
+        assert_eq!(probe_hypervisor_vm(|| 0, || 0xfae9_4001), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_verdict_is_stable() {
+        let first = hypervisor_vm_create_probe();
+        let second = hypervisor_vm_create_probe();
+        eprintln!("HVF probe verdicts: {first:?}, {second:?}");
+        assert_eq!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_preserves_an_existing_vm() {
+        type Create = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+        type Destroy = unsafe extern "C" fn() -> u32;
+        struct OwnedVm(Destroy);
+        impl Drop for OwnedVm {
+            fn drop(&mut self) {
+                unsafe {
+                    (self.0)();
+                }
+            }
+        }
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+            )
+        }
+        .unwrap();
+        let create: libloading::Symbol<Create> = unsafe { lib.get(b"hv_vm_create") }.unwrap();
+        let destroy: libloading::Symbol<Destroy> = unsafe { lib.get(b"hv_vm_destroy") }.unwrap();
+        let result = unsafe { create(std::ptr::null_mut()) };
+        if result != 0 {
+            eprintln!("SKIP: test binary cannot create a VM: {result:#x}");
+            return;
+        }
+        let owned = OwnedVm(*destroy);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
+        assert_eq!(unsafe { create(std::ptr::null_mut()) }, 0xfae9_4002);
+        drop(owned);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
     }
 
     #[test]

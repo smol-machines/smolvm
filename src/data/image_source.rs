@@ -499,7 +499,7 @@ fn archive_with_mtime_in(base: &Path, reference: &str, mtime: u64) -> Result<Str
 }
 
 fn archive_cache_base() -> Result<PathBuf> {
-    let base = dirs::cache_dir()
+    let base = smolvm_paths::cache_dir()
         .ok_or_else(|| Error::storage("image archive cache", "no cache directory available"))?;
     Ok(base.join("smolvm-image-archives"))
 }

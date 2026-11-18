@@ -445,6 +445,9 @@ pub enum MachineCmd {
     /// Copy files between host and machine
     Cp(CpCmd),
 
+    /// Browse and transfer files in a running machine
+    Files(super::machine_files::FilesCmd),
+
     /// Synchronize guest-local staged mounts back to their host directories
     Sync(SyncCmd),
 
@@ -509,6 +512,7 @@ impl MachineCmd {
             MachineCmd::Prune(cmd) => cmd.run(),
             MachineCmd::Shell(cmd) => cmd.run(),
             MachineCmd::Cp(cmd) => cmd.run(),
+            MachineCmd::Files(cmd) => cmd.run(),
             MachineCmd::Sync(cmd) => cmd.run(),
             MachineCmd::Monitor(cmd) => cmd.run(),
             MachineCmd::NetworkTest(cmd) => cmd.run(),
@@ -1399,6 +1403,23 @@ fn explain_vm_death(manager: &smolvm::agent::AgentManager, error: smolvm::Error)
         ),
         None => error,
     }
+}
+
+/// Synchronize a foreground run's staged mounts back to the host once its
+/// command has ended. A session that ended because the reader of our output
+/// went away (`run -i ... | head`) closed its connection so the agent would
+/// kill the command and waited for its exit acknowledgement; only then may
+/// that case synchronize over a new connection.
+fn sync_staged_mounts_after_run(
+    mounts: &[HostMount],
+    client: &mut AgentClient,
+    manager: &AgentManager,
+) -> smolvm::Result<()> {
+    if client.session_reader_gone() {
+        client.ensure_session_finished()?;
+        *client = AgentClient::connect_with_retry(manager.vsock_socket())?;
+    }
+    smolvm::staged_mount::sync_mounts(mounts, client)
 }
 
 impl RunCmd {
@@ -2458,7 +2479,8 @@ impl RunCmd {
                 };
 
                 if mounts.iter().any(|mount| mount.staged) {
-                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                    if let Err(error) = sync_staged_mounts_after_run(&mounts, &mut client, &manager)
+                    {
                         // Preserve the VM and its ephemeral DB record so the
                         // guest-local copy remains recoverable and sync can be
                         // retried by machine name.
@@ -2609,7 +2631,8 @@ impl RunCmd {
                     exit_code
                 };
                 if mounts.iter().any(|mount| mount.staged) {
-                    if let Err(error) = smolvm::staged_mount::sync_mounts(&mounts, &mut client) {
+                    if let Err(error) = sync_staged_mounts_after_run(&mounts, &mut client, &manager)
+                    {
                         manager.detach();
                         return Err(Error::agent(
                             "sync staged mounts",
@@ -2793,6 +2816,31 @@ mod tests {
         assert_eq!(super::parse_octal_mode("0o600").unwrap(), 0o600);
         assert!(super::parse_octal_mode("8x").is_err());
         assert!(super::parse_octal_mode("77777").is_err());
+    }
+
+    #[test]
+    fn copy_paths_keep_explicit_host_paths_local() {
+        assert_eq!(
+            super::machine_copy_path("vm:/workspace/a:b"),
+            Some(("vm", "/workspace/a:b"))
+        );
+        for path in ["./a:b", "/tmp/a:b", "folder/file:name", "plain-file"] {
+            assert_eq!(super::machine_copy_path(path), None, "{path}");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn copy_paths_keep_windows_drive_and_unc_prefixes_local() {
+        for path in [
+            r"C:\folder\file.bin",
+            "C:/folder/file.bin",
+            r"C:relative.bin",
+            r"\\?\C:\folder\file.bin",
+            r"\\server\share\file:stream",
+        ] {
+            assert_eq!(super::machine_copy_path(path), None, "{path}");
+        }
     }
 
     use super::*;
@@ -7949,14 +7997,30 @@ fn parse_octal_mode(s: &str) -> smolvm::Result<u32> {
         })
 }
 
+/// A Windows drive prefix belongs to the host path, not a machine named C.
+/// Explicit local paths also keep colons in their filenames literal.
+fn machine_copy_path(value: &str) -> Option<(&str, &str)> {
+    if matches!(
+        Path::new(value).components().next(),
+        Some(std::path::Component::Prefix(_))
+    ) {
+        return None;
+    }
+    let (name, path) = value.split_once(':')?;
+    if name.contains(['/', '\\']) {
+        return None;
+    }
+    Some((name, path))
+}
+
 impl CpCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // Parse src/dst to determine direction
         let (machine_name, guest_path, local_path, is_upload) =
-            if let Some((name, path)) = self.src.split_once(':') {
+            if let Some((name, path)) = machine_copy_path(&self.src) {
                 // Download: machine:path -> local
                 (name.to_string(), path.to_string(), self.dst.clone(), false)
-            } else if let Some((name, path)) = self.dst.split_once(':') {
+            } else if let Some((name, path)) = machine_copy_path(&self.dst) {
                 // Upload: local -> machine:path
                 (name.to_string(), path.to_string(), self.src.clone(), true)
             } else {

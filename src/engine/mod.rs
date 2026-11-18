@@ -67,9 +67,9 @@ pub struct EngineConfig {
 impl EngineConfig {
     /// The default socket, `~/.smolvm/run/docker.sock`, and state directory.
     pub fn default_paths() -> crate::Result<Self> {
-        let home =
-            dirs::home_dir().ok_or_else(|| crate::Error::config("engine", "no home directory"))?;
-        let data = dirs::data_local_dir()
+        let home = smolvm_paths::home_dir()
+            .ok_or_else(|| crate::Error::config("engine", "no home directory"))?;
+        let data = smolvm_paths::data_local_dir()
             .ok_or_else(|| crate::Error::config("engine", "no data directory"))?;
         Ok(Self {
             socket: default_socket_path(&home),

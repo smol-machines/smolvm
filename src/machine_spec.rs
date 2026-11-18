@@ -134,6 +134,9 @@ pub struct CreateSpec {
     // Network ----------------------------------------------------------------
     /// Outbound networking. Also turned on by any option that needs it.
     pub net: bool,
+    /// Replace inherited outbound policy before the machine is published.
+    /// `None` inherits; `Some` replaces the allow list, including explicit off.
+    pub egress: Option<crate::data::network::EgressPolicy>,
     /// Network backend.
     pub network_backend: Option<NetworkBackend>,
     /// Guest DNS resolver.
@@ -270,6 +273,7 @@ impl CreateSpec {
             remote_volumes,
             disk_volumes,
             net,
+            egress,
             network_backend,
             dns,
             dns_options,
@@ -339,6 +343,7 @@ impl CreateSpec {
             remote_volumes: list(self.remote_volumes, remote_volumes),
             disk_volumes: list(self.disk_volumes, disk_volumes),
             net: net || self.net,
+            egress: egress.or(self.egress),
             network_backend: network_backend.or(self.network_backend),
             dns: dns.or(self.dns),
             dns_options: replace(self.dns_options, dns_options),
@@ -450,6 +455,9 @@ pub struct RestoredState {
     /// re-authorize them, so their values must be supplied by the caller,
     /// never read from this host's environment.
     pub credentials_from_artifact: bool,
+    /// The captured machine keeps a `local:` image on its storage disk rather
+    /// than mounting host-backed layers.
+    pub packed_image_on_storage: bool,
 }
 
 /// A [`CreateSpec`] with every rule applied: the machine's settings, ready to
@@ -854,6 +862,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
         remote_volumes,
         disk_volumes,
         net,
+        egress,
         network_backend,
         dns,
         dns_options,
@@ -1013,7 +1022,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             ..Default::default()
         };
 
-    let resolved = match source {
+    let mut resolved = match source {
         SpecSource::Bare | SpecSource::Image(_) => {
             if keep_identity {
                 return Err(Error::config(
@@ -1102,11 +1111,50 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 ));
             }
             let pack = PackDefaults::of(manifest);
+            let packed_egress = crate::pack_export::validated_manifest_egress(manifest)?;
+            let packed_egress = if caller == Caller::Cli {
+                packed_egress.with_cli_overrides(
+                    allowed_cidrs,
+                    allowed_hosts,
+                    block_private,
+                    egress_rules,
+                )
+            } else {
+                let replaces_allow_list = allowed_cidrs.is_some() || allowed_hosts.is_some();
+                crate::pack_export::ValidatedManifestEgress {
+                    allowed_cidrs: if replaces_allow_list {
+                        allowed_cidrs
+                    } else {
+                        packed_egress.allowed_cidrs
+                    },
+                    dns_filter_hosts: if replaces_allow_list {
+                        allowed_hosts
+                    } else {
+                        packed_egress.dns_filter_hosts
+                    },
+                    block_private: block_private.or(packed_egress.block_private),
+                    egress_rules: if egress_rules.is_empty() {
+                        packed_egress.egress_rules
+                    } else {
+                        egress_rules
+                    },
+                }
+            };
+            let crate::pack_export::ValidatedManifestEgress {
+                allowed_cidrs,
+                dns_filter_hosts: allowed_hosts,
+                block_private,
+                egress_rules,
+            } = packed_egress;
             let (entrypoint, cmd) = if explicit_command {
                 (entrypoint.unwrap_or_default(), cmd.unwrap_or_default())
             } else {
                 (pack.entrypoint, pack.cmd)
             };
+            let has_pack_egress = block_private.is_some()
+                || allowed_cidrs.is_some()
+                || allowed_hosts.is_some()
+                || !egress_rules.is_empty();
             ResolvedSpec {
                 caller,
                 image: pack.image,
@@ -1143,7 +1191,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 mounts,
                 remote_volumes,
                 disk_volumes,
-                net: net || implied_net || pack.net,
+                net: net || implied_net || pack.net || has_pack_egress,
                 network_backend,
                 dns,
                 dns_options,
@@ -1505,10 +1553,40 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                             .credential_policy
                             .as_ref()
                             .is_some_and(|policy| !policy.is_empty()),
+                    packed_image_on_storage:
+                        crate::portable_checkpoint::checkpoint_image_on_storage(checkpoint),
                 }),
             }
         }
     };
+
+    // Apply caller policy before any creation path can publish a record.
+    // Reuse stopped-machine normalization and enforcement checks without
+    // minting credential placeholders or touching the database.
+    if let Some(policy) = egress.as_ref() {
+        let mut record = resolved.validation_record();
+        let before = record.launch_network_plan();
+        record.apply_egress_policy(policy)?;
+        let after = record.launch_network_plan();
+        if resolved.restored.is_some() && before.backend != after.backend {
+            return Err(Error::config(
+                "egress policy",
+                "the checkpoint's network backend cannot change; use a deny-all policy \
+                 instead of turning networking off, or recreate the machine",
+            ));
+        }
+        if !policy.network && after.outbound {
+            return Err(Error::config(
+                "egress policy",
+                "inherited network settings require outbound networking; use a deny-all \
+                 policy instead of turning networking off",
+            ));
+        }
+        resolved.net = record.network;
+        resolved.allowed_cidrs = record.allowed_cidrs;
+        resolved.allowed_hosts = record.dns_filter_hosts;
+        resolved.egress_rules = record.egress_rules;
+    }
 
     // Checks on the resolved machine.
     if resolved.cuda_fork_pool_size.is_some() && !resolved.cuda {
@@ -1534,6 +1612,13 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 crate::credentials::require_host_sources(policy)?;
             }
         }
+    }
+    if resolved.network_backend == Some(NetworkBackend::Host)
+        && (caller == Caller::Api
+            || resolved.auto_ports.is_some()
+            || resolved.credentials.is_some())
+    {
+        return Err(Error::config("host network", "host networking requires a trusted local caller without automatic port publishing or credential bindings"));
     }
     let resources = resolved.vm_resources();
     resources.validate()?;
@@ -1581,6 +1666,10 @@ impl ResolvedSpec {
     /// Record checks that need the whole machine but no new state (the
     /// placeholders minted by [`Self::to_record`]).
     fn unrecorded_record_checks(&self) -> Result<()> {
+        self.validation_record().validate_remote_volumes()
+    }
+
+    fn validation_record(&self) -> VmRecord {
         let mut record = VmRecord::new(
             String::new(),
             self.cpus,
@@ -1601,7 +1690,7 @@ impl ResolvedSpec {
         record.network_backend = self.network_backend;
         record.set_port_mappings(&self.ports);
         record.credential_policy = self.credentials.clone();
-        record.validate_remote_volumes()
+        record
     }
 
     /// Whether credential values come from the caller rather than from this
@@ -1786,7 +1875,7 @@ impl ResolvedSpec {
             credentials_supplied_by_api,
             ephemeral,
             source_smolmachine: None,
-            packed_image_on_storage: false,
+            packed_image_on_storage: restored.packed_image_on_storage,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
