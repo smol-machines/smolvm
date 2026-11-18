@@ -1114,7 +1114,7 @@ fn safe_unpack_skipping<R: Read>(
             if let Some(name) = entry_path.file_name().and_then(|n| n.to_str()) {
                 let parent_rel = entry_path.parent().unwrap_or(Path::new(""));
                 if name == ".wh..wh..opq" {
-                    let dir = dest.join(parent_rel);
+                    let dir = resolve_in_root(dest, parent_rel, true)?;
                     if !normalize_path(&dir).starts_with(&canonical_dest) {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
@@ -1130,8 +1130,15 @@ fn safe_unpack_skipping<R: Read>(
                     continue;
                 }
                 if let Some(victim) = name.strip_prefix(".wh.") {
-                    let target = dest.join(parent_rel).join(victim);
-                    if !normalize_path(&target).starts_with(&canonical_dest) {
+                    // The victim itself is never followed: a link is replaced,
+                    // not the file it names.
+                    let target = resolve_in_root(dest, &parent_rel.join(victim), false)?;
+                    if victim.is_empty()
+                        || victim == ".."
+                        || victim == "."
+                        || !normalize_path(&target).starts_with(&canonical_dest)
+                        || normalize_path(&target) == canonical_dest
+                    {
                         return Err(std::io::Error::new(
                             std::io::ErrorKind::InvalidData,
                             format!(
@@ -1148,7 +1155,11 @@ fn safe_unpack_skipping<R: Read>(
                     }
                     let _ = fs::remove_file(&target);
                     let _ = fs::remove_dir_all(&target);
-                    File::create(&target)?;
+                    // create_new: never opens whatever might be in its place
+                    std::fs::OpenOptions::new()
+                        .write(true)
+                        .create_new(true)
+                        .open(&target)?;
                     record_override_stat(&target, 0, 0, WHITEOUT_MODE)?;
                     report.entries += 1;
                     continue;
@@ -1282,9 +1293,10 @@ fn safe_unpack_skipping<R: Read>(
         // Ensure parent directories are writable before extracting any entry.
         // OCI layer tars may set restrictive directory modes (e.g., dr-xr-xr-x)
         // before child entries, which prevents creating files or subdirectories.
-        if let Some(parent) = full_path.parent() {
-            if parent.is_dir() {
-                set_mode(parent, 0o755);
+        if let Some(parent_rel) = entry_path.parent() {
+            let parent = resolve_in_root(dest, parent_rel, true)?;
+            if fs::symlink_metadata(&parent).is_ok_and(|m| m.is_dir()) {
+                set_mode(&parent, 0o755);
             }
         }
 
@@ -1308,7 +1320,7 @@ fn safe_unpack_skipping<R: Read>(
             };
             if mode != 0o755 {
                 deferred_dir_modes.push((
-                    full_path.clone(),
+                    resolve_in_root(dest, &entry_path, true)?,
                     if owner_xattr { mode | 0o700 } else { mode },
                 ));
             }
@@ -1466,7 +1478,8 @@ fn safe_unpack_skipping<R: Read>(
     // path beneath it untraversable, so the children's own restores would fail.
     deferred_dir_modes.sort_by_key(|(path, _)| std::cmp::Reverse(path.components().count()));
     for (path, mode) in deferred_dir_modes {
-        if path.is_dir() {
+        // A later entry may have put a link in its place: chmod follows links.
+        if fs::symlink_metadata(&path).is_ok_and(|m| m.is_dir()) {
             set_mode(&path, mode);
         }
     }
@@ -1488,6 +1501,61 @@ fn normalize_path(path: &Path) -> PathBuf {
         }
     }
     components.iter().collect()
+}
+
+/// Where `rel` lies inside `root` as the guest will see it: every component of
+/// `rel` that exists as a symlink is followed, its target taken relative to
+/// `root` (an absolute target names a path under `root`, as it does in the
+/// guest), so the walk can never leave `root`; `..` stops at `root`. The last
+/// component is followed only with `follow_last`, so a caller can remove or
+/// replace a link itself. Anything not yet on disk is taken as written.
+///
+/// A layer may hold a link to any absolute path (`etc -> /etc`): only what the
+/// guest sees is checked at its creation, so every filesystem call smolvm makes
+/// itself beneath such a link must go through here, or a later entry under the
+/// link (`etc/.wh.passwd`) acts on the host's file instead of the image's.
+fn resolve_in_root(root: &Path, rel: &Path, follow_last: bool) -> std::io::Result<PathBuf> {
+    fn split(path: &str) -> impl DoubleEndedIterator<Item = String> + '_ {
+        // tar paths and link targets use Unix separators on every host
+        path.split('/')
+            .filter(|c| !c.is_empty() && *c != ".")
+            .map(str::to_string)
+    }
+    let mut pending: std::collections::VecDeque<String> = split(&rel.to_string_lossy()).collect();
+    let mut resolved = PathBuf::new();
+    let mut hops = 0u32;
+    while let Some(component) = pending.pop_front() {
+        if component == ".." {
+            resolved.pop();
+            continue;
+        }
+        let candidate = resolved.join(&component);
+        let is_last = pending.is_empty();
+        let on_disk = root.join(&candidate);
+        let is_link = std::fs::symlink_metadata(&on_disk)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false);
+        if is_link && (follow_last || !is_last) {
+            hops += 1;
+            if hops > 40 {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!("too many symbolic links under '{}'", rel.display()),
+                ));
+            }
+            let target = std::fs::read_link(&on_disk)?;
+            let target = target.to_string_lossy();
+            if target.starts_with('/') {
+                resolved = PathBuf::new();
+            }
+            for part in split(&target).rev() {
+                pending.push_front(part);
+            }
+            continue;
+        }
+        resolved.push(component);
+    }
+    Ok(root.join(resolved))
 }
 
 /// Resolve a manifest asset path against an extraction cache without allowing
@@ -8082,6 +8150,73 @@ mod tests {
             stacked.join("var/lib/docker/diff/etc/gone").exists(),
             "becomes the whiteout"
         );
+    }
+
+    /// A layer's link to a host path (`abs -> /home/me`) names the image's own
+    /// path: whiteouts beneath it land inside the layer, never on the host.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn a_whiteout_beneath_a_link_out_of_the_layer_never_touches_the_host() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        // What a hostile layer aims at: files outside the extraction.
+        let host = root.path().join("host");
+        fs::create_dir_all(host.join("victim-dir")).unwrap();
+        fs::write(host.join("victim-file"), b"host data").unwrap();
+        fs::write(host.join("victim-dir/inner"), b"host data").unwrap();
+        let host_abs = host.canonicalize().unwrap();
+
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Symlink);
+        header.set_mode(0o777);
+        header.set_size(0);
+        header.set_link_name(&host_abs).unwrap();
+        header.set_cksum();
+        builder.append_data(&mut header, "abs", &b""[..]).unwrap();
+        for whiteout in [
+            "abs/.wh.victim-file",
+            "abs/.wh.victim-dir",
+            "abs/.wh..wh..opq",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(0);
+            header.set_cksum();
+            builder
+                .append_data(&mut header, whiteout, &b""[..])
+                .unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+
+        let dest = root.path().join("layer");
+        fs::create_dir(&dest).unwrap();
+        let mut archive = tar::Archive::new(tar_bytes.as_slice());
+        safe_unpack_with_policy(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            true,
+        )
+        .unwrap();
+
+        assert_eq!(fs::read(host.join("victim-file")).unwrap(), b"host data");
+        assert_eq!(
+            fs::read(host.join("victim-dir/inner")).unwrap(),
+            b"host data"
+        );
+        assert_eq!(read_user_xattr(&host, OVERLAY_OPAQUE_XATTR), None);
+        // The link names the image's own path, as it does in the guest.
+        let inside = dest.join(host_abs.strip_prefix("/").unwrap());
+        assert!(
+            inside.join("victim-file").exists(),
+            "the whiteout lands inside the layer"
+        );
+        assert!(inside.join("victim-dir").is_file());
     }
 
     /// Host-side extraction that describes ownership to the guest: every
