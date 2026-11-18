@@ -245,6 +245,7 @@ mod tests {
             read_only: true,
             staged: false,
             recorded_ownership: false,
+            owner: None,
         };
         let from_parsed = mounts_to_virtiofs_bindings(&[host_mount]);
         let from_record =
@@ -262,6 +263,7 @@ mod tests {
                 read_only: false,
                 staged: false,
                 recorded_ownership: false,
+                owner: None,
             },
             HostMount {
                 source: PathBuf::from("/tmp"),
@@ -269,6 +271,7 @@ mod tests {
                 recorded_ownership: false,
                 read_only: false,
                 staged: true,
+                owner: None,
             },
         ];
         assert_eq!(

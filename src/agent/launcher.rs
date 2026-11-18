@@ -829,6 +829,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         read_only: false,
                         staged: false,
                         recorded_ownership: false,
+                        owner: None,
                     });
                 }
             }
@@ -2266,6 +2267,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // the COW wall entirely. The shared policy keeps this launcher,
             // packed VMs, and the direct backend on the same window size.
             let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
+            // The mount's owner (`uid=`/`gid=`) is set on its share once added.
+            let set_owner = || set_mount_owner(&krun, ctx, &tag, mount);
             // Recorded ownership keeps guest permissions separate from host
             // access, including on macOS where overlayfs uses mode-000 workdirs.
             if mount.recorded_ownership {
@@ -2293,6 +2296,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             mount.source.display()
                         ),
                     ));
+                }
+                if let Err(e) = set_owner() {
+                    krun_free_ctx(ctx);
+                    return Err(e);
                 }
                 continue;
             }
@@ -2388,6 +2395,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         mount.source.display()
                     ),
                 ));
+            }
+            if let Err(e) = set_owner() {
+                krun_free_ctx(ctx);
+                return Err(e);
             }
         }
 
@@ -3406,6 +3417,34 @@ pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
                 .expect("port mapping format cannot contain null bytes")
         })
         .collect())
+}
+
+/// Serve the files of `mount`'s share that record no owner of their own as its
+/// `uid=`/`gid=` owner. Fails when the library cannot, rather than boot the
+/// mount owned by root.
+fn set_mount_owner(
+    krun: &super::krun::KrunFunctions,
+    ctx: u32,
+    tag: &std::ffi::CStr,
+    mount: &HostMount,
+) -> Result<()> {
+    let Some((uid, gid)) = mount.owner else {
+        return Ok(());
+    };
+    let Some(set_virtiofs_owner) = krun.set_virtiofs_owner else {
+        return Err(Error::agent(
+            "set mount owner",
+            "a mount's uid=/gid= needs libkrun with krun_set_virtiofs_owner",
+        ));
+    };
+    // SAFETY: `tag` names a share just added to the live context `ctx`.
+    if unsafe { set_virtiofs_owner(ctx, tag.as_ptr(), uid, gid) } < 0 {
+        return Err(Error::agent(
+            "set mount owner",
+            format!("could not set the owner of '{}'", mount.source.display()),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

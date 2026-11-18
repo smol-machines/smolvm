@@ -521,6 +521,12 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recorded_ownership: bool,
 
+    /// The owner (`uid`, `gid`) of live mount `index` in `mounts`
+    /// ([`crate::data::storage::HostMount::owner`]). Kept apart from `mounts`
+    /// so existing records keep their tuple encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mount_owners: Vec<(usize, u32, u32)>,
+
     /// The fork source whose host directories this branch's staged working
     /// copies were seeded from. A branch keeps the copies (they live on its own
     /// cloned storage disk and survive restarts, since the mounts stay
@@ -1034,6 +1040,7 @@ impl VmRecord {
             staged_mounts: Vec::new(),
             recorded_ownership: false,
             staged_mounts_detached_from: None,
+            mount_owners: Vec::new(),
             ports,
             udp_ports: Vec::new(),
             allocated_ports: Vec::new(),
@@ -1144,6 +1151,7 @@ impl VmRecord {
             staged_mounts: Vec::new(),
             recorded_ownership: false,
             staged_mounts_detached_from: None,
+            mount_owners: Vec::new(),
             ports,
             udp_ports: Vec::new(),
             allocated_ports: Vec::new(),
@@ -1285,12 +1293,23 @@ impl VmRecord {
         let mut live = self
             .mounts
             .iter()
-            .map(|(host, guest, ro)| crate::data::storage::HostMount {
-                source: std::path::PathBuf::from(host),
-                target: std::path::PathBuf::from(guest),
-                read_only: *ro,
-                staged: false,
-                recorded_ownership: self.recorded_ownership,
+            .enumerate()
+            .map(|(i, (host, guest, ro))| {
+                let owner = self
+                    .mount_owners
+                    .iter()
+                    .find(|(index, _, _)| *index == i)
+                    .map(|&(_, uid, gid)| (uid, gid));
+                crate::data::storage::HostMount {
+                    source: std::path::PathBuf::from(host),
+                    target: std::path::PathBuf::from(guest),
+                    read_only: *ro,
+                    staged: false,
+                    // Linux serves an owner only where owners are virtualized.
+                    recorded_ownership: self.recorded_ownership
+                        || (cfg!(target_os = "linux") && owner.is_some()),
+                    owner,
+                }
             })
             .collect::<std::collections::VecDeque<_>>();
         let staged = self

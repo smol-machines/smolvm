@@ -240,6 +240,21 @@ fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
     ))
 }
 
+/// A packed machine's mounts take no owner yet: refused rather than mounted
+/// owned by root.
+fn reject_mount_owners(mounts: &[smolvm::data::storage::HostMount]) -> smolvm::Result<()> {
+    match mounts.iter().find(|m| m.owner.is_some()) {
+        Some(m) => Err(smolvm::Error::config(
+            "mount",
+            format!(
+                "a packed machine's mount takes no owner (uid=/gid=): {}",
+                m.target.display()
+            ),
+        )),
+        None => Ok(()),
+    }
+}
+
 /// Convert parsed mounts to PackedMount format for the VM launcher.
 fn mounts_to_packed(mounts: &[smolvm::data::storage::HostMount]) -> Vec<PackedMount> {
     mounts
@@ -719,6 +734,7 @@ impl PackRunCmd {
         let (volume_specs, disk_volumes) =
             smolvm::data::storage::split_disk_volume_specs(&self.volume)?;
         let mounts = HostMount::parse_with_system_mounts(&volume_specs, self.allow_system_mounts)?;
+        reject_mount_owners(&mounts)?;
         smolvm::data::storage::ensure_disk_volumes_distinct(
             &disk_volumes,
             mounts.iter().filter_map(|m| m.target.to_str()),
@@ -1966,6 +1982,7 @@ fn run_from_cache(
     let (volume_specs, disk_volumes) =
         smolvm::data::storage::split_disk_volume_specs(&args.volume)?;
     let mounts = HostMount::parse_with_system_mounts(&volume_specs, args.allow_system_mounts)?;
+    reject_mount_owners(&mounts)?;
     smolvm::data::storage::ensure_disk_volumes_distinct(
         &disk_volumes,
         mounts.iter().filter_map(|m| m.target.to_str()),
@@ -2430,6 +2447,7 @@ fn daemon_start(
     let (volume_specs, disk_volumes) =
         smolvm::data::storage::split_disk_volume_specs(&args.volume)?;
     let mounts = HostMount::parse_with_system_mounts(&volume_specs, args.allow_system_mounts)?;
+    reject_mount_owners(&mounts)?;
     smolvm::data::storage::ensure_disk_volumes_distinct(
         &disk_volumes,
         mounts.iter().filter_map(|m| m.target.to_str()),
