@@ -529,6 +529,13 @@ pub struct OciRlimit {
 /// Linux-specific configuration.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OciLinux {
+    /// Managed cgroup for workloads that need per-container accounting.
+    #[serde(
+        rename = "cgroupsPath",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub cgroups_path: Option<String>,
     /// Namespaces to create.
     pub namespaces: Vec<OciNamespace>,
     /// Device nodes to create in the container.
@@ -658,6 +665,7 @@ impl OciSpec {
                 no_new_privileges: false,
             },
             linux: OciLinux {
+                cgroups_path: None,
                 namespaces: vec![
                     OciNamespace {
                         ns_type: "pid".to_string(),

@@ -251,6 +251,8 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
         }
     }
 
+    let container_id = crate::oci::generate_container_id();
+    crate::container_stats::configure(&mut oci, &container_id)?;
     let bundle = rootfs
         .parent()
         .ok_or("invalid rootfs path: no parent")?
@@ -258,9 +260,8 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
     std::fs::create_dir_all(&bundle)?;
     oci.write_to(&bundle)
         .map_err(|e| format!("failed to write OCI spec: {e}"))?;
-    let container_id = crate::oci::generate_container_id();
     tracing::info!(id = %spec.id, container_id = %container_id, command = ?spec.command, tty = spec.tty, "starting container");
-    let (mut child, pty) = crate::spawn_crun_run(&bundle, &container_id, spec.tty, false)?;
+    let (mut child, pty) = crate::spawn_crun_run(&bundle, &container_id, spec.tty, true)?;
     // Only a running container becomes the overlay's main container: a `Run`
     // that looked it up while crun was still creating it would find it not
     // running and delete its state, failing the start.

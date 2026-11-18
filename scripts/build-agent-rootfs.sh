@@ -241,7 +241,7 @@ install_crane "$CRANE_BINARY"
 echo "Installing additional packages..."
 # GNU tar replaces busybox tar, which never sets a symlink's owner when it
 # unpacks image layers.
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd tar"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra json-c libseccomp util-linux libcap seatd tar"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -432,6 +432,10 @@ else
     echo "Install smolvm first: https://github.com/smolvm/smolvm"
     exit 1
 fi
+
+# Use the same pinned runtime and cleanup patch for native and cross builds.
+# A failed build must stop packaging rather than fall back to a different crun.
+python3 "$SCRIPT_DIR/build-crun.py" "$ALPINE_ARCH" "$OUTPUT_DIR"
 
 repair_executable_modes "$OUTPUT_DIR"
 
