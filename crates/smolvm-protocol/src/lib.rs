@@ -50,8 +50,12 @@ pub struct S3Volume {
     pub session_token: Option<String>,
 }
 
+/// Guest support for owned container TCP listener discovery and raw app connections.
+pub const CONTAINER_APP_PORTS_CAPABILITY: &str = "container-app-ports-v1";
+
 pub mod auto_ports;
 pub mod binary_stream;
+pub mod container_session;
 pub mod credentials;
 pub mod disk_volume;
 pub mod egress_rule;
@@ -600,6 +604,27 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Control a container execution whose lifetime is independent of this connection.
+    ContainerSession {
+        /// Start, attach, or exchange sequenced container I/O.
+        control: container_session::Control,
+    },
+    /// Watch guest TCP listener changes; after protocol confirmation, receive
+    /// coalesced little-endian u64 generations until this connection closes.
+    WatchListeners,
+    /// Discover TCP listeners owned by one running Docker workload's cgroup.
+    ContainerPorts {
+        /// Persistent workload overlay identity.
+        overlay_id: String,
+    },
+    /// Connect to an owned TCP listener; after a successful `Ok` with
+    /// `protocol: smol-app-tcp-v1`, this connection carries raw TCP bytes.
+    ContainerPortConnect {
+        /// Persistent workload overlay identity.
+        overlay_id: String,
+        /// A currently listening TCP port belonging to that workload.
+        port: u16,
+    },
     /// Offline trailing CPUs after the host verifies runtime shrink support.
     OfflineCpus {
         /// Retained online CPU count, starting at CPU0; must be nonzero.
@@ -1476,6 +1501,7 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::ContainerSession { .. } => "ContainerSession".into(),
             AgentRequest::OnlineMemory {
                 start_address,
                 length_bytes,
@@ -1518,6 +1544,11 @@ impl AgentRequest {
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
             AgentRequest::PressureStatus => "PressureStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
+            AgentRequest::WatchListeners => "WatchListeners".into(),
+            AgentRequest::ContainerPorts { .. } => "ContainerPorts".into(),
+            AgentRequest::ContainerPortConnect { port, .. } => {
+                format!("ContainerPortConnect {{ port: {port} }}")
+            }
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
@@ -1619,6 +1650,11 @@ pub struct DirectoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AgentResponse {
+    /// Acknowledgement or sequenced I/O from a durable container execution.
+    ContainerSession {
+        /// Session event, scoped to the execution confirmed by attachment.
+        event: container_session::Event,
+    },
     /// Operation completed successfully.
     Ok {
         /// Response data (varies by request type).

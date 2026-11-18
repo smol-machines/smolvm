@@ -273,10 +273,16 @@ fn owner_only_request(owner: &str, method: &axum::http::Method, path: &str) -> b
         return false;
     };
     id == owner
-        && matches!(
-            (method.as_str(), action),
-            ("GET", "json" | "logs" | "top" | "stats") | ("POST", "wait" | "attach" | "resize")
-        )
+        && ((method == axum::http::Method::POST
+            && action
+                .strip_prefix("smol/ports/")
+                .and_then(|s| s.strip_suffix("/connect"))
+                .is_some_and(|p| p.parse::<u16>().is_ok_and(|p| p != 0)))
+            || matches!(
+                (method.as_str(), action),
+                ("GET", "json" | "logs" | "top" | "stats" | "smol/ports")
+                    | ("POST", "wait" | "attach" | "resize")
+            ))
 }
 
 fn resolve_container(engine: &Engine, name: &str) -> ApiResult<String> {
@@ -702,6 +708,42 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_app_requests_stay_on_the_live_container_owner() {
+        use axum::http::Method;
+        let owner = "a".repeat(64);
+        assert!(owner_only_request(
+            &owner,
+            &Method::GET,
+            &format!("/containers/{owner}/smol/ports")
+        ));
+        assert!(owner_only_request(
+            &owner,
+            &Method::POST,
+            &format!("/containers/{owner}/smol/ports/8080/connect")
+        ));
+        for action in [
+            "smol/ports/0/connect",
+            "smol/ports/65536/connect",
+            "smol/ports/8080/connect/extra",
+        ] {
+            assert!(!owner_only_request(
+                &owner,
+                &Method::POST,
+                &format!("/containers/{owner}/{action}")
+            ));
+        }
+        assert!(!owner_only_request(
+            &owner,
+            &Method::GET,
+            "/containers/other/smol/ports"
+        ));
+        assert!(!owner_only_request(
+            &owner,
+            &Method::DELETE,
+            &format!("/containers/{owner}/smol/ports")
+        ));
+    }
     #[tokio::test]
     async fn supervisor_readiness_is_signalled_and_socket_is_removed() {
         let dir = tempfile::tempdir().unwrap();

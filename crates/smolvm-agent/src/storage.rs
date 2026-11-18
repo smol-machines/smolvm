@@ -1593,20 +1593,42 @@ pub(crate) fn archive_scratch_dir() -> PathBuf {
 /// last, so the image-info and overlay paths share one flatten within a start.
 fn ensure_archive_flattened_with_progress<F>(
     packed_dir: &Path,
-    mut progress: F,
+    progress: F,
 ) -> Result<Option<PathBuf>>
 where
     F: FnMut(&str, u64),
 {
-    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
-    if !archive.exists() {
-        return Ok(None);
-    }
     let key = packed_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("archive");
     let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
+    ensure_archive_flattened_at(
+        packed_dir,
+        out_base,
+        progress,
+        flatten_archive_with_progress,
+    )
+}
+
+mod archive_lock;
+
+fn ensure_archive_flattened_at<F, G>(
+    packed_dir: &Path,
+    out_base: PathBuf,
+    mut progress: F,
+    flatten: G,
+) -> Result<Option<PathBuf>>
+where
+    F: FnMut(&str, u64),
+    G: FnOnce(&Path, &Path, &mut F) -> Result<Option<Vec<u8>>>,
+{
+    let preparation = archive_lock::for_image(&out_base);
+    let _preparing = preparation.lock();
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    if !archive.exists() {
+        return Ok(None);
+    }
     let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
     let signature = archive_signature(&archive)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
@@ -1619,7 +1641,7 @@ where
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
     progress("flattening local image archive", 0);
-    let oci_config = flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+    let oci_config = flatten(&archive, &rootfs, &mut progress)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.

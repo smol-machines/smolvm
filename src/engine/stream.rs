@@ -135,17 +135,45 @@ pub(crate) fn hijack(
     }
 }
 
-/// Read the client's input until it closes, handing each piece to `f`.
-pub(crate) async fn read_input(
+/// The reader belongs to an execution, not its output attachment. A client
+/// can close after writing buffered stdin: keep draining those accepted bytes
+/// before EOF even if the output side has already noticed the disconnect.
+/// The generation's closed signal cancels the reader when its process exits.
+pub(crate) fn forward_input(
+    input: Box<dyn AsyncRead + Unpin + Send>,
+    sender: super::runtime::InputSender,
+    close_stdin: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(read_input(input, sender, close_stdin))
+}
+
+/// Await queue capacity before reading more socket data. This carries guest
+/// backpressure all the way to the Docker client's write, without dropping bytes.
+async fn read_input(
     mut input: Box<dyn AsyncRead + Unpin + Send>,
-    mut f: impl FnMut(Vec<u8>),
+    sender: super::runtime::InputSender,
+    close_stdin: bool,
 ) {
-    let mut buf = vec![0u8; 32 * 1024];
-    loop {
-        match input.read(&mut buf).await {
-            Ok(0) | Err(_) => return,
-            Ok(n) => f(buf[..n].to_vec()),
+    use super::runtime::Input;
+    let forward = async {
+        let mut buf = vec![0u8; 32 * 1024];
+        loop {
+            match input.read(&mut buf).await {
+                Ok(0) | Err(_) => break,
+                Ok(n) => {
+                    if sender.send(Input::Data(buf[..n].to_vec())).await.is_err() {
+                        return;
+                    }
+                }
+            }
         }
+        if close_stdin {
+            let _ = sender.send(Input::Eof).await;
+        }
+    };
+    tokio::select! {
+        _ = sender.closed() => {},
+        _ = forward => {},
     }
 }
 
@@ -164,7 +192,86 @@ use tokio_stream::StreamExt as _;
 
 #[cfg(test)]
 mod tests {
+    use super::super::runtime::{Input, InputQueue};
     use super::*;
+    use std::time::Duration;
+    use tokio::time::timeout;
+
+    #[tokio::test]
+    async fn socket_input_backpressure_preserves_large_binary_stream_and_eof() {
+        let queue = InputQueue::default();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let data: Vec<u8> = (0..2 * 1024 * 1024).map(|n| (n % 251) as u8).collect();
+        let sent = data.clone();
+        let mut writer = tokio::spawn(async move {
+            client.write_all(&sent).await.unwrap();
+            client.shutdown().await.unwrap();
+        });
+        let mut reader = forward_input(Box::new(server), queue.sender(), true);
+        assert!(timeout(Duration::from_millis(30), &mut writer)
+            .await
+            .is_err());
+        let received = timeout(Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            loop {
+                match queue.next().await {
+                    Input::Data(data) => bytes.extend(data),
+                    Input::Eof => break bytes,
+                    Input::Resize { .. } => panic!("unexpected resize"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, data);
+        writer.await.unwrap();
+        (&mut reader).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn execution_end_releases_a_socket_reader_without_waiting_for_client_eof() {
+        let queue = InputQueue::default();
+        let (mut client, server) = tokio::io::duplex(1024);
+        let mut reader = forward_input(Box::new(server), queue.sender(), true);
+        queue.finish();
+        timeout(Duration::from_secs(1), &mut reader)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(client.write_all(b"old execution").await.is_err());
+        queue
+            .sender()
+            .send(Input::Data(b"new".to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(queue.next().await, Input::Data(b) if b == b"new"));
+    }
+
+    #[tokio::test]
+    async fn disconnect_drains_accepted_stdin_before_eof_even_after_output_detaches() {
+        let queue = InputQueue::default();
+        let (mut client, server) = tokio::io::duplex(512 * 1024);
+        let data = vec![42; 512 * 1024];
+        client.write_all(&data).await.unwrap();
+        drop(client);
+        let reader = forward_input(Box::new(server), queue.sender(), true);
+        // The output attachment may observe full connection close first.
+        // Its handle dropping must not truncate bytes already in the socket.
+        drop(reader);
+        let received = timeout(Duration::from_secs(5), async {
+            let mut bytes = Vec::new();
+            loop {
+                match queue.next().await {
+                    Input::Data(data) => bytes.extend(data),
+                    Input::Eof => break bytes,
+                    Input::Resize { .. } => panic!("unexpected resize"),
+                }
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(received, data);
+    }
 
     #[test]
     fn frame_header_names_stream_and_length() {

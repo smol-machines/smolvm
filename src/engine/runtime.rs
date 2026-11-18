@@ -52,10 +52,15 @@ impl AgentWriter {
 
 impl AgentReader {
     pub(crate) async fn recv(&mut self) -> std::io::Result<AgentResponse> {
+        self.recv_limited(MAX_FRAME).await
+    }
+
+    /// A caller with a bounded streaming protocol can impose a smaller limit.
+    pub(crate) async fn recv_limited(&mut self, limit: usize) -> std::io::Result<AgentResponse> {
         let mut header = [0u8; 4];
         self.0.read_exact(&mut header).await?;
         let len = u32::from_be_bytes(header) as usize;
-        if len > MAX_FRAME {
+        if len == 0 || len > limit.min(MAX_FRAME) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::InvalidData,
                 format!("agent frame of {len} bytes is too large"),
@@ -81,6 +86,55 @@ pub(crate) async fn request(
     tokio::time::timeout(std::time::Duration::from_secs(30), r.recv())
         .await
         .map_err(|_| std::io::Error::new(std::io::ErrorKind::TimedOut, "agent did not answer"))?
+}
+
+/// Negotiate a raw app stream without buffering past the final response frame.
+pub(crate) async fn app_connect(
+    socket: &Path,
+    overlay: &str,
+    port: u16,
+) -> super::util::ApiResult<UnixStream> {
+    let (mut reader, mut writer) = connect(socket)
+        .await
+        .map_err(|e| super::util::ApiError::internal(e.to_string()))?;
+    writer
+        .send(&AgentRequest::ContainerPortConnect {
+            overlay_id: overlay.into(),
+            port,
+        })
+        .await
+        .map_err(|e| super::util::ApiError::internal(e.to_string()))?;
+    let reply = reader
+        .recv()
+        .await
+        .map_err(|e| super::util::ApiError::internal(e.to_string()))?;
+    super::app_ports::confirmed(reply)?;
+    reader
+        .0
+        .reunite(writer.0)
+        .map_err(|e| super::util::ApiError::internal(e.to_string()))
+}
+
+pub(crate) async fn listener_watch(socket: &Path) -> std::io::Result<UnixStream> {
+    let (mut reader, mut writer) = connect(socket).await?;
+    writer.send(&AgentRequest::WatchListeners).await?;
+    match reader.recv().await? {
+        AgentResponse::Ok { data: Some(data) } if data["protocol"] == "smol-listener-watch-v1" => {}
+        AgentResponse::Error { code, .. }
+            if code.as_deref() == Some(smolvm_protocol::error_codes::INVALID_REQUEST) =>
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::Unsupported,
+                "Guest listener notifications require a newer runtime",
+            ));
+        }
+        _ => {
+            return Err(std::io::Error::other(
+                "Guest did not confirm listener notifications",
+            ))
+        }
+    }
+    reader.0.reunite(writer.0).map_err(std::io::Error::other)
 }
 
 /// The error text of an agent reply, if it is an error.
@@ -113,30 +167,10 @@ pub(crate) enum Input {
     },
 }
 
-/// A queue of input for a container's process that outlives any one run, so
-/// input written by a client attached before the start is not lost.
-#[derive(Default)]
-pub(crate) struct InputQueue {
-    queue: parking_lot::Mutex<std::collections::VecDeque<Input>>,
-    notify: tokio::sync::Notify,
-}
-
-impl InputQueue {
-    pub(crate) fn push(&self, input: Input) {
-        self.queue.lock().push_back(input);
-        self.notify.notify_one();
-    }
-
-    pub(crate) async fn next(&self) -> Input {
-        loop {
-            let notified = self.notify.notified();
-            if let Some(input) = self.queue.lock().pop_front() {
-                return input;
-            }
-            notified.await;
-        }
-    }
-}
+#[cfg(test)]
+mod exec_io_tests;
+mod input;
+pub(crate) use input::{InputQueue, InputSender};
 
 impl Input {
     pub(crate) fn into_request(self) -> AgentRequest {
@@ -155,52 +189,67 @@ pub(crate) struct Exit {
     pub oom: bool,
 }
 
-/// Carry a started process's I/O until it exits: output goes to `on_output`,
-/// input comes from `input`. An agent that goes away without reporting an
-/// exit (the machine died) ends the process with 137.
-pub(crate) async fn pump(
+/// Streaming replies carry at most 64 KiB of output in current guests. Allow
+/// room for the legacy JSON byte-array encoding while bounding frame allocation.
+pub(crate) const STREAM_FRAME_LIMIT: usize = 512 * 1024;
+const OUTPUT_CHUNK: usize = 64 * 1024;
+
+async fn deliver<F, Fut>(on_output: &mut F, stream: u8, data: Vec<u8>)
+where
+    F: FnMut(u8, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    if data.is_empty() {
+        return;
+    }
+    if data.len() <= OUTPUT_CHUNK {
+        on_output(stream, data).await;
+    } else {
+        for bytes in data.chunks(OUTPUT_CHUNK) {
+            on_output(stream, bytes.to_vec()).await;
+        }
+    }
+}
+
+/// Carry an exec's I/O until the guest reports its exit. Output delivery is
+/// awaited, so a slow client backpressures the guest instead of growing a queue.
+/// A lost transport is an error, never an invented process exit status.
+pub(crate) async fn pump<F, Fut>(
     mut reader: AgentReader,
     mut writer: AgentWriter,
     input: &InputQueue,
-    mut on_output: impl FnMut(u8, Vec<u8>),
-) -> Exit {
-    // Input and output run at once: a process that echoes its input (a
-    // tunnel such as `buildctl dial-stdio`) blocks writing output while its
-    // input waits, so output read only between input writes deadlocks both.
+    mut on_output: F,
+) -> std::io::Result<Exit>
+where
+    F: FnMut(u8, Vec<u8>) -> Fut,
+    Fut: std::future::Future<Output = ()>,
+{
+    // Input and output run concurrently: an echoing process or buildctl tunnel
+    // must still receive stdin while delivery of earlier output is blocked.
     let forward = async {
         loop {
             let next = input.next().await;
             if writer.send(&next.into_request()).await.is_err() {
-                // The process is gone; its exit arrives on the reader.
+                // Exit can race stdin. Let the reader consume its actual status.
                 std::future::pending::<()>().await;
             }
         }
     };
     let receive = async {
         loop {
-            match reader.recv().await {
-                Ok(AgentResponse::Stdout { data }) => on_output(1, data),
-                Ok(AgentResponse::Stderr { data }) => on_output(2, data),
-                Ok(AgentResponse::Exited { exit_code, oom }) => {
-                    return Exit {
+            match reader.recv_limited(STREAM_FRAME_LIMIT).await? {
+                AgentResponse::Stdout { data } => deliver(&mut on_output, 1, data).await,
+                AgentResponse::Stderr { data } => deliver(&mut on_output, 2, data).await,
+                AgentResponse::Exited { exit_code, oom } => {
+                    return Ok(Exit {
                         code: exit_code as i64,
                         oom,
-                    };
+                    });
                 }
-                Ok(AgentResponse::Error { message, .. }) => {
-                    on_output(2, format!("{message}\n").into_bytes());
-                    return Exit {
-                        code: 126,
-                        oom: false,
-                    };
+                AgentResponse::Error { message, .. } => {
+                    return Err(std::io::Error::other(message));
                 }
-                Ok(_) => {}
-                Err(_) => {
-                    return Exit {
-                        code: 137,
-                        oom: false,
-                    }
-                }
+                _ => {}
             }
         }
     };

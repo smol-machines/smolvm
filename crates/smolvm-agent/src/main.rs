@@ -85,10 +85,13 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod app_ports;
 mod attach;
 mod auto_ports;
 mod branchpoint;
 mod container;
+#[cfg(target_os = "linux")]
+mod container_session;
 mod container_stats;
 mod credentials;
 mod cuda;
@@ -98,6 +101,7 @@ mod disk_trim;
 mod docker_bridge;
 mod forkpoint;
 mod io_target;
+mod listener_watch;
 #[cfg(target_os = "linux")]
 mod memory_trim;
 mod mount_owner;
@@ -2199,7 +2203,12 @@ fn needs_work_slot(request: &AgentRequest) -> bool {
     // like a daemon, not like a unit of work.
     !matches!(
         request,
-        AgentRequest::Ping | AgentRequest::Shutdown { .. } | AgentRequest::ContainerStart(_)
+        AgentRequest::Ping
+            | AgentRequest::Shutdown { .. }
+            | AgentRequest::ContainerStart(_)
+            | AgentRequest::ContainerSession { .. }
+            | AgentRequest::ContainerPortConnect { .. }
+            | AgentRequest::WatchListeners
     )
 }
 
@@ -2547,6 +2556,33 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if matches!(request, AgentRequest::WatchListeners) {
+            listener_watch::serve(stream)?;
+            return Ok(());
+        }
+
+        if let AgentRequest::ContainerPortConnect { overlay_id, port } = request {
+            app_ports::connect(stream, &overlay_id, port)?;
+            return Ok(());
+        }
+
+        if let AgentRequest::ContainerSession { control } = request {
+            #[cfg(target_os = "linux")]
+            container_session::serve(stream, control)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = control;
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        "container sessions require Linux",
+                        error_codes::INVALID_REQUEST,
+                    ),
+                )?;
+            }
+            return Ok(());
+        }
+
         // ContainerStart runs a container's command as its init and streams
         // its I/O on this connection until it exits.
         if let AgentRequest::ContainerStart(spec) = request {
@@ -2763,6 +2799,8 @@ fn handle_request(
             let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::WORKLOAD_TARGET_CAPABILITY.to_string(),
+                smolvm_protocol::CONTAINER_APP_PORTS_CAPABILITY.to_string(),
+                smolvm_protocol::container_session::CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
                 smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
@@ -3143,10 +3181,12 @@ fn handle_request(
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
 
-        AgentRequest::ContainerStart(_) => AgentResponse::error(
-            "ContainerStart is a streaming request",
-            error_codes::INVALID_REQUEST,
-        ),
+        AgentRequest::ContainerStart(_) | AgentRequest::ContainerSession { .. } => {
+            AgentResponse::error(
+                "ContainerStart is a streaming request",
+                error_codes::INVALID_REQUEST,
+            )
+        }
 
         AgentRequest::ContainerSignal {
             overlay_id,
@@ -3156,6 +3196,15 @@ fn handle_request(
 
         AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
         AgentRequest::ContainerStats { overlay_id } => container_stats::handle(&overlay_id),
+        AgentRequest::WatchListeners => AgentResponse::error(
+            "listener watches require streaming dispatch",
+            error_codes::INVALID_REQUEST,
+        ),
+        AgentRequest::ContainerPorts { overlay_id } => app_ports::list(&overlay_id),
+        AgentRequest::ContainerPortConnect { .. } => AgentResponse::error(
+            "app connections require streaming dispatch",
+            error_codes::INVALID_REQUEST,
+        ),
 
         AgentRequest::ContainerArchive {
             image,
@@ -9215,11 +9264,18 @@ mod work_slot_tests {
     use std::time::Duration;
 
     #[test]
-    fn only_pings_and_shutdown_skip_the_work_slots() {
+    fn control_and_long_lived_streams_do_not_consume_work_slots() {
         assert!(!needs_work_slot(&AgentRequest::Ping));
         assert!(!needs_work_slot(&AgentRequest::Shutdown {
             progress: false,
             stop_timeout_secs: None,
+        }));
+        assert!(!needs_work_slot(&AgentRequest::ContainerPortConnect {
+            overlay_id: "test-overlay".into(),
+            port: 8080,
+        }));
+        assert!(needs_work_slot(&AgentRequest::ContainerPorts {
+            overlay_id: "test-overlay".into(),
         }));
         assert!(needs_work_slot(&AgentRequest::ListImages));
     }

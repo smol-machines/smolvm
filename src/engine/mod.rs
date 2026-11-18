@@ -27,14 +27,17 @@
 //! up where it was.
 
 mod api;
+mod app_ports;
 mod archive;
 mod build;
 pub mod builder;
+mod container_session;
 mod containers;
 mod events;
 mod exec;
 mod filters;
 mod image_ops;
+mod image_share;
 mod images;
 mod logs;
 mod model;
@@ -97,6 +100,7 @@ pub(crate) struct Engine {
     pub(crate) networks: network::Networks,
     pub(crate) execs: parking_lot::Mutex<HashMap<String, Arc<exec::Exec>>>,
     pub(crate) events: events::Events,
+    app_listener_watch: parking_lot::Mutex<std::sync::Weak<app_ports::Watch>>,
     pub(crate) bases: warm::Bases,
 }
 
@@ -116,6 +120,7 @@ impl Engine {
         let networks = network::Networks::load(&store, &config.socket)?;
         let engine = Arc::new(Self {
             events: events::Events::persistent(&config.root)?,
+            app_listener_watch: parking_lot::Mutex::new(std::sync::Weak::new()),
             config,
             owner,
             activity: Arc::new(supervisor::Activity::default()),
