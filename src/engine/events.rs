@@ -3,6 +3,7 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
+#[cfg(not(target_os = "macos"))]
 use notify::Watcher;
 use tokio::sync::watch;
 
@@ -12,6 +13,9 @@ use super::filters::Filters;
 
 /// Events kept for clients that ask for `since` in the past.
 const HISTORY: usize = 2048;
+
+#[cfg(target_os = "macos")]
+mod macos;
 
 /// One event, in the shape the Docker API streams.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -57,8 +61,18 @@ pub(crate) struct Events {
 /// All HTTP subscribers share one OS watcher, released with the last stream.
 /// Supervisors only emit events and never allocate a watcher of their own.
 struct DirectoryWatch {
+    #[cfg(target_os = "macos")]
+    task: tokio::task::AbortHandle,
+    #[cfg(not(target_os = "macos"))]
     _watcher: parking_lot::Mutex<notify::RecommendedWatcher>,
     error: Arc<parking_lot::Mutex<Option<String>>>,
+}
+
+#[cfg(target_os = "macos")]
+impl Drop for DirectoryWatch {
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 pub(crate) struct Subscription {
@@ -114,46 +128,52 @@ impl Events {
             let directory = match shared.upgrade() {
                 Some(directory) => directory,
                 None => {
-                    let error = Arc::new(parking_lot::Mutex::new(None));
-                    let failure = error.clone();
-                    let signal = self.changed.clone();
-                    let watched = root.canonicalize()?;
-                    let watch_path = watched.clone();
-                    let mut watcher =
-                        notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
-                            match event {
-                                Ok(event) => {
-                                    if matches!(event.kind, notify::EventKind::Access(_)) {
-                                        return;
+                    #[cfg(target_os = "macos")]
+                    let directory = Arc::new(macos::watch(root, self.changed.clone())?);
+                    #[cfg(not(target_os = "macos"))]
+                    let directory = {
+                        let error = Arc::new(parking_lot::Mutex::new(None));
+                        let failure = error.clone();
+                        let signal = self.changed.clone();
+                        let watched = root.canonicalize()?;
+                        let watch_path = watched.clone();
+                        let mut watcher = notify::recommended_watcher(
+                            move |event: notify::Result<notify::Event>| {
+                                match event {
+                                    Ok(event) => {
+                                        if matches!(event.kind, notify::EventKind::Access(_)) {
+                                            return;
+                                        }
+                                        if !watched.is_dir()
+                                            || (event.paths.contains(&watched)
+                                                && matches!(
+                                                    event.kind,
+                                                    notify::EventKind::Remove(_)
+                                                        | notify::EventKind::Modify(
+                                                            notify::event::ModifyKind::Name(_)
+                                                        )
+                                                ))
+                                        {
+                                            *failure.lock() = Some(
+                                                "The engine event directory was removed or moved"
+                                                    .into(),
+                                            );
+                                        }
                                     }
-                                    if !watched.is_dir()
-                                        || (event.paths.contains(&watched)
-                                            && matches!(
-                                                event.kind,
-                                                notify::EventKind::Remove(_)
-                                                    | notify::EventKind::Modify(
-                                                        notify::event::ModifyKind::Name(_)
-                                                    )
-                                            ))
-                                    {
-                                        *failure.lock() = Some(
-                                            "The engine event directory was removed or moved"
-                                                .into(),
-                                        );
-                                    }
+                                    Err(error) => *failure.lock() = Some(error.to_string()),
                                 }
-                                Err(error) => *failure.lock() = Some(error.to_string()),
-                            }
-                            signal.send_replace(());
+                                signal.send_replace(());
+                            },
+                        )
+                        .map_err(std::io::Error::other)?;
+                        watcher
+                            .watch(&watch_path, notify::RecursiveMode::NonRecursive)
+                            .map_err(std::io::Error::other)?;
+                        Arc::new(DirectoryWatch {
+                            _watcher: parking_lot::Mutex::new(watcher),
+                            error,
                         })
-                        .map_err(std::io::Error::other)?;
-                    watcher
-                        .watch(&watch_path, notify::RecursiveMode::NonRecursive)
-                        .map_err(std::io::Error::other)?;
-                    let directory = Arc::new(DirectoryWatch {
-                        _watcher: parking_lot::Mutex::new(watcher),
-                        error,
-                    });
+                    };
                     *shared = Arc::downgrade(&directory);
                     directory
                 }

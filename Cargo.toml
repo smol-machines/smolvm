@@ -96,7 +96,8 @@ tar = "0.4"
 imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
 # HTTP API server
-tokio = { version = "1", features = ["full"] }
+# I/O-safe AsyncFd registration for the macOS engine event watcher.
+tokio = { version = "1.54", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 # mTLS for the fleet serve API (control↔node). axum-server's rustls acceptor
 # does the TLS handshake + client-cert verification; rustls-pemfile parses the
