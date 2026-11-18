@@ -1610,6 +1610,54 @@ pub fn is_extracted(cache_dir: &Path) -> bool {
         && !unsynced_before_this_boot(&unsynced_marker_path(cache_dir))
 }
 
+/// The SHA-256 of the artifact a private cache was extracted from, inside it.
+const EXTRACTED_FROM: &str = ".extracted-from-sha256";
+
+/// Whether `cache_dir` is a complete extraction of exactly the artifact whose
+/// SHA-256 is `sha256`. Private caches are named by the artifact's CRC-32,
+/// which anyone can forge: a pack crafted to share a trusted pack's CRC would
+/// otherwise leave its own agent, rootfs and init for the trusted one to boot.
+pub fn extracted_from(cache_dir: &Path, sha256: &str) -> bool {
+    is_extracted(cache_dir)
+        && fs::read_to_string(cache_dir.join(EXTRACTED_FROM)).is_ok_and(|d| d.trim() == sha256)
+}
+
+/// Record that `cache_dir` was just extracted from the artifact `sha256` names.
+pub fn record_extracted_from(cache_dir: &Path, sha256: &str) -> std::io::Result<()> {
+    fs::write(cache_dir.join(EXTRACTED_FROM), sha256)
+}
+
+/// Empty `cache_dir` before extracting a different artifact into it, so nothing
+/// another artifact left there survives the extraction.
+pub fn clear_for_extraction(cache_dir: &Path) {
+    if cache_dir.exists() {
+        force_detach_layers_volume(cache_dir);
+        let _ = fs::remove_dir_all(cache_dir);
+    }
+}
+
+/// SHA-256 of a whole file, lowercase hex.
+pub fn file_sha256(path: &Path) -> std::io::Result<String> {
+    use sha2::{Digest, Sha256};
+    let mut file = File::open(path)?;
+    let mut sha = Sha256::new();
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        sha.update(&buf[..n]);
+    }
+    Ok(format!("{:x}", sha.finalize()))
+}
+
+/// SHA-256 of bytes in memory, lowercase hex.
+pub fn bytes_sha256(bytes: &[u8]) -> String {
+    use sha2::{Digest, Sha256};
+    format!("{:x}", Sha256::digest(bytes))
+}
+
 /// Marker beside a shared extraction whose checkpoint RAM is not yet known to
 /// be on disk. It sits beside the tree, like the SHA-256 marker, so the tree
 /// itself stays identical to a private extraction.
@@ -5579,9 +5627,11 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
         );
     }
 
-    // Cache key based on libs content hash
+    // Cache key: the libs' SHA-256. A CRC-32 key let a packed binary crafted
+    // to share another's checksum leave its own libkrun for that one to load.
     file.seek(SeekFrom::Start(footer.libs_offset))?;
-    let mut hasher = crc32fast::Hasher::new();
+    use sha2::Digest as _;
+    let mut hasher = sha2::Sha256::new();
     let mut remaining = footer.libs_size;
     let mut buf = [0u8; 64 * 1024];
     while remaining > 0 {
@@ -5593,13 +5643,11 @@ pub fn extract_libs_from_binary(exe_path: &Path, debug: bool) -> std::io::Result
         hasher.update(&buf[..n]);
         remaining -= n as u64;
     }
-    let libs_checksum = hasher.finalize();
+    let libs_digest = format!("{:x}", hasher.finalize());
 
     let cache_base = smolvm_paths::cache_dir()
         .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache directory"))?;
-    let libs_cache_dir = cache_base
-        .join("smolvm-libs")
-        .join(format!("{:08x}", libs_checksum));
+    let libs_cache_dir = cache_base.join("smolvm-libs").join(libs_digest);
     let lib_dir = libs_cache_dir.join("lib");
 
     // Acquire exclusive lock to prevent concurrent extraction races.
@@ -7750,6 +7798,34 @@ mod tests {
         fs::write(temp_dir.path().join("lib/libkrun.dylib"), "partial").unwrap();
 
         assert!(!is_extracted(temp_dir.path()));
+    }
+
+    /// A private cache is named by a CRC-32 anyone can forge: one extracted from
+    /// a different artifact, or from before its digest was recorded, is never
+    /// taken for an extraction of this one.
+    #[test]
+    fn a_cache_is_reused_only_for_the_artifact_it_was_extracted_from() {
+        let temp = tempfile::tempdir().unwrap();
+        let cache = temp.path().join("deadbeef");
+        fs::create_dir_all(&cache).unwrap();
+        mark_extracted(&cache).unwrap();
+        let (trusted, colliding) = (
+            bytes_sha256(b"trusted pack"),
+            bytes_sha256(b"colliding pack"),
+        );
+        assert!(
+            !extracted_from(&cache, &trusted),
+            "an unrecorded cache is extracted again"
+        );
+        record_extracted_from(&cache, &colliding).unwrap();
+        assert!(
+            !extracted_from(&cache, &trusted),
+            "another artifact's extraction is not reused"
+        );
+        assert!(extracted_from(&cache, &colliding));
+        fs::write(cache.join("planted"), b"x").unwrap();
+        clear_for_extraction(&cache);
+        assert!(!cache.exists(), "nothing the other artifact left survives");
     }
 
     #[test]

@@ -974,6 +974,46 @@ pub fn verify_sidecar_checksum_file(file: &mut File, footer: &PackFooter) -> Res
     Ok(actual == footer.checksum)
 }
 
+/// [`verify_sidecar_checksum`], also taking the SHA-256 of the whole sidecar in
+/// the same read: `Some(digest)` when the checksum matches, `None` when it does
+/// not. The CRC-32 detects damage but anyone can forge it, so a cache that two
+/// sidecars could share is bound to the digest (`extract::extracted_from`).
+pub fn verify_sidecar_checksum_and_sha256(
+    sidecar_path: impl AsRef<Path>,
+    footer: &PackFooter,
+) -> Result<Option<String>> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut file = File::open(sidecar_path.as_ref())?;
+    let checksum_size = footer
+        .assets_size
+        .checked_add(footer.manifest_size)
+        .ok_or_else(|| {
+            crate::PackError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "assets_size + manifest_size overflow",
+            ))
+        })?;
+    let mut crc = crc32fast::Hasher::new();
+    let mut sha = Sha256::new();
+    let mut read = 0u64;
+    let mut buf = vec![0u8; 1024 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let in_range = checksum_size.saturating_sub(read).min(n as u64) as usize;
+        crc.update(&buf[..in_range]);
+        sha.update(&buf[..n]);
+        read += n as u64;
+    }
+    if read < checksum_size || crc.finalize() != footer.checksum {
+        return Ok(None);
+    }
+    Ok(Some(format!("{:x}", sha.finalize())))
+}
+
 /// Validate that footer-derived sizes are consistent with the actual file size.
 fn validate_footer_bounds(footer: &PackFooter, file_size: u64) -> Result<()> {
     // Cap manifest size to prevent excessive memory allocation
@@ -1550,6 +1590,11 @@ mod tests {
 
         // Valid sidecar should pass
         assert!(verify_sidecar_checksum(&sidecar, &footer).unwrap());
+        // The one-pass check takes the whole file's SHA-256 along the way.
+        assert_eq!(
+            verify_sidecar_checksum_and_sha256(&sidecar, &footer).unwrap(),
+            Some(crate::extract::file_sha256(&sidecar).unwrap())
+        );
 
         // Corrupt the sidecar by flipping a byte in the assets region
         let mut data = fs::read(&sidecar).unwrap();
@@ -1560,6 +1605,10 @@ mod tests {
 
         // Corrupted sidecar should fail checksum
         assert!(!verify_sidecar_checksum(&sidecar, &footer).unwrap());
+        assert_eq!(
+            verify_sidecar_checksum_and_sha256(&sidecar, &footer).unwrap(),
+            None
+        );
     }
 
     #[test]
