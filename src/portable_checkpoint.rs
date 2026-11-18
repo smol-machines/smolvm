@@ -1793,10 +1793,10 @@ fn checkpoint_lib_dir(options: &CaptureOptions) -> Result<PathBuf> {
 }
 
 /// The agent rootfs to pack with a checkpoint of `vm`: an explicit directory,
-/// else the rootfs the machine booted with, by the digest its record keeps
-/// (the host's installed rootfs while it still matches, else the store's
-/// copy), else the host's installed rootfs, for a record from before the
-/// digest was kept.
+/// else the verified directory it booted from or the rootfs with its recorded
+/// digest in the store/current installation. An app update can replace the
+/// installed rootfs while the machine still uses its older extracted tree.
+/// Records from before the digest was kept use the installed rootfs.
 fn checkpoint_rootfs_dir(options: &CaptureOptions, vm: &VmRecord) -> Result<PathBuf> {
     if let Some(dir) = &options.rootfs_dir {
         return crate::agent::AgentManager::resolve_rootfs_path(
@@ -1805,7 +1805,13 @@ fn checkpoint_rootfs_dir(options: &CaptureOptions, vm: &VmRecord) -> Result<Path
         );
     }
     match &vm.agent_rootfs_digest {
-        Some(digest) => crate::agent::rootfs_store::resolve(digest),
+        Some(digest) => crate::agent::rootfs_store::golden_rootfs(
+            vm.agent_rootfs_path.as_deref(),
+            digest,
+            &crate::agent::rootfs_store::host(),
+        )
+        .map(Ok)
+        .unwrap_or_else(|| crate::agent::rootfs_store::resolve(digest)),
         // The same resolver a machine boots with; see `AgentManager::resolve_rootfs_path`.
         None => {
             crate::agent::AgentManager::resolve_rootfs_path(None, "find checkpoint agent rootfs")
@@ -7904,6 +7910,37 @@ mod tests {
         assert!(
             install_credential_ca(extracted.path(), other.path(), partial.path(), &misplaced)
                 .is_err()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn checkpoint_keeps_the_verified_booted_rootfs_after_an_app_update() {
+        let temp = tempfile::tempdir().unwrap();
+        let booted = temp.path().join("previous-extraction");
+        std::fs::create_dir_all(booted.join("sbin")).unwrap();
+        std::fs::create_dir_all(booted.join("usr/local/bin")).unwrap();
+        let agent = booted.join("usr/local/bin/smolvm-agent");
+        std::fs::write(&agent, b"the agent this live machine booted").unwrap();
+        std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", booted.join("sbin/init"))
+            .unwrap();
+        let mut record = VmRecord::new("upgrade".into(), 1, 256, vec![], vec![], false);
+        record.agent_rootfs_digest =
+            Some(smolvm_pack::assets::agent_rootfs_digest(&booted).unwrap());
+        record.agent_rootfs_path = Some(booted.clone());
+
+        // An upgrade need not retain the previous bundle at the default path:
+        // its immutable extraction remains the source of this live userland.
+        assert_eq!(
+            checkpoint_rootfs_dir(&CaptureOptions::default(), &record).unwrap(),
+            booted
+        );
+
+        // A recorded path alone is not authority to pack different userland.
+        std::fs::write(&agent, b"replacement agent with different bytes and size").unwrap();
+        assert_ne!(
+            checkpoint_rootfs_dir(&CaptureOptions::default(), &record).ok(),
+            Some(booted)
         );
     }
 
