@@ -8152,10 +8152,8 @@ mod tests {
         );
     }
 
-    /// Host-side extraction that describes ownership to the guest: every
-    /// entry's archived owner and mode land in libkrun's override xattr, the
-    /// host copy stays readable, OCI whiteouts become faked 0:0 character
-    /// devices and opaque markers become `user.overlay.opaque`.
+    /// A layer's link to a host path (`abs -> /home/me`) names the image's own
+    /// path: whiteouts beneath it land inside the layer, never on the host.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn a_whiteout_beneath_a_link_out_of_the_layer_never_touches_the_host() {
@@ -8221,6 +8219,11 @@ mod tests {
         assert!(inside.join("victim-dir").is_file());
     }
 
+    /// Host-side extraction that describes ownership to the guest: every
+    /// entry's archived owner and mode land in libkrun's override xattr, the
+    /// host copy stays readable, OCI whiteouts become faked 0:0 character
+    /// devices and opaque markers become `user.overlay.opaque`.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn owner_xattr_extraction_records_owners_and_translates_whiteouts() {
         use std::os::unix::fs::PermissionsExt;
