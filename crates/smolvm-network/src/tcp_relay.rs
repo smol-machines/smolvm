@@ -679,12 +679,15 @@ impl TcpRelayTable {
         }
         // A gateway destination is dialed as host loopback. A deny on the
         // dialed address has to hold even though the guest named the gateway.
+        // Under --block-private loopback stays closed unless an exception
+        // names it; an exception that only covers the gateway does not.
         let dialed = self.host_connect_addr(destination);
         if dialed.ip() != destination.ip()
-            && self
+            && (self
                 .egress
                 .rule_action(FlowTransport::Tcp, dialed.ip(), Some(dialed.port()))
                 == Some(RuleAction::Deny)
+                || self.egress.private_floor_blocks(dialed.ip()))
         {
             return false;
         }
@@ -2605,6 +2608,32 @@ mod tests {
         // Without the deny the same flow is not refused by the rule path.
         let open = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None);
         assert!(open.destination_allowed(SocketAddr::new(gateway, 5432)));
+    }
+
+    #[test]
+    fn a_private_exception_covering_the_gateway_keeps_loopback_closed() {
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let floored = |exceptions: &[&str]| {
+            let policy = EgressPolicy::unrestricted()
+                .with_private_floor(
+                    &exceptions
+                        .iter()
+                        .map(|range| range.to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            TcpRelayTable::new(None, policy, vec![gateway], None)
+        };
+
+        let tailnet = floored(&["100.64.0.0/10"]);
+        assert!(!tailnet.destination_allowed(SocketAddr::new(gateway, 18765)));
+        assert!(tailnet.destination_allowed(SocketAddr::new("100.100.1.2".parse().unwrap(), 443)));
+        assert!(floored(&["100.64.0.0/10", "127.0.0.0/8"])
+            .destination_allowed(SocketAddr::new(gateway, 18765)));
+
+        // Without --block-private the gateway still reaches the host.
+        let open = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None);
+        assert!(open.destination_allowed(SocketAddr::new(gateway, 18765)));
     }
 
     #[test]
