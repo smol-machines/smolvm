@@ -620,23 +620,7 @@ pub fn resolve_secret_refs_for_env(
 /// create time. The resolved plaintext stays in the returned vector and never
 /// touches the record or the DB.
 pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
-    let mut env = record.env.clone();
-    // A variable bound to a credential never carries plaintext into the guest:
-    // its secret reference feeds the host interceptor and the guest gets the
-    // placeholder instead.
-    let (refs, credential_env) = smolvm::credentials::workload_env(
-        record.credential_policy.as_ref(),
-        &record.credential_placeholders,
-        &record.secret_refs,
-    );
-    env.extend(smolvm::secrets::expose_into_env(
-        smolvm::secrets::resolve_refs_to_env(
-            &refs,
-            smolvm::secrets::ResolutionScope::RecordReplay,
-        )?,
-    ));
-    env.extend(credential_env);
-    Ok(env)
+    smolvm::secrets::record_env_with_secrets(record)
 }
 
 /// The `run` counterpart of [`record_env_with_secrets`]: resolve the create

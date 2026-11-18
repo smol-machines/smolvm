@@ -399,6 +399,11 @@ impl ImageFeedCmd {
 /// Manage machines
 #[derive(Subcommand, Debug)]
 pub enum MachineCmd {
+    /// Generate a standard SSH client configuration for a machine
+    SshConfig(super::ssh::Configure),
+    /// Serve the generated SSH configuration's on-demand connection
+    #[command(hide = true)]
+    SshProxy(super::ssh::Proxy),
     /// Prepare local images for managed Kubernetes
     #[command(hide = true)]
     ImageFeed(ImageFeedCmd),
@@ -518,11 +523,16 @@ impl MachineCmd {
         // over successive runs. Other commands sweep everything.
         if matches!(self, MachineCmd::Run(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
-        } else if !matches!(self, MachineCmd::ImageFeed(_)) {
+        } else if !matches!(
+            self,
+            MachineCmd::ImageFeed(_) | MachineCmd::SshConfig(_) | MachineCmd::SshProxy(_)
+        ) {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
 
         match self {
+            MachineCmd::SshConfig(cmd) => cmd.run(),
+            MachineCmd::SshProxy(cmd) => cmd.run(),
             MachineCmd::ImageFeed(cmd) => cmd.run(),
             MachineCmd::Run(cmd) => cmd.run(),
             MachineCmd::Exec(cmd) => cmd.run(),

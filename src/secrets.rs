@@ -684,6 +684,27 @@ pub fn file_ref(path: impl Into<std::path::PathBuf>) -> SecretRef {
 // Tests
 // ============================================================================
 
+/// Resolve a trusted machine record for execution, preserving credential placeholders.
+/// Resolved values are transient and must never be logged or persisted.
+pub fn record_env_with_secrets(
+    record: &crate::config::VmRecord,
+) -> crate::Result<Vec<(String, String)>> {
+    let mut env = record.env.clone();
+    // A variable bound to a credential never carries plaintext into the guest:
+    // its secret reference feeds the host interceptor and the guest gets the
+    // placeholder instead.
+    let (refs, credential_env) = crate::credentials::workload_env(
+        record.credential_policy.as_ref(),
+        &record.credential_placeholders,
+        &record.secret_refs,
+    );
+    env.extend(crate::secrets::expose_into_env(
+        crate::secrets::resolve_refs_to_env(&refs, crate::secrets::ResolutionScope::RecordReplay)?,
+    ));
+    env.extend(credential_env);
+    Ok(env)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

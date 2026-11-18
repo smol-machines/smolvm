@@ -180,3 +180,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// executable's path or inode, when another engine asks to branch it: the
 /// same release installed as two files is one build.
 pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOLVM_GIT_COMMIT"));
+
+/// On-demand standard SSH access to local machine environments.
+pub mod ssh;
