@@ -187,7 +187,16 @@ fn spawn_packed_boot_vm(
 /// Two-file mode: libs embedded in stub binary (SMOLLIBS footer).
 /// Single-file mode: libs extracted from Mach-O section to cache_dir/lib/.
 /// `smolvm pack run`: uses the host-installed libs.
-fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
+/// `assets_from_executable`: the extracted assets came from the executable
+/// running now (a single-file or embedded packed binary), so the libraries
+/// among them are that program's own. Anything else (a `.smolmachine` handed
+/// to `smolvm pack run`, a sidecar beside a stub) is data: libraries in it are
+/// never loaded, or opening a pack would run its code on the host.
+fn resolve_lib_dir(
+    cache_dir: &Path,
+    debug: bool,
+    assets_from_executable: bool,
+) -> smolvm::Result<PathBuf> {
     // Explicit override (matches the non-packed launcher). Lets a dev run a
     // packed sidecar with a freshly-built smolvm binary pointed at a known-good
     // libkrun, instead of the libs embedded in the original stub.
@@ -216,7 +225,7 @@ fn resolve_lib_dir(cache_dir: &Path, debug: bool) -> smolvm::Result<PathBuf> {
 
     // Single-file mode: libs extracted from Mach-O section alongside other assets
     let cache_lib = cache_dir.join("lib");
-    if cache_lib.exists() {
+    if assets_from_executable && cache_lib.exists() {
         if debug {
             eprintln!("debug: using libs from cache: {}", cache_lib.display());
         }
@@ -696,7 +705,7 @@ impl PackRunCmd {
         } else {
             cache_dir.join("agent-rootfs")
         };
-        let lib_dir = resolve_lib_dir(&cache_dir, self.debug)?;
+        let lib_dir = resolve_lib_dir(&cache_dir, self.debug, false)?;
         let layers_lease = extract::acquire_layers_lease(&cache_dir, self.debug)
             .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
         let layers_dir = &layers_lease.path;
@@ -1974,7 +1983,7 @@ fn run_from_cache(
     debug: bool,
 ) -> smolvm::Result<()> {
     let rootfs_path = cache_dir.join("agent-rootfs");
-    let lib_dir = resolve_lib_dir(cache_dir, debug)?;
+    let lib_dir = resolve_lib_dir(cache_dir, debug, true)?;
     let layers_lease = extract::acquire_layers_lease(cache_dir, debug)
         .map_err(|e| Error::agent("acquire layers lease", e.to_string()))?;
     let layers_dir = &layers_lease.path;
@@ -2600,7 +2609,11 @@ fn daemon_start(
     let packed_mounts = mounts_to_packed(&mounts);
 
     let rootfs_path = cache_dir.join("agent-rootfs");
-    let lib_dir = resolve_lib_dir(&cache_dir, debug)?;
+    let lib_dir = resolve_lib_dir(
+        &cache_dir,
+        debug,
+        !matches!(mode, PackedMode::Sidecar { .. }),
+    )?;
     // Use a temporary RAII lease to mount the volume for the launch config.
     // The persistent daemon lease is created after fork with the real child
     // PID. If fork fails, the RAII lease cleans up normally. If fork
@@ -2926,6 +2939,24 @@ fn daemon_status(checksum: u32) -> smolvm::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A `.smolmachine` is data: libraries extracted from it are never what
+    /// `smolvm pack run` loads, while a packed binary's own assets still are.
+    #[test]
+    fn a_sidecars_own_libraries_are_never_loaded() {
+        if std::env::var_os(smolvm::data::consts::ENV_SMOLVM_LIB_DIR).is_some() {
+            return;
+        }
+        let cache = tempfile::tempdir().unwrap();
+        let planted = cache.path().join("lib");
+        std::fs::create_dir_all(&planted).unwrap();
+        std::fs::write(planted.join("libkrun.so"), b"not ours").unwrap();
+        // The host's install, or no library at all: never the pack's.
+        if let Ok(dir) = resolve_lib_dir(cache.path(), false, false) {
+            assert_ne!(dir, planted);
+        }
+        assert_eq!(resolve_lib_dir(cache.path(), false, true).unwrap(), planted);
+    }
 
     /// Regression for #1315: CLI `--secret-env`/`--secret-file` refs must reach
     /// the workload env when a run is served through the pack-run path (e.g.
