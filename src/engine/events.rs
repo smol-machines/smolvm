@@ -1,6 +1,6 @@
 //! `docker events`: what happened to containers, images, volumes and networks.
 
-use std::collections::{BTreeMap, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 use std::sync::{Arc, Weak};
 
 use notify::Watcher;
@@ -218,7 +218,16 @@ impl Events {
     }
 
     /// Past events at or after `since_nanos`.
+    #[cfg(test)]
     pub(crate) fn since(&self, since_nanos: i64) -> Vec<Event> {
+        self.pending(since_nanos, &mut BTreeSet::new())
+    }
+
+    /// Deduplicate by durable identity, not a timestamp watermark: directory
+    /// iteration is not an atomic snapshot, and another supervisor can publish
+    /// an older timestamp after a newer event has already been delivered.
+    /// Remember only identities still in the bounded history.
+    pub(crate) fn pending(&self, since_nanos: i64, seen: &mut BTreeSet<String>) -> Vec<Event> {
         if let Some(root) = &self.root {
             let mut paths: Vec<_> = std::fs::read_dir(root)
                 .into_iter()
@@ -232,26 +241,53 @@ impl Events {
             for path in &paths[..excess] {
                 let _ = std::fs::remove_file(path);
             }
-            return paths[excess..]
-                .iter()
-                .filter_map(|p| {
-                    let name = p.file_name()?.to_str()?;
-                    let timestamp: i64 = name.split_once('-')?.0.parse().ok()?;
-                    if timestamp < since_nanos {
-                        return None;
-                    }
-                    let bytes = std::fs::read(p).ok()?;
-                    let mut event: Event = serde_json::from_slice(&bytes).ok()?;
-                    event.cursor = p.file_name()?.to_string_lossy().into_owned();
-                    Some(event)
-                })
-                .filter(|e| e.time_nano >= since_nanos)
-                .collect();
+            let mut pending = Vec::new();
+            for path in &paths[excess..] {
+                let Some(cursor) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if seen.contains(cursor)
+                    || (seen.len() == HISTORY
+                        && seen.first().is_some_and(|oldest| cursor < oldest.as_str()))
+                {
+                    continue;
+                }
+                let Some(timestamp) = cursor
+                    .split_once('-')
+                    .and_then(|(s, _)| s.parse::<i64>().ok())
+                else {
+                    continue;
+                };
+                if timestamp < since_nanos {
+                    continue;
+                }
+                let Ok(bytes) = std::fs::read(path) else {
+                    continue;
+                };
+                let Ok(mut event) = serde_json::from_slice::<Event>(&bytes) else {
+                    continue;
+                };
+                if event.time_nano < since_nanos {
+                    continue;
+                }
+                event.cursor = cursor.to_string();
+                seen.insert(event.cursor.clone());
+                // Keep the same newest identities as the on-disk history.
+                // Do not forget a delivered ID merely because a concurrent
+                // directory mutation made it absent from this enumeration.
+                while seen.len() > HISTORY {
+                    seen.pop_first();
+                }
+                pending.push(event);
+            }
+            return pending;
         }
-        self.history
-            .lock()
+        let history = self.history.lock();
+        let retained: HashSet<_> = history.iter().map(|e| e.cursor.as_str()).collect();
+        seen.retain(|cursor| retained.contains(cursor.as_str()));
+        history
             .iter()
-            .filter(|e| e.time_nano >= since_nanos)
+            .filter(|e| e.time_nano >= since_nanos && seen.insert(e.cursor.clone()))
             .cloned()
             .collect()
     }
@@ -410,6 +446,23 @@ mod persistence_tests {
         .await
         .expect("removed directory left an apparently healthy stream");
         assert!(events.subscribe().is_err());
+    }
+
+    #[test]
+    fn incomplete_directory_snapshots_do_not_forget_delivered_events() {
+        let root = tempfile::tempdir().unwrap();
+        let events = Events::persistent(root.path()).unwrap();
+        events.emit("container", "start", "one", BTreeMap::new());
+        events.emit("container", "start", "two", BTreeMap::new());
+        let mut seen = BTreeSet::new();
+        let delivered = events.pending(0, &mut seen);
+        assert_eq!(delivered.len(), 2);
+        let path = root.path().join("events").join(&delivered[0].cursor);
+        let hidden = root.path().join("hidden");
+        std::fs::rename(&path, &hidden).unwrap();
+        assert!(events.pending(0, &mut seen).is_empty());
+        std::fs::rename(hidden, path).unwrap();
+        assert!(events.pending(0, &mut seen).is_empty());
     }
 
     #[test]

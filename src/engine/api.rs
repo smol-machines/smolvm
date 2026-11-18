@@ -501,22 +501,11 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
         };
     let (tx, body) = super::stream::json_lines();
     tokio::spawn(async move {
-        let mut last = start;
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
         loop {
-            for e in engine.events.since(last) {
-                if e.time_nano < last {
-                    continue;
-                }
+            for e in engine.events.pending(start, &mut seen) {
                 if until_nanos.is_some_and(|u| e.time_nano > u) {
                     return;
-                }
-                if e.time_nano > last {
-                    seen.clear();
-                    last = e.time_nano;
-                }
-                if !seen.insert(e.cursor.clone()) {
-                    continue;
                 }
                 if super::events::matches(&e, &f)
                     && tx
@@ -1600,6 +1589,82 @@ mod event_tests {
         })
         .await
         .expect("disconnected stream kept its engine and watcher alive");
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_is_not_discarded_by_a_newer_timestamp() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let response = request(engine.clone(), &[("since", "0".into())]).await;
+        let mut stream = response.into_body().into_data_stream();
+        engine
+            .events
+            .emit("container", "start", "newer", BTreeMap::new());
+        let line = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut delayed: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        let stamp = delayed["timeNano"].as_i64().unwrap() - 1;
+        delayed["timeNano"] = stamp.into();
+        delayed["Actor"]["ID"] = "delayed".into();
+        let dir = engine.config.root.join("events");
+        let temp = dir.join("delayed.tmp");
+        std::fs::write(&temp, delayed.to_string()).unwrap();
+        std::fs::rename(temp, dir.join(format!("{stamp}-delayed.json"))).unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let delivered: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(delivered["Actor"]["ID"], "delayed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_subscribers_receive_a_burst_while_history_is_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        for n in 0..2048 {
+            engine
+                .events
+                .emit("container", "seed", &n.to_string(), BTreeMap::new());
+        }
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let response = request(engine.clone(), &[]).await;
+            readers.push(tokio::spawn(async move {
+                let mut stream = response.into_body().into_data_stream();
+                let mut ids = std::collections::BTreeSet::new();
+                for _ in 0..30 {
+                    let line = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                    assert!(
+                        ids.insert(event["Actor"]["ID"].as_str().unwrap().to_string()),
+                        "duplicate event"
+                    );
+                }
+                assert_eq!(ids, (0..30).map(|n| format!("burst-{n}")).collect());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), stream.next())
+                        .await
+                        .is_err()
+                );
+            }));
+        }
+        let writer = super::super::events::Events::persistent(&engine.config.root).unwrap();
+        for n in 0..30 {
+            writer.emit("container", "start", &format!("burst-{n}"), BTreeMap::new());
+            tokio::task::yield_now().await;
+        }
+        for reader in readers {
+            reader.await.unwrap();
+        }
     }
 
     #[tokio::test]
