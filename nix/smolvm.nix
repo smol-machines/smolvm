@@ -86,6 +86,9 @@ in
     dontPatchELF = true;
     dontPatchShebangs = true;
     dontStrip = true;
+    # agent-rootfs is the guest's root filesystem: its links resolve inside the
+    # VM (etc/mtab -> /proc/mounts), never in the store.
+    dontCheckForBrokenSymlinks = true;
 
     installPhase =
       ''
