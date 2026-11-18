@@ -324,7 +324,8 @@ impl Images {
         self.records.read().values().cloned().collect()
     }
 
-    /// Store `record`, moving each of its tags off any other image.
+    /// Store `record`, moving its tags and digest aliases off other images.
+    /// An index alias names the most recently selected platform.
     pub(crate) fn insert(&self, store: &Store, record: ImageRecord) -> crate::Result<()> {
         let mut records = self.records.write();
         let mut retagged = Vec::new();
@@ -332,9 +333,12 @@ impl Images {
             if other.id == record.id {
                 continue;
             }
-            let before = other.repo_tags.len();
+            let before = (other.repo_tags.len(), other.repo_digests.len());
             other.repo_tags.retain(|t| !record.repo_tags.contains(t));
-            if other.repo_tags.len() != before {
+            other
+                .repo_digests
+                .retain(|d| !record.repo_digests.contains(d));
+            if (other.repo_tags.len(), other.repo_digests.len()) != before {
                 retagged.push(other.clone());
             }
         }
@@ -702,20 +706,8 @@ pub(crate) async fn finish_pull(
                 .await;
         }
     }
-    let record = ImageRecord {
-        id: meta.config_digest.clone(),
-        repo_tags: reference.familiar_tag().into_iter().collect(),
-        repo_digests: vec![format!(
-            "{}@{}",
-            reference.familiar_repo(),
-            meta.manifest_digest
-        )],
-        pull_ref,
-        config: meta.config,
-        size: meta.compressed_size as i64,
-        pulled: super::util::now_rfc3339(),
-        last_tag_time: String::new(),
-    };
+    let reference_digest = meta.reference_digest.clone();
+    let record = pulled_image_record(&reference, meta, pull_ref);
     if let Err(e) = engine.images.insert(&engine.store, record) {
         let message = e.to_string();
         let _ = tx
@@ -724,7 +716,7 @@ pub(crate) async fn finish_pull(
         return;
     }
     let _ = tx
-        .send(serde_json::json!({"status": format!("Digest: {}", meta.manifest_digest)}))
+        .send(serde_json::json!({"status": format!("Digest: {}", reference_digest)}))
         .await;
     let status = if present {
         format!("Status: Image is up to date for {shown}")
@@ -740,9 +732,113 @@ pub(crate) async fn finish_pull(
     );
 }
 
+fn pulled_image_record(
+    reference: &ImageRef,
+    meta: crate::image_store::ImageMetadata,
+    pull_ref: String,
+) -> ImageRecord {
+    let mut repo_digests = vec![format!(
+        "{}@{}",
+        reference.familiar_repo(),
+        meta.reference_digest
+    )];
+    if meta.reference_digest != meta.manifest_digest {
+        repo_digests.push(format!(
+            "{}@{}",
+            reference.familiar_repo(),
+            meta.manifest_digest
+        ));
+    }
+    ImageRecord {
+        id: meta.config_digest,
+        repo_tags: reference.familiar_tag().into_iter().collect(),
+        repo_digests,
+        pull_ref,
+        config: meta.config,
+        size: meta.compressed_size as i64,
+        pulled: super::util::now_rfc3339(),
+        last_tag_time: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn pulled_record(name: &str, index: char, child: char, config: char) -> ImageRecord {
+        let reference = ImageRef::parse(name).unwrap();
+        let meta = crate::image_store::ImageMetadata {
+            reference_digest: format!("sha256:{}", index.to_string().repeat(64)),
+            manifest_digest: format!("sha256:{}", child.to_string().repeat(64)),
+            config_digest: format!("sha256:{}", config.to_string().repeat(64)),
+            config: serde_json::json!({"architecture":"arm64", "os":"linux"}),
+            compressed_size: 123,
+        };
+        let pull_ref = reference.pinned(&meta.manifest_digest);
+        pulled_image_record(&reference, meta, pull_ref)
+    }
+
+    #[test]
+    fn pulled_index_and_child_resolve_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let images = Images::load(&store).unwrap();
+        let index = format!("sha256:{}", "a".repeat(64));
+        let child = format!("sha256:{}", "b".repeat(64));
+        let name = format!("alpine@{index}");
+        images
+            .insert(&store, pulled_record(&name, 'a', 'b', 'c'))
+            .unwrap();
+        for images in [images, Images::load(&store).unwrap()] {
+            for reference in [
+                &name,
+                &format!("docker.io/library/alpine@{index}"),
+                &format!("alpine@{child}"),
+            ] {
+                let image = images
+                    .resolve(reference)
+                    .expect("a pulled digest must resolve");
+                assert_eq!(image.pull_ref, format!("docker.io/library/alpine@{child}"));
+                assert_eq!(image.repo_digests.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn repulling_index_for_another_platform_moves_only_its_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let images = Images::load(&store).unwrap();
+        images
+            .insert(&store, pulled_record("alpine:latest", 'a', 'b', 'c'))
+            .unwrap();
+        let mut other = pulled_record("alpine:latest", 'a', 'd', 'e');
+        other.config["architecture"] = "amd64".into();
+        images.insert(&store, other).unwrap();
+        for images in [images, Images::load(&store).unwrap()] {
+            let index = images
+                .resolve(&format!("alpine@sha256:{}", "a".repeat(64)))
+                .unwrap();
+            assert_eq!(index.architecture(), "amd64");
+            assert_eq!(images.resolve("alpine").unwrap().id, index.id);
+            let previous = images
+                .resolve(&format!("alpine@sha256:{}", "b".repeat(64)))
+                .unwrap();
+            assert_eq!(previous.architecture(), "arm64");
+            assert!(previous.repo_tags.is_empty());
+            assert_eq!(previous.repo_digests.len(), 1);
+        }
+    }
+
+    #[test]
+    fn direct_manifest_has_one_digest_alias() {
+        let image = pulled_record("alpine:latest", 'a', 'a', 'b');
+        assert_eq!(
+            image.repo_digests,
+            vec![format!("alpine@sha256:{}", "a".repeat(64))]
+        );
+        assert_eq!(image.repo_tags, vec!["alpine:latest"]);
+    }
 
     #[test]
     fn failed_record_removal_preserves_image_for_retry() {
