@@ -20,16 +20,38 @@ pub struct Session {
     /// Command lifetime limit in milliseconds.
     #[serde(default)]
     pub timeout_ms: Option<u64>,
-    /// Allocate a terminal rather than byte-preserving pipes.
+    /// Initial terminal configuration, or byte-preserving pipes when absent.
     #[serde(default)]
-    pub tty: bool,
+    pub terminal: Option<Terminal>,
 }
 
 impl std::fmt::Debug for Session {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Session")
-            .field("tty", &self.tty)
+            .field("tty", &self.terminal.is_some())
             .finish_non_exhaustive()
+    }
+}
+
+/// Terminal state applied before the command can observe its stdin.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct Terminal {
+    /// Nonzero width in character cells.
+    pub cols: u16,
+    /// Nonzero height in character cells.
+    pub rows: u16,
+    /// RFC 4254 terminal mode opcode/value pairs, in wire order.
+    #[serde(default)]
+    pub modes: Vec<(u8, u32)>,
+}
+impl Default for Terminal {
+    fn default() -> Self {
+        Self {
+            cols: 80,
+            rows: 24,
+            modes: Vec::new(),
+        }
     }
 }
 
@@ -88,7 +110,7 @@ mod tests {
             env: vec![("TOKEN".into(), "secret-env".into())],
             workdir: Some("private-path".into()),
             timeout_ms: None,
-            tty: false,
+            terminal: None,
         };
         let request = Request {
             id: session.id.clone(),

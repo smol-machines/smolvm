@@ -125,6 +125,7 @@ mod rosetta_tracer;
 mod s3mount;
 mod ssh_agent;
 mod storage;
+mod terminal_modes;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
@@ -2538,6 +2539,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         }
         | AgentRequest::Run { tty: true, .. } = &request
         {
+            // Admission may have waited behind other commands. Interactive
+            // work belongs to this connection and must not start after cancel.
+            if process::is_peer_closed(stream.as_raw_fd()) {
+                return Ok(());
+            }
             // Handle interactive session
             handle_interactive_run(stream, request)?;
             continue;
@@ -2556,6 +2562,9 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         | AgentRequest::VmExec { tty: true, .. }
         | AgentRequest::VmExecControlled { .. } = &request
         {
+            if process::is_peer_closed(stream.as_raw_fd()) {
+                return Ok(());
+            }
             // Handle interactive VM exec session
             handle_interactive_vm_exec(stream, request)?;
             continue;
@@ -7090,24 +7099,9 @@ fn run_interactive_loop_pty(
             match request {
                 Some(AgentRequest::Stdin { data }) => {
                     if data.is_empty() {
-                        // Host stdin reached EOF. A PTY cannot have one
-                        // direction closed, so signal end-of-input to the
-                        // child by writing the EOF control character (VEOF,
-                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
-                        // pending line available to the child's read()
-                        // immediately; a read() that finds an empty line
-                        // buffer returns 0, which is the EOF the child waits
-                        // for. Without it a stdin-reading child (cat, sh,
-                        // read) never terminates and the exec session hangs.
-                        //
-                        // Send it twice: if the host's final stdin chunk was
-                        // not newline-terminated, the first VEOF only flushes
-                        // that partial line (delivered as data, not EOF), so a
-                        // second VEOF — now at an empty line buffer — is what
-                        // produces the zero-length read. When the buffer is
-                        // already empty the first VEOF yields EOF and the
-                        // second is harmlessly consumed after the child exits.
-                        pending_stdin = vec![0x04, 0x04];
+                        // Honor the current VEOF (including application changes).
+                        // Raw or disabled-EOF terminals have no half-close byte.
+                        pending_stdin = pty_master.eof_input()?;
                         stdin_offset = 0;
                     } else {
                         pending_stdin = data;
@@ -9011,7 +9005,7 @@ fn handle_interactive_vm_exec(
     stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (command, env, workdir, timeout_ms, tty, control) = match request {
+    let (command, env, workdir, timeout_ms, tty, control, terminal) = match request {
         AgentRequest::VmExec {
             command,
             env,
@@ -9019,7 +9013,7 @@ fn handle_interactive_vm_exec(
             timeout_ms,
             tty,
             ..
-        } => (command, env, workdir, timeout_ms, tty, None),
+        } => (command, env, workdir, timeout_ms, tty, None, None),
         AgentRequest::VmExecControlled { session } => {
             let registration = match interactive_control::Registration::reserve(&session.id) {
                 Ok(registration) => registration,
@@ -9036,8 +9030,9 @@ fn handle_interactive_vm_exec(
                 session.env,
                 session.workdir,
                 session.timeout_ms,
-                session.tty,
+                session.terminal.is_some(),
                 Some(registration),
+                session.terminal,
             )
         }
         _ => {
@@ -9064,7 +9059,14 @@ fn handle_interactive_vm_exec(
     }
 
     let spawned = if control.is_some() {
-        spawn_direct_interactive_command_controlled(&command, &env, workdir.as_deref(), tty, true)
+        spawn_direct_interactive_command_controlled(
+            &command,
+            &env,
+            workdir.as_deref(),
+            tty,
+            true,
+            terminal.as_ref(),
+        )
     } else {
         spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty)
     };
@@ -9142,7 +9144,7 @@ fn spawn_direct_interactive_command(
     workdir: Option<&str>,
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    spawn_direct_interactive_command_controlled(command, env, workdir, tty, false)
+    spawn_direct_interactive_command_controlled(command, env, workdir, tty, false, None)
 }
 
 #[cfg(unix)]
@@ -9152,8 +9154,9 @@ fn spawn_direct_interactive_command_controlled(
     workdir: Option<&str>,
     tty: bool,
     controlled: bool,
+    terminal: Option<&smolvm_protocol::interactive_control::Terminal>,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(&command[0]);
@@ -9167,18 +9170,26 @@ fn spawn_direct_interactive_command_controlled(
     }
 
     if tty {
-        // Allocate a PTY pair with default 80x24 size (host will send Resize).
-        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
-        let slave_raw = slave_fd.as_raw_fd();
-
-        // Set up stdio from the slave fd. We dup because Stdio::from_raw_fd
-        // takes ownership and we need the fd for all three handles + pre_exec.
-        // SAFETY: slave_fd is a valid open fd from openpty.
-        unsafe {
-            cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_raw)));
-            cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_raw)));
-            cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+        // Apply the initial dimensions and modes before the child can read them.
+        let (cols, rows) = terminal.map_or((80, 24), |t| (t.cols, t.rows));
+        if cols == 0 || rows == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal dimensions must be nonzero",
+            )
+            .into());
         }
+        let (pty_master, slave_fd) = pty::open_pty(cols, rows)?;
+        let slave_raw = slave_fd.as_raw_fd();
+        if let Some(terminal) = terminal {
+            terminal_modes::apply(slave_raw, &terminal.modes)?;
+        }
+
+        // Owned clones report fd exhaustion instead of constructing Stdio
+        // from a failed dup() result. Keep the original for pre_exec.
+        cmd.stdin(Stdio::from(slave_fd.try_clone()?));
+        cmd.stdout(Stdio::from(slave_fd.try_clone()?));
+        cmd.stderr(Stdio::from(slave_fd.try_clone()?));
 
         // SAFETY: pre_exec closure calls only async-signal-safe functions.
         unsafe {
@@ -9212,6 +9223,7 @@ fn spawn_direct_interactive_command_controlled(
     workdir: Option<&str>,
     _tty: bool,
     _controlled: bool,
+    _terminal: Option<&smolvm_protocol::interactive_control::Terminal>,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);

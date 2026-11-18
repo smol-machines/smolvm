@@ -3099,8 +3099,18 @@ impl AgentClient {
             .set_read_timeout(None)
             .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
 
-        self.send(&request)?;
-        match self.receive()? {
+        let data = self.encode_traced(&request)?;
+        let Some(body) = super::interactive_start::exchange(
+            &mut self.stream,
+            &data,
+            input.wake_fd(),
+            || input.rx.is_closed(),
+            MAX_FRAME_SIZE as usize,
+        )?
+        else {
+            return Ok(DISCONNECT_EXIT_CODE);
+        };
+        match self.decode_response(&body)? {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => return Err(Error::agent(op, message)),
             _ => return Err(Error::agent(op, "expected Started response")),
@@ -3129,7 +3139,11 @@ impl AgentClient {
 
             // The wake-up descriptor stands where a terminal's stdin would: input
             // arriving on the channel interrupts the wait. -1 is ignored by poll().
-            let poll_timeout = if pending.is_empty() {
+            // Startup may have drained input notifications while waiting for
+            // Started. Process already-queued input without needing a new wake.
+            let poll_timeout = if pending.is_empty() && !input.rx.is_empty() {
+                0
+            } else if pending.is_empty() {
                 poll_timeout_ms
             } else {
                 BACKPRESSURE_POLL_TIMEOUT_MS
@@ -3349,7 +3363,7 @@ impl AgentClient {
         S: FnOnce(),
         F: FnMut(InteractiveOutput),
     {
-        session.env = with_term_default(session.env, session.tty);
+        session.env = with_term_default(session.env, session.terminal.is_some());
         self.interactive_session_io_started(
             AgentRequest::VmExecControlled { session },
             input,
@@ -4178,7 +4192,11 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(&buf)
+        self.decode_response(&buf)
+    }
+
+    fn decode_response(&mut self, body: &[u8]) -> Result<AgentResponse> {
+        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(body)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
         if binary {
             self.binary_stream.store(true, Ordering::Release);
@@ -6332,11 +6350,41 @@ mod interactive_input_tests {
 
     #[test]
     fn a_vanished_peer_ends_the_session_without_waiting_for_the_poll_timeout() {
-        let (input, _output, session, guest) = session(&["cat"], 8);
+        let (input, output, session, guest) = session(&["cat"], 8);
+        runtime()
+            .block_on(input.send(InteractiveInput::Stdin(b"started".to_vec())))
+            .unwrap();
+        let mut echoed = Vec::new();
+        while echoed.len() < 7 {
+            match output.recv_timeout(DEADLINE).expect("command started") {
+                InteractiveOutput::Stdout(data) => echoed.extend(data),
+                other => panic!("unexpected output {other:?}"),
+            }
+        }
+        assert_eq!(echoed, b"started");
         drop(input);
         assert_eq!(session.join().unwrap().unwrap(), DISCONNECT_EXIT_CODE);
         // The guest sees its connection close and kills the command.
         guest.finish();
+    }
+
+    #[test]
+    fn an_already_disconnected_input_never_submits_the_command() {
+        let (client, mut peer) = UdsStream::pair().unwrap();
+        peer.set_read_timeout(Some(DEADLINE)).unwrap();
+        let (input, receiver) = interactive_input(8).unwrap();
+        drop(input);
+        let code = AgentClient::from_stream(client)
+            .interactive_session_io(
+                request(&["must-not-run"]),
+                receiver,
+                |_| {},
+                "test",
+                NEVER_MS,
+            )
+            .unwrap();
+        assert_eq!(code, DISCONNECT_EXIT_CODE);
+        assert_eq!(peer.read(&mut [0; 4]).unwrap(), 0);
     }
 
     #[test]

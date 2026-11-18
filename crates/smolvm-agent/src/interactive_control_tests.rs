@@ -20,6 +20,12 @@ struct Running {
 }
 impl Running {
     fn start(command: &str, tty: bool) -> Self {
+        Self::with_terminal(command, tty.then(Default::default))
+    }
+    fn with_terminal(
+        command: &str,
+        terminal: Option<smolvm_protocol::interactive_control::Terminal>,
+    ) -> Self {
         static SEQUENCE: AtomicU64 = AtomicU64::new(1);
         let id = format!("{:032x}", SEQUENCE.fetch_add(1, Ordering::Relaxed));
         let session = Session {
@@ -28,7 +34,7 @@ impl Running {
             env: vec![],
             workdir: None,
             timeout_ms: Some(5000),
-            tty,
+            terminal,
         };
         let (mut agent, stream) = UnixStream::pair().unwrap();
         stream
@@ -195,4 +201,53 @@ fn interactive_control_resize_reaches_owned_terminal() {
         session.control(Action::Resize { cols: 80, rows: 24 }),
         AgentResponse::Error { .. }
     ));
+}
+
+#[test]
+fn interactive_control_terminal_modes_apply_before_exec_and_custom_eof_works() {
+    use smolvm_protocol::interactive_control::Terminal;
+    let terminal = Terminal {
+        cols: 113,
+        rows: 31,
+        modes: vec![(53, 0), (1, 24), (5, 5), (128, 9600), (129, 9600)],
+    };
+    let mut inspect = Running::with_terminal("stty size; stty -a", Some(terminal.clone()));
+    let (code, output) = inspect.finish();
+    assert_eq!(code, 0);
+    let output = String::from_utf8_lossy(&output);
+    assert!(output.starts_with("31 113"), "{output}");
+    assert!(
+        output.contains("-echo ")
+            && output.contains("intr = ^X")
+            && output.contains("eof = ^E")
+            && output.contains("9600"),
+        "{output}"
+    );
+    let mut session = Running::with_terminal("cat; exit 17", Some(terminal));
+    for data in [b"unterminated".to_vec(), vec![]] {
+        session
+            .stream
+            .write_all(&smolvm_protocol::encode_message(&AgentRequest::Stdin { data }).unwrap())
+            .unwrap();
+    }
+    assert_eq!(session.finish(), (17, b"unterminated".to_vec()));
+}
+
+#[test]
+fn interactive_control_raw_terminal_preserves_binary_bytes() {
+    use smolvm_protocol::interactive_control::Terminal;
+    let terminal = Terminal {
+        cols: 80,
+        rows: 24,
+        modes: vec![(50, 0), (51, 0), (53, 0), (70, 0), (38, 0), (36, 0)],
+    };
+    let mut session = Running::with_terminal("head -c 256", Some(terminal));
+    let data: Vec<u8> = (0..=255).collect();
+    session
+        .stream
+        .write_all(
+            &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: data.clone() }).unwrap(),
+        )
+        .unwrap();
+    assert_eq!(session.finish(), (0, data));
 }
