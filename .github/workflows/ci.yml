@@ -103,6 +103,20 @@ jobs:
         if: ${{ runner.environment == 'self-hosted' }}
         run: git clean -ffdx -e /target
 
+      # The kept target/ grows with every build (29 GB on 2026-11-17) until the
+      # fork tests' disk images hit "No space left on device", on 11-17 and again
+      # on 11-18 for every PR. Start from a clean target/ when the disk runs low.
+      - name: Keep room on the disk
+        if: ${{ runner.environment == 'self-hosted' }}
+        run: |
+          free_gb=$(df -g . | awk 'NR==2 {print $4}')
+          echo "free: ${free_gb} GB"
+          if [ "${free_gb}" -lt 45 ]; then
+            echo "under 45 GB free: removing target/ ($(du -sh target 2>/dev/null | cut -f1))"
+            rm -rf target
+            echo "free now: $(df -g . | awk 'NR==2 {print $4}') GB"
+          fi
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
