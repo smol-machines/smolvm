@@ -404,6 +404,9 @@ pub enum MachineCmd {
     /// Serve the generated SSH configuration's on-demand connection
     #[command(hide = true)]
     SshProxy(super::ssh::Proxy),
+    /// Own one pending SSH start until completion or proxy disconnect
+    #[command(hide = true)]
+    SshStart(super::ssh::Start),
     /// Prepare local images for managed Kubernetes
     #[command(hide = true)]
     ImageFeed(ImageFeedCmd),
@@ -525,7 +528,10 @@ impl MachineCmd {
             super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
         } else if !matches!(
             self,
-            MachineCmd::ImageFeed(_) | MachineCmd::SshConfig(_) | MachineCmd::SshProxy(_)
+            MachineCmd::ImageFeed(_)
+                | MachineCmd::SshConfig(_)
+                | MachineCmd::SshProxy(_)
+                | MachineCmd::SshStart(_)
         ) {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
@@ -533,6 +539,7 @@ impl MachineCmd {
         match self {
             MachineCmd::SshConfig(cmd) => cmd.run(),
             MachineCmd::SshProxy(cmd) => cmd.run(),
+            MachineCmd::SshStart(cmd) => cmd.run(),
             MachineCmd::ImageFeed(cmd) => cmd.run(),
             MachineCmd::Run(cmd) => cmd.run(),
             MachineCmd::Exec(cmd) => cmd.run(),

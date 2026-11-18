@@ -81,6 +81,22 @@ pub fn proxy(machine: &str) -> Result<()> {
     result
 }
 
+/// Internal one-shot startup owner. EOF means its invoking proxy has gone.
+#[doc(hidden)]
+pub fn start_owned(machine: &str) -> Result<()> {
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .max_blocking_threads(4)
+        .build()?;
+    let result = runtime.block_on(async {
+        let mut interrupts = startup::Interrupts::new()?;
+        let _ = startup::prepare_owned(machine, tokio::io::stdin(), &mut interrupts).await?;
+        Ok(())
+    });
+    runtime.shutdown_background();
+    result
+}
+
 async fn serve<T>(
     machine: String,
     host: PrivateKey,

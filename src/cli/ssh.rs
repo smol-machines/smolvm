@@ -33,3 +33,15 @@ impl Proxy {
         action().map_err(|e| smolvm::Error::config("SSH connection", format!("{e:#}")))
     }
 }
+
+#[derive(Args, Debug)]
+pub struct Start {
+    #[arg(long)]
+    name: String,
+}
+impl Start {
+    pub fn run(self) -> smolvm::Result<()> {
+        smolvm::ssh::start_owned(&self.name)
+            .map_err(|e| smolvm::Error::config("SSH startup", format!("{e:#}")))
+    }
+}

@@ -108,6 +108,86 @@ async fn operation_locks(
 
 pub(super) async fn prepare<R: AsyncRead + Unpin>(
     machine: &str,
+    input: R,
+    interrupts: &mut Interrupts,
+) -> Result<Chain<Cursor<Vec<u8>>, R>> {
+    #[cfg(unix)]
+    {
+        // Keep warm connections in this process, but never bypass another
+        // client's initialization merely because it has published Running.
+        if let Some(_saved) = crate::agent::fork::try_lock_saved_execution(machine)? {
+            if let Some(_source) = crate::agent::fork::try_lock_fork_source(machine)? {
+                let record = crate::db::SmolvmDb::open()?
+                    .get_vm(machine)?
+                    .context("selected machine does not exist")?;
+                if running(&record) {
+                    return Ok(Cursor::new(Vec::new()).chain(input));
+                }
+            }
+        }
+        let mut command = Command::new(std::env::current_exe()?);
+        command.args(["machine", "ssh-start", "--name", machine]);
+        supervised_start(command, input, interrupts).await
+    }
+    #[cfg(not(unix))]
+    prepare_owned(machine, input, interrupts).await
+}
+
+/// The pipe writer belongs only to the SSH proxy. Even SIGKILL closes it,
+/// letting the startup owner cancel and release its locks after cleanup.
+/// This helper exists only while starting or waiting for a machine.
+#[cfg(unix)]
+async fn supervised_start<R: AsyncRead + Unpin>(
+    mut command: Command,
+    mut input: R,
+    interrupts: &mut Interrupts,
+) -> Result<Chain<Cursor<Vec<u8>>, R>> {
+    use std::os::unix::process::CommandExt;
+    command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::inherit());
+    // A client's process-group termination must not prevent cleanup. No
+    // kill-on-drop: closing the pipe asks the owner to finish that cleanup.
+    command.as_std_mut().process_group(0);
+    let mut child = command.spawn()?;
+    let lifetime = child
+        .stdin
+        .take()
+        .context("missing startup lifetime pipe")?;
+    let mut buffered = Vec::new();
+    let deadline = tokio::time::sleep(START_TIMEOUT);
+    tokio::pin!(deadline);
+    let result = loop {
+        tokio::select! {
+            status = child.wait() => break status.context("wait for SSH startup owner"),
+            read = read_early(&mut input, &mut buffered) => if let Err(error) = read { break Err(error); },
+            _ = interrupts.wait() => break Err(anyhow::anyhow!("SSH machine startup canceled")),
+            _ = &mut deadline => break Err(anyhow::anyhow!("SSH machine startup timed out")),
+        }
+    };
+    drop(lifetime);
+    match result {
+        Ok(status) => anyhow::ensure!(
+            status.success(),
+            "could not start the selected machine for SSH"
+        ),
+        Err(error) => {
+            // The owner independently has the same bounded startup deadline.
+            // If cleanup is slow, leave it holding the operation locks rather
+            // than kill it and allow another start to race its unfinished VM.
+            tokio::time::timeout(CANCEL_GRACE * 2 + Duration::from_secs(2), child.wait())
+                .await
+                .context("SSH startup cleanup is still in progress")?
+                .context("wait for canceled SSH startup owner")?;
+            return Err(error);
+        }
+    }
+    Ok(Cursor::new(buffered).chain(input))
+}
+
+pub(super) async fn prepare_owned<R: AsyncRead + Unpin>(
+    machine: &str,
     mut input: R,
     interrupts: &mut Interrupts,
 ) -> Result<Chain<Cursor<Vec<u8>>, R>> {
@@ -294,6 +374,68 @@ mod tests {
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         command
+    }
+
+    #[tokio::test]
+    async fn supervised_start_preserves_client_bytes() {
+        let (mut client, input) = tokio::io::duplex(128);
+        client.write_all(b"SSH-2.0-supervised\r\n").await.unwrap();
+        let mut input =
+            supervised_start(command("sleep 0.1"), input, &mut Interrupts::new().unwrap())
+                .await
+                .unwrap();
+        client.write_all(b"\0\x01\xfflater").await.unwrap();
+        drop(client);
+        let mut bytes = Vec::new();
+        input.read_to_end(&mut bytes).await.unwrap();
+        assert_eq!(bytes, b"SSH-2.0-supervised\r\n\0\x01\xfflater");
+    }
+
+    #[tokio::test]
+    async fn supervised_disconnect_waits_for_cleanup() {
+        let directory = tempfile::tempdir().unwrap();
+        let finished = directory.path().join("finished");
+        let mut owner = command("read ignored; sleep 0.1; touch \"$1\"");
+        owner.arg("startup-owner").arg(&finished);
+        let (client, input) = tokio::io::duplex(128);
+        drop(client);
+        let result = tokio::time::timeout(
+            Duration::from_secs(3),
+            supervised_start(owner, input, &mut Interrupts::new().unwrap()),
+        )
+        .await
+        .unwrap();
+        assert!(result.err().unwrap().to_string().contains("disconnected"));
+        assert!(finished.exists(), "returned before the owner cleaned up");
+    }
+
+    #[tokio::test]
+    async fn dropping_supervised_request_keeps_cleanup_owner_alive() {
+        let directory = tempfile::tempdir().unwrap();
+        let ready = directory.path().join("ready");
+        let finished = directory.path().join("finished");
+        let mut owner = command("touch \"$1\"; read ignored; sleep 0.1; touch \"$2\"");
+        owner.arg("startup-owner").arg(&ready).arg(&finished);
+        let (_client, input) = tokio::io::duplex(128);
+        let pending = tokio::spawn(async move {
+            supervised_start(owner, input, &mut Interrupts::new().unwrap()).await
+        });
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !ready.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        pending.abort();
+        assert!(pending.await.unwrap_err().is_cancelled());
+        tokio::time::timeout(Duration::from_secs(3), async {
+            while !finished.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("aborting the request killed its cleanup owner");
     }
 
     #[tokio::test]
