@@ -71,6 +71,38 @@ impl Handler {
         }
         Ok(())
     }
+    fn admit(&mut self, channel: Channel<server::Msg>) -> Option<ChannelId> {
+        // A locally closed channel can be removed by russh before its peer
+        // close reaches the callback. Reap completed workers before admission.
+        self.inputs
+            .retain(|_, input| !input.task.as_ref().is_some_and(|task| task.is_finished()));
+        if self.inputs.len() >= CHANNELS {
+            return None;
+        }
+        let id = channel.id();
+        let (read, write) = channel.split();
+        // Deliver inbound bytes through the handler only; retain the bounded
+        // remote-window-aware writer, not the library's duplicate read queue.
+        drop(read);
+        let (sender, receiver) = mpsc::unbounded_channel();
+        self.metrics.channels.fetch_add(1, Ordering::SeqCst);
+        self.inputs.insert(
+            id,
+            Input {
+                sender,
+                receiver: Some(receiver),
+                writer: Some(write),
+                task: None,
+                queued: Arc::default(),
+                eof: false,
+                metrics: self.metrics.clone(),
+                terminal: None,
+                term: None,
+                controls: None,
+            },
+        );
+        Some(id)
+    }
     fn authorize(&self, user: &str, key: &russh::keys::PublicKey) -> server::Auth {
         if user == "smol" && key.key_data() == self.allowed.key_data() {
             server::Auth::Accept
@@ -109,36 +141,60 @@ impl server::Handler for Handler {
         reply: server::ChannelOpenHandle,
         _: &mut server::Session,
     ) -> Result<(), Self::Error> {
-        // A locally closed channel can be removed by russh before its peer
-        // close reaches the callback. Reap completed workers before admission.
-        self.inputs
-            .retain(|_, input| !input.task.as_ref().is_some_and(|task| task.is_finished()));
-        if self.inputs.len() >= CHANNELS {
+        if self.admit(channel).is_none() {
+            reply
+                .reject(russh::ChannelOpenFailure::ResourceShortage)
+                .await;
             return Ok(());
         }
-        let id = channel.id();
-        let (read, write) = channel.split();
-        // Deliver inbound bytes through the handler only; retain the bounded
-        // remote-window-aware writer, not the library's duplicate read queue.
-        drop(read);
-        let (sender, receiver) = mpsc::unbounded_channel();
-        self.metrics.channels.fetch_add(1, Ordering::SeqCst);
-        self.inputs.insert(
-            id,
-            Input {
-                sender,
-                receiver: Some(receiver),
-                writer: Some(write),
-                task: None,
-                queued: Arc::default(),
-                eof: false,
-                metrics: self.metrics.clone(),
-                terminal: None,
-                term: None,
-                controls: None,
-            },
-        );
         reply.accept().await;
+        Ok(())
+    }
+    async fn channel_open_direct_tcpip(
+        &mut self,
+        channel: Channel<server::Msg>,
+        host: &str,
+        port: u32,
+        _: &str,
+        _: u32,
+        reply: server::ChannelOpenHandle,
+        session: &mut server::Session,
+    ) -> Result<(), Self::Error> {
+        let Ok(port) = u16::try_from(port) else {
+            return Ok(());
+        };
+        if (crate::agent::interactive_control::Builtin::TcpConnect {
+            host: host.into(),
+            port,
+        })
+        .validate()
+        .is_err()
+        {
+            return Ok(());
+        }
+        let Some(id) = self.admit(channel) else {
+            reply
+                .reject(russh::ChannelOpenFailure::ResourceShortage)
+                .await;
+            return Ok(());
+        };
+        let input = self.inputs.get_mut(&id).unwrap();
+        let (task, _) = guest::start(
+            id,
+            input.receiver.take().unwrap(),
+            input.writer.take().unwrap(),
+            input.queued.clone(),
+            session.handle(),
+            self.machine.clone(),
+            self.expected_host.clone(),
+            guest::Operation::Tcp {
+                host: host.into(),
+                port,
+                reply,
+            },
+            self.metrics.guest_threads.clone(),
+        );
+        input.task = Some(task);
         Ok(())
     }
     async fn exec_request(
@@ -167,14 +223,16 @@ impl server::Handler for Handler {
                 session.handle(),
                 self.machine.clone(),
                 self.expected_host.clone(),
-                String::from_utf8(command.to_vec()).unwrap(),
-                input.terminal.clone(),
-                input
-                    .term
-                    .clone()
-                    .map(|term| ("TERM".into(), term))
-                    .into_iter()
-                    .collect(),
+                guest::Operation::Execute {
+                    command: String::from_utf8(command.to_vec()).unwrap(),
+                    terminal: input.terminal.clone(),
+                    env: input
+                        .term
+                        .clone()
+                        .map(|term| ("TERM".into(), term))
+                        .into_iter()
+                        .collect(),
+                },
                 self.metrics.guest_threads.clone(),
             );
             input.task = Some(task);

@@ -1,5 +1,6 @@
 //! On-demand SSH connections carried by the invoking client's standard I/O.
 mod context;
+mod forward;
 mod guest;
 mod handler;
 mod identity;

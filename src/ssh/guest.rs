@@ -1,12 +1,12 @@
 //! Bridge SSH channels to the actual agent; callbacks never wait on guest I/O.
 use crate::agent::{
-    interactive_control::{Action, Request, Session, Terminal},
+    interactive_control::{Action, Builtin, Request, Session, Terminal, TCP_CAPABILITY},
     interactive_input, AgentClient, AgentManager, InteractiveInput, InteractiveOutput,
 };
 use russh::{server, ChannelId, ChannelWriteHalf};
 use std::{
     sync::{
-        atomic::{AtomicUsize, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
     },
     time::Duration,
@@ -33,6 +33,19 @@ impl Drop for AbortOnDrop {
     }
 }
 
+pub(super) enum Operation {
+    Execute {
+        command: String,
+        terminal: Option<Terminal>,
+        env: Vec<(String, String)>,
+    },
+    Tcp {
+        host: String,
+        port: u16,
+        reply: server::ChannelOpenHandle,
+    },
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(super) fn start(
     id: ChannelId,
@@ -42,16 +55,42 @@ pub(super) fn start(
     handle: server::Handle,
     machine: String,
     expected_host: Arc<russh::keys::PublicKey>,
-    command: String,
-    terminal: Option<Terminal>,
-    env: Vec<(String, String)>,
+    operation: Operation,
     active: Arc<AtomicUsize>,
 ) -> (tokio::task::JoinHandle<()>, mpsc::Sender<Action>) {
     let (controls, mut requests) = mpsc::channel::<Action>(16);
     let task = tokio::spawn(async move {
+        let (command, terminal, env, builtin, reply) = match operation {
+            Operation::Execute {
+                command,
+                terminal,
+                env,
+            } => (
+                vec!["sh".into(), "-c".into(), command],
+                terminal,
+                env,
+                None,
+                None,
+            ),
+            Operation::Tcp { host, port, reply } => (
+                Vec::new(),
+                None,
+                Vec::new(),
+                Some(Builtin::TcpConnect { host, port }),
+                Some(reply),
+            ),
+        };
+        let forwarding = reply.is_some();
+        let accepted = Arc::new(AtomicBool::new(false));
         let Ok((input, input_rx)) = interactive_input(8) else {
-            let _ = writer.exit_status(255).await;
-            let _ = writer.close().await;
+            if let Some(reply) = reply {
+                reply
+                    .reject(russh::ChannelOpenFailure::ResourceShortage)
+                    .await;
+            } else {
+                let _ = writer.exit_status(255).await;
+                let _ = writer.close().await;
+            }
             return;
         };
         let writer = Arc::new(writer);
@@ -72,17 +111,23 @@ pub(super) fn start(
                         .get_vm(&machine)?
                         .ok_or_else(|| anyhow::anyhow!("selected machine no longer exists"))?;
                     let target = crate::workload::machine_target(&record);
-                    let mut environment = crate::secrets::record_env_with_secrets(&record)?;
+                    // A TCP relay needs the workload's namespaces and identity,
+                    // but never dereferences its host secrets or credential store.
+                    let mut environment = if forwarding { record.env.clone() } else { crate::secrets::record_env_with_secrets(&record)? };
                     for (key, value) in env {
                         environment.retain(|(existing, _)| existing != &key);
                         environment.push((key, value));
                     }
                     let manager = AgentManager::for_vm(&machine)?;
                     let mut client = AgentClient::connect(manager.vsock_socket())?;
+                    if forwarding {
+                        anyhow::ensure!(client.supports_capability(TCP_CAPABILITY)?, "this running machine needs an updated runtime for SSH forwarding");
+                    }
                     Ok(client.vm_exec_controlled_io(
                         Session {
                             id: session_id,
-                            command: vec!["sh".into(), "-c".into(), command],
+                            command,
+                            builtin,
                             env: environment,
                             workdir: record.workdir,
                             timeout_ms: None,
@@ -104,8 +149,14 @@ pub(super) fn start(
                 let _ = finished.send(value);
             });
         if spawned.is_err() {
-            let _ = writer.exit_status(255).await;
-            let _ = writer.close().await;
+            if let Some(reply) = reply {
+                reply
+                    .reject(russh::ChannelOpenFailure::ResourceShortage)
+                    .await;
+            } else {
+                let _ = writer.exit_status(255).await;
+                let _ = writer.close().await;
+            }
             return;
         }
         let control_task = AbortOnDrop(tokio::spawn(async move {
@@ -152,7 +203,14 @@ pub(super) fn start(
             }
         }));
         let output_writer = writer.clone();
+        let output_accepted = accepted.clone();
         let mut output_task = AbortOnDrop(tokio::spawn(async move {
+            if let Some(reply) = reply {
+                let result =
+                    super::forward::output(output_rx, output_writer, reply, output_accepted).await;
+                tracing::debug!(succeeded = result.is_ok(), "SSH TCP relay finished");
+                return;
+            }
             while let Some(chunk) = output_rx.recv().await {
                 let sent = match chunk {
                     InteractiveOutput::Stdout(data) => output_writer.data_bytes(data).await,
@@ -165,10 +223,21 @@ pub(super) fn start(
                 }
             }
         }));
-        let result = done.await;
-        // Wait for all guest output before reporting exit; task destruction on
-        // channel closure drops both queues, unblocking the agent callback.
-        let _ = (&mut output_task.0).await;
+        let mut done = done;
+        let mut input_task = Some(input_task);
+        let result = tokio::select! {
+            result = &mut done => {
+                // Drain all buffered output before reporting normal completion.
+                let _ = (&mut output_task.0).await;
+                result
+            }
+            _ = &mut output_task.0 => {
+                // A failed destination or blocked startup deadline must cancel
+                // the guest even while DNS, stdin or its output is still blocked.
+                drop(input_task.take());
+                done.await
+            }
+        };
         drop(output_task);
         drop(input_task);
         drop(control_task);
@@ -176,9 +245,13 @@ pub(super) fn start(
             Ok(Ok(code)) => u32::try_from(code).unwrap_or(255),
             _ => 255,
         };
-        let _ = writer.exit_status(code).await;
-        let _ = writer.eof().await;
-        let _ = writer.close().await;
+        if !forwarding {
+            let _ = writer.exit_status(code).await;
+            let _ = writer.eof().await;
+        }
+        if !forwarding || accepted.load(Ordering::SeqCst) {
+            let _ = writer.close().await;
+        }
     });
     (task, controls)
 }

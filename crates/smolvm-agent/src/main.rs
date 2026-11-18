@@ -127,6 +127,8 @@ mod rosetta_tracer;
 mod s3mount;
 mod ssh_agent;
 mod storage;
+#[cfg(target_os = "linux")]
+mod tcp_forward;
 mod terminal_modes;
 #[cfg(target_os = "linux")]
 mod timesync;
@@ -356,6 +358,10 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if tcp_forward::helper_requested() {
+        std::process::exit(tcp_forward::run_helper());
+    }
     #[cfg(target_os = "linux")]
     if controlled_exec::helper_requested() {
         std::process::exit(controlled_exec::run_helper());
@@ -2836,6 +2842,8 @@ fn handle_request(
             }
             #[cfg(target_os = "linux")]
             capabilities.push(smolvm_protocol::interactive_control::CAPABILITY.to_string());
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::TCP_CAPABILITY.to_string());
             if attach::available() {
                 capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
             }
@@ -9056,6 +9064,13 @@ fn handle_interactive_vm_exec(
             ..
         } => (command, env, workdir, timeout_ms, tty, None, None),
         AgentRequest::VmExecControlled { session } => {
+            if let Err(error) = session.validate_operation() {
+                send_response(
+                    stream,
+                    &AgentResponse::error(error, error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
             #[cfg(target_os = "linux")]
             if matches!(session.target, Some(WorkloadTarget::Container { .. })) {
                 return controlled_exec::serve(stream, session);
@@ -9082,8 +9097,24 @@ fn handle_interactive_vm_exec(
                     return Ok(());
                 }
             };
+            let command = match &session.builtin {
+                Some(builtin) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        std::iter::once("/proc/self/exe".to_string())
+                            .chain(tcp_forward::command(builtin))
+                            .collect()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = builtin;
+                        return Err("builtin operations require a Linux guest".into());
+                    }
+                }
+                None => session.command,
+            };
             (
-                session.command,
+                command,
                 session.env,
                 session.workdir,
                 session.timeout_ms,

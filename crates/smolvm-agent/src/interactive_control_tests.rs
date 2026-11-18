@@ -31,6 +31,7 @@ impl Running {
         let session = Session {
             id: id.clone(),
             command: vec!["sh".into(), "-c".into(), command.into()],
+            builtin: None,
             env: vec![],
             workdir: None,
             timeout_ms: Some(5000),

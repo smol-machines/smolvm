@@ -45,7 +45,7 @@ fn helper() -> io::Result<()> {
     };
     let executable = parse_fd(0)?;
     let socket = parse_fd(1)?;
-    if executable == socket || args.len() < 4 || args[2] != "--" {
+    if executable == socket || args.len() < 4 || (args[2] != "--" && args[2] != "--builtin") {
         return Err(io::Error::other("invalid helper invocation"));
     }
     // SAFETY: this private helper invocation owns the two inherited descriptors.
@@ -81,6 +81,9 @@ fn helper() -> io::Result<()> {
     }
     drop(socket);
     drop(executable);
+    if args[2] == "--builtin" {
+        return crate::tcp_forward::run(&args[3..]);
+    }
     // No helper process survives: the requested command keeps this PID/group.
     Err(Command::new(&args[3]).args(&args[4..]).exec())
 }
@@ -167,9 +170,7 @@ fn execute(
     let WorkloadTarget::Container { image, overlay_id } = target else {
         return Err("expected image target".into());
     };
-    if session.command.is_empty() {
-        return Err("command cannot be empty".into());
-    }
+    session.validate_operation()?;
     if session
         .terminal
         .as_ref()
@@ -186,7 +187,11 @@ fn execute(
     crate::ssh_agent::inject_into_env(&mut env);
     let launch = crate::ResolvedLaunch::resolve(
         image,
-        session.command,
+        session
+            .builtin
+            .as_ref()
+            .map(crate::tcp_forward::command)
+            .unwrap_or(session.command),
         env,
         session.workdir,
         session.user,
@@ -224,7 +229,12 @@ fn execute(
         HELPER.into(),
         executable.as_raw_fd().to_string(),
         child.as_raw_fd().to_string(),
-        "--".into(),
+        if session.builtin.is_some() {
+            "--builtin"
+        } else {
+            "--"
+        }
+        .into(),
     ];
     process.args.extend(launch.command);
     let spec = ProcessFile(crate::write_exec_process_file(&container, &process)?);

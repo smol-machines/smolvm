@@ -4,6 +4,9 @@ use serde::{Deserialize, Serialize};
 /// The agent supports controlled VM exec and a separate signal/resize connection.
 pub const CAPABILITY: &str = "vm-exec-control-v1";
 
+/// Controlled connections originate inside the selected workload's namespaces.
+pub const TCP_CAPABILITY: &str = "vm-exec-tcp-v1";
+
 /// An interactive VM command whose controls do not share its stdin stream.
 #[derive(Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -12,6 +15,10 @@ pub struct Session {
     pub id: String,
     /// Program and arguments; executed inside the VM.
     pub command: Vec<String>,
+    /// An agent-provided operation that needs no tools installed in the image.
+    /// Mutually exclusive with command and terminal configuration.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub builtin: Option<Builtin>,
     /// Guest environment overrides.
     #[serde(default)]
     pub env: Vec<(String, String)>,
@@ -29,6 +36,53 @@ pub struct Session {
     /// Override the image's configured user, resolved inside its filesystem.
     #[serde(default)]
     pub user: Option<String>,
+}
+
+/// Agent-provided operations executed with the selected workload's identity.
+#[derive(Clone, Serialize, Deserialize)]
+#[serde(tag = "operation", rename_all = "snake_case", deny_unknown_fields)]
+pub enum Builtin {
+    /// Connect from the guest, reading raw stdin and writing framed TCP events.
+    TcpConnect {
+        /// Destination resolved by the guest, never by the host.
+        host: String,
+        /// Nonzero destination port.
+        port: u16,
+    },
+}
+impl Builtin {
+    /// Reject malformed destinations before acquiring guest resources.
+    pub fn validate(&self) -> Result<(), &'static str> {
+        match self {
+            Self::TcpConnect { host, port }
+                if !host.is_empty()
+                    && host.len() <= 253
+                    && !host
+                        .bytes()
+                        .any(|byte| byte.is_ascii_control() || byte.is_ascii_whitespace())
+                    && *port != 0 =>
+            {
+                Ok(())
+            }
+            _ => Err("invalid TCP destination"),
+        }
+    }
+}
+
+impl Session {
+    /// Validate the operation shape before starting a process or resolving an image.
+    pub fn validate_operation(&self) -> Result<(), &'static str> {
+        match &self.builtin {
+            Some(builtin) => {
+                if !self.command.is_empty() || self.terminal.is_some() {
+                    return Err("builtin operations cannot include commands or terminals");
+                }
+                builtin.validate()
+            }
+            None if self.command.is_empty() => Err("command cannot be empty"),
+            None => Ok(()),
+        }
+    }
 }
 
 impl std::fmt::Debug for Session {
@@ -113,6 +167,7 @@ mod tests {
         let session = Session {
             id: "abcdef0123456789abcdef0123456789".into(),
             command: vec!["secret-command".into()],
+            builtin: None,
             env: vec![("TOKEN".into(), "secret-env".into())],
             workdir: Some("private-path".into()),
             timeout_ms: None,
