@@ -39,6 +39,9 @@ pub enum LayerEntry<'a> {
     Whiteout(&'a str),
     /// An ordinary entry to extract as-is.
     Normal,
+    /// A whiteout marker naming its own directory or its parent (`.wh..`,
+    /// `.wh...`): skipped, never applied.
+    Invalid,
 }
 
 /// Classify an entry by its file name. The opaque marker must be checked before
@@ -48,6 +51,9 @@ pub fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
         return LayerEntry::OpaqueDir;
     }
     match file_name.strip_prefix(WHITEOUT_PREFIX) {
+        // A whiteout names one entry of its own directory: `.wh..` and
+        // `.wh...` would name the directory itself and its parent.
+        Some("." | "..") => LayerEntry::Invalid,
         Some(name) if !name.is_empty() => LayerEntry::Whiteout(name),
         _ => LayerEntry::Normal,
     }
@@ -306,10 +312,22 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
                     continue;
                 }
                 LayerEntry::Whiteout(removed) => {
-                    if let Some(parent) = full_path.parent() {
+                    // The deleted name goes through the same jail as the marker:
+                    // it is destroyed as root, so it must name an entry of the
+                    // marker's own directory and nothing a link leads to.
+                    let parent_rel = path.parent().unwrap_or(Path::new(""));
+                    let Some(target) = jailed_join(dest, &parent_rel.join(removed)) else {
+                        warn!(path = %path.display(), "skipping a whiteout that escapes the layer dir");
+                        continue;
+                    };
+                    if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent)?;
-                        create_overlay_whiteout(&parent.join(removed))?;
                     }
+                    create_overlay_whiteout(&target)?;
+                    continue;
+                }
+                LayerEntry::Invalid => {
+                    warn!(path = %path.display(), "skipping a whiteout that names no entry");
                     continue;
                 }
                 LayerEntry::Normal => {}
@@ -408,6 +426,32 @@ mod tests {
         assert_eq!(classify_layer_entry(".wh."), LayerEntry::Normal);
         assert_eq!(classify_layer_entry("CERN.repo"), LayerEntry::Normal);
         assert_eq!(classify_layer_entry(".wherever"), LayerEntry::Normal);
+        assert_eq!(classify_layer_entry(".wh.."), LayerEntry::Invalid);
+        assert_eq!(classify_layer_entry(".wh..."), LayerEntry::Invalid);
+    }
+
+    /// `.wh...` named the layer dir's parent and `.wh..` the layer dir: their
+    /// whiteouts deleted them, as root when the host fills the image cache.
+    #[test]
+    fn a_whiteout_naming_its_own_directory_or_parent_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let dest = cache.join("layerdir");
+        std::fs::create_dir_all(&dest).unwrap();
+        let victim = cache.join("victim");
+        std::fs::write(&victim, b"outside the layer").unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for marker in [".wh...", ".wh..", "sub/.wh..."] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, marker, &b"x"[..]).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        extract_oci_layer(&tar_bytes[..], &dest).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside the layer");
+        assert!(dest.is_dir(), "the layer dir itself survives");
     }
 
     #[test]
