@@ -45,7 +45,7 @@ zstd = "0.14.3"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.27", features = ["socket", "fs", "ioctl"] }
+nix = { version = "0.27", features = ["socket", "fs", "ioctl", "uio"] }
 # The new mount API (fsopen/fsconfig/fsmount/move_mount) for overlay mounts — lets
 # us append each lower layer via `lowerdir+` instead of shelling out to `mount(8)`,
 # whose `-o lowerdir=` value is capped at ~255 bytes. Already in the workspace lock.

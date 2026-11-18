@@ -93,6 +93,8 @@ mod container;
 #[cfg(target_os = "linux")]
 mod container_session;
 mod container_stats;
+#[cfg(target_os = "linux")]
+mod controlled_exec;
 mod credentials;
 mod cuda;
 mod directory_write;
@@ -354,6 +356,10 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if controlled_exec::helper_requested() {
+        std::process::exit(controlled_exec::run_helper());
+    }
     if live_resources::filesystem_helper_requested() {
         std::process::exit(live_resources::run_filesystem_helper());
     }
@@ -6513,8 +6519,21 @@ fn spawn_interactive_command(
 /// The client went away: kill the command and everything it started. For an
 /// image container the command is a grandchild (under `crun exec`), so killing
 /// only the direct child would leave it running.
-fn kill_child_on_disconnect(child: &mut Child) -> i32 {
+fn terminate_interactive_child(
+    child: &mut Child,
+    control: Option<&interactive_control::Registration>,
+) {
+    if let Some(control) = control {
+        control.terminate();
+    }
     process::kill_child_tree(child);
+}
+
+fn kill_child_on_disconnect(
+    child: &mut Child,
+    control: Option<&interactive_control::Registration>,
+) -> i32 {
+    terminate_interactive_child(child, control);
     124
 }
 
@@ -6598,6 +6617,15 @@ fn run_interactive_loop(
     child: &mut Child,
     timeout_ms: Option<u64>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    run_interactive_loop_controlled(stream, child, timeout_ms, None)
+}
+
+fn run_interactive_loop_controlled(
+    stream: &mut WireStream<impl ReadWrite>,
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+    control: Option<&interactive_control::Registration>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
     let result = run_interactive_loop_io(
@@ -6606,6 +6634,7 @@ fn run_interactive_loop(
         timeout_ms,
         &mut child_stdout,
         &mut child_stderr,
+        control,
     );
     // A pipe still open after the session is held by a process the command
     // left running in the background: keep it drained, so that process is not
@@ -6621,6 +6650,7 @@ fn run_interactive_loop_io(
     timeout_ms: Option<u64>,
     child_stdout: &mut Option<std::process::ChildStdout>,
     child_stderr: &mut Option<std::process::ChildStderr>,
+    control: Option<&interactive_control::Registration>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::time::{Duration, Instant};
@@ -6679,7 +6709,7 @@ fn run_interactive_loop_io(
                 warn!("interactive command timed out, killing process");
                 // The whole tree: in an image container the command is a
                 // grandchild. Also reaps the child, avoiding a zombie.
-                process::kill_child_tree(child);
+                terminate_interactive_child(child, control);
                 send_response(
                     stream,
                     &AgentResponse::Stderr {
@@ -6756,7 +6786,7 @@ fn run_interactive_loop_io(
                 && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
             debug!("host disconnected during interactive execution");
-            return Ok(kill_child_on_disconnect(child));
+            return Ok(kill_child_on_disconnect(child, control));
         }
 
         // Read available stdout. If send_response fails (host disconnected),
@@ -6784,7 +6814,7 @@ fn run_interactive_loop_io(
                             .is_err()
                             {
                                 debug!("host disconnected while sending stdout");
-                                return Ok(kill_child_on_disconnect(child));
+                                return Ok(kill_child_on_disconnect(child, control));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6825,7 +6855,7 @@ fn run_interactive_loop_io(
                             .is_err()
                             {
                                 debug!("host disconnected while sending stderr");
-                                return Ok(kill_child_on_disconnect(child));
+                                return Ok(kill_child_on_disconnect(child, control));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6850,12 +6880,12 @@ fn run_interactive_loop_io(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     // Keep the existing protocol-error behavior while also
                     // reaping the workload before returning the error.
-                    process::kill_child_tree(child);
+                    terminate_interactive_child(child, control);
                     return Err(error.into());
                 }
                 Err(error) => {
                     debug!(%error, "host disconnected during interactive exec");
-                    return Ok(kill_child_on_disconnect(child));
+                    return Ok(kill_child_on_disconnect(child, control));
                 }
             };
             match request {
@@ -6918,6 +6948,17 @@ fn run_interactive_loop_pty(
     pty_master: pty::PtyMaster,
     timeout_ms: Option<u64>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    run_interactive_loop_pty_controlled(stream, child, pty_master, timeout_ms, None)
+}
+
+#[cfg(unix)]
+fn run_interactive_loop_pty_controlled(
+    stream: &mut WireStream<impl ReadWrite>,
+    child: &mut Child,
+    pty_master: pty::PtyMaster,
+    timeout_ms: Option<u64>,
+    control: Option<&interactive_control::Registration>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
@@ -6969,7 +7010,7 @@ fn run_interactive_loop_pty(
         if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive PTY command timed out, killing process");
-                process::kill_child_tree(child);
+                terminate_interactive_child(child, control);
                 send_response(
                     stream,
                     &AgentResponse::Stdout {
@@ -7034,7 +7075,7 @@ fn run_interactive_loop_pty(
                 && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
             debug!("host disconnected during interactive execution");
-            return Ok(kill_child_on_disconnect(child));
+            return Ok(kill_child_on_disconnect(child, control));
         }
 
         // Read available data from PTY master. If send_response fails
@@ -7054,7 +7095,7 @@ fn run_interactive_loop_pty(
                         .is_err()
                         {
                             debug!("host disconnected while sending PTY stdout");
-                            return Ok(kill_child_on_disconnect(child));
+                            return Ok(kill_child_on_disconnect(child, control));
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -7087,12 +7128,12 @@ fn run_interactive_loop_pty(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     // Keep the existing protocol-error behavior while also
                     // reaping the workload before returning the error.
-                    process::kill_child_tree(child);
+                    terminate_interactive_child(child, control);
                     return Err(error.into());
                 }
                 Err(error) => {
                     debug!(%error, "host disconnected during PTY interactive exec");
-                    return Ok(kill_child_on_disconnect(child));
+                    return Ok(kill_child_on_disconnect(child, control));
                 }
             };
 
@@ -9015,6 +9056,22 @@ fn handle_interactive_vm_exec(
             ..
         } => (command, env, workdir, timeout_ms, tty, None, None),
         AgentRequest::VmExecControlled { session } => {
+            #[cfg(target_os = "linux")]
+            if matches!(session.target, Some(WorkloadTarget::Container { .. })) {
+                return controlled_exec::serve(stream, session);
+            }
+            if session.user.is_some()
+                || matches!(session.target, Some(WorkloadTarget::Container { .. }))
+            {
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        "controlled target or user is unsupported on this guest",
+                        error_codes::INVALID_REQUEST,
+                    ),
+                )?;
+                return Ok(());
+            }
             let registration = match interactive_control::Registration::reserve(&session.id) {
                 Ok(registration) => registration,
                 Err(error) => {

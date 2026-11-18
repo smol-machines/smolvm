@@ -88,6 +88,13 @@ mod linux {
                 return Err(io::Error::last_os_error());
             }
             let process = unsafe { OwnedFd::from_raw_fd(fd as i32) };
+            self.activate_descriptor(process, terminal)
+        }
+        pub fn activate_descriptor(
+            &self,
+            process: OwnedFd,
+            terminal: Option<i32>,
+        ) -> io::Result<()> {
             // Check both kernel support and process-group ownership before
             // acknowledging Started; never fall back to an unpinned killpg.
             if let Err(error) = pidfd_signal(&process, 0) {
@@ -111,6 +118,13 @@ mod linux {
                 .transpose()?;
             *lock(&self.entry) = Some(Target { process, terminal });
             Ok(())
+        }
+    }
+    impl Registration {
+        pub fn terminate(&self) {
+            if let Some(target) = lock(&self.entry).as_ref() {
+                let _ = pidfd_signal(&target.process, libc::SIGKILL);
+            }
         }
     }
     impl Drop for Registration {
@@ -287,6 +301,7 @@ pub fn handle(request: &interactive_control::Request) -> AgentResponse {
 pub struct Registration;
 #[cfg(not(target_os = "linux"))]
 impl Registration {
+    pub fn terminate(&self) {}
     pub fn reserve(_: &str) -> std::io::Result<Self> {
         Err(std::io::Error::new(
             std::io::ErrorKind::Unsupported,

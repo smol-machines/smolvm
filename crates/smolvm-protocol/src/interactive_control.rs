@@ -23,6 +23,12 @@ pub struct Session {
     /// Initial terminal configuration, or byte-preserving pipes when absent.
     #[serde(default)]
     pub terminal: Option<Terminal>,
+    /// Explicit filesystem and environment for this command; absent means bare VM.
+    #[serde(default)]
+    pub target: Option<crate::WorkloadTarget>,
+    /// Override the image's configured user, resolved inside its filesystem.
+    #[serde(default)]
+    pub user: Option<String>,
 }
 
 impl std::fmt::Debug for Session {
@@ -111,6 +117,8 @@ mod tests {
             workdir: Some("private-path".into()),
             timeout_ms: None,
             terminal: None,
+            target: None,
+            user: None,
         };
         let request = Request {
             id: session.id.clone(),

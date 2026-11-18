@@ -35,6 +35,8 @@ impl Running {
             workdir: None,
             timeout_ms: Some(5000),
             terminal,
+            target: None,
+            user: None,
         };
         let (mut agent, stream) = UnixStream::pair().unwrap();
         stream
