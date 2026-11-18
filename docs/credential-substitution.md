@@ -205,16 +205,23 @@ the destination. The interceptor reads the TLS server name:
 
 Refused with a `403` and a one-line reason in the body:
 
-- a placeholder in the path or query string, or in a request body when the
-  binding lacks `:body`;
+- a placeholder in the path or query string, or in a form body whose
+  binding lacks `:body` (bodies are only looked at as described below);
 - a placeholder in a routing or framing header (`Host`, `Content-Length`,
   `Transfer-Encoding`, `Connection`, `Cookie`, …);
 - more than one placeholder in a request;
 - a placeholder the machine did not mint, or one whose binding does not allow
   this host or method (`405`).
 
-Under `:body`, a request body that is not `application/x-www-form-urlencoded`
-is refused with a `415`.
+A request body is scanned for placeholders only when some binding for the
+host has `:body` **and** the body is `application/x-www-form-urlencoded`
+(gpu-branch fork). Every other body is opaque: it is forwarded unchanged, and
+a placeholder in it travels as the literal string, which was never going to
+become a value. This keeps clients that resend their whole history working
+after it once quoted a placeholder (an LLM conversation that read `env`, a
+document, or a web page); upstream smolvm refused every such request with a
+`403`. A JSON body to a `:body` host is likewise forwarded unscanned rather
+than refused with a `415`.
 
 `502 smolvm credentials: credential unavailable` means the host could not
 resolve the binding — the variable is unset, the file is missing or

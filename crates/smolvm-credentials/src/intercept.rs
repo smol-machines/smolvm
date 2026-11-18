@@ -12,8 +12,10 @@
 //! 4. otherwise splices the raw bytes to the destination untouched.
 //!
 //! Only the placeholder is replaced; the guest supplies `Bearer ` or any other
-//! surrounding syntax. A placeholder anywhere other than an ordinary request
-//! header is refused so it can never travel upstream unreplaced.
+//! surrounding syntax. A placeholder in the path, query or a protected header
+//! is refused. A request body is scanned only when it could be substituted (a
+//! form body to a host with a `body` binding); any other body is opaque and a
+//! placeholder in it travels as the literal string (gpu-branch fork).
 //!
 //! Every response from a credential host is scrubbed of the values its
 //! bindings carry (see [`crate::scrub`]), so a host that reflects a request's
@@ -549,9 +551,25 @@ impl State {
                 ))
             }
         };
-        let body_placeholder = match find_body_placeholder(&body) {
-            Ok(found) => found,
-            Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
+        // gpu-branch fork: the body is looked at only when a placeholder in it
+        // could be substituted — some binding for this host enables body
+        // injection and the body is a form. Anything else is opaque: a
+        // placeholder there was never going to become a value, so it travels
+        // as the literal string. Scanning every body broke clients that resend
+        // their whole history (an LLM conversation that once quoted
+        // `SMOL_PLACEHOLDER_…` was refused on every later turn).
+        let scan_body = self
+            .policy
+            .bindings_for_host(host)
+            .any(|b| b.injection_location.body)
+            && is_form_body(&headers);
+        let body_placeholder = if scan_body {
+            match find_body_placeholder(&body) {
+                Ok(found) => found,
+                Err(reason) => return Ok(text(StatusCode::FORBIDDEN, reason)),
+            }
+        } else {
+            None
         };
         if substitution
             .as_ref()
@@ -599,26 +617,13 @@ impl State {
                     "smolvm credentials: header substitution is disabled for this binding",
                 ));
             }
-            if body_placeholder.is_some() {
-                if !binding.injection_location.body {
-                    return Ok(text(
-                        StatusCode::FORBIDDEN,
-                        "smolvm credentials: body substitution is disabled for this binding",
-                    ));
-                }
-                if !headers.get(header::CONTENT_TYPE).is_some_and(|value| {
-                    value.to_str().is_ok_and(|value| {
-                        value.split(';').next().is_some_and(|mime| {
-                            mime.trim()
-                                .eq_ignore_ascii_case("application/x-www-form-urlencoded")
-                        })
-                    })
-                }) {
-                    return Ok(text(
-                        StatusCode::UNSUPPORTED_MEDIA_TYPE,
-                        "smolvm credentials: body substitution requires a form body",
-                    ));
-                }
+            // Only form bodies are scanned (see `scan_body`), so a body
+            // placeholder here is already in a form.
+            if body_placeholder.is_some() && !binding.injection_location.body {
+                return Ok(text(
+                    StatusCode::FORBIDDEN,
+                    "smolvm credentials: body substitution is disabled for this binding",
+                ));
             }
             let secret = match self
                 .resolve(
@@ -973,6 +978,19 @@ fn find(haystack: &[u8], needle: &[u8]) -> Option<usize> {
 
 fn contains(haystack: &[u8], needle: &[u8]) -> bool {
     find(haystack, needle).is_some()
+}
+
+/// Whether the request declares an `application/x-www-form-urlencoded` body,
+/// the only kind body substitution supports.
+fn is_form_body(headers: &header::HeaderMap) -> bool {
+    headers.get(header::CONTENT_TYPE).is_some_and(|value| {
+        value.to_str().is_ok_and(|value| {
+            value.split(';').next().is_some_and(|mime| {
+                mime.trim()
+                    .eq_ignore_ascii_case("application/x-www-form-urlencoded")
+            })
+        })
+    })
 }
 
 /// Find the one literal placeholder in a form body, rejecting repeated tokens
@@ -1563,6 +1581,8 @@ mod tests {
             )
         );
 
+        // gpu-branch fork: with no body binding for the host the body is never
+        // scanned, so the placeholder goes out as the literal string it is.
         policy.credentials[0].injection_location.body = false;
         let f = fixture_with_policy(
             policy,
@@ -1578,7 +1598,81 @@ mod tests {
         let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
             .await
             .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(f.upstream.bodies.lock().unwrap().clone(), vec![body]);
+    }
+
+    /// gpu-branch fork: a header-only host treats the body as opaque. A JSON
+    /// body quoting placeholders (this machine's, a forged one, the bare
+    /// prefix) is forwarded byte for byte while the header is substituted.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_header_only_host_forwards_a_body_quoting_placeholders_unchanged() {
+        let f = fixture().await;
+        let body = format!(
+            "{{\"messages\":[{{\"role\":\"user\",\"content\":\"env says {} and SMOL_PLACEHOLDER_test and SMOL_PLACEHOLDER_\"}}]}}",
+            f.placeholder
+        );
+        let request = format!(
+            "POST /v1/messages HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Type: application/json\r\nAuthorization: Bearer {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            f.placeholder,
+            body.len()
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(
+            f.upstream.seen.lock().unwrap()[0].0,
+            "Bearer real-secret".to_string()
+        );
+        assert_eq!(f.upstream.bodies.lock().unwrap().clone(), vec![body]);
+    }
+
+    /// gpu-branch fork: on a host that does have a body binding, a form body
+    /// carrying the placeholder of a header-only binding is still refused.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_form_body_with_a_header_only_bindings_placeholder_is_still_refused() {
+        let binding = |name: &str, env: &str, body: bool| CredentialBinding {
+            name: name.into(),
+            environment_variable: env.into(),
+            allowed_hosts: vec![CRED_HOST.into()],
+            injection_location: InjectionLocation {
+                body,
+                ..InjectionLocation::default()
+            },
+            methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+            set_header: None,
+        };
+        let policy = CredentialPolicy {
+            // `generate_placeholders` is a BTreeMap: "api" sorts first, so
+            // the fixture's placeholder is the header-only binding's.
+            credentials: vec![
+                binding("api", "API_KEY", false),
+                binding("refresh", "REFRESH_TOKEN", true),
+            ],
+        };
+        let f = fixture_with_policy(
+            policy,
+            CRED_HOST,
+            StaticResolver::new()
+                .with("api", "api-secret")
+                .with("refresh", "refresh-secret"),
+        )
+        .await;
+        assert!(f.placeholder.starts_with("SMOL_PLACEHOLDER_API_"));
+        let body = format!("token={}", f.placeholder);
+        let request = format!(
+            "POST /token HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Type: application/x-www-form-urlencoded\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
         assert!(response.starts_with("HTTP/1.1 403"), "{response}");
+        assert!(
+            response.ends_with("body substitution is disabled for this binding"),
+            "{response}"
+        );
         assert!(f.upstream.seen.lock().unwrap().is_empty());
     }
 
@@ -1603,8 +1697,9 @@ mod tests {
             StaticResolver::new().with("refresh", "real"),
         )
         .await;
+        // gpu-branch fork: a non-form body is no longer refused with 415; it is
+        // not scanned (checked after this loop).
         for (method, content_type, value, expected) in [
-            ("POST", "application/json", f.placeholder.as_str(), "415"),
             (
                 "GET",
                 "application/x-www-form-urlencoded",
@@ -1632,6 +1727,19 @@ mod tests {
             );
         }
         assert!(f.upstream.seen.lock().unwrap().is_empty());
+
+        // A JSON body to the same body-binding host is not scanned: it goes
+        // out unchanged, the placeholder unsubstituted.
+        let body = format!("{{\"refresh_token\":\"{}\"}}", f.placeholder);
+        let request = format!(
+            "POST /token HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert_eq!(f.upstream.bodies.lock().unwrap().clone(), vec![body]);
     }
 
     #[test]
