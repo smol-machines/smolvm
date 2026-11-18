@@ -142,6 +142,12 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
 landlock = "0.4"
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = "3.7"
+security-framework-sys = "2.17"
 
 # Windows process management (OpenProcess / TerminateProcess / Wait) and
 # DLL-search-path control (SetDllDirectoryW). Used to replace the Unix

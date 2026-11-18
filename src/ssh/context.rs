@@ -65,6 +65,10 @@ impl Context {
         );
         for path in value.paths.values().flatten() {
             ensure!(path.is_absolute(), "SSH context paths must be absolute");
+            ensure!(
+                !path.as_os_str().as_encoded_bytes().contains(&0),
+                "SSH context paths cannot contain NUL"
+            );
         }
         russh::keys::PublicKey::from_openssh(&value.host_key)
             .context("invalid SSH machine identity")?;
@@ -122,14 +126,15 @@ mod tests {
         );
         let original: serde_json::Value =
             serde_json::from_slice(&hex::decode(&encoded).unwrap()).unwrap();
-        for mutation in [0, 1, 2, 3, 4] {
+        for mutation in [0, 1, 2, 3, 4, 5] {
             let mut value = original.clone();
             match mutation {
                 0 => value["paths"]["LD_PRELOAD"] = "/tmp/injected.so".into(),
                 1 => value["paths"]["SMOLVM_DATA_DIR"] = "relative".into(),
                 2 => value["version"] = 2.into(),
                 3 => value["machine"] = "\0".into(),
-                _ => value["host_key"] = "invalid public key".into(),
+                4 => value["host_key"] = "invalid public key".into(),
+                _ => value["paths"]["SMOLVM_DATA_DIR"] = "/valid-prefix\0suffix".into(),
             }
             assert!(Context::decode(&hex::encode(serde_json::to_vec(&value).unwrap())).is_err());
         }

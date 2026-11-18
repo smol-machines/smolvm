@@ -34,6 +34,7 @@
 use crate::error::{Error, Result};
 use std::collections::BTreeMap;
 use zeroize::Zeroizing;
+mod keychain;
 
 /// Maximum number of bytes read when resolving a `from_file` source. A
 /// file larger than this is almost never a credential; we refuse rather
@@ -123,7 +124,9 @@ fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, 
     #[cfg(unix)]
     {
         use std::os::unix::fs::OpenOptionsExt;
-        opts.custom_flags(libc::O_NOFOLLOW);
+        // A FIFO must not block open before we can reject its file type.
+        // O_NONBLOCK has no effect on regular files.
+        opts.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
     }
     let f = opts.open(path).map_err(|e| {
         // O_NOFOLLOW on a symlink leaf fails with ELOOP — surface it as the
@@ -134,6 +137,12 @@ fn read_from_file_source(path: &std::path::Path) -> std::result::Result<String, 
         }
         FileSourceError::Io(e)
     })?;
+    if !f.metadata()?.is_file() {
+        return Err(FileSourceError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "secret source must be a regular file",
+        )));
+    }
     read_file_bounded(f, MAX_FROM_FILE_BYTES)
 }
 
@@ -182,7 +191,8 @@ pub enum ResolutionScope {
     TrustedLocal,
 
     /// Ref was persisted by a `TrustedLocal` actor in a prior session
-    /// (e.g., read back from a VM record). Trust is preserved across time.
+    /// (e.g., read back from a VM record). Trust is preserved across time,
+    /// but replay must never ask the user to unlock/authorize a credential.
     RecordReplay,
 
     /// Ref came in from an unauthenticated or semi-trusted source: an
@@ -330,56 +340,20 @@ fn keychain_item_parts(item: &str) -> Option<(&str, Option<&str>)> {
     (!service.is_empty() && account.is_none_or(|a| !a.is_empty())).then_some((service, account))
 }
 
-/// Read a keychain item fresh, as the other sources are read: macOS's
-/// `security`, or `secret-tool` for a Linux Secret Service. Both run by
-/// absolute path, so a launch environment with a short `PATH` or a planted
-/// binary cannot change which tool answers.
-fn read_keychain_item(item: &str) -> std::result::Result<Zeroizing<String>, ResolutionFailure> {
+/// Read natively, permitting authorization only for newly supplied local refs.
+fn read_keychain_item(
+    item: &str,
+    scope: ResolutionScope,
+) -> std::result::Result<Zeroizing<String>, ResolutionFailure> {
     let (service, account) = keychain_item_parts(item).ok_or(ResolutionFailure::Internal)?;
-    let mut command =
-        keychain_command(service, account).ok_or(ResolutionFailure::KeychainUnavailable)?;
-    let output = command
-        .stdin(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .output()
-        .map_err(|_| ResolutionFailure::KeychainUnavailable)?;
-    let stdout = Zeroizing::new(output.stdout);
-    if !output.status.success() {
-        return Err(ResolutionFailure::KeychainItemMissing);
+    let bytes = keychain::read(service, account, scope == ResolutionScope::TrustedLocal)?;
+    if bytes.len() as u64 > MAX_FROM_FILE_BYTES {
+        return Err(ResolutionFailure::KeychainUnavailable);
     }
-    let value = std::str::from_utf8(&stdout).map_err(|_| ResolutionFailure::KeychainItemMissing)?;
+    let value = std::str::from_utf8(&bytes).map_err(|_| ResolutionFailure::KeychainUnavailable)?;
     Ok(Zeroizing::new(
         value.trim_end_matches(['\n', '\r']).to_string(),
     ))
-}
-
-#[cfg(target_os = "macos")]
-fn keychain_command(service: &str, account: Option<&str>) -> Option<std::process::Command> {
-    let mut command = std::process::Command::new("/usr/bin/security");
-    command.args(["find-generic-password", "-s", service]);
-    if let Some(account) = account {
-        command.args(["-a", account]);
-    }
-    command.arg("-w");
-    Some(command)
-}
-
-#[cfg(target_os = "linux")]
-fn keychain_command(service: &str, account: Option<&str>) -> Option<std::process::Command> {
-    let tool = ["/usr/bin/secret-tool", "/bin/secret-tool"]
-        .into_iter()
-        .find(|path| std::path::Path::new(path).exists())?;
-    let mut command = std::process::Command::new(tool);
-    command.args(["lookup", "service", service]);
-    if let Some(account) = account {
-        command.args(["account", account]);
-    }
-    Some(command)
-}
-
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
-fn keychain_command(_service: &str, _account: Option<&str>) -> Option<std::process::Command> {
-    None
 }
 
 // ============================================================================
@@ -404,11 +378,11 @@ pub enum ResolutionFailure {
     FileReadFailed,
     /// `from_file` target exceeds the size cap.
     FileTooLarge,
-    /// `from_keychain` names an item the host keychain does not hold (or
-    /// that the user declined to release).
+    /// `from_keychain` names an item the host keychain does not hold.
     KeychainItemMissing,
-    /// This host has no keychain smolvm can read: not macOS, and no
-    /// `secret-tool` for a Linux Secret Service.
+    /// An existing item requires explicit unlock/authorization; replay is silent.
+    KeychainInteractionRequired,
+    /// The host credential store is unsupported, unavailable, or failed to read.
     KeychainUnavailable,
     /// Any other failure: an internal/unexpected condition (e.g. a ref
     /// with no source reaching resolution despite validation).
@@ -425,6 +399,7 @@ impl ResolutionFailure {
                 | Self::FileReadFailed
                 | Self::FileTooLarge
                 | Self::KeychainItemMissing
+                | Self::KeychainInteractionRequired
                 | Self::KeychainUnavailable
         )
     }
@@ -437,6 +412,7 @@ impl ResolutionFailure {
             Self::FileReadFailed => "file_read_failed",
             Self::FileTooLarge => "file_too_large",
             Self::KeychainItemMissing => "keychain_item_missing",
+            Self::KeychainInteractionRequired => "keychain_interaction_required",
             Self::KeychainUnavailable => "keychain_unavailable",
             Self::Internal => "internal",
         }
@@ -520,7 +496,7 @@ pub fn resolve_secret_ref_classified(
                 .map(|v| Zeroizing::new(v.trim_end_matches(['\n', '\r']).to_string()))
                 .map_err(classify_file_source_error)
         } else if let Some(item) = &r.from_keychain {
-            read_keychain_item(item)
+            read_keychain_item(item, scope)
         } else {
             // Never reachable if validate_ref was called at the boundary.
             Err(ResolutionFailure::Internal)
@@ -553,8 +529,14 @@ fn resolve_secret_ref(
     r: &SecretRef,
     scope: ResolutionScope,
 ) -> Result<Zeroizing<String>> {
-    resolve_secret_ref_classified(name, r, scope)
-        .map_err(|f| Error::config(format!("resolve secret '{}'", name), f.as_str().to_string()))
+    resolve_secret_ref_classified(name, r, scope).map_err(|failure| {
+        let message = if failure == ResolutionFailure::KeychainInteractionRequired {
+            "keychain_interaction_required: unlock or explicitly authorize the saved credential before retrying".to_string()
+        } else {
+            failure.as_str().to_string()
+        };
+        Error::config(format!("resolve secret '{}'", name), message)
+    })
 }
 
 /// Resolve a map of secret refs and flatten into `(name, value)` pairs
@@ -710,6 +692,32 @@ mod tests {
     use super::*;
     use std::path::Path;
 
+    #[cfg(unix)]
+    #[test]
+    fn fifo_secret_source_is_rejected_without_waiting_for_data() {
+        use std::os::unix::{ffi::OsStrExt, fs::OpenOptionsExt};
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("secret-pipe");
+        let cpath = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        assert_eq!(unsafe { libc::mkfifo(cpath.as_ptr(), 0o600) }, 0);
+        // Keep a writer open so an incorrect blocking read cannot see EOF.
+        let writer = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(libc::O_NONBLOCK)
+            .open(&path)
+            .unwrap();
+        let (send, receive) = std::sync::mpsc::channel();
+        let reader = std::thread::spawn(move || {
+            let result = read_from_file_source(&path).map_err(classify_file_source_error);
+            let _ = send.send(result);
+        });
+        let result = receive.recv_timeout(std::time::Duration::from_secs(1));
+        drop(writer); // Release a regressed reader before joining/asserting.
+        reader.join().unwrap();
+        assert_eq!(result.unwrap(), Err(ResolutionFailure::FileReadFailed));
+    }
+
     fn env_ref_for(name: &str) -> SecretRef {
         env_ref(name)
     }
@@ -849,7 +857,7 @@ mod tests {
     fn a_missing_keychain_item_is_reported_without_its_name() {
         let r = keychain_ref("smolvm-test-no-such-item-7f3a/nobody");
         let failure =
-            resolve_secret_ref_classified("K", &r, ResolutionScope::TrustedLocal).unwrap_err();
+            resolve_secret_ref_classified("K", &r, ResolutionScope::RecordReplay).unwrap_err();
         assert!(matches!(
             failure,
             ResolutionFailure::KeychainItemMissing | ResolutionFailure::KeychainUnavailable

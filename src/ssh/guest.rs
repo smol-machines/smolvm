@@ -246,6 +246,15 @@ pub(super) fn start(
         drop(control_task);
         let code = match result {
             Ok(Ok(code)) => u32::try_from(code).unwrap_or(255),
+            Ok(Err(error)) => {
+                if !forwarding {
+                    // Keep errors off stdout: SFTP and editor bootstrap use it
+                    // as a protocol stream. Secret-resolution errors are redacted.
+                    let message = format!("SSH operation failed: {error:#}\r\n");
+                    let _ = writer.extended_data_bytes(1, message).await;
+                }
+                255
+            }
             _ => 255,
         };
         if !forwarding {
