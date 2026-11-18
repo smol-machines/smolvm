@@ -1580,7 +1580,11 @@ pub fn get_cache_dir(checksum: u32) -> std::io::Result<PathBuf> {
 /// extracted, so later restores of the same artifact reuse it as is.
 pub fn mark_extracted(cache_dir: &Path) -> std::io::Result<()> {
     fs::write(cache_dir.join(EXTRACTION_MARKER), "")?;
-    File::open(cache_dir)?.sync_all()
+    // A directory entry is made durable through the directory on Unix; Windows
+    // cannot open a directory as a file (nor needs to).
+    #[cfg(unix)]
+    File::open(cache_dir)?.sync_all()?;
+    Ok(())
 }
 
 /// Mark an extraction incomplete before removing it, so a removal interrupted
