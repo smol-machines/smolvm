@@ -4461,6 +4461,7 @@ pub fn register_ephemeral_vm(
     let (live_mounts, staged_mounts) = HostMount::split_storage_tuples(mounts);
     let mut record = VmRecord::new(name.to_string(), cpus, mem, live_mounts, vec![], network);
     record.staged_mounts = staged_mounts;
+    record.mount_owners = HostMount::stored_owners(mounts);
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;

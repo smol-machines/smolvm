@@ -969,6 +969,7 @@ fn cases() -> Vec<Case> {
                     read_only: true,
                     staged: false,
                     recorded_ownership: false,
+                    owner: None,
                 }]
             },
             |r| r.mounts.len() == 1
@@ -982,6 +983,7 @@ fn cases() -> Vec<Case> {
                 read_only: true,
                 staged: false,
                 recorded_ownership: false,
+                owner: None,
             }]
         })
         .checkpoint(Refused("volume mounts")),

@@ -2440,6 +2440,7 @@ impl RunCmd {
                                 // stay as refs), workdir and user, the image itself
                                 // and the workload command.
                                 let r = &mut o.record;
+                                r.mount_owners = HostMount::stored_owners(&mounts);
                                 r.env = defaults
                                     .env
                                     .iter()
@@ -2607,6 +2608,7 @@ impl RunCmd {
                             // command line flags may enable features on top of
                             // what the Smolfile asked for.
                             let r = &mut o.record;
+                            r.mount_owners = HostMount::stored_owners(&mounts);
                             r.image = None;
                             r.ssh_agent |= self.ssh_agent;
                             r.cuda |= self.cuda;
@@ -7361,6 +7363,11 @@ impl UpdateCmd {
         // machine cannot lose the staged/live distinction or mount order.
         let mut final_mounts = record.host_mounts();
         for rm in &self.remove_volume {
+            // A mount is named by its paths; its owner and mode may be repeated.
+            let rm = rm
+                .rsplit_once(':')
+                .filter(|(_, options)| options.contains('='))
+                .map_or(rm.as_str(), |(head, _)| head);
             let rm_without_mode = rm
                 .strip_suffix(":ro")
                 .or_else(|| rm.strip_suffix(":rw"))
@@ -7450,6 +7457,7 @@ impl UpdateCmd {
                 }
                 r.mounts = final_live_mounts.clone();
                 r.staged_mounts = final_staged_mounts.clone();
+                r.mount_owners = HostMount::stored_owners(&final_mounts);
             }
             if r.disk_volumes != final_disk_volumes {
                 for target in &new_disk_volumes {
@@ -8748,6 +8756,12 @@ impl MountAddCmd {
             return Err(smolvm::Error::config(
                 "mount add",
                 "a staged mount is copied in at boot; add it with `machine update -v` and restart",
+            ));
+        }
+        if mount.owner.is_some() {
+            return Err(smolvm::Error::config(
+                "mount add",
+                "a mount's owner (uid=/gid=) is set at boot; add it with `machine update -v` and restart",
             ));
         }
         let (record, running) = mount_target_machine(&name)?;

@@ -1056,6 +1056,7 @@ fn resolve_mounts(
                     read_only: m.read_only,
                     staged: false,
                     recorded_ownership: true,
+                    owner: None,
                 });
                 shares.len() - 1
             }
