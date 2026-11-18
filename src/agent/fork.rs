@@ -34,6 +34,9 @@ pub(crate) use compact::{flatten_standalone, flatten_to_raw};
 /// all stay cheap at this depth.
 const MAX_FORK_LINEAGE_DEPTH: usize = 256;
 
+#[cfg(unix)]
+mod inherited_lock;
+
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
 #[cfg(target_os = "linux")]
@@ -62,12 +65,20 @@ impl ForkSourceLock {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        #[cfg(unix)]
+        let inherited = inherited_lock::take_matching(path)
+            .map_err(|error| Error::agent("inherited operation lock", error.to_string()))?;
+        #[cfg(not(unix))]
+        let inherited: Option<File> = None;
+        let file = match inherited {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?,
+        };
         lock_file_exclusive(&file)
             .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         Ok(Self { _file: file })
@@ -78,12 +89,20 @@ impl ForkSourceLock {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        #[cfg(unix)]
+        let inherited = inherited_lock::take_matching(path)
+            .map_err(|error| Error::agent("inherited operation lock", error.to_string()))?;
+        #[cfg(not(unix))]
+        let inherited: Option<File> = None;
+        let file = match inherited {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?,
+        };
         match try_lock_file_exclusive(&file) {
             Ok(()) => Ok(Some(Self { _file: file })),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -112,6 +131,23 @@ pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
 pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
+}
+
+#[cfg(unix)]
+pub(crate) fn try_lock_saved_execution(source: &str) -> Result<Option<ForkSourceLock>> {
+    validate_vm_name(source, "saved execution")
+        .map_err(|error| Error::config("saved execution", error))?;
+    ForkSourceLock::try_acquire_at(&saved_execution_lock_path(source))
+}
+
+/// Preserve the same locked file descriptions through an owned startup child.
+/// The caller must keep both guards alive through spawn and cleanup.
+#[cfg(unix)]
+pub(crate) fn inherit_operation_locks(
+    command: &mut std::process::Command,
+    locks: &[&ForkSourceLock],
+) -> std::io::Result<()> {
+    inherited_lock::configure(command, locks.iter().map(|lock| &lock._file))
 }
 
 fn fork_source_lock_path(source: &str) -> PathBuf {

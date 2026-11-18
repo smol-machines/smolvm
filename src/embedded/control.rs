@@ -326,6 +326,13 @@ pub(crate) fn start_vm_with_interceptor(
     name: &str,
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
+    let startup_lock = crate::agent::fork::lock_fork_source(name)?;
+    if get_record(db, name)?.paused_checkpoint.is_some() {
+        return Err(Error::agent_conflict(
+            "start machine",
+            "machine is paused; use resume",
+        ));
+    }
     crate::agent::state_probe::refuse_start_while_held(db, name)?;
     // A machine with no network cannot pull its registry image in-guest; the
     // host fetches it instead.
@@ -339,7 +346,7 @@ pub(crate) fn start_vm_with_interceptor(
     // A fresh registry-image machine starts on a shared seed of its image, as
     // the CLI and API do, so an SDK create skips the in-guest pull.
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
-    let started = launch_from_record(
+    let mut started = launch_from_record(
         &record,
         LaunchFeatures {
             external_interceptor: interceptor,
@@ -347,6 +354,7 @@ pub(crate) fn start_vm_with_interceptor(
         },
     )?;
     mark_running(db, name, started.handle.child_pid())?;
+    started._startup_lock = Some(startup_lock);
     Ok(started)
 }
 
@@ -420,6 +428,7 @@ fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result
 pub(crate) struct StartedVm {
     pub(crate) handle: VmHandle,
     pub(crate) freshly_started: bool,
+    _startup_lock: Option<crate::agent::fork::ForkSourceLock>,
 }
 
 /// Boot `record` with the given launch features and return a handle. Shared by
@@ -491,6 +500,7 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     Ok(StartedVm {
         handle: VmHandle::new(manager, None),
         freshly_started: freshly_started && !restoring_checkpoint,
+        _startup_lock: None,
     })
 }
 
@@ -500,6 +510,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 /// `machine start --forkable`, surfaced for the embedded SDK.
 /// Start or reconnect to a forkable VM and retain the actual launch status.
 pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
+    let startup_lock = crate::agent::fork::lock_fork_source(name)?;
+    if get_record(db, name)?.paused_checkpoint.is_some() {
+        return Err(Error::agent_conflict(
+            "start machine",
+            "machine is paused; use resume",
+        ));
+    }
     db.update_vm(name, |record| record.forkable = true)?
         .ok_or_else(|| Error::vm_not_found(name))?;
     let record = crate::image_store::pin_for_start(
@@ -513,8 +530,9 @@ pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> 
         forkable: true,
         ..LaunchFeatures::default()
     };
-    let started = launch_from_record(&record, features)?;
+    let mut started = launch_from_record(&record, features)?;
     mark_running(db, name, started.handle.child_pid())?;
+    started._startup_lock = Some(startup_lock);
     Ok(started)
 }
 
@@ -528,14 +546,22 @@ pub fn start_vm_with_netns(
     name: &str,
     netns: std::path::PathBuf,
 ) -> Result<VmHandle> {
+    let startup_lock = crate::agent::fork::lock_fork_source(name)?;
+    if get_record(db, name)?.paused_checkpoint.is_some() {
+        return Err(Error::agent_conflict(
+            "start machine",
+            "machine is paused; use resume",
+        ));
+    }
     crate::agent::state_probe::refuse_start_while_held(db, name)?;
     let record = get_record(db, name)?;
     let features = LaunchFeatures {
         pod_netns: Some(netns),
         ..LaunchFeatures::default()
     };
-    let started = launch_from_record(&record, features)?;
+    let mut started = launch_from_record(&record, features)?;
     mark_running(db, name, started.handle.child_pid())?;
+    started._startup_lock = Some(startup_lock);
     Ok(started.handle)
 }
 

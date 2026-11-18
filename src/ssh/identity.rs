@@ -77,6 +77,37 @@ fn directory(machine: &str, create: bool) -> Result<PathBuf> {
     protect(&root).context("cannot access private machine SSH identity; run ssh-config first")?;
     root.canonicalize().map_err(Into::into)
 }
+// Serialize concurrent SSH cold starts through cleanup, rather than letting
+// a second connection mistake the first connection's boot for an orphan.
+#[cfg(not(unix))]
+pub(super) fn startup_lock(machine: &str) -> Result<fs::File> {
+    let path = directory(machine, false)?.join("startup.lock");
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options
+            .mode(0o600)
+            .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(&path)?;
+    let metadata = file.metadata()?;
+    ensure!(metadata.is_file(), "SSH startup lock is not a regular file");
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        ensure!(
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.nlink() == 1,
+            "SSH startup lock must belong only to this user"
+        );
+        file.set_permissions(fs::Permissions::from_mode(0o600))?;
+    }
+    #[cfg(windows)]
+    windows_private::make_private(&path).map_err(anyhow::Error::msg)?;
+    Ok(file)
+}
+
 fn read(path: &Path) -> Result<Zeroizing<Vec<u8>>> {
     protect(path)?;
     let mut options = fs::OpenOptions::new();

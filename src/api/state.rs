@@ -1637,6 +1637,11 @@ pub async fn ensure_running_and_persist(
     // nor detaches. On Linux the guarded mount is a no-op, so this is harmless.
     let lifecycle = state.lifecycle_lock(name);
     let _guard = lifecycle.lock().await;
+    let source = name.to_string();
+    let _source_lock =
+        tokio::task::spawn_blocking(move || crate::agent::fork::lock_fork_source(&source))
+            .await
+            .map_err(|error| crate::Error::agent("start operation lock", error.to_string()))??;
 
     // A nested machine waking on a server that has since turned nesting off
     // stays down, the same as an explicit start.

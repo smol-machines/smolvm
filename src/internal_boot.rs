@@ -77,6 +77,10 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> crate::Result<VmDis
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> crate::Result<()> {
     let t_proc = std::time::Instant::now();
+    #[cfg(unix)]
+    crate::ssh::ownership::register_boot().map_err(|error| {
+        crate::Error::agent("register SSH startup ownership", error.to_string())
+    })?;
 
     // --- Parent-death watchdog ---------------------------------------------
     // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:

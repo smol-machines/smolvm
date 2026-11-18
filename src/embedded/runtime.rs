@@ -645,6 +645,7 @@ impl EmbeddedRuntime {
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
         self.with_name_lock(name, || {
+            let startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
                 .is_some()
@@ -677,6 +678,7 @@ impl EmbeddedRuntime {
                 return Ok(());
             }
 
+            drop(startup_lock);
             let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
@@ -1382,7 +1384,14 @@ impl EmbeddedRuntime {
     }
 
     fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
-        let record = control::get_record(&self.db, name)?;
+        let mut record = control::get_record(&self.db, name)?;
+        if !record.init_completed {
+            handle.initialize_machine(name, &record)?;
+            self.db
+                .update_vm(name, |record| record.init_completed = true)?
+                .ok_or_else(|| Error::vm_not_found(name))?;
+            record.init_completed = true;
+        }
         handle.launch_image_workload(name, &record)
     }
 

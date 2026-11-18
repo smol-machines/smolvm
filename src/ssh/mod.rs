@@ -4,6 +4,9 @@ mod forward;
 mod guest;
 mod handler;
 mod identity;
+#[cfg(unix)]
+pub(crate) mod ownership;
+mod startup;
 mod transport;
 
 use anyhow::{Context, Result};
@@ -49,30 +52,42 @@ pub fn proxy_machine(encoded: &str) -> Result<String> {
 /// alive during runtime shutdown; guest workers are reaped before shutdown.
 pub fn proxy(machine: &str) -> Result<()> {
     let keys = identity::load(machine)?;
-    let manager = crate::agent::AgentManager::for_vm(machine)?;
-    let mut client = crate::agent::AgentClient::connect(manager.vsock_socket())?;
-    anyhow::ensure!(
-        client.supports_capability(crate::agent::interactive_control::CAPABILITY)?,
-        "this running machine needs an updated runtime before using SSH"
-    );
-    drop(client);
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .max_blocking_threads(4)
         .build()?;
-    let result = runtime.block_on(serve(
-        machine.to_string(),
-        keys.0,
-        keys.1,
-        tokio::io::join(tokio::io::stdin(), tokio::io::stdout()),
-    ));
+    let result = runtime.block_on(async {
+        let mut interrupts = startup::Interrupts::new()?;
+        let input = startup::prepare(machine, tokio::io::stdin(), &mut interrupts).await?;
+        let manager = crate::agent::AgentManager::for_vm(machine)?;
+        let mut client = crate::agent::AgentClient::connect(manager.vsock_socket())?;
+        anyhow::ensure!(
+            client.supports_capability(crate::agent::interactive_control::CAPABILITY)?,
+            "this running machine needs an updated runtime before using SSH"
+        );
+        drop(client);
+        serve(
+            machine.to_string(),
+            keys.0,
+            keys.1,
+            tokio::io::join(input, tokio::io::stdout()),
+            &mut interrupts,
+        )
+        .await
+    });
     // Tokio's standard-I/O implementation uses blocking OS reads, which cannot
     // always be canceled. They belong only to this short-lived proxy process.
     runtime.shutdown_background();
     result
 }
 
-async fn serve<T>(machine: String, host: PrivateKey, allowed: PublicKey, stream: T) -> Result<()>
+async fn serve<T>(
+    machine: String,
+    host: PrivateKey,
+    allowed: PublicKey,
+    stream: T,
+    interrupts: &mut startup::Interrupts,
+) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin + Send + 'static,
 {
@@ -105,15 +120,15 @@ where
     };
     let cancellation = transport::Cancellation::default();
     let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
-    let started = tokio::time::timeout_at(
-        deadline,
-        server::run_stream(config, cancellation.wrap(stream), handler),
-    )
-    .await;
+    let started = tokio::select! {
+        started = tokio::time::timeout_at(deadline, server::run_stream(config, cancellation.wrap(stream), handler)) => Some(started),
+        _ = interrupts.wait() => None,
+    };
     let result = match started {
-        Ok(Ok(mut running)) => {
+        Some(Ok(Ok(mut running))) => {
             let ready = tokio::select! {
                 finished = &mut running => Some(finished.map_err(anyhow::Error::from)),
+                _ = interrupts.wait() => Some(Ok(())),
                 authenticated = tokio::time::timeout_at(deadline, auth) => {
                     if matches!(authenticated, Ok(Ok(()))) { None }
                     else { Some(Err(anyhow::anyhow!("SSH authentication timed out"))) }
@@ -126,7 +141,7 @@ where
                 }
                 None => tokio::select! {
                     finished = &mut running => finished.map_err(anyhow::Error::from),
-                    _ = tokio::signal::ctrl_c() => {
+                    _ = interrupts.wait() => {
                         cancellation.cancel();
                         let _ = tokio::time::timeout(Duration::from_secs(3), &mut running).await;
                         Ok(())
@@ -134,8 +149,9 @@ where
                 },
             }
         }
-        Ok(Err(error)) => Err(error.into()),
-        Err(_) => Err(anyhow::anyhow!("SSH handshake timed out")),
+        Some(Ok(Err(error))) => Err(error.into()),
+        Some(Err(_)) => Err(anyhow::anyhow!("SSH handshake timed out")),
+        None => Ok(()),
     };
     cancellation.cancel();
     tokio::time::timeout(Duration::from_secs(3), async {

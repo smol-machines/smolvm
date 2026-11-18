@@ -3881,7 +3881,16 @@ impl AgentManager {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
+            if crate::ssh::ownership::managed() {
+                // Stay in the startup request's group until _boot-vm registers
+                // its exact process identity with the on-demand SSH proxy.
+                cmd.env(
+                    crate::ssh::ownership::MACHINE_ENV,
+                    self.name().unwrap_or("default"),
+                );
+            } else {
+                cmd.process_group(0);
+            }
         }
         // Windows analogue: detach the VM from the launching process's console so
         // it survives that shell closing (a closing console delivers

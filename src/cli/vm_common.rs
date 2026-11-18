@@ -311,10 +311,31 @@ pub(crate) fn run_init_commands(
     init: &[String],
     context: InitRunContext<'_>,
 ) -> smolvm::Result<()> {
+    run_init_commands_with_output(client, init, context, true)
+}
+
+/// Run the same initialization without writing to the embedding application's
+/// terminal or enabling a PTY; retain command output for failure diagnostics.
+pub(crate) fn run_init_commands_captured(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    context: InitRunContext<'_>,
+) -> smolvm::Result<()> {
+    run_init_commands_with_output(client, init, context, false)
+}
+
+fn run_init_commands_with_output(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    context: InitRunContext<'_>,
+    stream_output: bool,
+) -> smolvm::Result<()> {
     if init.is_empty() {
         return Ok(());
     }
-    println!("Running {} init command(s)...", init.len());
+    if stream_output {
+        println!("Running {} init command(s)...", init.len());
+    }
     for (i, cmd) in init.iter().enumerate() {
         if let Some(image) = context.image {
             let defaults = resolve_image_runtime_defaults(
@@ -329,18 +350,30 @@ pub(crate) fn run_init_commands(
                 &defaults,
                 context.record_mounts,
                 context.overlay_id,
-            )
-            .with_tty(true);
+            );
             // Interactive run streams the command's output live so the user sees
             // progress (a slow compile, apt-get, etc.). The output isn't buffered
             // here, so on a non-zero exit we report just the code — the detail was
             // already printed above. Not checking the exit code would silently
             // ignore a failed init command (e.g. a broken `apt install`).
-            let exit_code = client.run_interactive(config)?;
+            let (exit_code, stdout, stderr) = if stream_output {
+                (
+                    client.run_interactive(config.with_tty(true))?,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                client.run_non_interactive(config)?
+            };
             if exit_code != 0 {
                 return Err(smolvm::Error::agent(
                     "init",
-                    format_init_failure(i, exit_code, "", ""),
+                    format_init_failure(
+                        i,
+                        exit_code,
+                        &String::from_utf8_lossy(&stdout),
+                        &String::from_utf8_lossy(&stderr),
+                    ),
                 ));
             }
         } else {
@@ -1744,6 +1777,7 @@ fn start_vm_named_with_db(
     options: StartOptions,
 ) -> smolvm::Result<()> {
     use smolvm::Error;
+    let startup_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let StartOptions {
         no_workload,
         external_interceptor,
@@ -2242,6 +2276,7 @@ fn start_vm_named_with_db(
 
     // Keep VM running (persistent)
     manager.detach();
+    drop(startup_lock);
     if stop_after_workload {
         println!(
             "Workload exited; stopping machine '{}' (stop_on_exit)",

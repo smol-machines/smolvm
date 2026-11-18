@@ -4855,6 +4855,11 @@ impl SigintGuard {
     /// Install a SIGINT handler that will SIGTERM+SIGKILL the given PID.
     #[cfg(unix)]
     pub fn new(pid: Pid) -> Self {
+        // The SSH proxy owns the boot process from spawn through the durable
+        // Running commit. Killing it here could undo a committed resume.
+        if crate::ssh::ownership::managed() {
+            return Self(());
+        }
         SIGINT_CHILD_PID.store(pid, Ordering::SeqCst);
         unsafe {
             libc::signal(
