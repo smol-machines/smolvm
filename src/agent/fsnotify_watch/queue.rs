@@ -73,8 +73,24 @@ impl EventQueue {
         pending.all = true;
         self.changed.notify_one();
     }
+    pub fn stop_flag(&self) -> &Arc<AtomicBool> {
+        &self.stop
+    }
+    pub fn shutdown(&self) {
+        // Share the consumer's lock so stopping between its predicate check
+        // and wait cannot lose the notification and strand teardown.
+        let _pending = self.pending.lock();
+        self.stop.store(true, Ordering::SeqCst);
+        self.changed.notify_all();
+    }
+    pub fn wait(&self) -> Option<Work> {
+        self.take_until(None)
+    }
+    #[cfg(test)]
     pub fn take(&self, timeout: Duration) -> Option<Work> {
-        let deadline = Instant::now() + timeout;
+        self.take_until(Some(Instant::now() + timeout))
+    }
+    fn take_until(&self, deadline: Option<Instant>) -> Option<Work> {
         let mut pending = self.pending.lock();
         let mut burst_deadline = None;
         loop {
@@ -87,7 +103,8 @@ impl EventQueue {
             }
             if !pending.paths.is_empty() {
                 let burst = *burst_deadline.get_or_insert_with(|| {
-                    (Instant::now() + Duration::from_millis(25)).min(deadline)
+                    let burst = Instant::now() + Duration::from_millis(25);
+                    deadline.map_or(burst, |deadline| burst.min(deadline))
                 });
                 if let Some(remaining) = burst.checked_duration_since(Instant::now()) {
                     self.changed.wait_for(&mut pending, remaining);
@@ -97,9 +114,12 @@ impl EventQueue {
                     std::mem::take(&mut pending.paths).into_iter().collect(),
                 ));
             }
-            let remaining = deadline.checked_duration_since(Instant::now())?;
-            self.changed
-                .wait_for(&mut pending, remaining.min(Duration::from_millis(50)));
+            if let Some(deadline) = deadline {
+                let remaining = deadline.checked_duration_since(Instant::now())?;
+                self.changed.wait_for(&mut pending, remaining);
+            } else {
+                self.changed.wait(&mut pending);
+            }
         }
     }
 }
@@ -108,6 +128,38 @@ mod tests {
     use super::*;
     fn write(p: impl Into<PathBuf>) -> notify::Result<Event> {
         Ok(Event::new(notify::EventKind::Any).add_path(p.into()))
+    }
+    #[test]
+    fn idle_consumer_wakes_for_changes_and_shutdown() {
+        let queue = Arc::new(EventQueue::new(Arc::new(AtomicBool::new(false))));
+        let consumer = queue.clone();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            tx.send(consumer.wait()).unwrap();
+            tx.send(consumer.wait()).unwrap();
+        });
+        assert!(rx.recv_timeout(Duration::from_millis(250)).is_err());
+        queue.push(write("/source/changed"));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Some(Work::Paths(paths)) if paths == [PathBuf::from("/source/changed")]
+        ));
+        queue.shutdown();
+        assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_none());
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn shutdown_racing_with_wait_never_strands_the_consumer() {
+        for _ in 0..64 {
+            let queue = Arc::new(EventQueue::new(Arc::new(AtomicBool::new(false))));
+            let consumer = queue.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            let worker = std::thread::spawn(move || tx.send(consumer.wait()).unwrap());
+            queue.shutdown();
+            assert!(rx.recv_timeout(Duration::from_secs(2)).unwrap().is_none());
+            worker.join().unwrap();
+        }
     }
     #[test]
     fn a_disconnected_consumer_never_blocks_the_native_callback() {

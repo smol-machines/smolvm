@@ -23,7 +23,7 @@ struct ImageRecord {
 
 /// The image catalog directory shared with the Docker-compatible adapter.
 pub fn default_root() -> crate::Result<PathBuf> {
-    dirs::data_local_dir()
+    smolvm_paths::data_local_dir()
         .map(|path| path.join("smolvm").join("engine"))
         .ok_or_else(|| crate::Error::config("image feed", "no data directory"))
 }

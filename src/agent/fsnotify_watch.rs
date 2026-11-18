@@ -75,7 +75,7 @@ struct WatchTarget {
 /// Propagates host file changes under `-v` mounts into the guest as fsnotify
 /// events for the lifetime of the value. Drop to stop.
 pub struct FsNotifyWatcher {
-    stop: Arc<AtomicBool>,
+    queue: Arc<EventQueue>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -153,15 +153,16 @@ impl FsNotifyWatcher {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
+        let queue = Arc::new(EventQueue::new(stop));
+        let queue_thread = queue.clone();
         let (initialized, ready) = mpsc::sync_channel(1);
         let handle = std::thread::Builder::new()
             .name("fsnotify-watch".into())
-            .spawn(move || run_watch(socket_path, targets, stop_thread, poll, initialized))
+            .spawn(move || run_watch(socket_path, targets, queue_thread, poll, initialized))
             .ok()?;
 
         let watcher = Self {
-            stop,
+            queue,
             handle: Some(handle),
         };
         // Establish the baseline and OS watches before the guest can read or
@@ -176,7 +177,7 @@ impl FsNotifyWatcher {
 
 impl Drop for FsNotifyWatcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.queue.shutdown();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -187,11 +188,11 @@ impl Drop for FsNotifyWatcher {
 /// How often the polling watcher (forked children on macOS) rescans.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-struct StopOnExit(Option<Arc<AtomicBool>>);
+struct StopOnExit(Option<Arc<EventQueue>>);
 impl Drop for StopOnExit {
     fn drop(&mut self) {
-        if let Some(stop) = &self.0 {
-            stop.store(true, Ordering::SeqCst);
+        if let Some(queue) = &self.0 {
+            queue.shutdown();
         }
     }
 }
@@ -199,11 +200,11 @@ impl Drop for StopOnExit {
 fn run_watch(
     socket_path: PathBuf,
     targets: Vec<WatchTarget>,
-    stop: Arc<AtomicBool>,
+    queue: Arc<EventQueue>,
     poll: bool,
     initialized: mpsc::SyncSender<()>,
 ) {
-    run_with_registration(socket_path, targets, stop, move |queue, targets, stop| {
+    run_with_registration(socket_path, targets, queue, move |queue, targets, stop| {
         let watcher = register_watches(queue, targets, stop, poll);
         if watcher.is_some() {
             let _ = initialized.send(());
@@ -217,9 +218,10 @@ fn run_watch(
 fn run_with_registration<R: Send>(
     socket_path: PathBuf,
     targets: Vec<WatchTarget>,
-    stop: Arc<AtomicBool>,
+    rx: Arc<EventQueue>,
     register: impl FnOnce(Arc<EventQueue>, &[WatchTarget], &Arc<AtomicBool>) -> Option<R> + Send,
 ) {
+    let stop = rx.stop_flag().clone();
     let mut snapshot = match Snapshot::new() {
         Ok(snapshot) => snapshot,
         Err(error) => {
@@ -237,7 +239,6 @@ fn run_with_registration<R: Send>(
         }
         warn!(%error,"initial host notification snapshot was incomplete");
     }
-    let rx = Arc::new(EventQueue::new(stop.clone()));
 
     std::thread::scope(|scope| {
         let registration = std::thread::Builder::new()
@@ -245,7 +246,7 @@ fn run_with_registration<R: Send>(
             .spawn_scoped(scope, || {
                 // Failed or panicked setup must also release the delivery
                 // worker, including while it waits for a cold guest.
-                let mut failed = StopOnExit(Some(stop.clone()));
+                let mut failed = StopOnExit(Some(rx.clone()));
                 let watcher = register(rx.clone(), &targets, &stop);
                 if watcher.is_some() {
                     failed.0.take();
@@ -264,7 +265,7 @@ fn run_with_registration<R: Send>(
         // before joining setup or destroying its returned OS watcher. The
         // registration thread exits after setup; its result owns the watcher
         // for the rest of this VM's lifetime.
-        let _stop_on_exit = StopOnExit(Some(stop.clone()));
+        let _stop_on_exit = StopOnExit(Some(rx.clone()));
         run_delivery(&socket_path, &targets, &stop, &rx, &mut snapshot);
         drop(_stop_on_exit);
         if registration.join().is_err() {
@@ -279,7 +280,8 @@ fn register_watches(
     stop: &Arc<AtomicBool>,
     poll: bool,
 ) -> Option<Box<dyn Watcher + Send>> {
-    let handler = move |res| queue.push(res);
+    let events = queue.clone();
+    let handler = move |res| events.push(res);
     let watcher: notify::Result<Box<dyn Watcher + Send>> = if poll {
         notify::PollWatcher::new(
             handler,
@@ -298,7 +300,7 @@ fn register_watches(
     };
     // If a backend panics in watch(), release its callback before unwinding
     // destroys the OS watcher and joins the callback thread.
-    let mut failed = StopOnExit(Some(stop.clone()));
+    let mut failed = StopOnExit(Some(queue));
 
     for t in targets {
         if stop.load(Ordering::SeqCst) {
@@ -328,8 +330,8 @@ fn run_delivery(
     );
     let mut last_error = None;
     while !stop.load(Ordering::SeqCst) {
-        let Some(work) = rx.take(Duration::from_millis(200)) else {
-            continue;
+        let Some(work) = rx.wait() else {
+            return;
         };
         let roots = match work {
             Work::All => watched_roots(targets),
@@ -575,7 +577,8 @@ mod tests {
         let listener = UnixListener::bind(&socket).unwrap();
         listener.set_nonblocking(true).unwrap();
         let stop = Arc::new(AtomicBool::new(false));
-        let stopped = stop.clone();
+        let queue = Arc::new(EventQueue::new(stop));
+        let stopped = queue.clone();
         let released = Arc::new(AtomicBool::new(false));
         let owned = released.clone();
         let (registered, complete) = mpsc::channel();
@@ -602,7 +605,7 @@ mod tests {
         });
         // Own shutdown even if a socket assertion panics.
         let watcher = FsNotifyWatcher {
-            stop,
+            queue,
             handle: Some(handle),
         };
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -647,7 +650,8 @@ mod tests {
             let root = tempfile::tempdir().unwrap();
             let socket = root.path().join("absent.sock");
             let stop = Arc::new(AtomicBool::new(false));
-            let stopped = stop.clone();
+            let queue = Arc::new(EventQueue::new(stop));
+            let stopped = queue.clone();
             let (finished, done) = mpsc::channel();
             let handle = std::thread::spawn(move || {
                 run_with_registration(socket, vec![], stopped, move |_, _, _| {
@@ -657,7 +661,7 @@ mod tests {
                 finished.send(()).unwrap();
             });
             let watcher = FsNotifyWatcher {
-                stop,
+                queue,
                 handle: Some(handle),
             };
             let result = done.recv_timeout(Duration::from_secs(2));
