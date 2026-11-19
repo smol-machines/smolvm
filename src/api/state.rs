@@ -1381,13 +1381,15 @@ impl ApiState {
         self.machines.read().keys().cloned().collect()
     }
 
-    /// Get restart config for a machine from the in-memory registry.
+    /// Read authoritative restart policy, including stops by another process.
     pub fn get_restart_config(&self, name: &str) -> Option<RestartConfig> {
-        let machines = self.machines.read();
-        machines.get(name).map(|entry| {
-            let entry = entry.lock();
-            entry.restart.clone()
-        })
+        match self.db.get_vm(name) {
+            Ok(record) => record.map(|record| record.restart),
+            Err(error) => {
+                tracing::warn!(machine = %name, %error, "cannot read restart policy; refusing automatic restart");
+                None
+            }
+        }
     }
 
     /// Best-effort update to the VM database record. Logs warnings on
@@ -2198,6 +2200,37 @@ mod tests {
         let path = dir.path().join("test.db");
         let db = SmolvmDb::open_at(&path).unwrap();
         (dir, ApiState::with_db(db))
+    }
+
+    #[test]
+    fn restart_policy_observes_persisted_stop_and_start_transitions() {
+        let (_dir, state) = temp_api_state();
+        let mut record =
+            crate::config::VmRecord::new("restart-policy".into(), 1, 128, vec![], vec![], false);
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        state.db.insert_vm(&record.name, &record).unwrap();
+        assert!(state
+            .get_restart_config(&record.name)
+            .unwrap()
+            .should_restart(None));
+        state
+            .db
+            .update_vm(&record.name, |r| r.restart.user_stopped = true)
+            .unwrap();
+        assert!(!state
+            .get_restart_config(&record.name)
+            .unwrap()
+            .should_restart(None));
+        state
+            .db
+            .update_vm(&record.name, |r| r.restart.user_stopped = false)
+            .unwrap();
+        assert!(state
+            .get_restart_config(&record.name)
+            .unwrap()
+            .should_restart(None));
+        state.db.remove_vm(&record.name).unwrap();
+        assert!(state.get_restart_config(&record.name).is_none());
     }
 
     /// A create dropped before it registers its machine leaves nothing on disk:

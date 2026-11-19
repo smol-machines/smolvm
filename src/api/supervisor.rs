@@ -305,6 +305,12 @@ impl Supervisor {
             }
         };
 
+        // A restart can have queued behind an explicit stop or pause. The
+        // original scheduling decision is no longer authority to boot it.
+        if record.restart.user_stopped || record.paused_checkpoint.is_some() {
+            return Ok(());
+        }
+
         // Never auto-restart a fork base: clones CoW-read its disks by path, so
         // relaunching it writable would corrupt them. Clones keep working
         // without the base process, so skipping is safe (and avoids thrashing,
