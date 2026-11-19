@@ -1115,6 +1115,8 @@ async fn container_update(
     let update: Update = json_body(&body)?;
     let mut warnings = Vec::new();
     if let Some(policy) = update.restart_policy {
+        let _op = c.op_lock().await;
+        let _admission = c.admit_mutation(&engine, false)?;
         c.update(&engine, |r| {
             r.host_config.restart_policy = policy.clone();
             if let Some(obj) = r.host_config_raw.as_object_mut() {
