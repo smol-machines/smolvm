@@ -1796,18 +1796,18 @@ impl AgentClient {
         self.pull(image, PullOptions::new())
     }
 
-    /// Pull an OCI image with automatic registry credential lookup.
-    ///
-    /// Loads credentials from `~/.config/smolvm/registries.toml` and applies
-    /// registry mirrors if configured.
-    ///
-    /// Shorthand for `pull(image, PullOptions::new().use_registry_config(true))`.
     /// Pull without this host's saved registry logins, for a machine whose
     /// image a pack or checkpoint chose.
     pub fn withhold_registry_logins(&mut self) {
         self.withhold_registry_logins = true;
     }
 
+    /// Pull an OCI image with automatic registry credential lookup.
+    ///
+    /// Loads credentials from `~/.config/smolvm/registries.toml` and applies
+    /// registry mirrors if configured.
+    ///
+    /// Shorthand for `pull(image, PullOptions::new().use_registry_config(true))`.
     pub fn pull_with_registry_config(&mut self, image: &str) -> Result<ImageInfo> {
         self.pull(image, PullOptions::new().use_registry_config(true))
     }
