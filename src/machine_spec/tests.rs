@@ -604,6 +604,46 @@ fn a_checkpoint_keeps_block_private_udp_ports_and_its_settings() {
     assert_eq!(record.health_cmd, Some(vec!["true".to_string()]));
 }
 
+// An artifact's `local-dir:` image names a directory on its author's host. A
+// pack that ships no layers, or a checkpoint, would share that directory with
+// the guest here, so either is refused; a pack that ships its layers is not.
+#[test]
+fn an_artifact_cannot_name_a_host_directory_as_its_image() {
+    let mut layerless = pack_manifest();
+    layerless.image = "local-dir:/".into();
+    let mut checkpoint = checkpoint_manifest();
+    checkpoint
+        .checkpoint
+        .as_mut()
+        .unwrap()
+        .workload
+        .as_mut()
+        .unwrap()
+        .image = "local-dir:/etc".into();
+    for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+        for manifest in [&layerless, &checkpoint] {
+            let refused = resolve(
+                SpecSource::from_manifest(manifest),
+                CreateSpec::default(),
+                caller,
+            );
+            assert!(refused.is_err(), "{caller:?}");
+        }
+    }
+    let mut layered = layerless.clone();
+    layered.assets.layers.push(smolvm_pack::format::LayerEntry {
+        digest: "sha256:00".into(),
+        path: "layers/00.tar".into(),
+        size: 1,
+    });
+    assert!(resolve(
+        SpecSource::from_manifest(&layered),
+        CreateSpec::default(),
+        Caller::Cli
+    )
+    .is_ok());
+}
+
 #[test]
 fn a_checkpoint_refuses_a_network_it_was_captured_without() {
     let mut manifest = checkpoint_manifest();
