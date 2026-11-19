@@ -400,7 +400,8 @@ install_smolvm() {
     # --no-same-owner: as root, tar would otherwise give every file the uid/gid
     # stored in the archive (the release builder's), and `cp -a` below carries
     # that owner into the installed agent-rootfs.
-    tar --no-same-owner -xzf "$archive" -C "$tmp_dir" || {
+    # -p keeps guest permissions, including sticky temporary directories.
+    tar --no-same-owner -xpzf "$archive" -C "$tmp_dir" || {
         error "Failed to extract archive"
         rm -rf "$tmp_dir"
         exit 1
