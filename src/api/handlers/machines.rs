@@ -2598,31 +2598,33 @@ pub(crate) fn machine_entry_from_record(record: &VmRecord, manager: AgentManager
 /// VMM to start with the same disks.
 async fn reconcile_confirmed_stopped_machine(
     state: &Arc<ApiState>,
-    name: &str,
+    reviewed: &VmRecord,
     explicitly_stopped: bool,
 ) -> Result<VmRecord, ApiError> {
-    if let Ok(entry) = state.get_machine(name) {
-        entry.lock().manager.mark_stopped();
-    }
-
-    state
-        .update_vm(name, move |record| {
-            // Keeps the PID of a process the kernel is holding after SIGKILL,
-            // as the CLI and the embedded runtime do, so a later start is
-            // refused while that process has the machine's disks open.
+    let expected_process = (reviewed.pid, reviewed.pid_start_time);
+    let record = state
+        .update_vm_for_record(reviewed, move |record| {
+            // Recovery may already have cleared this process. A different live
+            // execution must never inherit this delayed stopped notification.
+            if record.pid.is_some() && (record.pid, record.pid_start_time) != expected_process {
+                return Err(SmolvmError::agent_conflict(
+                    "reconcile stopped machine",
+                    "machine process changed during this operation; retry with current state",
+                ));
+            }
             record.mark_process_stopped();
             if explicitly_stopped {
-                // An explicit stop must suppress the restart supervisor even when
-                // the process had already exited before this request arrived.
                 record.restart.user_stopped = true;
             }
+            Ok(())
         })
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{name}' disappeared from database while reconciling its stopped state"
-            ))
-        })
+        .await?;
+    // Only release cached launch ownership after the original row accepted the
+    // transition. A stale request must leave a replacement's registry untouched.
+    if let Ok(entry) = state.get_machine(&reviewed.name) {
+        entry.lock().manager.mark_stopped();
+    }
+    Ok(record)
 }
 
 /// The machine's recorded process, when it is this machine's and the kernel is
@@ -3999,7 +4001,7 @@ async fn start_machine_transaction(
         || (record.state == RecordState::Running && resolved == RecordState::Stopped)
         || record.state == RecordState::Stopped
     {
-        record = reconcile_confirmed_stopped_machine(&state, &name, false).await?;
+        record = reconcile_confirmed_stopped_machine(&state, &record, false).await?;
     }
 
     if let Some(pool_size) = query.fork_pool_size {
@@ -4015,9 +4017,11 @@ async fn start_machine_transaction(
         }
         record.cuda_fork_pool_size = Some(pool_size);
         state
-            .update_vm(&name, move |r| r.cuda_fork_pool_size = Some(pool_size))
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+            .update_vm_for_record(&record, move |r| {
+                r.cuda_fork_pool_size = Some(pool_size);
+                Ok(())
+            })
+            .await?;
     }
     if let Some(limit_mib) = query.cuda_vram_limit_mib {
         if limit_mib == 0 {
@@ -4032,9 +4036,11 @@ async fn start_machine_transaction(
         }
         record.cuda_vram_limit_mib = Some(limit_mib);
         state
-            .update_vm(&name, move |r| r.cuda_vram_limit_mib = Some(limit_mib))
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+            .update_vm_for_record(&record, move |r| {
+                r.cuda_vram_limit_mib = Some(limit_mib);
+                Ok(())
+            })
+            .await?;
     }
 
     // Like forkPoolSize above, an explicit forkable start is a durable launch
@@ -4044,9 +4050,11 @@ async fn start_machine_transaction(
     if query.forkable && !record.forkable {
         record.forkable = true;
         state
-            .update_vm(&name, |r| r.forkable = true)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+            .update_vm_for_record(&record, |r| {
+                r.forkable = true;
+                Ok(())
+            })
+            .await?;
     }
 
     // A machine with no network cannot pull its registry image in-guest; the
@@ -4067,11 +4075,11 @@ async fn start_machine_transaction(
         let fetched = crate::image_store::fetch_image_archive(&image, &auth).await?;
         record.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone());
         state
-            .update_vm(&name, move |r| {
-                r.pin_host_fetched_image(fetched.local, fetched.digest)
+            .update_vm_for_record(&record, move |r| {
+                r.pin_host_fetched_image(fetched.local, fetched.digest);
+                Ok(())
             })
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+            .await?;
     }
 
     let mounts = record.host_mounts();
@@ -4119,7 +4127,7 @@ async fn start_machine_transaction(
         },
         None => crate::registry::PullAuth::FromConfig,
     };
-    let (manager, pid) = tokio::task::spawn_blocking(move || {
+    let (manager, pid, pid_start_time) = tokio::task::spawn_blocking(move || {
         crate::network::private_floor::log_record_hosts_blocked_by_private_floor(
             &name_clone,
             &restore_record,
@@ -4224,11 +4232,14 @@ async fn start_machine_transaction(
         }
 
         let pid = manager.child_pid();
-        Ok::<_, String>((manager, pid))
+        Ok::<_, String>((manager, pid, pid.and_then(process_start_time)))
     })
     .await
     .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
     .map_err(classify_launch_error)?;
+
+    record.pid = pid;
+    record.pid_start_time = pid_start_time;
 
     // Register in ApiState so exec/run/container endpoints can find it
     let mut entry = machine_entry_from_record(&record, manager);
@@ -4312,7 +4323,7 @@ async fn start_machine_transaction(
             // machine is stopped with no live process and is cleanly retryable
             // (e.g. once a transient registry outage
             // clears) and deletable — then surface the pull failure.
-            let st = pid.and_then(process_start_time);
+            let st = pid_start_time;
             let name_rb = name.clone();
             let stopped = tokio::task::spawn_blocking(move || {
                 shutdown_machine_process(&name_rb, pid, st, false)
@@ -4320,7 +4331,7 @@ async fn start_machine_transaction(
             .await
             .unwrap_or(false);
             if stopped {
-                reconcile_confirmed_stopped_machine(&state, &name, false).await?;
+                reconcile_confirmed_stopped_machine(&state, &record, false).await?;
             } else {
                 tracing::warn!(machine = %name, "image pull failed and VM teardown is incomplete; retaining the launch lock");
             }
@@ -4354,14 +4365,39 @@ async fn start_machine_transaction(
         }
     }
 
-    // Capture start time for PID verification
-    let pid_start_time = pid.and_then(process_start_time);
     // Past the fatal pull above, the machine's storage holds its image.
     let image_on_storage = record.image.is_some() && !restoring_checkpoint;
 
-    // Persist state to database (off the reactor)
-    let record = state
-        .update_vm(&name, move |r| {
+    let record =
+        persist_started_machine(&state, &record, pid, pid_start_time, image_on_storage).await?;
+
+    // Build response directly with state=running. We just confirmed the VM
+    // is running (wait_for_ready passed), so we bypass actual_state() which
+    // may falsely report "stopped" on macOS due to setsid/session-leader
+    // PID visibility issues.
+    let mut info = record_to_info(&name, &record);
+    info.state = "running".to_string();
+    info.pid = pid;
+    Ok(Json(info))
+}
+
+/// Finish the exact boot this request observed; a delayed image pull may not
+/// publish Running over a later execution or a recreated machine.
+async fn persist_started_machine(
+    state: &ApiState,
+    record: &VmRecord,
+    pid: Option<i32>,
+    pid_start_time: Option<u64>,
+    image_on_storage: bool,
+) -> Result<VmRecord, ApiError> {
+    state
+        .update_vm_for_record(record, move |r| {
+            if (r.pid, r.pid_start_time) != (pid, pid_start_time) {
+                return Err(SmolvmError::agent_conflict(
+                    "finish machine start",
+                    "machine process changed before startup completed",
+                ));
+            }
             r.state = RecordState::Running;
             r.pid = pid;
             r.pid_start_time = pid_start_time;
@@ -4374,23 +4410,9 @@ async fn start_machine_transaction(
             // exhausted max_retries can be restarted and supervised again.
             r.restart.user_stopped = false;
             r.restart.restart_count = 0;
+            Ok(())
         })
-        .await?
-        .ok_or_else(|| {
-            ApiError::NotFound(format!(
-                "machine '{}' disappeared from database during start",
-                name
-            ))
-        })?;
-
-    // Build response directly with state=running. We just confirmed the VM
-    // is running (wait_for_ready passed), so we bypass actual_state() which
-    // may falsely report "stopped" on macOS due to setsid/session-leader
-    // PID visibility issues.
-    let mut info = record_to_info(&name, &record);
-    info.state = "running".to_string();
-    info.pid = pid;
-    Ok(Json(info))
+        .await
 }
 
 /// Classify a fork-preparation failure into the right HTTP status. The golden
@@ -5819,7 +5841,7 @@ async fn stop_machine_transaction(
         // return so either this request or a later start repairs the lifecycle.
         let record = if record.state == RecordState::Running || record.state == RecordState::Stopped
         {
-            reconcile_confirmed_stopped_machine(&state, &name, true).await?
+            reconcile_confirmed_stopped_machine(&state, &record, true).await?
         } else {
             record
         };
@@ -5904,7 +5926,7 @@ async fn stop_machine_transaction(
 
     // Persist stopped state and release the long-lived registry manager's flock
     // through the same path used for already-dead and out-of-process stops.
-    let record = reconcile_confirmed_stopped_machine(&state, &name, true).await?;
+    let record = reconcile_confirmed_stopped_machine(&state, &record, true).await?;
 
     Ok(Json(record_to_info(&name, &record)))
 }
@@ -6432,7 +6454,7 @@ async fn delete_one_transaction(
         if let Ok(entry) = state.get_machine(&name) {
             entry.lock().restart.user_stopped = true;
         }
-        reconcile_confirmed_stopped_machine(&state, &name, true)
+        reconcile_confirmed_stopped_machine(&state, &record, true)
             .await
             .map_err(|reconcile_error| {
                 ApiError::internal(format!(
@@ -9037,6 +9059,7 @@ mod held_process_tests {
     /// The two steps of the stop handler: end the process, then record it.
     async fn api_stop(state: &Arc<ApiState>, name: &str) -> VmRecord {
         let record = state.db().get_vm(name).unwrap().unwrap();
+        let reviewed = record.clone();
         let machine = name.to_string();
         let started = std::time::Instant::now();
         let stopped = tokio::task::spawn_blocking(move || {
@@ -9046,7 +9069,7 @@ mod held_process_tests {
         .unwrap();
         assert!(stopped, "the stop must complete around a held process");
         assert!(started.elapsed() < std::time::Duration::from_secs(5));
-        reconcile_confirmed_stopped_machine(state, name, true)
+        reconcile_confirmed_stopped_machine(state, &reviewed, true)
             .await
             .unwrap()
     }
@@ -9077,9 +9100,13 @@ mod held_process_tests {
         running(&state, name, held.pid, Some(fake_held::START_TIME));
         api_stop(&state, name).await;
 
-        let record = reconcile_confirmed_stopped_machine(&state, name, true)
-            .await
-            .unwrap();
+        let record = reconcile_confirmed_stopped_machine(
+            &state,
+            &state.db().get_vm(name).unwrap().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(record.state, RecordState::Stopped);
         assert_eq!(record.pid, Some(held.pid));
@@ -9155,9 +9182,13 @@ mod held_process_tests {
         // No such process: Linux pids never reach 2^31.
         running(&state, name, 0x7fff_fff0, Some(1));
 
-        let record = reconcile_confirmed_stopped_machine(&state, name, true)
-            .await
-            .unwrap();
+        let record = reconcile_confirmed_stopped_machine(
+            &state,
+            &state.db().get_vm(name).unwrap().unwrap(),
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(record.state, RecordState::Stopped);
         assert_eq!(record.pid, None);
@@ -9181,3 +9212,6 @@ mod held_process_tests {
 
 #[cfg(test)]
 mod transfer_admission_tests;
+
+#[cfg(test)]
+mod reviewed_lifecycle_tests;

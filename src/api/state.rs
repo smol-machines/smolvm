@@ -1328,6 +1328,25 @@ impl ApiState {
             .map_err(ApiError::database)
     }
 
+    /// Apply a request's metadata update to its original machine incarnation.
+    /// A stale request is a conflict, including after the blocking task waited
+    /// for another writer; never retry it by looking the name up again.
+    pub(crate) async fn update_vm_for_record<F>(
+        &self,
+        record: &VmRecord,
+        f: F,
+    ) -> Result<VmRecord, ApiError>
+    where
+        F: FnOnce(&mut VmRecord) -> crate::Result<()> + Send + 'static,
+    {
+        let db = self.db.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || db.update_vm_for_record(&record, f))
+            .await
+            .map_err(|e| ApiError::internal(format!("reviewed update task join: {e}")))?
+            .map_err(ApiError::from)
+    }
+
     /// Insert a machine entry directly into the in-memory registry.
     ///
     /// Used by start_machine to register a booted VM so that exec/run/container

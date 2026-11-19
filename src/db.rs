@@ -753,6 +753,42 @@ impl SmolvmDb {
         self.update_vm_with_durability(name, f, true, false, Some(review))
     }
 
+    /// Update only the machine whose database record the caller reviewed.
+    /// The closure can refuse stale execution/configuration state; its errors
+    /// roll back all changes. Portable/deserialized records carry no authority.
+    pub fn update_vm_for_record<F>(&self, reviewed: &VmRecord, f: F) -> Result<VmRecord>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
+        let review = launch_admission::LaunchReview::from_record(reviewed)?;
+        let _admission = self.admit_machine_mutation(&reviewed.name)?;
+        self.try_update_vm_with_durability(
+            &reviewed.name,
+            |record| {
+                f(record)?;
+                if record.name != reviewed.name {
+                    return Err(Error::agent_conflict(
+                        "update reviewed machine",
+                        "a reviewed update cannot rename the machine",
+                    ));
+                }
+                let roots = record
+                    .host_mounts()
+                    .into_iter()
+                    .map(|mount| mount.source)
+                    .collect::<Vec<_>>();
+                // The outer gate stays held through commit. Include newly attached
+                // shares, which may belong to another environment being moved.
+                self.admit_workload_mutation(Some(&reviewed.name), &roots)?;
+                Ok(())
+            },
+            true,
+            false,
+            Some(&review),
+        )?
+        .ok_or_else(|| Error::vm_not_found(&reviewed.name))
+    }
+
     /// Persist a recovery boundary before releasing its live execution state.
     pub fn update_vm_durable<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>>
     where
@@ -825,6 +861,29 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
+        self.try_update_vm_with_durability(
+            name,
+            |record| {
+                f(record);
+                Ok(())
+            },
+            durable,
+            finish_pause,
+            review,
+        )
+    }
+
+    fn try_update_vm_with_durability<F>(
+        &self,
+        name: &str,
+        f: F,
+        durable: bool,
+        finish_pause: bool,
+        review: Option<&launch_admission::LaunchReview>,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
         self.with_conn(|conn| {
             if durable {
                 conn.execute_batch("PRAGMA synchronous=FULL;")
@@ -855,7 +914,7 @@ impl SmolvmDb {
                         let mut record: VmRecord = serde_json::from_slice(&bytes)
                             .db_err(format!("deserialize vm record '{}'", name))?;
                         let before = record.clone();
-                        f(&mut record);
+                        f(&mut record)?;
                         transition = Some((before, record.clone()));
                         if finish_pause {
                             tx.execute(

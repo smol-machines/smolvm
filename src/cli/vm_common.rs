@@ -1900,11 +1900,17 @@ fn start_vm_named_locked(
             ));
         }
         record.cuda_fork_pool_size = Some(pool_size);
-        db.update_vm(name, |r| r.cuda_fork_pool_size = Some(pool_size))?;
+        db.update_vm_for_record(&record, |r| {
+            r.cuda_fork_pool_size = Some(pool_size);
+            Ok(())
+        })?;
     }
     if let Some(limit_mib) = fork.vram_limit_mib {
         record.cuda_vram_limit_mib = Some(limit_mib);
-        db.update_vm(name, |r| r.cuda_vram_limit_mib = Some(limit_mib))?;
+        db.update_vm_for_record(&record, |r| {
+            r.cuda_vram_limit_mib = Some(limit_mib);
+            Ok(())
+        })?;
     }
 
     // A machine with no network cannot pull its registry image in-guest; the

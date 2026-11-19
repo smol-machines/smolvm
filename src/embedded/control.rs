@@ -327,7 +327,8 @@ pub(crate) fn start_vm_with_interceptor(
     interceptor: Option<smolvm_protocol::InterceptEndpoint>,
 ) -> Result<StartedVm> {
     let startup_lock = crate::agent::fork::lock_fork_source(name)?;
-    if get_record(db, name)?.paused_checkpoint.is_some() {
+    let record = get_record(db, name)?;
+    if record.paused_checkpoint.is_some() {
         return Err(Error::agent_conflict(
             "start machine",
             "machine is paused; use resume",
@@ -339,7 +340,7 @@ pub(crate) fn start_vm_with_interceptor(
     let record = crate::image_store::pin_for_start(
         db,
         name,
-        get_record(db, name)?,
+        record,
         &crate::registry::PullAuth::FromConfig,
     )?;
     crate::network::private_floor::log_record_hosts_blocked_by_private_floor(name, &record);
@@ -514,18 +515,21 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
 /// Start or reconnect to a forkable VM and retain the actual launch status.
 pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> {
     let startup_lock = crate::agent::fork::lock_fork_source(name)?;
-    if get_record(db, name)?.paused_checkpoint.is_some() {
+    let record = get_record(db, name)?;
+    if record.paused_checkpoint.is_some() {
         return Err(Error::agent_conflict(
             "start machine",
             "machine is paused; use resume",
         ));
     }
-    db.update_vm(name, |record| record.forkable = true)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    let record = db.update_vm_for_record(&record, |record| {
+        record.forkable = true;
+        Ok(())
+    })?;
     let record = crate::image_store::pin_for_start(
         db,
         name,
-        get_record(db, name)?,
+        record,
         &crate::registry::PullAuth::FromConfig,
     )?;
     crate::image_seed::seed_first_start(name, &record, false, None, None, None);
