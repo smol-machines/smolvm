@@ -487,7 +487,7 @@ fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
 /// Clone a file using the platform-optimal copy method.
 ///
 /// - macOS: `clonefile()` for instant APFS copy-on-write
-/// - Linux: `FICLONE` reflink, then sparse `SEEK_HOLE`/`SEEK_DATA` fallback
+/// - Linux: `FICLONE`, then sparse `copy_file_range`, then userspace sparse copying
 /// - Fallback: `fs::copy`
 ///
 /// Disk templates are sparse files (~500KB actual data in a 512MB logical file).
@@ -706,6 +706,15 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
 #[cfg(target_os = "linux")]
 fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
+    sparse_copy_with_kernel(src, dst, copy_extent_in_kernel)
+}
+
+#[cfg(target_os = "linux")]
+fn sparse_copy_with_kernel(
+    src: &Path,
+    dst: &Path,
+    mut kernel_copy: impl FnMut(&mut std::fs::File, &mut std::fs::File, u64) -> std::io::Result<u64>,
+) -> std::io::Result<u64> {
     use std::io::{Seek, SeekFrom};
     use std::os::unix::io::AsRawFd;
 
@@ -726,7 +735,9 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     let src_fd = src_file.as_raw_fd();
     let mut total: u64 = 0;
     let mut offset: i64 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
+    let mut kernel_available = true;
+    // No userspace buffer is needed when the filesystem can clone the ranges.
+    let mut buf = Vec::new();
 
     loop {
         let data_start = unsafe { libc::lseek(src_fd, offset, libc::SEEK_DATA) };
@@ -750,11 +761,87 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
         src_file.seek(SeekFrom::Start(data_start as u64))?;
         dst_file.seek(SeekFrom::Start(data_start as u64))?;
         let length = (data_end - data_start) as u64;
-        copy_extent_exact(&mut src_file, &mut dst_file, length, &mut buf)?;
+        let remaining = if kernel_available {
+            kernel_copy(&mut src_file, &mut dst_file, length)?
+        } else {
+            length
+        };
+        if remaining != 0 {
+            kernel_available = false;
+            if buf.is_empty() {
+                buf.resize(256 * 1024, 0);
+            }
+            // Both file offsets already include any successful kernel copies.
+            copy_extent_exact(&mut src_file, &mut dst_file, remaining, &mut buf)?;
+        }
         total += length;
         offset = data_end;
     }
     Ok(total)
+}
+
+/// Return the bytes left for the userspace fallback when the kernel/filesystem
+/// cannot copy this range. Successful calls advance both file offsets.
+#[cfg(target_os = "linux")]
+fn copy_extent_in_kernel(
+    source: &mut std::fs::File,
+    destination: &mut std::fs::File,
+    remaining: u64,
+) -> std::io::Result<u64> {
+    use std::os::fd::AsRawFd;
+
+    copy_kernel_extent(remaining, |count| {
+        // Safety: both descriptors are live files, and null offsets request
+        // advancement of their current positions. No userspace memory is read.
+        let copied = unsafe {
+            libc::copy_file_range(
+                source.as_raw_fd(),
+                std::ptr::null_mut(),
+                destination.as_raw_fd(),
+                std::ptr::null_mut(),
+                count,
+                0,
+            )
+        };
+        if copied < 0 {
+            Err(std::io::Error::last_os_error())
+        } else {
+            Ok(copied as usize)
+        }
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn copy_kernel_extent(
+    mut remaining: u64,
+    mut copy: impl FnMut(usize) -> std::io::Result<usize>,
+) -> std::io::Result<u64> {
+    while remaining != 0 {
+        // Bound each request on both 32-bit and 64-bit Linux.
+        let count = remaining.min(1024 * 1024 * 1024) as usize;
+        match copy(count) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "copy_file_range made no progress within a data extent",
+                ));
+            }
+            Ok(copied) => remaining -= copied as u64,
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(error)
+                if matches!(
+                    error.raw_os_error(),
+                    Some(
+                        libc::ENOSYS | libc::EXDEV | libc::EOPNOTSUPP | libc::EINVAL | libc::EPERM
+                    )
+                ) =>
+            {
+                return Ok(remaining);
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(0)
 }
 
 /// Copy `remaining` bytes, seeking past chunks that are all zeros instead of
@@ -785,7 +872,81 @@ fn copy_extent_exact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(target_os = "linux")]
+    use std::io::Read;
     use std::io::{Seek, SeekFrom, Write};
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_extent_copy_retries_interruptions_and_short_transfers() {
+        let input = b"every byte must survive short kernel copies";
+        let mut source = std::io::Cursor::new(input);
+        let mut destination = Vec::new();
+        let mut interrupt = true;
+        let remaining = copy_kernel_extent(input.len() as u64, |count| {
+            if std::mem::take(&mut interrupt) {
+                return Err(std::io::ErrorKind::Interrupted.into());
+            }
+            std::io::copy(
+                &mut (&mut source).take(count.min(3) as u64),
+                &mut destination,
+            )
+            .map(|copied| copied as usize)
+        })
+        .unwrap();
+        assert_eq!(remaining, 0);
+        assert_eq!(destination, input);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn kernel_extent_copy_rejects_truncated_input() {
+        let mut source = &b"short"[..];
+        let mut destination = Vec::new();
+        let error = copy_kernel_extent(6, |count| {
+            std::io::copy(&mut (&mut source).take(count as u64), &mut destination)
+                .map(|copied| copied as usize)
+        })
+        .unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        assert_eq!(destination, b"short");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sparse_copy_falls_back_at_the_current_offsets() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = dir.path().join("source.img");
+        let dst = dir.path().join("destination.img");
+        {
+            let mut file = std::fs::File::create(&src).unwrap();
+            let head: Vec<u8> = (0..8192).map(|i| (i % 251 + 1) as u8).collect();
+            file.write_all(&head).unwrap();
+            file.set_len(2 * 1024 * 1024).unwrap();
+            file.seek(SeekFrom::Start(1024 * 1024)).unwrap();
+            file.write_all(b"data after a hole").unwrap();
+        }
+
+        let mut first = true;
+        sparse_copy_with_kernel(&src, &dst, |source, destination, remaining| {
+            copy_kernel_extent(remaining, |count| {
+                if std::mem::take(&mut first) {
+                    std::io::copy(
+                        &mut (&mut *source).take(count.min(37) as u64),
+                        &mut *destination,
+                    )
+                    .map(|copied| copied as usize)
+                } else {
+                    Err(std::io::Error::from_raw_os_error(libc::EXDEV))
+                }
+            })
+        })
+        .unwrap();
+
+        assert_eq!(std::fs::read(&dst).unwrap(), std::fs::read(&src).unwrap());
+        use std::os::unix::fs::MetadataExt;
+        assert!(std::fs::metadata(&dst).unwrap().blocks() * 512 < 1024 * 1024);
+    }
 
     #[cfg(target_os = "linux")]
     #[test]
@@ -877,7 +1038,8 @@ mod tests {
             "the source must really hold its zeros"
         );
 
-        sparse_copy(&src, &dst).unwrap();
+        // Exercise zero elision when the kernel copy operation is unavailable.
+        sparse_copy_with_kernel(&src, &dst, |_, _, remaining| Ok(remaining)).unwrap();
 
         assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
         let allocated = std::fs::metadata(&dst).unwrap().blocks() * 512;
