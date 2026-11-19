@@ -1470,9 +1470,8 @@ struct SavedVmPause {
 }
 
 impl SavedVmPause {
-    fn stop(&mut self, name: &str, record: &VmRecord) -> Result<()> {
-        crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?
-            .stop_paused()?;
+    fn stop(&mut self, name: &str) -> Result<()> {
+        crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
         self.armed = false;
         Ok(())
     }
@@ -2922,7 +2921,7 @@ fn capture_with_completion(
         }
         if stop_after_capture {
             publish_resume_point(PauseCaptureStage::Durable)?;
-            pause.stop(name, vm)?;
+            pause.stop(name)?;
             record_paused_disks(
                 &crate::agent::vm_data_dir(name),
                 output,
@@ -3030,7 +3029,7 @@ fn capture_with_completion(
             pins.commit(output)?;
         }
         publish_resume_point(PauseCaptureStage::Durable)?;
-        pause.stop(name, vm)?;
+        pause.stop(name)?;
         record_paused_disks(
             &crate::agent::vm_data_dir(name),
             output,

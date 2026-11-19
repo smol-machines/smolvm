@@ -7789,20 +7789,22 @@ pub struct ImagesCmd {
 
 impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // Validate VM exists before creating storage (for_vm creates dirs).
+        // Observe existing disks first; prepare them only if this query starts a VM.
         let db = smolvm::db::SmolvmDb::open()?;
         let record = db.get_vm(&self.name)?.ok_or_else(|| {
             smolvm::Error::config("images", format!("machine '{}' not found", self.name))
         })?;
 
-        let manager =
-            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+        let mut manager = AgentManager::for_vm(&self.name)?;
 
         let started_for_query = if manager.try_connect_existing().is_some() {
             manager.detach();
             false
         } else {
             eprintln!("Starting machine '{}' to query storage...", self.name);
+            manager.detach();
+            manager =
+                AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
             manager.start()?;
             true
         };
@@ -7895,14 +7897,13 @@ pub struct PruneCmd {
 
 impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // Validate VM exists before creating storage (for_vm creates dirs).
+        // Observe existing disks first; prepare them only if this query starts a VM.
         let db = smolvm::db::SmolvmDb::open()?;
         let record = db.get_vm(&self.name)?.ok_or_else(|| {
             smolvm::Error::config("prune", format!("machine '{}' not found", self.name))
         })?;
 
-        let manager =
-            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+        let mut manager = AgentManager::for_vm(&self.name)?;
 
         // Regular prune (unreferenced layers only) is safe on a running VM —
         // referenced layers can't be collected. --all deletes manifests for
@@ -7921,6 +7922,9 @@ impl PruneCmd {
             manager.detach();
         } else {
             eprintln!("Starting machine...");
+            manager.detach();
+            manager =
+                AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
             manager.start()?;
             started_for_prune = true;
         }

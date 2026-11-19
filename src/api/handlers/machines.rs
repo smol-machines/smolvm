@@ -3910,19 +3910,16 @@ async fn start_machine_transaction(
         if !state.machine_exists(&name) {
             // Running in DB but not in registry (startup recovery case).
             let name_for_repair = name.clone();
-            let storage_gb = record.storage_gb;
-            let overlay_gb = record.overlay_gb;
-            let manager = tokio::task::spawn_blocking(move || {
-                AgentManager::for_vm_with_sizes(&name_for_repair, storage_gb, overlay_gb)
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(|e| {
-                ApiError::internal(format!(
-                    "machine '{}' is running but registry repair failed: {}",
-                    name, e
-                ))
-            })?;
+            let manager =
+                tokio::task::spawn_blocking(move || AgentManager::for_vm(&name_for_repair))
+                    .await
+                    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
+                    .map_err(|e| {
+                        ApiError::internal(format!(
+                            "machine '{}' is running but registry repair failed: {}",
+                            name, e
+                        ))
+                    })?;
 
             state.insert_machine(&name, machine_entry_from_record(&record, manager));
         }

@@ -306,12 +306,7 @@ impl EmbeddedRuntime {
                             "source is still running; refusing to stop newer execution",
                         ));
                     }
-                    crate::agent::AgentManager::for_vm_with_sizes(
-                        name,
-                        record.storage_gb,
-                        record.overlay_gb,
-                    )?
-                    .stop_paused()?;
+                    crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
                     self.remove_cached_handle(name)?;
                 }
             }
@@ -460,7 +455,7 @@ impl EmbeddedRuntime {
                 if status.trim() != "OK paused" {
                     return Err(Error::agent_conflict("resume machine", "source is still running; refusing to replace its execution"));
                 }
-                crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
+                crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
             }
             self.remove_cached_handle(name)?;
             if let Some(image) = crate::portable_checkpoint::prepare_paused_restore(&record)? {

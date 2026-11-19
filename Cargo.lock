@@ -4344,6 +4344,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "rustls-pki-types",
+ "same-file",
  "seccompiler",
  "secret-service",
  "security-framework",

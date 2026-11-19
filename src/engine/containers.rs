@@ -1877,10 +1877,8 @@ async fn restore_saved_execution(
         return Ok(false);
     }
     let name = saved.machine.clone();
-    let storage = vm.storage_gb;
-    let overlay = vm.overlay_gb;
     let socket = tokio::task::spawn_blocking(move || {
-        crate::agent::AgentManager::for_vm_with_sizes(&name, storage, overlay)
+        crate::agent::AgentManager::for_vm(&name)
             .map(|manager| manager.vsock_socket().to_path_buf())
     })
     .await

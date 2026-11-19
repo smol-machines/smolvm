@@ -160,6 +160,23 @@ impl SmolvmDb {
         machine: Option<&str>,
         sources: &[PathBuf],
     ) -> Result<MutationGuard> {
+        self.admit_workload_paths(machine, sources, |path| path.canonicalize())
+    }
+
+    pub(super) fn admit_startup_mutation(
+        &self,
+        machine: Option<&str>,
+        sources: &[PathBuf],
+    ) -> Result<MutationGuard> {
+        self.admit_workload_paths(machine, sources, super::launch_admission::resource_path)
+    }
+
+    fn admit_workload_paths(
+        &self,
+        machine: Option<&str>,
+        sources: &[PathBuf],
+        resolve: impl Fn(&Path) -> std::io::Result<PathBuf>,
+    ) -> Result<MutationGuard> {
         let gate = self.transfer_gate(false)?;
         let claims = self.with_read_conn(|conn| {
             let mut statement = conn
@@ -187,16 +204,17 @@ impl SmolvmDb {
                 ));
             }
             for source in sources {
-                let source = source.canonicalize().map_err(|_| {
-                    conflict("a shared directory cannot be resolved while a transfer is active")
+                let source = resolve(source).map_err(|_| {
+                    conflict("a workload path cannot be resolved while a transfer is active")
                 })?;
-                if claims
-                    .iter()
-                    .any(|claim| claim.roots.iter().any(|root| overlaps(&source, root)))
-                {
-                    return Err(conflict(
-                        "this shared data belongs to an active environment transfer",
-                    ));
+                for root in claims.iter().flat_map(|claim| &claim.roots) {
+                    if overlaps(&source, root)
+                        || super::launch_admission::same_resource(&source, root)?
+                    {
+                        return Err(conflict(
+                            "this shared data belongs to an active environment transfer",
+                        ));
+                    }
                 }
             }
         }

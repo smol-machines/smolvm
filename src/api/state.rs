@@ -600,22 +600,27 @@ impl ApiState {
                     }
                 } else {
                     tracing::info!(machine = %name, "cleaning up dead ephemeral machine from database");
-                    if let Err(e) = self.db.remove_vm(&name) {
-                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
-                    }
-                    // Reclaim the data dir too. Removing only the DB record leaks the
-                    // machine's storage + overlay images (multi-GB sparse files) — and
-                    // since the record is gone, nothing will ever clean them up later.
-                    // On a long-lived node that churns/crashes machines this is a slow
-                    // disk-fill across server restarts. Only ephemeral machines reach
-                    // here: a persistent machine's disks are its data and are kept.
-                    let dir = crate::agent::vm_data_dir(&name);
-                    if dir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&dir) {
-                            tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                    match self.db.remove_vm(&name) {
+                        Ok(Some(_)) => {
+                            let dir = crate::agent::vm_data_dir(&name);
+                            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                                if error.kind() != std::io::ErrorKind::NotFound {
+                                    tracing::warn!(machine = %name, error = %error, "failed to remove dead machine data dir");
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            // A live startup/preparation can own the disks even
+                            // when this scan read an older process identity.
+                            tracing::warn!(machine = %name, %error, "preserving machine after refused removal");
+                            match self.db.get_vm(&name) {
+                                Ok(Some(latest)) => record = latest,
+                                _ => continue,
+                            }
                         }
                     }
-                    continue;
                 }
             }
 
@@ -646,11 +651,7 @@ impl ApiState {
             };
 
             // Create AgentManager and try to reconnect
-            let manager = if admission.is_ok() {
-                AgentManager::for_vm_with_sizes(&name, record.storage_gb, record.overlay_gb)
-            } else {
-                AgentManager::for_vm(&name)
-            };
+            let manager = AgentManager::for_vm(&name);
             match manager {
                 Ok(manager) => {
                     // Try to reconnect to existing running VM

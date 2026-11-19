@@ -91,6 +91,146 @@ struct Launch {
     storage: PathBuf,
     roots: Vec<PathBuf>,
     child: Option<ProcessIdentity>,
+    #[serde(default, skip_serializing_if = "Purpose::is_boot")]
+    purpose: Purpose,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    exclusive_paths: Vec<PathBuf>,
+}
+
+#[derive(Debug, Default, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+enum Purpose {
+    #[default]
+    Boot,
+    Prepare {
+        name: Option<String>,
+    },
+}
+
+impl Purpose {
+    fn is_boot(&self) -> bool {
+        matches!(self, Self::Boot)
+    }
+}
+
+impl Launch {
+    fn name(&self) -> Option<&str> {
+        match &self.purpose {
+            Purpose::Boot => self.member.as_ref().map(|member| member.name.as_str()),
+            Purpose::Prepare { name } => name.as_deref(),
+        }
+    }
+
+    fn paths(&self) -> impl Iterator<Item = &PathBuf> {
+        std::iter::once(&self.storage).chain(self.exclusive_paths.iter())
+    }
+
+    fn alive(&self) -> bool {
+        self.child.as_ref().unwrap_or(&self.owner).may_be_alive()
+    }
+}
+
+/// Resolve the existing prefix before creating a disk or runtime file. A
+/// dangling symlink is not a prospective regular path and must not be guessed.
+pub(super) fn resource_path(path: &Path) -> std::io::Result<PathBuf> {
+    let mut prefix = std::path::absolute(path)?;
+    let mut tail = Vec::new();
+    loop {
+        match prefix.canonicalize() {
+            Ok(mut path) => {
+                for part in tail.into_iter().rev() {
+                    path.push(part);
+                }
+                return Ok(path);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                match prefix.symlink_metadata() {
+                    Ok(meta) if meta.file_type().is_symlink() => return Err(error),
+                    Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
+                        return Err(error)
+                    }
+                    _ => {}
+                }
+                let part = prefix.file_name().ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "unresolved workload path",
+                    )
+                })?;
+                tail.push(part.to_owned());
+                prefix.pop();
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+/// Canonical spelling catches symlinks; file identity also catches hard links.
+/// Metadata-only checks on Unix work for disks and sockets without opening them.
+pub(super) fn same_resource(a: &Path, b: &Path) -> std::io::Result<bool> {
+    if a == b {
+        return Ok(true);
+    }
+    let metadata = |path: &Path| match path.metadata() {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    };
+    let (Some(a_meta), Some(b_meta)) = (metadata(a)?, metadata(b)?) else {
+        return Ok(false);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        Ok(a_meta.dev() == b_meta.dev() && a_meta.ino() == b_meta.ino())
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (a_meta, b_meta);
+        same_file::is_same_file(a, b)
+    }
+}
+
+fn refuse_other_owners(tx: &Transaction<'_>, name: Option<&str>, paths: &[PathBuf]) -> Result<()> {
+    for (token, launch) in rows(tx)? {
+        if !launch.alive() {
+            remove(tx, &token)?;
+            continue;
+        }
+        if name.is_some() && name == launch.name() {
+            return Err(conflict("another launch still owns this machine"));
+        }
+        for owned in launch.paths() {
+            for requested in paths {
+                if same_resource(owned, requested)? {
+                    return Err(conflict(
+                        "another launch still owns this disk or runtime path",
+                    ));
+                }
+            }
+        }
+    }
+    if let Some(name) = name {
+        let data: Option<Vec<u8>> = tx
+            .query_row("SELECT data FROM vms WHERE name = ?1", [name], |row| {
+                row.get(0)
+            })
+            .optional()
+            .db_err("read preparation member")?;
+        if let Some(data) = data {
+            let record: VmRecord =
+                serde_json::from_slice(&data).db_err("decode preparation member")?;
+            if record.pid.is_some_and(|pid| {
+                record.pid_start_time.map_or_else(
+                    || crate::process::is_alive(pid),
+                    |start| ProcessIdentity { pid, start }.may_be_alive(),
+                )
+            }) {
+                return Err(conflict("the recorded machine process is still present"));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Cancels an unclaimed launch on every normal failure path. Once admitted,
@@ -124,6 +264,14 @@ fn decode(data: &[u8]) -> Result<Launch> {
         || launch.child.as_ref().is_some_and(|child| child.pid <= 0)
         || !launch.storage.is_absolute()
         || launch.roots.iter().any(|root| !root.is_absolute())
+        || launch
+            .exclusive_paths
+            .iter()
+            .any(|path| !path.is_absolute())
+        || (!launch.purpose.is_boot() && (launch.member.is_some() || launch.child.is_some()))
+        || launch
+            .name()
+            .is_some_and(|name| crate::data::validate_vm_name(name, "startup member").is_err())
         || launch.member.as_ref().is_some_and(|member| {
             crate::data::validate_vm_name(&member.name, "startup member").is_err()
         })
@@ -184,14 +332,23 @@ impl SmolvmDb {
         provisional: Option<VmRecord>,
         storage: &Path,
         roots: &[PathBuf],
+        exclusive_paths: &[PathBuf],
     ) -> Result<LaunchReservation> {
         let name = provisional.as_ref().map(|record| record.name.as_str());
-        let _gate = self.admit_workload_mutation(name, roots)?;
+        let paths = std::iter::once(storage.to_path_buf())
+            .chain(exclusive_paths.iter().cloned())
+            .collect::<Vec<_>>();
+        let _gate = self.admit_startup_mutation(name, &paths)?;
+        let _shares = self.admit_workload_mutation(name, roots)?;
         if let Some(name) = name {
             crate::data::validate_vm_name(name, "startup member")
                 .map_err(|_| conflict("invalid startup member"))?;
         }
         let storage = storage.canonicalize()?;
+        let exclusive_paths = exclusive_paths
+            .iter()
+            .map(|path| resource_path(path))
+            .collect::<std::io::Result<Vec<_>>>()?;
         let roots = roots
             .iter()
             .map(|root| root.canonicalize())
@@ -214,23 +371,13 @@ impl SmolvmDb {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin startup reservation")?;
             let mut inserted = false;
-            for (token, launch) in rows(&tx)? {
-                if launch.storage != storage
-                    && !launch
-                        .member
-                        .as_ref()
-                        .is_some_and(|member| Some(member.name.as_str()) == name)
-                {
-                    continue;
-                }
-                if launch.child.as_ref().map_or_else(
-                    || launch.owner.may_be_alive(),
-                    ProcessIdentity::may_be_alive,
-                ) {
-                    return Err(conflict("another launch still owns this machine"));
-                }
-                remove(&tx, &token)?;
-            }
+            refuse_other_owners(
+                &tx,
+                name,
+                &std::iter::once(storage.clone())
+                    .chain(exclusive_paths.iter().cloned())
+                    .collect::<Vec<_>>(),
+            )?;
             let member = if let Some(provisional) = &provisional {
                 let data: Option<Vec<u8>> = tx
                     .query_row(
@@ -283,6 +430,8 @@ impl SmolvmDb {
                 storage,
                 roots,
                 child: None,
+                purpose: Purpose::Boot,
+                exclusive_paths,
             };
             tx.execute(
                 "INSERT INTO vm_launch_admission(token, data) VALUES (?1, ?2)",
@@ -300,6 +449,67 @@ impl SmolvmDb {
                 self.journal_insert(&record.name, record);
             }
         }
+        Ok(reservation)
+    }
+
+    /// Own creation/growth before touching disks, without inventing a VM record
+    /// or holding a database write lock during filesystem work. Boot and other
+    /// preparation reservations use the same atomic conflict check.
+    pub(crate) fn reserve_vm_preparation(
+        &self,
+        name: Option<&str>,
+        storage: &Path,
+        exclusive_paths: &[PathBuf],
+    ) -> Result<LaunchReservation> {
+        if let Some(name) = name {
+            crate::data::validate_vm_name(name, "preparation member")
+                .map_err(|_| conflict("invalid preparation member"))?;
+        }
+        let paths = std::iter::once(storage.to_path_buf())
+            .chain(exclusive_paths.iter().cloned())
+            .map(|path| resource_path(&path))
+            .collect::<std::io::Result<Vec<_>>>()?;
+        let _gate = self.admit_startup_mutation(name, &paths)?;
+        let owner = ProcessIdentity::current()?;
+        let token = rand::random::<[u8; 24]>()
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect();
+        let reservation = LaunchReservation {
+            db: self.clone(),
+            owner: owner.clone(),
+            ticket: BootTicket {
+                database: self.path.canonicalize()?,
+                token,
+            },
+        };
+        self.with_durable_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin disk preparation")?;
+            refuse_other_owners(&tx, name, &paths)?;
+            let launch = Launch {
+                version: 1,
+                owner,
+                member: None,
+                storage: paths[0].clone(),
+                exclusive_paths: paths[1..].to_vec(),
+                roots: Vec::new(),
+                child: None,
+                purpose: Purpose::Prepare {
+                    name: name.map(str::to_owned),
+                },
+            };
+            tx.execute(
+                "INSERT INTO vm_launch_admission(token, data) VALUES (?1, ?2)",
+                params![
+                    reservation.ticket.token,
+                    serde_json::to_vec(&launch).db_err("encode disk preparation")?
+                ],
+            )
+            .db_err("reserve disk preparation")?;
+            tx.commit().db_err("commit disk preparation")
+        })?;
         Ok(reservation)
     }
 
@@ -347,6 +557,9 @@ impl SmolvmDb {
                 .db_err("read boot admission")?;
             let mut launch =
                 decode(&data.ok_or_else(|| conflict("startup was cancelled or recovered"))?)?;
+            if !launch.purpose.is_boot() {
+                return Err(conflict("disk preparation does not authorize VM execution"));
+            }
             if launch.child.is_some() {
                 return Err(conflict("startup ticket was already consumed"));
             }
@@ -416,16 +629,16 @@ pub(super) fn reconcile_transfer(
     roots: &[PathBuf],
 ) -> Result<()> {
     for (token, launch) in rows(tx)? {
-        let reviewed = launch
-            .member
-            .as_ref()
-            .and_then(|member| members.iter().find(|reviewed| reviewed.name == member.name));
-        if reviewed.is_none()
-            && !launch
-                .roots
-                .iter()
-                .any(|root| roots.iter().any(|other| overlaps(root, other)))
-        {
+        let reviewed = members
+            .iter()
+            .find(|reviewed| Some(reviewed.name.as_str()) == launch.name());
+        let mut relevant = reviewed.is_some();
+        for path in launch.paths().chain(launch.roots.iter()) {
+            for root in roots {
+                relevant |= overlaps(path, root) || same_resource(path, root)?;
+            }
+        }
+        if !relevant {
             continue;
         }
         if let Some(child) = &launch.child {
@@ -456,12 +669,11 @@ pub(super) fn reconcile_transfer(
 /// admitted child must be stopped first, even if another writer lost its PID.
 pub(super) fn revoke_removed_member(tx: &Transaction<'_>, name: &str) -> Result<()> {
     for (token, launch) in rows(tx)? {
-        if !launch
-            .member
-            .as_ref()
-            .is_some_and(|member| member.name == name)
-        {
+        if launch.name() != Some(name) {
             continue;
+        }
+        if !launch.purpose.is_boot() && launch.owner.may_be_alive() {
+            return Err(conflict("disk preparation is still in progress"));
         }
         if launch
             .child

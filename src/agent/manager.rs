@@ -1934,6 +1934,21 @@ impl AgentManager {
             }
             DiskAccess::Observe => None,
         };
+        let storage_dir = vm_data_dir(&name);
+        let (storage_path, storage_format) =
+            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
+        let _preparation = match access {
+            DiskAccess::Launch { .. } => {
+                Some(crate::db::SmolvmDb::open()?.reserve_vm_preparation(
+                    Some(&name),
+                    &storage_path,
+                    &[overlay_path.clone(), storage_dir.join("agent.sock")],
+                )?)
+            }
+            DiskAccess::Observe => None,
+        };
         let rootfs_path = match access {
             DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,
             DiskAccess::Observe => Self::default_rootfs_path()?,
@@ -1942,7 +1957,7 @@ impl AgentManager {
         // binding on first call and detects collisions on subsequent calls
         // (refusing to open a hash dir that belongs to a different name); an
         // observation only verifies an existing binding.
-        let storage_dir = match access {
+        match access {
             DiskAccess::Observe => observe_vm_dir(&name)?,
             DiskAccess::Launch { .. } => ensure_vm_dir(&name)?,
         };
@@ -1950,12 +1965,7 @@ impl AgentManager {
         // A fork clone has a `.qcow2` copy-on-write overlay in place of the
         // `.raw` disk; detect it by file presence (the on-disk file is the
         // source of truth) and open it as-is rather than creating/formatting.
-        let (storage_path, storage_format) =
-            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
         let storage_disk = open_storage_disk_for_manager(&storage_path, storage_format, access)?;
-
-        let (overlay_path, overlay_format) =
-            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
         let overlay_disk = open_overlay_disk_for_manager(&overlay_path, overlay_format, access)?;
 
         Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
@@ -3395,11 +3405,82 @@ impl AgentManager {
             }
         }
         let resources_for_config = resources.clone();
-        // Per-boot disk-prep (template copy). Formerly bounded by a process-wide
-        // boot gate to avoid host-disk thrash on slow/shared storage; removed
-        // after metal measurements showed disk-prep at ~1ms (NVMe + qcow2 thin
-        // clone) with flat boot latency from 8 → 32 concurrent boots — the gate
-        // was non-binding and only serialized needlessly.
+        let extra_disks = {
+            let mut __d = features.extra_disks;
+            // `--disk` values recorded on the machine, re-attached on every
+            // start in the order given. Format is read from the file's magic
+            // rather than assumed: a block device and a raw image are both
+            // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
+            // exposes its header as the whole device.
+            for disk in &resources_for_config.disks {
+                __d.push((
+                    disk.path.clone(),
+                    disk.read_only,
+                    disk.boot_format()
+                        .map_err(|e| crate::Error::agent("attach disk", e))?,
+                ));
+            }
+            if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
+                for entry in spec.split(',').filter(|s| !s.is_empty()) {
+                    let (path, ro) = match entry.strip_suffix(":ro") {
+                        Some(p) => (p, true),
+                        None => (entry, false),
+                    };
+                    __d.push((
+                        std::path::PathBuf::from(path),
+                        ro,
+                        crate::data::disk::DiskFormat::Raw,
+                    ));
+                }
+            }
+            __d
+        };
+        let mut exclusive_paths = vec![
+            self.overlay_disk.path().to_path_buf(),
+            self.vsock_socket.clone(),
+            self.pid_file.clone(),
+            self.config_file.clone(),
+        ];
+        exclusive_paths.push(
+            features
+                .control_socket
+                .clone()
+                .unwrap_or_else(|| self.vsock_socket.with_file_name("control.sock")),
+        );
+        exclusive_paths.extend(
+            extra_disks
+                .iter()
+                .filter(|(_, read_only, _)| !read_only)
+                .map(|(path, _, _)| path.clone()),
+        );
+        // Own disks and runtime paths before formatting or clearing old files.
+        // The same ticket becomes child ownership before the helper boots.
+        let provisional = self.name().map(|name| {
+            let (live, staged) = HostMount::split_storage_tuples(&mounts);
+            let mut record = crate::config::VmRecord::new(
+                name.to_owned(),
+                resources_for_config.cpus,
+                resources_for_config.memory_mib,
+                live,
+                vec![],
+                resources_for_config.network,
+            );
+            record.staged_mounts = staged;
+            record.mount_owners = HostMount::stored_owners(&mounts);
+            record.ephemeral = true;
+            record
+        });
+        let launch = crate::db::SmolvmDb::open()?.reserve_vm_launch(
+            provisional,
+            self.storage_disk.path(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+            &exclusive_paths,
+        )?;
+        // Formatting runs outside the database transaction. Independent VMs
+        // can prepare concurrently while the durable reservation fences aliases.
         self.prepare_for_launch(&mounts, &ports, resources)?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
@@ -3682,31 +3763,6 @@ impl AgentManager {
         let records_window = features.packed_layers_dir.is_some();
         let leased_layers = features.packed_layers_dir.clone();
 
-        // Persist intent before spawning: the child publishes its own identity
-        // before opening disks, even if this controller crashes immediately.
-        let provisional = self.name().map(|name| {
-            let (live, staged) = HostMount::split_storage_tuples(&mounts);
-            let mut record = crate::config::VmRecord::new(
-                name.to_owned(),
-                resources_for_config.cpus,
-                resources_for_config.memory_mib,
-                live,
-                vec![],
-                resources_for_config.network,
-            );
-            record.staged_mounts = staged;
-            record.mount_owners = HostMount::stored_owners(&mounts);
-            record.ephemeral = true;
-            record
-        });
-        let launch = crate::db::SmolvmDb::open()?.reserve_vm_launch(
-            provisional,
-            self.storage_disk.path(),
-            &mounts
-                .iter()
-                .map(|mount| mount.source.clone())
-                .collect::<Vec<_>>(),
-        )?;
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
             startup_ticket: Some(launch.ticket.clone()),
@@ -3736,36 +3792,7 @@ impl AgentManager {
             packed_layers_dir: features.packed_layers_dir,
             packed_layers_dax_window,
             pack_idmap_source,
-            extra_disks: {
-                let mut __d = features.extra_disks;
-                // `--disk` values recorded on the machine, re-attached on every
-                // start in the order given. Format is read from the file's magic
-                // rather than assumed: a block device and a raw image are both
-                // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
-                // exposes its header as the whole device.
-                for disk in &resources_for_config.disks {
-                    __d.push((
-                        disk.path.clone(),
-                        disk.read_only,
-                        disk.boot_format()
-                            .map_err(|e| crate::Error::agent("attach disk", e))?,
-                    ));
-                }
-                if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
-                    for entry in spec.split(',').filter(|s| !s.is_empty()) {
-                        let (path, ro) = match entry.strip_suffix(":ro") {
-                            Some(p) => (p, true),
-                            None => (entry, false),
-                        };
-                        __d.push((
-                            std::path::PathBuf::from(path),
-                            ro,
-                            crate::data::disk::DiskFormat::Raw,
-                        ));
-                    }
-                }
-                __d
-            },
+            extra_disks,
             pod_netns: features.pod_netns,
             // Ephemeral machines share one runtime directory, so only a named
             // machine keeps a workload log of its own.

@@ -464,9 +464,12 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
             features.uid_share_dir = Some(crate::agent::vm_data_dir(g));
         }
     }
-    let manager =
+    let manager = if record.is_process_alive() {
+        AgentManager::for_vm(&record.name)
+    } else {
         AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
-            .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+    }
+    .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(&record.name)).is_some();
@@ -924,13 +927,16 @@ pub fn fork_vm_batch(
 /// Connect to an already-running VM and return a cached handle.
 pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = get_record(db, name)?;
-    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
+    let manager = AgentManager::for_vm(name)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     // Reconnection records the existing PID for explicit lifecycle operations,
     // but this handle did not start that process and must not stop it on Drop.
     manager.detach();
 
-    if manager.try_connect_existing().is_none() {
+    if manager
+        .try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time)
+        .is_none()
+    {
         return Err(Error::agent_not_found(
             "connect machine",
             format!("machine '{}' is not running", name),
@@ -951,9 +957,9 @@ pub fn stop_vm_with_timeout(
     stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     let record = get_record(db, name)?;
-    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
+    let manager = AgentManager::for_vm(name)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
-    manager.try_connect_existing();
+    manager.try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time);
     if !record.staged_mounts.is_empty() {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
         crate::staged_mount::sync_staged_mounts(&record, &mut client)?;

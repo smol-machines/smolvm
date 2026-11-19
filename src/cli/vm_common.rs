@@ -2509,7 +2509,7 @@ fn check_port_conflicts(
 /// at the default sizes. A recorded default machine starts through
 /// [`start_vm_named`] with its own sizes.
 pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default_with_sizes(None, None)?;
+    let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());
@@ -2525,6 +2525,8 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     // zombie would collide on its sockets and pid files.
     cli_recover_if_unreachable("default")?;
 
+    manager.detach();
+    let manager = AgentManager::new_default_with_sizes(None, None)?;
     eprintln!("Starting machine 'default'...");
     manager.ensure_running_with_full_config(
         Vec::new(),
