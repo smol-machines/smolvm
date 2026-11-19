@@ -2910,6 +2910,37 @@ mod tests {
     }
 
     use super::*;
+
+    // `update --no-net` must leave nothing that asks for outbound networking:
+    // a machine that reports `network: disabled` must not reach the network.
+    #[test]
+    fn disabling_the_network_leaves_no_way_out() {
+        let fresh = || {
+            let mut r =
+                smolvm::config::VmRecord::new("m".into(), 1, 512, Vec::new(), Vec::new(), true);
+            r.network_backend = Some(smolvm::network::NetworkBackend::VirtioNet);
+            r
+        };
+        let setups: [fn(&mut smolvm::config::VmRecord); 4] = [
+            |r| r.block_private = Some(Vec::new()),
+            |r| r.guest_subnet = Some("203.0.113.0/30".into()),
+            |r| r.network_name = Some("lab".into()),
+            |r| {
+                r.credential_policy = Some(smolvm_protocol::CredentialPolicy::default());
+            },
+        ];
+        for setup in setups {
+            let mut r = fresh();
+            setup(&mut r);
+            assert!(
+                r.launch_network_plan().outbound,
+                "the setup asks for networking"
+            );
+            disable_network(&mut r);
+            assert!(!r.network);
+            assert!(!r.launch_network_plan().outbound);
+        }
+    }
     use clap::Parser;
 
     #[test]
@@ -6967,6 +6998,62 @@ pub struct UpdateCmd {
     pub remove_labels: Vec<String>,
 }
 
+/// Turn a machine's networking off in its record, returning the changes made.
+/// Every setting that asks the launcher for outbound networking goes, or the
+/// machine would still reach the network after reporting it disabled.
+fn disable_network(r: &mut smolvm::config::VmRecord) -> Vec<String> {
+    let mut changes = Vec::new();
+    changes.push("  network: disabled".to_string());
+    r.network = false;
+    // Clear egress policy — allow_cidrs and dns_filter_hosts imply
+    // networking. Leaving them set would re-enable egress on start.
+    if r.allowed_cidrs.is_some() {
+        changes.push("  cleared allow_cidrs".to_string());
+        r.allowed_cidrs = None;
+    }
+    if r.dns_filter_hosts.is_some() {
+        changes.push("  cleared dns_filter_hosts".to_string());
+        r.dns_filter_hosts = None;
+    }
+    if !r.egress_rules.is_empty() {
+        changes.push("  cleared egress_rules".to_string());
+        r.egress_rules.clear();
+    }
+    if r.external_interceptor_required || r.mediated_egress_required {
+        changes.push("  cleared egress interceptor requirement".to_string());
+        r.external_interceptor_required = false;
+        r.mediated_egress_required = false;
+    }
+    // Each of these asks the launcher for outbound networking on
+    // its own, so a machine that kept one would still reach the
+    // internet after reporting `network: disabled`.
+    if r.block_private.is_some() {
+        changes.push("  cleared block_private".to_string());
+        r.block_private = None;
+    }
+    if r.guest_subnet.is_some() {
+        changes.push("  cleared guest_subnet".to_string());
+        r.guest_subnet = None;
+    }
+    if r.network_name.is_some() {
+        changes.push("  left network".to_string());
+        r.network_name = None;
+    }
+    if r.credential_policy.is_some() {
+        changes.push("  cleared credential bindings".to_string());
+        r.credential_policy = None;
+        r.credential_placeholders.clear();
+    }
+    // virtio-net without networking or published ports is rejected
+    // at launch, so a machine that keeps the backend could never
+    // start again. Published ports still need it.
+    if r.ports.is_empty() && r.udp_ports.is_empty() && r.network_backend.is_some() {
+        changes.push("  cleared network backend".to_string());
+        r.network_backend = None;
+    }
+    changes
+}
+
 impl UpdateCmd {
     /// The record's egress after this update's allow-list flags, or `None`
     /// when none were given. The merge and its guards live on the record
@@ -7528,34 +7615,7 @@ impl UpdateCmd {
                 r.network = true;
             }
             if self.no_net {
-                changes.push("  network: disabled".to_string());
-                r.network = false;
-                // Clear egress policy — allow_cidrs and dns_filter_hosts imply
-                // networking. Leaving them set would re-enable egress on start.
-                if r.allowed_cidrs.is_some() {
-                    changes.push("  cleared allow_cidrs".to_string());
-                    r.allowed_cidrs = None;
-                }
-                if r.dns_filter_hosts.is_some() {
-                    changes.push("  cleared dns_filter_hosts".to_string());
-                    r.dns_filter_hosts = None;
-                }
-                if !r.egress_rules.is_empty() {
-                    changes.push("  cleared egress_rules".to_string());
-                    r.egress_rules.clear();
-                }
-                if r.external_interceptor_required || r.mediated_egress_required {
-                    changes.push("  cleared egress interceptor requirement".to_string());
-                    r.external_interceptor_required = false;
-                    r.mediated_egress_required = false;
-                }
-                // virtio-net without networking or published ports is rejected
-                // at launch, so a machine that keeps the backend could never
-                // start again. Published ports still need it.
-                if r.ports.is_empty() && r.udp_ports.is_empty() && r.network_backend.is_some() {
-                    changes.push("  cleared network backend".to_string());
-                    r.network_backend = None;
-                }
+                changes.extend(disable_network(r));
             }
             if let Some(ref next) = egress {
                 if r.allowed_cidrs != next.allowed_cidrs {
