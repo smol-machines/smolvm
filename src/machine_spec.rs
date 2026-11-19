@@ -467,6 +467,8 @@ pub struct RestoredState {
 pub struct ResolvedSpec {
     /// Who asked for it.
     pub caller: Caller,
+    /// Whether `image` came from a pack or checkpoint rather than the user.
+    pub image_from_artifact: bool,
     /// OCI image the workload runs from; `None` for a bare or VM-mode machine.
     pub image: Option<String>,
     /// Workload entrypoint.
@@ -1032,6 +1034,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             }
             ResolvedSpec {
                 caller,
+                image_from_artifact: false,
                 image: match source {
                     SpecSource::Image(image) => Some(image.to_string()),
                     _ => None,
@@ -1163,6 +1166,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 || !egress_rules.is_empty();
             ResolvedSpec {
                 caller,
+                image_from_artifact: true,
                 image: pack.image,
                 entrypoint,
                 cmd,
@@ -1475,6 +1479,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             let captured_settings = &checkpoint.settings;
             ResolvedSpec {
                 caller,
+                image_from_artifact: true,
                 image: workload.map(|workload| workload.image.clone()),
                 entrypoint: pack.entrypoint,
                 cmd: pack.cmd,
@@ -1742,6 +1747,7 @@ impl ResolvedSpec {
         // Destructured without `..`, like `resolve`.
         let ResolvedSpec {
             caller: _,
+            image_from_artifact,
             image,
             entrypoint,
             cmd,
@@ -1908,6 +1914,7 @@ impl ResolvedSpec {
             ephemeral,
             source_smolmachine: None,
             packed_image_on_storage: restored.packed_image_on_storage,
+            image_from_artifact,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,

@@ -2814,8 +2814,17 @@ impl AgentManager {
         // A queued caller may still hold an entry retired by discovery. A
         // name-derived socket is not authority to connect to its replacement.
         validate()?;
-        let client = super::AgentClient::connect_with_retry(&self.vsock_socket)?;
+        let mut client = super::AgentClient::connect_with_retry(&self.vsock_socket)?;
         validate()?;
+        // Every pull through this connection follows the machine's provenance:
+        // an image a pack or checkpoint chose never gets this host's logins.
+        if let Some(name) = &self.name {
+            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                if record.image_from_artifact || record.source_smolmachine.is_some() {
+                    client.withhold_registry_logins();
+                }
+            }
+        }
         Ok(client)
     }
 

@@ -1086,6 +1086,21 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
 }
 
 /// Resolve credentials for the registry that will actually receive the pull.
+/// The login a pull sends. One the caller passed explicitly always goes; the
+/// host's saved ones are withheld from a machine whose image an artifact chose.
+fn pull_auth(
+    withhold_saved: bool,
+    config: &RegistryConfig,
+    effective_image: &str,
+    explicit: Option<RegistryAuth>,
+) -> Option<RegistryAuth> {
+    if withhold_saved {
+        explicit
+    } else {
+        registry_pull_credentials(config, effective_image, explicit)
+    }
+}
+
 fn registry_pull_credentials(
     config: &RegistryConfig,
     effective_image: &str,
@@ -1133,6 +1148,9 @@ pub struct AgentClient {
     /// Why command termination could not be confirmed after an output pipe closed.
     /// Staged files must remain in the VM until a caller can recover them.
     session_end_error: Option<String>,
+    /// Set for a machine whose image an artifact chose: its pulls go out
+    /// without this host's registry logins (see `VmRecord::image_from_artifact`).
+    withhold_registry_logins: bool,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1333,6 +1351,7 @@ impl AgentClient {
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
             session_end_error: None,
+            withhold_registry_logins: false,
         }
     }
 }
@@ -1462,6 +1481,7 @@ impl AgentClient {
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
             session_end_error: None,
+            withhold_registry_logins: false,
         })
     }
 
@@ -1695,7 +1715,12 @@ impl AgentClient {
             // Credentials must be scoped to the registry that receives the
             // request. A mirror is a different host and cannot inherit the
             // upstream registry's saved token or Docker login credentials.
-            let auth = registry_pull_credentials(&registry_config, &img, options.auth);
+            let auth = pull_auth(
+                self.withhold_registry_logins,
+                &registry_config,
+                &img,
+                options.auth,
+            );
             (img, auth)
         } else {
             (image.to_string(), options.auth)
@@ -1777,6 +1802,12 @@ impl AgentClient {
     /// registry mirrors if configured.
     ///
     /// Shorthand for `pull(image, PullOptions::new().use_registry_config(true))`.
+    /// Pull without this host's saved registry logins, for a machine whose
+    /// image a pack or checkpoint chose.
+    pub fn withhold_registry_logins(&mut self) {
+        self.withhold_registry_logins = true;
+    }
+
     pub fn pull_with_registry_config(&mut self, image: &str) -> Result<ImageInfo> {
         self.pull(image, PullOptions::new().use_registry_config(true))
     }
@@ -3940,6 +3971,7 @@ impl AgentClient {
             streaming_output_cap: self.streaming_output_cap,
             reader_gone: self.reader_gone,
             session_end_error: self.session_end_error.clone(),
+            withhold_registry_logins: self.withhold_registry_logins,
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -6654,6 +6686,36 @@ password = "mirror-secret"
             registry_pull_credentials(&config, "origin.example.invalid/app:latest", None).unwrap();
         assert_eq!(original.username, "origin");
         assert_eq!(original.password, "upstream-secret");
+    }
+
+    // An artifact chose this machine's image and its guest says when it is
+    // missing, so a re-pull must not hand the host's saved login to the guest.
+    #[test]
+    fn saved_logins_are_withheld_from_an_artifact_chosen_image() {
+        let config: RegistryConfig = toml::from_str(
+            r#"
+[registries."private.example.invalid"]
+username = "host-user"
+password = "host-secret"
+"#,
+        )
+        .unwrap();
+        let image = "private.example.invalid/app:latest";
+        assert_eq!(
+            pull_auth(false, &config, image, None).unwrap().password,
+            "host-secret"
+        );
+        assert!(pull_auth(true, &config, image, None).is_none());
+        let explicit = RegistryAuth {
+            username: "asked".into(),
+            password: "given".into(),
+        };
+        assert_eq!(
+            pull_auth(true, &config, image, Some(explicit))
+                .unwrap()
+                .password,
+            "given"
+        );
     }
 
     #[test]

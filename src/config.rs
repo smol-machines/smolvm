@@ -841,6 +841,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub packed_image_on_storage: bool,
 
+    /// `image` was chosen by an artifact (a pack or a checkpoint), not by this
+    /// host's user. Its pulls never carry this host's registry logins: the
+    /// artifact names the image and the guest says when it is missing, so a
+    /// login sent along would be handed to whoever wrote the artifact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_from_artifact: bool,
+
     /// Registry reference `source_smolmachine` was pulled from, if any. Carried
     /// into a live checkpoint so another host can fetch the same pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1108,6 +1115,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
+            image_from_artifact: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
@@ -1220,6 +1228,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
+            image_from_artifact: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,

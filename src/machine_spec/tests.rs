@@ -724,6 +724,22 @@ fn a_checkpoint_policy_that_reaches_the_host_is_refused() {
     .is_ok());
 }
 
+// A pack or checkpoint chose the image of a machine made from it, which is
+// what keeps the host's registry logins out of that machine's pulls.
+#[test]
+fn an_artifact_chosen_image_is_recorded_as_such() {
+    let record = |source| {
+        resolve(source, CreateSpec::default(), Caller::Cli)
+            .unwrap()
+            .to_record("m")
+            .unwrap()
+    };
+    let (pack, checkpoint) = (pack_manifest(), checkpoint_manifest());
+    assert!(!record(SpecSource::Image("alpine")).image_from_artifact);
+    assert!(record(SpecSource::from_manifest(&pack)).image_from_artifact);
+    assert!(record(SpecSource::from_manifest(&checkpoint)).image_from_artifact);
+}
+
 #[test]
 fn a_checkpoint_refuses_a_network_it_was_captured_without() {
     let mut manifest = checkpoint_manifest();
