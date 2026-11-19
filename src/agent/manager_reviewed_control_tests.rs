@@ -286,7 +286,8 @@ fn paused_stop_retains_ownership_through_signal_wait_and_cleanup() {
             });
             assert!(!process::is_our_process_strict(pid, Some(start)));
             assert!(!manager.pid_file.exists());
-            db.update_vm(&record.name, |r| r.mark_stopped()).unwrap();
+            db.update_vm(&record.name, |r| r.mark_process_stopped())
+                .unwrap();
         },
     );
 }
