@@ -79,6 +79,25 @@ impl PackCmd {
     }
 }
 
+/// Read the requirements of a portable source without interrupting it.
+#[derive(Args, Debug)]
+pub struct CheckpointRequirementsCmd {
+    /// Running machine whose transfer requirements should be inspected.
+    #[arg(long, value_name = "NAME")]
+    pub name: String,
+}
+
+impl CheckpointRequirementsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let requirements = smolvm::portable_checkpoint::capture_requirements(&self.name)?;
+        println!(
+            "{}",
+            serde_json::to_string(&requirements).map_err(std::io::Error::other)?
+        );
+        Ok(())
+    }
+}
+
 /// Persist one running machine, including RAM and execution state, as a
 /// portable `.checkpoint` file.
 #[derive(Args, Debug)]

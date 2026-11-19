@@ -45,6 +45,13 @@ pub const DEVICE_PROFILE_PACKED_LAYERS: &str = "smolvm-packed-layers-v1";
 /// Same image device, with its exact archive carried inside the checkpoint.
 /// Older runtimes must reject this profile instead of trying a registry pull.
 pub const DEVICE_PROFILE_IMAGE_ARCHIVE: &str = "smolvm-image-archive-v1";
+/// Device profiles understood by this reader; this does not reserve capacity
+/// or waive the CPU, runtime ABI, archive, and device checks during restore.
+pub const SUPPORTED_DEVICE_PROFILES: &[&str] = &[
+    DEVICE_PROFILE,
+    DEVICE_PROFILE_PACKED_LAYERS,
+    DEVICE_PROFILE_IMAGE_ARCHIVE,
+];
 const IMAGE_ARCHIVE_ASSET: &str = "checkpoint/image-archive.tar";
 const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
@@ -1865,6 +1872,65 @@ fn validated_capture_source(name: &str, host_mounts: bool) -> Result<(SmolvmConf
         crate::agent::fork::validate_checkpoint_agent(name)?;
     }
     Ok((config, frozen))
+}
+
+/// Requirements observed before pausing a source. The identity lets a caller
+/// reject a changed source after destination preflight; capture and restore
+/// still validate their own consistency boundaries.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CheckpointRequirements {
+    /// Reviewed machine name.
+    pub name: String,
+    /// Creation identity of that machine.
+    pub created_at: u64,
+    /// Current VMM process identity.
+    pub pid: Option<i32>,
+    /// Host process start time, guarding PID reuse.
+    pub pid_start_time: Option<u64>,
+    /// Guest architecture required by this capture.
+    pub architecture: String,
+    /// Engine release performing the capture.
+    pub engine_version: String,
+    /// Format used by a standalone pause checkpoint.
+    pub format_version: u32,
+    /// Devices and carried assets required by the running guest.
+    pub device_profile: String,
+    /// Configured virtual CPU count.
+    pub cpus: u8,
+    /// Configured guest memory in MiB.
+    pub memory_mib: u32,
+}
+
+fn capture_device_profile(vm: &VmRecord) -> &'static str {
+    if vm.packed_layer_source().is_some() {
+        DEVICE_PROFILE_PACKED_LAYERS
+    } else if vm.local_image_layers_dir().is_some() {
+        DEVICE_PROFILE_IMAGE_ARCHIVE
+    } else {
+        DEVICE_PROFILE
+    }
+}
+
+/// Inspect a portable source without capturing memory, stopping execution,
+/// staging image archives, or allocating destination resources.
+pub fn capture_requirements(name: &str) -> Result<CheckpointRequirements> {
+    let (config, _) = validated_capture_source(name, false)?;
+    let vm = config
+        .vms
+        .get(name)
+        .ok_or_else(|| Error::vm_not_found(name))?;
+    Ok(CheckpointRequirements {
+        name: name.to_owned(),
+        created_at: vm.created_at,
+        pid: vm.pid,
+        pid_start_time: vm.pid_start_time,
+        architecture: crate::platform::Arch::current().oci_arch().to_owned(),
+        engine_version: crate::VERSION.to_owned(),
+        format_version: FORMAT_VERSION,
+        device_profile: capture_device_profile(vm).to_owned(),
+        cpus: vm.cpus,
+        memory_mib: vm.mem,
+    })
 }
 
 /// Capture a running checkpointable machine into a self-contained artifact.
