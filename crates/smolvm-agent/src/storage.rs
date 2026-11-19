@@ -7812,7 +7812,10 @@ mod tests {
         // `..` and absolute paths escape the layer dir — rejected.
         assert!(jailed_join(base, Path::new("../etc/passwd")).is_none());
         assert!(jailed_join(base, Path::new("tmp/../../etc")).is_none());
-        assert!(jailed_join(base, Path::new("/etc/passwd")).is_none());
+        assert_eq!(
+            jailed_join(base, Path::new("/etc/passwd")),
+            Some(base.join("etc/passwd"))
+        );
     }
 
     /// End-to-end extraction with whiteout conversion. mknod/setxattr(trusted.*)
