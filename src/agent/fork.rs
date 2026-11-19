@@ -2709,11 +2709,18 @@ pub fn resume_golden(golden: &str, snapshot_dir: &Path) -> Result<()> {
 /// dead and which has no dependent clones. A checkpoint is tied to the exact
 /// golden PID/memfd identity and can never be valid after that process exits.
 pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<()> {
-    let snapshot_root = vm_data_dir(golden).join("s");
-    match std::fs::symlink_metadata(&snapshot_root) {
+    discard_retained_snapshots_at(db, golden, &vm_data_dir(golden).join("s"))
+}
+
+pub(crate) fn discard_retained_snapshots_at(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_root: &Path,
+) -> Result<()> {
+    match std::fs::symlink_metadata(snapshot_root) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            stop_snapshot_guardians(&snapshot_root)?;
-            std::fs::remove_dir_all(&snapshot_root).map_err(|error| {
+            stop_snapshot_guardians(snapshot_root)?;
+            std::fs::remove_dir_all(snapshot_root).map_err(|error| {
                 Error::agent("remove retained fork snapshots", error.to_string())
             })?;
         }

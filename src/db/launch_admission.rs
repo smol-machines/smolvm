@@ -21,20 +21,20 @@ use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ProcessIdentity {
-    pid: i32,
-    start: u64,
+pub(super) struct ProcessIdentity {
+    pub(super) pid: i32,
+    pub(super) start: u64,
 }
 
 impl ProcessIdentity {
-    fn current() -> Result<Self> {
+    pub(super) fn current() -> Result<Self> {
         let pid = std::process::id() as i32;
         let start = crate::process::process_start_time(pid)
             .ok_or_else(|| conflict("cannot identify the startup process"))?;
         Ok(Self { pid, start })
     }
 
-    fn may_be_alive(&self) -> bool {
+    pub(super) fn may_be_alive(&self) -> bool {
         // Linux can positively identify an exited, unreaped thread group.
         #[cfg(target_os = "linux")]
         if !crate::process::is_alive(self.pid) {
@@ -207,6 +207,7 @@ fn refuse_other_owners(
     paths: &[PathBuf],
     except: Option<&str>,
 ) -> Result<()> {
+    super::recovery::refuse_conflicts(tx, name, paths)?;
     for (token, launch) in rows(tx)? {
         if except == Some(token.as_str()) {
             continue;
@@ -691,6 +692,21 @@ impl SmolvmDb {
         }
         Ok(())
     }
+}
+
+/// Keep the admitted execution's disk/runtime paths fenced through recovery.
+pub(super) fn recovery_paths(
+    tx: &Transaction<'_>,
+    member: &Member,
+    runtime: &Path,
+) -> Result<Vec<PathBuf>> {
+    let mut paths = std::collections::BTreeSet::from([runtime.to_path_buf()]);
+    for (_, launch) in rows(tx)? {
+        if launch.name() == Some(member.name.as_str()) {
+            paths.extend(launch.paths().cloned());
+        }
+    }
+    Ok(paths.into_iter().collect())
 }
 
 /// Called in the same durable transaction that claims transfer authority.

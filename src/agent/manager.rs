@@ -443,14 +443,22 @@ pub fn cleanup_dead_vm_runtime(name: &str) -> Result<()> {
 }
 
 pub(crate) fn cleanup_dead_vm_runtime_in_db(name: &str, db: &crate::db::SmolvmDb) -> Result<()> {
+    cleanup_dead_vm_runtime_at(name, db, &vm_data_dir(name))
+}
+
+pub(crate) fn cleanup_dead_vm_runtime_at(
+    name: &str,
+    db: &crate::db::SmolvmDb,
+    runtime: &Path,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
-    launcher::cleanup_cuda_ring_dir(&vm_data_dir(name))
+    launcher::cleanup_cuda_ring_dir(runtime)
         .map_err(|error| Error::agent("clean CUDA ring directory", error.to_string()))?;
     #[cfg(not(target_os = "linux"))]
     let _ = name;
 
     if db.dependent_clones(name)?.is_empty() {
-        crate::agent::fork::discard_retained_snapshots(db, name)?;
+        crate::agent::fork::discard_retained_snapshots_at(db, name, &runtime.join("s"))?;
     }
     Ok(())
 }

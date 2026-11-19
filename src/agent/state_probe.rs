@@ -186,9 +186,7 @@ fn recover_unreachable_machine_with(
 ) -> crate::Result<()> {
     // Retain the caller's review across a potentially slow process teardown.
     // A transfer must refuse recovery before even the stop marker is written.
-    let _admission = db.admit_machine_mutation(&record.name)?;
-    let review = crate::db::launch_admission::LaunchReview::from_record(record)?;
-    review.validate_execution(db, None)?;
+    let ownership = db.reserve_vm_recovery(record)?;
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
@@ -200,7 +198,7 @@ fn recover_unreachable_machine_with(
                     ),
                 ));
             }
-            crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(&record.name), pid);
+            crate::vm_exit::mark_stop_requested(ownership.runtime_dir(), pid);
             if let crate::process::VmStop::Held(held) = stop(pid)? {
                 // Nothing can make the process exit, and it runs no more
                 // code. Finish the teardown and keep its PID in the record,
@@ -214,28 +212,12 @@ fn recover_unreachable_machine_with(
         }
     }
 
-    // A restart or recreation committed while stop waited must keep its runtime.
-    review.validate_execution(db, None)?;
-    if let Err(error) = crate::agent::cleanup_dead_vm_runtime_in_db(&record.name, db) {
-        tracing::warn!(
-            machine = %record.name,
-            %error,
-            "failed to clean runtime after unreachable VM teardown"
-        );
+    if let Err(error) =
+        crate::agent::cleanup_dead_vm_runtime_at(&record.name, db, ownership.runtime_dir())
+    {
+        tracing::warn!(machine = %record.name, %error, "failed to clean runtime after unreachable VM teardown");
     }
-
-    // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full
-    // in-memory config load; the update is targeted to the one record.
-    db.update_vm_for_record(record, |current| {
-        if (current.pid, current.pid_start_time) != (record.pid, record.pid_start_time) {
-            return Err(crate::Error::agent_conflict(
-                "recover unreachable machine",
-                "machine execution changed during recovery",
-            ));
-        }
-        current.mark_process_stopped();
-        Ok(())
-    })?;
+    ownership.mark_stopped()?;
     Ok(())
 }
 

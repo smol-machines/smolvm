@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod incarnation;
+mod recovery;
 mod resize;
 pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
 pub mod launch_admission;
@@ -359,6 +360,7 @@ impl SmolvmDb {
         )
         .db_err("create tables")?;
         incarnation::install(&mut conn)?;
+        recovery::install(&mut conn)?;
 
         Ok(conn)
     }

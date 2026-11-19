@@ -116,24 +116,27 @@ fn transfer_ownership_refuses_recovery_before_any_teardown() {
 }
 
 #[test]
-fn replacement_during_recovery_wait_keeps_its_runtime_and_record() {
+fn replacement_during_recovery_wait_is_refused_until_cleanup_finishes() {
     isolated(
-        "replacement_during_recovery_wait_keeps_its_runtime_and_record",
+        "replacement_during_recovery_wait_is_refused_until_cleanup_finishes",
         || {
             let (db, record, mut child, proof) = fixture();
-            let mut replacement = Vec::new();
-            let error = recover_unreachable_machine_with(&record, &db, |_| {
+            recover_unreachable_machine_with(&record, &db, |_| {
                 child.0.kill().unwrap();
                 child.0.wait().unwrap();
-                db.remove_vm(&record.name).unwrap();
-                db.insert_vm(&record.name, &record).unwrap();
-                replacement = bytes(&db, &record.name);
+                assert!(db.remove_vm(&record.name).is_err());
+                assert!(db.insert_vm(&record.name, &record).is_err());
+                assert_eq!(std::fs::read(&proof).unwrap(), b"retained snapshot");
                 Ok(crate::process::VmStop::Exited(0))
             })
-            .unwrap_err();
-            assert!(error.to_string().contains("changed"));
-            assert_eq!(bytes(&db, &record.name), replacement);
-            assert_eq!(std::fs::read(proof).unwrap(), b"retained snapshot");
+            .unwrap();
+            assert_eq!(
+                db.get_vm(&record.name).unwrap().unwrap().state,
+                RecordState::Stopped
+            );
+            assert!(!proof.exists());
+            db.remove_vm(&record.name).unwrap();
+            db.insert_vm(&record.name, &record).unwrap();
         },
     );
 }

@@ -224,6 +224,7 @@ impl SmolvmDb {
         resolve: impl Fn(&Path) -> std::io::Result<PathBuf>,
     ) -> Result<MutationGuard> {
         let gate = self.transfer_gate(false)?;
+        self.check_recovery_admission(machine, sources)?;
         let claims = self.with_read_conn(|conn| {
             let mut statement = conn
                 .prepare("SELECT data FROM workload_transfer_admission WHERE retired = 0")
