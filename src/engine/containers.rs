@@ -371,8 +371,22 @@ impl Container {
                 .map(|record| (record.id.clone(), record))
                 .collect();
             records.insert(record.id.clone(), record.clone());
-            let owner = super::transfer::machine_owner(&records, &record.id)?;
-            records[owner].machine.clone()
+            match super::transfer::machine_owner(&records, &record.id) {
+                Ok(owner) => records[owner].machine.clone(),
+                Err(error)
+                    if deleting
+                        && record.machine.is_empty()
+                        && !storage.has_active_transfers()
+                        && !self.owns_live_execution()
+                        && error.status == axum::http::StatusCode::NOT_FOUND =>
+                {
+                    // A stopped shared container has no VM of its own. Permit
+                    // removing its orphaned record when the host is gone, but
+                    // never treat a missing owner as authority during a move.
+                    record.machine.clone()
+                }
+                Err(error) => return Err(error),
+            }
         } else {
             record.machine.clone()
         };
@@ -3272,6 +3286,81 @@ pub(crate) fn matches(engine: &Engine, c: &Container, filters: &Filters) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn orphaned_shared_container_remains_removable_without_an_active_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        let id = super::super::util::new_id();
+        let engine = Engine::open_with_db(
+            super::super::EngineConfig {
+                root: root.path().join("engine"),
+                socket: root.path().join("api.sock"),
+            },
+            Some(id.clone()),
+            crate::db::SmolvmDb::open_at(&root.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id":id,"name":"orphan","created":"","image":"","image_id":"",
+            "pull_ref":"","machine":"","config":{},
+            "host_config":{"NetworkMode":format!("container:{}", "d".repeat(64))},
+            "host_config_raw":{},"networks":{},"path":"sh","args":[],
+            "state":StateRecord::default(),"restart_count":0,"ports":[],"mounts":[]
+        }))
+        .unwrap();
+        engine.store.save_container(&record).unwrap();
+        let container = Container::from_record(record);
+        engine
+            .containers
+            .write()
+            .insert(id.clone(), container.clone());
+        let owner = format!("orphan-transfer-{:032x}", rand::random::<u128>());
+        engine
+            .db
+            .insert_vm(
+                &owner,
+                &crate::config::VmRecord::new(owner.clone(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        engine
+            .db
+            .claim_workload_transfer(
+                "orphan-move",
+                vec![engine.db.review_workload_member(&owner).unwrap()],
+                &[],
+            )
+            .unwrap();
+        assert!(remove(&engine, &container, true, false).await.is_err());
+        assert!(engine.store.load_container(&id).unwrap().is_some());
+        engine.db.retire_workload_transfer("orphan-move").unwrap();
+        engine.db.remove_vm(&owner).unwrap();
+
+        // Neither a potentially live execution nor cyclic ownership is an
+        // orphaned stopped record that can be discarded.
+        container.update(&engine, |record| record.state.status = "running".into());
+        assert!(remove(&engine, &container, true, false).await.is_err());
+        container.update(&engine, |record| {
+            record.state.status = "created".into();
+            record.host_config.network_mode = format!("container:{id}");
+        });
+        assert_eq!(
+            remove(&engine, &container, false, false)
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        container.update(&engine, |record| {
+            record.host_config.network_mode = format!("container:{}", "d".repeat(64))
+        });
+        container.update(&engine, |record| record.machine = "unexpected-owner".into());
+        assert!(remove(&engine, &container, false, false).await.is_err());
+        container.update(&engine, |record| record.machine.clear());
+        remove(&engine, &container, false, false).await.unwrap();
+        assert!(engine.find_container(&id).is_none());
+        assert!(engine.store.load_container(&id).unwrap().is_none());
+        assert!(engine.db.list_vms().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn transfer_claim_preserves_container_removal_and_rename() {
