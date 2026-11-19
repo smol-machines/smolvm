@@ -760,6 +760,29 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord) -> Result<()>,
     {
+        self.update_vm_for_record_inner(reviewed, f, false)
+    }
+
+    pub(crate) fn finish_saved_execution_for_record<F>(
+        &self,
+        reviewed: &VmRecord,
+        f: F,
+    ) -> Result<VmRecord>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
+        self.update_vm_for_record_inner(reviewed, f, true)
+    }
+
+    fn update_vm_for_record_inner<F>(
+        &self,
+        reviewed: &VmRecord,
+        f: F,
+        finish_pause: bool,
+    ) -> Result<VmRecord>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
         let review = launch_admission::LaunchReview::from_record(reviewed)?;
         let _admission = self.admit_machine_mutation(&reviewed.name)?;
         self.try_update_vm_with_durability(
@@ -783,7 +806,7 @@ impl SmolvmDb {
                 Ok(())
             },
             true,
-            false,
+            finish_pause,
             Some(&review),
         )?
         .ok_or_else(|| Error::vm_not_found(&reviewed.name))

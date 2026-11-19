@@ -297,13 +297,23 @@ pub fn set_egress_policy(
             actual: format!("{state:?}"),
         });
     }
-    let mut updated = record;
+    let mut updated = record.clone();
     updated.apply_egress_policy(policy)?;
-    db.update_vm(name, |r| {
+    db.update_vm_for_record(&record, |r| {
+        if !matches!(
+            r.actual_state(),
+            RecordState::Stopped | RecordState::Created
+        ) {
+            return Err(Error::agent_conflict(
+                "update egress policy",
+                "machine started while settings were being reviewed",
+            ));
+        }
         r.network = updated.network;
         r.allowed_cidrs = updated.allowed_cidrs.clone();
         r.dns_filter_hosts = updated.dns_filter_hosts.clone();
         r.egress_rules = updated.egress_rules.clone();
+        Ok(())
     })?;
     Ok(())
 }
@@ -334,7 +344,7 @@ pub(crate) fn start_vm_with_interceptor(
             "machine is paused; use resume",
         ));
     }
-    crate::agent::state_probe::refuse_start_while_held(db, name)?;
+    crate::agent::state_probe::refuse_start_while_held_record(db, &record)?;
     // A machine with no network cannot pull its registry image in-guest; the
     // host fetches it instead.
     let record = crate::image_store::pin_for_start(
@@ -354,7 +364,7 @@ pub(crate) fn start_vm_with_interceptor(
             ..Default::default()
         },
     )?;
-    mark_running(db, name, started.handle.child_pid())?;
+    mark_running_for_record(db, &started.record)?;
     started._startup_lock = Some(startup_lock);
     Ok(started)
 }
@@ -376,16 +386,7 @@ pub(crate) fn resume_vm(db: &SmolvmDb, name: &str, detached: bool) -> Result<Sta
             ..Default::default()
         },
     )?;
-    let pid = started.handle.child_pid();
-    let pid_start_time = pid.and_then(crate::process::process_start_time);
-    db.finish_saved_execution(name, |record| {
-        record.state = RecordState::Running;
-        record.pid = pid;
-        record.pid_start_time = pid_start_time;
-        record.engine_build = Some(crate::ENGINE_BUILD.to_string());
-        record.paused_checkpoint = None;
-    })?
-    .ok_or_else(|| Error::vm_not_found(name))?;
+    finish_resumed_execution(db, &started.record)?;
     Ok(started)
 }
 
@@ -429,6 +430,7 @@ fn record_launch_features(record: &VmRecord, features: LaunchFeatures) -> Result
 pub(crate) struct StartedVm {
     pub(crate) handle: VmHandle,
     pub(crate) freshly_started: bool,
+    pub(crate) record: VmRecord,
     _startup_lock: Option<crate::agent::fork::ForkSourceLock>,
 }
 
@@ -466,7 +468,7 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
         }
     }
     let manager = if record.is_process_alive() {
-        AgentManager::for_vm(&record.name)
+        AgentManager::for_existing_vm_record(record)
     } else {
         AgentManager::for_vm_record(record)
     }
@@ -501,8 +503,13 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
         }
     }
 
+    let mut observed = record.clone();
+    let process = manager.pid_and_start_time();
+    observed.pid = process.map(|(pid, _)| pid);
+    observed.pid_start_time = process.and_then(|(_, start)| start);
     Ok(StartedVm {
         handle: VmHandle::new(manager, None),
+        record: observed,
         freshly_started: freshly_started && !restoring_checkpoint,
         _startup_lock: None,
     })
@@ -538,7 +545,7 @@ pub(crate) fn start_forkable_vm(db: &SmolvmDb, name: &str) -> Result<StartedVm> 
         ..LaunchFeatures::default()
     };
     let mut started = launch_from_record(&record, features)?;
-    mark_running(db, name, started.handle.child_pid())?;
+    mark_running_for_record(db, &started.record)?;
     started._startup_lock = Some(startup_lock);
     Ok(started)
 }
@@ -554,20 +561,20 @@ pub fn start_vm_with_netns(
     netns: std::path::PathBuf,
 ) -> Result<VmHandle> {
     let startup_lock = crate::agent::fork::lock_fork_source(name)?;
-    if get_record(db, name)?.paused_checkpoint.is_some() {
+    let record = get_record(db, name)?;
+    if record.paused_checkpoint.is_some() {
         return Err(Error::agent_conflict(
             "start machine",
             "machine is paused; use resume",
         ));
     }
-    crate::agent::state_probe::refuse_start_while_held(db, name)?;
-    let record = get_record(db, name)?;
+    crate::agent::state_probe::refuse_start_while_held_record(db, &record)?;
     let features = LaunchFeatures {
         pod_netns: Some(netns),
         ..LaunchFeatures::default()
     };
     let mut started = launch_from_record(&record, features)?;
-    mark_running(db, name, started.handle.child_pid())?;
+    mark_running_for_record(db, &started.record)?;
     started._startup_lock = Some(startup_lock);
     Ok(started.handle)
 }
@@ -705,7 +712,7 @@ fn boot_prepared_fork(
                 let _ = handle.stop();
                 return Err(error);
             }
-            if let Err(error) = mark_running(db, clone, handle.child_pid()) {
+            if let Err(error) = mark_running_for_record(db, &started.record) {
                 let _ = handle.stop();
                 return Err(error);
             }
@@ -931,7 +938,7 @@ pub fn fork_vm_batch(
 /// Connect to an already-running VM and return a cached handle.
 pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
     let record = get_record(db, name)?;
-    let manager = AgentManager::for_vm(name)
+    let manager = AgentManager::for_existing_vm_record(&record)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     // Reconnection records the existing PID for explicit lifecycle operations,
     // but this handle did not start that process and must not stop it on Drop.
@@ -961,7 +968,8 @@ pub fn stop_vm_with_timeout(
     stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     let record = get_record(db, name)?;
-    let manager = AgentManager::for_vm(name)
+    let _admission = db.admit_machine_mutation(name)?;
+    let manager = AgentManager::for_existing_vm_record(&record)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     manager.try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time);
     if !record.staged_mounts.is_empty() {
@@ -979,7 +987,7 @@ pub fn stop_vm_with_timeout(
     // force_detach is infallible and no-ops when unmounted; macOS hdiutil detach, a
     // compile-time no-op on Linux.
     smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(name));
-    mark_stopped(db, name)
+    mark_stopped_for_record(db, &record)
 }
 
 /// Remove a VM record and its storage directory.
@@ -1075,21 +1083,69 @@ pub fn reconcile_runtime_machines(db: &SmolvmDb) -> Result<usize> {
 
 /// Mark a machine record as running.
 pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
-    let pid_start_time = pid.and_then(crate::process::process_start_time);
-    db.update_vm(name, |record| {
+    let mut record = get_record(db, name)?;
+    record.pid = pid;
+    record.pid_start_time = pid.and_then(crate::process::process_start_time);
+    mark_running_for_record(db, &record)
+}
+
+fn require_same_execution(current: &VmRecord, reviewed: &VmRecord) -> Result<()> {
+    if (current.pid, current.pid_start_time) != (reviewed.pid, reviewed.pid_start_time) {
+        return Err(Error::agent_conflict(
+            "publish machine state",
+            "machine execution changed during this operation",
+        ));
+    }
+    Ok(())
+}
+
+pub(crate) fn mark_running_for_record(db: &SmolvmDb, reviewed: &VmRecord) -> Result<()> {
+    db.update_vm_for_record(reviewed, |record| {
+        require_same_execution(record, reviewed)?;
+        if reviewed.pid.is_none() || reviewed.pid_start_time.is_none() {
+            return Err(Error::agent_conflict(
+                "publish machine start",
+                "running process identity is unavailable",
+            ));
+        }
         record.state = RecordState::Running;
-        record.pid = pid;
-        record.pid_start_time = pid_start_time;
         record.engine_build = Some(crate::ENGINE_BUILD.to_string());
-    })?
-    .ok_or_else(|| Error::vm_not_found(name))?;
+        Ok(())
+    })?;
+    Ok(())
+}
+
+fn finish_resumed_execution(db: &SmolvmDb, reviewed: &VmRecord) -> Result<()> {
+    db.finish_saved_execution_for_record(reviewed, |record| {
+        require_same_execution(record, reviewed)?;
+        if reviewed.pid.is_none()
+            || reviewed.pid_start_time.is_none()
+            || record.paused_checkpoint != reviewed.paused_checkpoint
+        {
+            return Err(Error::agent_conflict(
+                "finish resume",
+                "saved execution changed during this operation",
+            ));
+        }
+        record.state = RecordState::Running;
+        record.engine_build = Some(crate::ENGINE_BUILD.to_string());
+        record.paused_checkpoint = None;
+        Ok(())
+    })?;
     Ok(())
 }
 
 /// Mark a machine record as stopped.
 pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
-    db.update_vm(name, VmRecord::mark_process_stopped)?
-        .ok_or_else(|| Error::vm_not_found(name))?;
+    mark_stopped_for_record(db, &get_record(db, name)?)
+}
+
+pub(crate) fn mark_stopped_for_record(db: &SmolvmDb, reviewed: &VmRecord) -> Result<()> {
+    db.update_vm_for_record(reviewed, |record| {
+        require_same_execution(record, reviewed)?;
+        record.mark_process_stopped();
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -1676,3 +1732,7 @@ mod held_process_tests {
         fake_held::held(pid).start_refusal()
     }
 }
+
+#[cfg(test)]
+#[path = "control_reviewed_tests.rs"]
+mod reviewed_control_tests;

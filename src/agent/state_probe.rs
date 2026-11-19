@@ -226,6 +226,13 @@ pub fn refuse_start_while_held(db: &SmolvmDb, name: &str) -> crate::Result<()> {
     let Some(record) = db.get_vm(name)? else {
         return Ok(());
     };
+    refuse_start_while_held_record(db, &record)
+}
+
+pub(crate) fn refuse_start_while_held_record(
+    db: &SmolvmDb,
+    record: &VmRecord,
+) -> crate::Result<()> {
     let (RecordState::Stopped, Some(pid)) = (&record.state, record.pid) else {
         return Ok(());
     };
@@ -233,11 +240,18 @@ pub fn refuse_start_while_held(db: &SmolvmDb, name: &str) -> crate::Result<()> {
         return Err(crate::Error::agent("start agent", held.start_refusal()));
     }
     if !record.is_process_alive() {
-        db.update_vm(name, |r| {
-            if r.state == RecordState::Stopped && r.pid == Some(pid) {
+        db.update_vm_for_record(record, |r| {
+            if (r.pid, r.pid_start_time) != (Some(pid), record.pid_start_time) {
+                return Err(crate::Error::agent_conflict(
+                    "recover held process",
+                    "machine execution changed",
+                ));
+            }
+            if r.state == RecordState::Stopped {
                 r.pid = None;
                 r.pid_start_time = None;
             }
+            Ok(())
         })?;
     }
     Ok(())

@@ -1956,6 +1956,19 @@ impl AgentManager {
         )
     }
 
+    /// Observe or reconnect to the exact persisted machine the caller read,
+    /// without preparing or growing its disks.
+    pub fn for_existing_vm_record(record: &crate::config::VmRecord) -> Result<Self> {
+        Self::open_with_creation(
+            &record.name,
+            DiskAccess::Observe,
+            None,
+            Some(crate::db::launch_admission::LaunchReview::from_record(
+                record,
+            )?),
+        )
+    }
+
     /// Prepare a machine owned by an unpublished creation. The capability
     /// stays with its creator and workers until publication or failure cleanup.
     pub fn for_vm_creation(
@@ -2443,6 +2456,7 @@ impl AgentManager {
         pid: Option<i32>,
         expected_start_time: Option<u64>,
     ) -> Option<()> {
+        self.validate_control_identity().ok()?;
         if !self.vsock_socket.exists() {
             return None;
         }
@@ -2476,6 +2490,16 @@ impl AgentManager {
         // before binding its port.
         if let Ok(mut client) = super::AgentClient::connect_for_state_probe(&self.vsock_socket) {
             if client.ping().is_ok() {
+                // The socket may have been replaced while connect/ping waited.
+                self.validate_control_identity().ok()?;
+                self.launch_review
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .validate_execution(
+                        &crate::db::SmolvmDb::open().ok()?,
+                        effective_pid.map(|pid| (pid, pid_start_time)),
+                    )
+                    .ok()?;
                 // Update internal state to reflect running
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
@@ -2483,7 +2507,7 @@ impl AgentManager {
                 // Without verification, stop() could signal the wrong process.
                 if let Some(p) = effective_pid {
                     if process::is_our_process_strict(p, pid_start_time) {
-                        inner.child = Some(ChildProcess::new(p));
+                        inner.child = Some(ChildProcess::from_identity(p, pid_start_time));
                     } else {
                         tracing::debug!(
                             pid = p,
@@ -2611,7 +2635,8 @@ impl AgentManager {
     /// Get the VM process ID and its captured start time for verified external cleanup.
     ///
     /// Prefers the in-memory child handle (start time captured at spawn).
-    /// Falls back to the PID file if no in-memory handle is present.
+    /// Otherwise retains the PID from the original database review. Only an
+    /// unregistered helper falls back to its runtime PID file.
     /// Returns `None` if neither source has a PID.
     pub fn pid_and_start_time(&self) -> Option<(i32, Option<u64>)> {
         {
@@ -2620,7 +2645,38 @@ impl AgentManager {
                 return Some((child.pid(), child.start_time()));
             }
         }
+        if let Some((pid, start)) = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observed_execution()
+        {
+            return pid.map(|pid| (pid, start));
+        }
         self.read_pid_file_with_start_time()
+    }
+
+    fn validate_control_identity(&self) -> Result<()> {
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|child| (child.pid(), child.start_time()));
+        self.launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .validate_execution(&crate::db::SmolvmDb::open()?, child)
+    }
+
+    fn admit_control_mutation(&self) -> Result<crate::db::transfer_admission::MutationGuard> {
+        let db = crate::db::SmolvmDb::open()?;
+        let admission = match self.name() {
+            Some(name) => db.admit_machine_mutation(name)?,
+            None => db.admit_workload_mutation(None, &[self.storage_disk.path().to_path_buf()])?,
+        };
+        self.validate_control_identity()?;
+        Ok(admission)
     }
 
     /// Check if the VM process is actually alive using start-time-aware
@@ -4299,6 +4355,21 @@ impl AgentManager {
         guest_is_paused: bool,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
+        self.validate_control_identity()?;
+        // An acknowledgment from a path is not authority over an arbitrary PID.
+        // Verify before opening the agent socket or writing a stop marker.
+        if !process::is_alive(pid) {
+            return Ok(());
+        }
+        let verified = process::is_our_process_strict(pid, start_time)
+            || (start_time.is_none()
+                && process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy()));
+        if !verified {
+            return Err(Error::agent_conflict(
+                "stop agent",
+                "machine process identity changed",
+            ));
+        }
         // Whatever ends the VMM from here, smolvm asked for it.
         if let Some(name) = self.name() {
             crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
@@ -4307,12 +4378,11 @@ impl AgentManager {
         // flush, so skip the handshake rather than wait out its deadline and
         // then refuse the stop. Identity is still verified below, from the PID
         // start time or this VM's own boot-config path.
-        let shutdown_acked = if guest_is_paused {
+        if guest_is_paused {
             tracing::debug!(
                 pid,
                 "guest is paused; terminating without a shutdown handshake"
             );
-            false
         } else {
             // Use short timeout — the agent may already be gone (ephemeral run exited).
             // A 100ms connect timeout avoids blocking the exit path.
@@ -4324,11 +4394,13 @@ impl AgentManager {
                 connected = connection.is_ok(),
                 "shutdown agent connect finished"
             );
-            let shutdown = connection.and_then(|mut client| match stop_timeout {
-                Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
-                None => client.shutdown(),
+            let shutdown = connection.and_then(|mut client| {
+                self.validate_control_identity()?;
+                match stop_timeout {
+                    Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
+                    None => client.shutdown(),
+                }
             });
-            let acked = shutdown.is_ok();
 
             // Process identity is not proof that guest writes reached disk. A slow
             // flush must not turn a graceful stop into an unannounced power cut.
@@ -4366,27 +4438,20 @@ impl AgentManager {
                 );
                 return Ok(());
             }
-            acked
-        };
+        }
 
-        // Identity check: vsock acknowledgement OR strict PID start-time match OR
-        // an argv match on this VM's unique boot-config path. We intentionally do
-        // NOT use the lenient is_our_process() here because it treats any alive
-        // PID as "ours" when start_time is None — which risks killing an unrelated
-        // process if the OS reused the PID. The cmdline fallback is safe for the
-        // same reason it's specific: only our `_boot-vm <this-vm>/boot-config.json`
-        // process carries that exact path, so it recovers the case where the agent
-        // vsock is wedged (no ack) AND the start-time record is missing — the exact
-        // combination that otherwise leaks a live orphan the control can never see.
-        let identity_ok = shutdown_acked
-            || process::is_our_process_strict(pid, start_time)
-            || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
+        // Recheck after the guest flush: an acknowledgment does not identify a
+        // host PID. Legacy records without a start time may use the exact boot
+        // path, but a mismatched known start time never falls back to argv.
+        let identity_ok = process::is_our_process_strict(pid, start_time)
+            || (start_time.is_none()
+                && process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy()));
 
         let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
-                    "PID start-time not verified, identity confirmed via vsock"
+                    "legacy process identity confirmed by its boot-config path"
                 );
             }
             // The stop helper observes the kernel's exit event or reaps our
@@ -4507,16 +4572,18 @@ impl AgentManager {
     /// Kill the VM and wait up to `timeout` before reclaiming its resources.
     /// Large disposable helpers can take longer to release their mappings.
     pub fn kill_and_wait(&self, timeout: std::time::Duration) {
-        // Two PID sources with very different PID-reuse risk:
-        //   - the in-memory child: a direct child we still own, so the kernel
-        //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
-        //   - the pid-file: a process we did NOT spawn as our child (recovered
-        //     after a re-attach), so between the pid-file write and now the OS
-        //     may have reused the PID. Verify the recorded start-time before
-        //     SIGKILL (`kill_verified`) so we never signal an unrelated process.
+        let _admission = match self.admit_control_mutation() {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::warn!(%error, "refusing stale or transfer-owned VM cleanup");
+                return;
+            }
+        };
+        // A cached child may have been reattached rather than spawned here.
+        // Retain and verify its original start time before signaling it.
         let owned_child = {
             let inner = self.inner.lock();
-            inner.child.as_ref().map(|c| c.pid())
+            inner.child.as_ref().map(|c| (c.pid(), c.start_time()))
         };
 
         // Whatever ends the VMM from here, smolvm asked for it.
@@ -4526,22 +4593,28 @@ impl AgentManager {
             }
         };
         let killed_pid = match owned_child {
-            Some(pid) => {
+            Some((pid, start_time)) => {
                 if process::is_alive(pid) {
+                    if !process::is_our_process_strict(pid, start_time) {
+                        tracing::warn!(pid, "refusing kill of a changed process identity");
+                        return;
+                    }
                     mark(pid);
-                    process::kill(pid);
+                    process::kill_verified(pid, start_time);
                 }
                 Some(pid)
             }
-            None => match self.read_pid_file_with_start_time() {
+            None => match self.pid_and_start_time() {
                 Some((pid, start_time)) => {
                     mark(pid);
                     if process::kill_verified(pid, start_time) {
                         Some(pid)
-                    } else if process::cmdline_contains(
-                        pid,
-                        &self.boot_config_path().to_string_lossy(),
-                    ) {
+                    } else if start_time.is_none()
+                        && process::cmdline_contains(
+                            pid,
+                            &self.boot_config_path().to_string_lossy(),
+                        )
+                    {
                         // Start-time unverifiable, but the live PID's argv carries
                         // this VM's unique boot-config path — unambiguously ours,
                         // so kill it rather than leak a live orphan.
@@ -4638,6 +4711,7 @@ impl AgentManager {
     }
 
     fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
+        let _admission = self.admit_control_mutation()?;
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -4646,7 +4720,7 @@ impl AgentManager {
         if state == AgentState::Stopped {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
-            if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
+            if let Some((pid, start_time)) = self.pid_and_start_time() {
                 if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
                 {
                     tracing::warn!(
@@ -4671,20 +4745,10 @@ impl AgentManager {
         // Get the child PID and start time — try in-memory first, then PID file.
         // The PID file fallback is critical for default VMs where a fresh
         // AgentManager doesn't know the PID from a previous CLI invocation.
-        let (child_pid, pid_start_time) = {
-            let inner = self.inner.lock();
-            if let Some(child) = inner.child.as_ref() {
-                // Use the start time captured when the child handle was created,
-                // not recomputed from the PID (which would be self-fulfilling
-                // if the PID was recycled by the OS).
-                (Some(child.pid()), child.start_time())
-            } else {
-                match self.read_pid_file_with_start_time() {
-                    Some((pid, start_time)) => (Some(pid), start_time),
-                    None => (None, None),
-                }
-            }
-        };
+        let (child_pid, pid_start_time) = self
+            .pid_and_start_time()
+            .map(|(pid, start)| (Some(pid), start))
+            .unwrap_or((None, None));
 
         if let Some(pid) = child_pid {
             if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
@@ -6463,3 +6527,7 @@ mod egress_signal_tests {
         assert!(read_egress_signals_at(&log).is_none());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "manager_reviewed_control_tests.rs"]
+mod reviewed_control_tests;

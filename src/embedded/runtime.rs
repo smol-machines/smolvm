@@ -626,7 +626,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -691,7 +691,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -740,7 +740,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -1038,7 +1038,7 @@ impl EmbeddedRuntime {
                     handle.sync_staged_mounts(&record)?;
                 }
                 handle.stop_with_timeout(options.stop_timeout)?;
-                control::mark_stopped(&self.db, name)?;
+                control::mark_stopped_for_record(&self.db, &record)?;
                 return Ok(());
             }
 

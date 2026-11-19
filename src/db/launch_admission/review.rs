@@ -19,17 +19,19 @@ pub(crate) struct LaunchReview {
     database: PathBuf,
     name: Option<String>,
     identity: Option<RecordIdentity>,
+    execution: Option<(Option<i32>, Option<u64>)>,
 }
 
 impl LaunchReview {
     pub(crate) fn capture(db: &SmolvmDb, name: Option<&str>) -> Result<Self> {
+        let record = name.map(|name| db.get_vm(name)).transpose()?.flatten();
         Ok(Self {
             database: db.path.canonicalize()?,
             name: name.map(str::to_owned),
-            identity: name
-                .map(|name| db.get_vm(name))
-                .transpose()?
-                .flatten()
+            execution: record
+                .as_ref()
+                .map(|record| (record.pid, record.pid_start_time)),
+            identity: record
                 .map(|record| {
                     record.database_identity.ok_or_else(|| {
                         conflict(
@@ -52,6 +54,7 @@ impl LaunchReview {
             database: identity.database.clone(),
             name: Some(record.name.clone()),
             identity: Some(identity),
+            execution: Some((record.pid, record.pid_start_time)),
         })
     }
 
@@ -76,6 +79,7 @@ impl LaunchReview {
             database,
             name: member.map(|member| member.name.clone()),
             identity,
+            execution: member.map(|member| (member.pid, member.pid_start_time)),
         })
     }
 
@@ -91,13 +95,45 @@ impl LaunchReview {
     }
 
     pub(crate) fn validate_conn(&self, db: &SmolvmDb, conn: &Connection) -> Result<()> {
+        self.reviewed_record(db, conn).map(|_| ())
+    }
+
+    /// A known record with no PID is distinct from an anonymous process whose
+    /// identity can only be recovered from its private runtime files.
+    pub(crate) fn observed_execution(&self) -> Option<(Option<i32>, Option<u64>)> {
+        self.execution
+    }
+
+    pub(crate) fn validate_execution(
+        &self,
+        db: &SmolvmDb,
+        child: Option<(i32, Option<u64>)>,
+    ) -> Result<()> {
+        db.with_read_conn(|conn| {
+            if let Some(record) = self.reviewed_record(db, conn)? {
+                let expected = child
+                    .map(|(pid, start)| (Some(pid), start))
+                    .or(self.execution);
+                if expected != Some((record.pid, record.pid_start_time)) {
+                    return Err(conflict(
+                        "machine execution changed since this handle was acquired",
+                    ));
+                }
+            }
+            Ok(())
+        })
+    }
+
+    fn reviewed_record(&self, db: &SmolvmDb, conn: &Connection) -> Result<Option<VmRecord>> {
         if self.database != db.path.canonicalize()? {
             return Err(conflict("startup review belongs to another database"));
         }
         if let Some(name) = &self.name {
-            let current = read_record(conn, &self.database, name)?
+            let record = read_record(conn, &self.database, name)?;
+            let current = record
+                .as_ref()
                 .map(|record| {
-                    record.database_identity.ok_or_else(|| {
+                    record.database_identity.clone().ok_or_else(|| {
                         conflict(
                             "machine identity is missing or corrupt; recover it before starting",
                         )
@@ -109,8 +145,9 @@ impl LaunchReview {
                     "machine changed since its settings were reviewed; retry with current settings",
                 ));
             }
+            return Ok(record);
         }
-        Ok(())
+        Ok(None)
     }
 }
 
