@@ -6405,6 +6405,25 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
 #[cfg(target_os = "linux")]
 const MAX_COW_CHAIN_FILES: usize = 4;
 
+/// Refuse a file the manifest lists as raw that is in fact a qcow2 image. Only
+/// files listed as qcow2 have their backing checked, while the layer above can
+/// declare its backing qcow2 (or leave it to a reader that probes), so a qcow2
+/// listed as raw would be parsed as qcow2 anyway, with a backing file of the
+/// checkpoint author's choosing: any host file the restoring user can read.
+fn refuse_qcow2_listed_as_raw(path: &Path, target: &str) -> Result<()> {
+    let mut magic = [0_u8; 4];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut magic))
+        .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+    if read == magic.len() && magic == *b"QFI\xfb" {
+        return Err(Error::agent(
+            "install checkpoint",
+            format!("disk '{target}' is listed as raw but is a qcow2 image"),
+        ));
+    }
+    Ok(())
+}
+
 /// Check that the qcow2 `staged` (file `index` of `disk`) is backed by exactly
 /// the next file of the captured chain.
 fn verify_qcow2_backing(staged: &Path, disk: &CheckpointDisk, index: usize) -> Result<()> {
@@ -6662,6 +6681,9 @@ fn install_with(
                     let started = std::time::Instant::now();
                     let staged = staged_disks.join(&file.target);
                     let source = extracted.join(&file.asset.path);
+                    if file.format == "raw" {
+                        refuse_qcow2_listed_as_raw(&source, &file.target)?;
+                    }
                     #[cfg(target_os = "linux")]
                     if index == 0
                         && disk.files.len() == 1
@@ -7306,6 +7328,26 @@ mod tests {
     }
 
     use super::*;
+
+    // A checkpoint can list a qcow2 layer as raw: install never inspects a raw
+    // file, so its backing path would reach a host file through the layer
+    // above. Such a file is refused.
+    #[test]
+    fn a_qcow2_listed_as_raw_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw.img");
+        std::fs::write(&raw, vec![0_u8; 4096]).unwrap();
+        assert!(refuse_qcow2_listed_as_raw(&raw, "storage.raw").is_ok());
+        let disguised = dir.path().join("disguised.img");
+        let mut bytes = b"QFI\xfb".to_vec();
+        bytes.resize(4096, 0);
+        std::fs::write(&disguised, bytes).unwrap();
+        let error = refuse_qcow2_listed_as_raw(&disguised, "storage.raw").unwrap_err();
+        assert!(error.to_string().contains("listed as raw"), "{error}");
+        let tiny = dir.path().join("tiny.img");
+        std::fs::write(&tiny, b"QF").unwrap();
+        assert!(refuse_qcow2_listed_as_raw(&tiny, "storage.raw").is_ok());
+    }
 
     /// `/proc/cpuinfo` of an M4 Max guest booted with pointer authentication off.
     const M4_MAX_GUEST_CPUINFO: &str = "processor\t: 0\nFeatures\t: fp asimd evtstrm aes \
