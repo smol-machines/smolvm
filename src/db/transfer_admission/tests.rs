@@ -278,6 +278,83 @@ fn transfer_claim_waits_for_inflight_mutations_without_serializing_readers() {
 
 #[cfg(unix)]
 #[test]
+fn transfer_admission_gate_releases_only_in_its_owning_process() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    struct Forked(i32);
+    impl Drop for Forked {
+        fn drop(&mut self) {
+            // SAFETY: This unreaped direct child still owns its PID. It runs
+            // only the pipe handshake below, with no guest or external work.
+            unsafe {
+                libc::kill(self.0, libc::SIGKILL);
+                while libc::waitpid(self.0, std::ptr::null_mut(), 0) < 0 {
+                    if std::io::Error::last_os_error().raw_os_error() != Some(libc::EINTR) {
+                        break;
+                    }
+                }
+            }
+        }
+    }
+
+    let root = tempfile::tempdir().unwrap();
+    let db = SmolvmDb::open_at(&root.path().join("state.db")).unwrap();
+    for exclusive in [false, true] {
+        for child_drops_guard in [false, true] {
+            let gate = db.transfer_gate(exclusive).unwrap();
+            let (mut parent, child) = UnixStream::pair().unwrap();
+            // SAFETY: The child uses only descriptor close, getpid, pipe I/O,
+            // and _exit; it never touches the inherited SQLite connection or
+            // any lock held by another test-runner thread.
+            let pid = unsafe { libc::fork() };
+            assert!(pid >= 0);
+            if pid == 0 {
+                drop(parent);
+                if child_drops_guard {
+                    drop(gate);
+                } else {
+                    std::mem::forget(gate);
+                }
+                let mut byte = [0_u8];
+                // SAFETY: Buffers and the owned socket descriptor are valid;
+                // _exit bypasses inherited Rust/SQLite destructors.
+                unsafe {
+                    libc::write(child.as_raw_fd(), b"R".as_ptr().cast(), 1);
+                    libc::read(child.as_raw_fd(), byte.as_mut_ptr().cast(), 1);
+                    libc::_exit(0);
+                }
+            }
+            let child_process = Forked(pid);
+            drop(child);
+            parent
+                .set_read_timeout(Some(std::time::Duration::from_secs(5)))
+                .unwrap();
+            let mut ready = [0];
+            parent.read_exact(&mut ready).unwrap();
+            assert_eq!(ready, *b"R");
+            assert!(
+                db.transfer_gate(true).is_err(),
+                "a child released its parent's gate"
+            );
+            drop(gate);
+            let next = db.transfer_gate(true);
+            // The child still lives with its inherited descriptor: success
+            // must not depend on that unrelated process reaching exec/exit.
+            assert!(
+                next.is_ok(),
+                "an inherited descriptor retained a completed operation's gate"
+            );
+            drop(next);
+            parent.write_all(b"D").unwrap();
+            drop(child_process);
+        }
+    }
+}
+
+#[cfg(unix)]
+#[test]
 fn transfer_admission_fences_shared_data_aliases_and_both_directory_directions() {
     let root = tempfile::tempdir().unwrap();
     let db = SmolvmDb::open_at(&root.path().join("state.db")).unwrap();

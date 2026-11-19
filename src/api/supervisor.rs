@@ -113,6 +113,7 @@ impl Supervisor {
 
     /// Check a single machine and restart if needed.
     async fn check_machine(&mut self, name: &str) -> crate::Result<()> {
+        let _admission = self.state.db().admit_machine_mutation(name)?;
         {
             let lifecycle = self.state.lifecycle_lock(name);
             // An API lifecycle operation may be creating or deleting the row.
@@ -243,6 +244,15 @@ impl Supervisor {
 
     /// Attempt to restart a machine.
     async fn restart_machine(&self, name: &str) -> crate::Result<()> {
+        let state = self.state.clone();
+        let name = name.to_string();
+        tokio::spawn(async move { Self::restart_machine_owned(&state, &name).await })
+            .await
+            .map_err(|error| crate::Error::agent("restart task", error.to_string()))?
+    }
+
+    async fn restart_machine_owned(state: &Arc<ApiState>, name: &str) -> crate::Result<()> {
+        let _admission = state.db().admit_machine_mutation(name)?;
         // Hold the per-machine lifecycle lock across the acquire+mount+launch so a
         // concurrent user-initiated stop/delete cannot detach the macOS layers
         // volume out from under this restart (review finding #3). Acquired before
@@ -251,7 +261,7 @@ impl Supervisor {
         // also follow. If a user op holds it, this restart blocks until that op
         // completes (operations are bounded), then re-derives state from the DB.
         // Linux: the guarded mount is a no-op.
-        let lifecycle = self.state.lifecycle_lock(name);
+        let lifecycle = state.lifecycle_lock(name);
         let _guard = lifecycle.lock().await;
         let source = name.to_string();
         let _source_lock =
@@ -267,12 +277,12 @@ impl Supervisor {
         // completed, so re-launching would kill+reboot a healthy machine and —
         // under concurrent boots — double the disk-prep load. If it's alive
         // again, there's nothing to restart.
-        if self.state.is_machine_alive(name) {
+        if state.is_machine_alive(name) {
             tracing::debug!(machine = %name, "machine came back alive before restart; skipping");
             return Ok(());
         }
 
-        let entry = match self.state.get_machine(name) {
+        let entry = match state.get_machine(name) {
             Ok(entry) => entry,
             Err(_) => {
                 tracing::warn!(machine = %name, "machine no longer exists, skipping restart");
@@ -283,7 +293,7 @@ impl Supervisor {
         // Load the authoritative config from the database record rather than
         // the in-memory MachineEntry, which may have lost fields (e.g.,
         // network_backend, gpu_vram_mib) during the ResourceSpec round-trip.
-        let record = match self.state.db().get_vm(name) {
+        let record = match state.db().get_vm(name) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 tracing::warn!(machine = %name, "machine not found in database, skipping restart");
@@ -299,7 +309,7 @@ impl Supervisor {
         // relaunching it writable would corrupt them. Clones keep working
         // without the base process, so skipping is safe (and avoids thrashing,
         // since `prepare_for_launch` would refuse the launch anyway).
-        match self.state.db().dependent_clones(name) {
+        match state.db().dependent_clones(name) {
             Ok(clones) if !clones.is_empty() => {
                 tracing::warn!(
                     machine = %name,
@@ -314,7 +324,7 @@ impl Supervisor {
             }
         }
 
-        if record.nested_virt.unwrap_or(false) && !self.state.nested_virt_allowed() {
+        if record.nested_virt.unwrap_or(false) && !state.nested_virt_allowed() {
             tracing::warn!(
                 machine = %name,
                 "not auto-restarting: nested virtualization is disabled on this server"
@@ -335,7 +345,12 @@ impl Supervisor {
 
         let entry_clone = entry.clone();
         let start_result = tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
+            let mut entry = entry_clone.lock();
+            entry.manager = crate::agent::AgentManager::for_vm_with_sizes(
+                &name_for_features,
+                record.storage_gb,
+                record.overlay_gb,
+            )?;
             // Wire pre-extracted layers if this machine was created from a .smolmachine.
             let mut features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
@@ -366,20 +381,14 @@ impl Supervisor {
                     let entry = entry.lock();
                     entry.manager.child_pid()
                 };
-                if let Err(e) = self
-                    .state
-                    .update_machine_state(name, RecordState::Running, pid)
-                {
+                if let Err(e) = state.update_machine_state(name, RecordState::Running, pid) {
                     tracing::warn!(machine = %name, error = %e, "failed to persist running state");
                 }
                 tracing::info!(machine = %name, pid = ?pid, "machine restarted successfully");
                 Ok(())
             }
             Err(e) => {
-                if let Err(db_err) =
-                    self.state
-                        .update_machine_state(name, RecordState::Failed, None)
-                {
+                if let Err(db_err) = state.update_machine_state(name, RecordState::Failed, None) {
                     tracing::warn!(machine = %name, error = %db_err, "failed to persist failed state");
                 }
                 tracing::error!(machine = %name, error = %e, "failed to restart machine");
@@ -430,6 +439,59 @@ mod restart_timing_tests {
     use std::collections::HashMap;
     use std::time::Duration;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn transfer_admission_preserves_supervisor_metadata_and_restart_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let mut record = crate::config::VmRecord::new(
+            "transfer-supervisor".into(),
+            1,
+            128,
+            vec![],
+            vec![],
+            false,
+        );
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        record.restart.restart_count = 3;
+        record.restart.max_retries = 7;
+        record.restart.max_backoff_secs = 1;
+        assert!(db.insert_vm_if_not_exists(&record.name, &record).unwrap());
+        db.claim_workload_transfer(
+            "move",
+            vec![crate::db::transfer_admission::Member::from_record(
+                &record.name,
+                &record,
+            )],
+            &[],
+        )
+        .unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        assert_eq!(state.load_persisted_machines(), vec![record.name.clone()]);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        let scheduled = Instant::now();
+        supervisor
+            .next_restart_at
+            .insert(record.name.clone(), scheduled);
+        for error in [
+            supervisor.check_machine(&record.name).await.unwrap_err(),
+            supervisor.restart_machine(&record.name).await.unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("environment is moving"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            supervisor.next_restart_at.get(&record.name),
+            Some(&scheduled)
+        );
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap()
+        );
+    }
 
     #[tokio::test]
     async fn live_database_pid_survives_missing_manager_identity() {

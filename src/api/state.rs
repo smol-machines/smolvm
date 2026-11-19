@@ -555,12 +555,16 @@ impl ApiState {
         let mut loaded = Vec::new();
 
         for (name, mut record) in vms {
+            // A restarting server must preserve transfer-owned metadata and
+            // still expose the machine for observation and recovery.
+            let admission = self.db.admit_machine_mutation(&name);
             // A machine that was started but whose process is gone (a host
             // reboot, a crash, a kill -9) is kept as stopped with its disks, so
             // a start boots it again. Only a dead ephemeral machine that no
             // retained clone depends on is removed. Machines in "created" state
             // (pid=None) have never been started and are preserved as they are.
-            if record.paused_checkpoint.is_none()
+            if admission.is_ok()
+                && record.paused_checkpoint.is_none()
                 && record.pid.is_some()
                 && !record.is_process_alive()
             {
@@ -642,7 +646,12 @@ impl ApiState {
             };
 
             // Create AgentManager and try to reconnect
-            match AgentManager::for_vm_with_sizes(&name, record.storage_gb, record.overlay_gb) {
+            let manager = if admission.is_ok() {
+                AgentManager::for_vm_with_sizes(&name, record.storage_gb, record.overlay_gb)
+            } else {
+                AgentManager::for_vm(&name)
+            };
+            match manager {
                 Ok(manager) => {
                     // Try to reconnect to existing running VM
                     let reconnected = manager
@@ -1546,7 +1555,7 @@ pub async fn ensure_machine_running(
 ) -> crate::Result<bool> {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
+        let mut entry = entry_clone.lock();
         let mounts: Vec<_> = entry
             .mounts
             .iter()
@@ -1582,6 +1591,16 @@ pub async fn ensure_machine_running(
                 "start machine",
                 "machine is running but its agent is not answering yet; retry",
             ));
+        }
+        // A server may have loaded this entry in observation mode while a
+        // transfer owned it. Prepare disks only after admission and liveness
+        // checks, when an explicit release allows a fresh start again.
+        if let Some(name) = entry.manager.name().map(str::to_owned) {
+            entry.manager = AgentManager::for_vm_with_sizes(
+                name,
+                entry.resources.storage_gb,
+                entry.resources.overlay_gb,
+            )?;
         }
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
         let mut features = build_launch_features(
@@ -1623,10 +1642,26 @@ fn refuse_implicit_start_of_paused(record: &crate::config::VmRecord) -> crate::R
 /// State persistence is best-effort — a DB write failure is logged but does
 /// not fail the request, matching the supervisor's error-handling pattern.
 pub async fn ensure_running_and_persist(
+    state: &Arc<ApiState>,
+    name: &str,
+    entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+) -> crate::Result<()> {
+    // A disconnected exec/files request must not abandon a boot before its
+    // PID is registered or release admission while spawn_blocking still runs.
+    let state = state.clone();
+    let name = name.to_string();
+    let entry = entry.clone();
+    tokio::spawn(async move { ensure_running_and_persist_owned(&state, &name, &entry).await })
+        .await
+        .map_err(|error| crate::Error::agent("implicit startup task", error.to_string()))?
+}
+
+async fn ensure_running_and_persist_owned(
     state: &ApiState,
     name: &str,
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
 ) -> crate::Result<()> {
+    let _admission = state.db().admit_machine_mutation(name)?;
     // Hold the per-machine lifecycle lock across the implicit-start preflight.
     // ensure_machine_running mounts the macOS layers volume (via with_packed_layers)
     // when the VM is not already up — exactly like the explicit start_machine — so
@@ -1668,6 +1703,8 @@ pub async fn ensure_running_and_persist(
         e.ports = record.port_mappings().iter().map(PortSpec::from).collect();
         e.resources.cpus = Some(record.cpus);
         e.resources.memory_mb = Some(record.mem);
+        e.resources.storage_gb = record.storage_gb;
+        e.resources.overlay_gb = record.overlay_gb;
         e.network = record.network;
         e.forkable = record.forkable_on_start();
         e.cuda_fork_pool_size = record.cuda_fork_pool_size;

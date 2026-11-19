@@ -18,6 +18,12 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
     assert!(SmolvmDb::default_path()
         .unwrap()
         .starts_with(root.join("data")));
+    crate::embedded::bundle::set_bundle(crate::embedded::bundle::Bundle {
+        boot_binary: Some(engine.clone()),
+        ..Default::default()
+    })
+    .unwrap();
+    smolvm_pack::assets::add_template_root(root.clone());
     let db = SmolvmDb::open().unwrap();
     assert!(
         db.list_vms().unwrap().is_empty(),
@@ -159,6 +165,33 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
             .unwrap()
             .is_empty());
 
+        // A server restart during a transfer must keep every environment
+        // visible, including one whose shared data is owned by another member.
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db.clone()));
+        let loaded = state.load_persisted_machines();
+        for name in names {
+            assert!(loaded.iter().any(|loaded| loaded == name));
+        }
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            use axum::extract::{State, Path, Query};
+            use crate::api::handlers::machines;
+            let error = machines::start_machine(State(state.clone()), Path(names[0].into()), Query(Default::default()), Default::default(), axum::body::Bytes::new()).await.unwrap_err();
+            assert!(matches!(error, crate::api::error::ApiError::Conflict(ref message) if message.contains("environment is moving")), "{error:?}");
+            let error = machines::stop_machine(State(state.clone()), Path(names[0].into()), Query(Default::default())).await.unwrap_err();
+            assert!(matches!(error, crate::api::error::ApiError::Conflict(ref message) if message.contains("environment is moving")), "{error:?}");
+            let error = machines::delete_machine(State(state.clone()), Path(names[0].into()), Query(Default::default())).await.unwrap_err();
+            assert!(matches!(error, crate::api::error::ApiError::Conflict(ref message) if message.contains("environment is moving")), "{error:?}");
+            let entry = state.get_machine(names[2]).unwrap();
+            let error = crate::api::state::ensure_running_and_persist(&state, names[2], &entry).await.unwrap_err();
+            assert!(error.to_string().contains("active environment transfer"), "{error}");
+        });
+        assert!(db.get_vm(names[2]).unwrap().unwrap().pid.is_none());
+        assert_eq!(
+            Member::from_record(names[0], &before),
+            Member::from_record(names[0], &db.get_vm(names[0]).unwrap().unwrap())
+        );
+
         db.retire_workload_transfer("live-move").unwrap();
         let (ok, _, error) = command(&["mount", "add", "--name", names[1], "-v", &mapping]);
         assert!(ok, "{error}");
@@ -175,9 +208,34 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
         let (ok, output, error) =
             command(&["exec", "--name", names[0], "--", "cat", "/data/sentinel"]);
         assert!(ok && output.trim() == "after", "{output} {error}");
-        let (ok, _, error) = command(&["start", "--name", names[2]]);
-        assert!(ok, "{error}");
-        assert!(db.get_vm(names[2]).unwrap().unwrap().is_process_alive());
+        runtime.block_on(async {
+            let entry = state.get_machine(names[2]).unwrap();
+            crate::api::state::ensure_running_and_persist(&state, names[2], &entry)
+                .await
+                .unwrap();
+            assert!(db.get_vm(names[2]).unwrap().unwrap().is_process_alive());
+            use crate::api::handlers::machines;
+            use axum::extract::{Path, Query, State};
+            let stopped = machines::stop_machine(
+                State(state.clone()),
+                Path(names[2].into()),
+                Query(Default::default()),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stopped.state, "stopped");
+            let started = machines::start_machine(
+                State(state.clone()),
+                Path(names[2].into()),
+                Query(Default::default()),
+                Default::default(),
+                axum::body::Bytes::new(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(started.state, "running");
+            assert!(db.get_vm(names[2]).unwrap().unwrap().is_process_alive());
+        });
     }));
     let _ = db.retire_workload_transfer("live-move");
     for name in names {

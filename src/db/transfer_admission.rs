@@ -54,7 +54,28 @@ struct Claim {
 /// Keep this guard until the admitted mutation, including process registration,
 /// has finished. Claim creation cannot pass a live guard from another process.
 pub struct MutationGuard {
-    _gate: File,
+    _gate: AdmissionGate,
+}
+
+struct AdmissionGate {
+    file: File,
+    owner_pid: u32,
+}
+
+impl Drop for AdmissionGate {
+    fn drop(&mut self) {
+        // An unrelated fork inherits the open-file description, even with
+        // CLOEXEC, until it execs or exits. Closing our descriptor alone can
+        // therefore retain admission for that child's entire lifetime.
+        // Only the process that acquired this gate may unlock it: dropping
+        // an inherited Rust guard in a child must not release its parent.
+        if std::process::id() != self.owner_pid {
+            return;
+        }
+        if let Err(error) = self.file.unlock() {
+            tracing::warn!(%error, "could not explicitly release transfer admission gate");
+        }
+    }
 }
 
 fn conflict(message: &str) -> Error {
@@ -99,7 +120,7 @@ mod live_tests;
 mod tests;
 
 impl SmolvmDb {
-    fn transfer_gate(&self, exclusive: bool) -> Result<File> {
+    fn transfer_gate(&self, exclusive: bool) -> Result<AdmissionGate> {
         // Resolve symlink spellings of the database to the same gate. The gate
         // is outside removable VM directories and is never unlinked on release.
         let path = self
@@ -120,7 +141,10 @@ impl SmolvmDb {
             file.try_lock_shared()
         };
         match result {
-            Ok(()) => Ok(file),
+            Ok(()) => Ok(AdmissionGate {
+                file,
+                owner_pid: std::process::id(),
+            }),
             Err(TryLockError::WouldBlock) => Err(conflict(
                 "another machine operation is still being admitted; retry the move",
             )),
@@ -177,6 +201,25 @@ impl SmolvmDb {
             }
         }
         Ok(MutationGuard { _gate: gate })
+    }
+
+    /// Admit mutation of a named machine and its persisted host shares.
+    /// Keep the gate held while reading the record and checking the share roots,
+    /// so a transfer cannot claim a newly discovered dependency in between.
+    pub fn admit_machine_mutation(&self, name: &str) -> Result<MutationGuard> {
+        let admission = self.admit_workload_mutation(Some(name), &[])?;
+        if let Some(record) = self.get_vm(name)? {
+            let roots = record
+                .host_mounts()
+                .into_iter()
+                .map(|mount| mount.source)
+                .collect::<Vec<_>>();
+            let checked = self.admit_workload_mutation(Some(name), &roots)?;
+            drop(admission);
+            Ok(checked)
+        } else {
+            Ok(admission)
+        }
     }
 
     /// Claim all members and shared roots atomically, after dependency review.

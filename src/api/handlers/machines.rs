@@ -3817,6 +3817,21 @@ pub async fn start_machine(
     headers: axum::http::HeaderMap,
     body: Bytes,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    with_owned_operation(move |reply| async move {
+        let result = start_machine_transaction(state, name, query, headers, body).await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn start_machine_transaction(
+    state: Arc<ApiState>,
+    name: String,
+    query: StartMachineQuery,
+    headers: axum::http::HeaderMap,
+    body: Bytes,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let _admission = state.db().admit_machine_mutation(&name)?;
     let request: crate::api::types::StartMachineRequest = optional_json_body(&headers, &body)?;
     let query = query.with_body(&request);
     let registry_auth: Option<crate::registry::RegistryAuth> =
@@ -4559,10 +4574,28 @@ async fn branch_batch_transaction(
     golden: &str,
     batch: Vec<crate::api::state::QueuedBranch>,
 ) {
+    let _source_admission = match state.db().admit_machine_mutation(golden) {
+        Ok(admission) => admission,
+        Err(error) => {
+            let error = ApiError::from(error);
+            for queued in batch {
+                let _ = queued.reply.send(Err(error.clone()));
+            }
+            return;
+        }
+    };
+    let mut clone_admissions = Vec::with_capacity(batch.len());
     let mut accepted = Vec::with_capacity(batch.len());
     let mut names = std::collections::HashSet::new();
     let mut host_ports = std::collections::HashSet::new();
     for queued in batch {
+        match state.db().admit_machine_mutation(&queued.req.name) {
+            Ok(admission) => clone_admissions.push(admission),
+            Err(error) => {
+                let _ = queued.reply.send(Err(ApiError::from(error)));
+                continue;
+            }
+        }
         match check_queued_branch(state, golden, &queued.req, &mut names, &mut host_ports).await {
             Ok(fork_env) => accepted.push((queued, fork_env)),
             Err(error) => {
@@ -4829,6 +4862,8 @@ async fn fork_machine_transaction(
     req: ForkRequest,
     reply: &tokio::sync::oneshot::Sender<Result<MachineInfo, ApiError>>,
 ) -> Result<MachineInfo, ApiError> {
+    let _source_admission = state.db().admit_machine_mutation(&golden)?;
+    let _clone_admission = state.db().admit_machine_mutation(&req.name)?;
     let clone = req.name.clone();
     let pinned_ports = branch_pins(&req.ports)?;
     let req_share_weights = req.share_weights;
@@ -5545,6 +5580,7 @@ async fn saved_execution_operation(
     let guard = state.lifecycle_lock(&name).lock_owned().await;
     // The operation owns its lock even if the HTTP caller disconnects.
     tokio::task::spawn_blocking(move || {
+        let _admission = state.db().admit_machine_mutation(&name)?;
         let _guard = guard;
         let runtime = crate::embedded::EmbeddedRuntime::with_db(state.db().clone());
         if resume {
@@ -5686,6 +5722,19 @@ pub async fn stop_machine(
     Path(name): Path<String>,
     Query(query): Query<crate::api::types::StopQuery>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    with_owned_operation(move |reply| async move {
+        let result = stop_machine_transaction(state, name, query).await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn stop_machine_transaction(
+    state: Arc<ApiState>,
+    name: String,
+    query: crate::api::types::StopQuery,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let _admission = state.db().admit_machine_mutation(&name)?;
     let stop_timeout = query.timeout;
     crate::workload::validate_stop_settings(None, stop_timeout).map_err(ApiError::BadRequest)?;
     let stop_timeout = stop_timeout.map(std::time::Duration::from_secs);
@@ -5881,6 +5930,18 @@ pub async fn sync_machine(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    with_owned_operation(move |reply| async move {
+        let result = sync_machine_transaction(state, name).await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn sync_machine_transaction(
+    state: Arc<ApiState>,
+    name: String,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let _admission = state.db().admit_machine_mutation(&name)?;
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock().await;
     let _source_lock = acquire_fork_source_lock(name.clone()).await?;
@@ -5959,9 +6020,18 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
     for (name, record) in running {
         let state = state.clone();
         handles.push(tokio::spawn(async move {
+            let admission = match state.db().admit_machine_mutation(&name) {
+                Ok(admission) => Arc::new(admission),
+                Err(error) => {
+                    tracing::warn!(machine = %name, %error, "drain refused by environment transfer");
+                    return false;
+                }
+            };
             let name_for_kill = name.clone();
             let entry = state.get_machine(&name).ok();
+            let blocking_admission = admission.clone();
             let stopped = tokio::task::spawn_blocking(move || {
+                let _admission = blocking_admission;
                 let _source_lock = match crate::agent::fork::lock_fork_source(&name_for_kill) {
                     Ok(lock) => lock,
                     Err(error) => {
@@ -6005,6 +6075,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                     })
                     .await;
             }
+            drop(admission);
             tracing::info!(machine = %name, stopped, "drain: shutdown attempt finished");
             stopped
         }));
@@ -6051,6 +6122,19 @@ pub async fn delete_machine(
     Path(name): Path<String>,
     Query(query): Query<DeleteQuery>,
 ) -> Result<Json<DeleteResponse>, ApiError> {
+    with_owned_operation(move |reply| async move {
+        let result = delete_machine_transaction(state, name, query).await;
+        let _ = reply.send(result);
+    })
+    .await
+}
+
+async fn delete_machine_transaction(
+    state: Arc<ApiState>,
+    name: String,
+    query: DeleteQuery,
+) -> Result<Json<DeleteResponse>, ApiError> {
+    let _admission = state.db().admit_machine_mutation(&name)?;
     // Cascade: remove the entire lineage deepest-first so every qcow2 overlay
     // disappears before the image that backs it. The read is unlocked, but
     // delete_one re-checks direct dependants under each lifecycle lock, so a
@@ -6206,6 +6290,7 @@ async fn delete_one_transaction(
     state: Arc<ApiState>,
     name: String,
 ) -> Result<DeleteResponse, ApiError> {
+    let _admission = state.db().admit_machine_mutation(&name)?;
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
     // start's acquire+mount+launch (review finding #3). Acquired before the DB
@@ -9098,3 +9183,6 @@ mod held_process_tests {
         assert!(!record.is_process_alive());
     }
 }
+
+#[cfg(test)]
+mod transfer_admission_tests;
