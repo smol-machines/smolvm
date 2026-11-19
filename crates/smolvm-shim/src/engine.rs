@@ -680,7 +680,12 @@ impl PodBackend for EnginePodBackend {
                 .map_err(|e| format!("mkdir {}: {e}", share_dir.display()))?;
 
             let rt = smolvm::embedded::runtime().map_err(|e| e.to_string())?;
-            let mount = HostMount::new(&share_dir, POD_SHARE_GUEST_PATH, false)
+            // Read-only: the agent only reads the share (each container runs on
+            // an overlay whose writes land on the VM's own disk), and the root
+            // shim keeps copying into this tree while the guest runs. A
+            // writable share would let the guest race those copies, through
+            // swapped symlinks, into host paths outside it.
+            let mount = HostMount::new(&share_dir, POD_SHARE_GUEST_PATH, true)
                 .map_err(|e| format!("pod share mount: {e}"))?;
             let spec = MachineSpec {
                 name: id_owned.clone(),
