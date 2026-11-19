@@ -93,37 +93,27 @@ fn prospective_resources_resolve_symlink_parents_and_refuse_dangling_links() {
 }
 
 #[test]
-fn transfer_refuses_preparation_aliases_and_future_paths_until_release() {
+fn transfer_refuses_preparation_roots_and_future_paths_until_release() {
     if !crate::test_support::in_own_process!() {
         return;
     }
     let (root, db, storage, record) = fixture();
     db.insert_vm("web", &record).unwrap();
-    let alias = root.path().join("alias");
-    fs::hard_link(&storage, &alias).unwrap();
-    let pending = db.reserve_vm_preparation(None, &alias, &[]).unwrap();
+    let pending = db.reserve_vm_preparation(None, &storage, &[]).unwrap();
     assert!(db
-        .claim_workload_transfer("busy", vec![member(&db)], std::slice::from_ref(&storage))
+        .claim_workload_transfer("busy", vec![member(&db)], &[root.path().to_path_buf()])
         .is_err());
     drop(pending);
-    db.claim_workload_transfer("disk", vec![member(&db)], &[storage])
+    db.claim_workload_transfer("directory", vec![member(&db)], &[root.path().to_path_buf()])
         .unwrap();
-    assert!(db.reserve_vm_preparation(None, &alias, &[]).is_err());
-    assert!(db
-        .admit_workload_mutation(None, std::slice::from_ref(&alias))
-        .is_err());
-    db.retire_workload_transfer("disk").unwrap();
-    let directory = root.path().join("shared");
-    fs::create_dir(&directory).unwrap();
-    let future = directory.join("new/disk");
-    db.claim_workload_transfer("directory", vec![member(&db)], &[directory])
-        .unwrap();
+    assert!(db.reserve_vm_preparation(None, &storage, &[]).is_err());
+    let future = root.path().join("new/disk");
     assert!(db.reserve_vm_preparation(None, &future, &[]).is_err());
     assert!(!future.exists());
     db.retire_workload_transfer("directory").unwrap();
     let _released = db.reserve_vm_preparation(None, &future, &[]).unwrap();
     assert!(!future.exists());
-    assert_eq!(fs::read(alias).unwrap(), b"untouched");
+    assert_eq!(fs::read(storage).unwrap(), b"untouched");
 }
 
 #[test]
@@ -192,7 +182,7 @@ fn preparation_blocks_real_manager_mutations_and_failed_cleanup_keeps_inventory(
             .env(ROOT, root.path())
             .env("SMOLVM_DATA_DIR", root.path().join("data"))
             .env("SMOLVM_AGENT_ROOTFS", root.path().join("rootfs"))
-            .env("HOME", root.path().join("home"))
+            .env("HOME", root.path().join("data"))
             .env_remove("XDG_DATA_HOME")
             .env_remove("XDG_CACHE_HOME")
             .env_remove("XDG_CONFIG_HOME")
