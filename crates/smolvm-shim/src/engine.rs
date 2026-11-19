@@ -808,10 +808,22 @@ impl PodBackend for EnginePodBackend {
             // their sources to the guest-visible path, so the agent can
             // materialize them into the container's writable overlay. Also inject
             // the pod hostname (which lives on the sandbox spec, not the container).
+            // The VMM reads the share as the sandbox's own uid when it drops
+            // privileges; its data dir (the socket's) is owned by that uid.
+            let owner = sandbox
+                .socket
+                .parent()
+                .and_then(|dir| std::fs::metadata(dir).ok())
+                .map(|meta| {
+                    use std::os::unix::fs::MetadataExt;
+                    (meta.uid(), meta.gid())
+                })
+                .filter(|(uid, _)| *uid != 0);
             let spec_json = materialize_bind_mounts(
                 &spec_json,
                 &sandbox.share_dir,
                 &id_owned,
+                owner,
                 sandbox.hostname.as_deref(),
                 sandbox.sysctls.as_ref(),
             )?;
@@ -1101,6 +1113,7 @@ fn materialize_bind_mounts(
     spec_json: &str,
     share_dir: &Path,
     id: &str,
+    owner: Option<(u32, u32)>,
     sandbox_hostname: Option<&str>,
     sandbox_sysctls: Option<&serde_json::Value>,
 ) -> Result<String, String> {
@@ -1183,8 +1196,7 @@ fn materialize_bind_mounts(
             continue;
         }
 
-        std::fs::create_dir_all(&mounts_dir)
-            .map_err(|e| format!("mkdir {}: {e}", mounts_dir.display()))?;
+        prepare_mounts_dir(&mounts_dir, owner)?;
         let dst = mounts_dir.join(n.to_string());
         // `cp -aT` makes `dst` a copy of `source` (file or dir), preserving
         // modes/owners/symlinks; reflink keeps it cheap on the same fs.
@@ -1197,21 +1209,48 @@ fn materialize_bind_mounts(
             return Err(format!("copy mount {source}: cp exited {status}"));
         }
 
-        // Make the copy world-readable/traversable so the guest agent can read it
-        // through the (uid-mapped) virtiofs share regardless of the source's
-        // original owner/mode — a CRI volume created root-only (e.g. mode 0700)
-        // is otherwise EACCES to the guest. Container-visible perms only widen
-        // read access on this ephemeral copy; write goes to the guest overlay.
-        let _ = std::process::Command::new("chmod")
-            .args(["-R", "a+rX"])
-            .arg(&dst)
-            .status();
+        // A VMM that dropped to the sandbox's uid reads the copy as that uid,
+        // so hand the copy to it. Secrets and ConfigMaps are often root-only
+        // (mode 0400 or 0700); widening them for everyone would let any local
+        // user read them here, where kubelet's own directory keeps them out.
+        if let Some((uid, gid)) = owner {
+            // -h: a link in the volume is re-owned itself, never its target.
+            let status = std::process::Command::new("chown")
+                .args(["-hR", &format!("{uid}:{gid}")])
+                .arg(&dst)
+                .status()
+                .map_err(|e| format!("spawn chown for mount {source}: {e}"))?;
+            if !status.success() {
+                return Err(format!("chown mount {source}: exited {status}"));
+            }
+            let status = std::process::Command::new("chmod")
+                .args(["-R", "u+rX"])
+                .arg(&dst)
+                .status()
+                .map_err(|e| format!("spawn chmod for mount {source}: {e}"))?;
+            if !status.success() {
+                return Err(format!("chmod mount {source}: exited {status}"));
+            }
+        }
 
         m["source"] = serde_json::Value::String(format!("{POD_SHARE_GUEST_MOUNT}/{id}/mounts/{n}"));
         n += 1;
     }
 
     serde_json::to_string(&spec).map_err(|e| format!("reserialize spec: {e}"))
+}
+
+/// The directory a container's volume copies live in: readable only by the
+/// VMM that serves them (the sandbox's uid, or root when it keeps root).
+fn prepare_mounts_dir(dir: &Path, owner: Option<(u32, u32)>) -> Result<(), String> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::create_dir_all(dir).map_err(|e| format!("mkdir {}: {e}", dir.display()))?;
+    if let Some((uid, gid)) = owner {
+        std::os::unix::fs::chown(dir, Some(uid), Some(gid))
+            .map_err(|e| format!("chown {}: {e}", dir.display()))?;
+    }
+    std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700))
+        .map_err(|e| format!("chmod {}: {e}", dir.display()))
 }
 
 /// Build a cgroups v1 `Metrics` message (the format containerd's CRI decodes for
@@ -1360,6 +1399,55 @@ mod tests {
 
     fn spec_with(annotations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "annotations": annotations })
+    }
+
+    // A Secret volume kubelet keeps root-only must not become readable to
+    // every local user once copied into the pod share.
+    #[test]
+    fn volume_copies_stay_private_to_the_vmm() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let mode = |path: &Path| std::fs::metadata(path).unwrap().permissions().mode() & 0o7777;
+        let root = tempfile::tempdir().unwrap();
+        let secret = root.path().join("secret");
+        std::fs::create_dir(&secret).unwrap();
+        std::fs::write(secret.join("token"), b"hunter2").unwrap();
+        std::fs::set_permissions(secret.join("token"), std::fs::Permissions::from_mode(0o400))
+            .unwrap();
+        std::fs::set_permissions(&secret, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let spec = serde_json::json!({
+            "mounts": [{
+                "destination": "/var/run/secrets/app",
+                "type": "bind",
+                "source": secret.to_str().unwrap(),
+                "options": ["rbind", "ro"],
+            }],
+        })
+        .to_string();
+
+        // The VMM keeps root: nothing is widened.
+        let share = root.path().join("share-root");
+        materialize_bind_mounts(&spec, &share, "ctr", None, None, None).unwrap();
+        let mounts = share.join("ctr/mounts");
+        assert_eq!(mode(&mounts), 0o700);
+        assert_eq!(mode(&mounts.join("0")), 0o700);
+        assert_eq!(mode(&mounts.join("0/token")), 0o400);
+
+        // The VMM drops to the sandbox's uid: the copy is that uid's alone.
+        let me = std::fs::metadata(root.path()).unwrap();
+        let owner = (me.uid(), me.gid());
+        let share = root.path().join("share-dropped");
+        let rewritten =
+            materialize_bind_mounts(&spec, &share, "ctr", Some(owner), None, None).unwrap();
+        let mounts = share.join("ctr/mounts");
+        for path in [mounts.clone(), mounts.join("0"), mounts.join("0/token")] {
+            let meta = std::fs::metadata(&path).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), owner, "{}", path.display());
+            assert_eq!(mode(&path) & 0o077, 0, "{} is private", path.display());
+        }
+        assert!(
+            rewritten.contains("\"ro\""),
+            "mount options pass through: {rewritten}"
+        );
     }
 
     #[test]

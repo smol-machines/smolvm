@@ -458,7 +458,12 @@ impl EmbeddedRuntime {
                 crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
             }
             self.remove_cached_handle(name)?;
-            crate::portable_checkpoint::prepare_paused_restore(&record)?;
+            if let Some(image) = crate::portable_checkpoint::prepare_paused_restore(&record)? {
+                // Keep the pause and its retry key active until the VM actually
+                // resumes; only replace the verified image cache reference here.
+                self.db.update_vm_durable(name, |record| image.apply(record))?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+            }
             let started = control::resume_vm(&self.db, name, detached)?;
             if detached {
                 started.handle.detach();
@@ -645,6 +650,7 @@ impl EmbeddedRuntime {
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
         self.with_name_lock(name, || {
+            let startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
                 .is_some()
@@ -677,6 +683,7 @@ impl EmbeddedRuntime {
                 return Ok(());
             }
 
+            drop(startup_lock);
             let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
@@ -882,6 +889,7 @@ impl EmbeddedRuntime {
                 parallel,
                 options.source_policy,
                 options.keep_machine_id,
+                if options.detached { Some(false) } else { None },
             )?;
             if options.detached {
                 for (_, handle) in started {
@@ -973,6 +981,9 @@ impl EmbeddedRuntime {
     /// Connect to an already-running machine and cache its handle.
     pub fn connect_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            // A live agent (or cached process handle) does not mean another
+            // process has finished initialization or fork rejuvenation.
+            let _startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
                     return Ok(());
@@ -1382,7 +1393,14 @@ impl EmbeddedRuntime {
     }
 
     fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
-        let record = control::get_record(&self.db, name)?;
+        let mut record = control::get_record(&self.db, name)?;
+        if !record.init_completed {
+            handle.initialize_machine(name, &record)?;
+            self.db
+                .update_vm(name, |record| record.init_completed = true)?
+                .ok_or_else(|| Error::vm_not_found(name))?;
+            record.init_completed = true;
+        }
         handle.launch_image_workload(name, &record)
     }
 

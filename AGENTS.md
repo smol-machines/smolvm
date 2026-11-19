@@ -182,7 +182,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--net` | | run, create, update, pack run | Enable outbound networking (off by default) |
 | `--gpu` | | run, create, update, pack create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
-| `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro]`, or `GUEST` alone for a directory on the machine's own disk (`-v /var/lib/docker`), which starts with the image's owner and mode at that path |
+| `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro][:uid=N[,gid=N]]` (`uid=`/`gid=`: the guest owner of files that record none, e.g. `~/.pi:/home/ubuntu/.pi:uid=1000`), or `GUEST` alone for a directory on the machine's own disk (`-v /var/lib/docker`), which starts with the image's owner and mode at that path |
 | `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update, pack run | Port mapping: `HOST:GUEST`, or `HOST:GUEST/udp` for UDP |
 | `--auto-ports` | | run, create, update | Publish every TCP port the guest listens on at the same port on host loopback while it listens (off by default) |

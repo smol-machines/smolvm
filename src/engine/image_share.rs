@@ -76,6 +76,51 @@ fn lock(path: &Path) -> crate::Result<File> {
 }
 
 impl Lease {
+    pub(super) fn generation(&self) -> &str {
+        &self.generation
+    }
+
+    /// Recover an existing reference without changing the running guest's exports.
+    pub(super) fn recover(
+        root: &Path,
+        machine: String,
+        host: &str,
+        generation: String,
+        owner: String,
+        name: String,
+    ) -> crate::Result<Self> {
+        let lease = Self {
+            path: root
+                .join("guest-image-shares")
+                .join(host)
+                .join(format!("{name}.json")),
+            machine,
+            name,
+            owner,
+            generation,
+            preparing: None,
+        };
+        lease.verify_retained(&Machine(&lease.machine))?;
+        Ok(lease)
+    }
+
+    fn verify_retained(&self, exports: &impl Exports) -> crate::Result<()> {
+        let _guard = lock(&self.path)?;
+        let owners: Owners = read_json(&self.path)?.ok_or_else(|| {
+            crate::Error::config("image share", "retained image ownership is missing")
+        })?;
+        if owners.generation != self.generation
+            || !owners.containers.contains(&self.owner)
+            || exports.source(&self.name)?.as_ref() != Some(&owners.source)
+        {
+            return Err(crate::Error::config(
+                "image share",
+                "retained image ownership or live export changed",
+            ));
+        }
+        Ok(())
+    }
+
     pub(super) fn acquire(
         root: &Path,
         machine: String,
@@ -255,6 +300,28 @@ mod tests {
         assert_eq!(device.0.lock().unwrap().len(), 1);
         new.unclaim(&device).unwrap();
         assert!(device.0.lock().unwrap().is_empty());
+    }
+
+    #[test]
+    fn saved_owner_keeps_its_export_until_recovered_execution_exits() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::default();
+        let mut original = lease(dir.path(), "saved", "boot1");
+        original.claim(dir.path(), &device).unwrap();
+        original.prepared();
+        drop(original); // Saving execution must not release its durable reference.
+        let mut recovered = lease(dir.path(), "saved", "boot1");
+        recovered.verify_retained(&device).unwrap();
+        assert!(lease(dir.path(), "other", "boot1")
+            .verify_retained(&device)
+            .is_err());
+        assert!(lease(dir.path(), "saved", "boot2")
+            .verify_retained(&device)
+            .is_err());
+        assert_eq!(device.0.lock().unwrap().len(), 1);
+        recovered.unclaim(&device).unwrap();
+        assert!(device.0.lock().unwrap().is_empty());
+        assert!(recovered.verify_retained(&device).is_err());
     }
 
     #[test]

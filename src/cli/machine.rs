@@ -399,6 +399,14 @@ impl ImageFeedCmd {
 /// Manage machines
 #[derive(Subcommand, Debug)]
 pub enum MachineCmd {
+    /// Generate a standard SSH client configuration for a machine
+    SshConfig(super::ssh::Configure),
+    /// Serve the generated SSH configuration's on-demand connection
+    #[command(hide = true)]
+    SshProxy(super::ssh::Proxy),
+    /// Own one pending SSH start until completion or proxy disconnect
+    #[command(hide = true)]
+    SshStart(super::ssh::Start),
     /// Prepare local images for managed Kubernetes
     #[command(hide = true)]
     ImageFeed(ImageFeedCmd),
@@ -420,6 +428,9 @@ pub enum MachineCmd {
 
     /// Save a running machine, including RAM, as a portable checkpoint
     Checkpoint(super::pack::CheckpointCmd),
+
+    /// Describe checkpoint requirements as JSON without pausing the machine
+    CheckpointRequirements(super::pack::CheckpointRequirementsCmd),
 
     /// Prepare an incremental checkpoint for fast restores without starting a VM
     CheckpointWarm(super::pack::WarmCheckpointCmd),
@@ -521,11 +532,21 @@ impl MachineCmd {
         // over successive runs. Other commands sweep everything.
         if matches!(self, MachineCmd::Run(_)) {
             super::vm_common::cleanup_orphaned_ephemeral_vms_bounded(EPHEMERAL_RUN_SWEEP_CAP);
-        } else if !matches!(self, MachineCmd::ImageFeed(_)) {
+        } else if !matches!(
+            self,
+            MachineCmd::ImageFeed(_)
+                | MachineCmd::CheckpointRequirements(_)
+                | MachineCmd::SshConfig(_)
+                | MachineCmd::SshProxy(_)
+                | MachineCmd::SshStart(_)
+        ) {
             super::vm_common::cleanup_orphaned_ephemeral_vms();
         }
 
         match self {
+            MachineCmd::SshConfig(cmd) => cmd.run(),
+            MachineCmd::SshProxy(cmd) => cmd.run(),
+            MachineCmd::SshStart(cmd) => cmd.run(),
             MachineCmd::ImageFeed(cmd) => cmd.run(),
             MachineCmd::Run(cmd) => cmd.run(),
             MachineCmd::Exec(cmd) => cmd.run(),
@@ -533,6 +554,7 @@ impl MachineCmd {
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Branch(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
+            MachineCmd::CheckpointRequirements(cmd) => cmd.run(),
             MachineCmd::CheckpointPrune(cmd) => cmd.run(),
             MachineCmd::CheckpointLog(cmd) => cmd.run(),
             MachineCmd::CheckpointWarm(cmd) => cmd.run(),
@@ -1406,7 +1428,7 @@ fn ensure_init_layer(
 /// user's terminal; on failure the captured stdout and stderr tails are surfaced
 /// in the error.
 fn run_smolvm(exe: &Path, args: &[&str]) -> smolvm::Result<()> {
-    let out = std::process::Command::new(exe)
+    let out = smolvm::engine_cli::command(exe)
         .args(args)
         .output()
         .map_err(|e| smolvm::Error::config("init-layer bake", e.to_string()))?;
@@ -2423,6 +2445,7 @@ impl RunCmd {
                                 // stay as refs), workdir and user, the image itself
                                 // and the workload command.
                                 let r = &mut o.record;
+                                r.mount_owners = HostMount::stored_owners(&mounts);
                                 r.env = defaults
                                     .env
                                     .iter()
@@ -2590,6 +2613,7 @@ impl RunCmd {
                             // command line flags may enable features on top of
                             // what the Smolfile asked for.
                             let r = &mut o.record;
+                            r.mount_owners = HostMount::stored_owners(&mounts);
                             r.image = None;
                             r.ssh_agent |= self.ssh_agent;
                             r.cuda |= self.cuda;
@@ -4387,7 +4411,7 @@ pub struct ExecCmd {
 
 impl ExecCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        let (manager, mut client) = vm_common::ensure_running_and_connect(&self.name)?;
+        let (manager, mut client) = vm_common::connect_after_startup(&self.name)?;
 
         // Detach immediately — exec never owns the VM lifecycle. Without this,
         // any early return (failed exec, timeout, client signal) triggers
@@ -5733,7 +5757,10 @@ impl CreateCmd {
                     record.source_registry_ref = reference;
                 }
                 if let Some(image) =
-                    smolvm::portable_checkpoint::fetch_checkpoint_host_image_blocking(checkpoint)?
+                    smolvm::portable_checkpoint::restore_checkpoint_host_image_blocking(
+                        checkpoint,
+                        &vm_data_dir,
+                    )?
                 {
                     image.apply(&mut record);
                 }
@@ -7344,6 +7371,11 @@ impl UpdateCmd {
         // machine cannot lose the staged/live distinction or mount order.
         let mut final_mounts = record.host_mounts();
         for rm in &self.remove_volume {
+            // A mount is named by its paths; its owner and mode may be repeated.
+            let rm = rm
+                .rsplit_once(':')
+                .filter(|(_, options)| options.contains('='))
+                .map_or(rm.as_str(), |(head, _)| head);
             let rm_without_mode = rm
                 .strip_suffix(":ro")
                 .or_else(|| rm.strip_suffix(":rw"))
@@ -7433,6 +7465,7 @@ impl UpdateCmd {
                 }
                 r.mounts = final_live_mounts.clone();
                 r.staged_mounts = final_staged_mounts.clone();
+                r.mount_owners = HostMount::stored_owners(&final_mounts);
             }
             if r.disk_volumes != final_disk_volumes {
                 for target in &new_disk_volumes {
@@ -8079,8 +8112,7 @@ impl CpCmd {
             ));
         }
 
-        let (manager, mut client) =
-            vm_common::ensure_running_and_connect(&Some(machine_name.clone()))?;
+        let (manager, mut client) = vm_common::connect_after_startup(&Some(machine_name.clone()))?;
         // Detach so the VM keeps running after cp exits.
         manager.detach();
 
@@ -8278,7 +8310,7 @@ impl SyncCmd {
         }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
-        let (manager, mut client) = vm_common::ensure_running_and_connect(&Some(name.clone()))?;
+        let (manager, mut client) = vm_common::connect_after_startup(&Some(name.clone()))?;
         // This command observes an existing persistent VM; a failed sync must
         // leave it running so the user can fix the cause and retry.
         manager.detach();
@@ -8732,6 +8764,12 @@ impl MountAddCmd {
             return Err(smolvm::Error::config(
                 "mount add",
                 "a staged mount is copied in at boot; add it with `machine update -v` and restart",
+            ));
+        }
+        if mount.owner.is_some() {
+            return Err(smolvm::Error::config(
+                "mount add",
+                "a mount's owner (uid=/gid=) is set at boot; add it with `machine update -v` and restart",
             ));
         }
         let (record, running) = mount_target_machine(&name)?;

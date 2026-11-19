@@ -49,6 +49,21 @@ impl Store {
         write_json(&dir.join("config.json"), record)
     }
 
+    pub(crate) fn save_container_durable(&self, record: &ContainerRecord) -> crate::Result<()> {
+        let dir = self.container_dir(&record.id);
+        // Do not recreate a removed container or engine while relinquishing its execution.
+        let path = dir.join("config.json");
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|error| crate::Error::config("engine execution", error.to_string()))?;
+        let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+        use std::io::Write;
+        staged.write_all(&bytes)?;
+        staged.as_file().sync_all()?;
+        staged.persist(&path).map_err(|error| error.error)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    }
+
     pub(crate) fn remove_container(&self, id: &str) {
         let _ = std::fs::remove_dir_all(self.container_dir(id));
     }

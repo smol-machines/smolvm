@@ -1273,9 +1273,6 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             if !disks.is_empty() {
                 return Err(fixed("attached disks", TOPOLOGY));
             }
-            if !mounts.is_empty() {
-                return Err(fixed("volume mounts", TOPOLOGY));
-            }
             if !remote_volumes.is_empty() {
                 return Err(fixed("remote volumes", TOPOLOGY));
             }
@@ -1432,16 +1429,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 }
                 ports
             };
-            let mounts = crate::portable_checkpoint::restored_host_mounts(checkpoint)?
-                .into_iter()
-                .map(|(source, target, read_only)| HostMount {
-                    source: source.into(),
-                    target: target.into(),
-                    read_only,
-                    staged: false,
-                    recorded_ownership: false,
-                })
-                .collect();
+            let mounts = crate::portable_checkpoint::restored_host_mounts_at(checkpoint, &mounts)?;
 
             let captured_settings = &checkpoint.settings;
             ResolvedSpec {
@@ -1780,6 +1768,7 @@ impl ResolvedSpec {
         let restored = restored.unwrap_or_default();
         let is_restore = self.restored.is_some();
         let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
+        let mount_owners = HostMount::stored_owners(&mounts);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
         let listen_addresses = PortMapping::listen_addresses(&ports);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
@@ -1813,6 +1802,7 @@ impl ResolvedSpec {
             staged_mounts,
             recorded_ownership: recorded_ownership_mounts,
             staged_mounts_detached_from: None,
+            mount_owners,
             ports,
             udp_ports,
             allocated_ports: Vec::new(),

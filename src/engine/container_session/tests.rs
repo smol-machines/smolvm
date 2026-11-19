@@ -657,3 +657,101 @@ async fn idle_session_sends_no_keepalives_and_does_not_poll_vm_liveness() {
     finish.send(()).unwrap();
     server.await.unwrap();
 }
+
+#[tokio::test]
+async fn a_saved_session_reattaches_without_starting_another_command() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (connection, execution) = begin(&listener).await;
+        drop(connection);
+        let (mut connection, _) = listener.accept().await.unwrap();
+        let resume = match request(&mut connection).await {
+            AgentRequest::ContainerSession {
+                control: Control::Attach { overlay_id, resume },
+            } => {
+                assert_eq!(overlay_id, "overlay");
+                assert_eq!(resume.execution, execution);
+                resume
+            }
+            other => panic!("saved execution must only attach: {other:?}"),
+        };
+        event(
+            &mut connection,
+            Event::Attached {
+                stdin_closed: false,
+                snapshot: Snapshot {
+                    execution,
+                    output_first: 1,
+                    output_next: 1,
+                    input_next: resume.input_next,
+                },
+            },
+        )
+        .await;
+        event(
+            &mut connection,
+            Event::Exited {
+                exit: wire::Exit {
+                    code: 7,
+                    oom: false,
+                },
+            },
+        )
+        .await;
+    });
+    let mut original = Session::new(socket.clone(), "overlay".into(), origin());
+    original.start(spec()).await.unwrap();
+    let bytes = serde_json::to_vec(&original.saved()).unwrap();
+    drop(original);
+    let saved = serde_json::from_slice(&bytes).unwrap();
+    let mut restored = Session::from_saved(socket, "overlay".into(), saved)
+        .await
+        .unwrap();
+    let exit = restored
+        .pump(&InputQueue::default(), |_, _| {}, |_| {}, |_| {}, || true)
+        .await
+        .unwrap();
+    assert_eq!(exit.code, 7);
+    server.await.unwrap();
+}
+
+#[tokio::test]
+async fn a_missing_saved_execution_is_never_replaced_with_a_new_start() {
+    let dir = tempfile::tempdir().unwrap();
+    let socket = dir.path().join("agent.sock");
+    let listener = UnixListener::bind(&socket).unwrap();
+    let server = tokio::spawn(async move {
+        let (connection, _) = begin(&listener).await;
+        drop(connection);
+        let (mut connection, _) = listener.accept().await.unwrap();
+        assert!(matches!(
+            request(&mut connection).await,
+            AgentRequest::ContainerSession {
+                control: Control::Attach { .. }
+            }
+        ));
+        response(
+            &mut connection,
+            AgentResponse::Error {
+                message: "saved execution no longer exists".into(),
+                code: Some(wire::ABSENT.into()),
+            },
+        )
+        .await;
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), listener.accept())
+                .await
+                .is_err()
+        );
+    });
+    let mut original = Session::new(socket.clone(), "overlay".into(), origin());
+    original.start(spec()).await.unwrap();
+    let saved = original.saved();
+    drop(original);
+    assert!(Session::from_saved(socket, "overlay".into(), saved)
+        .await
+        .is_err());
+    server.await.unwrap();
+}

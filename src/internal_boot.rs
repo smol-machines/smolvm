@@ -77,6 +77,26 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> crate::Result<VmDis
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> crate::Result<()> {
     let t_proc = std::time::Instant::now();
+    // Map the anonymous commit file before redirecting stdin or closing inherited
+    // descriptors. The mapping also survives the later credential/sandbox setup.
+    #[cfg(unix)]
+    if let Some(parent) = std::env::var_os(crate::agent::startup_transaction::PARENT_ENV) {
+        std::env::remove_var(crate::agent::startup_transaction::PARENT_ENV);
+        let parent = parent
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| crate::Error::agent("watch startup transaction", "invalid owner PID"))?;
+        crate::agent::startup_transaction::watch_stdin(parent, || {
+            if let Some(socket) = AGENT_SOCKET.get() {
+                flush_guest_before_exit(socket);
+            }
+        })
+        .map_err(|error| crate::Error::agent("watch startup transaction", error.to_string()))?;
+    }
+    #[cfg(unix)]
+    crate::ssh::ownership::register_boot().map_err(|error| {
+        crate::Error::agent("register SSH startup ownership", error.to_string())
+    })?;
 
     // --- Parent-death watchdog ---------------------------------------------
     // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:

@@ -3412,8 +3412,9 @@ async fn create_machine_to_end(
     // whatever the restored machine's network: the guest holds its device.
     let mut restored_host_image = None;
     if let Some(checkpoint) = manifest_checkpoint.as_ref() {
-        match crate::portable_checkpoint::fetch_checkpoint_host_image(
+        match crate::portable_checkpoint::restore_checkpoint_host_image(
             checkpoint,
+            &vm_data_dir(&name),
             &crate::registry::PullAuth::FromConfig,
         )
         .await
@@ -5201,6 +5202,9 @@ async fn boot_prepared_fork_inner(
     prep: crate::agent::fork::PreparedFork,
     boot: PreparedForkBoot,
 ) -> Result<MachineInfo, ApiError> {
+    // The blocking boot owns `prep`, but publication happens after it returns.
+    // Keep other processes out through both phases and any rollback.
+    let _startup_lock = prep.startup_lock.clone();
     let inherited_interceptor = if prep.clone_record.external_interceptor_required {
         let source = prep.clone_record.golden.as_deref().ok_or_else(|| {
             ApiError::BadRequest("intercepted branch has no source machine".into())

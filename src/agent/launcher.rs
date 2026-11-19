@@ -328,6 +328,10 @@ pub struct LaunchFeatures {
     /// `SMOLVM_BOOT_BINARY` (so `current_exe` need not handle `_boot-vm`) yet
     /// DETACHES the VM to persist after the CLI exits (e.g. `smol start`/`fork`).
     pub watch_parent: Option<bool>,
+    /// Internal batch startup commit file, passed through the boot helper's
+    /// unused stdin on Unix; provisional children exit if their owner dies.
+    #[doc(hidden)]
+    pub startup_commit: Option<std::sync::Arc<std::fs::File>>,
     /// Kubernetes pod network namespace to attach the VM's virtio-net device to
     /// (the CNI-provisioned netns for a shim-booted pod sandbox). When set, the
     /// launcher bridges the guest NIC L2 to a tap inside this netns (tc-redirect
@@ -829,6 +833,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         read_only: false,
                         staged: false,
                         recorded_ownership: false,
+                        owner: None,
                     });
                 }
             }
@@ -1136,61 +1141,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem via the root virtiofs tag ("/dev/root").
-        //
-        // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
-        // with KRUN_FS_ROOT_TAG. Use virtiofs3 for both policy states so every
-        // launcher interprets the shared rootfs DAX setting identically.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
-        let root_tag = cstr("/dev/root");
-        let rootfs_dax_window = super::virtiofs::rootfs_dax_window();
-        if rootfs_dax_window == 0 {
-            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "SMOLVM_ROOTFS_DAX=0 requires libkrun with krun_add_virtiofs3",
-                ));
-            };
-
-            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, true) < 0 {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "krun_add_virtiofs3 failed for root filesystem",
-                ));
-            }
-            tracing::info!("rootfs configured via virtiofs without DAX");
-        } else {
-            // Default: restore the 512 MB root DAX window the removed krun_set_root
-            // configured. Plain krun_add_virtiofs passes shm_size=0 (no DAX), which
-            // drops virtiofs to writeback caching and hides the guest's ready-marker
-            // write from the host until the socket-probe grace — a boot-time regression.
-            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "root DAX requires libkrun with krun_add_virtiofs3",
-                ));
-            };
-            if add_virtiofs3(
-                ctx,
-                root_tag.as_ptr(),
-                root.as_ptr(),
-                rootfs_dax_window,
-                true,
-            ) < 0
-            {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "krun_add_virtiofs3 failed for root filesystem",
-                ));
-            }
+        if let Err(error) = super::virtiofs::configure_rootfs(&krun, ctx, &root, true) {
+            krun_free_ctx(ctx);
+            return Err(error);
         }
 
         let network_plan = select_network_plan(
@@ -2266,6 +2224,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // the COW wall entirely. The shared policy keeps this launcher,
             // packed VMs, and the direct backend on the same window size.
             let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
+            // The mount's owner (`uid=`/`gid=`) is set on its share once added.
+            let set_owner = || set_mount_owner(&krun, ctx, &tag, mount);
             // Recorded ownership keeps guest permissions separate from host
             // access, including on macOS where overlayfs uses mode-000 workdirs.
             if mount.recorded_ownership {
@@ -2293,6 +2253,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             mount.source.display()
                         ),
                     ));
+                }
+                if let Err(e) = set_owner() {
+                    krun_free_ctx(ctx);
+                    return Err(e);
                 }
                 continue;
             }
@@ -2388,6 +2352,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         mount.source.display()
                     ),
                 ));
+            }
+            if let Err(e) = set_owner() {
+                krun_free_ctx(ctx);
+                return Err(e);
             }
         }
 
@@ -3406,6 +3374,34 @@ pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
                 .expect("port mapping format cannot contain null bytes")
         })
         .collect())
+}
+
+/// Serve the files of `mount`'s share that record no owner of their own as its
+/// `uid=`/`gid=` owner. Fails when the library cannot, rather than boot the
+/// mount owned by root.
+fn set_mount_owner(
+    krun: &super::krun::KrunFunctions,
+    ctx: u32,
+    tag: &std::ffi::CStr,
+    mount: &HostMount,
+) -> Result<()> {
+    let Some((uid, gid)) = mount.owner else {
+        return Ok(());
+    };
+    let Some(set_virtiofs_owner) = krun.set_virtiofs_owner else {
+        return Err(Error::agent(
+            "set mount owner",
+            "a mount's uid=/gid= needs libkrun with krun_set_virtiofs_owner",
+        ));
+    };
+    // SAFETY: `tag` names a share just added to the live context `ctx`.
+    if unsafe { set_virtiofs_owner(ctx, tag.as_ptr(), uid, gid) } < 0 {
+        return Err(Error::agent(
+            "set mount owner",
+            format!("could not set the owner of '{}'", mount.source.display()),
+        ));
+    }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -64,7 +64,7 @@ impl FilesCmd {
             .get_vm(&self.name)?
             .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
         // This only connects to an existing guest; browsing never boots one.
-        let (manager, mut client) = super::vm_common::ensure_running_and_connect(&Some(self.name))?;
+        let (manager, mut client) = super::vm_common::connect_after_startup(&Some(self.name))?;
         manager.detach();
         client.use_target(smolvm::workload::machine_target(&record))?;
         let archive = matches!(self.command, FilesAction::Archive { .. });

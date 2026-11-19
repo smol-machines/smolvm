@@ -20,7 +20,7 @@ members = [
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
-exclude = ["vendor/smoltcp"]
+exclude = ["vendor/smoltcp", "vendor/russh", "vendor/tar"]
 resolver = "2"
 
 [package]
@@ -42,6 +42,9 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
+rand = "0.10"
+russh = { path = "vendor/russh", version = "=0.65.2", default-features = false, features = ["ring"] }
 smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.35.0" }
 smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.35.0" }
 smolvm-network = { path = "crates/smolvm-network", version = "1.35.0" }
@@ -91,7 +94,7 @@ base64 = { workspace = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
-tar = "0.4"
+tar = { workspace = true }
 # Inspect and safely rebase qcow2 backing chains in portable checkpoints.
 imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
@@ -139,6 +142,12 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
 landlock = "0.4"
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = "3.7"
+security-framework-sys = "2.17"
 
 # Windows process management (OpenProcess / TerminateProcess / Wait) and
 # DLL-search-path control (SetDllDirectoryW). Used to replace the Unix
@@ -147,6 +156,8 @@ landlock = "0.4"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
@@ -171,6 +182,7 @@ wiremock = "0.6"
 pkg-config = "0.3"
 
 [workspace.dependencies]
+tar = { package = "smolvm-tar", path = "vendor/tar", version = "=0.4.46-smol.1" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

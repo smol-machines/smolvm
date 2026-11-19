@@ -368,32 +368,12 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // Set root filesystem via the root virtiofs tag (upstream removed
-    // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
     let root = try_or_free_ctx!(
         path_to_cstring(config.rootfs_path),
         "rootfs path contains null byte"
     );
-    let root_tag = cstr("/dev/root");
-    // Default root with a 512 MB DAX window (matches the removed krun_set_root).
-    // Plain krun_add_virtiofs passes shm_size=0 (no DAX), dropping virtiofs to
-    // writeback caching so the guest's ready-marker write isn't visible to the
-    // host until the socket-probe grace — a multi-second boot-time regression.
-    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
-        free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
-    };
-    // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe {
-        add_virtiofs3(
-            ctx,
-            root_tag.as_ptr(),
-            root.as_ptr(),
-            super::virtiofs::rootfs_dax_window(),
-            true,
-        )
-    } < 0
-    {
-        free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
+    if let Err(error) = super::virtiofs::configure_rootfs(krun, ctx, &root, true) {
+        free_ctx_on_err!(error.to_string());
     }
 
     let network_plan = plan_launch_network(
@@ -933,6 +913,10 @@ pub fn launch_agent_vm_dynamic(
     if unsafe { (krun.set_exec)(ctx, exec_path.as_ptr(), argv.as_ptr(), envp.as_ptr()) } < 0 {
         free_ctx_on_err!("krun_set_exec failed");
     }
+
+    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
+        free_ctx_on_err!("mounts require libkrun with krun_add_virtiofs3");
+    };
 
     // Packed image layers use DAX where the guest architecture supports it.
     // User mounts follow the same explicit policy as every other launch path.
