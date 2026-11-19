@@ -5,17 +5,16 @@ on:
 jobs:
   clean:
     runs-on: [self-hosted, macOS, ARM64]
+    timeout-minutes: 40
     steps:
-      - name: Measure and clear rebuildable caches
+      - name: Free build output and measure the rest
         run: |
           df -h /System/Volumes/Data | tail -1
-          for d in ~/Library/Caches ~/Library/Caches/smolvm ~/.smolvm ~/Documents ~/Downloads ~/Library/Application\ Support ~/Library/Containers ~/actions-runner/_work; do
-            perl -e 'alarm 240; exec @ARGV' du -sh -x "$d" 2>/dev/null || echo "?? $d"
-          done
-          perl -e 'alarm 240; exec @ARGV' du -sh -x ~/Library/Caches/* ~/Documents/* 2>/dev/null | sort -rh | head -15
-          C=~/Library/Caches/smolvm
-          for p in "$C/image-seeds" "$C/vms/_restore-checkpoints" "$C/vms/_restore-base" "$C/vms/_pack-templates" "$C/vms/_pack-storage-seeds"; do
-            [ -e "$p" ] || continue
-            if [ -z "$(lsof +D "$p" 2>/dev/null | head -1)" ]; then echo "clearing $p ($(du -sh "$p" | cut -f1))"; chmod -R u+w "$p" 2>/dev/null; rm -rf "$p"; fi
-          done
+          for t in ~/actions-runner/_work/*/*/target; do [ -d "$t" ] && { echo "removing $t"; rm -rf "$t"; }; done
+          df -h /System/Volumes/Data | tail -1
+          echo "== largest files (Spotlight)"
+          mdfind -onlyin "$HOME" 'kMDItemFSSize > 2000000000' 2>/dev/null | head -40 | while read -r f; do echo "$(stat -f %z "$f" 2>/dev/null | awk '{printf "%.1f GB", $1/1073741824}') $(stat -f %Sm -t %Y-%m-%d "$f" 2>/dev/null) $f"; done | sort -rn | head -30
+          echo "== top-level sizes"
+          for d in ~/.smolvm ~/Documents ~/Downloads; do (perl -e 'alarm 900; exec @ARGV' du -d 2 -x -h "$d" 2>/dev/null | sort -rh | head -12 > "/tmp/du-$(basename $d).txt"; echo done) & done; wait
+          cat /tmp/du-.smolvm.txt /tmp/du-Documents.txt /tmp/du-Downloads.txt
           df -h /System/Volumes/Data | tail -1
