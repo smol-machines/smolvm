@@ -41,8 +41,8 @@ fn make_manager(root: &std::path::Path) -> AgentManager {
     let manager = AgentManager::new_named(
         "reviewed-control",
         root.join("rootfs"),
-        StorageDisk::open_existing_with_format(storage, DiskFormat::Raw).unwrap(),
-        OverlayDisk::open_existing_with_format(overlay, DiskFormat::Raw).unwrap(),
+        StorageDisk::open_existing_with_format(&storage, DiskFormat::Raw).unwrap(),
+        OverlayDisk::open_existing_with_format(&overlay, DiskFormat::Raw).unwrap(),
     )
     .unwrap();
     manager.detach();
