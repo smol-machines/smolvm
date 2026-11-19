@@ -1685,6 +1685,15 @@ pub struct RestoreCheckpointQuery {
     /// checkpoint of a machine with one: the base it was captured over, which
     /// this node fetches from `sourceUrl` when it does not have it yet.
     pub cache_disk: Option<String>,
+    /// JSON `allowedCidrs` of a create request. Like the other egress fields,
+    /// it replaces the checkpoint's own as `create` with `from` does; one left
+    /// out keeps the captured value, so `[]` here and in `allowed_hosts`
+    /// denies all egress.
+    pub allowed_cidrs: Option<String>,
+    /// JSON `allowedHosts` of a create request.
+    pub allowed_hosts: Option<String>,
+    /// JSON `egressRules` of a create request.
+    pub egress_rules: Option<String>,
 }
 
 /// Object-store hosts a checkpoint may be fetched from.
@@ -2264,7 +2273,43 @@ mod checkpoint_source_tests {
     }
 }
 
-/// Import a live checkpoint, optionally rebinding its host-side published ports.
+/// The create request a restore runs, built from its query before the
+/// checkpoint arrives so a malformed field is refused first; the caller sets
+/// `from` once the checkpoint is staged.
+fn restore_create_request(
+    name: &str,
+    options: &RestoreCheckpointQuery,
+    registry_token: Option<String>,
+) -> Result<CreateMachineRequest, ApiError> {
+    fn field<T: serde::de::DeserializeOwned>(
+        raw: &Option<String>,
+        what: &str,
+    ) -> Result<Option<T>, ApiError> {
+        raw.as_deref()
+            .map(serde_json::from_str)
+            .transpose()
+            .map_err(|error| ApiError::BadRequest(format!("invalid restore {what}: {error}")))
+    }
+    let ports: Vec<PortSpec> = field(&options.ports, "ports")?.unwrap_or_default();
+    let cache_disk: Option<serde_json::Value> = field(&options.cache_disk, "cache disk")?;
+    let allowed_cidrs: Option<Vec<String>> = field(&options.allowed_cidrs, "allowed cidrs")?;
+    let allowed_hosts: Option<Vec<String>> = field(&options.allowed_hosts, "allowed hosts")?;
+    let egress_rules: Vec<smolvm_protocol::EgressRule> =
+        field(&options.egress_rules, "egress rules")?.unwrap_or_default();
+    serde_json::from_value(serde_json::json!({
+        "name": name,
+        "ports": ports,
+        "registryIdentityToken": registry_token,
+        "cacheDisk": cache_disk,
+        "allowedCidrs": allowed_cidrs,
+        "allowedHosts": allowed_hosts,
+        "egressRules": egress_rules,
+    }))
+    .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))
+}
+
+/// Import a live checkpoint, optionally rebinding its host-side published ports
+/// and replacing its egress policy.
 pub async fn restore_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -2279,19 +2324,7 @@ pub async fn restore_portable_checkpoint(
         .get("x-smolvm-registry-token")
         .and_then(|value| value.to_str().ok())
         .map(str::to_string);
-    let ports: Vec<PortSpec> = options
-        .ports
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|error| ApiError::BadRequest(format!("invalid restore ports: {error}")))?
-        .unwrap_or_default();
-    let cache_disk: Option<serde_json::Value> = options
-        .cache_disk
-        .as_deref()
-        .map(serde_json::from_str)
-        .transpose()
-        .map_err(|error| ApiError::BadRequest(format!("invalid restore cache disk: {error}")))?;
+    let mut create = restore_create_request(&name, &options, registry_token)?;
     // A cached artifact is hard-linked straight into a staging directory:
     // nothing is created or fetched, and the cache's own inode is untouched by
     // whatever the restore does with its copy. Overlapping restores of the same
@@ -2518,20 +2551,13 @@ pub async fn restore_portable_checkpoint(
         .map(|input| input.path.clone())
         .unwrap_or(restore_path);
 
-    let request: CreateMachineRequest = serde_json::from_value(serde_json::json!({
-        "name": name,
-        "from": restore_path.to_string_lossy(),
-        "ports": ports,
-        "registryIdentityToken": registry_token,
-        "cacheDisk": cache_disk,
-    }))
-    .map_err(|error| ApiError::internal(format!("build checkpoint restore request: {error}")))?;
+    create.from = Some(restore_path.to_string_lossy().into_owned());
     // create_machine consumes and verifies the artifact before this TempDir is
     // dropped, installing owned checkpoint payloads and exact qcow chains.
     // The cache take verified this request's pinned artifact; hand that
     // verification over so creation does not read the payload a second time.
     // It only applies if the path creation uses still names that exact inode.
-    let result = create_machine_inner(State(state), Json(request), verified, cache_hit).await;
+    let result = create_machine_inner(State(state), Json(create), verified, cache_hit).await;
     #[cfg(target_os = "linux")]
     drop(prepared);
     // The restore no longer leases the checkpoint's shared extraction.
@@ -7796,6 +7822,39 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    /// A restore's egress fields reach the create request it runs, so the
+    /// restored guest follows the caller's policy, not the one it was captured
+    /// with; a restore that names none keeps the captured one.
+    #[test]
+    fn restore_query_egress_reaches_the_create_request() {
+        let restore = |query: &[(&str, &str)]| {
+            let url = reqwest::Url::parse_with_params("http://node/checkpoint", query).unwrap();
+            let uri: axum::http::Uri = url.as_str().parse().unwrap();
+            let Query(options) = Query::<RestoreCheckpointQuery>::try_from_uri(&uri).unwrap();
+            restore_create_request("restored", &options, None)
+        };
+        let captured = restore(&[]).unwrap();
+        assert_eq!(captured.allowed_cidrs, None);
+        assert_eq!(captured.allowed_hosts, None);
+        assert!(captured.egress_rules.is_empty());
+
+        let deny_all = restore(&[("allowed_cidrs", "[]"), ("allowed_hosts", "[]")]).unwrap();
+        assert_eq!(deny_all.allowed_cidrs, Some(vec![]));
+        assert_eq!(deny_all.allowed_hosts, Some(vec![]));
+
+        let rule = r#"[{"action":"deny","cidr":"10.0.0.0/8"}]"#;
+        let replaced = restore(&[
+            ("allowed_hosts", r#"["only.test"]"#),
+            ("egress_rules", rule),
+        ])
+        .unwrap();
+        assert_eq!(replaced.allowed_hosts, Some(vec!["only.test".to_string()]));
+        assert_eq!(
+            replaced.egress_rules,
+            serde_json::from_str::<Vec<smolvm_protocol::EgressRule>>(rule).unwrap()
+        );
+    }
 
     #[test]
     fn only_partial_downloads_of_the_base_are_removed() {
