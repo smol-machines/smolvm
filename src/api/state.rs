@@ -677,6 +677,9 @@ impl ApiState {
             let manager = AgentManager::for_vm(&name);
             match manager {
                 Ok(manager) => {
+                    // Loading inventory does not transfer ownership of guests
+                    // started by another CLI, SDK, or previous API process.
+                    manager.detach();
                     // Try to reconnect to existing running VM
                     let reconnected = manager
                         .try_connect_existing_with_pid_and_start_time(
@@ -1224,8 +1227,15 @@ impl ApiState {
 
         // Complete the cross-process create reservation and insert the VM row
         // atomically. Only after that succeeds do we publish the in-memory entry.
-        match self.db.commit_reserved_vm(&name, token, &record) {
-            Ok(true) => {
+        match self.db.commit_reserved_vm_record(&name, token, &record) {
+            Ok(Some(record)) => {
+                // The preparation manager reviewed an absent row. Bind the
+                // registered observer to the exact incarnation just published.
+                let manager = reg.manager;
+                manager
+                    .bind_created_record(&self.db, &record)
+                    .map_err(ApiError::from)?;
+                manager.detach();
                 {
                     let mut reserved = self.reserved_names.write();
                     if !reserved.remove(&name) {
@@ -1238,15 +1248,12 @@ impl ApiState {
                 machines.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(
-                        crate::api::handlers::machines::machine_entry_from_record(
-                            &record,
-                            reg.manager,
-                        ),
+                        crate::api::handlers::machines::machine_entry_from_record(&record, manager),
                     )),
                 );
                 Ok(())
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Name already exists or the DB reservation was lost.
                 Err(ApiError::Conflict(format!(
                     "machine '{}' already exists or is no longer reserved",
@@ -1333,8 +1340,9 @@ impl ApiState {
     /// Used by start_machine to register a booted VM so that exec/run/container
     /// endpoints can find it without server restart.
     ///
-    /// An existing entry is replaced in place rather than swapped for a new
-    /// one. A request that looked the machine up before a start finished (an
+    /// An existing entry for the same incarnation is replaced in place.
+    /// A different incarnation gets a new entry so old requests stay fenced.
+    /// A request that looked the machine up before a start finished (an
     /// exec queued behind the start's lifecycle lock) still holds the old
     /// entry; with a separate entry it would reconnect a stale manager to the
     /// new VM, adopt its process, and stop that VM when the request dropped
@@ -1344,9 +1352,21 @@ impl ApiState {
     pub fn insert_machine(&self, name: &str, entry: MachineEntry) {
         let existing = self.machines.read().get(name).cloned();
         if let Some(slot) = existing {
-            let replaced = std::mem::replace(&mut *slot.lock(), entry);
-            replaced.manager.detach();
-            self.machines.write().insert(name.to_string(), slot);
+            let mut old = slot.lock();
+            if old.manager.same_record_as(&entry.manager) {
+                let replaced = std::mem::replace(&mut *old, entry);
+                replaced.manager.detach();
+                drop(old);
+                self.machines.write().insert(name.to_string(), slot);
+            } else {
+                // Same name, different incarnation: old requests retain an
+                // invalidated handle rather than silently adopting this VM.
+                old.manager.detach();
+                drop(old);
+                self.machines
+                    .write()
+                    .insert(name.to_string(), Arc::new(parking_lot::Mutex::new(entry)));
+            }
             return;
         }
         let mut machines = self.machines.write();
@@ -1510,14 +1530,16 @@ pub async fn ensure_machine_running(
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
         let mut entry = entry_clone.lock();
-        let mounts: Vec<_> = entry
-            .mounts
-            .iter()
-            .map(HostMount::try_from)
-            .collect::<crate::Result<Vec<_>>>()?;
-        let ports: Vec<_> = entry.ports.iter().map(PortMapping::from).collect();
-        let mut resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
-        resources.cache_disk = entry.cache_disk.clone();
+        entry.manager.require_record_incarnation(&record)?;
+        let mounts = record.host_mounts();
+        let ports = record.port_mappings();
+        let resources = record.vm_resources();
+        if !entry.manager.matches_record_execution(&record) && record.is_process_alive() {
+            let observer = AgentManager::for_existing_vm_record(&record)?;
+            observer.detach();
+            entry.manager.detach();
+            entry.manager = observer;
+        }
 
         // An implicit start (exec/run/files/images) never restarts a machine
         // that is up. `update` refuses running machines, so its recorded
@@ -1540,7 +1562,7 @@ pub async fn ensure_machine_running(
         }
         // Up but not answering (busy, or still restoring): fail this request
         // rather than stop the VM and boot it fresh.
-        if entry.manager.is_process_alive() {
+        if record.is_process_alive() || entry.manager.is_process_alive() {
             return Err(crate::Error::agent_conflict(
                 "start machine",
                 "machine is running but its agent is not answering yet; retry",
@@ -1549,7 +1571,16 @@ pub async fn ensure_machine_running(
         // A server may have loaded this entry in observation mode while a
         // transfer owned it. Prepare disks only after admission and liveness
         // checks, when an explicit release allows a fresh start again.
-        entry.manager = AgentManager::for_vm_record(&record)?;
+        let manager = AgentManager::for_vm_record(&record)?;
+        let interceptor = entry.external_interceptor;
+        let replaced = std::mem::replace(
+            &mut *entry,
+            crate::api::handlers::machines::machine_entry_from_record(&record, manager),
+        );
+        replaced.manager.detach();
+        if record.external_interceptor_required {
+            entry.external_interceptor = interceptor;
+        }
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
         let mut features = build_launch_features(
             entry.manager.name(),
@@ -1626,23 +1657,8 @@ async fn ensure_running_and_persist_owned(
             .await
             .map_err(|error| crate::Error::agent("start operation lock", error.to_string()))??;
 
-    // A nested machine waking on a server that has since turned nesting off
-    // stays down, the same as an explicit start.
-    let nested = entry.lock().resources.nested_virt.unwrap_or(false);
-    if nested && !state.nested_virt_allowed() {
-        return Err(crate::Error::agent_forbidden(
-            "start machine",
-            NESTED_VIRT_DISABLED,
-        ));
-    }
-
-    // Refresh the entry's launch config from the persisted record before an
-    // implicit start. The record is the source of truth and can change while
-    // the machine is stopped (`machine update` from the CLI edits the DB but
-    // not this server's in-memory entry), so booting from the cached entry
-    // launches with pre-update mounts/ports/resources. `update` refuses
-    // running machines, so a running machine's entry can't be stale — and for
-    // one, ensure_machine_running early-returns before the config matters.
+    // Load the settings used for this start once. CLI updates can change
+    // resources and policy without changing this server's cached entry.
     let record = Some(
         state
             .lookup_vm(name)
@@ -1651,20 +1667,13 @@ async fn ensure_running_and_persist_owned(
             .ok_or_else(|| crate::Error::vm_not_found(name))?,
     );
     if let Some(record) = &record {
+        entry.lock().manager.require_record_incarnation(record)?;
         refuse_implicit_start_of_paused(record)?;
-        let mut e = entry.lock();
-        e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
-        e.ports = record.port_mappings().iter().map(PortSpec::from).collect();
-        e.resources.cpus = Some(record.cpus);
-        e.resources.memory_mb = Some(record.mem);
-        e.resources.storage_gb = record.storage_gb;
-        e.resources.overlay_gb = record.overlay_gb;
-        e.network = record.network;
-        e.forkable = record.forkable_on_start();
-        e.cuda_fork_pool_size = record.cuda_fork_pool_size;
-        e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
-        if !record.external_interceptor_required {
-            e.external_interceptor = None;
+        if record.nested_virt.unwrap_or(false) && !state.nested_virt_allowed() {
+            return Err(crate::Error::agent_forbidden(
+                "start machine",
+                NESTED_VIRT_DISABLED,
+            ));
         }
     }
 
@@ -2418,8 +2427,15 @@ mod tests {
     /// would stop that VM.
     #[test]
     fn replacing_an_entry_updates_requests_already_holding_it() {
-        let (_dir, state) = temp_api_state();
-        let name = "replace-entry-qa";
+        let db = SmolvmDb::open().unwrap();
+        let state = ApiState::with_db(db.clone());
+        let owned_name = format!("replace-entry-{:032x}", rand::random::<u128>());
+        let name = owned_name.as_str();
+        db.insert_vm(
+            name,
+            &VmRecord::new(name.into(), 1, 128, vec![], vec![], false),
+        )
+        .unwrap();
         let entry = |image: &str| MachineEntry {
             credentials: None,
             external_interceptor: None,
@@ -2469,6 +2485,7 @@ mod tests {
         assert_eq!(seen.image.as_deref(), Some("started"));
         assert!(!seen.manager.is_detached());
         drop(seen);
+        db.remove_vm(name).unwrap();
         state.forget_deleted_machine(name).unwrap();
         std::fs::remove_dir_all(crate::agent::vm_data_dir(name)).ok();
     }

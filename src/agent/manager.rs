@@ -2805,7 +2805,97 @@ impl AgentManager {
     ///
     /// Uses retry logic to handle transient connection failures.
     pub fn connect(&self) -> crate::error::Result<super::AgentClient> {
-        super::AgentClient::connect_with_retry(&self.vsock_socket)
+        let validate = || {
+            self.launch_review
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .validate(&crate::db::SmolvmDb::open()?)
+        };
+        // A queued caller may still hold an entry retired by discovery. A
+        // name-derived socket is not authority to connect to its replacement.
+        validate()?;
+        let client = super::AgentClient::connect_with_retry(&self.vsock_socket)?;
+        validate()?;
+        Ok(client)
+    }
+
+    pub(crate) fn matches_record_incarnation(&self, record: &crate::config::VmRecord) -> bool {
+        self.launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .matches_record(record)
+    }
+
+    /// Finish an owned creation using the record returned by its publication
+    /// transaction. An existing machine/controller cannot be rebound this way.
+    pub(crate) fn bind_created_record(
+        &self,
+        db: &crate::db::SmolvmDb,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        if self.name() != Some(record.name.as_str()) || self.inner.lock().child.is_some() {
+            return Err(Error::agent_conflict(
+                "register creation",
+                "manager is not this unpublished creation",
+            ));
+        }
+        let mut review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if review.identity().is_some() {
+            return Err(Error::agent_conflict(
+                "register creation",
+                "manager already belongs to a published machine",
+            ));
+        }
+        let published = crate::db::launch_admission::LaunchReview::from_record(record)?;
+        published.validate(db)?;
+        *review = published;
+        Ok(())
+    }
+
+    pub(crate) fn same_record_as(&self, other: &Self) -> bool {
+        let identity = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .identity();
+        identity.is_some()
+            && identity
+                == other
+                    .launch_review
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .identity()
+    }
+
+    pub(crate) fn matches_record_execution(&self, record: &crate::config::VmRecord) -> bool {
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|child| (Some(child.pid()), child.start_time()));
+        let review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        review.matches_record(record)
+            && child.or(review.observed_execution()) == Some((record.pid, record.pid_start_time))
+    }
+
+    pub(crate) fn require_record_incarnation(
+        &self,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        if !self.matches_record_incarnation(record) {
+            return Err(Error::agent_conflict(
+                "use machine entry",
+                "machine changed since this request acquired its entry; look it up again",
+            ));
+        }
+        Ok(())
     }
 
     /// Get the currently configured mounts.

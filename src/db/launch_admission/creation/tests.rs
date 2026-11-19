@@ -46,6 +46,43 @@ fn record(name: &str) -> VmRecord {
 }
 
 #[test]
+fn creation_publication_returns_the_original_incarnation() {
+    fn here() {}
+    let Some(_root) = isolated(std::any::type_name_of_val(&here)) else {
+        return;
+    };
+    let db = SmolvmDb::open().unwrap();
+    let name = "published-incarnation";
+    let lease = VmCreationLease::reserve(db.clone(), name).unwrap();
+    let manager = crate::agent::AgentManager::for_vm(name).unwrap();
+    let original = db
+        .commit_reserved_vm_record(name, lease.token(), &record(name))
+        .unwrap()
+        .unwrap();
+    lease.disarm();
+    manager.bind_created_record(&db, &original).unwrap();
+    assert!(manager.matches_record_incarnation(&original));
+    assert!(manager.bind_created_record(&db, &original).is_err());
+    assert!(original.database_identity.is_some());
+    assert_eq!(
+        original.database_identity,
+        db.get_vm(name).unwrap().unwrap().database_identity
+    );
+    db.remove_vm(name).unwrap();
+    db.insert_vm(name, &record(name)).unwrap();
+    assert!(manager
+        .bind_created_record(&db, &db.get_vm(name).unwrap().unwrap())
+        .is_err());
+    assert_ne!(
+        original.database_identity,
+        db.get_vm(name).unwrap().unwrap().database_identity
+    );
+    assert!(crate::agent::AgentManager::for_existing_vm_record(&original).is_err());
+    db.remove_vm(name).unwrap();
+    fs::remove_dir_all(crate::agent::vm_data_dir(name)).unwrap();
+}
+
+#[test]
 fn live_creation_never_expires_or_authorizes_unowned_preparation() {
     fn here() {}
     let Some(root) = isolated(std::any::type_name_of_val(&here)) else {

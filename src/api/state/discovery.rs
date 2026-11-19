@@ -1,7 +1,6 @@
 //! Observe newly published CLI/SDK machines without taking over their controller.
-use super::{ApiState, MachineEntry};
+use super::ApiState;
 use crate::config::VmRecord;
-use std::collections::btree_map::Entry;
 use std::sync::Arc;
 
 /// Container, builder, warm-base and Kubernetes lifecycles have their own owners.
@@ -21,11 +20,6 @@ impl ApiState {
         let state = self.clone();
         tokio::task::spawn_blocking(move || {
             for (_, record) in state.db.list_vms()? {
-                if externally_supervised(&record)
-                    || state.machines.read().contains_key(&record.name)
-                {
-                    continue;
-                }
                 let lifecycle = state.lifecycle_lock(&record.name);
                 let Ok(_guard) = lifecycle.try_lock() else {
                     continue;
@@ -40,40 +34,192 @@ impl ApiState {
         .map_err(|error| crate::Error::agent("discover machines", error.to_string()))?
     }
 
-    // Caller holds the lifecycle lock. Observer managers have no child process,
-    // so losing an insertion race cannot stop another controller's guest.
+    // Caller holds the lifecycle lock. Retired entries keep their own identity:
+    // queued requests must fail rather than inherit the replacement's manager.
     fn discover_machine(&self, observed: &VmRecord) -> crate::Result<bool> {
-        if externally_supervised(observed) || self.machines.read().contains_key(&observed.name) {
+        let prior = self.machines.read().get(&observed.name).cloned();
+        let external = externally_supervised(observed);
+        if let Some(prior) = &prior {
+            let Some(entry) = prior.try_lock() else {
+                return Ok(false);
+            };
+            if !external && entry.manager.matches_record_execution(observed) {
+                return Ok(false);
+            }
+        } else if external {
             return Ok(false);
         }
-        let manager = crate::agent::AgentManager::for_existing_vm_record(observed)?;
-        // A later exec/status reconnect may populate its process handle. It
-        // still belongs to the CLI/SDK caller, not this observer's lifetime.
-        manager.detach();
+        let replacement = if external {
+            None
+        } else {
+            let manager = crate::agent::AgentManager::for_existing_vm_record(observed)?;
+            manager.detach();
+            Some(crate::api::handlers::machines::machine_entry_from_record(
+                observed, manager,
+            ))
+        };
         let Some(current) = self.db.get_vm(&observed.name)? else {
             return Ok(false);
         };
-        if !super::same_observation(observed, &current) || externally_supervised(&current) {
+        if !super::same_observation(observed, &current) {
             return Ok(false);
         }
-        let entry = crate::api::handlers::machines::machine_entry_from_record(&current, manager);
-        Ok(self.insert_discovered_machine(&current.name, entry))
-    }
 
-    fn insert_discovered_machine(&self, name: &str, entry: MachineEntry) -> bool {
-        match self.machines.write().entry(name.to_owned()) {
-            Entry::Vacant(slot) => {
-                slot.insert(Arc::new(parking_lot::Mutex::new(entry)));
-                true
-            }
-            Entry::Occupied(_) => false,
+        let mut machines = self.machines.write();
+        // Creation or a start may have registered an entry since this scan
+        // began. Compare the slot too, not merely its name.
+        match (machines.get(&observed.name), prior.as_ref()) {
+            (None, None) => {}
+            (Some(actual), Some(expected)) if Arc::ptr_eq(actual, expected) => {}
+            _ => return Ok(false),
         }
+        let mut replacement = replacement;
+        if let Some(prior) = prior {
+            let Some(entry) = prior.try_lock() else {
+                return Ok(false);
+            };
+            if !external && entry.manager.matches_record_execution(&current) {
+                return Ok(false);
+            }
+            if let Some(new) = &mut replacement {
+                if current.external_interceptor_required
+                    && entry.manager.matches_record_incarnation(&current)
+                {
+                    new.external_interceptor = entry.external_interceptor;
+                }
+            }
+            // Never stop a guest when releasing a superseded controller.
+            entry.manager.detach();
+        }
+        match replacement {
+            Some(entry) => {
+                machines.insert(current.name, Arc::new(parking_lot::Mutex::new(entry)));
+            }
+            None => {
+                machines.remove(&current.name);
+            }
+        }
+        Ok(true)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn discovery_replaces_recreated_names_without_retargeting_old_handles() {
+        let db = crate::db::SmolvmDb::open().unwrap();
+        let state = Arc::new(ApiState::with_db(db.clone()));
+        let name = format!("recreated-{:032x}", rand::random::<u128>());
+        let record = VmRecord::new(name.clone(), 1, 128, vec![], vec![], false);
+        db.insert_vm(&name, &record).unwrap();
+        state.discover_persisted_machines().await.unwrap();
+        let old = state.get_machine(&name).unwrap();
+        db.remove_vm(&name).unwrap();
+        db.insert_vm(&name, &record).unwrap();
+        state.discover_persisted_machines().await.unwrap();
+        let current = state.get_machine(&name).unwrap();
+        let replacement = db.get_vm(&name).unwrap().unwrap();
+        assert!(old
+            .lock()
+            .manager
+            .connect()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("changed"));
+        assert!(
+            super::super::ensure_machine_running(&old, replacement.clone())
+                .await
+                .is_err()
+        );
+        assert!(current
+            .lock()
+            .manager
+            .matches_record_incarnation(&replacement));
+        assert!(!crate::agent::vm_data_dir(&name).exists());
+        db.remove_vm(&name).unwrap();
+        assert!(
+            !Arc::ptr_eq(&old, &current),
+            "replacement kept the old manager"
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_refreshes_external_restarts_and_retires_private_owners_without_writes() {
+        let db = crate::db::SmolvmDb::open().unwrap();
+        let state = Arc::new(ApiState::with_db(db.clone()));
+        let name = format!("restarted-{:032x}", rand::random::<u128>());
+        let record = VmRecord::new(name.clone(), 1, 128, vec![], vec![], false);
+        db.insert_vm(&name, &record).unwrap();
+        state.discover_persisted_machines().await.unwrap();
+        let old = state.get_machine(&name).unwrap();
+        let running = db
+            .update_vm(&name, |r| {
+                r.pid = Some(i32::MAX);
+                r.pid_start_time = Some(1);
+                r.state = crate::config::RecordState::Running;
+            })
+            .unwrap()
+            .unwrap();
+        {
+            let _busy = old.lock();
+            assert!(!state.discover_machine(&running).unwrap());
+        }
+        state.discover_persisted_machines().await.unwrap();
+        let current = state.get_machine(&name).unwrap();
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(current.lock().manager.matches_record_execution(&running));
+        assert!(old.lock().manager.matches_record_incarnation(&running));
+        let private = db
+            .update_vm(&name, |r| {
+                r.runtime_managed = true;
+            })
+            .unwrap()
+            .unwrap();
+        state.discover_persisted_machines().await.unwrap();
+        assert!(state.get_machine(&name).is_err());
+        assert_eq!(
+            serde_json::to_value(db.get_vm(&name).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(private).unwrap()
+        );
+        db.remove_vm(&name).unwrap();
+    }
+
+    #[test]
+    fn explicit_registration_does_not_retarget_a_replaced_incarnation() {
+        let db = crate::db::SmolvmDb::open().unwrap();
+        let state = ApiState::with_db(db.clone());
+        let name = format!("registered-{:032x}", rand::random::<u128>());
+        let record = VmRecord::new(name.clone(), 1, 128, vec![], vec![], false);
+        let register = || {
+            let stored = db.get_vm(&name).unwrap().unwrap();
+            let manager = crate::agent::AgentManager::for_existing_vm_record(&stored).unwrap();
+            manager.detach();
+            state.insert_machine(
+                &name,
+                crate::api::handlers::machines::machine_entry_from_record(&stored, manager),
+            );
+        };
+        db.insert_vm(&name, &record).unwrap();
+        register();
+        let old = state.get_machine(&name).unwrap();
+        db.remove_vm(&name).unwrap();
+        db.insert_vm(&name, &record).unwrap();
+        register();
+        let current = state.get_machine(&name).unwrap();
+        assert!(!Arc::ptr_eq(&old, &current));
+        assert!(old
+            .lock()
+            .manager
+            .connect()
+            .err()
+            .unwrap()
+            .to_string()
+            .contains("changed"));
+        db.remove_vm(&name).unwrap();
+    }
 
     #[tokio::test]
     async fn discovery_enrolls_late_cli_records_without_replacing_controllers_or_writing_state() {

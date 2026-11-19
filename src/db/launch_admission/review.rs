@@ -23,6 +23,17 @@ pub(crate) struct LaunchReview {
 }
 
 impl LaunchReview {
+    pub(crate) fn identity(&self) -> Option<RecordIdentity> {
+        self.identity.clone()
+    }
+
+    /// Compare the published incarnation, independently of a later stop/start.
+    pub(crate) fn matches_record(&self, record: &VmRecord) -> bool {
+        self.identity.is_some()
+            && self.identity == record.database_identity
+            && self.name.as_deref() == Some(record.name.as_str())
+    }
+
     pub(crate) fn capture(db: &SmolvmDb, name: Option<&str>) -> Result<Self> {
         let record = name.map(|name| db.get_vm(name)).transpose()?.flatten();
         Ok(Self {

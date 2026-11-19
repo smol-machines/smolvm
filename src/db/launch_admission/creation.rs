@@ -350,20 +350,34 @@ impl SmolvmDb {
 
     /// Publish the record and release ownership in one durable transaction.
     pub fn commit_reserved_vm(&self, name: &str, token: &str, record: &VmRecord) -> Result<bool> {
+        self.commit_reserved_vm_record(name, token, record)
+            .map(|published| published.is_some())
+    }
+
+    /// Return the incarnation from the publication transaction, never a later
+    /// lookup that could already describe a replacement with the same name.
+    pub(crate) fn commit_reserved_vm_record(
+        &self,
+        name: &str,
+        token: &str,
+        record: &VmRecord,
+    ) -> Result<Option<VmRecord>> {
         if record.name != name {
             return Err(conflict("creation record names another machine"));
         }
         self.with_durable_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).db_err("begin creation publication")?;
             let reserved: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM vm_create_reservations WHERE name = ?1 AND owner_token = ?2)", params![name, token], |row| row.get(0)).db_err("check creation token")?;
-            if !reserved { return Ok(false); }
+            if !reserved { return Ok(None); }
             owned_creation(&tx, name, token)?;
             tx.execute("INSERT INTO vms(name, data) VALUES (?1, ?2)", params![name, serde_json::to_vec(record).db_err("encode created machine")?]).db_err("publish created machine")?;
             tx.execute("DELETE FROM vm_create_reservations WHERE name = ?1 AND owner_token = ?2", params![name, token]).db_err("release published creation")?;
             remove(&tx, token)?;
+            let published = super::review::read_record(&tx, &self.path.canonicalize()?, name)?
+                .ok_or_else(|| Error::vm_not_found(name))?;
             tx.commit().db_err("commit creation publication")?;
-            Ok(true)
-        }).inspect(|inserted| { if *inserted { self.journal_insert(name, record); } })
+            Ok(Some(published))
+        }).inspect(|published| { if published.is_some() { self.journal_insert(name, record); } })
     }
 
     /// Release an uncommitted reservation after its filesystem work is done.
