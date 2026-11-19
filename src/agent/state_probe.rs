@@ -170,6 +170,25 @@ pub(crate) fn recover_unreachable_machine_in_db(
     record: &VmRecord,
     db: &SmolvmDb,
 ) -> crate::Result<()> {
+    recover_unreachable_machine_with(record, db, |pid| {
+        crate::process::stop_vm_process_bounded(
+            pid,
+            crate::process::VM_SIGTERM_TIMEOUT,
+            crate::process::VM_SIGKILL_TIMEOUT,
+        )
+    })
+}
+
+fn recover_unreachable_machine_with(
+    record: &VmRecord,
+    db: &SmolvmDb,
+    stop: impl FnOnce(i32) -> crate::Result<crate::process::VmStop>,
+) -> crate::Result<()> {
+    // Retain the caller's review across a potentially slow process teardown.
+    // A transfer must refuse recovery before even the stop marker is written.
+    let _admission = db.admit_machine_mutation(&record.name)?;
+    let review = crate::db::launch_admission::LaunchReview::from_record(record)?;
+    review.validate_execution(db, None)?;
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
@@ -182,11 +201,7 @@ pub(crate) fn recover_unreachable_machine_in_db(
                 ));
             }
             crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(&record.name), pid);
-            if let crate::process::VmStop::Held(held) = crate::process::stop_vm_process_bounded(
-                pid,
-                crate::process::VM_SIGTERM_TIMEOUT,
-                crate::process::VM_SIGKILL_TIMEOUT,
-            )? {
+            if let crate::process::VmStop::Held(held) = stop(pid)? {
                 // Nothing can make the process exit, and it runs no more
                 // code. Finish the teardown and keep its PID in the record,
                 // so a later start is refused while it still holds the disks.
@@ -199,6 +214,8 @@ pub(crate) fn recover_unreachable_machine_in_db(
         }
     }
 
+    // A restart or recreation committed while stop waited must keep its runtime.
+    review.validate_execution(db, None)?;
     if let Err(error) = crate::agent::cleanup_dead_vm_runtime_in_db(&record.name, db) {
         tracing::warn!(
             machine = %record.name,
@@ -209,7 +226,16 @@ pub(crate) fn recover_unreachable_machine_in_db(
 
     // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full
     // in-memory config load; the update is targeted to the one record.
-    db.update_vm(&record.name, VmRecord::mark_process_stopped)?;
+    db.update_vm_for_record(record, |current| {
+        if (current.pid, current.pid_start_time) != (record.pid, record.pid_start_time) {
+            return Err(crate::Error::agent_conflict(
+                "recover unreachable machine",
+                "machine execution changed during recovery",
+            ));
+        }
+        current.mark_process_stopped();
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -519,6 +545,7 @@ mod tests {
         let mut r = record(RecordState::Unreachable, Some(std::process::id() as i32));
         r.pid_start_time = None;
         db.insert_vm(&r.name, &r).unwrap();
+        let r = db.get_vm(&r.name).unwrap().unwrap();
 
         let error = recover_unreachable_machine_in_db(&r, &db).unwrap_err();
 
@@ -551,7 +578,7 @@ mod held_process_tests {
         record.pid = Some(pid);
         record.pid_start_time = start_time;
         db.insert_vm(name, &record).unwrap();
-        record
+        db.get_vm(name).unwrap().unwrap()
     }
 
     /// What `machine stop` does for a machine whose agent no longer answers.
@@ -646,3 +673,7 @@ mod held_process_tests {
         refuse_start_while_held(&db, "no-such-machine").unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "state_probe_reviewed_tests.rs"]
+mod reviewed_recovery_tests;

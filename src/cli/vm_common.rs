@@ -5427,6 +5427,7 @@ mod held_process_tests {
         record.pid = Some(pid);
         record.pid_start_time = Some(fake_held::START_TIME);
         db.insert_vm(name, &record).unwrap();
+        let record = db.get_vm(name).unwrap().unwrap();
         smolvm::agent::state_probe::recover_unreachable_machine_in_db(&record, db).unwrap();
         db.get_vm(name).unwrap().unwrap()
     }
