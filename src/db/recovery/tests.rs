@@ -227,3 +227,54 @@ fn crashed_recovery_owner_releases_only_after_confirmed_exit() {
         },
     );
 }
+
+#[test]
+fn recovery_reviews_competing_owners_of_disks_outside_the_runtime_directory() {
+    isolated(
+        "recovery_reviews_competing_owners_of_disks_outside_the_runtime_directory",
+        || {
+            let (db, record) = fixture();
+            let root = tempfile::tempdir().unwrap();
+            let disk = root.path().join("external-disk");
+            fs::write(&disk, b"external disk").unwrap();
+            let review = LaunchReview::from_record(&record).unwrap();
+            let launch = db
+                .reserve_reviewed_vm_launch(&review, Some(record.clone()), &disk, &[], &[])
+                .unwrap();
+            // Register this isolated test process without starting a VMM. The
+            // reservation's file ownership is the same as an admitted helper's.
+            db.admit_vm_boot(&launch.ticket.token).unwrap();
+            let current = db.get_vm(&record.name).unwrap().unwrap();
+            let raw = Connection::open(&db.path).unwrap();
+            let bytes: Vec<u8> = raw
+                .query_row(
+                    "SELECT data FROM vm_launch_admission WHERE token=?1",
+                    [&launch.ticket.token],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            let mut competing: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+            competing["child"] = serde_json::Value::Null;
+            competing["member"] = serde_json::Value::Null;
+            competing["purpose"] = serde_json::json!({"Prepare":{"name":null}});
+            raw.execute(
+                "INSERT INTO vm_launch_admission(token,data) VALUES ('competing',?1)",
+                [serde_json::to_vec(&competing).unwrap()],
+            )
+            .unwrap();
+            assert!(db.reserve_vm_recovery(&current).is_err());
+            assert_eq!(fs::read(&disk).unwrap(), b"external disk");
+            raw.execute(
+                "DELETE FROM vm_launch_admission WHERE token='competing'",
+                [],
+            )
+            .unwrap();
+            let guard = db.reserve_vm_recovery(&current).unwrap();
+            assert!(db
+                .admit_workload_mutation(None, std::slice::from_ref(&disk))
+                .is_err());
+            drop(guard);
+            db.admit_workload_mutation(None, &[disk]).unwrap();
+        },
+    );
+}

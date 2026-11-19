@@ -221,6 +221,11 @@ impl SmolvmDb {
                 std::slice::from_ref(&runtime),
             )?;
             let paths = super::launch_admission::recovery_paths(&tx, &member, &runtime)?;
+            super::launch_admission::reconcile_transfer(
+                &tx,
+                std::slice::from_ref(&member),
+                &paths,
+            )?;
             refuse_conflicts(&tx, Some(&record.name), &paths)?;
             let saved = Recovery {
                 version: 1,
