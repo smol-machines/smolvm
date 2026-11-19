@@ -415,6 +415,62 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn extraction_preserves_pax_paths_and_link_targets_with_newlines() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(tmp.path()).unwrap();
+        let name = "測試\nname.txt";
+        let payload = b"preserved";
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("path", name.as_bytes())])
+            .unwrap();
+        let mut header = tar::Header::new_ustar();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o640);
+        header.set_uid(owner.uid() as u64);
+        header.set_gid(owner.gid() as u64);
+        builder
+            .append_data(&mut header, "fallback.txt", &payload[..])
+            .unwrap();
+        for (path, kind) in [
+            ("symlink", tar::EntryType::Symlink),
+            ("hardlink", tar::EntryType::Link),
+        ] {
+            builder
+                .append_pax_extensions([("linkpath", name.as_bytes())])
+                .unwrap();
+            let mut link = header.clone();
+            link.set_size(0);
+            link.set_entry_type(kind);
+            link.set_link_name("fallback.txt").unwrap();
+            builder
+                .append_data(&mut link, path, std::io::empty())
+                .unwrap();
+        }
+        let destination = tmp.path().join("layer");
+        std::fs::create_dir(&destination).unwrap();
+        let bytes =
+            extract_oci_layer_with_size(&builder.into_inner().unwrap()[..], &destination).unwrap();
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(destination.join(name)).unwrap(), payload);
+        assert!(!destination.join("fallback.txt").exists());
+        assert_eq!(
+            std::fs::read_link(destination.join("symlink")).unwrap(),
+            Path::new(name)
+        );
+        assert_eq!(std::fs::read(destination.join("symlink")).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(destination.join("hardlink"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(destination.join(name)).unwrap().ino()
+        );
+    }
+
     #[test]
     fn classify_recognizes_markers_and_normals() {
         assert_eq!(classify_layer_entry(".wh..wh..opq"), LayerEntry::OpaqueDir);
