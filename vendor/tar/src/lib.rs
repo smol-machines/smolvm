@@ -50,6 +50,7 @@ pub use crate::header::GnuExtSparseHeader;
 pub use crate::header::DETERMINISTIC_TIMESTAMP;
 pub use crate::header::{GnuHeader, GnuSparseHeader, Header, HeaderMode, OldHeader, UstarHeader};
 pub use crate::pax::{PaxExtension, PaxExtensions};
+pub use crate::sparse::punch_sparse_hole;
 
 mod archive;
 mod builder;
@@ -58,6 +59,7 @@ mod entry_type;
 mod error;
 mod header;
 mod pax;
+mod sparse;
 
 fn other(msg: &str) -> Error {
     Error::new(ErrorKind::Other, msg)

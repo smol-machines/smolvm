@@ -735,24 +735,29 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     destination.set_len(0)?;
     destination.set_len(metadata.len())?;
     let fd = source.as_raw_fd();
-    let copied = copy_sparse_contents(
-        &mut source,
-        &mut destination,
-        metadata.len(),
-        |offset, kind| {
-            loop {
-                // SAFETY: fd belongs to source, which remains open throughout copying.
-                let result = unsafe { libc::lseek(fd, offset, kind) };
-                if result >= 0 {
-                    return Ok(result);
+    let copied = {
+        #[cfg(target_os = "macos")]
+        let mut output = SparseFileOutput(&mut destination);
+        #[cfg(target_os = "linux")]
+        let mut output = &mut destination;
+        let copied =
+            copy_sparse_contents(&mut source, &mut output, metadata.len(), |offset, kind| {
+                loop {
+                    // SAFETY: fd belongs to source, which remains open throughout copying.
+                    let result = unsafe { libc::lseek(fd, offset, kind) };
+                    if result >= 0 {
+                        return Ok(result);
+                    }
+                    let error = std::io::Error::last_os_error();
+                    if error.kind() != std::io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
                 }
-                let error = std::io::Error::last_os_error();
-                if error.kind() != std::io::ErrorKind::Interrupted {
-                    return Err(error);
-                }
-            }
-        },
-    )?;
+            })?;
+        #[cfg(target_os = "macos")]
+        output.seek(SeekFrom::Start(metadata.len()))?;
+        copied
+    };
     if source.metadata()?.len() != metadata.len() {
         return Err(std::io::Error::new(
             std::io::ErrorKind::UnexpectedEof,
@@ -761,6 +766,34 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
     }
     destination.set_permissions(metadata.permissions())?;
     Ok(copied)
+}
+
+/// This writer is used only for a freshly truncated sparse-copy destination:
+/// every forward seek skips bytes already known to be zero. Preserve those
+/// holes before APFS writeback can allocate them alongside nearby data.
+#[cfg(target_os = "macos")]
+struct SparseFileOutput<'a>(&'a mut std::fs::File);
+
+#[cfg(target_os = "macos")]
+impl Write for SparseFileOutput<'_> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.0.flush()
+    }
+}
+
+#[cfg(target_os = "macos")]
+impl Seek for SparseFileOutput<'_> {
+    fn seek(&mut self, position: SeekFrom) -> std::io::Result<u64> {
+        let previous = self.0.stream_position()?;
+        let next = self.0.seek(position)?;
+        if next > previous {
+            tar::punch_sparse_hole(self.0, previous, next)?;
+        }
+        Ok(next)
+    }
 }
 
 #[cfg(any(target_os = "linux", target_os = "macos"))]
@@ -1089,6 +1122,8 @@ mod tests {
         let src = dir.path().join("src.img");
         let dst = dir.path().join("dst.img");
 
+        // Small gaps exercise APFS allocation during writeback, which must
+        // not turn the sparse fallback into a dense copy.
         let logical_len: u64 = 8 * 1024 * 1024; // 8 MiB logical
         let head = b"HEAD-DATA-REGION";
         let tail = b"TAIL-DATA-REGION";
@@ -1124,6 +1159,10 @@ mod tests {
             let sparse_dst = dir.path().join("sparse.img");
             sparse_copy(&src, &sparse_dst).unwrap();
             assert_eq!(std::fs::read(&sparse_dst).unwrap(), src_bytes);
+            std::fs::File::open(&sparse_dst)
+                .unwrap()
+                .sync_all()
+                .unwrap();
             assert!(std::fs::metadata(&sparse_dst).unwrap().blocks() * 512 < logical_len / 2);
         }
 

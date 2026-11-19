@@ -669,10 +669,11 @@ impl<'a> EntryFields<'a> {
                         }
                     }
                     EntryIo::Pad(d) => {
-                        // TODO: checked cast to i64
-                        let to = SeekFrom::Current(d.limit() as i64);
-                        let size = f.seek(to)?;
+                        let length = i64::try_from(d.limit())
+                            .map_err(|_| other("sparse hole exceeds supported file size"))?;
+                        let size = f.seek(SeekFrom::Current(length))?;
                         f.set_len(size)?;
+                        crate::punch_sparse_hole(&f, size - d.limit(), size)?;
                     }
                 }
             }
