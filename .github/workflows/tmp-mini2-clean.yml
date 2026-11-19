@@ -5,16 +5,20 @@ on:
 jobs:
   clean:
     runs-on: [self-hosted, macOS, ARM64]
-    timeout-minutes: 40
+    timeout-minutes: 60
     steps:
-      - name: Free build output and measure the rest
+      - name: Remove stale QA scratch from the home directory
         run: |
           df -h /System/Volumes/Data | tail -1
-          for t in ~/actions-runner/_work/*/*/target; do [ -d "$t" ] && { echo "removing $t"; rm -rf "$t"; }; done
-          df -h /System/Volumes/Data | tail -1
-          echo "== largest files (Spotlight)"
-          mdfind -onlyin "$HOME" 'kMDItemFSSize > 2000000000' 2>/dev/null | head -40 | while read -r f; do echo "$(stat -f %z "$f" 2>/dev/null | awk '{printf "%.1f GB", $1/1073741824}') $(stat -f %Sm -t %Y-%m-%d "$f" 2>/dev/null) $f"; done | sort -rn | head -30
-          echo "== top-level sizes"
-          for d in ~/.smolvm ~/Documents ~/Downloads; do (perl -e 'alarm 900; exec @ARGV' du -d 2 -x -h "$d" 2>/dev/null | sort -rh | head -12 > "/tmp/du-$(basename $d).txt"; echo done) & done; wait
-          cat /tmp/du-.smolvm.txt /tmp/du-Documents.txt /tmp/du-Downloads.txt
+          open_now=$(lsof -Fn 2>/dev/null | sed -n 's/^n//p' | grep "^$HOME/" | cut -d/ -f1-4 | sort -u)
+          n=0
+          for p in "$HOME"/*; do
+            name=$(basename "$p")
+            case "$name" in actions-runner|Library|Desktop|Documents|Downloads|Movies|Music|Pictures|Public|Applications) continue;; esac
+            [ -e "$p/.git" ] && { echo "keep (git) $name"; continue; }
+            [ -n "$(find "$p" -maxdepth 0 -mmin -1440)" ] && { echo "keep (recent) $name"; continue; }
+            echo "$open_now" | grep -qxF "$p" && { echo "keep (open) $name"; continue; }
+            chmod -R u+w "$p" 2>/dev/null; rm -rf "$p" 2>/dev/null && { echo "removed $name"; n=$((n+1)); }
+          done
+          echo "removed $n entries"
           df -h /System/Volumes/Data | tail -1
