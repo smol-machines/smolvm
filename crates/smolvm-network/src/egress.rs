@@ -481,6 +481,19 @@ struct CompiledRule {
 
 impl EgressPolicy {
     /// No allow-list — every destination is allowed EXCEPT the platform hard-floor.
+    /// The local floor `--allow-host-loopback` selects, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_host_loopback_allowed(mut self) -> Self {
+        self.floor = FloorMode::MetadataOnly;
+        self
+    }
+
+    /// The local default floor, whatever the test's environment says.
+    #[cfg(test)]
+    pub(crate) fn floor_for_test_default(&mut self) {
+        self.floor = FloorMode::MetadataAndLoopback;
+    }
+
     pub fn unrestricted() -> Self {
         Self {
             inner: None,
