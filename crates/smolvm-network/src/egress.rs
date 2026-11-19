@@ -385,6 +385,10 @@ fn is_reserved_v4(v4: Ipv4Addr) -> bool {
         || v4.is_private()    // 10/8, 172.16/12, 192.168/16 — host/control internal subnet
         || v4.is_unspecified()
         || v4.is_broadcast()
+        // 224.0.0.0/4: a group is delivered on the host's LAN, so a guest's
+        // datagram to 224.0.0.1 reaches every neighbour. 240.0.0.0/4 is reserved.
+        || v4.is_multicast()
+        || v4.octets()[0] >= 240
         // 100.64.0.0/10 (CGNAT) — the gateway's own guest/gateway addresses live here.
         || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
 }
@@ -403,6 +407,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
                     || v6.is_unspecified()
                     || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                     || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                    || v6.is_multicast() // ff00::/8, delivered on the host's LAN
                     || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
             }
         },
@@ -1129,6 +1134,32 @@ mod tests {
         assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(123)));
         assert!(policy.allows_flow(FlowTransport::Udp, target, Some(123)));
         assert!(!policy.allows_flow(FlowTransport::Icmp, target, None));
+    }
+
+    // A multicast group is delivered on the host's LAN, so it is as private as
+    // the LAN itself under --block-private and the strict floor.
+    #[test]
+    fn the_private_floor_covers_multicast() {
+        use smolvm_protocol::FlowTransport;
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        for mode in [FloorMode::Private, FloorMode::Strict] {
+            for group in [
+                "224.0.0.1",
+                "239.255.255.250",
+                "ff02::1",
+                "ff05::c",
+                "::ffff:224.0.0.251",
+                "240.0.0.1",
+            ] {
+                assert!(is_floored(ip(group), mode), "{group} {mode:?}");
+            }
+            assert!(!is_floored(ip("1.1.1.1"), mode));
+        }
+        let mut policy = EgressPolicy::unrestricted();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy.with_private_floor(&[]).unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Udp, ip("224.0.0.1"), Some(9)));
+        assert!(policy.allows_flow(FlowTransport::Udp, ip("1.1.1.1"), Some(53)));
     }
 
     #[test]
