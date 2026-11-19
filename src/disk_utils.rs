@@ -71,8 +71,8 @@ pub(crate) fn create_sparse_disk<D: DiskType>(path: &Path, size_bytes: u64) -> R
 /// Copy a disk from a pre-formatted template, resizing to target size.
 ///
 /// On macOS, uses `clonefile()` for instant APFS copy-on-write cloning.
-/// On Linux, falls back to `fs::copy` (which uses `copy_file_range` for
-/// sparse-aware copying on supported filesystems).
+/// On Linux, uses reflinks when available. Both platforms fall back to a
+/// sparse copy when the destination cannot share the source extents.
 pub(crate) fn copy_disk_from_template<D: DiskType>(
     disk_path: &Path,
     size_bytes: u64,
@@ -487,8 +487,10 @@ fn mark_file_sparse(file: &std::fs::File) -> std::io::Result<()> {
 /// Clone a file using the platform-optimal copy method.
 ///
 /// - macOS: `clonefile()` for instant APFS copy-on-write
-/// - Linux: `FICLONE` reflink, then sparse `SEEK_HOLE`/`SEEK_DATA` fallback
-/// - Fallback: `fs::copy`
+/// - Linux: `FICLONE` reflink
+/// - macOS/Linux fallback: copy data extents, or scan and skip zero chunks if
+///   the source filesystem does not support extent queries
+/// - Other platforms: their native copy fallback
 ///
 /// Disk templates are sparse files (~500KB actual data in a 512MB logical file).
 /// `std::fs::copy()` copies all bytes including zero regions. The sparse copy
@@ -516,7 +518,7 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         tracing::debug!(
             src = %src.display(),
             errno = std::io::Error::last_os_error().raw_os_error().unwrap_or(0),
-            "clonefile failed, falling back to fs::copy"
+            "clonefile unavailable, falling back to sparse copy"
         );
     }
 
@@ -559,18 +561,16 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
                 tracing::debug!(src = %src.display(), %error, "FICLONE unavailable, falling back to sparse copy");
             }
         }
-        match sparse_copy(src, dst) {
-            Ok(bytes) => {
-                tracing::debug!(
-                    src = %src.display(), dst = %dst.display(),
-                    bytes_copied = bytes, "sparse copy succeeded"
-                );
-                return Ok(());
-            }
-            Err(e) => {
-                tracing::debug!(src = %src.display(), error = %e, "sparse copy failed, falling back");
-            }
-        }
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // Do not retry an I/O failure as a dense copy: that can hide a damaged
+        // source or turn a nearly empty VM disk into gigabytes of allocations.
+        let bytes =
+            sparse_copy(src, dst).map_err(|e| Error::storage("copy sparse file", e.to_string()))?;
+        tracing::debug!(src = %src.display(), dst = %dst.display(), bytes_copied = bytes, "sparse copy succeeded");
+        Ok(())
     }
 
     #[cfg(windows)]
@@ -592,8 +592,11 @@ pub fn clone_or_copy_file(src: &Path, dst: &Path) -> Result<()> {
         }
     }
 
-    std::fs::copy(src, dst).map_err(|e| Error::storage("copy file", e.to_string()))?;
-    Ok(())
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        std::fs::copy(src, dst).map_err(|e| Error::storage("copy file", e.to_string()))?;
+        Ok(())
+    }
 }
 
 /// Copy a sparse file on Windows/NTFS by replicating only its allocated regions,
@@ -703,58 +706,114 @@ fn sparse_copy_windows(src: &Path, dst: &Path) -> std::io::Result<u64> {
     Ok(total)
 }
 
-/// Copy only data regions of a sparse file via SEEK_HOLE/SEEK_DATA.
-#[cfg(target_os = "linux")]
+/// Copy data extents without materializing holes, including across APFS volumes.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
-    use std::io::{Seek, SeekFrom};
-    use std::os::unix::io::AsRawFd;
+    use std::os::unix::{fs::MetadataExt, io::AsRawFd};
 
-    let mut src_file = std::fs::File::open(src)?;
-    let src_len = src_file.metadata()?.len();
-    if src_len == 0 {
-        std::fs::File::create(dst)?;
-        return Ok(0);
+    let mut source = std::fs::File::open(src)?;
+    let metadata = source.metadata()?;
+    if !metadata.is_file() || metadata.len() > i64::MAX as u64 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sparse copy source must be a regular file with a supported length",
+        ));
     }
-
-    let mut dst_file = std::fs::OpenOptions::new()
+    let mut destination = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
-        .truncate(true)
+        .truncate(false)
         .open(dst)?;
-    dst_file.set_len(src_len)?;
-
-    let src_fd = src_file.as_raw_fd();
-    let mut total: u64 = 0;
-    let mut offset: i64 = 0;
-    let mut buf = vec![0u8; 256 * 1024];
-
-    loop {
-        let data_start = unsafe { libc::lseek(src_fd, offset, libc::SEEK_DATA) };
-        if data_start < 0 {
-            if std::io::Error::last_os_error().raw_os_error() == Some(libc::ENXIO) {
-                break;
-            }
-            return Err(std::io::Error::last_os_error());
-        }
-        let hole_start = unsafe { libc::lseek(src_fd, data_start, libc::SEEK_HOLE) };
-        if hole_start < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let data_end = hole_start.min(src_len as i64);
-        if data_start >= data_end {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::UnexpectedEof,
-                "sparse source extent changed during copy",
-            ));
-        }
-        src_file.seek(SeekFrom::Start(data_start as u64))?;
-        dst_file.seek(SeekFrom::Start(data_start as u64))?;
-        let length = (data_end - data_start) as u64;
-        copy_extent_exact(&mut src_file, &mut dst_file, length, &mut buf)?;
-        total += length;
-        offset = data_end;
+    let target = destination.metadata()?;
+    if metadata.dev() == target.dev() && metadata.ino() == target.ino() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "sparse copy source and destination are the same file",
+        ));
     }
-    Ok(total)
+    // Truncate first: skipped zero chunks must not retain an older copy's data.
+    destination.set_len(0)?;
+    destination.set_len(metadata.len())?;
+    let fd = source.as_raw_fd();
+    let copied = copy_sparse_contents(
+        &mut source,
+        &mut destination,
+        metadata.len(),
+        |offset, kind| {
+            loop {
+                // SAFETY: fd belongs to source, which remains open throughout copying.
+                let result = unsafe { libc::lseek(fd, offset, kind) };
+                if result >= 0 {
+                    return Ok(result);
+                }
+                let error = std::io::Error::last_os_error();
+                if error.kind() != std::io::ErrorKind::Interrupted {
+                    return Err(error);
+                }
+            }
+        },
+    )?;
+    if source.metadata()?.len() != metadata.len() {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::UnexpectedEof,
+            "sparse source length changed during copy",
+        ));
+    }
+    destination.set_permissions(metadata.permissions())?;
+    Ok(copied)
+}
+
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn copy_sparse_contents(
+    source: &mut (impl std::io::Read + Seek),
+    destination: &mut (impl Write + Seek),
+    size: u64,
+    mut extent: impl FnMut(i64, libc::c_int) -> std::io::Result<i64>,
+) -> std::io::Result<u64> {
+    let unsupported = |e: &std::io::Error| {
+        e.raw_os_error().is_some_and(|code| {
+            [libc::EINVAL, libc::ENOTSUP, libc::EOPNOTSUPP, libc::ENOSYS].contains(&code)
+        })
+    };
+    let mut offset = 0i64;
+    let mut copied = 0;
+    let mut buffer = vec![0; 256 * 1024];
+    while (offset as u64) < size {
+        let range = (|| {
+            let start = match extent(offset, libc::SEEK_DATA) {
+                Err(error) if error.raw_os_error() == Some(libc::ENXIO) => return Ok(None),
+                result => result?,
+            };
+            let end = extent(start, libc::SEEK_HOLE)?.min(size as i64);
+            if start < offset || start >= end {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "invalid sparse source extent",
+                ));
+            }
+            Ok(Some((start, end)))
+        })();
+        let (start, end) = match range {
+            Ok(Some(range)) => range,
+            Ok(None) => break,
+            Err(error) if offset == 0 && unsupported(&error) => {
+                // Some network/FUSE filesystems cannot enumerate extents. Scan
+                // once, preserving zero chunks, instead of allocating holes.
+                source.seek(SeekFrom::Start(0))?;
+                destination.seek(SeekFrom::Start(0))?;
+                copy_extent_exact(source, destination, size, &mut buffer)?;
+                return Ok(size);
+            }
+            Err(error) => return Err(error),
+        };
+        source.seek(SeekFrom::Start(start as u64))?;
+        destination.seek(SeekFrom::Start(start as u64))?;
+        let length = (end - start) as u64;
+        copy_extent_exact(source, destination, length, &mut buffer)?;
+        copied += length;
+        offset = end;
+    }
+    Ok(copied)
 }
 
 /// Copy `remaining` bytes, seeking past chunks that are all zeros instead of
@@ -762,7 +821,7 @@ fn sparse_copy(src: &Path, dst: &Path) -> std::io::Result<u64> {
 /// the result is identical, but written zeros in the source (a template that
 /// was copied with a tool that fills holes) stay holes in the copy instead of
 /// becoming gigabytes of dirty page cache the guest's first flush must sync.
-#[cfg(target_os = "linux")]
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn copy_extent_exact(
     source: &mut impl std::io::Read,
     destination: &mut (impl std::io::Write + std::io::Seek),
@@ -787,7 +846,7 @@ mod tests {
     use super::*;
     use std::io::{Seek, SeekFrom, Write};
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sparse_extent_copy_retries_partial_writes_and_interruptions() {
         struct ShortWriter {
@@ -828,7 +887,7 @@ mod tests {
         assert_eq!(destination.bytes, input);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sparse_extent_copy_rejects_truncated_input() {
         let error = copy_extent_exact(
@@ -841,7 +900,7 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
     }
 
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sparse_extent_copy_rejects_stalled_output() {
         let error = copy_extent_exact(
@@ -857,7 +916,7 @@ mod tests {
     /// A template whose free space is written zeros rather than holes (what
     /// `scp` or a plain `cp` leaves) must still copy as a sparse file, or every
     /// machine created from it starts with its whole disk dirty in page cache.
-    #[cfg(target_os = "linux")]
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
     #[test]
     fn sparse_copy_leaves_written_zeros_as_holes() {
         use std::os::unix::fs::MetadataExt;
@@ -885,6 +944,139 @@ mod tests {
             allocated < 4 * 1024 * 1024,
             "the copy allocated {allocated} bytes for {zeros} bytes of zeros"
         );
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sparse_copy_preserves_large_logical_disks_and_overwrites_old_data() {
+        use std::io::Read;
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let src = root.path().join("source");
+        let dst = root.path().join("destination");
+        let size = 32 * 1024 * 1024 * 1024;
+        let mut file = std::fs::File::create(&src).unwrap();
+        file.set_len(size).unwrap();
+        file.write_all(b"HEAD").unwrap();
+        file.seek(SeekFrom::Start(size - 4)).unwrap();
+        file.write_all(b"TAIL").unwrap();
+        file.sync_all().unwrap();
+        std::fs::write(&dst, vec![1; 1024 * 1024]).unwrap();
+        let copied = sparse_copy(&src, &dst).unwrap();
+        let metadata = std::fs::metadata(&dst).unwrap();
+        assert_eq!(metadata.len(), size);
+        assert!(metadata.blocks() * 512 < 4 * 1024 * 1024);
+        assert!(copied < 4 * 1024 * 1024, "copy scanned {copied} bytes");
+        let mut file = std::fs::File::open(&dst).unwrap();
+        let mut bytes = [0; 4];
+        for (position, expected) in [(0, *b"HEAD"), (512 * 1024, [0; 4]), (size - 4, *b"TAIL")] {
+            file.seek(SeekFrom::Start(position)).unwrap();
+            file.read_exact(&mut bytes).unwrap();
+            assert_eq!(bytes, expected);
+        }
+        println!(
+            "32 GiB sparse fallback: read {copied} bytes, allocated {} bytes",
+            metadata.blocks() * 512
+        );
+        let alias = root.path().join("alias");
+        std::fs::hard_link(&src, &alias).unwrap();
+        assert!(sparse_copy(&src, &alias).is_err());
+        assert_eq!(std::fs::metadata(&src).unwrap().len(), size);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sparse_copy_scans_only_when_extent_queries_are_unsupported() {
+        use std::io::Cursor;
+        let mut bytes = vec![0; 1024 * 1024];
+        bytes[..4].copy_from_slice(b"HEAD");
+        bytes[1024 * 1024 - 4..].copy_from_slice(b"TAIL");
+        // Exercise both a filesystem without SEEK_DATA and one which supports
+        // SEEK_DATA but not SEEK_HOLE. Both must preserve complete contents.
+        for fail_data in [true, false] {
+            let mut output = Cursor::new(vec![0; bytes.len()]);
+            copy_sparse_contents(
+                &mut Cursor::new(&bytes),
+                &mut output,
+                bytes.len() as u64,
+                |_, kind| {
+                    if fail_data || kind == libc::SEEK_HOLE {
+                        Err(std::io::Error::from_raw_os_error(libc::EINVAL))
+                    } else {
+                        Ok(0)
+                    }
+                },
+            )
+            .unwrap();
+            assert_eq!(output.into_inner(), bytes);
+        }
+        // A read/extent failure is not permission to skip data or retry densely.
+        for code in [libc::EIO, libc::EACCES, libc::ENOSPC, libc::ENXIO] {
+            let mut output = Cursor::new(Vec::new());
+            let error = copy_sparse_contents(
+                &mut Cursor::new(&bytes),
+                &mut output,
+                bytes.len() as u64,
+                |_, kind| {
+                    if kind == libc::SEEK_DATA {
+                        Ok(0)
+                    } else {
+                        Err(std::io::Error::from_raw_os_error(code))
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.raw_os_error(), Some(code));
+            assert!(output.into_inner().is_empty());
+        }
+        let mut output = Cursor::new(Vec::new());
+        let error = copy_sparse_contents(
+            &mut Cursor::new(&bytes),
+            &mut output,
+            bytes.len() as u64,
+            |_, _| Err(std::io::Error::from_raw_os_error(libc::EIO)),
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert!(output.into_inner().is_empty());
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn sparse_copy_rejects_late_extent_failures_and_truncated_streams() {
+        use std::io::Cursor;
+        let mut output = Cursor::new(Vec::new());
+        let error = copy_sparse_contents(
+            &mut Cursor::new(b"first-second"),
+            &mut output,
+            12,
+            |offset, kind| match (offset, kind) {
+                (0, libc::SEEK_DATA) => Ok(0),
+                (0, libc::SEEK_HOLE) => Ok(5),
+                _ => Err(std::io::Error::from_raw_os_error(libc::EIO)),
+            },
+        )
+        .unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(libc::EIO));
+        assert_eq!(output.into_inner(), b"first");
+        for unsupported in [true, false] {
+            let error = copy_sparse_contents(
+                &mut Cursor::new(b"short"),
+                &mut Cursor::new(Vec::new()),
+                12,
+                |_, kind| {
+                    if unsupported {
+                        Err(std::io::Error::from_raw_os_error(libc::ENOTSUP))
+                    } else if kind == libc::SEEK_DATA {
+                        Ok(0)
+                    } else {
+                        Ok(12)
+                    }
+                },
+            )
+            .unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::UnexpectedEof);
+        }
     }
 
     /// `clone_or_copy_file` must reproduce a sparse file byte-for-byte on every
@@ -925,7 +1117,7 @@ mod tests {
         assert_eq!(&dst_bytes[..head.len()], head);
         assert_eq!(&dst_bytes[dst_bytes.len() - tail.len()..], tail);
 
-        #[cfg(target_os = "linux")]
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
         {
             use std::os::unix::fs::MetadataExt;
             // Exercise the fallback even on a filesystem supporting reflinks.
