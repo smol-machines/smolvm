@@ -19,6 +19,9 @@
 //! | Running | yes | no  | **Unreachable** ← the bug 2 case |
 //! | Running | no  | yes | Running (macOS PID-not-visible edge case) |
 //! | Running | no  | no  | Stopped |
+//! | Unreachable | * | yes | Running |
+//! | Unreachable | yes | no | Unreachable |
+//! | Unreachable | no | no | Stopped |
 //! | Stopped/Created/Failed | * | * | record.state (no probe) |
 //!
 //! Used by:
@@ -39,7 +42,14 @@ use crate::db::SmolvmDb;
 /// but short enough that a `machine list` over a handful of stale
 /// records doesn't take seconds.
 pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
-    if record.state != RecordState::Running {
+    // Unreachable is a previous observation, not permission to kill a VM.
+    // In particular, a command can arrive after the child publishes its PID
+    // but before the guest agent is ready. Probe again before recovery so a
+    // now-responsive guest gets an orderly shutdown and can flush its disks.
+    if !matches!(
+        record.state,
+        RecordState::Running | RecordState::Unreachable
+    ) {
         return record.state.clone();
     }
 
@@ -300,8 +310,8 @@ mod tests {
 
     #[test]
     fn non_running_states_pass_through_without_probing() {
-        // The resolver short-circuits on any state other than
-        // Running — never touches the agent socket. This matters
+        // The resolver short-circuits on inactive lifecycle states
+        // without touching the agent socket. This matters
         // both for performance (no per-record probe on big lists)
         // and for correctness (Stopped should never randomly
         // become Unreachable just because some unrelated socket
@@ -310,7 +320,6 @@ mod tests {
             RecordState::Created,
             RecordState::Stopped,
             RecordState::Failed,
-            RecordState::Unreachable, // already-unreachable stays unreachable
         ] {
             let r = record(s.clone(), Some(99999));
             // Pass a name that won't match any real agent socket on
@@ -334,6 +343,15 @@ mod tests {
         let r = record(RecordState::Running, None);
         let resolved = resolve_state("ghost-does-not-exist", &r);
         assert_eq!(resolved, RecordState::Stopped);
+    }
+
+    #[test]
+    fn unreachable_without_a_process_or_agent_resolves_to_stopped() {
+        let r = record(RecordState::Unreachable, None);
+        assert_eq!(
+            resolve_state("unreachable-ghost-does-not-exist", &r),
+            RecordState::Stopped
+        );
     }
 
     /// The cases that require a live agent socket (Running with PID

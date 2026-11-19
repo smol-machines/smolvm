@@ -1,4 +1,5 @@
 use super::*;
+use crate::config::RecordState;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -89,6 +90,22 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
         let before = db.get_vm(names[0]).unwrap().unwrap();
         let outside = db.get_vm(names[1]).unwrap().unwrap();
         assert!(before.is_process_alive() && outside.is_process_alive());
+        // A failed probe during boot can leave a stale Unreachable record.
+        // Once the guest responds, recovery must not force-kill it merely
+        // because that earlier observation was persisted.
+        db.update_vm(names[0], |record| record.state = RecordState::Unreachable)
+            .unwrap();
+        assert_eq!(
+            crate::agent::state_probe::resolve_state(
+                names[0],
+                &db.get_vm(names[0]).unwrap().unwrap()
+            ),
+            RecordState::Running
+        );
+        assert!(!crate::agent::state_probe::recover_if_unreachable(names[0]).unwrap());
+        assert!(db.get_vm(names[0]).unwrap().unwrap().is_process_alive());
+        db.update_vm(names[0], |record| record.state = RecordState::Running)
+            .unwrap();
         db.claim_workload_transfer(
             "live-move",
             vec![Member::from_record(names[0], &before)],
