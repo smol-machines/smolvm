@@ -21,6 +21,7 @@ note() { printf '  \033[31mFAIL\033[0m %s\n' "$1"; fail=1; }
 ok()   { printf '  \033[32mok\033[0m   %s\n' "$1"; }
 
 echo "secrets guardrails:"
+echo "V2_MARKER_linux_selfhosted $(uname -s) $(date -u +%FT%TZ)"
 
 # 1. SecretRef must reject unknown fields, so a Smolfile/API typo
 #    (`from_stor`) is a hard error instead of a silently-ignored empty ref.

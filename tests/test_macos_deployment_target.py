@@ -36,6 +36,7 @@ class DeploymentTargetTests(unittest.TestCase):
                               capture_output=True, text=True)
 
     def test_supported_library_passes(self):
+        print("V2_MARKER_macos_selfhosted")
         result = self.check(self.supported)
         self.assertEqual(result.returncode, 0, result.stderr)
 
