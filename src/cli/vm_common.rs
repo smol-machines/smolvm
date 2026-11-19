@@ -1801,6 +1801,7 @@ fn start_vm_named_with_db(
     fork: ForkLaunch,
     options: StartOptions,
 ) -> smolvm::Result<()> {
+    let _admission = db.admit_workload_mutation(Some(name), &[])?;
     let startup_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let stop_after_workload = start_vm_named_locked(
         db,
@@ -2612,6 +2613,7 @@ pub fn stop_vm_named_with_timeout(
     name: &str,
     stop_timeout: Option<std::time::Duration>,
 ) -> smolvm::Result<()> {
+    let _admission = SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     // Serialize against fork capture in this or another process. Stopping the
     // VMM between snapshot preparation and clone registration can otherwise
     // strand an ambiguous generation.
@@ -3036,6 +3038,7 @@ fn held_process_delete_gate(
 
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
+    let _admission = SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let config = SmolvmConfig::load()?;
 

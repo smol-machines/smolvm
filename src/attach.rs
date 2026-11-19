@@ -121,6 +121,8 @@ pub fn attach(
     read_only: bool,
     boot_targets: &[String],
 ) -> Result<AttachedMount> {
+    let _admission = crate::db::SmolvmDb::open()?
+        .admit_workload_mutation(Some(name), &[source.to_path_buf()])?;
     let source = std::fs::canonicalize(source).map_err(|e| {
         Error::config(
             "attach mount",
@@ -196,6 +198,8 @@ pub fn attach(
 /// into a container itself (the Docker engine's containers that run in
 /// another container's machine). `share` is ASCII letters and digits.
 pub fn add_share(name: &str, share: &str, source: &Path, read_only: bool) -> Result<()> {
+    let _admission = crate::db::SmolvmDb::open()?
+        .admit_workload_mutation(Some(name), &[source.to_path_buf()])?;
     if share.is_empty() || !share.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(Error::config(
             "attach share",
@@ -237,6 +241,7 @@ fn share_source_arg(source: &Path) -> Result<String> {
 
 /// Remove a share [`add_share`] added, revoking the guest's access to it.
 pub fn remove_share(name: &str, share: &str, read_only: bool) -> Result<()> {
+    let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     control(name, &format!("SHARE_REMOVE {} {share}", tag(read_only))).map(|_| ())
 }
 
@@ -294,6 +299,7 @@ fn parse_shared_directories(reply: &str) -> Result<Vec<(String, PathBuf)>> {
 
 /// Unmount the attached mount at `target` from the running machine `name`.
 pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
+    let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     let target = normalize_target(target)?;
     let target_str = target.to_string_lossy().into_owned();
     let (mut client, supported) = connect(name)?;

@@ -24,6 +24,7 @@ use std::time::Duration;
 
 mod resize;
 pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
+pub mod transfer_admission;
 
 /// SQLite busy_timeout: how long a blocked writer waits for the write lock
 /// before returning SQLITE_BUSY. Set high enough to survive burst contention
@@ -307,6 +308,11 @@ impl SmolvmDb {
              );
              CREATE UNIQUE INDEX IF NOT EXISTS vm_pause_active
                  ON vm_pause_operations(name) WHERE consumed = 0;
+             CREATE TABLE IF NOT EXISTS workload_transfer_admission (
+                 operation TEXT PRIMARY KEY NOT NULL,
+                 retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+                 data BLOB NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS config (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
@@ -663,6 +669,7 @@ impl SmolvmDb {
     ///
     /// Read + delete happen in a single transaction to prevent TOCTOU races.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
+        let _admission = self.admit_workload_mutation(Some(name), &[])?;
         self.with_conn(|conn| {
             // Reserve the writer before reading. A deferred transaction can
             // observe a record, lose a cross-process writer race, and fail its

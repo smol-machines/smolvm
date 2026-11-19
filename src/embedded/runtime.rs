@@ -257,6 +257,8 @@ impl EmbeddedRuntime {
     }
 
     fn pause_machine_inner(&self, name: &str, operation: Option<&str>) -> Result<()> {
+        // Pause recovery may itself resume a partially captured VMM.
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let mut record = control::get_record(&self.db, name)?;
@@ -415,6 +417,9 @@ impl EmbeddedRuntime {
         detached: bool,
         operation: Option<&str>,
     ) -> Result<()> {
+        // Recovery can send RESUME directly to an existing VMM, bypassing
+        // ordinary boot admission. Fence that path before touching its state.
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let _source = crate::agent::fork::lock_fork_source(name)?;
@@ -602,6 +607,7 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
@@ -649,6 +655,7 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if control::get_record(&self.db, name)?
@@ -704,6 +711,7 @@ impl EmbeddedRuntime {
     /// Used by the containerd shim for pod sandboxes; requires the machine to use
     /// the virtio-net backend.
     pub fn start_machine_with_netns(&self, name: &str, netns: std::path::PathBuf) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
@@ -723,6 +731,7 @@ impl EmbeddedRuntime {
     /// with [`fork_machine`](Self::fork_machine) — the basis for local RL rollout
     /// branching.
     pub fn start_forkable_machine(&self, name: &str) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
@@ -1007,6 +1016,7 @@ impl EmbeddedRuntime {
     /// commands and transfers finish first and overriding the workload's stop
     /// timeout. New commands are refused while the stop runs.
     pub fn stop_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         let _fence = self.inflight.fence(name, "stopped", options.drain);
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
@@ -1051,6 +1061,7 @@ impl EmbeddedRuntime {
     /// [`delete_machine`](Self::delete_machine), optionally letting running
     /// commands and transfers finish first.
     pub fn delete_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         let _fence = self.inflight.fence(name, "deleted", options.drain);
         let result = self.delete_machine_inner(name);
         if result.is_ok() {

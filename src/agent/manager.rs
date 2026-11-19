@@ -1926,6 +1926,14 @@ impl AgentManager {
 
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
         let name = name.into();
+        // Launch access may create or grow disks before start_via_subprocess.
+        // Observation remains available while a transfer owns the machine.
+        let _admission = match access {
+            DiskAccess::Launch { .. } => {
+                Some(crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(&name), &[])?)
+            }
+            DiskAccess::Observe => None,
+        };
         let rootfs_path = match access {
             DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,
             DiskAccess::Observe => Self::default_rootfs_path()?,
@@ -2667,6 +2675,13 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         if let Some(name) = self.name() {
             if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
                 if record.paused_checkpoint.is_some() && !features.resume_paused {
@@ -3178,6 +3193,15 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
+        // Retain the gate through boot and PID-file registration. Callers that
+        // publish the PID to the database must hold an outer guard until then.
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         let t_launch = Instant::now();
 
         // A machine created from a checkpoint carries a private,
@@ -4016,6 +4040,13 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         let reachable = self.try_connect_existing().is_some();
         if reachable {
