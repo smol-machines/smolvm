@@ -151,6 +151,19 @@ pub(crate) struct EndpointRecord {
     pub gateway6: String,
 }
 
+/// The machine generation and guest execution retained across a saved VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SavedExecution {
+    session: super::container_session::SavedSession,
+    machine: String,
+    machine_created_at: u64,
+    owner: String,
+    #[serde(default)]
+    process_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_generation: Option<String>,
+}
+
 /// Everything persisted about one container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ContainerRecord {
@@ -179,6 +192,11 @@ pub(crate) struct ContainerRecord {
     /// Monotonic host start order; raw VM checkpoints do not roll it back.
     #[serde(default)]
     pub execution_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_execution: Option<SavedExecution>,
+    /// The guest execution exists in a checkpoint rather than a live attachment.
+    #[serde(default)]
+    pub execution_suspended: bool,
     pub ports: Vec<PublishedPort>,
     pub mounts: Vec<MountRecord>,
     /// Stopped by a user, so `unless-stopped` and `always` keep it down.
@@ -325,6 +343,17 @@ impl Container {
         self.record.lock().clone()
     }
 
+    pub(crate) fn owns_live_execution(&self) -> bool {
+        self.running.lock().is_some() || {
+            let record = self.record.lock();
+            !record.execution_suspended
+                && matches!(
+                    record.state.status.as_str(),
+                    "running" | "paused" | "restarting"
+                )
+        }
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         self.running.lock().is_some()
             || matches!(
@@ -355,6 +384,22 @@ impl Container {
         if let Err(e) = engine.store.save_container(&record) {
             tracing::warn!(container = %record.id, error = %e, "could not save container record");
         }
+    }
+
+    fn update_durable(
+        &self,
+        engine: &Engine,
+        f: impl FnOnce(&mut ContainerRecord),
+    ) -> ApiResult<()> {
+        let mut record = self.record.lock();
+        let mut updated = record.clone();
+        f(&mut updated);
+        engine
+            .store
+            .save_container_durable(&updated)
+            .map_err(internal_execution)?;
+        *record = updated;
+        Ok(())
     }
 
     fn reserve_execution_generation(&self, engine: &Engine) -> ApiResult<u64> {
@@ -575,6 +620,8 @@ pub(crate) async fn create(
         state: StateRecord::default(),
         restart_count: 0,
         execution_generation: 0,
+        saved_execution: None,
+        execution_suspended: false,
         ports,
         mounts,
         user_stopped: false,
@@ -1491,58 +1538,99 @@ async fn run_container(
         }
     };
 
-    let pid = match &handle {
-        Some(handle) => handle.child_pid().unwrap_or(0) as i64,
-        None => record
-            .network_host()
-            .and_then(|h| engine.find_container(h))
-            .map(|h| h.record().state.pid)
-            .unwrap_or(0),
-    };
-    c.update(engine, |r| {
-        r.agent_socket = Some(socket.clone());
-        r.state.status = "running".into();
-        r.state.pid = pid;
-        r.state.exit_code = 0;
-        r.state.error.clear();
-        r.state.oom_killed = false;
-        r.state.started_at = origin.started_at.clone();
-        r.state.finished_at = super::util::ZERO_TIME.into();
-        r.pending_archives.clear();
-        if r.config.healthcheck.as_ref().is_some_and(health_enabled) {
-            r.state.health = Some(HealthRecord {
-                status: "starting".into(),
-                failing_streak: 0,
-                log: Vec::new(),
-            });
-        }
-    });
-    let health = record
-        .config
-        .healthcheck
-        .clone()
-        .filter(health_enabled)
-        .map(|h| tokio::spawn(health_loop(engine.clone(), c.clone(), h)).abort_handle());
-    let process_started = crate::process::process_start_time(pid as i32);
-    *c.running.lock() = Some(Running {
-        socket,
-        vm: handle,
-        _health: health,
-    });
-    c.emit(engine, "start", &[]);
+    supervise_container(engine, c, record, handle, socket, image_lease, session).await
+}
 
-    // Carry the container's I/O until its command exits.
-    let e = engine.clone();
-    let container = c.clone();
-    let tty = record.config.tty;
-    let log_path = super::logs::path(&engine.store, &record.id);
-    tokio::spawn(async move {
-        let mut log = super::logs::LogWriter::open(&log_path, tty).ok();
-        let alive = || {
-            crate::process::reap_vm_children();
-            pid > 0 && crate::process::is_our_process(pid as i32, process_started)
+fn supervise_container<'a>(
+    engine: &'a Arc<Engine>,
+    c: &'a Arc<Container>,
+    record: ContainerRecord,
+    handle: Option<crate::embedded::handle::VmHandle>,
+    socket: PathBuf,
+    image_lease: Option<super::image_share::Lease>,
+    mut session: super::container_session::Session,
+) -> futures_util::future::BoxFuture<'a, ApiResult<bool>> {
+    Box::pin(async move {
+        let origin = session.origin().clone();
+        let mut saved = saved_execution(engine, &record, &session)?;
+        saved.image_generation = image_lease
+            .as_ref()
+            .map(|lease| lease.generation().to_owned());
+        let process_paused = saved.process_paused;
+        // Failure to retain the identity must not silently create unrecoverable
+        // execution; the caller still owns the VM handle until this succeeds.
+        if let Err(error) = c.update_durable(engine, |r| {
+            r.saved_execution = Some(saved);
+            r.execution_suspended = false;
+        }) {
+            if record.saved_execution.is_none() {
+                let _ = session.cancel_and_forget().await;
+                if let Some(lease) = image_lease {
+                    lease.release().await;
+                }
+            }
+            return Err(error);
+        }
+        let pid = match &handle {
+            Some(handle) => handle.child_pid().unwrap_or(0) as i64,
+            // Recovery already verified the backing VM and read its current PID;
+            // another container's persisted status may still describe the pause.
+            None if record.saved_execution.is_some() => record.state.pid,
+            None => record
+                .network_host()
+                .and_then(|h| engine.find_container(h))
+                .map(|h| h.record().state.pid)
+                .unwrap_or(record.state.pid),
         };
-        let result = session
+        c.update(engine, |r| {
+            r.agent_socket = Some(socket.clone());
+            r.state.status = if process_paused { "paused" } else { "running" }.into();
+            r.state.pid = pid;
+            r.state.exit_code = 0;
+            r.state.error.clear();
+            r.state.oom_killed = false;
+            r.state.started_at = origin.started_at.clone();
+            r.state.finished_at = super::util::ZERO_TIME.into();
+            r.pending_archives.clear();
+            if r.config.healthcheck.as_ref().is_some_and(health_enabled) {
+                r.state.health = Some(HealthRecord {
+                    status: "starting".into(),
+                    failing_streak: 0,
+                    log: Vec::new(),
+                });
+            }
+        });
+        let health = record
+            .config
+            .healthcheck
+            .clone()
+            .filter(health_enabled)
+            .map(|h| tokio::spawn(health_loop(engine.clone(), c.clone(), h)).abort_handle());
+        let process_started = crate::process::process_start_time(pid as i32);
+        *c.running.lock() = Some(Running {
+            socket,
+            vm: handle,
+            _health: health,
+        });
+        if record.saved_execution.is_none() {
+            c.emit(engine, "start", &[]);
+        } else if !process_paused && (record.execution_suspended || record.state.status == "paused")
+        {
+            c.emit(engine, "unpause", &[]);
+        }
+
+        // Carry the container's I/O until its command exits.
+        let e = engine.clone();
+        let container = c.clone();
+        let tty = record.config.tty;
+        let log_path = super::logs::path(&engine.store, &record.id);
+        tokio::spawn(async move {
+            let mut log = super::logs::LogWriter::open(&log_path, tty).ok();
+            let alive = || {
+                crate::process::reap_vm_children();
+                pid > 0 && crate::process::is_our_process(pid as i32, process_started)
+            };
+            let result = session
             .pump(
                 &container.input,
                 |stream, data| {
@@ -1565,38 +1653,265 @@ async fn run_container(
                 alive,
             )
             .await;
-        let exit = match result {
-            Ok(exit) => {
-                if let Err(error) = session.forget().await {
-                    tracing::warn!(container = %record.id, error = %error, "could not release completed container session");
+            let exit = match result {
+                Ok(exit) => {
+                    if let Err(error) = session.forget().await {
+                        tracing::warn!(container = %record.id, error = %error, "could not release completed container session");
+                    }
+                    exit
                 }
-                exit
+                Err(error) => {
+                    if retain_saved_execution(&e, &container, &session, pid, process_started).await
+                    {
+                        if let Some(log) = log.as_mut() {
+                            log.flush();
+                        }
+                        container.log_written.notify_waiters();
+                        // A shared-VM container retains its durable image reference
+                        // until that execution exits, including across supervisor exit.
+                        drop(image_lease);
+                        return;
+                    }
+                    // This is an execution-management failure, not an observed
+                    // process status or OOM kill. Keep the reason in Docker inspect.
+                    container.update(&e, |r| {
+                        r.state.error = format!("Container execution lost: {error}")
+                    });
+                    if alive() {
+                        let _ = session.cancel_and_forget().await;
+                    }
+                    Exit {
+                        code: 255,
+                        oom: false,
+                    }
+                }
+            };
+            if let Some(log) = log.as_mut() {
+                log.flush();
             }
-            Err(error) => {
-                // This is an execution-management failure, not an observed
-                // process status or OOM kill. Keep the reason in Docker inspect.
-                container.update(&e, |r| {
-                    r.state.error = format!("Container execution lost: {error}")
+            container.log_written.notify_waiters();
+            if let Some(lease) = image_lease {
+                lease.release().await;
+            }
+            on_exit(e, container, exit).await;
+        });
+        Ok(true)
+    })
+}
+
+fn internal_execution(error: impl std::fmt::Display) -> ApiError {
+    ApiError::internal(format!("retain container execution: {error}"))
+}
+
+fn saved_execution(
+    engine: &Engine,
+    record: &ContainerRecord,
+    session: &super::container_session::Session,
+) -> ApiResult<SavedExecution> {
+    let host = record
+        .network_host()
+        .and_then(|id| engine.find_container(id))
+        .map(|c| c.record());
+    let owner = host.as_ref().unwrap_or(record);
+    let vm = engine
+        .db
+        .get_vm(&owner.machine)
+        .map_err(internal_execution)?
+        .ok_or_else(|| ApiError::conflict("container machine is missing"))?;
+    if vm.labels.get(MACHINE_LABEL) != Some(&owner.id) {
+        return Err(ApiError::conflict("container machine ownership changed"));
+    }
+    Ok(SavedExecution {
+        session: session.saved(),
+        machine: vm.name,
+        machine_created_at: vm.created_at,
+        owner: owner.id.clone(),
+        process_paused: record
+            .saved_execution
+            .as_ref()
+            .is_some_and(|saved| saved.process_paused),
+        image_generation: None,
+    })
+}
+
+fn retained_machine(
+    engine: &Engine,
+    saved: &SavedExecution,
+) -> ApiResult<Option<crate::config::VmRecord>> {
+    let vm = engine
+        .db
+        .get_vm(&saved.machine)
+        .map_err(internal_execution)?;
+    if vm.as_ref().is_some_and(|vm| {
+        vm.created_at != saved.machine_created_at
+            || vm.labels.get(MACHINE_LABEL) != Some(&saved.owner)
+    }) {
+        return Err(ApiError::conflict(
+            "saved container machine ownership changed",
+        ));
+    }
+    Ok(vm)
+}
+
+async fn retain_saved_execution(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+    session: &super::container_session::Session,
+    original_pid: i64,
+    original_start: Option<u64>,
+) -> bool {
+    let _vm_guard = c.vm.lock().await;
+    let record = c.record();
+    let Some(mut saved) = record.saved_execution else {
+        return false;
+    };
+    let uncertainty = match retained_machine(engine, &saved) {
+        Ok(Some(vm)) => {
+            let paused = vm.paused_checkpoint.is_some()
+                && matches!(
+                    vm.state,
+                    crate::config::RecordState::Paused | crate::config::RecordState::Pausing
+                );
+            let resumed = vm.is_process_alive()
+                && !crate::process::is_our_process(original_pid as i32, original_start);
+            if !paused && !resumed {
+                return false;
+            }
+            None
+        }
+        Ok(None) => return false,
+        // An unreadable or replaced owner is not proof that this execution
+        // ended. Keep its authority for recovery without touching another VM.
+        Err(error) => Some(error.message),
+    };
+    saved.session = session.saved();
+    if let Err(error) = c.update_durable(engine, |record| {
+        record.saved_execution = Some(saved);
+        record.execution_suspended = true;
+        record.state.status = "paused".into();
+        record.state.pid = 0;
+        record.state.error = uncertainty.unwrap_or_default();
+    }) {
+        // The start's identity is already durable. Keep that recovery authority
+        // and never translate a storage error into process cleanup or restart.
+        tracing::error!(container = %c.id(), error = %error.message, "cannot retain current container cursors");
+        let mut record = c.record.lock();
+        record.execution_suspended = true;
+        record.state.status = "paused".into();
+        record.state.error = error.message;
+    }
+    if let Some(mut running) = c.running.lock().take() {
+        if let Some(health) = running._health.take() {
+            health.abort();
+        }
+        if let Some(handle) = running.vm.take() {
+            handle.detach();
+        }
+    }
+    c.input.finish();
+    let _ = c.output.send(Output::End);
+    true
+}
+
+/// Reconcile only the private supervisor's own saved execution before serving
+/// a request. Observation never resumes a paused machine.
+pub(crate) async fn reconcile_owner(engine: &Arc<Engine>) -> ApiResult<()> {
+    let Some(c) = engine
+        .owner
+        .as_deref()
+        .and_then(|id| engine.find_container(id))
+    else {
+        return Ok(());
+    };
+    if c.running.lock().is_some() || c.record().saved_execution.is_none() {
+        return Ok(());
+    }
+    let _op = c.op.lock().await;
+    if c.running.lock().is_none() {
+        restore_saved_execution(engine, &c, false).await?;
+    }
+    Ok(())
+}
+
+async fn restore_saved_execution(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+    resume: bool,
+) -> ApiResult<bool> {
+    let _vm_guard = c.vm.lock().await;
+    if c.running.lock().is_some() {
+        return Ok(true);
+    }
+    let mut record = c.record();
+    let Some(saved) = record.saved_execution.clone() else {
+        return Ok(false);
+    };
+    let Some(mut vm) = retained_machine(engine, &saved)? else {
+        return Ok(false);
+    };
+    if vm.paused_checkpoint.is_some() {
+        if !resume {
+            if !record.execution_suspended
+                || record.state.status != "paused"
+                || record.state.pid != 0
+            {
+                c.update(engine, |record| {
+                    record.execution_suspended = true;
+                    record.state.status = "paused".into();
+                    record.state.pid = 0;
                 });
-                if alive() {
-                    let _ = session.cancel_and_forget().await;
-                }
-                Exit {
-                    code: 255,
-                    oom: false,
-                }
             }
-        };
-        if let Some(log) = log.as_mut() {
-            log.flush();
+            return Ok(true);
         }
-        container.log_written.notify_waiters();
-        if let Some(lease) = image_lease {
-            lease.release().await;
-        }
-        on_exit(e, container, exit).await;
-    });
-    Ok(true)
+        let name = saved.machine.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::embedded::EmbeddedRuntime::new()?.resume_machine_detached(&name)
+        })
+        .await
+        .map_err(internal_execution)?
+        .map_err(internal_execution)?;
+        vm = retained_machine(engine, &saved)?
+            .ok_or_else(|| ApiError::conflict("saved machine disappeared"))?;
+    }
+    if !vm.is_process_alive() {
+        return Ok(false);
+    }
+    let name = saved.machine.clone();
+    let storage = vm.storage_gb;
+    let overlay = vm.overlay_gb;
+    let socket = tokio::task::spawn_blocking(move || {
+        crate::agent::AgentManager::for_vm_with_sizes(&name, storage, overlay)
+            .map(|manager| manager.vsock_socket().to_path_buf())
+    })
+    .await
+    .map_err(internal_execution)?
+    .map_err(internal_execution)?;
+    let image_lease = if let Some(generation) = saved.image_generation {
+        let root = engine.store.root().to_path_buf();
+        let machine = saved.machine.clone();
+        let host = saved.owner.clone();
+        let owner = record.id.clone();
+        let share = record.guest_image_share();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                super::image_share::Lease::recover(&root, machine, &host, generation, owner, share)
+            })
+            .await
+            .map_err(internal_execution)?
+            .map_err(internal_execution)?,
+        )
+    } else {
+        None
+    };
+    let session = super::container_session::Session::from_saved(
+        socket.clone(),
+        overlay_id(&record),
+        saved.session,
+    )
+    .await
+    .map_err(internal_execution)?;
+    record.state.pid = vm.pid.unwrap_or(0) as i64;
+    supervise_container(engine, c, record, None, socket, image_lease, session).await
 }
 
 /// A start that failed leaves an auto-remove container to be removed, as the
@@ -1725,6 +2040,8 @@ async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
     c.input.finish();
     c.update(&engine, |r| {
         r.state.status = "exited".into();
+        r.saved_execution = None;
+        r.execution_suspended = false;
         r.state.pid = 0;
         r.state.exit_code = exit.code;
         r.state.oom_killed = exit.oom;
@@ -1960,6 +2277,10 @@ async fn signal_processes(c: &Container, signal: &str, all: bool) -> ApiResult<(
 pub(crate) async fn kill(engine: &Arc<Engine>, c: &Arc<Container>, sig: &str) -> ApiResult<()> {
     let number = super::util::signal_number(sig)
         .ok_or_else(|| ApiError::bad_request(format!("Invalid signal: {sig}")))?;
+    if c.record().execution_suspended {
+        let _op = c.op.lock().await;
+        restore_saved_execution(engine, c, true).await?;
+    }
     if !c.is_running() {
         return Err(ApiError::conflict(format!(
             "Cannot kill container: {}: Container {} is not running",
@@ -2012,6 +2333,9 @@ async fn stop_locked(
     timeout: Option<i64>,
     sig: Option<String>,
 ) -> ApiResult<bool> {
+    if c.record().execution_suspended {
+        restore_saved_execution(engine, c, true).await?;
+    }
     let record = c.record();
     if record.state.status == "restarting" {
         c.update(engine, |r| {
@@ -2055,6 +2379,11 @@ async fn stop_locked(
             Duration::from_secs(timeout as u64)
         };
         if !exited(&mut exits, wait).await {
+            // A machine save can race a stop begun while the command was live.
+            // Resume that same execution before enforcing the elapsed timeout.
+            if c.record().execution_suspended {
+                restore_saved_execution(engine, c, true).await?;
+            }
             c.emit(engine, "kill", &[("signal", "9".into())]);
             let _ = signal(c, "9").await;
         }
@@ -2063,12 +2392,20 @@ async fn stop_locked(
         let _ = signal(c, "9").await;
     }
     if !exited(&mut exits, Duration::from_secs(10)).await {
+        if c.record().execution_suspended {
+            restore_saved_execution(engine, c, true).await?;
+            let _ = signal(c, "9").await;
+        }
         // The agent did not end it; stop the machine, which ends everything.
         let socket_gone = c.running.lock().as_mut().and_then(|r| r.vm.take());
         if let Some(mut handle) = socket_gone {
             let _ =
                 tokio::task::spawn_blocking(move || handle.stop_with_timeout(Some(Duration::ZERO)))
                     .await;
+        } else if !record.machine.is_empty() {
+            // Reattached execution has no launching-process handle in this
+            // supervisor; its owned machine must still be stoppable.
+            stop_machine(engine, &record.machine, Some(Duration::ZERO)).await;
         }
         let _ = exited(&mut exits, Duration::from_secs(30)).await;
     }
@@ -2222,6 +2559,20 @@ pub(crate) async fn wait(c: &Arc<Container>, condition: &str) -> ApiResult<i64> 
 /// process of the container.
 pub(crate) async fn pause(engine: &Arc<Engine>, c: &Arc<Container>, pause: bool) -> ApiResult<()> {
     let _op = c.op.lock().await;
+    if !pause && c.record().execution_suspended {
+        restore_saved_execution(engine, c, true).await?;
+        if c.record().state.status == "paused" {
+            signal_processes(c, "SIGCONT", true).await?;
+            c.update(engine, |record| {
+                record.state.status = "running".into();
+                if let Some(saved) = &mut record.saved_execution {
+                    saved.process_paused = false;
+                }
+            });
+            c.emit(engine, "unpause", &[]);
+        }
+        return Ok(());
+    }
     let status = c.record().state.status;
     match (pause, status.as_str()) {
         (true, "running") => {}
@@ -2247,7 +2598,10 @@ pub(crate) async fn pause(engine: &Arc<Engine>, c: &Arc<Container>, pause: bool)
     }
     signal_processes(c, if pause { "SIGSTOP" } else { "SIGCONT" }, true).await?;
     c.update(engine, |r| {
-        r.state.status = if pause { "paused" } else { "running" }.into()
+        r.state.status = if pause { "paused" } else { "running" }.into();
+        if let Some(saved) = &mut r.saved_execution {
+            saved.process_paused = pause;
+        }
     });
     c.emit(engine, if pause { "pause" } else { "unpause" }, &[]);
     Ok(())
@@ -2380,6 +2734,16 @@ pub(crate) async fn recover(engine: &Arc<Engine>) {
         if engine.owner.as_deref() != Some(c.id().as_str()) {
             continue;
         }
+        if c.record().saved_execution.is_some() {
+            match restore_saved_execution(engine, &c, false).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(container = %c.id(), error = %error.message, "saved container execution requires recovery");
+                    continue;
+                }
+            }
+        }
         let record = c.record();
         let was_running = matches!(
             record.state.status.as_str(),
@@ -2431,7 +2795,7 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
         .containers
         .read()
         .values()
-        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()) && c.is_running())
+        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()) && c.owns_live_execution())
         .cloned()
         .collect();
     let mut tasks = Vec::new();
@@ -2883,6 +3247,107 @@ mod tests {
         restored.update(&engine, |r| r.execution_generation = u64::MAX);
         assert!(restored.reserve_execution_generation(&engine).is_err());
         assert_eq!(restored.record.lock().execution_generation, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn observing_saved_execution_keeps_restart_and_remove_policies_dormant() {
+        for policy in ["always", "auto-remove"] {
+            let root = tempfile::tempdir().unwrap();
+            let engine = super::super::test_engine(root.path());
+            let id = "a".repeat(64);
+            let mut vm =
+                crate::config::VmRecord::new("saved-owner".into(), 1, 512, vec![], vec![], false);
+            vm.labels.insert(MACHINE_LABEL.into(), id.clone());
+            vm.state = crate::config::RecordState::Paused;
+            vm.paused_checkpoint = Some(root.path().join("owned.checkpoint"));
+            engine.db.insert_vm(&vm.name, &vm).unwrap();
+            let mut record: ContainerRecord = serde_json::from_value(serde_json::json!({
+                "id": id, "name": "saved", "created": "", "image": "", "image_id": "",
+                "pull_ref": "", "machine": vm.name, "config": {}, "host_config": {}, "host_config_raw": {},
+                "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+                "restart_count": 0, "ports": [], "mounts": []
+            })).unwrap();
+            record.state.status = "running".into();
+            record.host_config.auto_remove = policy == "auto-remove";
+            if policy == "always" {
+                record.host_config.restart_policy.name = "always".into();
+            }
+            let session = super::super::container_session::Session::new(
+                root.path().join("agent.sock"),
+                vm.name.clone(),
+                smolvm_protocol::container_session::Origin {
+                    generation: 1,
+                    started_at: "2026-11-18T00:00:00Z".into(),
+                },
+            );
+            record.saved_execution = Some(saved_execution(&engine, &record, &session).unwrap());
+            engine.store.save_container(&record).unwrap();
+            let container = Container::from_record(record);
+            assert!(restore_saved_execution(&engine, &container, false)
+                .await
+                .unwrap());
+            let stored = engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.state.status, "paused");
+            assert!(stored.saved_execution.is_some() && stored.execution_suspended);
+            assert!(!container.owns_live_execution());
+            assert_eq!(stored.restart_count, 0);
+            assert_eq!(
+                engine
+                    .db
+                    .get_vm(&vm.name)
+                    .unwrap()
+                    .unwrap()
+                    .paused_checkpoint,
+                vm.paused_checkpoint
+            );
+            // A replacement with the same name must not inherit this authority.
+            engine
+                .db
+                .update_vm(&vm.name, |vm| vm.created_at += 1)
+                .unwrap();
+            assert!(restore_saved_execution(&engine, &container, false)
+                .await
+                .is_err());
+            assert!(engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .is_some());
+            assert!(retain_saved_execution(&engine, &container, &session, 0, None).await);
+            assert!(container.record().state.error.contains("ownership changed"));
+            assert_eq!(
+                engine.db.get_vm(&vm.name).unwrap().unwrap().created_at,
+                vm.created_at + 1
+            );
+        }
+    }
+
+    #[test]
+    fn failed_execution_persistence_does_not_change_in_memory_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id": "b".repeat(64), "name": "saved", "created": "", "image": "", "image_id": "",
+            "pull_ref": "", "machine": "", "config": {}, "host_config": {}, "host_config_raw": {},
+            "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+            "restart_count": 0, "ports": [], "mounts": []
+        }))
+        .unwrap();
+        engine.store.save_container(&record).unwrap();
+        let container = Container::from_record(record);
+        let directory = engine.store.container_dir(&container.id());
+        let retained = root.path().join("retained");
+        std::fs::rename(&directory, &retained).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        assert!(container
+            .update_durable(&engine, |r| r.execution_suspended = true)
+            .is_err());
+        assert!(!container.record().execution_suspended);
+        assert_eq!(container.record().state.status, "created");
     }
 
     #[test]

@@ -5752,7 +5752,10 @@ impl CreateCmd {
                     record.source_registry_ref = reference;
                 }
                 if let Some(image) =
-                    smolvm::portable_checkpoint::fetch_checkpoint_host_image_blocking(checkpoint)?
+                    smolvm::portable_checkpoint::restore_checkpoint_host_image_blocking(
+                        checkpoint,
+                        &vm_data_dir,
+                    )?
                 {
                     image.apply(&mut record);
                 }

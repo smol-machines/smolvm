@@ -3412,8 +3412,9 @@ async fn create_machine_to_end(
     // whatever the restored machine's network: the guest holds its device.
     let mut restored_host_image = None;
     if let Some(checkpoint) = manifest_checkpoint.as_ref() {
-        match crate::portable_checkpoint::fetch_checkpoint_host_image(
+        match crate::portable_checkpoint::restore_checkpoint_host_image(
             checkpoint,
+            &vm_data_dir(&name),
             &crate::registry::PullAuth::FromConfig,
         )
         .await
