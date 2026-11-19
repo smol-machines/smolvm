@@ -20,6 +20,9 @@ use std::path::PathBuf;
 /// Written to a temp file by the parent and read by the child.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BootConfig {
+    /// Durable launch ownership, required by `_boot-vm-owned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_ticket: Option<crate::db::launch_admission::BootTicket>,
     /// Path to the agent rootfs directory.
     pub rootfs_path: PathBuf,
     /// Path to the storage disk file.

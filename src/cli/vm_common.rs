@@ -2351,8 +2351,10 @@ fn start_vm_named_locked(
 /// test in this module.
 pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     let name = std::mem::take(&mut r.name);
+    let created_at = r.created_at;
     *r = o.record.clone();
     r.name = name;
+    r.created_at = created_at;
 }
 
 pub fn persist_named_running(
@@ -4468,11 +4470,24 @@ pub fn register_ephemeral_vm(
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;
+    record.pid_start_time = pid.and_then(smolvm::process::process_start_time);
     record.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
     record.image = image;
 
     if let Ok(db) = SmolvmDb::open() {
-        if let Err(e) = db.insert_vm(name, &record) {
+        let result = db
+            .update_vm(name, |existing| {
+                record.created_at = existing.created_at;
+                *existing = record.clone();
+            })
+            .and_then(|updated| {
+                if updated.is_some() {
+                    Ok(())
+                } else {
+                    db.insert_vm_if_not_exists(name, &record).map(|_| ())
+                }
+            });
+        if let Err(e) = result {
             tracing::debug!(error = %e, name, "failed to register ephemeral VM");
         }
     }

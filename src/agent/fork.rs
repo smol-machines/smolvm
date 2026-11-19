@@ -382,7 +382,7 @@ pub fn control_socket_cmd_with_timeout(
 ) -> Result<String> {
     #[cfg(not(target_os = "windows"))]
     use crate::platform::uds::UdsStream;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
     let started = std::time::Instant::now();
     let timed_out = || {
@@ -431,10 +431,7 @@ pub fn control_socket_cmd_with_timeout(
     let mut reply = Vec::new();
     let mut buffer = [0; 8192];
     loop {
-        stream
-            .set_read_timeout(Some(remaining()?))
-            .map_err(|e| Error::agent("read control socket", e.to_string()))?;
-        match stream.read(&mut buffer) {
+        match read_control_chunk(&mut stream, &mut buffer, remaining()?) {
             Ok(0) => {
                 return Err(Error::agent(
                     "read control socket",
@@ -469,6 +466,56 @@ pub fn control_socket_cmd_with_timeout(
             Err(e) => return Err(Error::agent("read control socket", e.to_string())),
         }
     }
+}
+
+#[cfg(target_os = "windows")]
+type ControlStream = std::net::TcpStream;
+#[cfg(not(target_os = "windows"))]
+type ControlStream = crate::platform::uds::UdsStream;
+
+fn read_control_chunk(
+    stream: &mut ControlStream,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> std::io::Result<usize> {
+    use std::io::Read;
+    if timeout.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    // socket2 truncates Unix timeouts to microseconds; a positive remainder
+    // smaller than one microsecond must not become zero (an unlimited wait).
+    let socket_timeout = timeout.max(Duration::from_micros(1));
+    let configured = stream.set_read_timeout(Some(socket_timeout));
+    #[cfg(not(target_os = "macos"))]
+    configured?;
+    #[cfg(target_os = "macos")]
+    if let Err(error) = configured {
+        // Darwin rejects SO_RCVTIMEO after a Unix peer closes, including when
+        // its complete reply is already buffered. Drain only immediately
+        // available bytes; never turn a failed timeout into an unbounded read.
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the live stream owns the descriptor and buffer is writable
+            // for its length. MSG_DONTWAIT cannot block on a still-open peer.
+            let read = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if read >= 0 {
+                return Ok(read as usize);
+            }
+            let read_error = std::io::Error::last_os_error();
+            if read_error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(read_error);
+            }
+        }
+        return Err(error);
+    }
+    stream.read(buffer)
 }
 
 /// The command word of a control command, without its arguments (paths).
@@ -6806,6 +6853,47 @@ tmpfs /tmp tmpfs rw 0 0
             }
             server.join().unwrap();
         }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_control_peer_keeps_its_buffered_reply_and_eof() {
+        use std::io::Write;
+        for reply in [b"".as_slice(), "OK /tmp/é= value\n".as_bytes()] {
+            let (mut client, mut server) = crate::platform::uds::UdsStream::pair().unwrap();
+            server.write_all(reply).unwrap();
+            drop(server); // Deterministically close before setting any read timeout.
+            let mut received = Vec::new();
+            let mut buffer = [0; 3];
+            loop {
+                let count =
+                    read_control_chunk(&mut client, &mut buffer, Duration::from_secs(1)).unwrap();
+                if count == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..count]);
+            }
+            assert_eq!(received, reply);
+            assert!(read_control_chunk(&mut client, &mut buffer, Duration::ZERO).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_submicrosecond_control_deadline_never_disables_the_socket_timeout() {
+        use std::io::Write;
+        let (mut client, mut server) = crate::platform::uds::UdsStream::pair().unwrap();
+        server.write_all(b"x").unwrap();
+        let mut buffer = [0; 1];
+        assert_eq!(
+            read_control_chunk(&mut client, &mut buffer, Duration::from_nanos(1)).unwrap(),
+            1
+        );
+        assert_eq!(buffer, *b"x");
+        assert!(client
+            .read_timeout()
+            .unwrap()
+            .is_some_and(|timeout| !timeout.is_zero()));
     }
 
     #[cfg(unix)]

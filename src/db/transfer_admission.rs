@@ -57,7 +57,7 @@ pub struct MutationGuard {
     _gate: AdmissionGate,
 }
 
-struct AdmissionGate {
+pub(super) struct AdmissionGate {
     file: File,
     owner_pid: u32,
 }
@@ -120,7 +120,7 @@ mod live_tests;
 mod tests;
 
 impl SmolvmDb {
-    fn transfer_gate(&self, exclusive: bool) -> Result<AdmissionGate> {
+    pub(super) fn transfer_gate(&self, exclusive: bool) -> Result<AdmissionGate> {
         // Resolve symlink spellings of the database to the same gate. The gate
         // is outside removable VM directories and is never unlinked on release.
         let path = self
@@ -304,6 +304,7 @@ impl SmolvmDb {
                         }
                     }
                 }
+                super::launch_admission::reconcile_transfer(&tx, &claim.members, &claim.roots)?;
                 for member in &claim.members {
                     let data: Option<Vec<u8>> = tx
                         .query_row(

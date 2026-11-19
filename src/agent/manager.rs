@@ -3682,8 +3682,34 @@ impl AgentManager {
         let records_window = features.packed_layers_dir.is_some();
         let leased_layers = features.packed_layers_dir.clone();
 
+        // Persist intent before spawning: the child publishes its own identity
+        // before opening disks, even if this controller crashes immediately.
+        let provisional = self.name().map(|name| {
+            let (live, staged) = HostMount::split_storage_tuples(&mounts);
+            let mut record = crate::config::VmRecord::new(
+                name.to_owned(),
+                resources_for_config.cpus,
+                resources_for_config.memory_mib,
+                live,
+                vec![],
+                resources_for_config.network,
+            );
+            record.staged_mounts = staged;
+            record.mount_owners = HostMount::stored_owners(&mounts);
+            record.ephemeral = true;
+            record
+        });
+        let launch = crate::db::SmolvmDb::open()?.reserve_vm_launch(
+            provisional,
+            self.storage_disk.path(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
+            startup_ticket: Some(launch.ticket.clone()),
             rootfs_path: self.rootfs_path(),
             storage_disk_path: self.storage_disk.path().to_path_buf(),
             overlay_disk_path: self.overlay_disk.path().to_path_buf(),
@@ -3852,7 +3878,9 @@ impl AgentManager {
                 None => cmd.env_remove(var),
             };
         }
-        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+        cmd.arg("_boot-vm-owned")
+            .arg(&config_path)
+            .arg(&launch.ticket.token)
             .env_remove("SMOLVM_INTERCEPTOR_TOKEN")
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
