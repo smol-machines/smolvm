@@ -103,7 +103,7 @@ fn transfer_ownership_refuses_recovery_before_any_teardown() {
             assert!(recover_unreachable_machine_in_db(&record, &db)
                 .unwrap_err()
                 .to_string()
-                .contains("recover-move"));
+                .contains("this environment is moving"));
             assert_eq!(bytes(&db, &record.name), before);
             assert!(child.0.try_wait().unwrap().is_none());
             assert_eq!(std::fs::read(proof).unwrap(), b"retained snapshot");
