@@ -62,9 +62,11 @@ from a chain at the limit.
 
 A capture refuses a machine with host mounts unless you pass `--host-mounts`,
 because they bind the artifact to a host where the same paths exist.
-`--host-mounts` records each mount (host path, guest path, read-only) and a
-restore attaches them again at the same guest paths; it refuses on a host where
-a recorded directory is missing. `machine pause` always keeps host mounts: a
+`--host-mounts` records each mount (host path, guest path, read-only). A
+restore attaches a recorded mount only where you name its host directory with
+`-v HOST:GUEST` (`:ro` for a read-only one), since a checkpoint must not choose
+what your host shares; the error names the `-v` to pass. It refuses a directory
+that does not exist. `machine pause` always keeps host mounts: a
 paused machine resumes on the host that paused it.
 
 ## History

@@ -442,7 +442,7 @@ fn checkpoint_mount_relocation_keeps_device_order_for_every_caller() {
 }
 
 #[test]
-fn checkpoint_mount_relocation_keeps_unmapped_directories_and_checks_destinations() {
+fn checkpoint_mounts_attach_only_where_the_user_names_them() {
     let original = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
     let mut manifest = checkpoint_manifest();
@@ -455,7 +455,12 @@ fn checkpoint_mount_relocation_keeps_unmapped_directories_and_checks_destination
             ..Default::default()
         })
         .collect();
-    let mounts = HostMount::parse(&[format!("{}:/data", destination.path().display())]).unwrap();
+    let original_path = original.path().display().to_string();
+    let mounts = HostMount::parse(&[
+        format!("{}:/data", destination.path().display()),
+        format!("{original_path}:/config"),
+    ])
+    .unwrap();
     let restore = |mounts| {
         resolve(
             SpecSource::from_manifest(&manifest),
@@ -466,24 +471,20 @@ fn checkpoint_mount_relocation_keeps_unmapped_directories_and_checks_destination
             Caller::Embedded,
         )
     };
-    let original_path = original.path().display().to_string();
-    assert_eq!(
-        restore(Vec::new())
-            .unwrap()
-            .to_record("same-host")
-            .unwrap()
-            .mounts,
-        vec![
-            (original_path.clone(), "/data".into(), false),
-            (original_path.clone(), "/config".into(), false),
-        ]
+    // The checkpoint alone attaches nothing, and names what to pass.
+    let unnamed = restore(Vec::new()).unwrap_err().to_string();
+    assert!(
+        unnamed.contains(&format!("-v {original_path}:/data")),
+        "{unnamed}"
     );
+    let partly = restore(mounts[..1].to_vec()).unwrap_err().to_string();
+    assert!(partly.contains("/config"), "{partly}");
     let record = restore(mounts.clone())
         .unwrap()
         .to_record("relocated")
         .unwrap();
     assert_eq!(record.mounts[0], mounts[0].to_storage_tuple());
-    assert_eq!(record.mounts[1], (original_path, "/config".into(), false));
+    assert_eq!(record.mounts[1], mounts[1].to_storage_tuple());
     // A file or missing directory cannot substitute for the captured share.
     let mut invalid = mounts.clone();
     invalid[0].source = destination.path().join("file");
