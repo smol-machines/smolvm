@@ -344,3 +344,94 @@ fn staged_sync_reviews_changes_committed_before_control_reservation() {
         },
     );
 }
+
+fn staged_fixture(root: &std::path::Path) -> (SmolvmDb, VmRecord) {
+    let (db, record) = fixture();
+    let host = root.join("staged-host");
+    std::fs::create_dir(&host).unwrap();
+    std::fs::write(host.join("sentinel"), b"host copy").unwrap();
+    db.update_vm(&record.name, |r| {
+        r.staged_mounts = vec![(0, host.to_string_lossy().into_owned(), "/staged".into())];
+    })
+    .unwrap();
+    let current = db.get_vm(&record.name).unwrap().unwrap();
+    (db, current)
+}
+
+#[test]
+fn staged_sync_does_not_start_a_stopped_machine_or_change_host_data() {
+    isolated(
+        "staged_sync_does_not_start_a_stopped_machine_or_change_host_data",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            let manager = make_manager(root);
+            let error = crate::staged_mount::sync_with_manager(&record, &manager).unwrap_err();
+            assert!(error.to_string().contains("must be running"));
+            assert!(!manager.pid_file.exists());
+            assert_eq!(db.get_vm(&record.name).unwrap().unwrap().pid, None);
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}
+
+#[test]
+fn staged_sync_preserves_saved_execution_and_host_data() {
+    isolated(
+        "staged_sync_preserves_saved_execution_and_host_data",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            db.update_vm(&record.name, |r| {
+                r.paused_checkpoint = Some("saved-checkpoint".into())
+            })
+            .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let manager = make_manager(root);
+            let error = crate::staged_mount::sync_with_manager(&record, &manager).unwrap_err();
+            assert!(error
+                .to_string()
+                .contains("saved execution must be resumed"));
+            assert_eq!(
+                db.get_vm(&record.name).unwrap().unwrap().paused_checkpoint,
+                record.paused_checkpoint
+            );
+            assert!(!manager.pid_file.exists());
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}
+
+#[test]
+fn failed_staged_sync_releases_ownership_and_preserves_the_running_process() {
+    isolated(
+        "failed_staged_sync_releases_ownership_and_preserves_the_running_process",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            let mut child = child();
+            let pid = child.0.id() as i32;
+            let start = process::process_start_time(pid).unwrap();
+            db.update_vm(&record.name, |r| {
+                r.pid = Some(pid);
+                r.pid_start_time = Some(start);
+            })
+            .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let manager = make_manager(root);
+            assert!(crate::staged_mount::sync_with_manager(&record, &manager).is_err());
+            assert!(child.0.try_wait().unwrap().is_none());
+            assert_eq!(db.get_vm(&record.name).unwrap().unwrap().pid, Some(pid));
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}

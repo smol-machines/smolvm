@@ -8296,11 +8296,7 @@ impl SyncCmd {
         }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
-        let (manager, mut client) = vm_common::connect_after_startup(&Some(name.clone()))?;
-        // This command observes an existing persistent VM; a failed sync must
-        // leave it running so the user can fix the cause and retry.
-        manager.detach();
-        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+        smolvm::staged_mount::sync_running_machine(&record)?;
         println!("Synchronized staged mounts for '{name}'");
         Ok(())
     }

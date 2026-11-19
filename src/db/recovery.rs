@@ -284,6 +284,13 @@ impl VmRecoveryGuard {
             .db
             .get_vm(&self.record.name)?
             .ok_or_else(|| conflict("controlled machine was deleted"))?;
+        if current.paused_checkpoint.is_some()
+            || record.paused_checkpoint != current.paused_checkpoint
+        {
+            return Err(conflict(
+                "saved execution must be resumed before synchronization",
+            ));
+        }
         if current.database_identity != self.record.database_identity
             || (current.pid, current.pid_start_time)
                 != (self.record.pid, self.record.pid_start_time)

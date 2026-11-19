@@ -5854,16 +5854,13 @@ async fn stop_machine_transaction(
     // the only current copy. An unreachable agent cannot be synchronized, but
     // its persistent storage disk remains available for a later restart.
     if !record.staged_mounts.is_empty() && resolved != RecordState::Unreachable {
-        let sync_name = name.clone();
         let sync_record = record.clone();
         tokio::task::spawn_blocking(move || {
-            let manager = AgentManager::for_vm(&sync_name)?;
-            let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-            crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+            crate::staged_mount::sync_running_machine(&sync_record)
         })
         .await
         .map_err(|error| ApiError::internal(format!("task error: {error}")))?
-        .map_err(|error| ApiError::internal(format!("sync staged mounts: {error}")))?;
+        .map_err(ApiError::from)?;
     }
 
     // Get PID and start time from database record - this is the source of truth
@@ -5978,16 +5975,11 @@ async fn sync_machine_transaction(
         )));
     }
 
-    let sync_name = name.clone();
     let sync_record = record.clone();
-    tokio::task::spawn_blocking(move || {
-        let manager = AgentManager::for_vm(&sync_name)?;
-        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-        crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
-    })
-    .await
-    .map_err(|error| ApiError::internal(format!("task error: {error}")))?
-    .map_err(|error| ApiError::internal(error.to_string()))?;
+    tokio::task::spawn_blocking(move || crate::staged_mount::sync_running_machine(&sync_record))
+        .await
+        .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+        .map_err(ApiError::from)?;
 
     Ok(Json(record_to_info(&name, &record)))
 }
@@ -6057,10 +6049,7 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                     }
                 };
                 if !record.staged_mounts.is_empty() {
-                    let sync_result = AgentManager::for_vm(&name_for_kill).and_then(|manager| {
-                        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-                        crate::staged_mount::sync_staged_mounts(&record, &mut client)
-                    });
+                    let sync_result = crate::staged_mount::sync_running_machine(&record);
                     if let Err(error) = sync_result {
                         tracing::warn!(machine = %name_for_kill, error = %error, "drain: staged mount sync failed; leaving machine running");
                         return false;
@@ -6352,16 +6341,13 @@ async fn delete_one_transaction(
     if !record.staged_mounts.is_empty() {
         match crate::agent::state_probe::resolve_state(&name, &record) {
             RecordState::Running => {
-                let sync_name = name.clone();
                 let sync_record = record.clone();
                 tokio::task::spawn_blocking(move || {
-                    let manager = AgentManager::for_vm(&sync_name)?;
-                    let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-                    crate::staged_mount::sync_staged_mounts(&sync_record, &mut client)
+                    crate::staged_mount::sync_running_machine(&sync_record)
                 })
                 .await
                 .map_err(|error| ApiError::internal(format!("task error: {error}")))?
-                .map_err(|error| ApiError::internal(format!("sync staged mounts: {error}")))?;
+                .map_err(ApiError::from)?;
             }
             RecordState::Unreachable => {
                 return Err(ApiError::Conflict(format!(

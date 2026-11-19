@@ -13,6 +13,47 @@ use std::collections::HashSet;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+/// Synchronize an existing registered guest without starting or stopping it.
+/// The reviewed record and runtime stay owned until host writeback finishes.
+/// Callers that require an explicit branch-sync error use `refuse_detached_sync`.
+pub fn sync_running_machine(record: &VmRecord) -> Result<()> {
+    if record.staged_mounts.is_empty() || !record.staged_mounts_sync_to_host() {
+        return Ok(());
+    }
+    let manager = crate::agent::AgentManager::for_existing_vm_record(record)?;
+    // This temporary manager only observes the persistent guest. In particular,
+    // errors must leave its running state and recoverable working copy intact.
+    manager.detach();
+    sync_with_manager(record, &manager)
+}
+
+pub(crate) fn sync_with_manager(
+    record: &VmRecord,
+    manager: &crate::agent::AgentManager,
+) -> Result<()> {
+    let operation = manager.reserve_control_operation()?;
+    operation.validate_staged_record(record)?;
+    if record.staged_mounts.is_empty() || !record.staged_mounts_sync_to_host() {
+        return Ok(());
+    }
+    let verify_process = || {
+        if !record
+            .pid
+            .is_some_and(|pid| crate::process::is_our_process_strict(pid, record.pid_start_time))
+        {
+            return Err(Error::agent_conflict(
+                "sync staged mounts",
+                "the reviewed machine must be running before synchronization",
+            ));
+        }
+        Ok(())
+    };
+    verify_process()?;
+    let mut client = manager.connect()?;
+    verify_process()?;
+    sync_staged_mounts(record, &mut client)
+}
+
 /// Synchronize every staged mount in `record` back to its host source.
 ///
 /// Live `rw` and `ro` mounts are ignored. The caller must hold the machine's

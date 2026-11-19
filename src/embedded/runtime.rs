@@ -1138,9 +1138,14 @@ impl EmbeddedRuntime {
             if record.staged_mounts.is_empty() {
                 return Ok(());
             }
-            let handle = self.started_handle(name)?;
-            let result = lock_handle(&handle)?.sync_staged_mounts(&record);
-            result
+            if let Some(error) = crate::staged_mount::refuse_detached_sync(&record, name) {
+                return Err(error);
+            }
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.sync_staged_mounts(&record)
+            } else {
+                crate::staged_mount::sync_running_machine(&record)
+            }
         })
     }
 

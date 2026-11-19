@@ -982,8 +982,7 @@ pub(crate) fn stop_vm_record_with_timeout(
     let _admission = manager.admit_control_mutation()?;
     manager.try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time);
     if !record.staged_mounts.is_empty() {
-        let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-        crate::staged_mount::sync_staged_mounts(record, &mut client)?;
+        crate::staged_mount::sync_with_manager(record, &manager)?;
     }
     match stop_timeout {
         Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
