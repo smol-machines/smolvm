@@ -349,17 +349,8 @@ impl Container {
         &self,
         engine: &Engine,
         deleting: bool,
-    ) -> ApiResult<(
-        crate::db::transfer_admission::MutationGuard,
-        crate::db::transfer_admission::MutationGuard,
-    )> {
+    ) -> ApiResult<Vec<crate::db::transfer_admission::MutationGuard>> {
         let record = self.record();
-        let machine = if deleting {
-            engine.db.admit_machine_deletion(&record.machine)
-        } else {
-            engine.db.admit_machine_mutation(&record.machine)
-        }
-        .map_err(mutation_error)?;
         let mut paths = vec![engine.store.container_dir(&record.id)];
         for mount in &record.mounts {
             match mount.kind.as_str() {
@@ -372,7 +363,35 @@ impl Container {
             .db
             .admit_storage_mutation(&paths)
             .map_err(mutation_error)?;
-        Ok((machine, storage))
+        let owner = if record.network_host().is_some() {
+            let mut records: BTreeMap<_, _> = engine
+                .store
+                .transfer_containers()?
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect();
+            records.insert(record.id.clone(), record.clone());
+            let owner = super::transfer::machine_owner(&records, &record.id)?;
+            records[owner].machine.clone()
+        } else {
+            record.machine.clone()
+        };
+        let machine = if deleting {
+            engine.db.admit_machine_deletion(&owner)
+        } else {
+            engine.db.admit_machine_mutation(&owner)
+        }
+        .map_err(mutation_error)?;
+        let active = storage.has_active_transfers();
+        let mut guards = vec![machine, storage];
+        if active {
+            for endpoint in record.networks.values() {
+                if let Some(network) = engine.networks.find(&endpoint.network_id) {
+                    guards.extend(engine.networks.admit_mutation(&engine.store, &network)?);
+                }
+            }
+        }
+        Ok(guards)
     }
 
     pub(crate) fn owns_live_execution(&self) -> bool {
@@ -565,19 +584,37 @@ pub(crate) async fn create(
         warnings.push("Published ports are discarded when using host network mode".into());
     }
 
-    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     let guest = host_config.network_mode.starts_with("container:");
+    let networks = if guest {
+        BTreeMap::new()
+    } else {
+        super::network::attach_at_create(engine, &id, &name, &req)?
+    };
+    let mut _network_admission = Vec::new();
+    for endpoint in networks.values() {
+        let network = engine
+            .networks
+            .find(&endpoint.network_id)
+            .ok_or_else(|| ApiError::conflict("network changed before container creation"))?;
+        _network_admission.extend(engine.networks.admit_mutation(&engine.store, &network)?);
+    }
+    let _host_admission = if let Some(host) = host_config.network_mode.strip_prefix("container:") {
+        Some(
+            engine
+                .find_container(host)
+                .ok_or_else(|| ApiError::no_such_container(host))?
+                .admit_mutation(engine, false)?,
+        )
+    } else {
+        None
+    };
+    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     if guest && !sockets.is_empty() {
         return Err(ApiError::bad_request(
             "a container that shares another container's network cannot mount a Unix socket",
         ));
     }
     let ports = resolve_ports(engine, &mut config, &host_config)?;
-    let networks = if guest {
-        BTreeMap::new()
-    } else {
-        super::network::attach_at_create(engine, &id, &name, &req)?
-    };
 
     // A container that shares another's network has no machine of its own.
     let machine = if guest {

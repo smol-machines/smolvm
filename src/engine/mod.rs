@@ -116,9 +116,9 @@ impl Engine {
         db: crate::db::SmolvmDb,
     ) -> crate::Result<Arc<Self>> {
         let store = store::Store::open(&config.root)?;
-        let images = images::Images::load(&store)?;
+        let images = images::Images::load(&store, db.clone())?;
         let volumes = volumes::Volumes::load(&store, db.clone())?;
-        let networks = network::Networks::load(&store, &config.socket)?;
+        let networks = network::Networks::load(&store, &config.socket, db.clone())?;
         let engine = Arc::new(Self {
             events: events::Events::persistent(&config.root)?,
             app_listener_watch: parking_lot::Mutex::new(std::sync::Weak::new()),

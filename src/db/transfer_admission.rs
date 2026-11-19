@@ -93,6 +93,16 @@ struct Claim {
 /// has finished. Claim creation cannot pass a live guard from another process.
 pub struct MutationGuard {
     _gate: AdmissionGate,
+    #[cfg(unix)]
+    active_transfers: bool,
+}
+
+#[cfg(unix)]
+impl MutationGuard {
+    /// The gate prevents a new transfer from appearing before this guard ends.
+    pub(crate) fn has_active_transfers(&self) -> bool {
+        self.active_transfers
+    }
 }
 
 pub(super) struct AdmissionGate {
@@ -280,7 +290,11 @@ impl SmolvmDb {
                 }
             }
         }
-        Ok(MutationGuard { _gate: gate })
+        Ok(MutationGuard {
+            _gate: gate,
+            #[cfg(unix)]
+            active_transfers: !claims.is_empty(),
+        })
     }
 
     /// Admit mutation of a named machine and its persisted host shares.

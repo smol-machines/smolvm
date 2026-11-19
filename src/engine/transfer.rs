@@ -108,7 +108,7 @@ fn resolve<'a>(records: &'a BTreeMap<String, ContainerRecord>, name: &str) -> Ap
     }
 }
 
-fn machine_owner<'a>(
+pub(super) fn machine_owner<'a>(
     records: &'a BTreeMap<String, ContainerRecord>,
     id: &'a str,
 ) -> ApiResult<&'a str> {

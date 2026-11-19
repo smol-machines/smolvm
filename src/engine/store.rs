@@ -11,6 +11,40 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// Keep metadata used by a moving workload stable, including containers
+    /// that execute inside another container's machine. Ordinary metadata
+    /// changes need no container inventory scan when no transfer is active.
+    pub(crate) fn admit_dependency_mutation(
+        &self,
+        db: &crate::db::SmolvmDb,
+        paths: &[PathBuf],
+        used_by: impl Fn(&ContainerRecord) -> bool,
+    ) -> crate::Result<Vec<crate::db::transfer_admission::MutationGuard>> {
+        let storage = db.admit_storage_mutation(paths)?;
+        if !storage.has_active_transfers() {
+            return Ok(vec![storage]);
+        }
+        let records: std::collections::BTreeMap<_, _> = self
+            .transfer_containers()?
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let mut machines = std::collections::BTreeSet::new();
+        for (id, record) in &records {
+            if used_by(record) {
+                let owner = super::transfer::machine_owner(&records, id).map_err(|error| {
+                    crate::Error::agent_conflict("change workload metadata", error.message)
+                })?;
+                machines.insert(records[owner].machine.clone());
+            }
+        }
+        let mut guards = vec![storage];
+        for machine in machines {
+            guards.push(db.admit_machine_mutation(&machine)?);
+        }
+        Ok(guards)
+    }
+
     pub(crate) fn open(root: &Path) -> crate::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(root)?;
