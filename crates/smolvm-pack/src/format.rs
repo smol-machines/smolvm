@@ -790,15 +790,16 @@ pub struct CheckpointPackedLayers {
     pub dax_window_bytes: Option<u64>,
 }
 
-/// Identity of the registry image a checkpointed machine booted from a
-/// host-fetched archive.
+/// Identity and optional portable archive of a host-backed image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointHostImage {
     /// Registry reference to fetch, pinned to the manifest digest the source
     /// host fetched when it recorded one.
     pub reference: String,
-    /// Digest of the image config the archive carries. A restore refuses an
-    /// archive with any other config, so a moved tag cannot swap the image.
+    /// Config identity checked by legacy registry-based restores. Carried
+    /// archives instead verify every byte with `archive.sha256`, including
+    /// OCI layouts and compressed archives without a Docker manifest.json.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub config_digest: String,
     /// Size in bytes of the archive the guest read.
     pub archive_size: u64,
@@ -806,6 +807,10 @@ pub struct CheckpointHostImage {
     /// read. The guest keys its flattened copy of the image on size and
     /// modification time, so a restore must serve an archive with both.
     pub archive_mtime: u64,
+    /// Exact archive bytes carried by newer checkpoints; legacy checkpoints
+    /// fetch `reference` from its registry instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<CheckpointAsset>,
 }
 
 /// Manifest describing the packed image and configuration.

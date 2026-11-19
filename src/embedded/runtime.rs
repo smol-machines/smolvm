@@ -458,7 +458,12 @@ impl EmbeddedRuntime {
                 crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
             }
             self.remove_cached_handle(name)?;
-            crate::portable_checkpoint::prepare_paused_restore(&record)?;
+            if let Some(image) = crate::portable_checkpoint::prepare_paused_restore(&record)? {
+                // Keep the pause and its retry key active until the VM actually
+                // resumes; only replace the verified image cache reference here.
+                self.db.update_vm_durable(name, |record| image.apply(record))?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+            }
             let started = control::resume_vm(&self.db, name, detached)?;
             if detached {
                 started.handle.detach();
