@@ -874,6 +874,9 @@ fn copy_extent_exact(
     Ok(())
 }
 
+#[cfg(all(test, unix))]
+mod sparse_archive_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
