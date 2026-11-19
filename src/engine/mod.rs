@@ -117,7 +117,7 @@ impl Engine {
     ) -> crate::Result<Arc<Self>> {
         let store = store::Store::open(&config.root)?;
         let images = images::Images::load(&store)?;
-        let volumes = volumes::Volumes::load(&store)?;
+        let volumes = volumes::Volumes::load(&store, db.clone())?;
         let networks = network::Networks::load(&store, &config.socket)?;
         let engine = Arc::new(Self {
             events: events::Events::persistent(&config.root)?,

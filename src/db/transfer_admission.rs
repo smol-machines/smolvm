@@ -222,6 +222,14 @@ impl SmolvmDb {
         )
     }
 
+    /// Hold admission across changes to engine-owned storage and metadata.
+    /// New paths are resolved through their existing ancestors, so unrelated
+    /// volume creation remains possible while a transfer owns another tree.
+    #[cfg(unix)]
+    pub(crate) fn admit_storage_mutation(&self, paths: &[PathBuf]) -> Result<MutationGuard> {
+        self.admit_startup_mutation(None, paths)
+    }
+
     fn admit_workload_paths(
         &self,
         machine: Option<&str>,
