@@ -10,6 +10,9 @@ use super::{params, DbResultExt, OptionalExtension, SmolvmDb, TransactionBehavio
 use crate::config::{RecordState, VmRecord};
 use crate::{Error, Result};
 use rusqlite::Transaction;
+
+mod creation;
+pub use creation::VmCreationLease;
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
@@ -105,6 +108,9 @@ enum Purpose {
     Prepare {
         name: Option<String>,
     },
+    Create {
+        name: String,
+    },
 }
 
 impl Purpose {
@@ -118,6 +124,7 @@ impl Launch {
         match &self.purpose {
             Purpose::Boot => self.member.as_ref().map(|member| member.name.as_str()),
             Purpose::Prepare { name } => name.as_deref(),
+            Purpose::Create { name } => Some(name),
         }
     }
 
@@ -191,8 +198,16 @@ pub(super) fn same_resource(a: &Path, b: &Path) -> std::io::Result<bool> {
     }
 }
 
-fn refuse_other_owners(tx: &Transaction<'_>, name: Option<&str>, paths: &[PathBuf]) -> Result<()> {
+fn refuse_other_owners(
+    tx: &Transaction<'_>,
+    name: Option<&str>,
+    paths: &[PathBuf],
+    except: Option<&str>,
+) -> Result<()> {
     for (token, launch) in rows(tx)? {
+        if except == Some(token.as_str()) {
+            continue;
+        }
         if !launch.alive() {
             remove(tx, &token)?;
             continue;
@@ -202,7 +217,7 @@ fn refuse_other_owners(tx: &Transaction<'_>, name: Option<&str>, paths: &[PathBu
         }
         for owned in launch.paths() {
             for requested in paths {
-                if same_resource(owned, requested)? {
+                if overlaps(owned, requested) || same_resource(owned, requested)? {
                     return Err(conflict(
                         "another launch still owns this disk or runtime path",
                     ));
@@ -298,6 +313,23 @@ fn rows(tx: &Transaction<'_>) -> Result<Vec<(String, Launch)>> {
 }
 
 fn remove(tx: &Transaction<'_>, token: &str) -> Result<()> {
+    let data: Option<Vec<u8>> = tx
+        .query_row(
+            "SELECT data FROM vm_launch_admission WHERE token = ?1",
+            [token],
+            |row| row.get(0),
+        )
+        .optional()
+        .db_err("read revoked ownership")?;
+    if let Some(data) = data {
+        if let Purpose::Create { name } = decode(&data)?.purpose {
+            tx.execute(
+                "DELETE FROM vm_create_reservations WHERE name = ?1 AND owner_token = ?2",
+                params![name, token],
+            )
+            .db_err("retire creation name with ownership")?;
+        }
+    }
     tx.execute("DELETE FROM vm_launch_admission WHERE token = ?1", [token])
         .db_err("revoke startup ticket")?;
     Ok(())
@@ -377,6 +409,7 @@ impl SmolvmDb {
                 &std::iter::once(storage.clone())
                     .chain(exclusive_paths.iter().cloned())
                     .collect::<Vec<_>>(),
+                None,
             )?;
             let member = if let Some(provisional) = &provisional {
                 let data: Option<Vec<u8>> = tx
@@ -487,7 +520,7 @@ impl SmolvmDb {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin disk preparation")?;
-            refuse_other_owners(&tx, name, &paths)?;
+            refuse_other_owners(&tx, name, &paths, None)?;
             let launch = Launch {
                 version: 1,
                 owner,

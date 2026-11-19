@@ -249,7 +249,7 @@ pub struct MachineRegistration {
 pub struct ReservationGuard<'a> {
     state: &'a ApiState,
     name: String,
-    token: String,
+    creation: crate::db::VmCreationLease,
     completed: bool,
 }
 
@@ -258,10 +258,15 @@ impl<'a> ReservationGuard<'a> {
     pub fn new(state: &'a ApiState, name: String) -> Result<Self, ApiError> {
         let token = SmolvmDb::create_reservation_token();
         state.reserve_machine_name(&name, &token)?;
+        let creation = crate::db::VmCreationLease::from_reserved(state.db.clone(), &name, token)
+            .map_err(|error| {
+                state.reserved_names.write().remove(&name);
+                ApiError::database(error)
+            })?;
         Ok(Self {
             state,
             name,
-            token,
+            creation,
             completed: false,
         })
     }
@@ -271,12 +276,36 @@ impl<'a> ReservationGuard<'a> {
         &self.name
     }
 
+    pub(crate) fn creation(&self) -> crate::db::VmCreationLease {
+        self.creation.clone()
+    }
+
+    /// Keep ownership inside blocking work even if its awaiting task is aborted.
+    pub(crate) fn spawn_blocking<F, T>(&self, work: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let owner = self.creation.clone();
+        tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            work()
+        })
+    }
+
     /// Complete registration, consuming the guard without releasing.
     ///
     /// This transfers ownership of the name to the machine registry.
     pub fn complete(mut self, registration: MachineRegistration) -> Result<(), ApiError> {
-        self.state
-            .complete_machine_registration(self.name.clone(), &self.token, registration)?;
+        self.creation
+            .ensure_exclusive()
+            .map_err(ApiError::database)?;
+        self.state.complete_machine_registration(
+            self.name.clone(),
+            self.creation.token(),
+            registration,
+        )?;
+        self.creation.disarm();
         self.completed = true;
         Ok(())
     }
@@ -285,23 +314,9 @@ impl<'a> ReservationGuard<'a> {
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.state
-                .release_machine_reservation(&self.name, &self.token);
-            tracing::debug!(machine = %self.name, "reservation guard released on drop");
-            // With the name released no machine owns its data directory, so
-            // whatever this create left there (an extracted pack, disks) would
-            // stay on disk with nothing to delete it. Remove it now.
-            let dir = crate::agent::vm_data_dir(&self.name);
-            smolvm_pack::extract::force_detach_layers_volume(&dir.join("pack"));
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {
-                    tracing::info!(machine = %self.name, "removed the data of a create that did not finish");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(machine = %self.name, %error, "could not remove the data of a create that did not finish");
-                }
-            }
+            // The shared creation lease, including any blocking worker, cleans
+            // the files before releasing database ownership on its final drop.
+            self.state.reserved_names.write().remove(&self.name);
         }
     }
 }

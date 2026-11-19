@@ -5640,8 +5640,8 @@ impl CreateCmd {
         // extract before publishing the VM row. Other processes either see the
         // reservation conflict or the finished VM, never a half-created record.
         let create_result = (|| -> smolvm::Result<()> {
-            let manager = AgentManager::for_vm_with_sizes(
-                &name_for_layers,
+            let manager = AgentManager::for_vm_creation(
+                &reservation.lease,
                 record.storage_gb,
                 record.overlay_gb,
             )?;
@@ -5771,23 +5771,7 @@ impl CreateCmd {
             Ok(())
         })();
 
-        if let Err(e) = create_result {
-            smolvm_pack::extract::force_detach_layers_volume(
-                &smolvm::agent::machine_layers_cache_dir(&name_for_layers),
-            );
-            let data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
-            if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
-                if remove_err.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        machine = %name_for_layers,
-                        dir = %data_dir.display(),
-                        error = %remove_err,
-                        "failed to remove machine data dir after create failure"
-                    );
-                }
-            }
-            return Err(e);
-        }
+        create_result?;
 
         Ok(record)
     }

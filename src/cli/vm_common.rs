@@ -701,62 +701,18 @@ pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result
 /// name-derived on-disk state. Dropping it releases the DB reservation unless
 /// it was committed.
 pub(crate) struct CreateVmReservation {
-    db: SmolvmDb,
-    name: String,
-    token: String,
-    completed: bool,
+    pub(crate) lease: smolvm::db::VmCreationLease,
 }
 
 impl CreateVmReservation {
     pub(crate) fn reserve(name: &str) -> smolvm::Result<Self> {
-        let db = SmolvmDb::open()?;
-        let token = SmolvmDb::create_reservation_token();
-        if !db.reserve_vm_create(name, &token)? {
-            return Err(smolvm::Error::config(
-                "create machine",
-                format!("machine '{}' already exists or is being created", name),
-            ));
-        }
         Ok(Self {
-            db,
-            name: name.to_string(),
-            token,
-            completed: false,
+            lease: smolvm::db::VmCreationLease::reserve(SmolvmDb::open()?, name)?,
         })
     }
 
-    pub(crate) fn commit(mut self, record: &VmRecord) -> smolvm::Result<()> {
-        if !self
-            .db
-            .commit_reserved_vm(&self.name, &self.token, record)?
-        {
-            return Err(smolvm::Error::config(
-                "create machine",
-                format!(
-                    "machine '{}' already exists or is no longer reserved",
-                    self.name
-                ),
-            ));
-        }
-        self.completed = true;
-        Ok(())
-    }
-}
-
-impl Drop for CreateVmReservation {
-    fn drop(&mut self) {
-        if !self.completed {
-            if let Err(e) = self
-                .db
-                .release_vm_create_reservation(&self.name, &self.token)
-            {
-                tracing::warn!(
-                    machine = %self.name,
-                    error = %e,
-                    "failed to release DB create reservation"
-                );
-            }
-        }
+    pub(crate) fn commit(&self, record: &VmRecord) -> smolvm::Result<()> {
+        self.lease.commit(record)
     }
 }
 

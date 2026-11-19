@@ -1924,7 +1924,32 @@ impl AgentManager {
         )
     }
 
+    /// Prepare a machine owned by an unpublished creation. The capability
+    /// stays with its creator and workers until publication or failure cleanup.
+    pub fn for_vm_creation(
+        creation: &crate::db::VmCreationLease,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
+        Self::open_with_creation(
+            creation.name(),
+            DiskAccess::Launch {
+                storage_gib: storage_gb,
+                overlay_gib: overlay_gb,
+            },
+            Some(creation),
+        )
+    }
+
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
+        Self::open_with_creation(name, access, None)
+    }
+
+    fn open_with_creation(
+        name: impl Into<String>,
+        access: DiskAccess,
+        creation: Option<&crate::db::VmCreationLease>,
+    ) -> Result<Self> {
         let name = name.into();
         // Launch access may create or grow disks before start_via_subprocess.
         // Observation remains available while a transfer owns the machine.
@@ -1939,15 +1964,24 @@ impl AgentManager {
             resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
         let (overlay_path, overlay_format) =
             resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
+        let _creation_preparation = creation
+            .map(|owner| {
+                owner.admit_preparation(&[
+                    storage_path.clone(),
+                    overlay_path.clone(),
+                    storage_dir.join("agent.sock"),
+                ])
+            })
+            .transpose()?;
         let _preparation = match access {
-            DiskAccess::Launch { .. } => {
+            DiskAccess::Launch { .. } if creation.is_none() => {
                 Some(crate::db::SmolvmDb::open()?.reserve_vm_preparation(
                     Some(&name),
                     &storage_path,
                     &[overlay_path.clone(), storage_dir.join("agent.sock")],
                 )?)
             }
-            DiskAccess::Observe => None,
+            _ => None,
         };
         let rootfs_path = match access {
             DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,

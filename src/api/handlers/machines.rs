@@ -3168,8 +3168,9 @@ async fn create_machine_to_end(
         .flatten();
 
     // Create manager (does not boot the VM)
-    let mut manager = tokio::task::spawn_blocking({
+    let mut manager = guard.spawn_blocking({
         let name = name.clone();
+        let creation = guard.creation();
         let storage_gb = restored_storage_gb;
         let overlay_gb = restored_overlay_gb;
         move || {
@@ -3192,7 +3193,7 @@ async fn create_machine_to_end(
                     tracing::warn!(machine = %name, %error, "no image seed; pulling in the guest");
                 }
             }
-            AgentManager::for_vm_with_sizes(&name, storage_gb, overlay_gb)
+            AgentManager::for_vm_creation(&creation, storage_gb, overlay_gb)
                 .map_err(|e| ApiError::internal(format!("failed to create agent manager: {}", e)))
         }
     })
@@ -3215,8 +3216,8 @@ async fn create_machine_to_end(
         let sidecar_path = sidecar_path.clone();
         let digest = received_digest.take();
         let is_checkpoint = manifest_checkpoint.is_some();
-        packed_storage_gib =
-            tokio::task::spawn_blocking(move || -> Result<Option<u64>, ApiError> {
+        packed_storage_gib = guard
+            .spawn_blocking(move || -> Result<Option<u64>, ApiError> {
                 let path = std::path::Path::new(&sidecar_path);
                 let cache_dir = crate::agent::machine_layers_cache_dir(&name);
                 if !is_checkpoint {
@@ -3277,42 +3278,43 @@ async fn create_machine_to_end(
             .parent()
             .map(std::path::Path::to_path_buf)
             .unwrap_or_else(|| vm_data_dir(&name));
-        let seed_result = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-            let cache_dir = crate::agent::machine_layers_cache_dir(&name2);
-            // With the shared store, the pack contents live in `_shared/<checksum>`
-            // (the per-machine `pack` dir is an empty mountpoint), so seed the
-            // VM-mode disk templates from the shared copy. Falls back to the
-            // per-machine dir when no pointer was written (macOS / kill-switch).
-            let (pack_content_dir, artifact_sha256) =
-                if let Some(shared_dir) = crate::agent::read_shared_pack_pointer(&cache_dir) {
-                    let digest = smolvm_pack::extract::read_shared_artifact_sha256(&shared_dir)
-                        .map_err(|e| {
-                            ApiError::internal(format!(
-                                "read shared artifact SHA-256 {}: {e}",
-                                shared_dir.display()
-                            ))
-                        })?;
-                    (shared_dir, Some(digest))
-                } else {
-                    (cache_dir, None)
-                };
-            crate::storage::seed_vm_mode_disks(
-                &disk_dir,
-                &pack_content_dir,
-                crate::storage::VmModeDiskSeedSpec {
-                    artifact_sha256: artifact_sha256.as_deref(),
-                    overlay_template: seed.overlay_template.as_deref(),
-                    storage_template: seed.storage_template.as_deref(),
-                    overlay_logical_size: seed.overlay_logical_size,
-                    storage_logical_size: seed.storage_logical_size,
-                    overlay_gb: seed.overlay_gb,
-                    storage_gb: seed.storage_gb,
-                },
-            )
-            .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
+        let seed_result = guard
+            .spawn_blocking(move || -> Result<(), ApiError> {
+                let cache_dir = crate::agent::machine_layers_cache_dir(&name2);
+                // With the shared store, the pack contents live in `_shared/<checksum>`
+                // (the per-machine `pack` dir is an empty mountpoint), so seed the
+                // VM-mode disk templates from the shared copy. Falls back to the
+                // per-machine dir when no pointer was written (macOS / kill-switch).
+                let (pack_content_dir, artifact_sha256) =
+                    if let Some(shared_dir) = crate::agent::read_shared_pack_pointer(&cache_dir) {
+                        let digest = smolvm_pack::extract::read_shared_artifact_sha256(&shared_dir)
+                            .map_err(|e| {
+                                ApiError::internal(format!(
+                                    "read shared artifact SHA-256 {}: {e}",
+                                    shared_dir.display()
+                                ))
+                            })?;
+                        (shared_dir, Some(digest))
+                    } else {
+                        (cache_dir, None)
+                    };
+                crate::storage::seed_vm_mode_disks(
+                    &disk_dir,
+                    &pack_content_dir,
+                    crate::storage::VmModeDiskSeedSpec {
+                        artifact_sha256: artifact_sha256.as_deref(),
+                        overlay_template: seed.overlay_template.as_deref(),
+                        storage_template: seed.storage_template.as_deref(),
+                        overlay_logical_size: seed.overlay_logical_size,
+                        storage_logical_size: seed.storage_logical_size,
+                        overlay_gb: seed.overlay_gb,
+                        storage_gb: seed.storage_gb,
+                    },
+                )
+                .map_err(|e| ApiError::internal(format!("seed VM-mode disks: {}", e)))
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
         // On failure roll back the data dir the manager created, so a retry starts
         // clean (the reservation guard releases the name but leaves the dir).
         if let Err(e) = seed_result {
@@ -3331,32 +3333,33 @@ async fn create_machine_to_end(
     // backing images keep owned hard links into the verified extraction cache.
     if let Some(checkpoint) = manifest_checkpoint.clone() {
         let name_for_checkpoint = name.clone();
-        let install = tokio::task::spawn_blocking(move || -> Result<(), ApiError> {
-            let cache_dir = crate::agent::machine_layers_cache_dir(&name_for_checkpoint);
-            let content_dir = crate::agent::read_shared_pack_pointer(&cache_dir)
-                .unwrap_or_else(|| cache_dir.clone());
-            // RAM the extraction left for later reaches the disk after this
-            // install, whether or not it succeeds, so it does not slow it down.
-            let mut deferred =
-                crate::portable_checkpoint::DeferredRestoreSync::for_extraction(&content_dir);
-            let installed = crate::portable_checkpoint::install_deferring_sync(
-                &content_dir,
-                &vm_data_dir(&name_for_checkpoint),
-                &checkpoint,
-                restore_cache_base.as_deref(),
-                &mut deferred,
-            )
-            .and_then(|()| {
-                crate::portable_checkpoint::discard_transport_pack(&vm_data_dir(
-                    &name_for_checkpoint,
-                ))
+        let install = guard
+            .spawn_blocking(move || -> Result<(), ApiError> {
+                let cache_dir = crate::agent::machine_layers_cache_dir(&name_for_checkpoint);
+                let content_dir = crate::agent::read_shared_pack_pointer(&cache_dir)
+                    .unwrap_or_else(|| cache_dir.clone());
+                // RAM the extraction left for later reaches the disk after this
+                // install, whether or not it succeeds, so it does not slow it down.
+                let mut deferred =
+                    crate::portable_checkpoint::DeferredRestoreSync::for_extraction(&content_dir);
+                let installed = crate::portable_checkpoint::install_deferring_sync(
+                    &content_dir,
+                    &vm_data_dir(&name_for_checkpoint),
+                    &checkpoint,
+                    restore_cache_base.as_deref(),
+                    &mut deferred,
+                )
+                .and_then(|()| {
+                    crate::portable_checkpoint::discard_transport_pack(&vm_data_dir(
+                        &name_for_checkpoint,
+                    ))
+                })
+                .map_err(|error| ApiError::BadRequest(error.to_string()));
+                deferred.start();
+                installed
             })
-            .map_err(|error| ApiError::BadRequest(error.to_string()));
-            deferred.start();
-            installed
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
         if let Err(error) = install {
             let _ = std::fs::remove_dir_all(vm_data_dir(&name));
             return Err(error);
@@ -3380,16 +3383,17 @@ async fn create_machine_to_end(
             let name = name.clone();
             let sidecar_for_task = sidecar.clone();
             let packed_for_task = packed.clone();
-            tokio::task::spawn_blocking(move || {
-                crate::portable_checkpoint::verify_checkpoint_pack(
-                    &sidecar_for_task,
-                    &packed_for_task,
-                )?;
-                crate::portable_checkpoint::materialize_pack_layers(&name, &sidecar_for_task)
-            })
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {e}")))?
-            .map_err(|e| ApiError::BadRequest(e.to_string()))?;
+            guard
+                .spawn_blocking(move || {
+                    crate::portable_checkpoint::verify_checkpoint_pack(
+                        &sidecar_for_task,
+                        &packed_for_task,
+                    )?;
+                    crate::portable_checkpoint::materialize_pack_layers(&name, &sidecar_for_task)
+                })
+                .await
+                .map_err(|e| ApiError::internal(format!("task error: {e}")))?
+                .map_err(|e| ApiError::BadRequest(e.to_string()))?;
             Ok::<_, ApiError>(sidecar)
         }
         .await;
@@ -3412,12 +3416,17 @@ async fn create_machine_to_end(
     // whatever the restored machine's network: the guest holds its device.
     let mut restored_host_image = None;
     if let Some(checkpoint) = manifest_checkpoint.as_ref() {
-        match crate::portable_checkpoint::restore_checkpoint_host_image(
-            checkpoint,
-            &vm_data_dir(&name),
-            &crate::registry::PullAuth::FromConfig,
-        )
-        .await
+        let checkpoint = checkpoint.clone();
+        let data = vm_data_dir(&name);
+        match guard
+            .spawn_blocking(move || {
+                crate::portable_checkpoint::restore_checkpoint_host_image_blocking(
+                    &checkpoint,
+                    &data,
+                )
+            })
+            .await
+            .map_err(|error| ApiError::internal(format!("restore image task: {error}")))?
         {
             Ok(image) => restored_host_image = image,
             Err(error) => {
@@ -3431,15 +3440,20 @@ async fn create_machine_to_end(
         // Install may publish a disk under a different name than the one the
         // manager opened (a copy-on-write top is `.qcow2`, not `.raw`), so
         // resolve the disks again rather than launch from a stale handle.
-        manager = tokio::task::spawn_blocking({
-            let name = name.clone();
-            move || {
-                AgentManager::for_vm_with_sizes(&name, restored_storage_gb, restored_overlay_gb)
+        manager = guard
+            .spawn_blocking({
+                let creation = guard.creation();
+                move || {
+                    AgentManager::for_vm_creation(
+                        &creation,
+                        restored_storage_gb,
+                        restored_overlay_gb,
+                    )
                     .map_err(|e| ApiError::internal(format!("reopen restored disks: {e}")))
-            }
-        })
-        .await
-        .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
+                }
+            })
+            .await
+            .map_err(|e| ApiError::internal(format!("task error: {e}")))??;
         crate::portable_checkpoint::log_phase(&name, "api_restore_install", &mut checkpoint_phase);
     }
 
@@ -3470,23 +3484,7 @@ async fn create_machine_to_end(
             .as_ref()
             .is_some_and(crate::portable_checkpoint::carries_no_host_layers),
     });
-    if let Err(e) = complete_result {
-        let data_dir = vm_data_dir(&name);
-        smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(
-            &name,
-        ));
-        if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
-            if remove_err.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    machine = %name,
-                    dir = %data_dir.display(),
-                    error = %remove_err,
-                    "failed to remove machine data dir after create commit failure"
-                );
-            }
-        }
-        return Err(e);
-    }
+    complete_result?;
 
     // Fetch the persisted record for the response (off the reactor).
     let record = state
