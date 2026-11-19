@@ -1,0 +1,21 @@
+name: tmp mini2 clean
+on:
+  push:
+    branches: [tmp-mini2-clean]
+jobs:
+  clean:
+    runs-on: [self-hosted, macOS, ARM64]
+    steps:
+      - name: Measure and clear rebuildable caches
+        run: |
+          df -h /System/Volumes/Data | tail -1
+          for d in ~/Library/Caches ~/Library/Caches/smolvm ~/.smolvm ~/Documents ~/Downloads ~/Library/Application\ Support ~/Library/Containers ~/actions-runner/_work; do
+            perl -e 'alarm 240; exec @ARGV' du -sh -x "$d" 2>/dev/null || echo "?? $d"
+          done
+          perl -e 'alarm 240; exec @ARGV' du -sh -x ~/Library/Caches/* ~/Documents/* 2>/dev/null | sort -rh | head -15
+          C=~/Library/Caches/smolvm
+          for p in "$C/image-seeds" "$C/vms/_restore-checkpoints" "$C/vms/_restore-base" "$C/vms/_pack-templates" "$C/vms/_pack-storage-seeds"; do
+            [ -e "$p" ] || continue
+            if [ -z "$(lsof +D "$p" 2>/dev/null | head -1)" ]; then echo "clearing $p ($(du -sh "$p" | cut -f1))"; chmod -R u+w "$p" 2>/dev/null; rm -rf "$p"; fi
+          done
+          df -h /System/Volumes/Data | tail -1
