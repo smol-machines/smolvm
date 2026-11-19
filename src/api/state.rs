@@ -330,8 +330,8 @@ fn is_vm_dir_hash(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Pure reaping decision for the dangling-dir sweep: a cache entry is dangling
-/// iff it has the VM-dir-hash shape AND no live machine record maps to it.
+/// Candidate filter only: removal also requires ownership of an abandoned
+/// creation, since an unpublished directory may still have a live writer.
 fn is_dangling_vm_dir(dir_name: &str, valid_hashes: &std::collections::HashSet<String>) -> bool {
     is_vm_dir_hash(dir_name) && !valid_hashes.contains(dir_name)
 }
@@ -727,23 +727,10 @@ impl ApiState {
         loaded
     }
 
-    /// Remove VM data dirs under the cache root that no current machine record
-    /// references — a filesystem-level GC for the dirs the per-record path can't
-    /// see (a dir whose record was already gone: a legacy leak, or a CLI ephemeral
-    /// orphan that resolved to the wrong hash).
-    ///
-    /// Deliberately NOT called from `load_persisted_machines`: this is a global
-    /// sweep keyed off the *current* DB, so it must only run in the real `smolvm
-    /// serve` process (which owns this node's cache), never from a unit test or an
-    /// embedded library user whose DB does not describe the host's dirs — there it
-    /// would wipe live machines. The caller invokes it at server startup, before
-    /// requests are served, so it cannot race VM creation. Returns the count
-    /// removed.
-    ///
-    /// Safe by construction: only entries whose name is a VM data-dir hash (16
-    /// lowercase hex chars, the `vm_dir_hash` shape) are candidates, so the shared
-    /// pack store (`_shared`) and marker files are never touched, and every hash
-    /// backing a live DB record is skipped.
+    /// Reclaim abandoned creations after acquiring their exact ownership.
+    /// A missing VM row alone is not proof of abandonment: another CLI or an
+    /// embedded caller can still be preparing that directory. Unknown legacy
+    /// directories are preserved until their writer lifetime can be established.
     pub fn reclaim_dangling_vm_dirs(&self) -> usize {
         let valid: std::collections::HashSet<String> = match self.db.list_vms() {
             Ok(vms) => vms
@@ -752,24 +739,32 @@ impl ApiState {
                 .collect(),
             Err(_) => return 0,
         };
-        let root = crate::agent::vm_cache_root();
-        let entries = match std::fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(_) => return 0,
+        let abandoned = match self.db.abandoned_vm_creations() {
+            Ok(creations) => creations,
+            Err(error) => {
+                tracing::warn!(%error, "cannot verify abandoned creation ownership");
+                return 0;
+            }
         };
         let mut removed = 0;
-        for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            if !is_dangling_vm_dir(&dir_name, &valid) {
+        for (name, token) in abandoned {
+            if !is_dangling_vm_dir(&crate::agent::vm_dir_hash(&name), &valid) {
                 continue;
             }
-            if entry.path().is_dir() {
-                tracing::info!(dir = %dir_name, "removing dangling VM data dir (no machine record)");
-                match std::fs::remove_dir_all(entry.path()) {
-                    Ok(()) => removed += 1,
-                    Err(e) => {
-                        tracing::warn!(dir = %dir_name, error = %e, "failed to remove dangling VM data dir")
+            let dir = crate::agent::vm_data_dir(&name);
+            let existed = dir.exists();
+            match self.db.recover_vm_creation(&name, &token) {
+                Ok(Some(owner)) => {
+                    // Cleanup remains owned until the final drop releases the
+                    // name, so a concurrent creator cannot lose its new data.
+                    drop(owner);
+                    if existed && !dir.exists() {
+                        removed += 1;
                     }
+                }
+                Ok(None) => {} // the name or creation generation changed
+                Err(error) => {
+                    tracing::warn!(%name, %error, "preserving creation data after refused recovery")
                 }
             }
         }
@@ -2187,7 +2182,8 @@ mod tests {
         let name = format!("unfinished-{}", SmolvmDb::create_reservation_token());
         let data = crate::agent::vm_data_dir(&name);
         {
-            let _guard = ReservationGuard::new(&state, name.clone()).unwrap();
+            let guard = ReservationGuard::new(&state, name.clone()).unwrap();
+            guard.creation.prepare_directory().unwrap();
             std::fs::create_dir_all(data.join("pack")).unwrap();
             std::fs::write(data.join("pack").join("layer.tar"), b"partial").unwrap();
         }

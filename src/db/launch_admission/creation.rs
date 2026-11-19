@@ -17,6 +17,7 @@ struct CreationOwner {
     token: String,
     owner: ProcessIdentity,
     data_dir: PathBuf,
+    prepared: parking_lot::Mutex<bool>,
     committed: AtomicBool,
 }
 
@@ -27,7 +28,9 @@ impl VmCreationLease {
         if !db.reserve_vm_create(name, &token)? {
             return Err(conflict("machine already exists or is being created"));
         }
-        Self::from_reserved(db, name, token)
+        let lease = Self::from_reserved(db, name, token)?;
+        lease.prepare_directory()?;
+        Ok(lease)
     }
 
     pub(crate) fn from_reserved(db: SmolvmDb, name: &str, token: String) -> Result<Self> {
@@ -38,13 +41,22 @@ impl VmCreationLease {
             token,
             owner: ProcessIdentity::current()?,
             data_dir,
+            prepared: parking_lot::Mutex::new(false),
             committed: AtomicBool::new(false),
         }));
-        // An exited creator can leave partial disks or extraction output. A new
-        // creation starts clean while it exclusively owns the unpublished name.
-        lease.0.cleanup_files()?;
-        crate::agent::ensure_vm_dir_at(&lease.0.data_dir, name)?;
         Ok(lease)
+    }
+
+    /// Run once in the creator's blocking worker. Adopting ownership itself
+    /// does not delete a potentially large abandoned import on an async reactor.
+    pub(crate) fn prepare_directory(&self) -> Result<()> {
+        let mut prepared = self.0.prepared.lock();
+        if !*prepared {
+            self.0.cleanup_files()?;
+            crate::agent::ensure_vm_dir_at(&self.0.data_dir, self.name())?;
+            *prepared = true;
+        }
+        Ok(())
     }
 
     /// The name whose preparation this capability owns.
@@ -229,6 +241,15 @@ impl SmolvmDb {
     /// Reserve a name and its directory until its exact creating process exits
     /// or explicitly publishes/releases it. A live import never expires by age.
     pub fn reserve_vm_create(&self, name: &str, token: &str) -> Result<bool> {
+        self.reserve_vm_create_matching(name, token, None)
+    }
+
+    fn reserve_vm_create_matching(
+        &self,
+        name: &str,
+        token: &str,
+        expected: Option<&str>,
+    ) -> Result<bool> {
         crate::data::validate_vm_name(name, "create machine").map_err(|error| conflict(&error))?;
         if token.is_empty()
             || token.len() > 128
@@ -260,6 +281,9 @@ impl SmolvmDb {
         self.with_durable_conn(|conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate).db_err("begin creation ownership")?;
             let prior: Option<(String, i64)> = tx.query_row("SELECT owner_token, owner_pid FROM vm_create_reservations WHERE name = ?1", [name], |row| Ok((row.get(0)?, row.get(1)?))).optional().db_err("read prior creation")?;
+            if expected.is_some() && prior.as_ref().map(|(token, _)| token.as_str()) != expected {
+                return Ok(false);
+            }
             if let Some((prior_token, pid)) = prior {
                 let alive = match saved_creation(&tx, name, &prior_token)? {
                     Some(launch) => launch.owner.may_be_alive(),
@@ -280,6 +304,37 @@ impl SmolvmDb {
             tx.commit().db_err("commit creation ownership")?;
             Ok(true)
         })
+    }
+
+    /// Candidates for recovery, never proof on their own: claiming one must
+    /// compare its token again in the same transaction that acquires ownership.
+    pub(crate) fn abandoned_vm_creations(&self) -> Result<Vec<(String, String)>> {
+        self.with_conn(|conn| {
+            let tx = conn.transaction().db_err("inspect abandoned creations")?;
+            let mut abandoned = Vec::new();
+            for (token, launch) in rows(&tx)? {
+                if !launch.owner.may_be_alive() {
+                    if let Purpose::Create { name } = launch.purpose {
+                        abandoned.push((name, token));
+                    }
+                }
+            }
+            Ok(abandoned)
+        })
+    }
+
+    pub(crate) fn recover_vm_creation(
+        &self,
+        name: &str,
+        expected: &str,
+    ) -> Result<Option<VmCreationLease>> {
+        let token = Self::create_reservation_token();
+        if !self.reserve_vm_create_matching(name, &token, Some(expected))? {
+            return Ok(None);
+        }
+        let owner = VmCreationLease::from_reserved(self.clone(), name, token)?;
+        owner.prepare_directory()?;
+        Ok(Some(owner))
     }
 
     fn creation_data_dir(&self, name: &str, token: &str) -> Result<PathBuf> {

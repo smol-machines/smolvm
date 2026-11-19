@@ -98,6 +98,7 @@ fn stale_creation_cleanup_cannot_remove_a_replacement() {
     };
     let db = SmolvmDb::open().unwrap();
     let old = VmCreationLease::reserve(db.clone(), "replacement").unwrap();
+    let old_token = old.token().to_owned();
     let dir = crate::agent::ensure_vm_dir(old.name()).unwrap();
     fs::write(dir.join("old"), b"partial").unwrap();
     // Simulate loss of the old capability before its destructor gets to run.
@@ -110,6 +111,10 @@ fn stale_creation_cleanup_cannot_remove_a_replacement() {
     );
     crate::agent::ensure_vm_dir(new.name()).unwrap();
     fs::write(dir.join("new"), b"replacement data").unwrap();
+    assert!(db
+        .recover_vm_creation("replacement", &old_token)
+        .unwrap()
+        .is_none());
     drop(old);
     assert_eq!(fs::read(dir.join("new")).unwrap(), b"replacement data");
     new.commit(&record(new.name())).unwrap();
@@ -339,4 +344,60 @@ fn creation_refuses_a_symlink_or_unbound_nonempty_directory() {
     fs::write(dir.join("keep"), b"unbound data").unwrap();
     assert!(VmCreationLease::reserve(db, "unbound").is_err());
     assert_eq!(fs::read(dir.join("keep")).unwrap(), b"unbound data");
+}
+
+#[test]
+fn startup_sweep_preserves_active_and_unknown_directories_and_reclaims_dead_creation() {
+    fn here() {}
+    let Some(root) = isolated(std::any::type_name_of_val(&here)) else {
+        return;
+    };
+    let db = SmolvmDb::open().unwrap();
+    if std::env::var_os("SMOL_CREATION_SWEEP_WORKER").is_some() {
+        let lease = VmCreationLease::reserve(db, "sweep-dead").unwrap();
+        fs::write(
+            crate::agent::vm_data_dir(lease.name()).join("partial"),
+            b"abandoned",
+        )
+        .unwrap();
+        fs::write(root.join("sweep-ready"), lease.token()).unwrap();
+        loop {
+            std::thread::park();
+        }
+    }
+    let active = VmCreationLease::reserve(db.clone(), "sweep-live").unwrap();
+    let live = crate::agent::vm_data_dir(active.name());
+    fs::write(live.join("keep"), b"active writer").unwrap();
+    let unknown = crate::agent::ensure_vm_dir("sweep-unknown").unwrap();
+    fs::write(unknown.join("keep"), b"unknown writer").unwrap();
+    let test = std::any::type_name_of_val(&here)
+        .strip_suffix("::here")
+        .unwrap()
+        .split_once("::")
+        .unwrap()
+        .1;
+    let mut child = ChildOwner(
+        Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", test, "--test-threads=1", "--nocapture"])
+            .env("SMOL_CREATION_SWEEP_WORKER", "1")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    let deadline = Instant::now() + Duration::from_secs(15);
+    while !root.join("sweep-ready").exists() {
+        assert!(child.0.try_wait().unwrap().is_none());
+        assert!(Instant::now() < deadline);
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    let state = crate::api::state::ApiState::with_db(db.clone());
+    assert_eq!(state.reclaim_dangling_vm_dirs(), 0);
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    assert_eq!(state.reclaim_dangling_vm_dirs(), 1);
+    assert!(!crate::agent::vm_data_dir("sweep-dead").exists());
+    assert_eq!(fs::read(live.join("keep")).unwrap(), b"active writer");
+    assert_eq!(fs::read(unknown.join("keep")).unwrap(), b"unknown writer");
+    assert_eq!(state.reclaim_dangling_vm_dirs(), 0);
 }

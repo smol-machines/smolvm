@@ -3174,6 +3174,7 @@ async fn create_machine_to_end(
         let storage_gb = restored_storage_gb;
         let overlay_gb = restored_overlay_gb;
         move || {
+            creation.prepare_directory().map_err(ApiError::from)?;
             if let Some(image) = seed_image {
                 let seeded = crate::image_seed::builder_exe()
                     .map_err(|e| crate::Error::config("image seed", e.to_string()))

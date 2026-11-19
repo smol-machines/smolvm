@@ -1931,6 +1931,7 @@ impl AgentManager {
         storage_gb: Option<u64>,
         overlay_gb: Option<u64>,
     ) -> Result<Self> {
+        creation.prepare_directory()?;
         Self::open_with_creation(
             creation.name(),
             DiskAccess::Launch {
