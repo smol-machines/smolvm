@@ -90,6 +90,9 @@ impl Supervisor {
 
     /// Check all machines and restart any that need it.
     async fn check_all_machines(&mut self) {
+        if let Err(error) = self.state.discover_persisted_machines().await {
+            tracing::warn!(%error, "failed to discover machines");
+        }
         let machine_names = self.state.list_machine_names();
 
         // Drop schedule entries for machines that no longer exist so the map
@@ -130,6 +133,11 @@ impl Supervisor {
             self.forget_schedule(name);
             return Ok(());
         };
+        if crate::api::state::externally_supervised(&record) || record.state == RecordState::Created
+        {
+            self.forget_schedule(name);
+            return Ok(());
+        }
         if self.state.is_machine_alive(name)
             || record.is_process_alive()
             || record.paused_checkpoint.is_some()
@@ -316,7 +324,11 @@ impl Supervisor {
 
         // A restart can have queued behind an explicit stop or pause. The
         // original scheduling decision is no longer authority to boot it.
-        if record.restart.user_stopped || record.paused_checkpoint.is_some() {
+        if record.restart.user_stopped
+            || record.state == RecordState::Created
+            || record.paused_checkpoint.is_some()
+            || crate::api::state::externally_supervised(&record)
+        {
             return Ok(());
         }
 
@@ -441,9 +453,12 @@ impl Supervisor {
 
 #[cfg(test)]
 mod restart_timing_tests {
-    use super::{RestartTiming, Supervisor, MIN_RESTART_DELAY};
+    use super::{
+        ApiState, Arc, RecordState, RestartTiming, Supervisor, VmRecord, MIN_RESTART_DELAY,
+    };
     use std::collections::HashMap;
     use std::time::Duration;
+    use tokio::sync::watch;
     use tokio::time::Instant;
 
     #[test]
@@ -526,6 +541,41 @@ mod restart_timing_tests {
         assert_eq!(
             serde_json::to_value(&record).unwrap(),
             serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_does_not_boot_created_machines_or_reconcile_other_runtime_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let mut record = VmRecord::new("discovery-created".into(), 1, 128, vec![], vec![], false);
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        db.insert_vm(&record.name, &record).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+        let (_tx, rx) = watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        supervisor.check_machine(&record.name).await.unwrap();
+        let current = state.db().get_vm(&record.name).unwrap().unwrap();
+        assert_eq!(current.state, RecordState::Created);
+        assert_eq!(current.restart.restart_count, 0);
+        assert!(current.pid.is_none());
+
+        state
+            .db()
+            .update_vm(&record.name, |r| {
+                r.state = RecordState::Running;
+                r.pid = Some(i32::MAX);
+                r.runtime_managed = true;
+                r.ephemeral = true;
+            })
+            .unwrap();
+        let before =
+            serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap();
+        assert!(state.load_persisted_machines().is_empty());
+        supervisor.check_machine(&record.name).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap(),
+            before
         );
     }
 

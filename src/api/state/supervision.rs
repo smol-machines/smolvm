@@ -14,6 +14,8 @@ fn same_state(a: &VmRecord, b: &VmRecord) -> bool {
         && a.paused_checkpoint == b.paused_checkpoint
         && a.restart == b.restart
         && a.last_exit_code == b.last_exit_code
+        && a.runtime_managed == b.runtime_managed
+        && a.labels == b.labels
 }
 
 fn changed() -> Error {
@@ -27,6 +29,7 @@ fn require_dead_observation(current: &VmRecord, observed: &VmRecord) -> Result<(
     // update_vm_for_record verifies row identity in this same transaction;
     // its mutable payload deliberately carries no deserialized identity.
     if !same_state(current, observed)
+        || super::externally_supervised(current)
         || current.is_process_alive()
         || current.paused_checkpoint.is_some()
         || matches!(
@@ -154,7 +157,7 @@ mod tests {
         state.db.remove_vm(&observed.name).unwrap();
         state.db.insert_vm(&observed.name, &observed).unwrap();
         assert_refused(&state, &observed);
-        for mutation in 0..4 {
+        for mutation in 0..6 {
             let observed = state.db.get_vm(&observed.name).unwrap().unwrap();
             state
                 .db
@@ -162,7 +165,12 @@ mod tests {
                     0 => r.restart.user_stopped = true,
                     1 => r.state = RecordState::Pausing,
                     2 => r.restart.policy = RestartPolicy::Never,
-                    _ => r.last_exit_code = Some(9),
+                    3 => r.last_exit_code = Some(9),
+                    4 => {
+                        r.labels
+                            .insert("smolvm.engine/container".into(), "owner".into());
+                    }
+                    _ => r.runtime_managed = true,
                 })
                 .unwrap();
             assert_refused(&state, &observed);

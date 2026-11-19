@@ -1,6 +1,8 @@
 //! API server state management.
 
+mod discovery;
 mod supervision;
+pub(crate) use discovery::externally_supervised;
 pub(crate) use supervision::same_observation;
 
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
@@ -573,6 +575,9 @@ impl ApiState {
         let mut loaded = Vec::new();
 
         for (name, mut record) in vms {
+            if externally_supervised(&record) {
+                continue;
+            }
             // A restarting server must preserve transfer-owned metadata and
             // still expose the machine for observation and recovery.
             let admission = self.db.admit_machine_mutation(&name);
