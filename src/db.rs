@@ -333,6 +333,10 @@ impl SmolvmDb {
                  data BLOB NOT NULL,
                  PRIMARY KEY (name, operation_id)
              );
+             CREATE TABLE IF NOT EXISTS workload_transfer_preparations (
+                 operation TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS fork_pools (
                  name TEXT PRIMARY KEY NOT NULL,
                  data BLOB NOT NULL
