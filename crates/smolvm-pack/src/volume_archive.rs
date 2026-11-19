@@ -17,6 +17,9 @@ use std::path::{Component, Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+mod limits;
+pub use limits::ImportLimits;
+
 // Linux guest file-type bits, independent of the host libc mode_t width.
 const TYPE_MASK: u32 = 0o170000;
 const DIRECTORY: u32 = 0o040000;
@@ -356,11 +359,18 @@ fn apply_metadata(path: &Path, metadata: &GuestMetadata) -> io::Result<()> {
 /// host files remain 0600 and directories 0700. Links can refer outside the guest
 /// volume, but are never followed during extraction. Incomplete streams, duplicate
 /// names, forward hardlinks and metadata that cannot be represented are errors.
-pub fn read_staged<R: Read>(input: R, staging_parent: &Path) -> io::Result<tempfile::TempDir> {
+/// Limits must come from destination admission; they are enforced before tar
+/// extension allocation or sparse expansion. The stream must end in complete
+/// zero blocks, with no appended payload, and the caller must bound read time.
+pub fn read_staged<R: Read>(
+    input: R,
+    staging_parent: &Path,
+    limits: ImportLimits,
+) -> io::Result<tempfile::TempDir> {
     let stage = tempfile::Builder::new()
         .prefix(".smol-volume-")
         .tempdir_in(staging_parent)?;
-    let mut archive = tar::Archive::new(input);
+    let mut archive = tar::Archive::new(limits::BoundedTar::new(input, limits));
     archive.set_overwrite(false);
     archive.set_preserve_ownerships(false);
     let mut seen = BTreeMap::<PathBuf, GuestMetadata>::new();
@@ -473,6 +483,7 @@ pub fn read_staged<R: Read>(input: R, staging_parent: &Path) -> io::Result<tempf
             "incomplete volume archive",
         ));
     }
+    archive.into_inner().finish()?;
     for (path, metadata) in directories.into_iter().rev() {
         apply_metadata(&path, &metadata)?;
         File::open(path)?.sync_all()?;
@@ -493,6 +504,19 @@ mod tests {
     use std::io::{Seek, SeekFrom};
     #[cfg(target_os = "linux")]
     use std::os::unix::ffi::OsStringExt;
+
+    fn test_limits() -> ImportLimits {
+        ImportLimits {
+            archive_bytes: 1 << 24,
+            logical_bytes: 1 << 30,
+            entries: 1000,
+            metadata_bytes: 1 << 20,
+        }
+    }
+
+    fn read_staged<R: Read>(input: R, parent: &Path) -> io::Result<tempfile::TempDir> {
+        super::read_staged(input, parent, test_limits())
+    }
 
     fn fixture() -> tempfile::TempDir {
         tempfile::tempdir().unwrap()
@@ -703,5 +727,316 @@ mod tests {
         }
         assert!(relative(Path::new("data/../escape")).is_err());
         assert!(relative(Path::new("/data/file")).is_err());
+    }
+
+    #[test]
+    fn volume_import_enforces_each_destination_allowance_and_removes_staging() {
+        let source = fixture();
+        let parent = fixture();
+        fs::write(source.path().join("file"), b"12345678").unwrap();
+        fs::hard_link(source.path().join("file"), source.path().join("linked")).unwrap();
+        let bytes = archive(source.path());
+        let accepted = ImportLimits {
+            archive_bytes: bytes.len() as u64,
+            logical_bytes: 8,
+            entries: 4, // root, regular file, hardlink, completion marker
+            ..test_limits()
+        };
+        let stage = super::read_staged(bytes.as_slice(), parent.path(), accepted).unwrap();
+        assert_eq!(fs::read(stage.path().join("linked")).unwrap(), b"12345678");
+        assert_eq!(fs::metadata(stage.path().join("file")).unwrap().nlink(), 2);
+        drop(stage);
+        for (limits, message) in [
+            (
+                ImportLimits {
+                    archive_bytes: accepted.archive_bytes - 1,
+                    ..accepted
+                },
+                "archive byte",
+            ),
+            (
+                ImportLimits {
+                    logical_bytes: 7,
+                    ..accepted
+                },
+                "logical byte",
+            ),
+            (
+                ImportLimits {
+                    entries: 3,
+                    ..accepted
+                },
+                "entry count",
+            ),
+            (
+                ImportLimits {
+                    metadata_bytes: 511,
+                    ..accepted
+                },
+                "metadata byte",
+            ),
+        ] {
+            let error = super::read_staged(bytes.as_slice(), parent.path(), limits).unwrap_err();
+            assert!(error.to_string().contains(message), "{error}");
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn volume_import_refuses_large_extensions_and_sparse_sizes_before_reading_bodies() {
+        struct HeaderOnly {
+            bytes: std::io::Cursor<Vec<u8>>,
+        }
+        impl Read for HeaderOnly {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                assert!(self.bytes.position() < 512, "read a refused entry's body");
+                self.bytes.read(out)
+            }
+        }
+        let parent = fixture();
+        for kind in [
+            tar::EntryType::XHeader,
+            tar::EntryType::GNULongName,
+            tar::EntryType::GNULongLink,
+            tar::EntryType::GNUSparse,
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(0o600);
+            header.set_path("data/hostile").unwrap();
+            header.set_size(if kind.is_gnu_sparse() { 0 } else { 1 << 30 });
+            if kind.is_gnu_sparse() {
+                header.as_gnu_mut().unwrap().set_real_size(1 << 50);
+            }
+            header.set_cksum();
+            let reader = HeaderOnly {
+                bytes: std::io::Cursor::new(header.as_bytes().to_vec()),
+            };
+            let limits = ImportLimits {
+                archive_bytes: 1 << 40,
+                ..test_limits()
+            };
+            let error = super::read_staged(reader, parent.path(), limits).unwrap_err();
+            let expected = if kind.is_gnu_sparse() {
+                "logical byte"
+            } else {
+                "extension is too large"
+            };
+            assert!(error.to_string().contains(expected), "{error}");
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn volume_import_limits_sparse_extent_metadata_before_tar_builds_an_unbounded_map() {
+        let parent = fixture();
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_size(0);
+        header.set_path("data/sparse").unwrap();
+        header.as_gnu_mut().unwrap().set_real_size(0);
+        header.as_gnu_mut().unwrap().set_is_extended(true);
+        header.set_cksum();
+        let mut bytes = header.as_bytes().to_vec();
+        let mut extension = tar::GnuExtSparseHeader::new();
+        extension.set_is_extended(true);
+        for _ in 0..1025 {
+            bytes.extend_from_slice(extension.as_bytes());
+        }
+        let error = read_staged(bytes.as_slice(), parent.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("sparse extent map is too large"),
+            "{error}"
+        );
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn volume_import_streams_valid_multiblock_sparse_maps_with_exact_limits() {
+        let source = fixture();
+        let parent = fixture();
+        let root = archive(source.path());
+        let marker = root
+            .windows(END.len())
+            .position(|b| b == END.as_bytes())
+            .unwrap();
+        let mut bytes = root[..marker].to_vec();
+        let metadata = serde_json::to_vec(&GuestMetadata {
+            uid: 42001,
+            gid: 42002,
+            mode: REGULAR | 0o640,
+            mtime: 0,
+            mtime_ns: 0,
+        })
+        .unwrap();
+        let mut pax = tar::Builder::new(Vec::new());
+        pax.append_pax_extensions([(PAX, metadata.as_slice())])
+            .unwrap();
+        let pax = pax.into_inner().unwrap();
+        bytes.extend_from_slice(&pax[..pax.len() - 1024]);
+        let mut header = tar::Header::new_gnu();
+        header.set_path("data/fragmented").unwrap();
+        header.set_entry_type(tar::EntryType::GNUSparse);
+        header.set_mode(0o600);
+        header.set_size(50 * 512);
+        let gnu = header.as_gnu_mut().unwrap();
+        gnu.set_real_size(50 * 4096);
+        gnu.set_is_extended(true);
+        for (index, block) in gnu.sparse.iter_mut().enumerate() {
+            block.set_offset(index as u64 * 4096);
+            block.set_length(512);
+        }
+        let mut next = gnu.sparse.len() as u64;
+        header.set_cksum();
+        bytes.extend_from_slice(header.as_bytes());
+        while next <= 50 {
+            let mut extension = tar::GnuExtSparseHeader::new();
+            for block in &mut extension.sparse {
+                if next > 50 {
+                    break;
+                }
+                block.set_offset(next * 4096);
+                block.set_length(if next == 50 { 0 } else { 512 });
+                next += 1;
+            }
+            extension.set_is_extended(next <= 50);
+            bytes.extend_from_slice(extension.as_bytes());
+        }
+        for value in 0..50u8 {
+            bytes.extend_from_slice(&[value; 512]);
+        }
+        bytes.extend_from_slice(&root[marker..]);
+        let limits = ImportLimits {
+            archive_bytes: bytes.len() as u64,
+            logical_bytes: 50 * 4096,
+            entries: 3,
+            ..test_limits()
+        };
+        let stage = super::read_staged(bytes.as_slice(), parent.path(), limits).unwrap();
+        let path = stage.path().join("fragmented");
+        let stat = fs::metadata(&path).unwrap();
+        assert_eq!(stat.len(), 50 * 4096);
+        assert_eq!(guest_metadata(&path, &stat).unwrap().uid, 42001);
+        let contents = fs::read(path).unwrap();
+        for value in 0..50usize {
+            let start = value * 4096;
+            assert_eq!(&contents[start..start + 512], &[value as u8; 512]);
+            assert!(contents[start + 512..start + 4096].iter().all(|b| *b == 0));
+        }
+        drop(stage);
+        let error = super::read_staged(
+            bytes.as_slice(),
+            parent.path(),
+            ImportLimits {
+                logical_bytes: limits.logical_bytes - 1,
+                ..limits
+            },
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("logical byte"), "{error}");
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn volume_import_rejects_pax_size_overrides_duplicate_keys_and_oversized_names() {
+        let parent = fixture();
+        let long_name = "n".repeat(4097);
+        for extensions in [
+            vec![("size", b"1073741824".as_slice())],
+            vec![("GNU.sparse.realsize", b"1073741824".as_slice())],
+            vec![
+                ("path", b"data/a".as_slice()),
+                ("path", b"data/b".as_slice()),
+            ],
+            vec![("path", long_name.as_bytes())],
+            vec![("linkpath", long_name.as_bytes())],
+        ] {
+            let mut builder = tar::Builder::new(Vec::new());
+            builder.append_pax_extensions(extensions).unwrap();
+            let bytes = builder.into_inner().unwrap();
+            let error = read_staged(bytes.as_slice(), parent.path()).unwrap_err();
+            assert!(error.to_string().contains("extension"), "{error}");
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        }
+    }
+
+    #[test]
+    fn volume_import_rejects_trailing_payload_and_requires_complete_terminators() {
+        let source = fixture();
+        let parent = fixture();
+        let bytes = archive(source.path());
+        for removed in [1, 512, 1024] {
+            assert!(read_staged(&bytes[..bytes.len() - removed], parent.path()).is_err());
+            assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        }
+        let mut extra = bytes.clone();
+        extra.extend_from_slice(&bytes);
+        let error = read_staged(extra.as_slice(), parent.path()).unwrap_err();
+        assert!(error.to_string().contains("data after"), "{error}");
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+        extra = bytes.clone();
+        extra.extend_from_slice(&[0; 512]);
+        drop(read_staged(extra.as_slice(), parent.path()).unwrap());
+        // Even an endless all-zero trailer stops at the reserved byte budget.
+        let limits = ImportLimits {
+            archive_bytes: bytes.len() as u64 + 512,
+            ..test_limits()
+        };
+        let error =
+            super::read_staged(bytes.as_slice().chain(io::repeat(0)), parent.path(), limits)
+                .unwrap_err();
+        assert!(error.to_string().contains("archive byte"), "{error}");
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn volume_import_handles_fragmented_and_interrupted_streams_without_dense_sparse_writes() {
+        struct Fragmented<R> {
+            input: R,
+            reads: usize,
+        }
+        impl<R: Read> Read for Fragmented<R> {
+            fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
+                self.reads += 1;
+                if self.reads.is_multiple_of(5) {
+                    return Err(io::ErrorKind::Interrupted.into());
+                }
+                let len = out.len().min(17);
+                self.input.read(&mut out[..len])
+            }
+        }
+        let source = fixture();
+        let parent = fixture();
+        let mut file = File::create(source.path().join("sparse")).unwrap();
+        file.set_len(8 << 30).unwrap();
+        file.seek(SeekFrom::Start(4 << 30)).unwrap();
+        file.write_all(b"saved state").unwrap();
+        drop(file);
+        let bytes = archive(source.path());
+        assert!(bytes.len() < 1 << 20);
+        let limits = ImportLimits {
+            logical_bytes: 8 << 30,
+            archive_bytes: bytes.len() as u64,
+            ..test_limits()
+        };
+        let reader = Fragmented {
+            input: bytes.as_slice(),
+            reads: 0,
+        };
+        let stage = super::read_staged(reader, parent.path(), limits).unwrap();
+        let restored = stage.path().join("sparse");
+        let metadata = fs::metadata(&restored).unwrap();
+        assert_eq!(metadata.len(), 8 << 30);
+        assert!(
+            metadata.blocks() * 512 < 1 << 20,
+            "sparse file became dense"
+        );
+        let mut restored = File::open(restored).unwrap();
+        restored.seek(SeekFrom::Start(4 << 30)).unwrap();
+        let mut value = [0; 11];
+        restored.read_exact(&mut value).unwrap();
+        assert_eq!(&value, b"saved state");
+        drop(stage);
+        assert_eq!(fs::read_dir(parent.path()).unwrap().count(), 0);
     }
 }
