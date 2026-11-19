@@ -4363,8 +4363,8 @@ dependencies = [
  "smolvm-paths",
  "smolvm-protocol",
  "smolvm-registry",
+ "smolvm-tar",
  "socket2",
- "tar",
  "tempfile",
  "thiserror 1.0.69",
  "tokio",
@@ -4402,7 +4402,7 @@ dependencies = [
  "smolvm-oci-layer",
  "smolvm-protocol",
  "smolvm-s3fs",
- "tar",
+ "smolvm-tar",
  "tempfile",
  "tracing",
  "tracing-subscriber",
@@ -4524,7 +4524,7 @@ dependencies = [
  "flate2",
  "libc",
  "ruzstd",
- "tar",
+ "smolvm-tar",
  "tempfile",
  "tracing",
  "zstd",
@@ -4542,7 +4542,7 @@ dependencies = [
  "sha2 0.10.9",
  "smolvm-paths",
  "smolvm-protocol",
- "tar",
+ "smolvm-tar",
  "tempfile",
  "thiserror 1.0.69",
  "time",
@@ -4633,6 +4633,15 @@ dependencies = [
  "heapless",
  "log",
  "managed",
+]
+
+[[package]]
+name = "smolvm-tar"
+version = "0.4.46-smol.1"
+dependencies = [
+ "filetime",
+ "libc",
+ "xattr",
 ]
 
 [[package]]
@@ -4815,17 +4824,6 @@ dependencies = [
  "proc-macro2",
  "quote",
  "syn 2.0.117",
-]
-
-[[package]]
-name = "tar"
-version = "0.4.46"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "3f6221d9a6003c78398e3b239969f352578258df48c8eb051caadae0015bc840"
-dependencies = [
- "filetime",
- "libc",
- "xattr",
 ]
 
 [[package]]

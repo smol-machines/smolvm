@@ -944,6 +944,47 @@ pub fn handle_set_primary_address(
 mod tests {
     use super::*;
 
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn imported_archives_preserve_pax_filenames_with_newlines() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(root.path()).unwrap();
+        let archive = root.path().join("upload.tar");
+        let name = "測試\nname.txt";
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        builder
+            .append_pax_extensions([("path", name.as_bytes())])
+            .unwrap();
+        let payload = b"keep exact bytes";
+        let mut header = tar::Header::new_ustar();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o640);
+        header.set_uid(owner.uid() as u64);
+        header.set_gid(owner.gid() as u64);
+        builder
+            .append_data(&mut header, "fallback.txt", &payload[..])
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        let guest = root.path().join("container");
+        std::fs::create_dir(&guest).unwrap();
+        unpack_archive(&guest, archive.to_str().unwrap(), "/uploaded").unwrap();
+        let imported = guest.join("uploaded").join(name);
+        assert_eq!(std::fs::read(&imported).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(imported).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!guest.join("uploaded/fallback.txt").exists());
+        assert!(
+            !archive.exists(),
+            "successful import removes its staging archive"
+        );
+    }
+
     #[test]
     fn hosts_file_names_the_container_and_lists_extra_hosts() {
         let hosts = hosts_file(
