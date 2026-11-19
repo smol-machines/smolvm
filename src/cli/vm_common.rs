@@ -2584,7 +2584,7 @@ pub fn stop_vm_named_with_timeout(
     // VMM between snapshot preparation and clone registration can otherwise
     // strand an ambiguous generation.
     let _fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
-    let mut config = SmolvmConfig::load()?;
+    let config = SmolvmConfig::load()?;
 
     // Check config for the named VM
     let record = match config.get_vm(name) {
@@ -2683,35 +2683,9 @@ pub fn stop_vm_named_with_timeout(
 
     println!("Stopping machine '{}'...", name);
 
-    // A frozen fork base is snapshot-paused: its agent cannot answer, so both
-    // the staged-mount sync and the shutdown handshake would block until their
-    // deadlines and then fail. The checkpoint that froze it already quiesced
-    // its filesystems, which is what the handshake exists to confirm.
-    let frozen = resolved == RecordState::Frozen;
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
-    if !frozen && !record.staged_mounts.is_empty() {
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
-    }
-    if frozen {
-        manager.stop_paused()?;
-    } else if let Some(stop_timeout) = stop_timeout {
-        manager.stop_with_timeout(stop_timeout)?;
-    } else {
-        manager.stop()?;
-    }
-
-    // Detach the machine's case-sensitive layers volume now that its process is
-    // gone (macOS hdiutil mount; no-op on Linux). A continuing source's volume
-    // stays mounted while child pack symlinks still reference it.
-    if record.source_smolmachine.is_some() {
-        smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
-            name,
-        ));
-    }
-
-    config.update_vm(name, VmRecord::mark_process_stopped);
+    let manager = AgentManager::for_existing_vm_record(&record)?;
+    manager.detach();
+    manager.stop_persisted(&record, stop_timeout)?;
 
     println!("Stopped machine: {}", name);
     Ok(())
@@ -2771,48 +2745,17 @@ fn kill_orphaned_boot_process(name: &str) {
 
 /// Stop the default machine.
 pub fn stop_vm_default(stop_timeout: Option<std::time::Duration>) -> smolvm::Result<()> {
+    if SmolvmDb::open()?.get_vm("default")?.is_some() {
+        return stop_vm_named_with_timeout("default", stop_timeout);
+    }
     let manager = AgentManager::new_default()?;
-
-    let record = SmolvmConfig::load()
-        .ok()
-        .and_then(|config| config.get_vm("default").cloned());
-
-    // try_connect_existing sets internal state if agent is reachable;
-    // stop() handles both responsive agents and orphans via PID file.
     manager.try_connect_existing();
     println!("Stopping machine 'default'...");
-    if let Some(record) = record
-        .as_ref()
-        .filter(|record| !record.staged_mounts.is_empty())
-    {
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        smolvm::staged_mount::sync_staged_mounts(record, &mut client)?;
-    }
     match stop_timeout {
         Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
         None => manager.stop()?,
     }
-
-    // Update database record if it exists
-    if let Ok(mut config) = SmolvmConfig::load() {
-        // Detach the per-machine layers volume now that the process is gone,
-        // unless fork children still reference it (macOS hdiutil; no-op on Linux).
-        // Gated on the record so non-bundle machines are untouched; the volume
-        // belongs to "default" and its linked children.
-        let is_bundle = config
-            .get_vm("default")
-            .map(|r| r.source_smolmachine.is_some())
-            .unwrap_or(false);
-        if is_bundle {
-            smolvm_pack::extract::force_detach_layers_volume(
-                &smolvm::agent::machine_layers_cache_dir("default"),
-            );
-        }
-        config.update_vm("default", VmRecord::mark_process_stopped);
-    }
-
     println!("Machine 'default' stopped");
-
     Ok(())
 }
 
@@ -3078,16 +3021,10 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
     if options.stop_if_running {
         match smolvm::agent::state_probe::resolve_state(name, &record) {
             RecordState::Running => {
-                let manager = AgentManager::for_vm(name)?;
+                let manager = AgentManager::for_existing_vm_record(&record)?;
+                manager.detach();
                 println!("Stopping machine '{}'...", name);
-                if !record.staged_mounts.is_empty() {
-                    let mut client =
-                        smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-                    smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
-                }
-                // The machine is being deleted, so its workload has nothing
-                // to save: kill it at once rather than wait out its timeout.
-                manager.stop_with_timeout(std::time::Duration::ZERO)?;
+                manager.stop_persisted(&record, Some(std::time::Duration::ZERO))?;
                 if record.pid.is_some_and(smolvm::process::can_still_run) {
                     return Err(smolvm::Error::agent(
                         "delete machine",

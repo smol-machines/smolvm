@@ -32,6 +32,15 @@ pub(crate) fn sync_with_manager(
     manager: &crate::agent::AgentManager,
 ) -> Result<()> {
     let operation = manager.reserve_control_operation()?;
+    sync_with_operation(record, manager, &operation)
+}
+
+pub(crate) fn sync_with_operation(
+    record: &VmRecord,
+    manager: &crate::agent::AgentManager,
+    operation: &crate::agent::ControlOperation,
+) -> Result<()> {
+    operation.validate_manager(manager)?;
     operation.validate_staged_record(record)?;
     if record.staged_mounts.is_empty() || !record.staged_mounts_sync_to_host() {
         return Ok(());

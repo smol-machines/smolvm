@@ -976,26 +976,10 @@ pub(crate) fn stop_vm_record_with_timeout(
     record: &VmRecord,
     stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
-    let name = &record.name;
-    let manager = AgentManager::for_existing_vm_record(record)
-        .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
-    let _admission = manager.admit_control_mutation()?;
-    manager.try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time);
-    if !record.staged_mounts.is_empty() {
-        crate::staged_mount::sync_with_manager(record, &manager)?;
-    }
-    match stop_timeout {
-        Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
-        None => manager.stop()?,
-    }
-    // Detach the per-machine layers volume if a (possibly cross-tool) bundle start
-    // left it mounted. Unconditional on purpose: the embedded record may carry no
-    // source_smolmachine even when a CLI/API `machine create <bundle>` extracted and
-    // mounted this name's volume in the shared DB, so we cannot gate on it.
-    // force_detach is infallible and no-ops when unmounted; macOS hdiutil detach, a
-    // compile-time no-op on Linux.
-    smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(name));
-    mark_stopped_for_record(db, record)
+    crate::db::launch_admission::LaunchReview::from_record(record)?.validate(db)?;
+    let manager = AgentManager::for_existing_vm_record(record)?;
+    manager.detach();
+    manager.stop_persisted(record, stop_timeout).map(|_| ())
 }
 
 /// Remove a VM record and its storage directory.

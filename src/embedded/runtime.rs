@@ -1032,13 +1032,9 @@ impl EmbeddedRuntime {
                     ),
                 ));
             }
-            if let Some(handle) = self.remove_cached_handle(name)? {
-                let mut handle = lock_handle(&handle)?;
-                if !record.staged_mounts.is_empty() {
-                    handle.sync_staged_mounts(&record)?;
-                }
-                handle.stop_with_timeout(options.stop_timeout)?;
-                control::mark_stopped_for_record(&self.db, &record)?;
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.stop_persisted(&record, options.stop_timeout)?;
+                self.remove_cached_handle(name)?;
                 return Ok(());
             }
 
@@ -1106,15 +1102,11 @@ impl EmbeddedRuntime {
                 // A graceful stop already synchronized staged mounts. Do not
                 // reconnect to the now-absent agent and fail a subsequent delete.
                 self.remove_cached_handle(name)?;
-            } else if let Some(handle) = self.remove_cached_handle(name)? {
-                let mut handle = lock_handle(&handle)?;
-                if !record.staged_mounts.is_empty() {
-                    handle.sync_staged_mounts(&record)?;
-                }
-                // The machine is going away: its workload has nothing to save.
-                handle.stop_with_timeout(Some(Duration::ZERO))?;
+            } else if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.stop_persisted(&record, Some(Duration::ZERO))?;
+                self.remove_cached_handle(name)?;
             } else {
-                control::stop_vm_with_timeout(&self.db, name, Some(Duration::ZERO))?;
+                control::stop_vm_record_with_timeout(&self.db, &record, Some(Duration::ZERO))?;
             }
 
             // Idempotent: deleting an already-deleted machine is a no-op success
@@ -2507,3 +2499,7 @@ mod tests {
         assert!(db.get_vm("delete-frozen").unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_stop_tests.rs"]
+mod stop_tests;

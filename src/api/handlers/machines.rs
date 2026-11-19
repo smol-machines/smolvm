@@ -5848,82 +5848,19 @@ async fn stop_machine_transaction(
         return Ok(Json(record_to_info(&name, &record)));
     }
 
-    // A staged mount makes its guest-local copy authoritative while the VM is
-    // running. Flush it before graceful shutdown; if synchronization fails,
-    // leave the VM alive so the caller can retry instead of silently losing
-    // the only current copy. An unreachable agent cannot be synchronized, but
-    // its persistent storage disk remains available for a later restart.
-    if !record.staged_mounts.is_empty() && resolved != RecordState::Unreachable {
-        let sync_record = record.clone();
-        tokio::task::spawn_blocking(move || {
-            crate::staged_mount::sync_running_machine(&sync_record)
-        })
-        .await
-        .map_err(|error| ApiError::internal(format!("task error: {error}")))?
-        .map_err(ApiError::from)?;
-    }
-
-    // Get PID and start time from database record - this is the source of truth
-    let pid = record.pid;
-    let pid_start_time = record.pid_start_time;
-
-    // Stop VM — prefer using the registered manager (which holds the flock)
-    // over creating a throwaway one. This ensures the flock is released so
-    // a subsequent start can re-acquire it.
     let entry = state.get_machine(&name).ok();
-    let name_clone = name.clone();
-    let frozen = resolved == RecordState::Frozen;
-    let stopped = tokio::task::spawn_blocking(move || {
-        // Carry WHY a stop failed, not just that it did. The reason is the only
-        // thing that distinguishes a guest too slow to confirm its flush from a
-        // wedged agent that will never answer, and a caller reading the API
-        // response never sees this node's log.
-        let outcome: Result<(), String> = if let Some(ref entry) = entry {
-            let e = entry.lock();
-            // A frozen fork base is snapshot-paused, so its agent cannot answer
-            // a shutdown request and its filesystems were quiesced when the
-            // checkpoint froze it. Asking anyway is how a machine that is safe
-            // to terminate ends up unstoppable. Clones were already refused
-            // above, so nothing still maps its memory or disks.
-            let stop = if frozen {
-                e.manager.stop_paused()
-            } else if let Some(stop_timeout) = stop_timeout {
-                e.manager.stop_with_timeout(stop_timeout)
-            } else {
-                e.manager.stop()
-            };
-            stop.map_err(|err| {
-                tracing::warn!(name = %name_clone, error = %err, "graceful stop failed; preserving the live VM for retry");
-                err.to_string()
-            })
-        } else if shutdown_machine_process(&name_clone, pid, pid_start_time, !frozen) {
-            Ok(())
+    let record = tokio::task::spawn_blocking(move || {
+        if let Some(entry) = entry {
+            entry.lock().manager.stop_persisted(&record, stop_timeout)
         } else {
-            Err("the VM process did not exit".to_string())
-        };
-        if outcome.is_ok() {
-            // Process is gone — detach this machine's case-sensitive layers
-            // volume (macOS hdiutil mount; no-op on Linux). The volume lives
-            // under the machine's data dir. The detach helper preserves it if
-            // a continuing source still has children referencing its layers.
-            smolvm_pack::extract::force_detach_layers_volume(
-                &crate::agent::machine_layers_cache_dir(&name_clone),
-            );
+            let manager = crate::agent::AgentManager::for_existing_vm_record(&record)?;
+            manager.detach();
+            manager.stop_persisted(&record, stop_timeout)
         }
-        outcome
     })
     .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-
-    if let Err(reason) = stopped {
-        return Err(ApiError::Internal(format!(
-            "machine '{name}' is still running because the stop did not complete: {reason}"
-        )));
-    }
-
-    // Persist stopped state and release the long-lived registry manager's flock
-    // through the same path used for already-dead and out-of-process stops.
-    let record = reconcile_confirmed_stopped_machine(&state, &record, true).await?;
+    .map_err(|error| ApiError::internal(format!("task error: {error}")))?
+    .map_err(ApiError::from)?;
 
     Ok(Json(record_to_info(&name, &record)))
 }
@@ -6048,39 +5985,21 @@ pub async fn drain_machines(state: &Arc<ApiState>) -> bool {
                         return false;
                     }
                 };
-                if !record.staged_mounts.is_empty() {
-                    let sync_result = crate::staged_mount::sync_running_machine(&record);
-                    if let Err(error) = sync_result {
-                        tracing::warn!(machine = %name_for_kill, error = %error, "drain: staged mount sync failed; leaving machine running");
-                        return false;
-                    }
+                let result = if let Some(entry) = entry {
+                    entry.lock().manager.stop_persisted(&record, None)
+                } else {
+                    crate::agent::AgentManager::for_existing_vm_record(&record).and_then(|manager| {
+                        manager.detach();
+                        manager.stop_persisted(&record, None)
+                    })
+                };
+                if let Err(error) = &result {
+                    tracing::warn!(machine = %name_for_kill, %error, "drain: stop failed; preserving the machine for retry");
                 }
-                // Both paths require guest quiescence before verified signals.
-                entry.as_ref().map(|e| e.lock().manager.stop().is_ok()).unwrap_or_else(||
-                    shutdown_machine_process(
-                        &name_for_kill,
-                        record.pid,
-                        record.pid_start_time,
-                        true,
-                    ))
+                result.is_ok()
             })
             .await
             .unwrap_or(false);
-            if stopped {
-                if let Ok(entry) = state.get_machine(&name) {
-                    entry.lock().manager.mark_stopped();
-                }
-                let _ = state
-                    .update_vm(&name, |r| {
-                        r.mark_process_stopped();
-                        // A drain is a deliberate decommission: mark the machine
-                        // user-stopped so the restart supervisor does not resurrect it
-                        // in the window before the host is terminated (or if drain is
-                        // used standalone). An explicit start elsewhere clears this.
-                        r.restart.user_stopped = true;
-                    })
-                    .await;
-            }
             drop(admission);
             tracing::info!(machine = %name, stopped, "drain: shutdown attempt finished");
             stopped

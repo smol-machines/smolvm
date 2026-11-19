@@ -310,7 +310,11 @@ impl VmRecoveryGuard {
     }
 
     /// Release ownership and publish stopped state as one durable transition.
-    pub(crate) fn mark_stopped(mut self) -> Result<()> {
+    pub(crate) fn mark_stopped(self) -> Result<()> {
+        self.finish_stop(false).map(|_| ())
+    }
+
+    pub(crate) fn finish_stop(mut self, user_stopped: bool) -> Result<VmRecord> {
         if self.owner != ProcessIdentity::current()? {
             return Err(conflict("recovery belongs to another process"));
         }
@@ -337,6 +341,9 @@ impl VmRecoveryGuard {
             }
             let mut after = before.clone();
             after.mark_process_stopped();
+            if user_stopped {
+                after.restart.user_stopped = true;
+            }
             tx.execute(
                 "DELETE FROM vm_recovery_owners WHERE name=?1 AND token=?2",
                 params![self.record.name, self.token],
@@ -355,7 +362,7 @@ impl VmRecoveryGuard {
         })?;
         self.active = false;
         crate::usage::on_update(&self.record.name, &before, &after);
-        Ok(())
+        Ok(after)
     }
 }
 

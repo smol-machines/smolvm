@@ -435,3 +435,125 @@ fn failed_staged_sync_releases_ownership_and_preserves_the_running_process() {
         },
     );
 }
+
+#[test]
+fn persisted_stop_retains_ownership_until_stopped_state_is_published() {
+    isolated(
+        "persisted_stop_retains_ownership_until_stopped_state_is_published",
+        |root| {
+            let (db, record) = fixture();
+            let child = child();
+            let pid = child.0.id() as i32;
+            let start = process::process_start_time(pid).unwrap();
+            db.update_vm(&record.name, |r| {
+                r.pid = Some(pid);
+                r.pid_start_time = Some(start);
+            })
+            .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let manager = make_manager(root);
+            std::fs::write(&manager.pid_file, format!("{pid}\n{start}")).unwrap();
+            let operation = manager.reserve_control_operation().unwrap();
+            operation.validate_staged_record(&record).unwrap();
+            manager.stop_owned(&operation, true, None).unwrap();
+            assert!(!process::is_our_process_strict(pid, Some(start)));
+            assert_eq!(db.get_vm(&record.name).unwrap().unwrap().pid, Some(pid));
+            let raw = rusqlite::Connection::open(SmolvmDb::default_path().unwrap()).unwrap();
+            assert!(raw
+                .execute("UPDATE vms SET data=data WHERE name='reviewed-control'", [])
+                .unwrap_err()
+                .to_string()
+                .contains("owned by recovery"));
+            let stopped = operation.finish_stop().unwrap();
+            assert_eq!(stopped.pid, None);
+            assert!(stopped.restart.user_stopped);
+            assert_eq!(stopped.database_identity, record.database_identity);
+            assert_eq!(db.get_vm(&record.name).unwrap().unwrap().pid, None);
+            db.admit_machine_mutation(&record.name).unwrap();
+            assert_eq!(
+                std::fs::read(root.join("storage")).unwrap(),
+                b"storage sentinel"
+            );
+        },
+    );
+}
+
+#[test]
+fn a_control_operation_cannot_be_used_by_another_manager() {
+    isolated(
+        "a_control_operation_cannot_be_used_by_another_manager",
+        |root| {
+            let (db, record) = fixture();
+            let manager = make_manager(root);
+            let other = make_manager(root);
+            let operation = manager.reserve_control_operation().unwrap();
+            assert!(other
+                .stop_owned(&operation, true, None)
+                .unwrap_err()
+                .to_string()
+                .contains("another manager"));
+            assert!(
+                crate::staged_mount::sync_with_operation(&record, &other, &operation)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("another manager")
+            );
+            drop(operation);
+            db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}
+
+#[test]
+fn persisted_stop_of_a_stopped_staged_machine_never_boots_or_syncs() {
+    isolated(
+        "persisted_stop_of_a_stopped_staged_machine_never_boots_or_syncs",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            let manager = make_manager(root);
+            let stopped = manager.stop_persisted(&record, None).unwrap();
+            assert_eq!(stopped.pid, None);
+            assert!(stopped.restart.user_stopped);
+            assert!(!manager.pid_file.exists());
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            manager.stop_persisted(&stopped, None).unwrap();
+            db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}
+
+#[test]
+fn failed_persisted_stop_preserves_execution_and_releases_ownership() {
+    isolated(
+        "failed_persisted_stop_preserves_execution_and_releases_ownership",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            let mut child = child();
+            let pid = child.0.id() as i32;
+            let start = process::process_start_time(pid).unwrap();
+            db.update_vm(&record.name, |r| {
+                r.pid = Some(pid);
+                r.pid_start_time = Some(start);
+            })
+            .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let manager = make_manager(root);
+            assert!(manager.stop_persisted(&record, None).is_err());
+            assert!(child.0.try_wait().unwrap().is_none());
+            let after = db.get_vm(&record.name).unwrap().unwrap();
+            assert_eq!(
+                (after.pid, after.pid_start_time),
+                (record.pid, record.pid_start_time)
+            );
+            assert!(!after.restart.user_stopped);
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}

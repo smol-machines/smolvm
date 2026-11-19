@@ -1720,11 +1720,33 @@ pub struct AgentManager {
 /// Own a registered execution through external control side effects. Helpers
 /// without a database record retain ordinary transfer admission.
 pub(crate) struct ControlOperation {
+    manager: Arc<Mutex<AgentInner>>,
     _ownership: Option<crate::db::VmRecoveryGuard>,
     _admission: crate::db::transfer_admission::MutationGuard,
 }
 
 impl ControlOperation {
+    pub(crate) fn validate_manager(&self, manager: &AgentManager) -> Result<()> {
+        if !Arc::ptr_eq(&self.manager, &manager.inner) {
+            return Err(Error::agent_conflict(
+                "control machine",
+                "operation belongs to another manager",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_stop(self) -> Result<crate::config::VmRecord> {
+        self._ownership
+            .ok_or_else(|| {
+                Error::agent_conflict(
+                    "stop machine",
+                    "stop publication requires a reviewed machine",
+                )
+            })?
+            .finish_stop(true)
+    }
+
     pub(crate) fn validate_staged_record(&self, record: &crate::config::VmRecord) -> Result<()> {
         self._ownership
             .as_ref()
@@ -2742,6 +2764,7 @@ impl AgentManager {
             None => None,
         };
         Ok(ControlOperation {
+            manager: self.inner.clone(),
             _ownership: ownership,
             _admission: admission,
         })
@@ -4772,6 +4795,45 @@ impl AgentManager {
         self.stop_inner(false, Some(stop_timeout))
     }
 
+    /// Synchronize and stop the reviewed registered machine, then publish its
+    /// stopped state while retaining the same execution and disk ownership.
+    /// The caller must hold its fork-source/lifecycle lock. On sync failure the
+    /// guest and its authoritative working copy remain available for retry.
+    pub fn stop_persisted(
+        &self,
+        record: &crate::config::VmRecord,
+        stop_timeout: Option<Duration>,
+    ) -> Result<crate::config::VmRecord> {
+        let operation = self.reserve_control_operation()?;
+        operation.validate_staged_record(record)?;
+        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
+        let frozen = resolved == crate::config::RecordState::Frozen;
+        if frozen {
+            let dependents = super::fork::stop_blocking_dependent_clones(
+                &crate::db::SmolvmDb::open()?,
+                &record.name,
+            )?;
+            if !dependents.is_empty() {
+                return Err(Error::agent_conflict(
+                    "stop machine",
+                    "frozen machine still has running dependent clones",
+                ));
+            }
+        }
+        if !frozen && record.is_process_alive() {
+            crate::staged_mount::sync_with_operation(record, self, &operation)?;
+        }
+        self.stop_owned(&operation, frozen, stop_timeout)?;
+        // Use the manager's captured path, never a fresh home/name resolution.
+        let runtime = operation
+            ._ownership
+            .as_ref()
+            .expect("reviewed by validate_staged_record")
+            .runtime_dir();
+        smolvm_pack::extract::force_detach_layers_volume(&runtime.join("pack"));
+        operation.finish_stop()
+    }
+
     /// Stop a machine whose guest is paused and already quiesced.
     ///
     /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its
@@ -4786,7 +4848,17 @@ impl AgentManager {
     }
 
     fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
-        let _operation = self.reserve_control_operation()?;
+        let operation = self.reserve_control_operation()?;
+        self.stop_owned(&operation, guest_is_paused, stop_timeout)
+    }
+
+    fn stop_owned(
+        &self,
+        operation: &ControlOperation,
+        guest_is_paused: bool,
+        stop_timeout: Option<Duration>,
+    ) -> Result<()> {
+        operation.validate_manager(self)?;
         let state = {
             let inner = self.inner.lock();
             inner.state

@@ -140,6 +140,16 @@ impl VmHandle {
         crate::staged_mount::sync_with_manager(record, &self.manager)
     }
 
+    pub(crate) fn stop_persisted(
+        &mut self,
+        record: &VmRecord,
+        stop_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        self.manager.stop_persisted(record, stop_timeout)?;
+        self.client = None;
+        Ok(())
+    }
+
     /// Stop the VM and drop the cached agent client.
     pub fn stop(&mut self) -> Result<()> {
         self.stop_with_timeout(None)
