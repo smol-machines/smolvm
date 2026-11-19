@@ -429,6 +429,9 @@ pub enum MachineCmd {
     /// Save a running machine, including RAM, as a portable checkpoint
     Checkpoint(super::pack::CheckpointCmd),
 
+    /// Describe checkpoint requirements as JSON without pausing the machine
+    CheckpointRequirements(super::pack::CheckpointRequirementsCmd),
+
     /// Prepare an incremental checkpoint for fast restores without starting a VM
     CheckpointWarm(super::pack::WarmCheckpointCmd),
 
@@ -532,6 +535,7 @@ impl MachineCmd {
         } else if !matches!(
             self,
             MachineCmd::ImageFeed(_)
+                | MachineCmd::CheckpointRequirements(_)
                 | MachineCmd::SshConfig(_)
                 | MachineCmd::SshProxy(_)
                 | MachineCmd::SshStart(_)
@@ -550,6 +554,7 @@ impl MachineCmd {
             MachineCmd::Start(cmd) => cmd.run(),
             MachineCmd::Branch(cmd) => cmd.run(),
             MachineCmd::Checkpoint(cmd) => cmd.run(),
+            MachineCmd::CheckpointRequirements(cmd) => cmd.run(),
             MachineCmd::CheckpointPrune(cmd) => cmd.run(),
             MachineCmd::CheckpointLog(cmd) => cmd.run(),
             MachineCmd::CheckpointWarm(cmd) => cmd.run(),
