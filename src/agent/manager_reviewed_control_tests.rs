@@ -311,3 +311,36 @@ fn staged_sync_refuses_retargeted_settings_before_connecting() {
         },
     );
 }
+
+#[test]
+fn staged_sync_reviews_changes_committed_before_control_reservation() {
+    isolated(
+        "staged_sync_reviews_changes_committed_before_control_reservation",
+        |_root| {
+            let (db, reviewed) = fixture();
+            let current = db
+                .update_vm(&reviewed.name, |record| {
+                    record.staged_mounts_detached_from = Some("changed-before-reservation".into());
+                })
+                .unwrap()
+                .unwrap();
+            let guard = db.reserve_vm_recovery(&reviewed).unwrap();
+            assert!(guard
+                .validate_staged_record(&reviewed)
+                .unwrap_err()
+                .to_string()
+                .contains("settings changed"));
+            guard.validate_staged_record(&current).unwrap();
+            assert!(db
+                .update_vm(&reviewed.name, |record| record
+                    .staged_mounts_detached_from =
+                    None)
+                .is_err());
+            drop(guard);
+            db.update_vm(&reviewed.name, |record| {
+                record.staged_mounts_detached_from = None
+            })
+            .unwrap();
+        },
+    );
+}

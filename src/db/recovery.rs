@@ -275,11 +275,23 @@ impl SmolvmDb {
 
 impl VmRecoveryGuard {
     pub(crate) fn validate_staged_record(&self, record: &VmRecord) -> Result<()> {
-        if record.database_identity != self.record.database_identity
-            || record.name != self.record.name
-            || (record.pid, record.pid_start_time) != (self.record.pid, self.record.pid_start_time)
-            || record.host_mounts() != self.record.host_mounts()
-            || record.staged_mounts_detached_from != self.record.staged_mounts_detached_from
+        if self.owner != ProcessIdentity::current()? {
+            return Err(conflict("control ownership belongs to another process"));
+        }
+        // Metadata may change after the initial review but before reservation.
+        // Re-read under ownership, when the row cannot be updated or replaced.
+        let current = self
+            .db
+            .get_vm(&self.record.name)?
+            .ok_or_else(|| conflict("controlled machine was deleted"))?;
+        if current.database_identity != self.record.database_identity
+            || (current.pid, current.pid_start_time)
+                != (self.record.pid, self.record.pid_start_time)
+            || record.database_identity != current.database_identity
+            || record.name != current.name
+            || (record.pid, record.pid_start_time) != (current.pid, current.pid_start_time)
+            || record.host_mounts() != current.host_mounts()
+            || record.staged_mounts_detached_from != current.staged_mounts_detached_from
         {
             return Err(conflict("staged mount settings changed since review"));
         }
