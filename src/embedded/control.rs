@@ -968,13 +968,22 @@ pub fn stop_vm_with_timeout(
     stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     let record = get_record(db, name)?;
-    let manager = AgentManager::for_existing_vm_record(&record)
+    stop_vm_record_with_timeout(db, &record, stop_timeout)
+}
+
+pub(crate) fn stop_vm_record_with_timeout(
+    db: &SmolvmDb,
+    record: &VmRecord,
+    stop_timeout: Option<std::time::Duration>,
+) -> Result<()> {
+    let name = &record.name;
+    let manager = AgentManager::for_existing_vm_record(record)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
     let _admission = manager.admit_control_mutation()?;
     manager.try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time);
     if !record.staged_mounts.is_empty() {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
-        crate::staged_mount::sync_staged_mounts(&record, &mut client)?;
+        crate::staged_mount::sync_staged_mounts(record, &mut client)?;
     }
     match stop_timeout {
         Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
@@ -987,7 +996,7 @@ pub fn stop_vm_with_timeout(
     // force_detach is infallible and no-ops when unmounted; macOS hdiutil detach, a
     // compile-time no-op on Linux.
     smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(name));
-    mark_stopped_for_record(db, &record)
+    mark_stopped_for_record(db, record)
 }
 
 /// Remove a VM record and its storage directory.

@@ -1042,7 +1042,7 @@ impl EmbeddedRuntime {
                 return Ok(());
             }
 
-            control::stop_vm_with_timeout(&self.db, name, options.stop_timeout)
+            control::stop_vm_record_with_timeout(&self.db, &record, options.stop_timeout)
         })
     }
 

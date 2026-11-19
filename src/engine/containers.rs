@@ -1523,11 +1523,12 @@ async fn run_container(
                 r.state.exit_code = code;
             });
             if let Some(mut handle) = handle {
-                let _ = tokio::task::spawn_blocking(move || handle.stop()).await;
                 let e = engine.clone();
                 let machine = record.machine.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    crate::embedded::control::mark_stopped(&e.db, &machine)
+                    let reviewed = crate::embedded::control::get_record(&e.db, &machine)?;
+                    handle.stop()?;
+                    crate::embedded::control::mark_stopped_for_record(&e.db, &reviewed)
                 })
                 .await;
             } else {
@@ -2230,15 +2231,14 @@ pub(crate) async fn stop_machine(engine: &Arc<Engine>, machine: &str, timeout: O
     let e = engine.clone();
     let machine = machine.to_string();
     let _ = tokio::task::spawn_blocking(move || {
-        let alive =
-            e.db.get_vm(&machine)
-                .ok()
-                .flatten()
-                .is_some_and(|r| r.state == crate::config::RecordState::Running);
-        if alive {
-            let _ = crate::embedded::control::stop_vm_with_timeout(&e.db, &machine, timeout);
+        let Ok(Some(reviewed)) = e.db.get_vm(&machine) else {
+            return;
+        };
+        if reviewed.state == crate::config::RecordState::Running {
+            let _ =
+                crate::embedded::control::stop_vm_record_with_timeout(&e.db, &reviewed, timeout);
         } else {
-            let _ = crate::embedded::control::mark_stopped(&e.db, &machine);
+            let _ = crate::embedded::control::mark_stopped_for_record(&e.db, &reviewed);
         }
     })
     .await;
