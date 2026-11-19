@@ -312,6 +312,7 @@ async fn dispatch_inner(
         return Ok(next.run(req).await);
     }
     if engine.owner.is_some() {
+        super::containers::reconcile_owner(engine).await?;
         if !owner_only_request(engine.owner.as_deref().unwrap(), req.method(), &path) {
             engine.refresh().map_err(internal)?;
         }
@@ -526,7 +527,7 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
                     .owner
                     .as_deref()
                     .and_then(|id| e.find_container(id))
-                    .is_some_and(|c| c.is_running() || c.record().state.status == "restarting");
+                    .is_some_and(|c| c.owns_live_execution());
                 if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
                     if let Some(id) = &e.owner {
                         match lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
