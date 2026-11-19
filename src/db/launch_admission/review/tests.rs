@@ -17,6 +17,16 @@ fn fixture() -> (tempfile::TempDir, SmolvmDb, VmRecord, PathBuf) {
 fn read_identities_survive_clones_and_updates_but_never_exports() {
     let (_root, db, record, _) = fixture();
     let review = LaunchReview::from_record(&record.clone()).unwrap();
+    let batched = db.load_all().unwrap().1.remove("web").unwrap();
+    assert_eq!(batched.database_identity, record.database_identity);
+    LaunchReview::from_record(&batched)
+        .unwrap()
+        .validate(&db)
+        .unwrap();
+    assert_eq!(
+        serde_json::to_vec(&batched).unwrap(),
+        serde_json::to_vec(&record).unwrap()
+    );
     let listed = db.list_vms().unwrap().remove(0).1;
     assert_eq!(listed.database_identity, record.database_identity);
     let updated = db.update_vm("web", |r| r.mem = 256).unwrap().unwrap();
@@ -41,10 +51,16 @@ fn read_identities_survive_clones_and_updates_but_never_exports() {
 fn stale_settings_cannot_prepare_boot_or_update_an_identical_replacement() {
     let (_root, db, record, disk) = fixture();
     let review = LaunchReview::from_record(&record).unwrap();
+    let batched = db.load_all().unwrap().1.remove("web").unwrap();
+    let batched_review = LaunchReview::from_record(&batched).unwrap();
     db.remove_vm("web").unwrap();
     db.insert_vm("web", &record).unwrap();
     let bytes = serde_json::to_vec(&db.get_vm("web").unwrap().unwrap()).unwrap();
     assert_eq!(bytes, serde_json::to_vec(&record).unwrap());
+    assert!(batched_review.validate(&db).is_err());
+    assert!(db
+        .update_vm_for_record(&batched, |_| panic!("must not touch replacement"))
+        .is_err());
     assert!(db
         .reserve_reviewed_vm_preparation(&review, Some("web"), &disk, &[])
         .is_err());
@@ -137,6 +153,9 @@ fn corrupt_identity_remains_observable_but_never_means_an_absent_machine() {
     .unwrap();
     let record = db.get_vm("web").unwrap().unwrap();
     assert_eq!(db.list_vms().unwrap().len(), 1);
+    let batched = db.load_all().unwrap().1.remove("web").unwrap();
+    assert!(batched.database_identity.is_none());
+    assert!(LaunchReview::from_record(&batched).is_err());
     assert!(LaunchReview::capture(&db, Some("web")).is_err());
     assert!(LaunchReview::from_record(&record).is_err());
     assert!(db.reserve_vm_launch(Some(record), &disk, &[], &[]).is_err());

@@ -2268,6 +2268,7 @@ impl SmolvmDb {
 
     /// Load all config settings and VM records in a single transaction.
     pub fn load_all(&self) -> Result<(HashMap<String, String>, BTreeMap<String, VmRecord>)> {
+        let database = self.path.canonicalize()?;
         self.with_conn(|conn| {
             let tx = conn.transaction().db_err("begin read transaction")?;
 
@@ -2292,19 +2293,21 @@ impl SmolvmDb {
             let mut vms = BTreeMap::new();
             {
                 let mut stmt = tx
-                    .prepare_cached("SELECT name, data FROM vms")
+                    .prepare_cached("SELECT v.name, v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name")
                     .db_err("prepare list vms")?;
                 let rows = stmt
                     .query_map([], |row| {
                         let name: String = row.get(0)?;
                         let data: Vec<u8> = row.get(1)?;
-                        Ok((name, data))
+                        let generation: Option<String> = row.get(2)?;
+                        Ok((name, data, generation))
                     })
                     .db_err("query vms")?;
                 for row in rows {
-                    let (name, data) = row.db_err("read vms row")?;
-                    let record: VmRecord = serde_json::from_slice(&data)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
+                    let (name, data, generation) = row.db_err("read vms row")?;
+                    let record = launch_admission::review::decode_record(
+                        &database, &name, &data, generation,
+                    )?;
                     vms.insert(name, record);
                 }
             }
