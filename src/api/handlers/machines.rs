@@ -6059,7 +6059,7 @@ async fn delete_machine_transaction(
     name: String,
     query: DeleteQuery,
 ) -> Result<Json<DeleteResponse>, ApiError> {
-    let _admission = state.db().admit_machine_mutation(&name)?;
+    let _admission = state.db().admit_machine_deletion(&name)?;
     // Cascade: remove the entire lineage deepest-first so every qcow2 overlay
     // disappears before the image that backs it. The read is unlocked, but
     // delete_one re-checks direct dependants under each lifecycle lock, so a
@@ -6122,7 +6122,7 @@ fn remove_machine_data_and_record(
         .ok_or_else(|| ApiError::NotFound(name.into()))?;
     let mut ownership = state
         .db()
-        .reserve_vm_control(&record, data_dir, &[])
+        .reserve_vm_deletion_at(&record, data_dir)
         .map_err(|e| ApiError::internal(e.to_string()))?;
     ownership.prepare_delete()?;
     crate::deletion::remove_owned_data_and_record(state.db(), ownership, name)
@@ -6134,7 +6134,7 @@ async fn delete_one_transaction(
     state: Arc<ApiState>,
     name: String,
 ) -> Result<DeleteResponse, ApiError> {
-    let _admission = state.db().admit_machine_mutation(&name)?;
+    let _admission = state.db().admit_machine_deletion(&name)?;
     // Hold the per-machine lifecycle lock across the whole delete so the layers
     // volume detach (before the data-dir removal) cannot race a concurrent
     // start's acquire+mount+launch (review finding #3). Acquired before the DB

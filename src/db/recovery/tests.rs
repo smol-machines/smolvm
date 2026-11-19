@@ -332,7 +332,8 @@ fn failed_owned_deletion_preserves_stopped_record_and_storage_for_retry() {
             assert!(stopped.restart.user_stopped);
             assert_eq!(stopped.state, crate::config::RecordState::Stopped);
             assert_eq!(fs::read(&runtime).unwrap(), b"not a directory");
-            assert!(db.reserve_vm_recovery(&stopped).is_ok());
+            assert!(db.reserve_vm_recovery(&stopped).is_err());
+            assert!(db.reserve_vm_deletion_at(&stopped, &runtime).is_ok());
             fs::remove_file(&runtime).unwrap();
             fs::create_dir(&runtime).unwrap();
             fs::write(runtime.join("storage.raw"), b"saved").unwrap();
@@ -392,6 +393,15 @@ fn interrupted_owned_deletion_leaves_an_intentional_stop_after_owner_release() {
             let stopped = reopened.get_vm(&record.name).unwrap().unwrap();
             assert!(stopped.restart.user_stopped);
             assert_eq!(stopped.state, crate::config::RecordState::Stopped);
+            assert!(reopened.admit_machine_mutation(&record.name).is_err());
+            assert!(reopened
+                .reserve_reviewed_vm_preparation(
+                    &LaunchReview::from_record(&stopped).unwrap(),
+                    Some(&record.name),
+                    &crate::agent::vm_data_dir(&record.name).join("storage.raw"),
+                    &[]
+                )
+                .is_err());
             crate::deletion::delete_machine_locked(&reopened, &stopped, None, true, false).unwrap();
             assert!(reopened.get_vm(&record.name).unwrap().is_none());
         },
@@ -425,6 +435,186 @@ fn deletion_refuses_symlinked_runtime_without_touching_its_target() {
                 .unwrap()
                 .file_type()
                 .is_symlink());
+        },
+    );
+}
+
+#[test]
+fn interrupted_deletion_blocks_new_preparation_until_cleanup_is_retried() {
+    isolated(
+        "interrupted_deletion_blocks_new_preparation_until_cleanup_is_retried",
+        || {
+            let (db, record) = fixture();
+            let runtime = crate::agent::vm_data_dir(&record.name);
+            fs::create_dir_all(&runtime).unwrap();
+            let disk = runtime.join("storage.raw");
+            fs::write(&disk, b"old storage").unwrap();
+            let mut guard = db.reserve_vm_recovery(&record).unwrap();
+            guard.prepare_delete().unwrap();
+            fs::remove_file(&disk).unwrap();
+            drop(guard);
+            let reopened = SmolvmDb::open_at(&db.path).unwrap();
+            let stopped = reopened.get_vm(&record.name).unwrap().unwrap();
+            let review = LaunchReview::from_record(&stopped).unwrap();
+            assert!(
+                reopened
+                    .reserve_reviewed_vm_preparation(&review, Some(&record.name), &disk, &[])
+                    .is_err(),
+                "partly deleted storage was admitted for fresh disk creation"
+            );
+            assert!(!disk.exists());
+            crate::deletion::delete_machine_locked(&reopened, &stopped, None, true, false).unwrap();
+            assert!(reopened.get_vm(&record.name).unwrap().is_none());
+        },
+    );
+}
+
+#[test]
+fn pending_deletion_fences_legacy_writers_aliases_and_cloud_claims() {
+    isolated(
+        "pending_deletion_fences_legacy_writers_aliases_and_cloud_claims",
+        || {
+            let (db, record) = fixture();
+            let runtime = crate::agent::vm_data_dir(&record.name);
+            fs::create_dir_all(&runtime).unwrap();
+            let disk = runtime.join("storage.raw");
+            fs::write(&disk, b"saved").unwrap();
+            let mut guard = db
+                .reserve_vm_control(&record, &runtime, std::slice::from_ref(&disk))
+                .unwrap();
+            guard.prepare_delete().unwrap();
+            drop(guard);
+            let raw = Connection::open(&db.path).unwrap();
+            for sql in [
+            "DELETE FROM vms WHERE name='recovery-owner'",
+            "UPDATE vms SET data=data WHERE name='recovery-owner'",
+            "INSERT OR REPLACE INTO vms SELECT * FROM vms WHERE name='recovery-owner'",
+            "DELETE FROM vm_incarnations WHERE name='recovery-owner'",
+            "UPDATE vm_incarnations SET generation=lower(hex(randomblob(24))) WHERE name='recovery-owner'",
+        ] { assert!(raw.execute(sql, []).unwrap_err().to_string().contains("deletion")); }
+            let legacy = serde_json::to_vec(
+                &serde_json::json!({"purpose":{"Prepare":{"name":record.name}},"storage":disk}),
+            )
+            .unwrap();
+            assert!(raw
+                .execute(
+                    "INSERT INTO vm_launch_admission(token,data) VALUES('legacy-delete-test',?1)",
+                    [legacy]
+                )
+                .unwrap_err()
+                .to_string()
+                .contains("deletion"));
+            let (member, stopped) = Member::read(&raw, &record.name).unwrap();
+            assert!(stopped.restart.user_stopped);
+            assert!(db
+                .claim_workload_transfer("delete-cloud-refused", vec![member], &[])
+                .is_err());
+            let alias = runtime.parent().unwrap().join("deleting-disk-alias");
+            fs::hard_link(&disk, &alias).unwrap();
+            assert!(db
+                .admit_workload_mutation(None, std::slice::from_ref(&alias))
+                .is_err());
+            let anonymous = LaunchReview::capture(&db, None).unwrap();
+            assert!(db
+                .reserve_reviewed_vm_preparation(&anonymous, None, &alias, &[])
+                .is_err());
+            let other = VmRecord::new("unrelated-pending".into(), 1, 128, vec![], vec![], false);
+            db.insert_vm(&other.name, &other).unwrap();
+            db.update_vm(&other.name, |r| r.mem = 256).unwrap();
+            let reviewed = db.get_vm(&record.name).unwrap().unwrap();
+            crate::deletion::delete_machine_locked(&db, &reviewed, None, true, false).unwrap();
+            assert_eq!(fs::read(&alias).unwrap(), b"saved");
+            db.admit_workload_mutation(None, &[alias]).unwrap();
+            db.insert_vm(&record.name, &record).unwrap();
+            let replacement = db.get_vm(&record.name).unwrap().unwrap();
+            assert_ne!(replacement.database_identity, record.database_identity);
+            db.reserve_reviewed_vm_preparation(
+                &LaunchReview::from_record(&replacement).unwrap(),
+                Some(&record.name),
+                &disk,
+                &[],
+            )
+            .unwrap();
+        },
+    );
+}
+
+#[test]
+fn pending_deletion_rejects_corruption_and_retargeted_retry() {
+    isolated(
+        "pending_deletion_rejects_corruption_and_retargeted_retry",
+        || {
+            let (db, record) = fixture();
+            let runtime = crate::agent::vm_data_dir(&record.name);
+            let mut guard = db.reserve_vm_recovery(&record).unwrap();
+            guard.prepare_delete().unwrap();
+            drop(guard);
+            let stopped = db.get_vm(&record.name).unwrap().unwrap();
+            let wrong = tempfile::tempdir().unwrap();
+            fs::write(wrong.path().join("keep"), b"other").unwrap();
+            assert!(db.reserve_vm_deletion_at(&stopped, wrong.path()).is_err());
+            assert_eq!(fs::read(wrong.path().join("keep")).unwrap(), b"other");
+            let raw = Connection::open(&db.path).unwrap();
+            let bytes: Vec<u8> = raw
+                .query_row(
+                    "SELECT data FROM vm_deletion_intents WHERE name=?1",
+                    [&record.name],
+                    |r| r.get(0),
+                )
+                .unwrap();
+            raw.execute(
+                "UPDATE vm_deletion_intents SET data=?2 WHERE name=?1",
+                params![record.name, b"{}".as_slice()],
+            )
+            .unwrap();
+            assert!(db.admit_machine_mutation(&record.name).is_err());
+            assert!(db.reserve_vm_deletion_at(&stopped, &runtime).is_err());
+            assert!(db.get_vm(&record.name).unwrap().is_some());
+            raw.execute(
+                "UPDATE vm_deletion_intents SET data=?2 WHERE name=?1",
+                params![record.name, bytes],
+            )
+            .unwrap();
+            crate::deletion::delete_machine_locked(&db, &stopped, None, true, false).unwrap();
+        },
+    );
+}
+
+#[test]
+fn deletion_intent_migration_is_atomic_for_concurrent_legacy_openers() {
+    isolated(
+        "deletion_intent_migration_is_atomic_for_concurrent_legacy_openers",
+        || {
+            let (db, record) = fixture();
+            let path = db.path.clone();
+            drop(db);
+            let raw = Connection::open(&path).unwrap();
+            let triggers=raw.prepare("SELECT name FROM sqlite_schema WHERE type='trigger' AND name LIKE 'vm_deletion_%'").unwrap().query_map([],|r|r.get::<_,String>(0)).unwrap().collect::<rusqlite::Result<Vec<_>>>().unwrap();
+            for name in triggers {
+                raw.execute_batch(&format!("DROP TRIGGER {name};")).unwrap();
+            }
+            raw.execute_batch("DROP TABLE vm_deletion_intents;")
+                .unwrap();
+            drop(raw);
+            let workers = (0..4)
+                .map(|_| {
+                    let path = path.clone();
+                    std::thread::spawn(move || {
+                        SmolvmDb::open_at(&path).unwrap().list_vms().unwrap();
+                    })
+                })
+                .collect::<Vec<_>>();
+            for worker in workers {
+                worker.join().unwrap();
+            }
+            let db = SmolvmDb::open_at(&path).unwrap();
+            let reviewed = db.get_vm(&record.name).unwrap().unwrap();
+            let mut guard = db.reserve_vm_recovery(&reviewed).unwrap();
+            guard.prepare_delete().unwrap();
+            drop(guard);
+            assert!(db.admit_machine_mutation(&record.name).is_err());
+            let stopped = db.get_vm(&record.name).unwrap().unwrap();
+            crate::deletion::delete_machine_locked(&db, &stopped, None, true, false).unwrap();
         },
     );
 }

@@ -46,7 +46,7 @@ pub fn delete_machine_locked(
     let mut ownership = if let Some(manager) = manager {
         manager.stop_for_deletion(record)?
     } else {
-        db.reserve_vm_recovery(record)?
+        db.reserve_vm_deletion_at(record, &crate::agent::vm_data_dir(&record.name))?
     };
     if record.is_process_alive() && record.held_process().is_none() {
         return Err(Error::agent_conflict(

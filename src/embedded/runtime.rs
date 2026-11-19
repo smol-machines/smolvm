@@ -1052,7 +1052,7 @@ impl EmbeddedRuntime {
     /// [`delete_machine`](Self::delete_machine), optionally letting running
     /// commands and transfers finish first.
     pub fn delete_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
-        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
+        let _admission = self.db.admit_machine_deletion(name)?;
         let _fence = self.inflight.fence(name, "deleted", options.drain);
         let result = self.delete_machine_inner(name);
         if result.is_ok() {

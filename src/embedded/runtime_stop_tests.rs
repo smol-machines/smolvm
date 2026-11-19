@@ -16,7 +16,7 @@ fn failed_cached_stop_and_delete_preserve_the_guest_for_retry() {
         .unwrap()
         .starts_with(root.join("data")));
     crate::embedded::bundle::set_bundle(crate::embedded::bundle::Bundle {
-        boot_binary: Some(engine),
+        boot_binary: Some(engine.clone()),
         ..Default::default()
     })
     .unwrap();
@@ -116,6 +116,35 @@ fn failed_cached_stop_and_delete_preserve_the_guest_for_retry() {
             "retry"
         );
         std::fs::remove_file(snapshots).unwrap();
+        let observer = crate::agent::AgentManager::for_existing_vm_record(&stopped).unwrap();
+        observer.detach();
+        let removed_disk = observer.overlay_path().to_path_buf();
+        drop(observer);
+        std::fs::remove_file(&removed_disk).unwrap();
+        for result in [runtime.start_machine(name), runtime.resume_machine(name)] {
+            assert!(result.unwrap_err().to_string().contains("deletion"));
+            assert!(!removed_disk.exists(), "a failed delete recreated a disk");
+        }
+        let refused = std::process::Command::new(&engine)
+            .args(["machine", "start", "--name", name])
+            .output()
+            .unwrap();
+        assert!(!refused.status.success());
+        assert!(String::from_utf8_lossy(&refused.stderr).contains("deletion"));
+        assert!(!removed_disk.exists());
+        assert!(runtime.db.get_vm(name).unwrap().unwrap().pid.is_none());
+        runtime.delete_machine(name).unwrap();
+        runtime
+            .create_machine(MachineSpec {
+                name: name.into(),
+                persistent: true,
+                ..Default::default()
+            })
+            .unwrap();
+        assert_ne!(
+            runtime.db.get_vm(name).unwrap().unwrap().database_identity,
+            stopped.database_identity
+        );
         runtime.delete_machine(name).unwrap();
         assert_eq!(
             std::fs::read_to_string(host.join("value")).unwrap(),

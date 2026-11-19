@@ -206,7 +206,7 @@ impl SmolvmDb {
         machine: Option<&str>,
         sources: &[PathBuf],
     ) -> Result<MutationGuard> {
-        self.admit_workload_paths(machine, sources, |path| path.canonicalize())
+        self.admit_workload_paths(machine, sources, |path| path.canonicalize(), false)
     }
 
     pub(super) fn admit_startup_mutation(
@@ -214,7 +214,12 @@ impl SmolvmDb {
         machine: Option<&str>,
         sources: &[PathBuf],
     ) -> Result<MutationGuard> {
-        self.admit_workload_paths(machine, sources, super::launch_admission::resource_path)
+        self.admit_workload_paths(
+            machine,
+            sources,
+            super::launch_admission::resource_path,
+            false,
+        )
     }
 
     fn admit_workload_paths(
@@ -222,9 +227,11 @@ impl SmolvmDb {
         machine: Option<&str>,
         sources: &[PathBuf],
         resolve: impl Fn(&Path) -> std::io::Result<PathBuf>,
+        allow_deletion: bool,
     ) -> Result<MutationGuard> {
         let gate = self.transfer_gate(false)?;
         self.check_recovery_admission(machine, sources)?;
+        self.check_deletion_admission(machine, sources, allow_deletion)?;
         let claims = self.with_read_conn(|conn| {
             let mut statement = conn
                 .prepare("SELECT data FROM workload_transfer_admission WHERE retired = 0")
@@ -287,6 +294,34 @@ impl SmolvmDb {
         }
     }
 
+    /// Admit only retrying deletion of this member; its durable intent continues
+    /// to refuse startup, transfer and mutation by other callers.
+    pub fn admit_machine_deletion(&self, name: &str) -> Result<MutationGuard> {
+        let admission = self.admit_workload_paths(
+            Some(name),
+            &[],
+            super::launch_admission::resource_path,
+            true,
+        )?;
+        if let Some(record) = self.get_vm(name)? {
+            let roots = record
+                .host_mounts()
+                .into_iter()
+                .map(|mount| mount.source)
+                .collect::<Vec<_>>();
+            let checked = self.admit_workload_paths(
+                Some(name),
+                &roots,
+                super::launch_admission::resource_path,
+                true,
+            )?;
+            drop(admission);
+            Ok(checked)
+        } else {
+            Ok(admission)
+        }
+    }
+
     /// Claim all members and shared roots atomically, after dependency review.
     /// Reusing the same operation is idempotent only for the exact same claim.
     /// A retired operation can never fence a later execution or reused name.
@@ -337,6 +372,14 @@ impl SmolvmDb {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .map_err(|e| Error::database_unavailable(e.to_string()))?;
+                for member in &claim.members {
+                    super::deletion_intent::refuse_conflicts(
+                        &tx,
+                        Some(&member.name),
+                        &claim.roots,
+                        false,
+                    )?;
+                }
                 let existing: Option<(bool, Vec<u8>)> = tx.query_row(
                     "SELECT retired, data FROM workload_transfer_admission WHERE operation = ?1",
                     [operation], |row| Ok((row.get(0)?, row.get(1)?)),

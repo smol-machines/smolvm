@@ -2899,7 +2899,7 @@ fn ensure_fork_base_delete_is_safe(
 
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
-    let _admission = SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
+    let _admission = SmolvmDb::open()?.admit_machine_deletion(name)?;
     let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let config = SmolvmConfig::load()?;
 

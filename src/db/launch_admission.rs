@@ -208,6 +208,7 @@ fn refuse_other_owners(
     except: Option<&str>,
 ) -> Result<()> {
     super::recovery::refuse_conflicts(tx, name, paths)?;
+    super::deletion_intent::refuse_conflicts(tx, name, paths, false)?;
     for (token, launch) in rows(tx)? {
         if except == Some(token.as_str()) {
             continue;

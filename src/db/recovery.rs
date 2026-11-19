@@ -207,7 +207,29 @@ impl SmolvmDb {
         runtime: &Path,
         disks: &[PathBuf],
     ) -> Result<VmRecoveryGuard> {
-        let admission = self.admit_machine_mutation(&record.name)?;
+        self.reserve_vm_control_kind(record, runtime, disks, false)
+    }
+
+    pub(crate) fn reserve_vm_deletion_at(
+        &self,
+        record: &VmRecord,
+        runtime: &Path,
+    ) -> Result<VmRecoveryGuard> {
+        self.reserve_vm_control_kind(record, runtime, &[], true)
+    }
+
+    fn reserve_vm_control_kind(
+        &self,
+        record: &VmRecord,
+        runtime: &Path,
+        disks: &[PathBuf],
+        deleting: bool,
+    ) -> Result<VmRecoveryGuard> {
+        let admission = if deleting {
+            self.admit_machine_deletion(&record.name)?
+        } else {
+            self.admit_machine_mutation(&record.name)?
+        };
         let review = LaunchReview::from_record(record)?;
         let runtime = resource_path(runtime)?;
         let disks = disks
@@ -236,6 +258,7 @@ impl SmolvmDb {
             )?;
             let mut paths = super::launch_admission::recovery_paths(&tx, &member, &runtime)?;
             paths.extend(disks.iter().cloned());
+            paths.extend(super::deletion_intent::retry_paths(&tx, &member, &runtime)?);
             paths.push(resource_path(
                 &crate::portable_checkpoint::paused_layers_dir(&runtime)?,
             )?);
@@ -359,6 +382,11 @@ impl VmRecoveryGuard {
                     |r| r.get(0),
                 )
                 .db_err("read retained deletion ownership")?;
+            if retain {
+                let (member, _) = Member::read(&tx, &self.record.name)?;
+                super::deletion_intent::retry_paths(&tx, &member, &self.runtime)?;
+                super::deletion_intent::retire_owned(&tx, &self.record.name)?;
+            }
             let mut after = before.clone();
             // Member::read decodes stored fields only. Return the original
             // database review whose identity was validated in this transaction.
@@ -384,7 +412,8 @@ impl VmRecoveryGuard {
                 let (member, _) = Member::read(&tx, &self.record.name)?;
                 let mut saved: Recovery = serde_json::from_slice(&saved_owner)
                     .db_err("decode retained deletion ownership")?;
-                saved.member = member;
+                saved.member = member.clone();
+                super::deletion_intent::persist(&tx, member, &self.runtime, saved.paths.clone())?;
                 tx.execute(
                     "INSERT INTO vm_recovery_owners(name,token,data) VALUES (?1,?2,?3)",
                     params![
@@ -431,6 +460,9 @@ impl VmRecoveryGuard {
             {
                 return Err(conflict("machine execution changed during deletion"));
             }
+            let (member, _) = Member::read(&tx, &self.record.name)?;
+            super::deletion_intent::retry_paths(&tx, &member, &self.runtime)?;
+            super::deletion_intent::retire_owned(&tx, &self.record.name)?;
             tx.execute(
                 "DELETE FROM vm_recovery_owners WHERE name=?1 AND token=?2",
                 params![self.record.name, self.token],

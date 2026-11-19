@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod deletion_intent;
 mod incarnation;
 mod recovery;
 pub(crate) use recovery::VmRecoveryGuard;
@@ -362,6 +363,7 @@ impl SmolvmDb {
         .db_err("create tables")?;
         incarnation::install(&mut conn)?;
         recovery::install(&mut conn)?;
+        deletion_intent::install(&mut conn)?;
 
         Ok(conn)
     }
