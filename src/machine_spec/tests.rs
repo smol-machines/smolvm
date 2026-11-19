@@ -349,6 +349,57 @@ fn keeping_an_identity_needs_a_checkpoint() {
 }
 
 #[test]
+fn checkpoint_mount_ownership_is_inherited_when_relocating_a_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manifest = checkpoint_manifest();
+    let checkpoint = manifest.checkpoint.as_mut().unwrap();
+    checkpoint.device_profile = crate::portable_checkpoint::DEVICE_PROFILE_MOUNT_OWNERSHIP.into();
+    checkpoint.host_mounts = vec![smolvm_pack::format::CheckpointHostMount {
+        host_path: directory
+            .path()
+            .join("missing-source")
+            .display()
+            .to_string(),
+        guest_path: "/data".into(),
+        read_only: false,
+        recorded_ownership: true,
+        owner: Some((42001, 42002)),
+    }];
+    let mount = HostMount::parse(&[format!("{}:/data", directory.path().display())])
+        .unwrap()
+        .remove(0);
+    for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+        let resolved = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                mounts: vec![mount.clone()],
+                ..Default::default()
+            },
+            caller,
+        )
+        .unwrap()
+        .to_record("relocated-owned")
+        .unwrap();
+        assert!(resolved.recorded_ownership);
+        assert_eq!(resolved.mount_owners, [(0, 42001, 42002)]);
+        assert_eq!(resolved.mounts, [mount.to_storage_tuple()]);
+    }
+    for owner in [Some((42001, 42002)), Some((1, 2))] {
+        let mut asked = mount.clone();
+        asked.owner = owner;
+        let resolved = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                mounts: vec![asked],
+                ..Default::default()
+            },
+            Caller::Embedded,
+        );
+        assert_eq!(resolved.is_ok(), owner == Some((42001, 42002)));
+    }
+}
+
+#[test]
 fn checkpoint_mount_relocation_keeps_device_order_for_every_caller() {
     let original = tempfile::tempdir().unwrap();
     let destination = tempfile::tempdir().unwrap();
@@ -361,6 +412,7 @@ fn checkpoint_mount_relocation_keeps_device_order_for_every_caller() {
             host_path: original.path().join(i.to_string()).display().to_string(),
             guest_path: target.into(),
             read_only: i == 1,
+            ..Default::default()
         })
         .collect();
     // The source machine's paths no longer exist on the destination host.
@@ -400,6 +452,7 @@ fn checkpoint_mount_relocation_keeps_unmapped_directories_and_checks_destination
             host_path: original.path().display().to_string(),
             guest_path: target.into(),
             read_only: false,
+            ..Default::default()
         })
         .collect();
     let mounts = HostMount::parse(&[format!("{}:/data", destination.path().display())]).unwrap();
@@ -460,6 +513,7 @@ fn checkpoint_mount_relocation_refuses_topology_and_permission_changes() {
             host_path: directory.path().display().to_string(),
             guest_path: "/data".into(),
             read_only: true,
+            ..Default::default()
         }];
     let mount = HostMount::parse(&[format!("{}:/data:ro", directory.path().display())])
         .unwrap()

@@ -1429,17 +1429,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 }
                 ports
             };
-            let mounts = crate::portable_checkpoint::restored_host_mounts_at(checkpoint, &mounts)?
-                .into_iter()
-                .map(|(source, target, read_only)| HostMount {
-                    source: source.into(),
-                    target: target.into(),
-                    read_only,
-                    staged: false,
-                    recorded_ownership: false,
-                    owner: None,
-                })
-                .collect();
+            let mounts = crate::portable_checkpoint::restored_host_mounts_at(checkpoint, &mounts)?;
 
             let captured_settings = &checkpoint.settings;
             ResolvedSpec {

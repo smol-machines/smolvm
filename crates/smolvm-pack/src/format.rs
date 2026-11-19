@@ -445,7 +445,7 @@ pub struct CheckpointWorkload {
 /// capture opted in (`host_mounts`); its contents must be transferred separately
 /// to move hosts. A restore can relocate its host directory but retains its
 /// guest path, access and device order.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointHostMount {
     /// Host directory, as given at `machine create`.
     pub host_path: String,
@@ -454,6 +454,13 @@ pub struct CheckpointHostMount {
     /// Whether the guest sees it read-only.
     #[serde(default)]
     pub read_only: bool,
+    /// Keep guest ownership and permissions separate from host inode access.
+    /// A checkpoint with this setting requires an ownership-aware device profile.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
+    /// Guest uid/gid for files that have no individually recorded owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<(u32, u32)>,
 }
 
 /// One host-to-guest TCP forward restored around a live VM.
