@@ -645,6 +645,85 @@ fn an_artifact_cannot_name_a_host_directory_as_its_image() {
     .is_ok());
 }
 
+// A checkpoint's own allow entries are its author's: one that reaches the
+// host (loopback, link-local metadata, or every address) is refused, unless the
+// restore brings an egress policy of its own.
+#[test]
+fn a_checkpoint_policy_that_reaches_the_host_is_refused() {
+    let reaching: [fn(&mut CheckpointNetwork); 5] = [
+        |n| n.allowed_cidrs = Some(vec!["127.0.0.0/8".into()]),
+        |n| n.allowed_cidrs = Some(vec!["0.0.0.0/0".into()]),
+        |n| n.dns_filter_hosts = Some(vec!["localhost".into()]),
+        |n| {
+            n.egress_rules = vec![EgressRule {
+                transport: None,
+                cidr: Some("169.254.169.254/32".into()),
+                ports: None,
+                action: smolvm_protocol::RuleAction::Allow,
+            }]
+        },
+        |n| {
+            n.egress_rules = vec![EgressRule {
+                transport: None,
+                cidr: None,
+                ports: None,
+                action: smolvm_protocol::RuleAction::Allow,
+            }]
+        },
+    ];
+    for set in reaching {
+        let mut manifest = checkpoint_manifest();
+        set(manifest
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .network
+            .as_mut()
+            .unwrap());
+        for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+            let refused = resolve(
+                SpecSource::from_manifest(&manifest),
+                CreateSpec::default(),
+                caller,
+            );
+            assert!(refused.is_err(), "{caller:?}");
+        }
+        // The user's own policy replaces the captured one.
+        let replaced = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                allowed_cidrs: Some(vec!["10.1.0.0/16".into()]),
+                allowed_hosts: Some(vec!["example.com".into()]),
+                egress_rules: vec![EgressRule {
+                    transport: None,
+                    cidr: Some("10.1.0.0/16".into()),
+                    ports: None,
+                    action: smolvm_protocol::RuleAction::Allow,
+                }],
+                ..Default::default()
+            },
+            Caller::Cli,
+        );
+        assert!(replaced.is_ok(), "{:?}", replaced.err());
+    }
+    // An ordinary captured allow list still restores.
+    let mut manifest = checkpoint_manifest();
+    manifest
+        .checkpoint
+        .as_mut()
+        .unwrap()
+        .network
+        .as_mut()
+        .unwrap()
+        .allowed_cidrs = Some(vec!["10.1.0.0/16".into()]);
+    assert!(resolve(
+        SpecSource::from_manifest(&manifest),
+        CreateSpec::default(),
+        Caller::Cli
+    )
+    .is_ok());
+}
+
 #[test]
 fn a_checkpoint_refuses_a_network_it_was_captured_without() {
     let mut manifest = checkpoint_manifest();
