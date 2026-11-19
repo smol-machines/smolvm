@@ -349,17 +349,8 @@ impl Container {
         &self,
         engine: &Engine,
         deleting: bool,
-    ) -> ApiResult<(
-        crate::db::transfer_admission::MutationGuard,
-        crate::db::transfer_admission::MutationGuard,
-    )> {
+    ) -> ApiResult<Vec<crate::db::transfer_admission::MutationGuard>> {
         let record = self.record();
-        let machine = if deleting {
-            engine.db.admit_machine_deletion(&record.machine)
-        } else {
-            engine.db.admit_machine_mutation(&record.machine)
-        }
-        .map_err(mutation_error)?;
         let mut paths = vec![engine.store.container_dir(&record.id)];
         for mount in &record.mounts {
             match mount.kind.as_str() {
@@ -372,7 +363,49 @@ impl Container {
             .db
             .admit_storage_mutation(&paths)
             .map_err(mutation_error)?;
-        Ok((machine, storage))
+        let owner = if record.network_host().is_some() {
+            let mut records: BTreeMap<_, _> = engine
+                .store
+                .transfer_containers()?
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect();
+            records.insert(record.id.clone(), record.clone());
+            match super::transfer::machine_owner(&records, &record.id) {
+                Ok(owner) => records[owner].machine.clone(),
+                Err(error)
+                    if deleting
+                        && record.machine.is_empty()
+                        && !storage.has_active_transfers()
+                        && !self.owns_live_execution()
+                        && error.status == axum::http::StatusCode::NOT_FOUND =>
+                {
+                    // A stopped shared container has no VM of its own. Permit
+                    // removing its orphaned record when the host is gone, but
+                    // never treat a missing owner as authority during a move.
+                    record.machine.clone()
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            record.machine.clone()
+        };
+        let machine = if deleting {
+            engine.db.admit_machine_deletion(&owner)
+        } else {
+            engine.db.admit_machine_mutation(&owner)
+        }
+        .map_err(mutation_error)?;
+        let active = storage.has_active_transfers();
+        let mut guards = vec![machine, storage];
+        if active {
+            for endpoint in record.networks.values() {
+                if let Some(network) = engine.networks.find(&endpoint.network_id) {
+                    guards.extend(engine.networks.admit_mutation(&engine.store, &network)?);
+                }
+            }
+        }
+        Ok(guards)
     }
 
     pub(crate) fn owns_live_execution(&self) -> bool {
@@ -565,19 +598,37 @@ pub(crate) async fn create(
         warnings.push("Published ports are discarded when using host network mode".into());
     }
 
-    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     let guest = host_config.network_mode.starts_with("container:");
+    let networks = if guest {
+        BTreeMap::new()
+    } else {
+        super::network::attach_at_create(engine, &id, &name, &req)?
+    };
+    let mut _network_admission = Vec::new();
+    for endpoint in networks.values() {
+        let network = engine
+            .networks
+            .find(&endpoint.network_id)
+            .ok_or_else(|| ApiError::conflict("network changed before container creation"))?;
+        _network_admission.extend(engine.networks.admit_mutation(&engine.store, &network)?);
+    }
+    let _host_admission = if let Some(host) = host_config.network_mode.strip_prefix("container:") {
+        Some(
+            engine
+                .find_container(host)
+                .ok_or_else(|| ApiError::no_such_container(host))?
+                .admit_mutation(engine, false)?,
+        )
+    } else {
+        None
+    };
+    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     if guest && !sockets.is_empty() {
         return Err(ApiError::bad_request(
             "a container that shares another container's network cannot mount a Unix socket",
         ));
     }
     let ports = resolve_ports(engine, &mut config, &host_config)?;
-    let networks = if guest {
-        BTreeMap::new()
-    } else {
-        super::network::attach_at_create(engine, &id, &name, &req)?
-    };
 
     // A container that shares another's network has no machine of its own.
     let machine = if guest {
@@ -3235,6 +3286,81 @@ pub(crate) fn matches(engine: &Engine, c: &Container, filters: &Filters) -> bool
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn orphaned_shared_container_remains_removable_without_an_active_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        let id = super::super::util::new_id();
+        let engine = Engine::open_with_db(
+            super::super::EngineConfig {
+                root: root.path().join("engine"),
+                socket: root.path().join("api.sock"),
+            },
+            Some(id.clone()),
+            crate::db::SmolvmDb::open_at(&root.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id":id,"name":"orphan","created":"","image":"","image_id":"",
+            "pull_ref":"","machine":"","config":{},
+            "host_config":{"NetworkMode":format!("container:{}", "d".repeat(64))},
+            "host_config_raw":{},"networks":{},"path":"sh","args":[],
+            "state":StateRecord::default(),"restart_count":0,"ports":[],"mounts":[]
+        }))
+        .unwrap();
+        engine.store.save_container(&record).unwrap();
+        let container = Container::from_record(record);
+        engine
+            .containers
+            .write()
+            .insert(id.clone(), container.clone());
+        let owner = format!("orphan-transfer-{:032x}", rand::random::<u128>());
+        engine
+            .db
+            .insert_vm(
+                &owner,
+                &crate::config::VmRecord::new(owner.clone(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        engine
+            .db
+            .claim_workload_transfer(
+                "orphan-move",
+                vec![engine.db.review_workload_member(&owner).unwrap()],
+                &[],
+            )
+            .unwrap();
+        assert!(remove(&engine, &container, true, false).await.is_err());
+        assert!(engine.store.load_container(&id).unwrap().is_some());
+        engine.db.retire_workload_transfer("orphan-move").unwrap();
+        engine.db.remove_vm(&owner).unwrap();
+
+        // Neither a potentially live execution nor cyclic ownership is an
+        // orphaned stopped record that can be discarded.
+        container.update(&engine, |record| record.state.status = "running".into());
+        assert!(remove(&engine, &container, true, false).await.is_err());
+        container.update(&engine, |record| {
+            record.state.status = "created".into();
+            record.host_config.network_mode = format!("container:{id}");
+        });
+        assert_eq!(
+            remove(&engine, &container, false, false)
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        container.update(&engine, |record| {
+            record.host_config.network_mode = format!("container:{}", "d".repeat(64))
+        });
+        container.update(&engine, |record| record.machine = "unexpected-owner".into());
+        assert!(remove(&engine, &container, false, false).await.is_err());
+        container.update(&engine, |record| record.machine.clear());
+        remove(&engine, &container, false, false).await.unwrap();
+        assert!(engine.find_container(&id).is_none());
+        assert!(engine.store.load_container(&id).unwrap().is_none());
+        assert!(engine.db.list_vms().unwrap().is_empty());
+    }
 
     #[tokio::test]
     async fn transfer_claim_preserves_container_removal_and_rename() {
