@@ -162,7 +162,7 @@ impl SmolvmDb {
         machine: Option<&str>,
         paths: &[PathBuf],
     ) -> Result<()> {
-        let owners = self.with_read_conn(rows)?;
+        let owners = self.with_read_conn(|conn| rows(conn))?;
         if owners.is_empty() {
             return Ok(());
         }
