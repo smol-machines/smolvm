@@ -1136,6 +1136,7 @@ impl VmRecord {
         restart: RestartConfig,
     ) -> Self {
         Self {
+            database_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,

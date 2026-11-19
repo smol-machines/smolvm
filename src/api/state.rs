@@ -1705,7 +1705,7 @@ async fn ensure_running_and_persist_owned(
         state
             .lookup_vm(name)
             .await
-            .map_err(|e| crate::Error::agent("read startup settings", e.to_string()))?
+            .map_err(|e| crate::Error::agent("read startup settings", format!("{e:?}")))?
             .ok_or_else(|| crate::Error::vm_not_found(name))?,
     );
     if let Some(record) = &record {
