@@ -18,6 +18,8 @@ pub mod format;
 pub mod macho;
 pub mod packer;
 pub mod signing;
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+pub mod volume_archive;
 
 pub use detect::{detect_packed_mode, PackedMode};
 pub use format::{

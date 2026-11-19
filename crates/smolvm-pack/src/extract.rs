@@ -399,7 +399,7 @@ fn user_xattrs_supported(dir: &Path) -> bool {
 /// `setxattr` with `XATTR_NOFOLLOW` (macOS), so a symlink is never followed;
 /// the Windows arm writes an alternate data stream instead, which a reparse
 /// point *would* redirect to its target, so callers must not hand it a link.
-fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
+pub(crate) fn set_user_xattr(path: &Path, name: &str, value: &[u8]) -> std::io::Result<()> {
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     {
         use std::os::unix::ffi::OsStrExt;
