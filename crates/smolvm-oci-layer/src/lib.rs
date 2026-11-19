@@ -60,8 +60,13 @@ pub fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
 }
 
 /// Join `rel` under `base`, returning `None` if any component would escape the
-/// base — lexically (`..`, an absolute path, a Windows-style prefix) **or**
-/// through a symlink already on disk.
+/// base — lexically (`..`, a Windows-style prefix) **or** through a symlink
+/// already on disk.
+///
+/// A leading `/` names the layer root, as Docker, containerd and
+/// `tar::Entry::unpack_in` read it: some image builders (Nix's among them)
+/// write every entry as `/nix/store/...`, and refusing those left whole layers
+/// empty.
 ///
 /// The symlink check is the load-bearing half. This path feeds the whiteout
 /// branch, which performs *destructive* operations (`remove_file`,
@@ -90,8 +95,8 @@ pub fn jailed_join(base: &Path, rel: &Path) -> Option<PathBuf> {
                     }
                 }
             }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
         }
     }
     Some(out)
@@ -519,7 +524,85 @@ mod tests {
             Some(base.join("etc/hosts"))
         );
         assert_eq!(jailed_join(base, Path::new("../escape")), None);
-        assert_eq!(jailed_join(base, Path::new("/abs")), None);
+        assert_eq!(jailed_join(base, Path::new("/../escape")), None);
+        assert_eq!(jailed_join(base, Path::new("/abs")), Some(base.join("abs")));
+    }
+
+    // Nix-built images write every entry with a leading `/`. Each one lands in
+    // the layer, as Docker places it, instead of being dropped.
+    #[cfg(unix)]
+    #[test]
+    fn absolute_entry_paths_land_in_the_layer() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("layer");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Owned by whoever runs the test: extraction keeps owners.
+        let me = std::fs::metadata(&dest).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for dir in [
+            "/nix/",
+            "/nix/store/",
+            "/nix/store/abc-bash/",
+            "/nix/store/abc-bash/bin/",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_uid(me.uid().into());
+            header.set_gid(me.gid().into());
+            builder
+                .append_data(&mut header, dir.trim_start_matches('/'), &[][..])
+                .unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        header.set_size(4);
+        header.set_uid(me.uid().into());
+        header.set_gid(me.gid().into());
+        builder
+            .append_data(&mut header, "nix/store/abc-bash/bin/bash", &b"bash"[..])
+            .unwrap();
+        let mut tar_bytes = builder.into_inner().unwrap();
+        // tar::Builder refuses to write absolute names, so prefix them in the
+        // raw headers, as the image builders do.
+        absolutize_names(&mut tar_bytes);
+        let names: Vec<String> = tar::Archive::new(&tar_bytes[..])
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with('/')), "{names:?}");
+
+        extract_oci_layer(&tar_bytes[..], &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("nix/store/abc-bash/bin/bash")).unwrap(),
+            b"bash"
+        );
+    }
+
+    /// Rewrite each ustar/GNU header's name to start with `/`, fixing up the
+    /// checksum. Names here are short, so they fit the 100-byte field.
+    fn absolutize_names(bytes: &mut [u8]) {
+        let mut offset = 0;
+        while offset + 512 <= bytes.len() {
+            let header = &mut bytes[offset..offset + 512];
+            if header.iter().all(|b| *b == 0) {
+                break;
+            }
+            let len = header[..100].iter().position(|b| *b == 0).unwrap_or(100);
+            header.copy_within(0..len, 1);
+            header[0] = b'/';
+            header[148..156].copy_from_slice(b"        ");
+            let sum: u32 = header.iter().map(|b| *b as u32).sum();
+            header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            let size = std::str::from_utf8(&header[124..135])
+                .ok()
+                .and_then(|s| u64::from_str_radix(s.trim_matches(char::from(0)).trim(), 8).ok())
+                .unwrap_or(0);
+            offset += 512 + size.div_ceil(512) as usize * 512;
+        }
     }
 
     /// A hostile layer must not be able to reach outside the layer dir through a
