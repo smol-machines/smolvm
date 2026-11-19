@@ -6,8 +6,9 @@
 //! fences, revalidate the plan and then pause *all* writers before copying data.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use axum::{extract::State, Json};
 use serde::{Deserialize, Serialize};
@@ -127,7 +128,44 @@ fn machine_owner<'a>(
     }
 }
 
+#[derive(Serialize)]
+struct LiveShare {
+    name: String,
+    source: PathBuf,
+    read_only: bool,
+}
+
+fn live_shares(name: &str, deadline: Instant) -> crate::Result<Vec<LiveShare>> {
+    let mut shares = Vec::new();
+    for read_only in [false, true] {
+        let remaining = deadline
+            .checked_duration_since(Instant::now())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(|| {
+                crate::Error::agent("plan transfer", "live share inventory timed out")
+            })?;
+        for (name, source) in
+            crate::attach::shared_directories_with_timeout(name, read_only, remaining)?
+        {
+            shares.push(LiveShare {
+                name,
+                source,
+                read_only,
+            });
+        }
+    }
+    Ok(shares)
+}
+
 fn build(engine: &Engine, requested: &[String]) -> ApiResult<Plan> {
+    build_with_inventory(engine, requested, live_shares)
+}
+
+fn build_with_inventory(
+    engine: &Engine,
+    requested: &[String],
+    mut inventory: impl FnMut(&str, Instant) -> crate::Result<Vec<LiveShare>>,
+) -> ApiResult<Plan> {
     let records: BTreeMap<_, _> = engine
         .store
         .transfer_containers()?
@@ -367,6 +405,78 @@ fn build(engine: &Engine, requested: &[String]) -> ApiResult<Plan> {
             }
         }
     }
+    // Dynamic SHARE_ADD exports are absent from VmRecord. Ask the VMM, not
+    // just the guest's attached-mount list: sidecar/image exports can exist
+    // without a guest mount-list entry. Observing never starts a machine.
+    // This is still a preflight, not an atomic inventory or admission fence.
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut live_identities = Vec::new();
+    for (name, vm) in &vms {
+        let selected = machines.contains(name);
+        if !selected && roots.is_empty() {
+            continue;
+        }
+        if !vm.is_process_alive() {
+            if vm.paused_checkpoint.is_some() {
+                // The checkpoint can retain dynamic exports we cannot inspect
+                // through a stopped VMM. Do not infer absence from its record.
+                blockers.insert(Blocker {
+                    code: "saved_machine_shares_unverified",
+                    container: String::new(),
+                    resource: name.clone(),
+                });
+            }
+            continue;
+        }
+        let shares = match inventory(name, deadline) {
+            Ok(shares) => shares,
+            Err(_) => {
+                blockers.insert(Blocker {
+                    code: "live_machine_shares_unverified",
+                    container: String::new(),
+                    resource: name.clone(),
+                });
+                continue;
+            }
+        };
+        if selected {
+            live_identities.push(serde_json::json!({"machine":name,"pid":vm.pid,"startTime":vm.pid_start_time,"shares":shares}));
+        }
+        for share in shares {
+            let source = match std::fs::canonicalize(&share.source) {
+                Ok(source) => source,
+                Err(_) => {
+                    blockers.insert(Blocker {
+                        code: "unresolved_live_share",
+                        container: String::new(),
+                        resource: format!("{name}:{}", share.name),
+                    });
+                    continue;
+                }
+            };
+            if selected {
+                // Boot-mount relocation does not yet relocate live device
+                // exports. Keep them visible as a bundle requirement, even
+                // when their data is an already selected managed volume.
+                blockers.insert(Blocker {
+                    code: "live_share_relocation_required",
+                    container: String::new(),
+                    resource: format!("{name}:{}", share.name),
+                });
+            } else {
+                for (volume, root) in &roots {
+                    if overlaps(&source, root) {
+                        blockers.insert(Blocker {
+                            code: "external_live_volume_user",
+                            container: String::new(),
+                            resource: format!("{name}:{volume}"),
+                        });
+                        live_identities.push(serde_json::json!({"machine":name,"pid":vm.pid,"startTime":vm.pid_start_time,"share":share,"source":source}));
+                    }
+                }
+            }
+        }
+    }
     // Hash only the relevant closure. Starting an unrelated container must
     // not invalidate the user's plan. Status/health polling is also irrelevant;
     // configuration changes and a new execution generation are not.
@@ -394,10 +504,10 @@ fn build(engine: &Engine, requested: &[String]) -> ApiResult<Plan> {
         Ok(serde_json::json!({"name":name,"path":root,"device":metadata.dev(),"inode":metadata.ino()}))
     }).collect::<ApiResult<Vec<_>>>()?;
     let data = serde_json::to_vec(&serde_json::json!({
-        "version":1,"selected":selected,"containers":identities,
+        "version":2,"selected":selected,"containers":identities,
         "volumes":volume_names.iter().map(|name|&volumes[name]).collect::<Vec<_>>(),
         "networks":network_ids.iter().map(|id|&networks[id]).collect::<Vec<_>>(),
-        "machines":machine_identities,"volumeIdentities":volume_identities,"blockers":blockers,
+        "machines":machine_identities,"volumeIdentities":volume_identities,"liveShares":live_identities,"blockers":blockers,
     }))
     .map_err(|e| ApiError::internal(e.to_string()))?;
     let fingerprint = format!("sha256:{:x}", Sha256::digest(data));
@@ -667,5 +777,150 @@ mod tests {
             .blockers
             .iter()
             .any(|b| b.code == "machine_ownership_mismatch"));
+    }
+    fn running_vm(engine: &Engine, name: &str, owner: Option<&str>) {
+        let mut vm = crate::config::VmRecord::new(name.into(), 1, 128, vec![], vec![], false);
+        vm.pid = Some(std::process::id() as i32);
+        assert!(vm.is_process_alive());
+        if let Some(owner) = owner {
+            vm.labels
+                .insert(super::super::containers::MACHINE_LABEL.into(), owner.into());
+        }
+        engine.db.insert_vm(name, &vm).unwrap();
+    }
+
+    #[test]
+    fn transfer_preflight_finds_unrecorded_live_volume_users_including_readers_and_aliases() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let a = record(&engine, 'a', "web", Some("data"));
+        running_vm(&engine, &a.machine, Some(&a.id));
+        running_vm(&engine, "outside", None);
+        let data = engine.volumes.mountpoint("data");
+        std::fs::create_dir(data.join("child")).unwrap();
+        let alias = root.path().join("alias");
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+        for source in [
+            alias,
+            data.clone(),
+            data.join("child"),
+            data.parent().unwrap().to_owned(),
+        ] {
+            for read_only in [false, true] {
+                let mut observed = Vec::new();
+                let plan = build_with_inventory(&engine, &["web".into()], |name, deadline| {
+                    assert!(deadline > Instant::now());
+                    observed.push(name.to_owned());
+                    Ok(if name == "outside" {
+                        vec![LiveShare {
+                            name: "hidden".into(),
+                            source: source.clone(),
+                            read_only,
+                        }]
+                    } else {
+                        vec![]
+                    })
+                })
+                .unwrap();
+                assert_eq!(observed.len(), 2);
+                assert!(
+                    plan.blockers
+                        .iter()
+                        .any(|b| b.code == "external_live_volume_user"
+                            && b.resource == "outside:data")
+                );
+                assert!(engine
+                    .db
+                    .get_vm("outside")
+                    .unwrap()
+                    .unwrap()
+                    .mounts
+                    .is_empty());
+            }
+        }
+    }
+
+    #[test]
+    fn transfer_preflight_binds_selected_live_exports_without_hashing_unrelated_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let a = record(&engine, 'a', "web", Some("data"));
+        running_vm(&engine, &a.machine, Some(&a.id));
+        running_vm(&engine, "outside", None);
+        let unrelated = root.path().join("unrelated");
+        std::fs::create_dir(&unrelated).unwrap();
+        let build_plan = |selected_read_only, outside_read_only| {
+            build_with_inventory(&engine, &["web".into()], |name, _| {
+                let selected = name == a.machine;
+                Ok(vec![LiveShare {
+                    name: "dynamic".into(),
+                    source: if selected {
+                        engine.volumes.mountpoint("data")
+                    } else {
+                        unrelated.clone()
+                    },
+                    read_only: if selected {
+                        selected_read_only
+                    } else {
+                        outside_read_only
+                    },
+                }])
+            })
+            .unwrap()
+        };
+        let first = build_plan(false, false);
+        assert!(first
+            .blockers
+            .iter()
+            .any(|b| b.code == "live_share_relocation_required"));
+        assert!(!first
+            .blockers
+            .iter()
+            .any(|b| b.code == "external_live_volume_user"));
+        assert_ne!(first.fingerprint, build_plan(true, false).fingerprint);
+        assert_eq!(first.fingerprint, build_plan(false, true).fingerprint);
+        assert!(!serde_json::to_string(&first)
+            .unwrap()
+            .contains(&unrelated.to_string_lossy().to_string()));
+    }
+
+    #[test]
+    fn transfer_preflight_refuses_unreadable_live_inventory_and_unverified_saved_exports() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let a = record(&engine, 'a', "web", Some("data"));
+        running_vm(&engine, &a.machine, Some(&a.id));
+        running_vm(&engine, "outside", None);
+        let plan = build_with_inventory(&engine, &["web".into()], |_, _| {
+            Err(crate::Error::agent("inventory", "runtime unavailable"))
+        })
+        .unwrap();
+        assert_eq!(
+            plan.blockers
+                .iter()
+                .filter(|b| b.code == "live_machine_shares_unverified")
+                .count(),
+            2
+        );
+        for name in [&a.machine, &"outside".to_string()] {
+            engine
+                .db
+                .update_vm(name, |vm| {
+                    vm.pid = None;
+                    vm.paused_checkpoint = Some(root.path().join("saved.checkpoint"));
+                })
+                .unwrap();
+        }
+        let plan = build_with_inventory(&engine, &["web".into()], |_, _| {
+            panic!("must not start a paused machine to inspect it")
+        })
+        .unwrap();
+        assert_eq!(
+            plan.blockers
+                .iter()
+                .filter(|b| b.code == "saved_machine_shares_unverified")
+                .count(),
+            2
+        );
     }
 }

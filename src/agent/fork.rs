@@ -384,60 +384,91 @@ pub fn control_socket_cmd_with_timeout(
     use crate::platform::uds::UdsStream;
     use std::io::{Read, Write};
 
+    let started = std::time::Instant::now();
+    let timed_out = || {
+        Error::agent(
+            "read control socket",
+            format!(
+                "no reply to {} within {} s",
+                verb_of(cmd),
+                timeout.as_secs()
+            ),
+        )
+    };
+    let remaining = || {
+        timeout
+            .checked_sub(started.elapsed())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(timed_out)
+    };
     #[cfg(target_os = "windows")]
     let mut stream = {
-        // libkrun's Windows control listener uses loopback TCP and writes its
-        // assigned port to this path; it is not an AF_UNIX socket.
+        // libkrun's Windows control listener uses loopback TCP.
         let port = std::fs::read_to_string(sock)
             .map_err(|e| Error::agent("read control port", e.to_string()))?
             .trim()
             .parse::<u16>()
             .map_err(|e| Error::agent("parse control port", e.to_string()))?;
-        std::net::TcpStream::connect(("127.0.0.1", port))
-            .map_err(|e| Error::agent("connect control socket", e.to_string()))?
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            remaining()?,
+        )
+        .map_err(|e| Error::agent("connect control socket", e.to_string()))?
     };
     #[cfg(not(target_os = "windows"))]
-    let mut stream = UdsStream::connect(sock)
+    let mut stream = UdsStream::connect_timeout(sock, remaining()?)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
-    stream.set_read_timeout(Some(timeout)).ok();
+    stream
+        .set_write_timeout(Some(remaining()?))
+        .map_err(|e| Error::agent("write control socket", e.to_string()))?;
     stream
         .write_all(format!("{cmd}\n").as_bytes())
         .map_err(|e| Error::agent("write control socket", e.to_string()))?;
-    let mut reply = String::new();
-    let mut byte = [0u8; 1];
+    // SHARE_LIST includes UTF-8 host paths. Turning each byte into a char
+    // corrupts those paths; decode only after the complete frame is received.
+    // The largest supported inventory (64 paths) fits well below this cap.
+    const MAX_REPLY: usize = 1024 * 1024;
+    let mut reply = Vec::new();
+    let mut buffer = [0; 8192];
     loop {
-        match stream.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                reply.push(byte[0] as char);
+        stream
+            .set_read_timeout(Some(remaining()?))
+            .map_err(|e| Error::agent("read control socket", e.to_string()))?;
+        match stream.read(&mut buffer) {
+            Ok(0) => {
+                return Err(Error::agent(
+                    "read control socket",
+                    "incomplete control reply",
+                ))
             }
-            // A signal landed during the read (SIGCHLD from a VMM child, say): the
-            // read did nothing, so do it again. `write_all` retries this itself;
-            // a byte-wise `read` does not.
+            Ok(read) => {
+                let end = buffer[..read].iter().position(|byte| *byte == b'\n');
+                let size = end.unwrap_or(read);
+                if size > MAX_REPLY - reply.len() {
+                    return Err(Error::agent(
+                        "read control socket",
+                        "control reply exceeds byte limit",
+                    ));
+                }
+                reply.extend_from_slice(&buffer[..size]);
+                if end.is_some() {
+                    return String::from_utf8(reply).map_err(|_| {
+                        Error::agent("read control socket", "control reply is not UTF-8")
+                    });
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // A read timeout surfaces as EAGAIN, which says nothing about why.
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                return Err(Error::agent(
-                    "read control socket",
-                    format!(
-                        "no reply to {} within {} s",
-                        verb_of(cmd),
-                        timeout.as_secs()
-                    ),
-                ));
+                return Err(timed_out())
             }
             Err(e) => return Err(Error::agent("read control socket", e.to_string())),
         }
     }
-    Ok(reply)
 }
 
 /// The command word of a control command, without its arguments (paths).
@@ -6736,5 +6767,76 @@ tmpfs /tmp tmpfs rw 0 0
             false,
             true
         ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn control_replies_preserve_utf8_and_refuse_partial_invalid_or_oversized_frames() {
+        use std::io::{BufRead, Write};
+        for (reply, expected) in [
+            (
+                "OK a=/tmp/é a= b \n".as_bytes().to_vec(),
+                Some("OK a=/tmp/é a= b "),
+            ),
+            (b"OK partial".to_vec(), None),
+            (b"OK \xff\n".to_vec(), None),
+            (vec![b'x'; 1024 * 1024 + 1], None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("control.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut command = String::new();
+                std::io::BufReader::new(&mut stream)
+                    .read_line(&mut command)
+                    .unwrap();
+                assert_eq!(command, "SHARE_LIST mounts\n");
+                for chunk in reply.chunks(137) {
+                    if stream.write_all(chunk).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result =
+                control_socket_cmd_with_timeout(&sock, "SHARE_LIST mounts", Duration::from_secs(5));
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap(), expected);
+            } else {
+                assert!(result.is_err());
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_reply_deadline_does_not_restart_when_bytes_keep_arriving() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut command = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut command)
+                .unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let started = std::time::Instant::now();
+        let error =
+            control_socket_cmd_with_timeout(&sock, "SHARE_LIST mounts", Duration::from_millis(150))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("no reply to SHARE_LIST"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
     }
 }

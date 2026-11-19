@@ -133,6 +133,7 @@ pub fn attach(
             format!("host path {} is not a directory", source.display()),
         ));
     }
+    let source_arg = share_source_arg(&source)?;
     let target = normalize_target(target)?;
     let target_str = target.to_string_lossy().into_owned();
     if boot_targets
@@ -176,7 +177,7 @@ pub fn attach(
     let share = share_name(&target);
     let source_str = source.to_string_lossy().into_owned();
     let tag = tag(read_only);
-    control(name, &format!("SHARE_ADD {tag} {share} {source_str}"))?;
+    control(name, &format!("SHARE_ADD {tag} {share} {source_arg}"))?;
     if let Err(error) = client.attach_mount(&share, &source_str, read_only, &target_str) {
         // Never leave a share the guest can reach but did not ask for.
         let _ = control(name, &format!("SHARE_REMOVE {tag} {share}"));
@@ -209,9 +210,29 @@ pub fn add_share(name: &str, share: &str, source: &Path, read_only: bool) -> Res
     })?;
     control(
         name,
-        &format!("SHARE_ADD {} {share} {}", tag(read_only), source.display()),
+        &format!(
+            "SHARE_ADD {} {share} {}",
+            tag(read_only),
+            share_source_arg(&source)?
+        ),
     )
     .map(|_| ())
+}
+
+// The existing VMM control protocol trims its command argument. A final /.
+// retains the exact directory identity when its name ends in whitespace;
+// canonicalization in LiveShares::attach removes it before recording the path.
+fn share_source_arg(source: &Path) -> Result<String> {
+    let source = source
+        .to_str()
+        .filter(|path| !path.chars().any(char::is_control))
+        .ok_or_else(|| {
+            Error::config(
+                "attach share",
+                "host path must be UTF-8 without control characters",
+            )
+        })?;
+    Ok(format!("{source}/."))
 }
 
 /// Remove a share [`add_share`] added, revoking the guest's access to it.
@@ -222,20 +243,53 @@ pub fn remove_share(name: &str, share: &str, read_only: bool) -> Result<()> {
 /// Live device exports, including shares bound by the container engine.
 #[cfg(unix)]
 pub(crate) fn shared_directories(name: &str, read_only: bool) -> Result<Vec<(String, PathBuf)>> {
-    let reply = control(name, &format!("SHARE_LIST {}", tag(read_only)))?;
-    let entries = reply.strip_prefix("OK").unwrap_or("").trim();
+    shared_directories_with_timeout(name, read_only, std::time::Duration::from_secs(60))
+}
+
+#[cfg(unix)]
+pub(crate) fn shared_directories_with_timeout(
+    name: &str,
+    read_only: bool,
+    timeout: std::time::Duration,
+) -> Result<Vec<(String, PathBuf)>> {
+    let reply = crate::agent::fork::control_socket_cmd_with_timeout(
+        &control_socket_path(name),
+        &format!("SHARE_LIST {}", tag(read_only)),
+        timeout,
+    )?;
+    parse_shared_directories(&reply)
+}
+
+#[cfg(unix)]
+fn parse_shared_directories(reply: &str) -> Result<Vec<(String, PathBuf)>> {
+    // Do not trim: a host directory may end in spaces. Only the transport
+    // removes the newline delimiting the control reply.
+    let invalid = || Error::config("attach share", "invalid or unsupported live share listing");
+    let entries = reply
+        .strip_prefix("OK ")
+        .or_else(|| (reply == "OK").then_some(""))
+        .ok_or_else(invalid)?;
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    entries
-        .split('\t')
-        .map(|entry| {
-            let (share, source) = entry
-                .split_once('=')
-                .ok_or_else(|| Error::config("attach share", "invalid live share listing"))?;
-            Ok((share.to_owned(), PathBuf::from(source)))
-        })
-        .collect()
+    let mut seen = std::collections::BTreeSet::new();
+    let mut shares = Vec::new();
+    for entry in entries.split('\t') {
+        let (share, source) = entry.split_once('=').ok_or_else(invalid)?;
+        if share.is_empty() || share.len() > 64 || matches!(share, "." | "..")
+            || !share.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !seen.insert(share) || seen.len() > 64
+            || !Path::new(source).is_absolute() || source.chars().any(char::is_control)
+            // The legacy wire format renders paths with Display. Refuse a
+            // lossy path instead of mistaking it for a different real path.
+            || source.contains('\u{fffd}')
+        {
+            return Err(invalid());
+        }
+        shares.push((share.to_owned(), PathBuf::from(source)));
+    }
+    shares.sort();
+    Ok(shares)
 }
 
 /// Unmount the attached mount at `target` from the running machine `name`.
@@ -295,5 +349,68 @@ mod tests {
         assert_ne!(share, share_name(Path::new("/data")));
         assert!(share.len() <= 64);
         assert!(share.bytes().all(|b| b.is_ascii_alphanumeric()));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn live_share_listing_preserves_unicode_equals_and_trailing_spaces() {
+        assert_eq!(
+            parse_shared_directories("OK g._-=/tmp/é a= b ").unwrap(),
+            vec![("g._-".into(), PathBuf::from("/tmp/é a= b "))]
+        );
+        assert!(parse_shared_directories("OK ").unwrap().is_empty());
+        assert!(parse_shared_directories("OK").unwrap().is_empty());
+        assert_eq!(
+            parse_shared_directories("OK b=/tmp/b\ta=/tmp/a").unwrap()[0].0,
+            "a"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_share_listing_refuses_partial_ambiguous_or_lossy_inventory() {
+        for reply in [
+            "",
+            "OKevil",
+            "ERR EINVAL unknown command",
+            "OK a",
+            "OK a=relative",
+            "OK =/tmp/a",
+            "OK ../=/tmp/a",
+            "OK ..=/tmp/a",
+            "OK a=/tmp/a\ta=/tmp/b",
+            "OK a=/tmp/a\t",
+            "OK a=/tmp/a\n",
+            "OK a=/tmp/\u{fffd}",
+        ] {
+            assert!(
+                parse_shared_directories(reply).is_err(),
+                "accepted {reply:?}"
+            );
+        }
+        let too_many = format!(
+            "OK {}",
+            (0..65)
+                .map(|n| format!("s{n}=/tmp/{n}"))
+                .collect::<Vec<_>>()
+                .join("\t")
+        );
+        assert!(parse_shared_directories(&too_many).is_err());
+    }
+    #[test]
+    fn share_attachment_keeps_trailing_spaces_and_refuses_unrepresentable_paths() {
+        assert_eq!(
+            share_source_arg(Path::new("/tmp/é= ")).unwrap(),
+            "/tmp/é= /."
+        );
+        for path in ["/tmp/new\nline", "/tmp/tab\tname", "/tmp/nul\0name"] {
+            assert!(share_source_arg(Path::new(path)).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(
+                share_source_arg(Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))).is_err()
+            );
+        }
     }
 }

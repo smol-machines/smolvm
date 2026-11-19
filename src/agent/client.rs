@@ -4490,15 +4490,23 @@ mod relay_output_tests {
     fn a_partial_exit_frame_cannot_extend_the_command_termination_deadline() {
         use super::AgentClient;
         use crate::platform::uds::UdsStream;
-        use std::io::Read;
         use std::time::Duration;
         let (host, mut guest) = UdsStream::pair().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let agent = std::thread::spawn(move || {
-            assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0);
+            // Establish the partial frame before starting the 20 ms deadline.
+            // Waiting for request EOF first could leave this thread unscheduled
+            // until after the client timed out and closed both halves: that
+            // exercised an absent response and could strand the fixture's read.
             guest.write_all(&100u32.to_be_bytes()).unwrap();
             guest.write_all(b"{").unwrap();
-            std::thread::sleep(Duration::from_millis(200));
+            ready_tx.send(()).unwrap();
+            // Keep the incomplete response open until the assertion finishes;
+            // no sleep races against scheduling on a loaded test host.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut client = AgentClient::from_stream(host);
         assert_eq!(
             client.end_session_reader_gone_with_timeout(Duration::from_millis(20)),
@@ -4506,6 +4514,7 @@ mod relay_output_tests {
         );
         let error = client.ensure_session_finished().unwrap_err().to_string();
         assert!(error.contains("deadline"), "{error}");
+        release_tx.send(()).unwrap();
         agent.join().unwrap();
     }
 }
