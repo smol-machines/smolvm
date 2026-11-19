@@ -990,58 +990,8 @@ pub fn delete_vm(db: &SmolvmDb, name: &str) -> Result<()> {
 
 /// Delete with the caller already holding this machine's fork-source lock.
 pub(crate) fn delete_vm_locked(db: &SmolvmDb, name: &str) -> Result<()> {
-    let dependents = db.dependent_clones(name)?;
-    if !dependents.is_empty() {
-        return Err(Error::agent(
-            "delete machine",
-            format!(
-                "machine '{name}' has dependent fork(s) ({}); delete descendants first",
-                dependents.join(", ")
-            ),
-        ));
-    }
-    if db.get_vm(name)?.is_none() {
-        return Err(Error::vm_not_found(name));
-    }
-    // A stopped or crashed branch source can still own the processes holding
-    // its forked RAM. Stop them while the record and their manifests exist, as
-    // the CLI and API deletes do; removing the data dir first leaks the RAM.
-    crate::agent::cleanup_dead_vm_runtime_in_db(name, db)?;
-    let Some(removed) = db.remove_vm(name)? else {
-        return Err(Error::vm_not_found(name));
-    };
-
-    let data_dir = crate::agent::vm_data_dir(name);
-    // Release this machine's per-VM uid (root launches only) before the dir
-    // holding its record is removed.
-    crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), &data_dir);
-    // Detach the per-machine layers volume before removing the data dir, else on
-    // macOS the live mountpoint under it makes remove_dir_all fail with "Resource
-    // busy", stranding both the mount and the data dir. Unconditional on purpose:
-    // the embedded record may carry no source_smolmachine even when a CLI/API create
-    // mounted this name's volume. hdiutil detach; a no-op on Linux and when nothing
-    // is mounted.
-    smolvm_pack::extract::force_detach_layers_volume(&crate::agent::machine_layers_cache_dir(name));
-    if data_dir.exists() {
-        std::fs::remove_dir_all(&data_dir).map_err(|e| {
-            Error::storage(
-                "delete machine data",
-                format!("{}: {}", data_dir.display(), e),
-            )
-        })?;
-    }
-
-    // With the child gone, its parent may hold a RAM generation, disk layers
-    // and a macOS layers mount that nothing references any more.
-    if let Some(parent) = removed.golden.as_deref() {
-        if let Err(error) =
-            crate::agent::fork::collect_parent_generations_after_child_delete(db, parent)
-        {
-            tracing::warn!(%parent, %error, "could not collect unreferenced fork generation");
-        }
-    }
-
-    Ok(())
+    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    crate::deletion::delete_machine_locked(db, &record, None, false, false)
 }
 
 /// Reclaim shim-managed sandbox VMs whose process is gone. After a node reboot

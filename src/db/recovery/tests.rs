@@ -278,3 +278,153 @@ fn recovery_reviews_competing_owners_of_disks_outside_the_runtime_directory() {
         },
     );
 }
+
+#[test]
+fn deletion_keeps_identity_and_disk_fences_after_stopped_publication() {
+    isolated(
+        "deletion_keeps_identity_and_disk_fences_after_stopped_publication",
+        || {
+            let (db, record) = fixture();
+            let mut guard = db.reserve_vm_recovery(&record).unwrap();
+            guard.prepare_delete().unwrap();
+            let stopped = db.get_vm(&record.name).unwrap().unwrap();
+            assert_eq!(stopped.state, crate::config::RecordState::Stopped);
+            assert!(stopped.restart.user_stopped);
+            assert_eq!(stopped.database_identity, record.database_identity);
+            let raw = Connection::open(&db.path).unwrap();
+            assert!(raw
+                .execute("DELETE FROM vms WHERE name=?1", [&record.name])
+                .is_err());
+            assert!(raw
+                .execute("UPDATE vms SET data=data WHERE name=?1", [&record.name])
+                .is_err());
+            assert!(db.reserve_vm_recovery(&stopped).is_err());
+            assert!(db
+                .admit_workload_mutation(None, &[guard.runtime_dir().to_path_buf()])
+                .is_err());
+            let other = VmRecord::new("unrelated-delete".into(), 1, 128, vec![], vec![], false);
+            db.insert_vm(&other.name, &other).unwrap();
+            guard.finish_delete().unwrap();
+            assert!(db.get_vm(&record.name).unwrap().is_none());
+            assert!(db.get_vm(&other.name).unwrap().is_some());
+            db.insert_vm(&record.name, &record).unwrap();
+            assert_ne!(
+                db.get_vm(&record.name).unwrap().unwrap().database_identity,
+                record.database_identity
+            );
+        },
+    );
+}
+
+#[test]
+fn failed_owned_deletion_preserves_stopped_record_and_storage_for_retry() {
+    isolated(
+        "failed_owned_deletion_preserves_stopped_record_and_storage_for_retry",
+        || {
+            let (db, record) = fixture();
+            let runtime = crate::agent::vm_data_dir(&record.name);
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            fs::write(&runtime, b"not a directory").unwrap();
+            assert!(
+                crate::deletion::delete_machine_locked(&db, &record, None, true, false).is_err()
+            );
+            let stopped = db.get_vm(&record.name).unwrap().unwrap();
+            assert!(stopped.restart.user_stopped);
+            assert_eq!(stopped.state, crate::config::RecordState::Stopped);
+            assert_eq!(fs::read(&runtime).unwrap(), b"not a directory");
+            assert!(db.reserve_vm_recovery(&stopped).is_ok());
+            fs::remove_file(&runtime).unwrap();
+            fs::create_dir(&runtime).unwrap();
+            fs::write(runtime.join("storage.raw"), b"saved").unwrap();
+            crate::deletion::delete_machine_locked(&db, &stopped, None, true, false).unwrap();
+            assert!(!runtime.exists());
+            assert!(db.get_vm(&record.name).unwrap().is_none());
+        },
+    );
+}
+
+#[test]
+fn reviewed_deletion_refuses_a_replacement_before_touching_storage() {
+    isolated(
+        "reviewed_deletion_refuses_a_replacement_before_touching_storage",
+        || {
+            let (db, record) = fixture();
+            db.remove_vm(&record.name).unwrap();
+            db.insert_vm(&record.name, &record).unwrap();
+            let replacement = db.get_vm(&record.name).unwrap().unwrap();
+            let runtime = crate::agent::vm_data_dir(&record.name);
+            fs::create_dir_all(&runtime).unwrap();
+            fs::write(runtime.join("storage.raw"), b"replacement").unwrap();
+            assert!(
+                crate::deletion::delete_machine_locked(&db, &record, None, true, false).is_err()
+            );
+            assert_eq!(
+                fs::read(runtime.join("storage.raw")).unwrap(),
+                b"replacement"
+            );
+            assert_eq!(
+                db.get_vm(&record.name).unwrap().unwrap().database_identity,
+                replacement.database_identity
+            );
+        },
+    );
+}
+
+#[test]
+fn interrupted_owned_deletion_leaves_an_intentional_stop_after_owner_release() {
+    isolated(
+        "interrupted_owned_deletion_leaves_an_intentional_stop_after_owner_release",
+        || {
+            if std::env::var_os("SMOL_DELETE_CRASH_CHILD").is_some() {
+                let db = SmolvmDb::open().unwrap();
+                let record = db.get_vm("recovery-owner").unwrap().unwrap();
+                let mut guard = db.reserve_vm_recovery(&record).unwrap();
+                guard.prepare_delete().unwrap();
+                std::process::exit(77);
+            }
+            let (db, record) = fixture();
+            let status = Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "db::recovery::tests::interrupted_owned_deletion_leaves_an_intentional_stop_after_owner_release", "--test-threads=1"])
+                .env("SMOL_DELETE_CRASH_CHILD", "1")
+                .status().unwrap();
+            assert_eq!(status.code(), Some(77));
+            let reopened = SmolvmDb::open_at(&db.path).unwrap();
+            let stopped = reopened.get_vm(&record.name).unwrap().unwrap();
+            assert!(stopped.restart.user_stopped);
+            assert_eq!(stopped.state, crate::config::RecordState::Stopped);
+            crate::deletion::delete_machine_locked(&reopened, &stopped, None, true, false).unwrap();
+            assert!(reopened.get_vm(&record.name).unwrap().is_none());
+        },
+    );
+}
+
+#[cfg(unix)]
+#[test]
+fn deletion_refuses_symlinked_runtime_without_touching_its_target() {
+    isolated(
+        "deletion_refuses_symlinked_runtime_without_touching_its_target",
+        || {
+            let (db, record) = fixture();
+            let runtime = crate::agent::vm_data_dir(&record.name);
+            let other = tempfile::tempdir().unwrap();
+            fs::write(other.path().join("storage.raw"), b"other machine").unwrap();
+            fs::create_dir_all(runtime.parent().unwrap()).unwrap();
+            std::os::unix::fs::symlink(other.path(), &runtime).unwrap();
+            assert!(
+                crate::deletion::delete_machine_locked(&db, &record, None, true, false)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("symlink")
+            );
+            assert_eq!(
+                fs::read(other.path().join("storage.raw")).unwrap(),
+                b"other machine"
+            );
+            assert!(db.get_vm(&record.name).unwrap().is_some());
+            assert!(fs::symlink_metadata(runtime)
+                .unwrap()
+                .file_type()
+                .is_symlink());
+        },
+    );
+}

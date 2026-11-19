@@ -4834,6 +4834,36 @@ impl AgentManager {
         operation.finish_stop()
     }
 
+    /// Retain control ownership after shutdown for destructive deletion.
+    pub(crate) fn stop_for_deletion(
+        &self,
+        record: &crate::config::VmRecord,
+    ) -> Result<crate::db::VmRecoveryGuard> {
+        let mut operation = self.reserve_control_operation()?;
+        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
+        if resolved == crate::config::RecordState::Running {
+            crate::staged_mount::sync_with_operation(record, self, &operation)?;
+        } else if resolved == crate::config::RecordState::Unreachable
+            && !record.staged_mounts.is_empty()
+        {
+            return Err(Error::agent_conflict(
+                "delete machine",
+                "machine has unsynchronized staged mounts but its agent is unreachable",
+            ));
+        }
+        self.stop_owned(
+            &operation,
+            matches!(
+                resolved,
+                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
+            ),
+            Some(Duration::ZERO),
+        )?;
+        operation._ownership.take().ok_or_else(|| {
+            Error::agent_conflict("delete machine", "deletion requires a reviewed machine")
+        })
+    }
+
     /// Stop a machine whose guest is paused and already quiesced.
     ///
     /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its

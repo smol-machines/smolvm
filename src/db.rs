@@ -16,7 +16,7 @@ use crate::pool::{
     ForkPoolSlotRecord, ForkPoolSlotState,
 };
 use parking_lot::{Condvar, Mutex};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -550,51 +550,7 @@ impl SmolvmDb {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin vm removal")?;
 
-            launch_admission::revoke_removed_member(&tx, name)?;
-
-            let data: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT data FROM vms WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .db_err(format!("get vm '{}'", name))?;
-
-            let record = match data {
-                Some(bytes) => {
-                    let r: VmRecord = serde_json::from_slice(&bytes)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
-                    tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
-                        .db_err(format!("remove vm '{}'", name))?;
-                    // Reusing a name starts a new lifetime; delayed requests
-                    // from the deleted machine must never capture it.
-                    tx.execute(
-                        "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
-                        params![name],
-                    ).db_err("retire deleted machine's pause intents")?;
-                    tx.execute(
-                        "DELETE FROM vm_resize_intents WHERE name = ?1",
-                        params![name],
-                    )
-                    .db_err("remove VM resize intent")?;
-                    tx.execute(
-                        "DELETE FROM vm_resize_receipts WHERE name = ?1",
-                        params![name],
-                    )
-                    .db_err("remove VM resize receipts")?;
-                    // A retained checkpoint only means anything while its golden
-                    // process is alive, so it dies with the record rather than
-                    // waiting for a sweep that only the pool controller runs.
-                    tx.execute(
-                        "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
-                        params![name],
-                    )
-                    .db_err(format!("remove retained fork snapshot for '{}'", name))?;
-                    Some(r)
-                }
-                None => None,
-            };
+            let record = Self::remove_vm_in_transaction(&tx, name)?;
 
             tx.commit().db_err("commit vm removal")?;
             Ok(record)
@@ -604,6 +560,61 @@ impl SmolvmDb {
                 crate::usage::on_remove(name, record);
             }
         })
+    }
+
+    /// Shared by ordinary removal and an operation retaining execution ownership.
+    pub(super) fn remove_vm_in_transaction(
+        tx: &Transaction<'_>,
+        name: &str,
+    ) -> Result<Option<VmRecord>> {
+        launch_admission::revoke_removed_member(tx, name)?;
+
+        let data: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT data FROM vms WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .db_err(format!("get vm '{}'", name))?;
+
+        let record = match data {
+            Some(bytes) => {
+                let r: VmRecord = serde_json::from_slice(&bytes)
+                    .db_err(format!("deserialize vm record '{}'", name))?;
+                tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
+                    .db_err(format!("remove vm '{}'", name))?;
+                // Reusing a name starts a new lifetime; delayed requests
+                // from the deleted machine must never capture it.
+                tx.execute(
+                    "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
+                    params![name],
+                )
+                .db_err("retire deleted machine's pause intents")?;
+                tx.execute(
+                    "DELETE FROM vm_resize_intents WHERE name = ?1",
+                    params![name],
+                )
+                .db_err("remove VM resize intent")?;
+                tx.execute(
+                    "DELETE FROM vm_resize_receipts WHERE name = ?1",
+                    params![name],
+                )
+                .db_err("remove VM resize receipts")?;
+                // A retained checkpoint only means anything while its golden
+                // process is alive, so it dies with the record rather than
+                // waiting for a sweep that only the pool controller runs.
+                tx.execute(
+                    "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
+                    params![name],
+                )
+                .db_err(format!("remove retained fork snapshot for '{}'", name))?;
+                Some(r)
+            }
+            None => None,
+        };
+
+        Ok(record)
     }
 
     /// List all VM records, ordered by name so every listing of the same

@@ -6110,105 +6110,24 @@ pub(crate) async fn delete_one(
     .await
 }
 
-/// Remove a stopped machine's data directory, retrying while something is
-/// still adding entries to it. A delete under heavy guest I/O has failed with
-/// "Directory not empty" and then succeeded seconds later, so the writer
-/// settles: retry for a short while, and name what was left each time so the
-/// writer can be found.
-fn remove_data_dir_settling(name: &str, data_dir: &std::path::Path) -> std::io::Result<()> {
-    const ATTEMPTS: u32 = 6;
-    let mut attempt = 1;
-    loop {
-        match std::fs::remove_dir_all(data_dir) {
-            Ok(()) => return Ok(()),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error)
-                if error.kind() == std::io::ErrorKind::DirectoryNotEmpty && attempt < ATTEMPTS =>
-            {
-                tracing::warn!(
-                    machine = name,
-                    attempt,
-                    left = %data_dir_entries(data_dir).join(", "),
-                    "machine data directory gained entries while it was removed; retrying"
-                );
-                std::thread::sleep(std::time::Duration::from_millis(250 << attempt.min(4)));
-                attempt += 1;
-            }
-            Err(error) => return Err(error),
-        }
-    }
-}
-
-/// Up to 20 paths still under `dir`, relative to it, for a removal diagnostic.
-fn data_dir_entries(dir: &std::path::Path) -> Vec<String> {
-    let mut found = Vec::new();
-    let mut pending = vec![dir.to_path_buf()];
-    while let Some(next) = pending.pop() {
-        let Ok(entries) = std::fs::read_dir(&next) else {
-            continue;
-        };
-        for entry in entries.flatten() {
-            let path = entry.path();
-            found.push(
-                path.strip_prefix(dir)
-                    .unwrap_or(&path)
-                    .display()
-                    .to_string(),
-            );
-            if found.len() >= 20 {
-                return found;
-            }
-            if entry.file_type().is_ok_and(|kind| kind.is_dir()) {
-                pending.push(path);
-            }
-        }
-    }
-    found
-}
-
-// Called with the lifecycle and fork-source locks held, after confirmed shutdown.
-// Keep filesystem and database I/O on the blocking thread.
+#[cfg(test)]
 fn remove_machine_data_and_record(
     state: &ApiState,
     name: &str,
     data_dir: &std::path::Path,
 ) -> Result<(), ApiError> {
-    match std::fs::symlink_metadata(data_dir) {
-        Ok(_) => {
-            // Shutdown was confirmed before entering this helper. Release the
-            // uid before removing its .vm-uid file, as in CLI deletion.
-            crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), data_dir);
-            remove_data_dir_settling(name, data_dir).map_err(|error| {
-                ApiError::internal(format!(
-                    "failed to remove data for machine '{name}': {error}; repair host storage and retry deletion"
-                ))
-            })?;
-            // Layers a pause pinned beside the data directory go with it.
-            if let Err(error) = crate::portable_checkpoint::remove_paused_layers(data_dir) {
-                tracing::warn!(machine = name, %error, "could not remove pinned layers");
-            }
-        }
-        // Storage may already be gone after an interrupted delete or DB failure.
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        // Path::exists would hide permission and I/O errors as absence.
-        Err(error) => {
-            return Err(ApiError::internal(format!(
-                "failed to inspect data for machine '{name}': {error}; retry deletion after resolving the error"
-            )));
-        }
-    }
-    match state.remove_machine(name) {
-        Ok(_) => Ok(()),
-        Err(ApiError::NotFound(_)) => {
-            // Startup recovery can leave a record without an in-memory entry.
-            let removed = state.db().remove_vm(name).map_err(ApiError::database)?;
-            if removed.is_none() {
-                return Err(ApiError::NotFound(format!("machine '{name}' not found")));
-            }
-            Ok(())
-        }
-        Err(error) => Err(error),
-    }
+    let record = state
+        .db()
+        .get_vm(name)?
+        .ok_or_else(|| ApiError::NotFound(name.into()))?;
+    let mut ownership = state
+        .db()
+        .reserve_vm_control(&record, data_dir, &[])
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    ownership.prepare_delete()?;
+    crate::deletion::remove_owned_data_and_record(state.db(), ownership, name)
+        .map_err(|e| ApiError::internal(e.to_string()))?;
+    Ok(())
 }
 
 async fn delete_one_transaction(
@@ -6254,141 +6173,35 @@ async fn delete_one_transaction(
         }
     }
 
-    // A running staged mount owns state that is newer than its host source.
-    // Flush it before delete; on failure leave both the VM and its data dir
-    // intact so the caller can repair and retry.
-    if !record.staged_mounts.is_empty() {
-        match crate::agent::state_probe::resolve_state(&name, &record) {
-            RecordState::Running => {
-                let sync_record = record.clone();
-                tokio::task::spawn_blocking(move || {
-                    crate::staged_mount::sync_running_machine(&sync_record)
-                })
-                .await
-                .map_err(|error| ApiError::internal(format!("task error: {error}")))?
-                .map_err(ApiError::from)?;
-            }
-            RecordState::Unreachable => {
-                return Err(ApiError::Conflict(format!(
-                    "machine '{name}' has unsynchronized staged mounts but its agent is unreachable"
-                )));
-            }
-            _ => {}
+    let state_delete = state.clone();
+    let reviewed = record.clone();
+    tokio::task::spawn_blocking(move || {
+        if let Ok(entry) = state_delete.get_machine(&reviewed.name) {
+            let entry = entry.lock();
+            crate::deletion::delete_machine_locked(
+                state_delete.db(),
+                &reviewed,
+                Some(&entry.manager),
+                true,
+                false,
+            )?;
+        } else {
+            crate::deletion::delete_machine_locked(
+                state_delete.db(),
+                &reviewed,
+                None,
+                true,
+                false,
+            )?;
         }
-    }
-
-    // Get PID and start time from database record
-    let pid = record.pid;
-    let pid_start_time = record.pid_start_time;
-
-    // Stop if running (in blocking task)
-    let name_clone = name.clone();
-    let stopped = tokio::task::spawn_blocking(move || {
-        let ok = shutdown_machine_process(&name_clone, pid, pid_start_time, false);
-        if ok {
-            // Process is gone — detach this machine's case-sensitive layers
-            // volume (macOS hdiutil mount; no-op on Linux) before the data dir is
-            // removed below, otherwise `rm -rf` fails with "Resource busy". The
-            // dependent children were checked above; the detach helper also
-            // preserves any remaining child pack references.
-            smolvm_pack::extract::force_detach_layers_volume(
-                &crate::agent::machine_layers_cache_dir(&name_clone),
-            );
-        }
-        ok
+        state_delete.forget_deleted_machine(&reviewed.name)?;
+        Ok::<_, crate::Error>(())
     })
     .await
-    .map_err(|e| ApiError::internal(format!("task error: {}", e)))?;
-
-    if !stopped {
-        return Err(ApiError::Internal(format!(
-            "machine '{}' process (pid {}) is still alive after shutdown; not removing",
-            name,
-            pid.map(|p| p.to_string())
-                .unwrap_or_else(|| "unknown".into()),
-        )));
-    }
-
-    // Re-check for dependent clones now that the golden's process (and its fork
-    // control socket) is down. API forks share the lifecycle lock held here, but
-    // a separate CLI/embedded process has no access to that in-process lock and
-    // could have registered a clone after the initial check. Abort BEFORE
-    // removing the DB record or data dir — the clones' copy-on-write disks are
-    // backed by this golden's disks, so removing them would be silent data loss.
-    // The golden is left stopped with its disks intact; delete the clones and
-    // retry.
-    {
-        let db = state.db().clone();
-        let golden = name.clone();
-        let clones = tokio::task::spawn_blocking(move || db.dependent_clones(&golden))
-            .await
-            .map_err(|e| ApiError::internal(format!("task error: {}", e)))?
-            .map_err(ApiError::database)?;
-        if !clones.is_empty() {
-            return Err(ApiError::Conflict(format!(
-                "machine '{}' gained {} clone(s) during deletion ({}); their disks are backed by \
-                 its disks — delete the clones first",
-                name,
-                clones.len(),
-                clones.join(", ")
-            )));
-        }
-    }
-
-    // Free the machine's data BEFORE the registry write, not after — the same
-    // order `cli::vm_common::remove_vm_data_and_record` uses for the CLI path.
-    //
-    // The registry lives on a filesystem an operator may have sized to share
-    // with VM storage, and a workload that fills it leaves the database with no
-    // room to commit. Removing the record first then needs space the workload
-    // has already taken: the delete fails, the machine is stopped but
-    // undeletable, and every retry hits the same wall. Releasing the disk images
-    // first makes the delete self-financing — it frees far more than the record
-    // removal needs, so cleanup still works on a full disk.
-    let state_rm = state.clone();
-    let name_rm = name.clone();
-    let cleanup = tokio::task::spawn_blocking(move || {
-        remove_machine_data_and_record(&state_rm, &name_rm, &vm_data_dir(&name_rm))
-    })
-    .await
-    .map_err(|e| ApiError::internal(format!("task error: {e}")))?;
-    if let Err(error) = cleanup {
-        // The process is confirmed dead, but its record must survive for retry.
-        // Clear its PID so startup recovery does not discard it as a crashed VM,
-        // and suppress automatic restarts over potentially half-removed disks.
-        if let Ok(entry) = state.get_machine(&name) {
-            entry.lock().restart.user_stopped = true;
-        }
-        reconcile_confirmed_stopped_machine(&state, &record, true)
-            .await
-            .map_err(|reconcile_error| {
-                ApiError::internal(format!(
-                    "cleanup failed: {error:?}; failed to persist stopped state: {reconcile_error:?}"
-                ))
-            })?;
-        return Err(error);
-    }
+    .map_err(|error| ApiError::internal(format!("task error: {error}")))??;
     // The machine may have held the last lease on a shared extraction.
     #[cfg(target_os = "linux")]
     crate::artifact_cache::trim_unleased_shared_packs_soon();
-
-    if let Some(parent) = record.golden.clone() {
-        let db = state.db().clone();
-        let parent_for_log = parent.clone();
-        let cleanup = tokio::task::spawn_blocking(move || {
-            crate::agent::fork::collect_parent_generations_after_child_delete(&db, &parent)
-        })
-        .await;
-        match cleanup {
-            Ok(Ok(())) => {}
-            Ok(Err(error)) => {
-                tracing::warn!(parent = %parent_for_log, %error, "could not collect unreferenced fork generation")
-            }
-            Err(error) => {
-                tracing::warn!(parent = %parent_for_log, %error, "fork-generation cleanup task failed")
-            }
-        }
-    }
 
     crate::credentials::forget_values(&name);
     Ok(DeleteResponse { deleted: name })

@@ -1083,39 +1083,12 @@ impl EmbeddedRuntime {
                 ));
             }
 
-            let state = crate::agent::state_probe::resolve_state(name, &record);
-            if matches!(
-                state,
-                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
-            ) {
-                // Paused vCPUs cannot acknowledge the normal guest shutdown.
-                // Reap the verified VMM directly instead of waiting for a
-                // response that cannot arrive.
-                self.remove_cached_handle(name)?;
-                crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
-            } else if matches!(
-                state,
-                crate::config::RecordState::Stopped
-                    | crate::config::RecordState::Created
-                    | crate::config::RecordState::Paused
-            ) {
-                // A graceful stop already synchronized staged mounts. Do not
-                // reconnect to the now-absent agent and fail a subsequent delete.
-                self.remove_cached_handle(name)?;
-            } else if let Some(handle) = self.cached_handle(name)? {
-                lock_handle(&handle)?.stop_persisted(&record, Some(Duration::ZERO))?;
-                self.remove_cached_handle(name)?;
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.delete_persisted(&self.db, &record)?;
             } else {
-                control::stop_vm_record_with_timeout(&self.db, &record, Some(Duration::ZERO))?;
+                crate::deletion::delete_machine_locked(&self.db, &record, None, true, false)?;
             }
-
-            // Idempotent: deleting an already-deleted machine is a no-op success
-            // (the desired end state — gone — already holds). Lets SDK callers
-            // call delete() more than once without an error.
-            match control::delete_vm_locked(&self.db, name) {
-                Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
-                Err(e) => return Err(e),
-            }
+            self.remove_cached_handle(name)?;
             self.remove_name_lock(name)?;
             Ok(())
         })

@@ -236,6 +236,9 @@ impl SmolvmDb {
             )?;
             let mut paths = super::launch_admission::recovery_paths(&tx, &member, &runtime)?;
             paths.extend(disks.iter().cloned());
+            paths.push(resource_path(
+                &crate::portable_checkpoint::paused_layers_dir(&runtime)?,
+            )?);
             paths.sort();
             paths.dedup();
             super::launch_admission::reconcile_transfer(
@@ -315,6 +318,16 @@ impl VmRecoveryGuard {
     }
 
     pub(crate) fn finish_stop(mut self, user_stopped: bool) -> Result<VmRecord> {
+        self.publish_stopped(user_stopped, false)
+    }
+
+    /// Persist an intentional stop before touching storage while retaining the
+    /// ownership fence. A crash or cleanup error leaves a visible stopped row.
+    pub(crate) fn prepare_delete(&mut self) -> Result<()> {
+        self.publish_stopped(true, true).map(|_| ())
+    }
+
+    fn publish_stopped(&mut self, user_stopped: bool, retain: bool) -> Result<VmRecord> {
         if self.owner != ProcessIdentity::current()? {
             return Err(conflict("recovery belongs to another process"));
         }
@@ -339,6 +352,13 @@ impl VmRecoveryGuard {
             {
                 return Err(conflict("machine execution changed during recovery"));
             }
+            let saved_owner: Vec<u8> = tx
+                .query_row(
+                    "SELECT data FROM vm_recovery_owners WHERE name=?1 AND token=?2",
+                    params![self.record.name, self.token],
+                    |r| r.get(0),
+                )
+                .db_err("read retained deletion ownership")?;
             let mut after = before.clone();
             // Member::read decodes stored fields only. Return the original
             // database review whose identity was validated in this transaction.
@@ -360,12 +380,70 @@ impl VmRecoveryGuard {
                 ],
             )
             .db_err("publish recovered machine")?;
+            if retain {
+                let (member, _) = Member::read(&tx, &self.record.name)?;
+                let mut saved: Recovery = serde_json::from_slice(&saved_owner)
+                    .db_err("decode retained deletion ownership")?;
+                saved.member = member;
+                tx.execute(
+                    "INSERT INTO vm_recovery_owners(name,token,data) VALUES (?1,?2,?3)",
+                    params![
+                        self.record.name,
+                        self.token,
+                        serde_json::to_vec(&saved).db_err("encode deletion ownership")?
+                    ],
+                )
+                .db_err("retain deletion ownership")?;
+            }
             tx.commit().db_err("commit recovery completion")?;
             Ok((before, after))
         })?;
-        self.active = false;
+        self.active = retain;
         crate::usage::on_update(&self.record.name, &before, &after);
+        self.record = after.clone();
         Ok(after)
+    }
+
+    /// Remove the reviewed row only after its captured storage has been removed.
+    pub(crate) fn finish_delete(mut self) -> Result<VmRecord> {
+        if self.owner != ProcessIdentity::current()? {
+            return Err(conflict("deletion belongs to another process"));
+        }
+        let removed = self.db.with_durable_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin owned deletion")?;
+            let token: Option<String> = tx
+                .query_row(
+                    "SELECT token FROM vm_recovery_owners WHERE name=?1",
+                    [&self.record.name],
+                    |r| r.get(0),
+                )
+                .optional()
+                .db_err("read deletion owner")?;
+            if token.as_deref() != Some(&self.token) {
+                return Err(conflict("deletion ownership changed"));
+            }
+            LaunchReview::from_record(&self.record)?.validate_conn(&self.db, &tx)?;
+            let (_, current) = Member::read(&tx, &self.record.name)?;
+            if (current.pid, current.pid_start_time)
+                != (self.record.pid, self.record.pid_start_time)
+            {
+                return Err(conflict("machine execution changed during deletion"));
+            }
+            tx.execute(
+                "DELETE FROM vm_recovery_owners WHERE name=?1 AND token=?2",
+                params![self.record.name, self.token],
+            )
+            .db_err("release deletion ownership")?;
+            let removed = SmolvmDb::remove_vm_in_transaction(&tx, &self.record.name)?
+                .ok_or_else(|| conflict("deleted machine disappeared"))?;
+            tx.commit().db_err("commit owned deletion")?;
+            Ok(removed)
+        })?;
+        self.active = false;
+        crate::usage::on_remove(&self.record.name, &removed);
+        Ok(removed)
     }
 }
 

@@ -104,6 +104,18 @@ fn failed_cached_stop_and_delete_preserve_the_guest_for_retry() {
                 .user_stopped
         );
         exec("printf retry > /staged/value");
+        let snapshots = crate::agent::vm_data_dir(name).join("s");
+        std::fs::write(&snapshots, b"invalid snapshot directory").unwrap();
+        assert!(runtime.delete_machine(name).is_err());
+        let stopped = runtime.db.get_vm(name).unwrap().unwrap();
+        assert!(!stopped.is_process_alive());
+        assert!(stopped.restart.user_stopped);
+        assert_eq!(stopped.state, crate::config::RecordState::Stopped);
+        assert_eq!(
+            std::fs::read_to_string(host.join("value")).unwrap(),
+            "retry"
+        );
+        std::fs::remove_file(snapshots).unwrap();
         runtime.delete_machine(name).unwrap();
         assert_eq!(
             std::fs::read_to_string(host.join("value")).unwrap(),

@@ -4925,7 +4925,7 @@ fn remove_paused_disks_marker(vm_data: &Path) -> Result<()> {
 /// Where a paused machine pins the backing layers its artifact references:
 /// beside its data directory, like [`paused_disks_marker`], so its VMM cannot
 /// replace them.
-fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
+pub(crate) fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
     match (vm_data.parent(), vm_data.file_name()) {
         (Some(parent), Some(name)) => {
             Ok(parent.join(format!(".{}{PAUSED_LAYERS_SUFFIX}", name.to_string_lossy())))

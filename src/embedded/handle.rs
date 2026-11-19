@@ -140,6 +140,16 @@ impl VmHandle {
         crate::staged_mount::sync_with_manager(record, &self.manager)
     }
 
+    pub(crate) fn delete_persisted(
+        &mut self,
+        db: &crate::db::SmolvmDb,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        crate::deletion::delete_machine_locked(db, record, Some(&self.manager), true, false)?;
+        self.client = None;
+        Ok(())
+    }
+
     pub(crate) fn stop_persisted(
         &mut self,
         record: &VmRecord,
