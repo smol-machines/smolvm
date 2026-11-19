@@ -1329,6 +1329,24 @@ fn safe_unpack_skipping<R: Read>(
         let is_regular =
             entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse;
 
+        // Where the entry lands, resolved without leaving `dest`: a link in
+        // its path is followed inside `dest`, as the guest will see it. Only a
+        // link entry may stand where a link already is; anything else there
+        // would be extracted, chmodded and chowned through it, onto a host path.
+        let landed = resolve_in_root(dest, &entry_path, false)?;
+        if entry_type != tar::EntryType::Symlink
+            && fs::symlink_metadata(&landed).is_ok_and(|m| m.file_type().is_symlink())
+        {
+            report.skipped += 1;
+            continue;
+        }
+        let streamed_sparse = entry_type == tar::EntryType::GNUSparse
+            || (is_regular && entry.header().size().unwrap_or(0) >= limits.sparse_threshold);
+        // The sparse paths write `full_path` themselves, after checking that
+        // its parents stay inside `dest`; every other entry is written by the
+        // tar crate, and smolvm then acts only on where it landed.
+        let full_path = if streamed_sparse { full_path } else { landed };
+
         // Read the owner off the header before the entry is consumed: the
         // sparse path streams `entry` to exhaustion, after which the header is
         // still available but reading it here keeps both branches symmetric.
@@ -1384,23 +1402,32 @@ fn safe_unpack_skipping<R: Read>(
             }
             set_owner(&full_path, host_uid, host_gid);
         } else {
-            if let Err(e) = entry.unpack_in(dest) {
-                // On macOS, certain entries fail to unpack due to platform
-                // limitations (xattr encoding, uid/gid mapping, resource forks).
-                // For non-Regular entries (symlinks, hardlinks, dirs), skip and
-                // continue rather than aborting the entire extraction.
-                //
-                // Only for the errors that leniency is meant for, though: a
-                // destination that has stopped accepting writes must abort,
-                // or the extraction reports success on a half-written tree.
-                if !is_regular && is_platform_unpack_quirk(&e) {
+            match entry.unpack_in(dest) {
+                Ok(true) => {}
+                // The tar crate declined the entry (a `..` component): it wrote
+                // nothing, so there is nothing to give a mode or owner.
+                Ok(false) => {
                     report.skipped += 1;
                     continue;
                 }
-                return Err(std::io::Error::new(
-                    e.kind(),
-                    format!("failed to unpack '{}': {}", entry_path.display(), e),
-                ));
+                Err(e) => {
+                    // On macOS, certain entries fail to unpack due to platform
+                    // limitations (xattr encoding, uid/gid mapping, resource forks).
+                    // For non-Regular entries (symlinks, hardlinks, dirs), skip and
+                    // continue rather than aborting the entire extraction.
+                    //
+                    // Only for the errors that leniency is meant for, though: a
+                    // destination that has stopped accepting writes must abort,
+                    // or the extraction reports success on a half-written tree.
+                    if !is_regular && is_platform_unpack_quirk(&e) {
+                        report.skipped += 1;
+                        continue;
+                    }
+                    return Err(std::io::Error::new(
+                        e.kind(),
+                        format!("failed to unpack '{}': {}", entry_path.display(), e),
+                    ));
+                }
             }
 
             // After extracting a directory, force it writable so subsequent
@@ -8305,6 +8332,78 @@ mod tests {
     }
 
     /// A layer's link to a host path (`abs -> /home/me`) names the image's own
+    /// A pack that plants a link to a host directory must not reach it through
+    /// a later entry: a directory entry standing on the link, or a `..` name
+    /// beneath it, never changes the host directory's mode.
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn entries_through_a_planted_link_leave_host_modes_alone() {
+        use std::os::unix::fs::PermissionsExt;
+        for owner_xattr in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            if owner_xattr && !user_xattrs_supported(root.path()) {
+                continue;
+            }
+            let host = root.path().join("host");
+            fs::create_dir_all(host.join("inner")).unwrap();
+            fs::set_permissions(&host, fs::Permissions::from_mode(0o700)).unwrap();
+            fs::set_permissions(host.join("inner"), fs::Permissions::from_mode(0o700)).unwrap();
+            let host_abs = host.canonicalize().unwrap();
+
+            let mut builder = tar::Builder::new(Vec::new());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_mode(0o777);
+            link.set_size(0);
+            link.set_link_name(&host_abs).unwrap();
+            link.set_cksum();
+            builder.append_data(&mut link, "data", &b""[..]).unwrap();
+            let mut inner = tar::Header::new_gnu();
+            inner.set_entry_type(tar::EntryType::Symlink);
+            inner.set_mode(0o777);
+            inner.set_size(0);
+            inner.set_link_name(host_abs.join("inner")).unwrap();
+            inner.set_cksum();
+            builder.append_data(&mut inner, "a", &b""[..]).unwrap();
+            // A directory entry standing on the link.
+            let mut dir = tar::Header::new_gnu();
+            dir.set_entry_type(tar::EntryType::Directory);
+            dir.set_mode(0o777);
+            dir.set_size(0);
+            dir.set_cksum();
+            builder.append_data(&mut dir, "data/", &b""[..]).unwrap();
+            // `a/../` resolves, through the link, to the host directory. The
+            // tar crate refuses to write such names, so set it in the header.
+            let mut dotdot = tar::Header::new_gnu();
+            dotdot.set_entry_type(tar::EntryType::Directory);
+            dotdot.set_mode(0o777);
+            dotdot.set_size(0);
+            dotdot.as_old_mut().name[..5].copy_from_slice(b"a/../");
+            dotdot.set_cksum();
+            builder.append(&dotdot, &b""[..]).unwrap();
+            let tar_bytes = builder.into_inner().unwrap();
+
+            let dest = root.path().join("layer");
+            fs::create_dir(&dest).unwrap();
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let _ = safe_unpack_with_policy(
+                &mut archive,
+                &dest,
+                &SafeUnpackLimits::from_env(),
+                false,
+                owner_xattr,
+            );
+            let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode(&host), 0o700, "owner_xattr={owner_xattr}");
+            assert_eq!(
+                mode(&host.join("inner")),
+                0o700,
+                "owner_xattr={owner_xattr}"
+            );
+            assert!(!host.join("x").exists(), "owner_xattr={owner_xattr}");
+        }
+    }
+
     /// path: whiteouts beneath it land inside the layer, never on the host.
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
