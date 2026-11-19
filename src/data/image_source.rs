@@ -371,7 +371,9 @@ pub fn is_local_ref(reference: &str) -> bool {
 /// directory may be gone if the archive cache was pruned — `start` then fails
 /// with a clear "no such directory" rather than silently pulling.
 pub fn packed_layers_dir_for_ref(reference: &str) -> Option<PathBuf> {
-    if let Some(hash) = reference.strip_prefix(LOCAL_ARCHIVE_PREFIX) {
+    if reference.starts_with(LOCAL_ARCHIVE_PREFIX) {
+        // A key is one name in the cache, never a path out of it.
+        let hash = local_archive_hash(reference)?;
         return archive_cache_base().ok().map(|base| base.join(hash));
     }
     reference.strip_prefix(LOCAL_DIR_PREFIX).map(PathBuf::from)
@@ -519,6 +521,26 @@ fn too_large(bytes: u64) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A `local:` key is one name in the archive cache, never a path out of it.
+    #[test]
+    fn a_local_archive_key_never_leaves_the_cache() {
+        for bad in [
+            "local:/etc",
+            "local:../../.ssh",
+            "local:a/b",
+            "local:..",
+            "local:",
+        ] {
+            assert_eq!(packed_layers_dir_for_ref(bad), None, "{bad}");
+        }
+        if let Ok(base) = archive_cache_base() {
+            assert_eq!(
+                packed_layers_dir_for_ref("local:abc123"),
+                Some(base.join("abc123"))
+            );
+        }
+    }
 
     #[test]
     fn only_a_staged_archive_reference_has_an_archive_key() {

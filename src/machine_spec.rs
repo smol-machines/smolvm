@@ -1111,6 +1111,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 ));
             }
             let pack = PackDefaults::of(manifest);
+            // A pack's local image is where its author built it. It is only a
+            // label when the pack ships the layers; with none, a start would
+            // share that host path as the guest's root filesystem.
+            if manifest.assets.layers.is_empty() {
+                refuse_artifact_local_dir(pack.image.as_deref())?;
+            }
             let packed_egress = crate::pack_export::validated_manifest_egress(manifest)?;
             let packed_egress = if caller == Caller::Cli {
                 packed_egress.with_cli_overrides(
@@ -1230,6 +1236,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             let pack = PackDefaults::of(manifest);
             let captured_net = checkpoint.network.clone().unwrap_or_default();
             let workload = checkpoint.workload.as_ref();
+            refuse_artifact_local_dir(workload.map(|workload| workload.image.as_str()))?;
 
             // The workload: already running, so its command, user and init
             // are the checkpoint's.
@@ -1883,6 +1890,23 @@ impl ResolvedSpec {
             fork_env: Vec::new(),
             runtime_managed,
         })
+    }
+}
+
+/// Refuse an artifact's image that is a `local-dir:` rootfs directory. The
+/// path was written on the artifact author's host; on this one a start would
+/// share whatever directory it names with the guest, `/` included. (A
+/// `local:` archive key resolves only inside this host's archive cache.)
+fn refuse_artifact_local_dir(image: Option<&str>) -> Result<()> {
+    match image {
+        Some(image) if image.starts_with("local-dir:") => Err(Error::config(
+            "create machine",
+            format!(
+                "this artifact's image is a directory on the host that made it ({image}); \
+                 create the machine from that directory with --image instead"
+            ),
+        )),
+        _ => Ok(()),
     }
 }
 
