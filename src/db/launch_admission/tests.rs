@@ -321,9 +321,14 @@ fn startup_deletion_revokes_ticket_even_when_name_generation_is_reused() {
     let reservation = db
         .reserve_vm_launch(Some(record.clone()), &storage, &[], &[])
         .unwrap();
+    let token = reservation.ticket.token.clone();
+    assert!(db.remove_vm("web").is_err());
+    assert!(db.get_vm("web").unwrap().is_some());
+    assert_eq!(fs::read(&storage).unwrap(), b"untouched");
+    drop(reservation);
     db.remove_vm("web").unwrap().unwrap();
     assert!(db.insert_vm_if_not_exists("web", &record).unwrap());
-    assert!(db.admit_vm_boot(&reservation.ticket.token).is_err());
+    assert!(db.admit_vm_boot(&token).is_err());
     assert!(db.get_vm("web").unwrap().unwrap().pid.is_none());
 }
 

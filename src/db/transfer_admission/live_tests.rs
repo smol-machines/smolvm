@@ -90,6 +90,29 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
         let before = db.get_vm(names[0]).unwrap().unwrap();
         let outside = db.get_vm(names[1]).unwrap().unwrap();
         assert!(before.is_process_alive() && outside.is_process_alive());
+        // Inventory and connection handles must not prepare a running disk.
+        // An explicit growth request must refuse while its owner is alive.
+        let observer = crate::agent::AgentManager::for_vm(names[0]).unwrap();
+        observer.detach();
+        let storage = observer.storage_path().to_path_buf();
+        let size = storage.metadata().unwrap().len();
+        assert!(crate::agent::AgentManager::for_vm_with_sizes(names[0], Some(2), Some(2)).is_err());
+        assert_eq!(storage.metadata().unwrap().len(), size);
+        drop(crate::embedded::control::connect_vm(&db, names[0]).unwrap());
+        for operation in ["images", "prune"] {
+            let (ok, _, error) = command(&[operation, "--name", names[0]]);
+            assert!(ok, "{operation}: {error}");
+        }
+        let observed = crate::api::state::ApiState::with_db(db.clone());
+        assert!(observed
+            .load_persisted_machines()
+            .iter()
+            .any(|name| name == names[0]));
+        assert_eq!(storage.metadata().unwrap().len(), size);
+        assert_eq!(
+            Member::from_record(names[0], &before),
+            Member::from_record(names[0], &db.get_vm(names[0]).unwrap().unwrap())
+        );
         // A failed probe during boot can leave a stale Unreachable record.
         // Once the guest responds, recovery must not force-kill it merely
         // because that earlier observation was persisted.

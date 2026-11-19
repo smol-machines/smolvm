@@ -665,14 +665,14 @@ pub(super) fn reconcile_transfer(
     Ok(())
 }
 
-/// Deletion must revoke delayed children atomically with name removal. A live
-/// admitted child must be stopped first, even if another writer lost its PID.
+/// Deletion must wait for a live controller's preparation or an admitted child
+/// to finish, then revoke delayed children atomically with name removal.
 pub(super) fn revoke_removed_member(tx: &Transaction<'_>, name: &str) -> Result<()> {
     for (token, launch) in rows(tx)? {
         if launch.name() != Some(name) {
             continue;
         }
-        if !launch.purpose.is_boot() && launch.owner.may_be_alive() {
+        if launch.child.is_none() && launch.owner.may_be_alive() {
             return Err(conflict("disk preparation is still in progress"));
         }
         if launch
