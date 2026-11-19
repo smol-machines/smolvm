@@ -1141,61 +1141,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem via the root virtiofs tag ("/dev/root").
-        //
-        // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
-        // with KRUN_FS_ROOT_TAG. Use virtiofs3 for both policy states so every
-        // launcher interprets the shared rootfs DAX setting identically.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
-        let root_tag = cstr("/dev/root");
-        let rootfs_dax_window = super::virtiofs::rootfs_dax_window();
-        if rootfs_dax_window == 0 {
-            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "SMOLVM_ROOTFS_DAX=0 requires libkrun with krun_add_virtiofs3",
-                ));
-            };
-
-            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, true) < 0 {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "krun_add_virtiofs3 failed for root filesystem",
-                ));
-            }
-            tracing::info!("rootfs configured via virtiofs without DAX");
-        } else {
-            // Default: restore the 512 MB root DAX window the removed krun_set_root
-            // configured. Plain krun_add_virtiofs passes shm_size=0 (no DAX), which
-            // drops virtiofs to writeback caching and hides the guest's ready-marker
-            // write from the host until the socket-probe grace — a boot-time regression.
-            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "root DAX requires libkrun with krun_add_virtiofs3",
-                ));
-            };
-            if add_virtiofs3(
-                ctx,
-                root_tag.as_ptr(),
-                root.as_ptr(),
-                rootfs_dax_window,
-                true,
-            ) < 0
-            {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "krun_add_virtiofs3 failed for root filesystem",
-                ));
-            }
+        if let Err(error) = super::virtiofs::configure_rootfs(&krun, ctx, &root, true) {
+            krun_free_ctx(ctx);
+            return Err(error);
         }
 
         let network_plan = select_network_plan(

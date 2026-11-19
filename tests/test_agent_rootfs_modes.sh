@@ -202,6 +202,24 @@ test_symlinks_do_not_trip_the_check() {
     return $rc
 }
 
+test_shared_temporary_directories_are_sticky_and_writable() {
+    local root rc=0 path
+    root=$(mktemp -d)
+    make_rootfs_fixture "$root"
+    mkdir -p "$root/tmp" "$root/var/tmp"
+    chmod 0755 "$root/tmp" "$root/var/tmp"
+    normalize_owner_only_modes "$root" >/dev/null || rc=1
+    for path in tmp var/tmp; do
+        if [[ "$(mode_of "$root/$path")" != "1777" ]]; then
+            echo "$path must be writable with the sticky bit"
+            rc=1
+        fi
+    done
+    rm -rf "$root"
+    return "$rc"
+}
+
+run_test "Temporary directories keep sticky write access" test_shared_temporary_directories_are_sticky_and_writable
 run_test "Stock Alpine owner-only paths are widened" test_stock_alpine_paths_are_widened
 run_test "Unexpected owner-only file fails loudly" test_unexpected_owner_only_path_fails_loudly
 run_test "Unexpected owner-only directory fails loudly" test_unexpected_owner_only_directory_fails_loudly
