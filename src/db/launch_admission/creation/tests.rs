@@ -105,7 +105,7 @@ fn stale_creation_cleanup_cannot_remove_a_replacement() {
         .unwrap();
     let new = VmCreationLease::reserve(db.clone(), old.name()).unwrap();
     assert!(
-        !dir.exists(),
+        !dir.join("old").exists(),
         "new creation must discard abandoned preparation"
     );
     crate::agent::ensure_vm_dir(new.name()).unwrap();
@@ -235,11 +235,11 @@ fn crashed_creation_is_recovered_without_reusing_partial_data_or_old_authority()
         .is_err());
     child.0.kill().unwrap();
     child.0.wait().unwrap();
-    db.claim_workload_transfer("recovered", members, &[dir.clone()])
+    db.claim_workload_transfer("recovered", members, std::slice::from_ref(&dir))
         .unwrap();
     db.retire_workload_transfer("recovered").unwrap();
     let fresh = VmCreationLease::reserve(db.clone(), "crashed-import").unwrap();
-    assert!(!dir.exists());
+    assert!(!dir.join("partial").exists());
     assert!(db.admit_vm_boot(&token).is_err());
     assert!(!db
         .commit_reserved_vm("crashed-import", &token, &record("crashed-import"))
@@ -292,4 +292,51 @@ fn legacy_live_creation_does_not_expire_and_pid_reuse_releases_new_ownership() {
         .unwrap());
     db.commit_reserved_vm("legacy", "new-generation", &record("legacy"))
         .unwrap();
+}
+
+#[test]
+fn creation_cleanup_uses_its_captured_directory_after_home_changes() {
+    fn here() {}
+    let Some(root) = isolated(std::any::type_name_of_val(&here)) else {
+        return;
+    };
+    let db = SmolvmDb::open().unwrap();
+    let lease = VmCreationLease::reserve(db, "home-change").unwrap();
+    let old = crate::agent::ensure_vm_dir(lease.name()).unwrap();
+    fs::write(old.join("old"), b"partial old creation").unwrap();
+    std::env::set_var("HOME", root.join("other-home"));
+    std::env::set_var("SMOLVM_DATA_DIR", root.join("other-home"));
+    let new = crate::agent::ensure_vm_dir(lease.name()).unwrap();
+    assert_ne!(old, new);
+    fs::write(new.join("new"), b"unrelated state root").unwrap();
+    assert!(crate::agent::AgentManager::for_vm_creation(&lease, Some(1), Some(1)).is_err());
+    drop(lease);
+    assert!(!old.exists());
+    assert_eq!(fs::read(new.join("new")).unwrap(), b"unrelated state root");
+}
+
+#[cfg(unix)]
+#[test]
+fn creation_refuses_a_symlink_or_unbound_nonempty_directory() {
+    fn here() {}
+    let Some(root) = isolated(std::any::type_name_of_val(&here)) else {
+        return;
+    };
+    let db = SmolvmDb::open().unwrap();
+    let outside = root.join("outside");
+    fs::create_dir(&outside).unwrap();
+    fs::write(outside.join("keep"), b"not creation data").unwrap();
+    let dir = crate::agent::vm_data_dir("symlink");
+    fs::create_dir_all(dir.parent().unwrap()).unwrap();
+    std::os::unix::fs::symlink(&outside, &dir).unwrap();
+    assert!(VmCreationLease::reserve(db.clone(), "symlink").is_err());
+    assert_eq!(
+        fs::read(outside.join("keep")).unwrap(),
+        b"not creation data"
+    );
+    let dir = crate::agent::vm_data_dir("unbound");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("keep"), b"unbound data").unwrap();
+    assert!(VmCreationLease::reserve(db, "unbound").is_err());
+    assert_eq!(fs::read(dir.join("keep")).unwrap(), b"unbound data");
 }

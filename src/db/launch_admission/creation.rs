@@ -16,6 +16,7 @@ struct CreationOwner {
     name: String,
     token: String,
     owner: ProcessIdentity,
+    data_dir: PathBuf,
     committed: AtomicBool,
 }
 
@@ -30,17 +31,19 @@ impl VmCreationLease {
     }
 
     pub(crate) fn from_reserved(db: SmolvmDb, name: &str, token: String) -> Result<Self> {
-        db.check_creation_owner(name, &token)?;
+        let data_dir = db.creation_data_dir(name, &token)?;
         let lease = Self(Arc::new(CreationOwner {
             db,
             name: name.to_owned(),
             token,
             owner: ProcessIdentity::current()?,
+            data_dir,
             committed: AtomicBool::new(false),
         }));
         // An exited creator can leave partial disks or extraction output. A new
         // creation starts clean while it exclusively owns the unpublished name.
         lease.0.cleanup_files()?;
+        crate::agent::ensure_vm_dir_at(&lease.0.data_dir, name)?;
         Ok(lease)
     }
 
@@ -84,6 +87,11 @@ impl VmCreationLease {
         &self,
         paths: &[PathBuf],
     ) -> Result<super::super::transfer_admission::MutationGuard> {
+        if resource_path(&crate::agent::vm_data_dir(self.name()))? != self.0.data_dir {
+            return Err(conflict(
+                "creation state directory changed during preparation",
+            ));
+        }
         let gate = self.db().admit_startup_mutation(Some(self.name()), paths)?;
         let paths = paths
             .iter()
@@ -143,9 +151,24 @@ impl CreationOwner {
         if !self.db.dependent_clones(&self.name)?.is_empty() {
             return Err(conflict("unpublished machine still has dependent clones"));
         }
-        let dir = crate::agent::observe_vm_dir(&self.name)?;
+        let dir = &self.data_dir;
+        let metadata = match dir.symlink_metadata() {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_dir() || metadata.file_type().is_symlink() {
+            return Err(conflict("creation directory is not an owned directory"));
+        }
+        match std::fs::read_to_string(dir.join("name")) {
+            Ok(name) if name == self.name => {}
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    && std::fs::read_dir(dir)?.next().is_none() => {}
+            _ => return Err(conflict("creation directory has no matching name binding")),
+        }
         smolvm_pack::extract::force_detach_layers_volume(&dir.join("pack"));
-        match std::fs::remove_dir_all(&dir) {
+        match std::fs::remove_dir_all(dir) {
             Ok(()) => Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(error) => Err(error.into()),
@@ -206,7 +229,7 @@ impl SmolvmDb {
     /// Reserve a name and its directory until its exact creating process exits
     /// or explicitly publishes/releases it. A live import never expires by age.
     pub fn reserve_vm_create(&self, name: &str, token: &str) -> Result<bool> {
-        crate::data::validate_vm_name(name, "create machine")?;
+        crate::data::validate_vm_name(name, "create machine").map_err(|error| conflict(&error))?;
         if token.is_empty()
             || token.len() > 128
             || !token
@@ -216,13 +239,20 @@ impl SmolvmDb {
             return Err(conflict("invalid creation capability"));
         }
         let dir = crate::agent::vm_data_dir(name);
+        match dir.symlink_metadata() {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(conflict("creation directory cannot be a symlink"))
+            }
+            Err(error) if error.kind() != std::io::ErrorKind::NotFound => return Err(error.into()),
+            _ => {}
+        }
         let mut paths = vec![resource_path(&dir)?];
         for filename in [
             crate::storage::STORAGE_DISK_FILENAME,
             crate::storage::OVERLAY_DISK_FILENAME,
         ] {
             paths.push(resource_path(
-                &crate::agent::manager::resolve_disk_image(&dir, filename).0,
+                &crate::agent::resolve_disk_image(&dir, filename).0,
             )?);
         }
         let _gate = self.admit_startup_mutation(Some(name), &paths)?;
@@ -252,12 +282,15 @@ impl SmolvmDb {
         })
     }
 
-    fn check_creation_owner(&self, name: &str, token: &str) -> Result<()> {
+    fn creation_data_dir(&self, name: &str, token: &str) -> Result<PathBuf> {
         self.with_conn(|conn| {
             let tx = conn.transaction().db_err("inspect creation owner")?;
-            owned_creation(&tx, name, token)?;
-            Ok(())
+            Ok(owned_creation(&tx, name, token)?.storage)
         })
+    }
+
+    fn check_creation_owner(&self, name: &str, token: &str) -> Result<()> {
+        self.creation_data_dir(name, token).map(|_| ())
     }
 
     /// Publish the record and release ownership in one durable transaction.

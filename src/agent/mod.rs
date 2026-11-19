@@ -20,6 +20,7 @@ pub mod launcher_dynamic;
 pub mod live_ports;
 pub mod live_resize;
 mod manager;
+pub(crate) use manager::ensure_vm_dir_at;
 pub mod pod_net;
 pub mod rootfs_store;
 #[cfg(unix)]

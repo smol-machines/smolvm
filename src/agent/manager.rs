@@ -1954,6 +1954,7 @@ impl AgentManager {
         // Launch access may create or grow disks before start_via_subprocess.
         // Observation remains available while a transfer owns the machine.
         let _admission = match access {
+            DiskAccess::Launch { .. } if creation.is_some() => None,
             DiskAccess::Launch { .. } => {
                 Some(crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(&name), &[])?)
             }
