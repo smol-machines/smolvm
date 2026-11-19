@@ -45,12 +45,22 @@ pub const DEVICE_PROFILE_PACKED_LAYERS: &str = "smolvm-packed-layers-v1";
 /// Same image device, with its exact archive carried inside the checkpoint.
 /// Older runtimes must reject this profile instead of trying a registry pull.
 pub const DEVICE_PROFILE_IMAGE_ARCHIVE: &str = "smolvm-image-archive-v1";
+/// Ownership-aware variants make older readers refuse rather than discard
+/// per-mount ownership settings and resume with different file access.
+pub const DEVICE_PROFILE_MOUNT_OWNERSHIP: &str = "smolvm-basic-mount-ownership-v1";
+/// Ownership-aware mounts alongside a packed image layer device.
+pub const DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP: &str = "smolvm-packed-layers-mount-ownership-v1";
+/// Ownership-aware mounts alongside a carried image archive device.
+pub const DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP: &str = "smolvm-image-archive-mount-ownership-v1";
 /// Device profiles understood by this reader; this does not reserve capacity
 /// or waive the CPU, runtime ABI, archive, and device checks during restore.
 pub const SUPPORTED_DEVICE_PROFILES: &[&str] = &[
     DEVICE_PROFILE,
     DEVICE_PROFILE_PACKED_LAYERS,
     DEVICE_PROFILE_IMAGE_ARCHIVE,
+    DEVICE_PROFILE_MOUNT_OWNERSHIP,
+    DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP,
+    DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP,
 ];
 const IMAGE_ARCHIVE_ASSET: &str = "checkpoint/image-archive.tar";
 const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
@@ -742,9 +752,9 @@ pub fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
 pub struct CaptureOptions {
     /// Maximum unreferenced prepared-checkpoint bytes to retain on this node.
     pub prepared_cache_budget_bytes: Option<u64>,
-    /// Keep host directory mounts in the capture. The artifact then restores
-    /// only where the same host paths exist; each is re-attached at its guest
-    /// path. Pause uses this (it resumes on the same host); portable
+    /// Record host directory mounts without copying their contents. Restore
+    /// reattaches the original paths unless given new host paths for those
+    /// guest mounts. Pause uses this for same-host resume; portable
     /// checkpoints opt in with `--host-mounts`.
     pub host_mounts: bool,
     /// Reuse content-addressed objects in this directory and publish a
@@ -1902,12 +1912,28 @@ pub struct CheckpointRequirements {
 }
 
 fn capture_device_profile(vm: &VmRecord) -> &'static str {
-    if vm.packed_layer_source().is_some() {
-        DEVICE_PROFILE_PACKED_LAYERS
-    } else if vm.local_image_layers_dir().is_some() {
-        DEVICE_PROFILE_IMAGE_ARCHIVE
-    } else {
-        DEVICE_PROFILE
+    checkpoint_device_profile(
+        vm.packed_layer_source().is_some(),
+        vm.packed_layer_source().is_none() && vm.local_image_layers_dir().is_some(),
+        &checkpoint_host_mounts(vm),
+    )
+}
+
+fn checkpoint_device_profile(
+    packed: bool,
+    archive: bool,
+    mounts: &[smolvm_pack::format::CheckpointHostMount],
+) -> &'static str {
+    let owned = mounts
+        .iter()
+        .any(|mount| mount.recorded_ownership || mount.owner.is_some());
+    match (archive, packed, owned) {
+        (true, _, true) => DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP,
+        (true, _, false) => DEVICE_PROFILE_IMAGE_ARCHIVE,
+        (false, true, true) => DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP,
+        (false, true, false) => DEVICE_PROFILE_PACKED_LAYERS,
+        (false, false, true) => DEVICE_PROFILE_MOUNT_OWNERSHIP,
+        (false, false, false) => DEVICE_PROFILE,
     }
 }
 
@@ -2708,6 +2734,11 @@ fn capture_with_completion(
     let packed_layers = checkpoint_packed_layers(name, vm)?;
     let host_image = checkpoint_host_image(vm, &snapshot_dir)?;
     let credential_ca = checkpoint_credential_ca(name, vm, &snapshot_dir)?;
+    let host_mounts = if options.host_mounts {
+        checkpoint_host_mounts(vm)
+    } else {
+        Vec::new()
+    };
     manifest.checkpoint = Some(PortableCheckpointManifest {
         version: FORMAT_VERSION,
         runtime_abi: captured_runtime_abi(&host_platform, &snapshot_dir.join("checkpoint.bin"))?
@@ -2734,16 +2765,13 @@ fn capture_with_completion(
             }
             .to_string(),
         ),
-        device_profile: if host_image
-            .as_ref()
-            .is_some_and(|image| image.archive.is_some())
-        {
-            DEVICE_PROFILE_IMAGE_ARCHIVE
-        } else if packed_layers.is_some() || host_image.is_some() {
-            DEVICE_PROFILE_PACKED_LAYERS
-        } else {
-            DEVICE_PROFILE
-        }
+        device_profile: checkpoint_device_profile(
+            packed_layers.is_some() || host_image.is_some(),
+            host_image
+                .as_ref()
+                .is_some_and(|image| image.archive.is_some()),
+            &host_mounts,
+        )
         .to_string(),
         state: describe_asset(
             &snapshot_dir.join("checkpoint.bin"),
@@ -2778,11 +2806,7 @@ fn capture_with_completion(
         disks: checkpoint_disks,
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
-        host_mounts: if options.host_mounts {
-            checkpoint_host_mounts(vm)
-        } else {
-            Vec::new()
-        },
+        host_mounts,
         packed_layers,
         host_image,
         lineage: Some(smolvm_pack::format::CheckpointLineage {
@@ -4206,8 +4230,8 @@ pub fn attach_cached_checkpoint_pack(
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
 ///
 /// `host_mounts` admits host directory mounts: the capture records them and a
-/// restore re-attaches the same host paths, so the artifact is bound to hosts
-/// where they exist. Staged mounts stay unsupported either way.
+/// restore re-attaches their directories, whose contents must be transferred
+/// separately to move hosts. Staged mounts stay unsupported either way.
 pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> {
     let mut unsupported = Vec::new();
     if vm.network_backend == Some(crate::network::NetworkBackend::Host) {
@@ -4283,40 +4307,105 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
 pub fn restored_host_mounts(
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<Vec<(String, String, bool)>> {
+    Ok(restored_host_mounts_at(checkpoint, &[])?
+        .iter()
+        .map(crate::data::storage::HostMount::to_storage_tuple)
+        .collect())
+}
+
+/// Reattach captured devices in their original order, optionally relocating
+/// their host directories. The caller must transfer the directory contents;
+/// a checkpoint does not include them. Guest paths and access stay fixed.
+pub(crate) fn restored_host_mounts_at(
+    checkpoint: &PortableCheckpointManifest,
+    destinations: &[crate::data::storage::HostMount],
+) -> Result<Vec<crate::data::storage::HostMount>> {
+    use crate::data::storage::HostMount;
+
+    HostMount::ensure_unique_targets(destinations)?;
+    let mut targets = std::collections::HashSet::new();
+    for mount in &checkpoint.host_mounts {
+        if !targets.insert(Path::new(&mount.guest_path)) {
+            return Err(Error::config(
+                "restore checkpoint volume mounts",
+                format!("duplicate captured mount target: {}", mount.guest_path),
+            ));
+        }
+    }
+    for destination in destinations {
+        let captured = checkpoint
+            .host_mounts
+            .iter()
+            .find(|mount| Path::new(&mount.guest_path) == destination.target)
+            .ok_or_else(|| {
+                Error::config(
+                    "restore checkpoint volume mounts",
+                    format!(
+                        "{} is not a captured guest mount; restore can only relocate existing mounts",
+                        destination.target.display()
+                    ),
+                )
+            })?;
+        if destination.staged
+            || destination.read_only != captured.read_only
+            || (destination.recorded_ownership && !captured.recorded_ownership)
+            || (destination.owner.is_some() && destination.owner != captured.owner)
+        {
+            return Err(Error::config(
+                "restore checkpoint volume mounts",
+                format!(
+                    "{} must keep its captured access and ownership settings; only its host directory can change",
+                    destination.target.display()
+                ),
+            ));
+        }
+    }
     checkpoint
         .host_mounts
         .iter()
         .map(|mount| {
-            if !Path::new(&mount.host_path).is_dir() {
+            let host = destinations
+                .iter()
+                .find(|destination| destination.target == Path::new(&mount.guest_path))
+                .map(|destination| destination.source.as_path())
+                .unwrap_or_else(|| Path::new(&mount.host_path));
+            if !host.is_dir() {
                 return Err(Error::config(
                     "restore checkpoint",
                     format!(
                         "this checkpoint mounts host directory {} at {}, which does not exist on \
-                         this host; create it or restore where it exists",
-                        mount.host_path, mount.guest_path
+                         this host; transfer its contents here or map the guest mount to their new host directory",
+                        host.display(), mount.guest_path
                     ),
                 ));
             }
-            Ok((
-                mount.host_path.clone(),
-                mount.guest_path.clone(),
-                mount.read_only,
-            ))
+            Ok(HostMount {
+                source: host.to_path_buf(),
+                target: mount.guest_path.clone().into(),
+                read_only: mount.read_only,
+                staged: false,
+                recorded_ownership: mount.recorded_ownership,
+                owner: mount.owner,
+            })
         })
         .collect()
 }
 
 /// Host directory mounts of `vm` as the checkpoint records them.
 fn checkpoint_host_mounts(vm: &VmRecord) -> Vec<smolvm_pack::format::CheckpointHostMount> {
-    vm.mounts
-        .iter()
-        .map(
-            |(host, guest, read_only)| smolvm_pack::format::CheckpointHostMount {
-                host_path: host.clone(),
-                guest_path: guest.clone(),
-                read_only: *read_only,
-            },
-        )
+    vm.host_mounts()
+        .into_iter()
+        .filter(|mount| !mount.staged)
+        .map(|mount| smolvm_pack::format::CheckpointHostMount {
+            host_path: mount.source.to_string_lossy().into_owned(),
+            guest_path: mount.target.to_string_lossy().into_owned(),
+            read_only: mount.read_only,
+            // Keep the persisted policy, not the host-specific flag that
+            // `host_mounts` derives for an owner on Linux. Restoring that
+            // derived flag as global policy would change unrelated mounts.
+            recorded_ownership: vm.recorded_ownership,
+            owner: mount.owner,
+        })
         .collect()
 }
 
@@ -5826,17 +5915,26 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
     if let Some(host) = &checkpoint.host_image {
         validate_embedded_image(host)?;
     }
-    let expected_profile = if checkpoint
-        .host_image
-        .as_ref()
-        .is_some_and(|host| host.archive.is_some())
-    {
-        DEVICE_PROFILE_IMAGE_ARCHIVE
-    } else if mounts_checkpoint_image_layers(checkpoint) {
-        DEVICE_PROFILE_PACKED_LAYERS
-    } else {
-        DEVICE_PROFILE
-    };
+    if let Some(first) = checkpoint.host_mounts.first() {
+        if checkpoint
+            .host_mounts
+            .iter()
+            .any(|mount| mount.recorded_ownership != first.recorded_ownership)
+        {
+            return Err(Error::config(
+                "restore checkpoint mount ownership",
+                "mixed recorded-ownership policies cannot be represented by this runtime",
+            ));
+        }
+    }
+    let expected_profile = checkpoint_device_profile(
+        mounts_checkpoint_image_layers(checkpoint),
+        checkpoint
+            .host_image
+            .as_ref()
+            .is_some_and(|host| host.archive.is_some()),
+        &checkpoint.host_mounts,
+    );
     if checkpoint.device_profile != expected_profile {
         return Err(Error::agent(
             "restore checkpoint",
@@ -9560,6 +9658,7 @@ mod tests {
                 host_path: "/host".to_string(),
                 guest_path: "/guest".to_string(),
                 read_only: true,
+                ..Default::default()
             }]
         );
         // Staged mounts are copies the restore cannot reproduce, with or without.
@@ -9578,6 +9677,147 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_mount_ownership_round_trips_and_requires_an_aware_profile() {
+        let host = tempfile::tempdir().unwrap();
+        let mut record = VmRecord::new(
+            "owned".into(),
+            1,
+            512,
+            vec![(host.path().display().to_string(), "/data".into(), false)],
+            Vec::new(),
+            false,
+        );
+        record.recorded_ownership = true;
+        record.mount_owners = vec![(0, 42001, 42002)];
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.host_mounts = checkpoint_host_mounts(&record);
+        assert!(checkpoint.host_mounts[0].recorded_ownership);
+        assert_eq!(checkpoint.host_mounts[0].owner, Some((42001, 42002)));
+        // Ownership cannot be attached to an old profile that old readers accept.
+        assert!(validate_compatibility(&checkpoint).is_err());
+        checkpoint.device_profile = capture_device_profile(&record).into();
+        assert_eq!(checkpoint.device_profile, DEVICE_PROFILE_MOUNT_OWNERSHIP);
+        validate_compatibility(&checkpoint).unwrap();
+        let wire = serde_json::to_vec(&checkpoint).unwrap();
+        let checkpoint: PortableCheckpointManifest = serde_json::from_slice(&wire).unwrap();
+        let manifest = PackManifest::new(
+            "bare".into(),
+            "sha256:0".into(),
+            "linux/amd64".into(),
+            String::new(),
+        );
+        let restored = restored_record("owned-restored", &manifest, &checkpoint).unwrap();
+        assert!(restored.recorded_ownership);
+        assert_eq!(restored.mount_owners, record.mount_owners);
+        assert_eq!(restored.host_mounts()[0].owner, Some((42001, 42002)));
+        let mut stripped = checkpoint;
+        stripped.host_mounts[0].recorded_ownership = false;
+        stripped.host_mounts[0].owner = None;
+        // Removing the settings without changing the profile is also inconsistent.
+        assert!(validate_compatibility(&stripped).is_err());
+    }
+
+    #[test]
+    fn checkpoint_mount_owner_does_not_change_other_mounts_ownership_policy() {
+        let host = tempfile::tempdir().unwrap();
+        let path = host.path().display().to_string();
+        let mut record = VmRecord::new(
+            "mixed-owners".into(),
+            1,
+            512,
+            vec![
+                (path.clone(), "/owned".into(), false),
+                (path, "/plain".into(), false),
+            ],
+            Vec::new(),
+            false,
+        );
+        record.mount_owners = vec![(0, 42001, 42002)];
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.host_mounts = checkpoint_host_mounts(&record);
+        assert!(checkpoint
+            .host_mounts
+            .iter()
+            .all(|mount| !mount.recorded_ownership));
+        checkpoint.device_profile = capture_device_profile(&record).into();
+        let manifest = PackManifest::new(
+            "bare".into(),
+            "sha256:0".into(),
+            "linux/amd64".into(),
+            String::new(),
+        );
+        let restored = restored_record("mixed-restored", &manifest, &checkpoint).unwrap();
+        assert!(!restored.recorded_ownership);
+        assert_eq!(restored.mount_owners, record.mount_owners);
+        assert!(!restored.host_mounts()[1].recorded_ownership);
+        assert_eq!(
+            restored.host_mounts()[0].recorded_ownership,
+            cfg!(target_os = "linux")
+        );
+        // Current records have one global policy: refuse an unrepresentable
+        // artifact instead of enabling virtual ownership on unrelated mounts.
+        checkpoint.host_mounts[0].recorded_ownership = true;
+        assert!(validate_compatibility(&checkpoint)
+            .unwrap_err()
+            .to_string()
+            .contains("mixed recorded-ownership"));
+    }
+
+    #[test]
+    fn checkpoint_mount_ownership_profiles_retain_each_image_topology() {
+        let mut mount = smolvm_pack::format::CheckpointHostMount::default();
+        for (packed, archive, plain, owned) in [
+            (false, false, DEVICE_PROFILE, DEVICE_PROFILE_MOUNT_OWNERSHIP),
+            (
+                true,
+                false,
+                DEVICE_PROFILE_PACKED_LAYERS,
+                DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP,
+            ),
+            (
+                true,
+                true,
+                DEVICE_PROFILE_IMAGE_ARCHIVE,
+                DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP,
+            ),
+        ] {
+            for (recorded, owner) in [
+                (false, None),
+                (true, None),
+                (false, Some((42, 43))),
+                (true, Some((42, 43))),
+            ] {
+                mount.recorded_ownership = recorded;
+                mount.owner = owner;
+                let profile =
+                    checkpoint_device_profile(packed, archive, std::slice::from_ref(&mount));
+                assert_eq!(
+                    profile,
+                    if recorded || owner.is_some() {
+                        owned
+                    } else {
+                        plain
+                    }
+                );
+                assert!(SUPPORTED_DEVICE_PROFILES.contains(&profile));
+            }
+        }
+        let old: smolvm_pack::format::CheckpointHostMount =
+            serde_json::from_value(serde_json::json!({
+                "host_path": "/old", "guest_path": "/data", "read_only": false,
+            }))
+            .unwrap();
+        assert!(!old.recorded_ownership);
+        assert_eq!(old.owner, None);
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::json!({
+                "host_path": "/old", "guest_path": "/data", "read_only": false,
+            })
+        );
+    }
+
+    #[test]
     fn restored_host_mounts_require_the_directories_to_exist() {
         let present = tempfile::tempdir().unwrap();
         let mut checkpoint = minimal_checkpoint_manifest();
@@ -9585,6 +9825,7 @@ mod tests {
             host_path: present.path().display().to_string(),
             guest_path: "/workspace".to_string(),
             read_only: false,
+            ..Default::default()
         }];
         assert_eq!(
             restored_host_mounts(&checkpoint).unwrap(),
