@@ -340,6 +340,9 @@ impl VmRecoveryGuard {
                 return Err(conflict("machine execution changed during recovery"));
             }
             let mut after = before.clone();
+            // Member::read decodes stored fields only. Return the original
+            // database review whose identity was validated in this transaction.
+            after.database_identity = self.record.database_identity.clone();
             after.mark_process_stopped();
             if user_stopped {
                 after.restart.user_stopped = true;
