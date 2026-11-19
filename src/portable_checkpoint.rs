@@ -4258,9 +4258,12 @@ pub fn restored_host_mounts(
         .collect())
 }
 
-/// Reattach captured devices in their original order, optionally relocating
-/// their host directories. The caller must transfer the directory contents;
-/// a checkpoint does not include them. Guest paths and access stay fixed.
+/// Reattach captured devices in their original order, each at the host
+/// directory the restoring user names for it. The caller must transfer the
+/// directory contents; a checkpoint does not include them. Guest paths and
+/// access stay fixed. A checkpoint is its author's, so it never chooses which
+/// host directory a guest gets: a captured mount the user does not name is
+/// refused, with the `-v` that would name it.
 pub(crate) fn restored_host_mounts_at(
     checkpoint: &PortableCheckpointManifest,
     destinations: &[crate::data::storage::HostMount],
@@ -4309,11 +4312,22 @@ pub(crate) fn restored_host_mounts_at(
         .host_mounts
         .iter()
         .map(|mount| {
-            let host = destinations
+            let Some(host) = destinations
                 .iter()
                 .find(|destination| destination.target == Path::new(&mount.guest_path))
                 .map(|destination| destination.source.as_path())
-                .unwrap_or_else(|| Path::new(&mount.host_path));
+            else {
+                return Err(Error::config(
+                    "restore checkpoint volume mounts",
+                    format!(
+                        "this checkpoint mounts a host directory at {guest}; a checkpoint does not \
+                         choose what this host shares, so name it: -v {host}:{guest}{access}",
+                        guest = mount.guest_path,
+                        host = mount.host_path,
+                        access = if mount.read_only { ":ro" } else { "" },
+                    ),
+                ));
+            };
             if !host.is_dir() {
                 return Err(Error::config(
                     "restore checkpoint",
@@ -9651,7 +9665,13 @@ mod tests {
             "linux/amd64".into(),
             String::new(),
         );
-        let restored = restored_record("owned-restored", &manifest, &checkpoint).unwrap();
+        let restored = restored_record_with(
+            "owned-restored",
+            &manifest,
+            &checkpoint,
+            named_mounts(&checkpoint),
+        )
+        .unwrap();
         assert!(restored.recorded_ownership);
         assert_eq!(restored.mount_owners, record.mount_owners);
         assert_eq!(restored.host_mounts()[0].owner, Some((42001, 42002)));
@@ -9691,7 +9711,13 @@ mod tests {
             "linux/amd64".into(),
             String::new(),
         );
-        let restored = restored_record("mixed-restored", &manifest, &checkpoint).unwrap();
+        let restored = restored_record_with(
+            "mixed-restored",
+            &manifest,
+            &checkpoint,
+            named_mounts(&checkpoint),
+        )
+        .unwrap();
         assert!(!restored.recorded_ownership);
         assert_eq!(restored.mount_owners, record.mount_owners);
         assert!(!restored.host_mounts()[1].recorded_ownership);
@@ -9762,6 +9788,26 @@ mod tests {
         );
     }
 
+    /// A restore spec naming every captured mount at its captured directory,
+    /// as the restoring user does.
+    fn named_mounts(checkpoint: &PortableCheckpointManifest) -> crate::machine_spec::CreateSpec {
+        crate::machine_spec::CreateSpec {
+            mounts: checkpoint
+                .host_mounts
+                .iter()
+                .map(|mount| crate::data::storage::HostMount {
+                    source: mount.host_path.clone().into(),
+                    target: mount.guest_path.clone().into(),
+                    read_only: mount.read_only,
+                    staged: false,
+                    recorded_ownership: false,
+                    owner: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
     #[test]
     fn restored_host_mounts_require_the_directories_to_exist() {
         let present = tempfile::tempdir().unwrap();
@@ -9772,16 +9818,29 @@ mod tests {
             read_only: false,
             ..Default::default()
         }];
-        assert_eq!(
-            restored_host_mounts(&checkpoint).unwrap(),
-            vec![(
-                present.path().display().to_string(),
-                "/workspace".to_string(),
-                false
-            )]
-        );
-        checkpoint.host_mounts[0].host_path = present.path().join("missing").display().to_string();
+        // The checkpoint alone never attaches a host directory.
         let error = restored_host_mounts(&checkpoint).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("-v {}:/workspace", present.path().display())),
+            "{error}"
+        );
+        let named = crate::data::storage::HostMount {
+            source: present.path().to_path_buf(),
+            target: "/workspace".into(),
+            read_only: false,
+            staged: false,
+            recorded_ownership: false,
+            owner: None,
+        };
+        let mounts = restored_host_mounts_at(&checkpoint, std::slice::from_ref(&named)).unwrap();
+        assert_eq!(mounts[0].source, present.path());
+        let missing = crate::data::storage::HostMount {
+            source: present.path().join("missing"),
+            ..named
+        };
+        let error = restored_host_mounts_at(&checkpoint, &[missing])
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("does not exist on this host"), "{error}");
         assert!(error.contains("/workspace"), "{error}");
     }
