@@ -111,6 +111,12 @@ fn retained_manager_never_adopts_a_new_pid_file_or_replacement() {
             fresh.kill_and_wait(Duration::ZERO);
             assert!(child.0.try_wait().unwrap().is_none());
             assert_eq!(std::fs::read_to_string(&manager.pid_file).unwrap(), marker);
+            let mut stale = crate::embedded::handle::VmHandle::new(manager, None);
+            assert!(stale
+                .sync_staged_mounts(&current)
+                .unwrap_err()
+                .to_string()
+                .contains("changed"));
         },
     );
 }
@@ -135,8 +141,14 @@ fn manager_refuses_transfer_before_shutdown_or_signal_side_effects() {
             assert_eq!(std::fs::read(&manager.pid_file).unwrap(), before);
             assert!(child.0.try_wait().unwrap().is_none());
             assert!(!crate::agent::vm_data_dir(&record.name)
-            .join("vmm-stop-requested")
+                .join("vmm-stop-requested")
                 .exists());
+            let mut handle = crate::embedded::handle::VmHandle::new(manager, None);
+            assert!(handle
+                .sync_staged_mounts(&record)
+                .unwrap_err()
+                .to_string()
+                .contains("moving"));
             db.retire_workload_transfer("moving").unwrap();
         },
     );

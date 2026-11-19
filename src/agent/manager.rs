@@ -2669,7 +2669,9 @@ impl AgentManager {
             .validate_execution(&crate::db::SmolvmDb::open()?, child)
     }
 
-    fn admit_control_mutation(&self) -> Result<crate::db::transfer_admission::MutationGuard> {
+    pub(crate) fn admit_control_mutation(
+        &self,
+    ) -> Result<crate::db::transfer_admission::MutationGuard> {
         let db = crate::db::SmolvmDb::open()?;
         let admission = match self.name() {
             Some(name) => db.admit_machine_mutation(name)?,

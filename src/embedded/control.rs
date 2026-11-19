@@ -968,9 +968,9 @@ pub fn stop_vm_with_timeout(
     stop_timeout: Option<std::time::Duration>,
 ) -> Result<()> {
     let record = get_record(db, name)?;
-    let _admission = db.admit_machine_mutation(name)?;
     let manager = AgentManager::for_existing_vm_record(&record)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
+    let _admission = manager.admit_control_mutation()?;
     manager.try_connect_existing_with_pid_and_start_time(record.pid, record.pid_start_time);
     if !record.staged_mounts.is_empty() {
         let mut client = AgentClient::connect_with_retry(manager.vsock_socket())?;
@@ -1081,14 +1081,6 @@ pub fn reconcile_runtime_machines(db: &SmolvmDb) -> Result<usize> {
     Ok(reclaimed)
 }
 
-/// Mark a machine record as running.
-pub fn mark_running(db: &SmolvmDb, name: &str, pid: Option<i32>) -> Result<()> {
-    let mut record = get_record(db, name)?;
-    record.pid = pid;
-    record.pid_start_time = pid.and_then(crate::process::process_start_time);
-    mark_running_for_record(db, &record)
-}
-
 fn require_same_execution(current: &VmRecord, reviewed: &VmRecord) -> Result<()> {
     if (current.pid, current.pid_start_time) != (reviewed.pid, reviewed.pid_start_time) {
         return Err(Error::agent_conflict(
@@ -1133,11 +1125,6 @@ fn finish_resumed_execution(db: &SmolvmDb, reviewed: &VmRecord) -> Result<()> {
         Ok(())
     })?;
     Ok(())
-}
-
-/// Mark a machine record as stopped.
-pub fn mark_stopped(db: &SmolvmDb, name: &str) -> Result<()> {
-    mark_stopped_for_record(db, &get_record(db, name)?)
 }
 
 pub(crate) fn mark_stopped_for_record(db: &SmolvmDb, reviewed: &VmRecord) -> Result<()> {
@@ -1681,7 +1668,7 @@ mod held_process_tests {
         let name = "embedded-held-stop";
         running(&db, name, held.pid);
 
-        mark_stopped(&db, name).unwrap();
+        mark_stopped_for_record(&db, &get_record(&db, name).unwrap()).unwrap();
 
         let stored = db.get_vm(name).unwrap().unwrap();
         assert_eq!(stored.state, RecordState::Stopped);
@@ -1695,7 +1682,7 @@ mod held_process_tests {
         // No such process: Linux pids never reach 2^31.
         running(&db, name, 0x7fff_fff0);
 
-        mark_stopped(&db, name).unwrap();
+        mark_stopped_for_record(&db, &get_record(&db, name).unwrap()).unwrap();
 
         let stored = db.get_vm(name).unwrap().unwrap();
         assert_eq!(stored.state, RecordState::Stopped);
@@ -1709,7 +1696,7 @@ mod held_process_tests {
         let held = fake_held::hold();
         let name = "embedded-held-start";
         running(&db, name, held.pid);
-        mark_stopped(&db, name).unwrap();
+        mark_stopped_for_record(&db, &get_record(&db, name).unwrap()).unwrap();
 
         for attempt in [
             start_vm(&db, name).map(|_| ()),
