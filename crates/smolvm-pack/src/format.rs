@@ -442,9 +442,9 @@ pub struct CheckpointWorkload {
 }
 
 /// A host directory the captured machine had mounted. Recorded only when the
-/// capture opted in (`host_mounts`), because it binds the artifact to a host
-/// where the same paths exist; a restore re-attaches each one at its guest path
-/// so the saved VM finds the device topology it was captured with.
+/// capture opted in (`host_mounts`); its contents must be transferred separately
+/// to move hosts. A restore can relocate its host directory but retains its
+/// guest path, access and device order.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointHostMount {
     /// Host directory, as given at `machine create`.

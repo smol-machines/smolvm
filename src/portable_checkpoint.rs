@@ -742,9 +742,9 @@ pub fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
 pub struct CaptureOptions {
     /// Maximum unreferenced prepared-checkpoint bytes to retain on this node.
     pub prepared_cache_budget_bytes: Option<u64>,
-    /// Keep host directory mounts in the capture. The artifact then restores
-    /// only where the same host paths exist; each is re-attached at its guest
-    /// path. Pause uses this (it resumes on the same host); portable
+    /// Record host directory mounts without copying their contents. Restore
+    /// reattaches the original paths unless given new host paths for those
+    /// guest mounts. Pause uses this for same-host resume; portable
     /// checkpoints opt in with `--host-mounts`.
     pub host_mounts: bool,
     /// Reuse content-addressed objects in this directory and publish a
@@ -4206,8 +4206,8 @@ pub fn attach_cached_checkpoint_pack(
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
 ///
 /// `host_mounts` admits host directory mounts: the capture records them and a
-/// restore re-attaches the same host paths, so the artifact is bound to hosts
-/// where they exist. Staged mounts stay unsupported either way.
+/// restore re-attaches their directories, whose contents must be transferred
+/// separately to move hosts. Staged mounts stay unsupported either way.
 pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> {
     let mut unsupported = Vec::new();
     if vm.network_backend == Some(crate::network::NetworkBackend::Host) {
@@ -4283,22 +4283,77 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
 pub fn restored_host_mounts(
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<Vec<(String, String, bool)>> {
+    restored_host_mounts_at(checkpoint, &[])
+}
+
+/// Reattach captured devices in their original order, optionally relocating
+/// their host directories. The caller must transfer the directory contents;
+/// a checkpoint does not include them. Guest paths and access stay fixed.
+pub(crate) fn restored_host_mounts_at(
+    checkpoint: &PortableCheckpointManifest,
+    destinations: &[crate::data::storage::HostMount],
+) -> Result<Vec<(String, String, bool)>> {
+    use crate::data::storage::HostMount;
+
+    HostMount::ensure_unique_targets(destinations)?;
+    let mut targets = std::collections::HashSet::new();
+    for mount in &checkpoint.host_mounts {
+        if !targets.insert(Path::new(&mount.guest_path)) {
+            return Err(Error::config(
+                "restore checkpoint volume mounts",
+                format!("duplicate captured mount target: {}", mount.guest_path),
+            ));
+        }
+    }
+    for destination in destinations {
+        let captured = checkpoint
+            .host_mounts
+            .iter()
+            .find(|mount| Path::new(&mount.guest_path) == destination.target)
+            .ok_or_else(|| {
+                Error::config(
+                    "restore checkpoint volume mounts",
+                    format!(
+                        "{} is not a captured guest mount; restore can only relocate existing mounts",
+                        destination.target.display()
+                    ),
+                )
+            })?;
+        if destination.staged
+            || destination.read_only != captured.read_only
+            || destination.recorded_ownership
+            || destination.owner.is_some()
+        {
+            return Err(Error::config(
+                "restore checkpoint volume mounts",
+                format!(
+                    "{} must keep its captured access and ownership settings; only its host directory can change",
+                    destination.target.display()
+                ),
+            ));
+        }
+    }
     checkpoint
         .host_mounts
         .iter()
         .map(|mount| {
-            if !Path::new(&mount.host_path).is_dir() {
+            let host = destinations
+                .iter()
+                .find(|destination| destination.target == Path::new(&mount.guest_path))
+                .map(|destination| destination.source.as_path())
+                .unwrap_or_else(|| Path::new(&mount.host_path));
+            if !host.is_dir() {
                 return Err(Error::config(
                     "restore checkpoint",
                     format!(
                         "this checkpoint mounts host directory {} at {}, which does not exist on \
-                         this host; create it or restore where it exists",
-                        mount.host_path, mount.guest_path
+                         this host; transfer its contents here or map the guest mount to their new host directory",
+                        host.display(), mount.guest_path
                     ),
                 ));
             }
             Ok((
-                mount.host_path.clone(),
+                host.to_string_lossy().into_owned(),
                 mount.guest_path.clone(),
                 mount.read_only,
             ))

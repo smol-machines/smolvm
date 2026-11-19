@@ -140,9 +140,9 @@ pub struct CheckpointCmd {
     /// Directory under which large temporary checkpoint assets are staged.
     #[arg(long = "staging-dir", value_name = "DIR", conflicts_with = "store")]
     pub staging_dir: Option<PathBuf>,
-    /// Keep the machine's host directory mounts in the checkpoint. It then
-    /// restores only on a host where the same paths exist; each is attached
-    /// again at its guest path.
+    /// Keep host directory mounts in the checkpoint (their contents are not
+    /// included). Restore at the same host paths, or transfer the contents and
+    /// use `machine create --from CHECKPOINT -v NEW_HOST:GUEST[:ro|:rw]`.
     #[arg(long = "host-mounts")]
     pub host_mounts: bool,
 

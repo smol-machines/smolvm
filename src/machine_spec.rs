@@ -1273,9 +1273,6 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             if !disks.is_empty() {
                 return Err(fixed("attached disks", TOPOLOGY));
             }
-            if !mounts.is_empty() {
-                return Err(fixed("volume mounts", TOPOLOGY));
-            }
             if !remote_volumes.is_empty() {
                 return Err(fixed("remote volumes", TOPOLOGY));
             }
@@ -1432,7 +1429,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 }
                 ports
             };
-            let mounts = crate::portable_checkpoint::restored_host_mounts(checkpoint)?
+            let mounts = crate::portable_checkpoint::restored_host_mounts_at(checkpoint, &mounts)?
                 .into_iter()
                 .map(|(source, target, read_only)| HostMount {
                     source: source.into(),
