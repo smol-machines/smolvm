@@ -1,5 +1,8 @@
 //! API server state management.
 
+mod supervision;
+pub(crate) use supervision::same_observation;
+
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
@@ -916,33 +919,6 @@ impl ApiState {
         Ok(true)
     }
 
-    /// Update machine state in database (call after start/stop).
-    ///
-    /// Returns an error if the database write fails. Callers in API handlers
-    /// should propagate this error; the supervisor can log and continue.
-    pub fn update_machine_state(
-        &self,
-        name: &str,
-        state: RecordState,
-        pid: Option<i32>,
-    ) -> std::result::Result<(), crate::Error> {
-        let pid_start_time = pid.and_then(crate::process::process_start_time);
-        let result = self.db.update_vm(name, |record| {
-            record.engine_build =
-                (state == RecordState::Running).then(|| crate::ENGINE_BUILD.to_string());
-            record.state = state;
-            record.pid = pid;
-            record.pid_start_time = pid_start_time;
-        })?;
-        match result {
-            Some(_) => Ok(()),
-            None => Err(crate::Error::database(
-                "update machine state",
-                format!("machine '{}' not found in database", name),
-            )),
-        }
-    }
-
     /// List all machines, in name order.
     pub fn list_machines(&self) -> Vec<MachineInfo> {
         let machines = self.machines.read();
@@ -1392,66 +1368,6 @@ impl ApiState {
         }
     }
 
-    /// Best-effort update to the VM database record. Logs warnings on
-    /// `Ok(None)` (row not found) and `Err` without propagating.
-    fn update_vm_best_effort(&self, name: &str, op_label: &str, f: impl FnOnce(&mut VmRecord)) {
-        match self.db.update_vm(name, f) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::warn!(machine = %name, op = op_label, "machine not found in database");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, machine = %name, op = op_label, "failed to persist update");
-            }
-        }
-    }
-
-    /// Increment restart count for a machine.
-    pub fn increment_restart_count(&self, name: &str) {
-        if let Some(entry) = self.machines.read().get(name) {
-            entry.lock().restart.restart_count += 1;
-        }
-        self.update_vm_best_effort(name, "increment_restart_count", |r| {
-            r.restart.restart_count += 1;
-        });
-    }
-
-    /// Mark machine as user-stopped.
-    pub fn mark_user_stopped(&self, name: &str, stopped: bool) {
-        if let Some(entry) = self.machines.read().get(name) {
-            entry.lock().restart.user_stopped = stopped;
-        }
-        self.update_vm_best_effort(name, "mark_user_stopped", |r| {
-            r.restart.user_stopped = stopped;
-        });
-    }
-
-    /// Reset restart count (on successful start).
-    pub fn reset_restart_count(&self, name: &str) {
-        if let Some(entry) = self.machines.read().get(name) {
-            entry.lock().restart.restart_count = 0;
-        }
-        self.update_vm_best_effort(name, "reset_restart_count", |r| {
-            r.restart.restart_count = 0;
-        });
-    }
-
-    /// Update last exit code for a machine.
-    pub fn set_last_exit_code(&self, name: &str, exit_code: Option<i32>) {
-        self.update_vm_best_effort(name, "set_last_exit_code", |r| {
-            r.last_exit_code = exit_code;
-        });
-    }
-
-    /// Get last exit code for a machine.
-    pub fn get_last_exit_code(&self, name: &str) -> Option<i32> {
-        self.db
-            .get_vm(name)
-            .ok()
-            .flatten()
-            .and_then(|r| r.last_exit_code)
-    }
-
     /// Check if a machine process is alive.
     ///
     /// Delegates to `AgentManager::is_process_alive()` which checks the
@@ -1666,8 +1582,8 @@ fn refuse_implicit_start_of_paused(record: &crate::config::VmRecord) -> crate::R
 /// Ensure a machine is running and persist the Running state to the database.
 ///
 /// Used by handlers that implicitly start VMs (containers, exec, images).
-/// State persistence is best-effort — a DB write failure is logged but does
-/// not fail the request, matching the supervisor's error-handling pattern.
+/// Publication requires the original machine and the execution this call
+/// observed; stale completion fails before the caller proceeds with its work.
 pub async fn ensure_running_and_persist(
     state: &Arc<ApiState>,
     name: &str,
@@ -1782,18 +1698,13 @@ async fn ensure_running_and_persist_owned(
         }
     }
 
-    let pid = {
-        let entry = entry.lock();
-        entry.manager.child_pid()
-    };
-    if let Err(e) = state.update_machine_state(name, RecordState::Running, pid) {
-        tracing::warn!(machine = %name, error = %e, "failed to persist Running state after implicit start");
-    }
-    // An implicit start (exec/file/image waking a stopped machine) re-enables
-    // supervision like the explicit start handler: clear the user-stopped flag so
-    // the restart supervisor will keep this machine up again. (Retry-budget reset
-    // stays on the explicit `start` path.) Idempotent for an already-running machine.
-    state.mark_user_stopped(name, false);
+    let execution = entry.lock().manager.pid_and_start_time();
+    state.publish_observed_start(
+        record
+            .as_ref()
+            .ok_or_else(|| crate::Error::vm_not_found(name))?,
+        execution,
+    )?;
 
     // An implicit start of an image machine (exec/files/images waking a stopped
     // machine) must relaunch the image workload just like the explicit start

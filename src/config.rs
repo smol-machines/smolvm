@@ -125,7 +125,7 @@ impl std::str::FromStr for RestartPolicy {
 }
 
 /// Restart configuration for a machine.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RestartConfig {
     /// The restart policy.
     #[serde(default)]
