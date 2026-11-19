@@ -32,6 +32,7 @@ const ANONYMOUS_LABEL: &str = "com.docker.volume.anonymous";
 pub(crate) struct Volumes {
     records: parking_lot::RwLock<HashMap<String, VolumeRecord>>,
     root: PathBuf,
+    db: crate::db::SmolvmDb,
 }
 
 impl Volumes {
@@ -44,7 +45,7 @@ impl Volumes {
         Ok(())
     }
 
-    pub(crate) fn load(store: &Store) -> crate::Result<Self> {
+    pub(crate) fn load(store: &Store, db: crate::db::SmolvmDb) -> crate::Result<Self> {
         let records = store
             .load_objects::<VolumeRecord>("volumes")?
             .into_iter()
@@ -53,6 +54,7 @@ impl Volumes {
         Ok(Self {
             records: parking_lot::RwLock::new(records),
             root: store.root().join("volumes"),
+            db,
         })
     }
 
@@ -67,6 +69,26 @@ impl Volumes {
 
     pub(crate) fn all(&self) -> Vec<VolumeRecord> {
         self.records.read().values().cloned().collect()
+    }
+
+    fn admit_mutation(
+        &self,
+        store: &Store,
+        name: &str,
+    ) -> ApiResult<crate::db::transfer_admission::MutationGuard> {
+        self.db
+            .admit_storage_mutation(&[
+                self.root.join(name),
+                self.mountpoint(name),
+                store.object_path("volumes", name),
+            ])
+            .map_err(|error| {
+                if error.code() == "CONFLICT" {
+                    ApiError::conflict(error.to_string())
+                } else {
+                    ApiError::from(error)
+                }
+            })
     }
 
     /// Create the volume, or return the existing one of that name. Returns
@@ -93,6 +115,7 @@ impl Volumes {
         if let Some(existing) = self.get(&name) {
             return Ok((existing, false));
         }
+        let _admission = self.admit_mutation(store, &name)?;
         // Docker marks the volumes it names itself.
         let mut labels = labels;
         if anonymous {
@@ -120,6 +143,7 @@ impl Volumes {
         if !records.contains_key(name) {
             return Err(ApiError::not_found(format!("get {name}: no such volume")));
         }
+        let _admission = self.admit_mutation(store, name)?;
         // Keep the record discoverable if either deletion fails, so callers can
         // repair the filesystem and retry. Recursive deletion may be partial.
         remove_tree(&self.root.join(name))
@@ -198,10 +222,97 @@ fn remove_tree(path: &std::path::Path) -> std::io::Result<()> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn transfer_claim_preserves_volume_data_and_allows_unrelated_volumes() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("machines.db")).unwrap();
+        let engine = crate::engine::Engine::open_with_db(
+            crate::engine::EngineConfig {
+                root: dir.path().join("engine"),
+                socket: dir.path().join("engine.sock"),
+            },
+            None,
+            db.clone(),
+        )
+        .unwrap();
+        let create = |name| {
+            engine.volumes.create(
+                &engine.store,
+                Some(name),
+                BTreeMap::new(),
+                BTreeMap::new(),
+                false,
+            )
+        };
+        create("moving").unwrap();
+        let data = engine.volumes.mountpoint("moving");
+        std::fs::write(data.join("value"), b"must survive the move").unwrap();
+        create("alias").unwrap();
+        let alias = engine.volumes.mountpoint("alias");
+        std::fs::remove_dir(&alias).unwrap();
+        std::os::unix::fs::symlink(&data, &alias).unwrap();
+        let reserved = engine.volumes.root.join("reserved");
+        std::fs::create_dir(&reserved).unwrap();
+        let name = format!("volume-owner-{:032x}", rand::random::<u128>());
+        db.insert_vm(
+            &name,
+            &crate::config::VmRecord::new(name.clone(), 1, 128, vec![], vec![], false),
+        )
+        .unwrap();
+        db.claim_workload_transfer(
+            "volume-move",
+            vec![db.review_workload_member(&name).unwrap()],
+            &[data.clone(), reserved.clone()],
+        )
+        .unwrap();
+
+        let error = engine.volumes.remove(&engine.store, "moving").unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        let error = engine.volumes.remove(&engine.store, "alias").unwrap_err();
+        assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+        assert!(alias.is_symlink());
+        assert_eq!(
+            create("reserved").unwrap_err().status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert!(!reserved.join("_data").exists());
+        assert!(engine.volumes.get("reserved").is_none());
+        assert_eq!(
+            std::fs::read(data.join("value")).unwrap(),
+            b"must survive the move"
+        );
+        assert!(engine.volumes.get("moving").is_some());
+        assert_eq!(
+            engine
+                .store
+                .transfer_objects::<VolumeRecord>("volumes")
+                .unwrap()
+                .len(),
+            2
+        );
+        assert!(
+            !create("moving").unwrap().1,
+            "an existing volume is only observed"
+        );
+
+        create("unrelated").unwrap();
+        engine.volumes.remove(&engine.store, "unrelated").unwrap();
+        db.retire_workload_transfer("volume-move").unwrap();
+        engine.volumes.remove(&engine.store, "alias").unwrap();
+        assert_eq!(
+            std::fs::read(data.join("value")).unwrap(),
+            b"must survive the move"
+        );
+        engine.volumes.remove(&engine.store, "moving").unwrap();
+        assert!(!data.exists());
+        assert!(engine.volumes.get("moving").is_none());
+    }
+
     fn fixture() -> (tempfile::TempDir, Store, Volumes) {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let volumes = Volumes::load(&store).unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("machines.db")).unwrap();
+        let volumes = Volumes::load(&store, db).unwrap();
         volumes
             .create(
                 &store,
@@ -223,13 +334,19 @@ mod tests {
         let error = volumes.remove(&store, "data").unwrap_err();
         assert!(error.message.contains("remove volume data"));
         assert!(volumes.get("data").is_some());
-        assert!(Volumes::load(&store).unwrap().get("data").is_some());
+        assert!(Volumes::load(&store, volumes.db.clone())
+            .unwrap()
+            .get("data")
+            .is_some());
         assert_eq!(std::fs::read(&path).unwrap(), b"must not be orphaned");
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir_all(path.join("_data")).unwrap();
         volumes.remove(&store, "data").unwrap();
         assert!(volumes.get("data").is_none());
-        assert!(Volumes::load(&store).unwrap().get("data").is_none());
+        assert!(Volumes::load(&store, volumes.db.clone())
+            .unwrap()
+            .get("data")
+            .is_none());
         assert!(!path.exists());
     }
 
@@ -239,7 +356,10 @@ mod tests {
         std::fs::remove_dir_all(volumes.root.join("data")).unwrap();
         volumes.remove(&store, "data").unwrap();
         assert!(volumes.get("data").is_none());
-        assert!(Volumes::load(&store).unwrap().get("data").is_none());
+        assert!(Volumes::load(&store, volumes.db.clone())
+            .unwrap()
+            .get("data")
+            .is_none());
     }
 
     #[test]
@@ -257,7 +377,10 @@ mod tests {
         assert!(result.is_err());
         assert_eq!(std::fs::read(&file).unwrap(), b"retained");
         assert!(volumes.get("data").is_some());
-        assert!(Volumes::load(&store).unwrap().get("data").is_some());
+        assert!(Volumes::load(&store, volumes.db.clone())
+            .unwrap()
+            .get("data")
+            .is_some());
         volumes.remove(&store, "data").unwrap();
     }
 
@@ -274,9 +397,15 @@ mod tests {
         std::fs::set_permissions(&volumes.root, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert!(volumes.get("data").is_some());
-        assert!(Volumes::load(&store).unwrap().get("data").is_some());
+        assert!(Volumes::load(&store, volumes.db.clone())
+            .unwrap()
+            .get("data")
+            .is_some());
         volumes.remove(&store, "data").unwrap();
-        assert!(Volumes::load(&store).unwrap().get("data").is_none());
+        assert!(Volumes::load(&store, volumes.db.clone())
+            .unwrap()
+            .get("data")
+            .is_none());
     }
 
     #[test]
@@ -325,7 +454,8 @@ mod tests {
     fn create_is_idempotent_and_remove_deletes_data() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let volumes = Volumes::load(&store).unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("machines.db")).unwrap();
+        let volumes = Volumes::load(&store, db).unwrap();
         let (v, created) = volumes
             .create(
                 &store,
@@ -356,7 +486,7 @@ mod tests {
                 false
             )
             .is_err());
-        let reloaded = Volumes::load(&store).unwrap();
+        let reloaded = Volumes::load(&store, volumes.db.clone()).unwrap();
         assert!(reloaded.get("data").is_some());
         volumes.remove(&store, "data").unwrap();
         assert!(!volumes.mountpoint("data").exists());

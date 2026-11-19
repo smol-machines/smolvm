@@ -137,7 +137,27 @@ impl VmHandle {
 
     /// Copy every guest-local staged mount back to its host source.
     pub fn sync_staged_mounts(&mut self, record: &crate::config::VmRecord) -> Result<()> {
-        crate::staged_mount::sync_staged_mounts(record, self.client_mut()?)
+        crate::staged_mount::sync_with_manager(record, &self.manager)
+    }
+
+    pub(crate) fn delete_persisted(
+        &mut self,
+        db: &crate::db::SmolvmDb,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        crate::deletion::delete_machine_locked(db, record, Some(&self.manager), true, false)?;
+        self.client = None;
+        Ok(())
+    }
+
+    pub(crate) fn stop_persisted(
+        &mut self,
+        record: &VmRecord,
+        stop_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        self.manager.stop_persisted(record, stop_timeout)?;
+        self.client = None;
+        Ok(())
     }
 
     /// Stop the VM and drop the cached agent client.

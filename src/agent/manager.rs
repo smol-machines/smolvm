@@ -443,14 +443,22 @@ pub fn cleanup_dead_vm_runtime(name: &str) -> Result<()> {
 }
 
 pub(crate) fn cleanup_dead_vm_runtime_in_db(name: &str, db: &crate::db::SmolvmDb) -> Result<()> {
+    cleanup_dead_vm_runtime_at(name, db, &vm_data_dir(name))
+}
+
+pub(crate) fn cleanup_dead_vm_runtime_at(
+    name: &str,
+    db: &crate::db::SmolvmDb,
+    runtime: &Path,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
-    launcher::cleanup_cuda_ring_dir(&vm_data_dir(name))
+    launcher::cleanup_cuda_ring_dir(runtime)
         .map_err(|error| Error::agent("clean CUDA ring directory", error.to_string()))?;
     #[cfg(not(target_os = "linux"))]
     let _ = name;
 
     if db.dependent_clones(name)?.is_empty() {
-        crate::agent::fork::discard_retained_snapshots(db, name)?;
+        crate::agent::fork::discard_retained_snapshots_at(db, name, &runtime.join("s"))?;
     }
     Ok(())
 }
@@ -1677,6 +1685,8 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
 pub struct AgentManager {
     /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
+    /// Identity reviewed before preparing disks, retained across launch attempts.
+    launch_review: std::sync::Mutex<crate::db::launch_admission::LaunchReview>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
     /// A rootfs chosen at launch over `rootfs_path`: a branch boots its
@@ -1707,6 +1717,49 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Own a registered execution through external control side effects. Helpers
+/// without a database record retain ordinary transfer admission.
+pub(crate) struct ControlOperation {
+    manager: Arc<Mutex<AgentInner>>,
+    _ownership: Option<crate::db::VmRecoveryGuard>,
+    _admission: crate::db::transfer_admission::MutationGuard,
+}
+
+impl ControlOperation {
+    pub(crate) fn validate_manager(&self, manager: &AgentManager) -> Result<()> {
+        if !Arc::ptr_eq(&self.manager, &manager.inner) {
+            return Err(Error::agent_conflict(
+                "control machine",
+                "operation belongs to another manager",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_stop(self) -> Result<crate::config::VmRecord> {
+        self._ownership
+            .ok_or_else(|| {
+                Error::agent_conflict(
+                    "stop machine",
+                    "stop publication requires a reviewed machine",
+                )
+            })?
+            .finish_stop(true)
+    }
+
+    pub(crate) fn validate_staged_record(&self, record: &crate::config::VmRecord) -> Result<()> {
+        self._ownership
+            .as_ref()
+            .ok_or_else(|| {
+                Error::agent_conflict(
+                    "sync staged mounts",
+                    "staged synchronization requires a reviewed machine",
+                )
+            })?
+            .validate_staged_record(record)
+    }
+}
+
 /// Apply the persistent fail-closed policy before spawning a named VM. Every
 /// launch path funnels through `start_via_subprocess`, including API restarts.
 fn reject_missing_external_interceptor(
@@ -1724,6 +1777,7 @@ fn reject_missing_external_interceptor(
 
 fn enforce_external_interceptor_requirement(
     db: &crate::db::SmolvmDb,
+    review: &crate::db::launch_admission::LaunchReview,
     name: &str,
     endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
 ) -> Result<()> {
@@ -1732,7 +1786,9 @@ fn enforce_external_interceptor_requirement(
         if endpoint.is_some() && !record.external_interceptor_required {
             // Persist before spawning the VMM. If the caller or boot fails,
             // every later start still requires interception.
-            db.update_vm(name, |record| record.external_interceptor_required = true)?;
+            db.update_reviewed_vm(review, name, |record| {
+                record.external_interceptor_required = true
+            })?;
         }
     }
     Ok(())
@@ -1789,7 +1845,7 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk)
+        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk, None)
     }
 
     /// Create a new agent manager for a named VM.
@@ -1806,6 +1862,7 @@ impl AgentManager {
             rootfs_path.into(),
             storage_disk,
             overlay_disk,
+            None,
         )
     }
 
@@ -1815,7 +1872,15 @@ impl AgentManager {
         rootfs_path: PathBuf,
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
+        review: Option<crate::db::launch_admission::LaunchReview>,
     ) -> Result<Self> {
+        let review = match review {
+            Some(review) => review,
+            None => crate::db::launch_admission::LaunchReview::capture(
+                &crate::db::SmolvmDb::open()?,
+                name.as_deref(),
+            )?,
+        };
         if let Some(ref vm_name) = name {
             validate_vm_name(vm_name, "machine name")
                 .map_err(|e| Error::config("validate machine name", e))?;
@@ -1857,6 +1922,7 @@ impl AgentManager {
 
         Ok(Self {
             name,
+            launch_review: std::sync::Mutex::new(review),
             rootfs_path,
             rootfs_override: std::sync::Mutex::new(None),
             storage_disk,
@@ -1924,8 +1990,107 @@ impl AgentManager {
         )
     }
 
+    /// Prepare the exact machine whose persisted settings the caller read.
+    /// Deserialized exports and new records are not startup authority: load the
+    /// published record from the database before using this entry point.
+    pub fn for_vm_record(record: &crate::config::VmRecord) -> Result<Self> {
+        Self::open_with_creation(
+            &record.name,
+            DiskAccess::Launch {
+                storage_gib: record.storage_gb,
+                overlay_gib: record.overlay_gb,
+            },
+            None,
+            Some(crate::db::launch_admission::LaunchReview::from_record(
+                record,
+            )?),
+        )
+    }
+
+    /// Observe or reconnect to the exact persisted machine the caller read,
+    /// without preparing or growing its disks.
+    pub fn for_existing_vm_record(record: &crate::config::VmRecord) -> Result<Self> {
+        Self::open_with_creation(
+            &record.name,
+            DiskAccess::Observe,
+            None,
+            Some(crate::db::launch_admission::LaunchReview::from_record(
+                record,
+            )?),
+        )
+    }
+
+    /// Prepare a machine owned by an unpublished creation. The capability
+    /// stays with its creator and workers until publication or failure cleanup.
+    pub fn for_vm_creation(
+        creation: &crate::db::VmCreationLease,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
+        creation.prepare_directory()?;
+        Self::open_with_creation(
+            creation.name(),
+            DiskAccess::Launch {
+                storage_gib: storage_gb,
+                overlay_gib: overlay_gb,
+            },
+            Some(creation),
+            None,
+        )
+    }
+
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
+        Self::open_with_creation(name, access, None, None)
+    }
+
+    fn open_with_creation(
+        name: impl Into<String>,
+        access: DiskAccess,
+        creation: Option<&crate::db::VmCreationLease>,
+        review: Option<crate::db::launch_admission::LaunchReview>,
+    ) -> Result<Self> {
         let name = name.into();
+        let db = crate::db::SmolvmDb::open()?;
+        let review = match review {
+            Some(review) => review,
+            None => crate::db::launch_admission::LaunchReview::capture(&db, Some(&name))?,
+        };
+        review.check_name(Some(&name))?;
+        review.validate(&db)?;
+        // Launch access may create or grow disks before start_via_subprocess.
+        // Observation remains available while a transfer owns the machine.
+        let _admission = match access {
+            DiskAccess::Launch { .. } if creation.is_some() => None,
+            DiskAccess::Launch { .. } => {
+                Some(crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(&name), &[])?)
+            }
+            DiskAccess::Observe => None,
+        };
+        let storage_dir = vm_data_dir(&name);
+        let (storage_path, storage_format) =
+            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
+        let _creation_preparation = creation
+            .map(|owner| {
+                owner.admit_preparation(&[
+                    storage_path.clone(),
+                    overlay_path.clone(),
+                    storage_dir.join("agent.sock"),
+                ])
+            })
+            .transpose()?;
+        let _preparation = match access {
+            DiskAccess::Launch { .. } if creation.is_none() => {
+                Some(db.reserve_reviewed_vm_preparation(
+                    &review,
+                    Some(&name),
+                    &storage_path,
+                    &[overlay_path.clone(), storage_dir.join("agent.sock")],
+                )?)
+            }
+            _ => None,
+        };
         let rootfs_path = match access {
             DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,
             DiskAccess::Observe => Self::default_rootfs_path()?,
@@ -1934,7 +2099,7 @@ impl AgentManager {
         // binding on first call and detects collisions on subsequent calls
         // (refusing to open a hash dir that belongs to a different name); an
         // observation only verifies an existing binding.
-        let storage_dir = match access {
+        match access {
             DiskAccess::Observe => observe_vm_dir(&name)?,
             DiskAccess::Launch { .. } => ensure_vm_dir(&name)?,
         };
@@ -1942,15 +2107,16 @@ impl AgentManager {
         // A fork clone has a `.qcow2` copy-on-write overlay in place of the
         // `.raw` disk; detect it by file presence (the on-disk file is the
         // source of truth) and open it as-is rather than creating/formatting.
-        let (storage_path, storage_format) =
-            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
         let storage_disk = open_storage_disk_for_manager(&storage_path, storage_format, access)?;
-
-        let (overlay_path, overlay_format) =
-            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
         let overlay_disk = open_overlay_disk_for_manager(&overlay_path, overlay_format, access)?;
 
-        Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
+        Self::new_internal(
+            Some(name),
+            rootfs_path,
+            storage_disk,
+            overlay_disk,
+            Some(review),
+        )
     }
 
     /// Open a named VM to observe or reconnect to it: status, list, stop,
@@ -2341,6 +2507,7 @@ impl AgentManager {
         pid: Option<i32>,
         expected_start_time: Option<u64>,
     ) -> Option<()> {
+        self.validate_control_identity().ok()?;
         if !self.vsock_socket.exists() {
             return None;
         }
@@ -2374,6 +2541,16 @@ impl AgentManager {
         // before binding its port.
         if let Ok(mut client) = super::AgentClient::connect_for_state_probe(&self.vsock_socket) {
             if client.ping().is_ok() {
+                // The socket may have been replaced while connect/ping waited.
+                self.validate_control_identity().ok()?;
+                self.launch_review
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .validate_execution(
+                        &crate::db::SmolvmDb::open().ok()?,
+                        effective_pid.map(|pid| (pid, pid_start_time)),
+                    )
+                    .ok()?;
                 // Update internal state to reflect running
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
@@ -2381,7 +2558,7 @@ impl AgentManager {
                 // Without verification, stop() could signal the wrong process.
                 if let Some(p) = effective_pid {
                     if process::is_our_process_strict(p, pid_start_time) {
-                        inner.child = Some(ChildProcess::new(p));
+                        inner.child = Some(ChildProcess::from_identity(p, pid_start_time));
                     } else {
                         tracing::debug!(
                             pid = p,
@@ -2509,7 +2686,8 @@ impl AgentManager {
     /// Get the VM process ID and its captured start time for verified external cleanup.
     ///
     /// Prefers the in-memory child handle (start time captured at spawn).
-    /// Falls back to the PID file if no in-memory handle is present.
+    /// Otherwise retains the PID from the original database review. Only an
+    /// unregistered helper falls back to its runtime PID file.
     /// Returns `None` if neither source has a PID.
     pub fn pid_and_start_time(&self) -> Option<(i32, Option<u64>)> {
         {
@@ -2518,7 +2696,78 @@ impl AgentManager {
                 return Some((child.pid(), child.start_time()));
             }
         }
+        if let Some((pid, start)) = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observed_execution()
+        {
+            return pid.map(|pid| (pid, start));
+        }
         self.read_pid_file_with_start_time()
+    }
+
+    fn validate_control_identity(&self) -> Result<()> {
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|child| (child.pid(), child.start_time()));
+        self.launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .validate_execution(&crate::db::SmolvmDb::open()?, child)
+    }
+
+    pub(crate) fn admit_control_mutation(
+        &self,
+    ) -> Result<crate::db::transfer_admission::MutationGuard> {
+        let db = crate::db::SmolvmDb::open()?;
+        let admission = match self.name() {
+            Some(name) => db.admit_machine_mutation(name)?,
+            None => db.admit_workload_mutation(None, &[self.storage_disk.path().to_path_buf()])?,
+        };
+        self.validate_control_identity()?;
+        Ok(admission)
+    }
+
+    pub(crate) fn reserve_control_operation(&self) -> Result<ControlOperation> {
+        let db = crate::db::SmolvmDb::open()?;
+        let admission = self.admit_control_mutation()?;
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|c| (c.pid(), c.start_time()));
+        let record = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .review_execution_record(&db, child)?;
+        let ownership = match record {
+            Some(record) => {
+                let runtime = self.vsock_socket.parent().ok_or_else(|| {
+                    Error::agent_conflict("control machine", "machine runtime directory is missing")
+                })?;
+                let guard = db.reserve_vm_control(
+                    &record,
+                    runtime,
+                    &[
+                        self.storage_disk.path().to_path_buf(),
+                        self.overlay_disk.path().to_path_buf(),
+                    ],
+                )?;
+                Some(guard)
+            }
+            None => None,
+        };
+        Ok(ControlOperation {
+            manager: self.inner.clone(),
+            _ownership: ownership,
+            _admission: admission,
+        })
     }
 
     /// Check if the VM process is actually alive using start-time-aware
@@ -2556,7 +2805,97 @@ impl AgentManager {
     ///
     /// Uses retry logic to handle transient connection failures.
     pub fn connect(&self) -> crate::error::Result<super::AgentClient> {
-        super::AgentClient::connect_with_retry(&self.vsock_socket)
+        let validate = || {
+            self.launch_review
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .validate(&crate::db::SmolvmDb::open()?)
+        };
+        // A queued caller may still hold an entry retired by discovery. A
+        // name-derived socket is not authority to connect to its replacement.
+        validate()?;
+        let client = super::AgentClient::connect_with_retry(&self.vsock_socket)?;
+        validate()?;
+        Ok(client)
+    }
+
+    pub(crate) fn matches_record_incarnation(&self, record: &crate::config::VmRecord) -> bool {
+        self.launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .matches_record(record)
+    }
+
+    /// Finish an owned creation using the record returned by its publication
+    /// transaction. An existing machine/controller cannot be rebound this way.
+    pub(crate) fn bind_created_record(
+        &self,
+        db: &crate::db::SmolvmDb,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        if self.name() != Some(record.name.as_str()) || self.inner.lock().child.is_some() {
+            return Err(Error::agent_conflict(
+                "register creation",
+                "manager is not this unpublished creation",
+            ));
+        }
+        let mut review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if review.identity().is_some() {
+            return Err(Error::agent_conflict(
+                "register creation",
+                "manager already belongs to a published machine",
+            ));
+        }
+        let published = crate::db::launch_admission::LaunchReview::from_record(record)?;
+        published.validate(db)?;
+        *review = published;
+        Ok(())
+    }
+
+    pub(crate) fn same_record_as(&self, other: &Self) -> bool {
+        let identity = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .identity();
+        identity.is_some()
+            && identity
+                == other
+                    .launch_review
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .identity()
+    }
+
+    pub(crate) fn matches_record_execution(&self, record: &crate::config::VmRecord) -> bool {
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|child| (Some(child.pid()), child.start_time()));
+        let review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        review.matches_record(record)
+            && child.or(review.observed_execution()) == Some((record.pid, record.pid_start_time))
+    }
+
+    pub(crate) fn require_record_incarnation(
+        &self,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        if !self.matches_record_incarnation(record) {
+            return Err(Error::agent_conflict(
+                "use machine entry",
+                "machine changed since this request acquired its entry; look it up again",
+            ));
+        }
+        Ok(())
     }
 
     /// Get the currently configured mounts.
@@ -2667,6 +3006,13 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         if let Some(name) = self.name() {
             if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
                 if record.paused_checkpoint.is_some() && !features.resume_paused {
@@ -3178,6 +3524,21 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
+        // Retain the gate through boot and PID-file registration. Callers that
+        // publish the PID to the database must hold an outer guard until then.
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        review.validate(&crate::db::SmolvmDb::open()?)?;
         let t_launch = Instant::now();
 
         // A machine created from a checkpoint carries a private,
@@ -3259,7 +3620,7 @@ impl AgentManager {
                 if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str())
                     || record.agent_rootfs_path.as_deref() != Some(rootfs_path.as_path())
                 {
-                    db.update_vm(name, |r| {
+                    db.update_reviewed_vm(&review, name, |r| {
                         r.agent_rootfs_digest = Some(rootfs_digest.clone());
                         r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
@@ -3276,7 +3637,7 @@ impl AgentManager {
                     ));
                 }
                 if features.mediated_egress && !record.mediated_egress_required {
-                    db.update_vm(name, |record| {
+                    db.update_reviewed_vm(&review, name, |record| {
                         record.mediated_egress_required = true;
                         record.external_interceptor_required = true;
                     })?;
@@ -3299,6 +3660,7 @@ impl AgentManager {
             }
             enforce_external_interceptor_requirement(
                 &db,
+                &review,
                 name,
                 features.external_interceptor.as_ref(),
             )?;
@@ -3313,9 +3675,6 @@ impl AgentManager {
                 "egress rules",
                 "redirect rules require a mediated egress interceptor on every start",
             ));
-        }
-        if let Some(snapshot) = features.snapshot_dir.as_deref() {
-            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
         }
 
         // A privileged node drops each VMM to a distinct uid. Start the shared
@@ -3371,11 +3730,87 @@ impl AgentManager {
             }
         }
         let resources_for_config = resources.clone();
-        // Per-boot disk-prep (template copy). Formerly bounded by a process-wide
-        // boot gate to avoid host-disk thrash on slow/shared storage; removed
-        // after metal measurements showed disk-prep at ~1ms (NVMe + qcow2 thin
-        // clone) with flat boot latency from 8 → 32 concurrent boots — the gate
-        // was non-binding and only serialized needlessly.
+        let extra_disks = {
+            let mut __d = features.extra_disks;
+            // `--disk` values recorded on the machine, re-attached on every
+            // start in the order given. Format is read from the file's magic
+            // rather than assumed: a block device and a raw image are both
+            // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
+            // exposes its header as the whole device.
+            for disk in &resources_for_config.disks {
+                __d.push((
+                    disk.path.clone(),
+                    disk.read_only,
+                    disk.boot_format()
+                        .map_err(|e| crate::Error::agent("attach disk", e))?,
+                ));
+            }
+            if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
+                for entry in spec.split(',').filter(|s| !s.is_empty()) {
+                    let (path, ro) = match entry.strip_suffix(":ro") {
+                        Some(p) => (p, true),
+                        None => (entry, false),
+                    };
+                    __d.push((
+                        std::path::PathBuf::from(path),
+                        ro,
+                        crate::data::disk::DiskFormat::Raw,
+                    ));
+                }
+            }
+            __d
+        };
+        let mut exclusive_paths = vec![
+            self.overlay_disk.path().to_path_buf(),
+            self.vsock_socket.clone(),
+            self.pid_file.clone(),
+            self.config_file.clone(),
+        ];
+        exclusive_paths.push(
+            features
+                .control_socket
+                .clone()
+                .unwrap_or_else(|| self.vsock_socket.with_file_name("control.sock")),
+        );
+        exclusive_paths.extend(
+            extra_disks
+                .iter()
+                .filter(|(_, read_only, _)| !read_only)
+                .map(|(path, _, _)| path.clone()),
+        );
+        // Own disks and runtime paths before formatting or clearing old files.
+        // The same ticket becomes child ownership before the helper boots.
+        let provisional = self.name().map(|name| {
+            let (live, staged) = HostMount::split_storage_tuples(&mounts);
+            let mut record = crate::config::VmRecord::new(
+                name.to_owned(),
+                resources_for_config.cpus,
+                resources_for_config.memory_mib,
+                live,
+                vec![],
+                resources_for_config.network,
+            );
+            record.staged_mounts = staged;
+            record.mount_owners = HostMount::stored_owners(&mounts);
+            record.ephemeral = true;
+            record
+        });
+        let launch = crate::db::SmolvmDb::open()?.reserve_reviewed_vm_launch(
+            &review,
+            provisional,
+            self.storage_disk.path(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+            &exclusive_paths,
+        )?;
+        *self.launch_review.lock().unwrap_or_else(|e| e.into_inner()) = launch.review()?;
+        if let Some(snapshot) = features.snapshot_dir.as_deref() {
+            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
+        }
+        // Formatting runs outside the database transaction. Independent VMs
+        // can prepare concurrently while the durable reservation fences aliases.
         self.prepare_for_launch(&mounts, &ports, resources)?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
@@ -3660,6 +4095,7 @@ impl AgentManager {
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
+            startup_ticket: Some(launch.ticket.clone()),
             rootfs_path: self.rootfs_path(),
             storage_disk_path: self.storage_disk.path().to_path_buf(),
             overlay_disk_path: self.overlay_disk.path().to_path_buf(),
@@ -3686,36 +4122,7 @@ impl AgentManager {
             packed_layers_dir: features.packed_layers_dir,
             packed_layers_dax_window,
             pack_idmap_source,
-            extra_disks: {
-                let mut __d = features.extra_disks;
-                // `--disk` values recorded on the machine, re-attached on every
-                // start in the order given. Format is read from the file's magic
-                // rather than assumed: a block device and a raw image are both
-                // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
-                // exposes its header as the whole device.
-                for disk in &resources_for_config.disks {
-                    __d.push((
-                        disk.path.clone(),
-                        disk.read_only,
-                        disk.boot_format()
-                            .map_err(|e| crate::Error::agent("attach disk", e))?,
-                    ));
-                }
-                if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
-                    for entry in spec.split(',').filter(|s| !s.is_empty()) {
-                        let (path, ro) = match entry.strip_suffix(":ro") {
-                            Some(p) => (p, true),
-                            None => (entry, false),
-                        };
-                        __d.push((
-                            std::path::PathBuf::from(path),
-                            ro,
-                            crate::data::disk::DiskFormat::Raw,
-                        ));
-                    }
-                }
-                __d
-            },
+            extra_disks,
             pod_netns: features.pod_netns,
             // Ephemeral machines share one runtime directory, so only a named
             // machine keeps a workload log of its own.
@@ -3828,7 +4235,9 @@ impl AgentManager {
                 None => cmd.env_remove(var),
             };
         }
-        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+        cmd.arg("_boot-vm-owned")
+            .arg(&config_path)
+            .arg(&launch.ticket.token)
             .env_remove("SMOLVM_INTERCEPTOR_TOKEN")
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
@@ -4016,6 +4425,13 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         let reachable = self.try_connect_existing().is_some();
         if reachable {
@@ -4120,20 +4536,34 @@ impl AgentManager {
         guest_is_paused: bool,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
+        self.validate_control_identity()?;
+        // An acknowledgment from a path is not authority over an arbitrary PID.
+        // Verify before opening the agent socket or writing a stop marker.
+        if !process::is_alive(pid) {
+            return Ok(());
+        }
+        let verified = process::is_our_process_strict(pid, start_time)
+            || (start_time.is_none()
+                && process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy()));
+        if !verified {
+            return Err(Error::agent_conflict(
+                "stop agent",
+                "machine process identity changed",
+            ));
+        }
         // Whatever ends the VMM from here, smolvm asked for it.
-        if let Some(name) = self.name() {
-            crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+        if let Some(runtime) = self.vsock_socket.parent() {
+            crate::vm_exit::mark_stop_requested(runtime, pid);
         }
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
         // then refuse the stop. Identity is still verified below, from the PID
         // start time or this VM's own boot-config path.
-        let shutdown_acked = if guest_is_paused {
+        if guest_is_paused {
             tracing::debug!(
                 pid,
                 "guest is paused; terminating without a shutdown handshake"
             );
-            false
         } else {
             // Use short timeout — the agent may already be gone (ephemeral run exited).
             // A 100ms connect timeout avoids blocking the exit path.
@@ -4145,11 +4575,13 @@ impl AgentManager {
                 connected = connection.is_ok(),
                 "shutdown agent connect finished"
             );
-            let shutdown = connection.and_then(|mut client| match stop_timeout {
-                Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
-                None => client.shutdown(),
+            let shutdown = connection.and_then(|mut client| {
+                self.validate_control_identity()?;
+                match stop_timeout {
+                    Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
+                    None => client.shutdown(),
+                }
             });
-            let acked = shutdown.is_ok();
 
             // Process identity is not proof that guest writes reached disk. A slow
             // flush must not turn a graceful stop into an unannounced power cut.
@@ -4187,27 +4619,20 @@ impl AgentManager {
                 );
                 return Ok(());
             }
-            acked
-        };
+        }
 
-        // Identity check: vsock acknowledgement OR strict PID start-time match OR
-        // an argv match on this VM's unique boot-config path. We intentionally do
-        // NOT use the lenient is_our_process() here because it treats any alive
-        // PID as "ours" when start_time is None — which risks killing an unrelated
-        // process if the OS reused the PID. The cmdline fallback is safe for the
-        // same reason it's specific: only our `_boot-vm <this-vm>/boot-config.json`
-        // process carries that exact path, so it recovers the case where the agent
-        // vsock is wedged (no ack) AND the start-time record is missing — the exact
-        // combination that otherwise leaks a live orphan the control can never see.
-        let identity_ok = shutdown_acked
-            || process::is_our_process_strict(pid, start_time)
-            || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
+        // Recheck after the guest flush: an acknowledgment does not identify a
+        // host PID. Legacy records without a start time may use the exact boot
+        // path, but a mismatched known start time never falls back to argv.
+        let identity_ok = process::is_our_process_strict(pid, start_time)
+            || (start_time.is_none()
+                && process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy()));
 
         let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
-                    "PID start-time not verified, identity confirmed via vsock"
+                    "legacy process identity confirmed by its boot-config path"
                 );
             }
             // The stop helper observes the kernel's exit event or reaps our
@@ -4308,7 +4733,14 @@ impl AgentManager {
 
     fn cleanup_dead_vm_runtime(&self) {
         if let Some(name) = self.name.as_deref() {
-            if let Err(error) = cleanup_dead_vm_runtime(name) {
+            let result = (|| {
+                let db = crate::db::SmolvmDb::open()?;
+                let runtime = self.vsock_socket.parent().ok_or_else(|| {
+                    Error::agent("clean runtime", "machine runtime directory is missing")
+                })?;
+                cleanup_dead_vm_runtime_at(name, &db, runtime)
+            })();
+            if let Err(error) = result {
                 tracing::warn!(%name, %error, "failed to clean dead VM runtime state");
             }
         } else {
@@ -4328,41 +4760,49 @@ impl AgentManager {
     /// Kill the VM and wait up to `timeout` before reclaiming its resources.
     /// Large disposable helpers can take longer to release their mappings.
     pub fn kill_and_wait(&self, timeout: std::time::Duration) {
-        // Two PID sources with very different PID-reuse risk:
-        //   - the in-memory child: a direct child we still own, so the kernel
-        //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
-        //   - the pid-file: a process we did NOT spawn as our child (recovered
-        //     after a re-attach), so between the pid-file write and now the OS
-        //     may have reused the PID. Verify the recorded start-time before
-        //     SIGKILL (`kill_verified`) so we never signal an unrelated process.
+        let _operation = match self.reserve_control_operation() {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::warn!(%error, "refusing stale or transfer-owned VM cleanup");
+                return;
+            }
+        };
+        // A cached child may have been reattached rather than spawned here.
+        // Retain and verify its original start time before signaling it.
         let owned_child = {
             let inner = self.inner.lock();
-            inner.child.as_ref().map(|c| c.pid())
+            inner.child.as_ref().map(|c| (c.pid(), c.start_time()))
         };
 
         // Whatever ends the VMM from here, smolvm asked for it.
         let mark = |pid| {
-            if let Some(name) = self.name() {
-                crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+            if let Some(runtime) = self.vsock_socket.parent() {
+                crate::vm_exit::mark_stop_requested(runtime, pid);
             }
         };
         let killed_pid = match owned_child {
-            Some(pid) => {
+            Some((pid, start_time)) => {
                 if process::is_alive(pid) {
+                    if !process::is_our_process_strict(pid, start_time) {
+                        tracing::warn!(pid, "refusing kill of a changed process identity");
+                        return;
+                    }
                     mark(pid);
-                    process::kill(pid);
+                    process::kill_verified(pid, start_time);
                 }
                 Some(pid)
             }
-            None => match self.read_pid_file_with_start_time() {
+            None => match self.pid_and_start_time() {
                 Some((pid, start_time)) => {
                     mark(pid);
                     if process::kill_verified(pid, start_time) {
                         Some(pid)
-                    } else if process::cmdline_contains(
-                        pid,
-                        &self.boot_config_path().to_string_lossy(),
-                    ) {
+                    } else if start_time.is_none()
+                        && process::cmdline_contains(
+                            pid,
+                            &self.boot_config_path().to_string_lossy(),
+                        )
+                    {
                         // Start-time unverifiable, but the live PID's argv carries
                         // this VM's unique boot-config path — unambiguously ours,
                         // so kill it rather than leak a live orphan.
@@ -4445,6 +4885,75 @@ impl AgentManager {
         self.stop_inner(false, Some(stop_timeout))
     }
 
+    /// Synchronize and stop the reviewed registered machine, then publish its
+    /// stopped state while retaining the same execution and disk ownership.
+    /// The caller must hold its fork-source/lifecycle lock. On sync failure the
+    /// guest and its authoritative working copy remain available for retry.
+    pub fn stop_persisted(
+        &self,
+        record: &crate::config::VmRecord,
+        stop_timeout: Option<Duration>,
+    ) -> Result<crate::config::VmRecord> {
+        let operation = self.reserve_control_operation()?;
+        operation.validate_staged_record(record)?;
+        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
+        let frozen = resolved == crate::config::RecordState::Frozen;
+        if frozen {
+            let dependents = super::fork::stop_blocking_dependent_clones(
+                &crate::db::SmolvmDb::open()?,
+                &record.name,
+            )?;
+            if !dependents.is_empty() {
+                return Err(Error::agent_conflict(
+                    "stop machine",
+                    "frozen machine still has running dependent clones",
+                ));
+            }
+        }
+        if !frozen && record.is_process_alive() {
+            crate::staged_mount::sync_with_operation(record, self, &operation)?;
+        }
+        self.stop_owned(&operation, frozen, stop_timeout)?;
+        // Use the manager's captured path, never a fresh home/name resolution.
+        let runtime = operation
+            ._ownership
+            .as_ref()
+            .expect("reviewed by validate_staged_record")
+            .runtime_dir();
+        smolvm_pack::extract::force_detach_layers_volume(&runtime.join("pack"));
+        operation.finish_stop()
+    }
+
+    /// Retain control ownership after shutdown for destructive deletion.
+    pub(crate) fn stop_for_deletion(
+        &self,
+        record: &crate::config::VmRecord,
+    ) -> Result<crate::db::VmRecoveryGuard> {
+        let mut operation = self.reserve_control_operation()?;
+        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
+        if resolved == crate::config::RecordState::Running {
+            crate::staged_mount::sync_with_operation(record, self, &operation)?;
+        } else if resolved == crate::config::RecordState::Unreachable
+            && !record.staged_mounts.is_empty()
+        {
+            return Err(Error::agent_conflict(
+                "delete machine",
+                "machine has unsynchronized staged mounts but its agent is unreachable",
+            ));
+        }
+        self.stop_owned(
+            &operation,
+            matches!(
+                resolved,
+                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
+            ),
+            Some(Duration::ZERO),
+        )?;
+        operation._ownership.take().ok_or_else(|| {
+            Error::agent_conflict("delete machine", "deletion requires a reviewed machine")
+        })
+    }
+
     /// Stop a machine whose guest is paused and already quiesced.
     ///
     /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its
@@ -4459,6 +4968,17 @@ impl AgentManager {
     }
 
     fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
+        let operation = self.reserve_control_operation()?;
+        self.stop_owned(&operation, guest_is_paused, stop_timeout)
+    }
+
+    fn stop_owned(
+        &self,
+        operation: &ControlOperation,
+        guest_is_paused: bool,
+        stop_timeout: Option<Duration>,
+    ) -> Result<()> {
+        operation.validate_manager(self)?;
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -4467,7 +4987,7 @@ impl AgentManager {
         if state == AgentState::Stopped {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
-            if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
+            if let Some((pid, start_time)) = self.pid_and_start_time() {
                 if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
                 {
                     tracing::warn!(
@@ -4492,20 +5012,10 @@ impl AgentManager {
         // Get the child PID and start time — try in-memory first, then PID file.
         // The PID file fallback is critical for default VMs where a fresh
         // AgentManager doesn't know the PID from a previous CLI invocation.
-        let (child_pid, pid_start_time) = {
-            let inner = self.inner.lock();
-            if let Some(child) = inner.child.as_ref() {
-                // Use the start time captured when the child handle was created,
-                // not recomputed from the PID (which would be self-fulfilling
-                // if the PID was recycled by the OS).
-                (Some(child.pid()), child.start_time())
-            } else {
-                match self.read_pid_file_with_start_time() {
-                    Some((pid, start_time)) => (Some(pid), start_time),
-                    None => (None, None),
-                }
-            }
-        };
+        let (child_pid, pid_start_time) = self
+            .pid_and_start_time()
+            .map(|(pid, start)| (Some(pid), start))
+            .unwrap_or((None, None));
 
         if let Some(pid) = child_pid {
             if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
@@ -5213,12 +5723,24 @@ mod tests {
         db.insert_vm("worker", &record).unwrap();
 
         // Existing records and ordinary machines remain bootable.
-        enforce_external_interceptor_requirement(&db, "worker", None).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            None,
+        )
+        .unwrap();
         let endpoint = smolvm_protocol::InterceptEndpoint {
             addr: "127.0.0.1:43123".parse().unwrap(),
             token: [7; smolvm_protocol::intercept::TOKEN_LEN],
         };
-        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            Some(&endpoint),
+        )
+        .unwrap();
         assert!(
             db.get_vm("worker")
                 .unwrap()
@@ -5226,11 +5748,23 @@ mod tests {
                 .external_interceptor_required
         );
 
-        let error = enforce_external_interceptor_requirement(&db, "worker", None).unwrap_err();
+        let error = enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            None,
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("requires an external interceptor"));
-        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            Some(&endpoint),
+        )
+        .unwrap();
     }
 
     /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
@@ -6260,3 +6794,7 @@ mod egress_signal_tests {
         assert!(read_egress_signals_at(&log).is_none());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "manager_reviewed_control_tests.rs"]
+mod reviewed_control_tests;

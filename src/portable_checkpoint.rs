@@ -962,26 +962,14 @@ pub fn restore_from_path_with(
     // Reserve the name before touching its data directory. SDKs and CLIs may
     // run in separate processes, so a process-local lifecycle mutex is not a
     // sufficient creation boundary.
-    let token = crate::db::SmolvmDb::create_reservation_token();
-    if !db.reserve_vm_create(name, &token)? {
-        return Err(Error::agent_conflict(
-            "restore checkpoint",
-            format!("machine '{name}' already exists or is being created"),
-        ));
-    }
-    let mut reservation = RestoreReservation {
-        db: db.clone(),
-        name: name.to_string(),
-        token,
-        committed: false,
-    };
+    let reservation = crate::db::VmCreationLease::reserve(db.clone(), name)?;
 
     let mut record = restored_record_with(name, &manifest, checkpoint, spec)?;
     let vm_data = crate::agent::vm_data_dir(name);
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
     let result = (|| -> Result<()> {
-        let _manager = crate::agent::AgentManager::for_vm_with_sizes(
-            name,
+        let _manager = crate::agent::AgentManager::for_vm_creation(
+            &reservation,
             checkpoint.storage_gib,
             checkpoint.overlay_gib,
         )?;
@@ -1026,31 +1014,13 @@ pub fn restore_from_path_with(
             image.apply(&mut record);
         }
         mark_image_on_storage(checkpoint, &mut record);
-        if !reservation
-            .db
-            .commit_reserved_vm(name, &reservation.token, &record)?
-        {
-            return Err(Error::agent_conflict(
-                "restore checkpoint",
-                format!("machine '{name}' is no longer reserved"),
-            ));
-        }
-        reservation.committed = true;
+        // Detach before publishing: another process may start immediately after
+        // commit, so no cleanup of its mounts may happen after ownership ends.
+        smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+        reservation.commit(&record)?;
         Ok(())
     })();
-    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-    if let Err(error) = result {
-        if let Err(remove_error) = std::fs::remove_dir_all(&vm_data) {
-            if remove_error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    machine = %name,
-                    error = %remove_error,
-                    "failed to clean checkpoint restore after error"
-                );
-            }
-        }
-        return Err(error);
-    }
+    result?;
     // The restored machine holds its own copies now; keep the shared store
     // within the restore cache's bounds, as a server restore does.
     #[cfg(target_os = "linux")]
@@ -1381,30 +1351,6 @@ impl VerifiedSidecar {
     }
 }
 
-struct RestoreReservation {
-    db: crate::db::SmolvmDb,
-    name: String,
-    token: String,
-    committed: bool,
-}
-
-impl Drop for RestoreReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            if let Err(error) = self
-                .db
-                .release_vm_create_reservation(&self.name, &self.token)
-            {
-                tracing::warn!(
-                    machine = %self.name,
-                    %error,
-                    "failed to release checkpoint restore reservation"
-                );
-            }
-        }
-    }
-}
-
 /// Guest subnet a checkpoint must be restored on.
 ///
 /// The restored guest keeps its captured address in memory, so the host side
@@ -1470,9 +1416,8 @@ struct SavedVmPause {
 }
 
 impl SavedVmPause {
-    fn stop(&mut self, name: &str, record: &VmRecord) -> Result<()> {
-        crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?
-            .stop_paused()?;
+    fn stop(&mut self, name: &str) -> Result<()> {
+        crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
         self.armed = false;
         Ok(())
     }
@@ -2922,7 +2867,7 @@ fn capture_with_completion(
         }
         if stop_after_capture {
             publish_resume_point(PauseCaptureStage::Durable)?;
-            pause.stop(name, vm)?;
+            pause.stop(name)?;
             record_paused_disks(
                 &crate::agent::vm_data_dir(name),
                 output,
@@ -3030,7 +2975,7 @@ fn capture_with_completion(
             pins.commit(output)?;
         }
         publish_resume_point(PauseCaptureStage::Durable)?;
-        pause.stop(name, vm)?;
+        pause.stop(name)?;
         record_paused_disks(
             &crate::agent::vm_data_dir(name),
             output,
@@ -4980,7 +4925,7 @@ fn remove_paused_disks_marker(vm_data: &Path) -> Result<()> {
 /// Where a paused machine pins the backing layers its artifact references:
 /// beside its data directory, like [`paused_disks_marker`], so its VMM cannot
 /// replace them.
-fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
+pub(crate) fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
     match (vm_data.parent(), vm_data.file_name()) {
         (Some(parent), Some(name)) => {
             Ok(parent.join(format!(".{}{PAUSED_LAYERS_SUFFIX}", name.to_string_lossy())))

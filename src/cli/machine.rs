@@ -5640,8 +5640,8 @@ impl CreateCmd {
         // extract before publishing the VM row. Other processes either see the
         // reservation conflict or the finished VM, never a half-created record.
         let create_result = (|| -> smolvm::Result<()> {
-            let manager = AgentManager::for_vm_with_sizes(
-                &name_for_layers,
+            let manager = AgentManager::for_vm_creation(
+                &reservation.lease,
                 record.storage_gb,
                 record.overlay_gb,
             )?;
@@ -5771,23 +5771,7 @@ impl CreateCmd {
             Ok(())
         })();
 
-        if let Err(e) = create_result {
-            smolvm_pack::extract::force_detach_layers_volume(
-                &smolvm::agent::machine_layers_cache_dir(&name_for_layers),
-            );
-            let data_dir = smolvm::agent::vm_data_dir(&name_for_layers);
-            if let Err(remove_err) = std::fs::remove_dir_all(&data_dir) {
-                if remove_err.kind() != std::io::ErrorKind::NotFound {
-                    tracing::warn!(
-                        machine = %name_for_layers,
-                        dir = %data_dir.display(),
-                        error = %remove_err,
-                        "failed to remove machine data dir after create failure"
-                    );
-                }
-            }
-            return Err(e);
-        }
+        create_result?;
 
         Ok(record)
     }
@@ -7789,20 +7773,21 @@ pub struct ImagesCmd {
 
 impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // Validate VM exists before creating storage (for_vm creates dirs).
+        // Observe existing disks first; prepare them only if this query starts a VM.
         let db = smolvm::db::SmolvmDb::open()?;
         let record = db.get_vm(&self.name)?.ok_or_else(|| {
             smolvm::Error::config("images", format!("machine '{}' not found", self.name))
         })?;
 
-        let manager =
-            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+        let mut manager = AgentManager::for_vm(&self.name)?;
 
         let started_for_query = if manager.try_connect_existing().is_some() {
             manager.detach();
             false
         } else {
             eprintln!("Starting machine '{}' to query storage...", self.name);
+            manager.detach();
+            manager = AgentManager::for_vm_record(&record)?;
             manager.start()?;
             true
         };
@@ -7895,14 +7880,13 @@ pub struct PruneCmd {
 
 impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
-        // Validate VM exists before creating storage (for_vm creates dirs).
+        // Observe existing disks first; prepare them only if this query starts a VM.
         let db = smolvm::db::SmolvmDb::open()?;
         let record = db.get_vm(&self.name)?.ok_or_else(|| {
             smolvm::Error::config("prune", format!("machine '{}' not found", self.name))
         })?;
 
-        let manager =
-            AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+        let mut manager = AgentManager::for_vm(&self.name)?;
 
         // Regular prune (unreferenced layers only) is safe on a running VM —
         // referenced layers can't be collected. --all deletes manifests for
@@ -7921,6 +7905,8 @@ impl PruneCmd {
             manager.detach();
         } else {
             eprintln!("Starting machine...");
+            manager.detach();
+            manager = AgentManager::for_vm_record(&record)?;
             manager.start()?;
             started_for_prune = true;
         }
@@ -8310,11 +8296,7 @@ impl SyncCmd {
         }
 
         let _source_lock = smolvm::agent::fork::lock_fork_source(&name)?;
-        let (manager, mut client) = vm_common::connect_after_startup(&Some(name.clone()))?;
-        // This command observes an existing persistent VM; a failed sync must
-        // leave it running so the user can fix the cause and retry.
-        manager.detach();
-        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
+        smolvm::staged_mount::sync_running_machine(&record)?;
         println!("Synchronized staged mounts for '{name}'");
         Ok(())
     }

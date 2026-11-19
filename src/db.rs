@@ -16,23 +16,26 @@ use crate::pool::{
     ForkPoolSlotRecord, ForkPoolSlotState,
 };
 use parking_lot::{Condvar, Mutex};
-use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod deletion_intent;
+mod incarnation;
+mod recovery;
+pub(crate) use recovery::VmRecoveryGuard;
 mod resize;
 pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
+pub mod launch_admission;
+pub use launch_admission::VmCreationLease;
+pub mod transfer_admission;
 
 /// SQLite busy_timeout: how long a blocked writer waits for the write lock
 /// before returning SQLITE_BUSY. Set high enough to survive burst contention
 /// from concurrent CLI processes (e.g., 10-20 VMs starting simultaneously).
 const BUSY_TIMEOUT: Duration = Duration::from_secs(15);
-
-/// Long enough for a legitimate slow create/extract, short enough that a
-/// crashed creator does not reserve a name forever.
-const CREATE_RESERVATION_TTL_SECS: u64 = 60 * 60;
 
 /// Inputs committed together when one ready fork-pool worker is claimed.
 pub struct ForkPoolSlotClaim<'a> {
@@ -275,7 +278,7 @@ impl SmolvmDb {
 
     /// Open the serialized writer, configure WAL, and ensure tables exist.
     fn open_writer_connection(path: &Path) -> Result<Connection> {
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .map_err(|e| Error::database_unavailable(format!("open database: {}", e)))?;
 
         // Install the busy handler before any pragma or schema statement that
@@ -307,6 +310,15 @@ impl SmolvmDb {
              );
              CREATE UNIQUE INDEX IF NOT EXISTS vm_pause_active
                  ON vm_pause_operations(name) WHERE consumed = 0;
+             CREATE TABLE IF NOT EXISTS workload_transfer_admission (
+                 operation TEXT PRIMARY KEY NOT NULL,
+                 retired INTEGER NOT NULL DEFAULT 0 CHECK (retired IN (0, 1)),
+                 data BLOB NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS vm_launch_admission (
+                 token TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS config (
                  key TEXT PRIMARY KEY NOT NULL,
                  value TEXT NOT NULL
@@ -349,6 +361,9 @@ impl SmolvmDb {
                  ON fork_leases(pool_name, state);",
         )
         .db_err("create tables")?;
+        incarnation::install(&mut conn)?;
+        recovery::install(&mut conn)?;
+        deletion_intent::install(&mut conn)?;
 
         Ok(conn)
     }
@@ -437,21 +452,42 @@ impl SmolvmDb {
 
     /// Insert or update a VM record.
     pub fn insert_vm(&self, name: &str, record: &VmRecord) -> Result<()> {
+        self.insert_vm_for_launch(name, record).map(|_| ())
+    }
+
+    pub(crate) fn insert_vm_for_launch(&self, name: &str, record: &VmRecord) -> Result<VmRecord> {
         let json = serde_json::to_vec(record).db_err("serialize vm record")?;
         let existed = self.get_vm(name)?.is_some();
-        self.with_conn(|conn| {
-            conn.execute(
-                "INSERT INTO vms (name, data) VALUES (?1, ?2)
+        let published = self.with_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin machine publication")?;
+            let changed = tx
+                .execute(
+                    "INSERT INTO vms (name, data)
+                 SELECT ?1, ?2 WHERE NOT EXISTS (
+                     SELECT 1 FROM vm_create_reservations WHERE name = ?1
+                 )
                  ON CONFLICT(name) DO UPDATE SET data = excluded.data",
-                params![name, json],
-            )
-            .db_err(format!("insert vm '{}'", name))?;
-            Ok(())
+                    params![name, json],
+                )
+                .db_err(format!("insert vm '{}'", name))?;
+            if changed != 1 {
+                return Err(Error::agent_conflict(
+                    "create machine",
+                    "machine creation is still owned",
+                ));
+            }
+            let published =
+                launch_admission::review::read_record(&tx, &self.path.canonicalize()?, name)?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+            tx.commit().db_err("commit machine publication")?;
+            Ok(published)
         })?;
         if !existed {
             self.journal_insert(name, record);
         }
-        Ok(())
+        Ok(published)
     }
 
     /// Parent lookup for the usage journal's branch-depth walk.
@@ -495,175 +531,18 @@ impl SmolvmDb {
         })
     }
 
-    /// Generate an opaque token identifying this process's create reservation.
-    pub fn create_reservation_token() -> String {
-        let nanos = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_nanos();
-        format!(
-            "{}-{}-{}",
-            std::process::id(),
-            crate::util::current_timestamp(),
-            nanos
-        )
-    }
-
-    /// Reserve a VM name across processes before touching its data directory.
-    ///
-    /// Returns `Ok(false)` when the VM already exists or another live creator
-    /// owns the reservation. Dead/stale reservations are reaped before the
-    /// insert attempt so a crashed creator does not permanently wedge a name.
-    pub fn reserve_vm_create(&self, name: &str, owner_token: &str) -> Result<bool> {
-        let owner_pid = i64::from(std::process::id());
-        let now = crate::util::current_timestamp();
-        let stale_before = now.saturating_sub(CREATE_RESERVATION_TTL_SECS);
-
-        self.with_write_conn(|conn| {
-            let tx = conn.transaction().db_err("begin create reservation")?;
-
-            if let Some((existing_pid, created_at)) = tx
-                .query_row(
-                    "SELECT owner_pid, created_at
-                     FROM vm_create_reservations
-                     WHERE name = ?1",
-                    params![name],
-                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, u64>(1)?)),
-                )
-                .optional()
-                .db_err(format!("read create reservation '{}'", name))?
-            {
-                let pid_alive = existing_pid > 0
-                    && crate::process::is_alive(existing_pid as crate::process::Pid);
-                if !pid_alive || created_at <= stale_before {
-                    tx.execute(
-                        "DELETE FROM vm_create_reservations WHERE name = ?1",
-                        params![name],
-                    )
-                    .db_err(format!("remove stale create reservation '{}'", name))?;
-                }
-            }
-
-            let exists: bool = tx
-                .query_row(
-                    "SELECT EXISTS(SELECT 1 FROM vms WHERE name = ?1)",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .db_err(format!("check vm '{}'", name))?;
-            if exists {
-                tx.commit().db_err("commit create reservation check")?;
-                return Ok(false);
-            }
-
-            let changed = tx
-                .execute(
-                    "INSERT OR IGNORE INTO vm_create_reservations
-                     (name, owner_token, owner_pid, created_at)
-                     VALUES (?1, ?2, ?3, ?4)",
-                    params![name, owner_token, owner_pid, now],
-                )
-                .db_err(format!("reserve vm '{}'", name))?;
-
-            tx.commit().db_err("commit create reservation")?;
-            Ok(changed == 1)
-        })
-    }
-
-    /// Persist a VM record and release the matching create reservation atomically.
-    ///
-    /// Returns `Ok(false)` if the caller does not own the reservation or if the
-    /// VM row already exists.
-    pub fn commit_reserved_vm(
-        &self,
-        name: &str,
-        owner_token: &str,
-        record: &VmRecord,
-    ) -> Result<bool> {
-        let json = serde_json::to_vec(record).db_err("serialize vm record")?;
-        self.with_write_conn(|conn| {
-            let tx = conn.transaction().db_err("begin reserved vm commit")?;
-
-            let owns_reservation: bool = tx
-                .query_row(
-                    "SELECT EXISTS(
-                         SELECT 1 FROM vm_create_reservations
-                         WHERE name = ?1 AND owner_token = ?2
-                     )",
-                    params![name, owner_token],
-                    |row| row.get(0),
-                )
-                .db_err(format!("check create reservation '{}'", name))?;
-            if !owns_reservation {
-                tx.commit().db_err("commit reservation ownership check")?;
-                return Ok(false);
-            }
-
-            let changed = tx
-                .execute(
-                    "INSERT OR IGNORE INTO vms (name, data) VALUES (?1, ?2)",
-                    params![name, json],
-                )
-                .db_err(format!("insert reserved vm '{}'", name))?;
-
-            tx.execute(
-                "DELETE FROM vm_create_reservations
-                 WHERE name = ?1 AND owner_token = ?2",
-                params![name, owner_token],
-            )
-            .db_err(format!("release create reservation '{}'", name))?;
-
-            tx.commit().db_err("commit reserved vm")?;
-            Ok(changed == 1)
-        })
-        .inspect(|inserted| {
-            if *inserted {
-                self.journal_insert(name, record);
-            }
-        })
-    }
-
-    /// Release a create reservation if it is still owned by `owner_token`.
-    pub fn release_vm_create_reservation(&self, name: &str, owner_token: &str) -> Result<()> {
-        self.with_conn(|conn| {
-            conn.execute(
-                "DELETE FROM vm_create_reservations
-                 WHERE name = ?1 AND owner_token = ?2",
-                params![name, owner_token],
-            )
-            .db_err(format!("release create reservation '{}'", name))?;
-            Ok(())
-        })
-    }
-
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        self.with_read_conn(|conn| {
-            let data: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT data FROM vms WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .db_err(format!("get vm '{}'", name))?;
-
-            match data {
-                Some(bytes) => {
-                    let record: VmRecord = serde_json::from_slice(&bytes)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
-                    Ok(Some(record))
-                }
-                None => Ok(None),
-            }
-        })
+        let database = self.path.canonicalize()?;
+        self.with_read_conn(|conn| launch_admission::review::read_record(conn, &database, name))
     }
 
     /// Remove a VM record by name, returning the removed record if it existed.
     ///
     /// Read + delete happen in a single transaction to prevent TOCTOU races.
     pub fn remove_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        self.with_conn(|conn| {
+        let _admission = self.admit_workload_mutation(Some(name), &[])?;
+        self.with_durable_conn(|conn| {
             // Reserve the writer before reading. A deferred transaction can
             // observe a record, lose a cross-process writer race, and fail its
             // DELETE upgrade with SQLITE_BUSY_SNAPSHOT — which surfaced when
@@ -673,49 +552,7 @@ impl SmolvmDb {
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin vm removal")?;
 
-            let data: Option<Vec<u8>> = tx
-                .query_row(
-                    "SELECT data FROM vms WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .db_err(format!("get vm '{}'", name))?;
-
-            let record = match data {
-                Some(bytes) => {
-                    let r: VmRecord = serde_json::from_slice(&bytes)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
-                    tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
-                        .db_err(format!("remove vm '{}'", name))?;
-                    // Reusing a name starts a new lifetime; delayed requests
-                    // from the deleted machine must never capture it.
-                    tx.execute(
-                        "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
-                        params![name],
-                    ).db_err("retire deleted machine's pause intents")?;
-                    tx.execute(
-                        "DELETE FROM vm_resize_intents WHERE name = ?1",
-                        params![name],
-                    )
-                    .db_err("remove VM resize intent")?;
-                    tx.execute(
-                        "DELETE FROM vm_resize_receipts WHERE name = ?1",
-                        params![name],
-                    )
-                    .db_err("remove VM resize receipts")?;
-                    // A retained checkpoint only means anything while its golden
-                    // process is alive, so it dies with the record rather than
-                    // waiting for a sweep that only the pool controller runs.
-                    tx.execute(
-                        "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
-                        params![name],
-                    )
-                    .db_err(format!("remove retained fork snapshot for '{}'", name))?;
-                    Some(r)
-                }
-                None => None,
-            };
+            let record = Self::remove_vm_in_transaction(&tx, name)?;
 
             tx.commit().db_err("commit vm removal")?;
             Ok(record)
@@ -727,26 +564,75 @@ impl SmolvmDb {
         })
     }
 
+    /// Shared by ordinary removal and an operation retaining execution ownership.
+    pub(super) fn remove_vm_in_transaction(
+        tx: &Transaction<'_>,
+        name: &str,
+    ) -> Result<Option<VmRecord>> {
+        launch_admission::revoke_removed_member(tx, name)?;
+
+        let data: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT data FROM vms WHERE name = ?1",
+                params![name],
+                |row| row.get(0),
+            )
+            .optional()
+            .db_err(format!("get vm '{}'", name))?;
+
+        let record = match data {
+            Some(bytes) => {
+                let r: VmRecord = serde_json::from_slice(&bytes)
+                    .db_err(format!("deserialize vm record '{}'", name))?;
+                tx.execute("DELETE FROM vms WHERE name = ?1", params![name])
+                    .db_err(format!("remove vm '{}'", name))?;
+                // Reusing a name starts a new lifetime; delayed requests
+                // from the deleted machine must never capture it.
+                tx.execute(
+                    "UPDATE vm_pause_operations SET consumed = 1 WHERE name = ?1 AND consumed = 0",
+                    params![name],
+                )
+                .db_err("retire deleted machine's pause intents")?;
+                tx.execute(
+                    "DELETE FROM vm_resize_intents WHERE name = ?1",
+                    params![name],
+                )
+                .db_err("remove VM resize intent")?;
+                tx.execute(
+                    "DELETE FROM vm_resize_receipts WHERE name = ?1",
+                    params![name],
+                )
+                .db_err("remove VM resize receipts")?;
+                // A retained checkpoint only means anything while its golden
+                // process is alive, so it dies with the record rather than
+                // waiting for a sweep that only the pool controller runs.
+                tx.execute(
+                    "DELETE FROM fork_pool_snapshots WHERE golden = ?1",
+                    params![name],
+                )
+                .db_err(format!("remove retained fork snapshot for '{}'", name))?;
+                Some(r)
+            }
+            None => None,
+        };
+
+        Ok(record)
+    }
+
     /// List all VM records, ordered by name so every listing of the same
     /// machines comes back in the same order.
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
+        let database = self.path.canonicalize()?;
         self.with_read_conn(|conn| {
-            let mut stmt = conn
-                .prepare_cached("SELECT name, data FROM vms ORDER BY name")
-                .db_err("prepare list_vms")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let name: String = row.get(0)?;
-                    let data: Vec<u8> = row.get(1)?;
-                    Ok((name, data))
-                })
+            let mut stmt = conn.prepare_cached(
+                "SELECT v.name, v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name ORDER BY v.name"
+            ).db_err("prepare list_vms")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<String>>(2)?)))
                 .db_err("query vms")?;
-
             let mut vms = Vec::new();
             for row in rows {
-                let (name, data) = row.db_err("read vms row")?;
-                let record: VmRecord = serde_json::from_slice(&data)
-                    .db_err(format!("deserialize vm record '{}'", name))?;
+                let (name, data, generation) = row.db_err("read vms row")?;
+                let record = launch_admission::review::decode_record(&database, &name, &data, generation)?;
                 vms.push((name, record));
             }
             Ok(vms)
@@ -853,7 +739,93 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, false, false)
+        self.update_vm_with_durability(name, f, false, false, None)
+    }
+
+    /// Startup bookkeeping may only change the row reviewed by this caller.
+    pub(crate) fn update_reviewed_vm<F>(
+        &self,
+        review: &launch_admission::LaunchReview,
+        name: &str,
+        f: F,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
+        review.check_name(Some(name))?;
+        self.update_vm_with_durability(name, f, false, false, Some(review))
+    }
+
+    pub(crate) fn update_reviewed_vm_durable<F>(
+        &self,
+        review: &launch_admission::LaunchReview,
+        name: &str,
+        f: F,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
+        review.check_name(Some(name))?;
+        self.update_vm_with_durability(name, f, true, false, Some(review))
+    }
+
+    /// Update only the machine whose database record the caller reviewed.
+    /// The closure can refuse stale execution/configuration state; its errors
+    /// roll back all changes. Portable/deserialized records carry no authority.
+    pub fn update_vm_for_record<F>(&self, reviewed: &VmRecord, f: F) -> Result<VmRecord>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
+        self.update_vm_for_record_inner(reviewed, f, false)
+    }
+
+    pub(crate) fn finish_saved_execution_for_record<F>(
+        &self,
+        reviewed: &VmRecord,
+        f: F,
+    ) -> Result<VmRecord>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
+        self.update_vm_for_record_inner(reviewed, f, true)
+    }
+
+    fn update_vm_for_record_inner<F>(
+        &self,
+        reviewed: &VmRecord,
+        f: F,
+        finish_pause: bool,
+    ) -> Result<VmRecord>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
+        let review = launch_admission::LaunchReview::from_record(reviewed)?;
+        let _admission = self.admit_machine_mutation(&reviewed.name)?;
+        self.try_update_vm_with_durability(
+            &reviewed.name,
+            |record| {
+                f(record)?;
+                if record.name != reviewed.name {
+                    return Err(Error::agent_conflict(
+                        "update reviewed machine",
+                        "a reviewed update cannot rename the machine",
+                    ));
+                }
+                let roots = record
+                    .host_mounts()
+                    .into_iter()
+                    .map(|mount| mount.source)
+                    .collect::<Vec<_>>();
+                // The outer gate stays held through commit. Include newly attached
+                // shares, which may belong to another environment being moved.
+                self.admit_workload_mutation(Some(&reviewed.name), &roots)?;
+                Ok(())
+            },
+            true,
+            finish_pause,
+            Some(&review),
+        )?
+        .ok_or_else(|| Error::vm_not_found(&reviewed.name))
     }
 
     /// Persist a recovery boundary before releasing its live execution state.
@@ -861,7 +833,7 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true, false)
+        self.update_vm_with_durability(name, f, true, false, None)
     }
 
     /// Commit resumed execution and retire retry keys in the same transaction.
@@ -869,7 +841,7 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true, true)
+        self.update_vm_with_durability(name, f, true, true, None)
     }
 
     /// A consumed key can never initiate a second pause after a successful resume.
@@ -923,9 +895,33 @@ impl SmolvmDb {
         f: F,
         durable: bool,
         finish_pause: bool,
+        review: Option<&launch_admission::LaunchReview>,
     ) -> Result<Option<VmRecord>>
     where
         F: FnOnce(&mut VmRecord),
+    {
+        self.try_update_vm_with_durability(
+            name,
+            |record| {
+                f(record);
+                Ok(())
+            },
+            durable,
+            finish_pause,
+            review,
+        )
+    }
+
+    fn try_update_vm_with_durability<F>(
+        &self,
+        name: &str,
+        f: F,
+        durable: bool,
+        finish_pause: bool,
+        review: Option<&launch_admission::LaunchReview>,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
     {
         self.with_conn(|conn| {
             if durable {
@@ -939,6 +935,9 @@ impl SmolvmDb {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .db_err("begin transaction")?;
+                if let Some(review) = review {
+                    review.validate_conn(self, &tx)?;
+                }
 
                 let data: Option<Vec<u8>> = tx
                     .query_row(
@@ -954,7 +953,7 @@ impl SmolvmDb {
                         let mut record: VmRecord = serde_json::from_slice(&bytes)
                             .db_err(format!("deserialize vm record '{}'", name))?;
                         let before = record.clone();
-                        f(&mut record);
+                        f(&mut record)?;
                         transition = Some((before, record.clone()));
                         if finish_pause {
                             tx.execute(
@@ -969,7 +968,7 @@ impl SmolvmDb {
                             params![name, new_data],
                         )
                         .db_err(format!("update vm '{}'", name))?;
-                        Some(record)
+                        launch_admission::review::read_record(&tx, &self.path.canonicalize()?, name)?
                     }
                     None => None,
                 };
@@ -2285,6 +2284,7 @@ impl SmolvmDb {
 
     /// Load all config settings and VM records in a single transaction.
     pub fn load_all(&self) -> Result<(HashMap<String, String>, BTreeMap<String, VmRecord>)> {
+        let database = self.path.canonicalize()?;
         self.with_conn(|conn| {
             let tx = conn.transaction().db_err("begin read transaction")?;
 
@@ -2309,19 +2309,21 @@ impl SmolvmDb {
             let mut vms = BTreeMap::new();
             {
                 let mut stmt = tx
-                    .prepare_cached("SELECT name, data FROM vms")
+                    .prepare_cached("SELECT v.name, v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name")
                     .db_err("prepare list vms")?;
                 let rows = stmt
                     .query_map([], |row| {
                         let name: String = row.get(0)?;
                         let data: Vec<u8> = row.get(1)?;
-                        Ok((name, data))
+                        let generation: Option<String> = row.get(2)?;
+                        Ok((name, data, generation))
                     })
                     .db_err("query vms")?;
                 for row in rows {
-                    let (name, data) = row.db_err("read vms row")?;
-                    let record: VmRecord = serde_json::from_slice(&data)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
+                    let (name, data, generation) = row.db_err("read vms row")?;
+                    let record = launch_admission::review::decode_record(
+                        &database, &name, &data, generation,
+                    )?;
                     vms.insert(name, record);
                 }
             }

@@ -483,10 +483,12 @@ pub fn pin_for_start(
     record: crate::config::VmRecord,
     auth: &PullAuth,
 ) -> Result<crate::config::VmRecord> {
+    let review = crate::db::launch_admission::LaunchReview::from_record(&record)?;
+    review.validate(db)?;
     let Some(fetched) = host_fetch_for(&record, auth)? else {
         return Ok(record);
     };
-    db.update_vm_durable(name, |r| {
+    db.update_reviewed_vm_durable(&review, name, |r| {
         r.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone())
     })?
     .ok_or_else(|| Error::vm_not_found(name))

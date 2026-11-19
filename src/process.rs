@@ -4760,9 +4760,15 @@ pub struct ChildProcess {
 impl ChildProcess {
     /// Create a new child process handle, capturing start time immediately.
     pub fn new(pid: Pid) -> Self {
+        Self::from_identity(pid, process_start_time(pid))
+    }
+
+    /// Reattach using the identity already verified by the caller; resampling
+    /// here could silently bind this handle to a recycled PID.
+    pub(crate) fn from_identity(pid: Pid, start_time: Option<u64>) -> Self {
         Self {
             pid,
-            start_time: process_start_time(pid),
+            start_time,
             exit_code: None,
         }
     }

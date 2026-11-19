@@ -8,7 +8,7 @@ use std::time::Duration;
 use tokio::sync::watch;
 
 use crate::api::state::ApiState;
-use crate::config::RecordState;
+use crate::config::{RecordState, VmRecord};
 
 /// Interval between health checks.
 const CHECK_INTERVAL: Duration = Duration::from_secs(5);
@@ -39,6 +39,7 @@ pub struct Supervisor {
     /// the loop, so a plain map needs no synchronization. Entries are cleared
     /// when a machine is alive again, its restart fires, or its policy stops it.
     next_restart_at: std::collections::HashMap<String, tokio::time::Instant>,
+    restart_observations: std::collections::HashMap<String, VmRecord>,
 }
 
 impl Supervisor {
@@ -48,6 +49,7 @@ impl Supervisor {
             state,
             shutdown_rx,
             next_restart_at: std::collections::HashMap::new(),
+            restart_observations: std::collections::HashMap::new(),
         }
     }
 
@@ -88,11 +90,16 @@ impl Supervisor {
 
     /// Check all machines and restart any that need it.
     async fn check_all_machines(&mut self) {
+        if let Err(error) = self.state.discover_persisted_machines().await {
+            tracing::warn!(%error, "failed to discover machines");
+        }
         let machine_names = self.state.list_machine_names();
 
         // Drop schedule entries for machines that no longer exist so the map
         // can't grow without bound across deletes.
         self.next_restart_at
+            .retain(|name, _| machine_names.iter().any(|n| n == name));
+        self.restart_observations
             .retain(|name, _| machine_names.iter().any(|n| n == name));
 
         for name in machine_names {
@@ -111,98 +118,102 @@ impl Supervisor {
         self.rotate_logs_if_needed().await;
     }
 
-    /// Check a single machine and restart if needed.
+    /// Check one reviewed execution; all later writes must still match it.
     async fn check_machine(&mut self, name: &str) -> crate::Result<()> {
-        {
-            let lifecycle = self.state.lifecycle_lock(name);
-            // An API lifecycle operation may be creating or deleting the row.
-            // Let it finish, without blocking other machines' health checks.
-            let Ok(_guard) = lifecycle.try_lock() else {
-                return Ok(());
-            };
-            if self.state.forget_deleted_machine(name)? {
-                self.next_restart_at.remove(name);
-                return Ok(());
-            }
-        }
-        // Check if machine is alive
-        let is_alive = self.state.is_machine_alive(name);
-
-        if is_alive {
-            // Running again (recovered, or a prior restart took hold) — drop any
-            // pending restart schedule so a future death re-arms from scratch.
-            self.next_restart_at.remove(name);
+        let _admission = self.state.db().admit_machine_mutation(name)?;
+        let lifecycle = self.state.lifecycle_lock(name);
+        let Ok(guard) = lifecycle.try_lock() else {
             return Ok(());
-        }
-
-        // Machine is dead — try to retrieve its exit code via waitpid
-        // and persist it so the restart policy can use it.
-        if let Ok(Some(record)) = self.state.db().get_vm(name) {
-            if record.paused_checkpoint.is_some() {
-                self.next_restart_at.remove(name);
-                return Ok(());
-            }
-            // A recovered manager can lack a child handle and its PID file
-            // can be missing while the database still identifies a live VMM.
-            // Do not erase that identity or schedule another launch.
-            if record.is_process_alive() {
-                self.next_restart_at.remove(name);
-                return Ok(());
-            }
-            if let Some(pid) = record.pid {
-                let exit_code = crate::process::try_wait(pid);
-                self.state.set_last_exit_code(name, exit_code);
-            }
-        }
-
-        let last_exit_code = self.state.get_last_exit_code(name);
-
-        // Machine is dead, check restart policy
-        let restart_config = match self.state.get_restart_config(name) {
-            Some(config) => config,
-            None => {
-                self.next_restart_at.remove(name);
-                return Ok(()); // Machine doesn't exist anymore
-            }
         };
-
-        // Determine if we should restart (delegate to RestartConfig)
-        if !restart_config.should_restart(last_exit_code) {
-            self.next_restart_at.remove(name);
-            tracing::debug!(machine = %name, policy = %restart_config.policy, "machine dead, not restarting per policy");
-            // Update state to stopped (best-effort in supervisor)
-            if let Err(e) = self
-                .state
-                .update_machine_state(name, RecordState::Stopped, None)
-            {
-                tracing::warn!(machine = %name, error = %e, "failed to persist stopped state");
-            }
+        if self.state.forget_deleted_machine(name)? {
+            self.forget_schedule(name);
+            return Ok(());
+        }
+        let Some(mut record) = self.state.db().get_vm(name)? else {
+            self.forget_schedule(name);
+            return Ok(());
+        };
+        if crate::api::state::externally_supervised(&record) || record.state == RecordState::Created
+        {
+            self.forget_schedule(name);
+            return Ok(());
+        }
+        if self.state.is_machine_alive(name)
+            || record.is_process_alive()
+            || record.paused_checkpoint.is_some()
+            || matches!(
+                record.state,
+                RecordState::Paused | RecordState::Pausing | RecordState::Frozen
+            )
+        {
+            self.forget_schedule(name);
             return Ok(());
         }
 
-        // Honor the backoff by SCHEDULING, not sleeping: blocking here would
-        // stall every other machine's check this tick. See `restart_timing`.
-        let backoff = restart_config.backoff_duration();
-        let now = tokio::time::Instant::now();
-        match Self::restart_timing(&mut self.next_restart_at, name, backoff, now) {
+        if let Some(pid) = record.pid {
+            // Never reap a different process that has reused this numeric PID.
+            let reused = crate::process::process_start_time(pid)
+                .is_some_and(|start| record.pid_start_time != Some(start));
+            if pid > 0 && !reused {
+                if let Some(exit_code) = crate::process::try_wait(pid) {
+                    record = self.state.publish_supervisor_exit(&record, exit_code)?;
+                }
+            }
+        }
+        // No new wait status is not an exit code: retain a status collected on
+        // an earlier tick instead of erasing it while a backoff is pending.
+        if !record.restart.should_restart(record.last_exit_code) {
+            self.forget_schedule(name);
+            if record.state != RecordState::Stopped || record.pid.is_some() {
+                self.state.publish_supervisor_stopped(&record)?;
+            }
+            return Ok(());
+        }
+        match self.restart_timing_for_record(&record, tokio::time::Instant::now()) {
             RestartTiming::Waiting => return Ok(()),
             RestartTiming::Armed => {
-                tracing::info!(
-                    machine = %name,
-                    restart_count = restart_config.restart_count,
-                    backoff_secs = backoff.as_secs(),
-                    "machine dead, scheduling restart"
-                );
+                tracing::info!(machine = %name, restart_count = record.restart.restart_count,
+                    backoff_secs = record.restart.backoff_duration().as_secs(),
+                    "machine dead, scheduling restart");
                 return Ok(());
             }
             RestartTiming::Fire => {}
         }
+        drop(guard);
+        // The queued task reviews this same observation after acquiring its
+        // locks, then consumes a retry immediately before attempting launch.
+        self.restart_machine(record).await
+    }
 
-        // Increment restart count
-        self.state.increment_restart_count(name);
+    fn forget_schedule(&mut self, name: &str) {
+        self.next_restart_at.remove(name);
+        self.restart_observations.remove(name);
+    }
 
-        // Attempt restart
-        self.restart_machine(name).await
+    fn restart_timing_for_record(
+        &mut self,
+        record: &VmRecord,
+        now: tokio::time::Instant,
+    ) -> RestartTiming {
+        if !self
+            .restart_observations
+            .get(&record.name)
+            .is_some_and(|prior| crate::api::state::same_observation(prior, record))
+        {
+            self.forget_schedule(&record.name);
+            self.restart_observations
+                .insert(record.name.clone(), record.clone());
+        }
+        let timing = Self::restart_timing(
+            &mut self.next_restart_at,
+            &record.name,
+            record.restart.backoff_duration(),
+            now,
+        );
+        if timing == RestartTiming::Fire {
+            self.restart_observations.remove(&record.name);
+        }
+        timing
     }
 
     /// Decide, for a dead machine that should restart, whether its restart fires
@@ -242,7 +253,16 @@ impl Supervisor {
     }
 
     /// Attempt to restart a machine.
-    async fn restart_machine(&self, name: &str) -> crate::Result<()> {
+    async fn restart_machine(&self, observed: VmRecord) -> crate::Result<()> {
+        let state = self.state.clone();
+        tokio::spawn(async move { Self::restart_machine_owned(&state, observed).await })
+            .await
+            .map_err(|error| crate::Error::agent("restart task", error.to_string()))?
+    }
+
+    async fn restart_machine_owned(state: &Arc<ApiState>, observed: VmRecord) -> crate::Result<()> {
+        let name = observed.name.as_str();
+        let _admission = state.db().admit_machine_mutation(name)?;
         // Hold the per-machine lifecycle lock across the acquire+mount+launch so a
         // concurrent user-initiated stop/delete cannot detach the macOS layers
         // volume out from under this restart (review finding #3). Acquired before
@@ -251,7 +271,7 @@ impl Supervisor {
         // also follow. If a user op holds it, this restart blocks until that op
         // completes (operations are bounded), then re-derives state from the DB.
         // Linux: the guarded mount is a no-op.
-        let lifecycle = self.state.lifecycle_lock(name);
+        let lifecycle = state.lifecycle_lock(name);
         let _guard = lifecycle.lock().await;
         let source = name.to_string();
         let _source_lock =
@@ -267,12 +287,12 @@ impl Supervisor {
         // completed, so re-launching would kill+reboot a healthy machine and —
         // under concurrent boots — double the disk-prep load. If it's alive
         // again, there's nothing to restart.
-        if self.state.is_machine_alive(name) {
+        if state.is_machine_alive(name) {
             tracing::debug!(machine = %name, "machine came back alive before restart; skipping");
             return Ok(());
         }
 
-        let entry = match self.state.get_machine(name) {
+        let entry = match state.get_machine(name) {
             Ok(entry) => entry,
             Err(_) => {
                 tracing::warn!(machine = %name, "machine no longer exists, skipping restart");
@@ -283,7 +303,7 @@ impl Supervisor {
         // Load the authoritative config from the database record rather than
         // the in-memory MachineEntry, which may have lost fields (e.g.,
         // network_backend, gpu_vram_mib) during the ResourceSpec round-trip.
-        let record = match self.state.db().get_vm(name) {
+        let record = match state.db().get_vm(name) {
             Ok(Some(r)) => r,
             Ok(None) => {
                 tracing::warn!(machine = %name, "machine not found in database, skipping restart");
@@ -295,11 +315,28 @@ impl Supervisor {
             }
         };
 
+        if !crate::api::state::same_observation(&record, &observed) {
+            return Err(crate::Error::agent_conflict(
+                "restart machine",
+                "machine execution or restart policy changed while restart was queued",
+            ));
+        }
+
+        // A restart can have queued behind an explicit stop or pause. The
+        // original scheduling decision is no longer authority to boot it.
+        if record.restart.user_stopped
+            || record.state == RecordState::Created
+            || record.paused_checkpoint.is_some()
+            || crate::api::state::externally_supervised(&record)
+        {
+            return Ok(());
+        }
+
         // Never auto-restart a fork base: clones CoW-read its disks by path, so
         // relaunching it writable would corrupt them. Clones keep working
         // without the base process, so skipping is safe (and avoids thrashing,
         // since `prepare_for_launch` would refuse the launch anyway).
-        match self.state.db().dependent_clones(name) {
+        match state.db().dependent_clones(name) {
             Ok(clones) if !clones.is_empty() => {
                 tracing::warn!(
                     machine = %name,
@@ -310,11 +347,11 @@ impl Supervisor {
             }
             Ok(_) => {}
             Err(e) => {
-                tracing::warn!(machine = %name, error = %e, "could not check dependent clones; proceeding")
+                return Err(e);
             }
         }
 
-        if record.nested_virt.unwrap_or(false) && !self.state.nested_virt_allowed() {
+        if record.nested_virt.unwrap_or(false) && !state.nested_virt_allowed() {
             tracing::warn!(
                 machine = %name,
                 "not auto-restarting: nested virtualization is disabled on this server"
@@ -322,6 +359,8 @@ impl Supervisor {
             return Ok(());
         }
 
+        let record = state.reserve_supervisor_retry(&record)?;
+        let launch_record = record.clone();
         let mounts = record.host_mounts();
         let ports = record.port_mappings();
         let resources = record.vm_resources();
@@ -335,7 +374,8 @@ impl Supervisor {
 
         let entry_clone = entry.clone();
         let start_result = tokio::task::spawn_blocking(move || {
-            let entry = entry_clone.lock();
+            let mut entry = entry_clone.lock();
+            entry.manager = crate::agent::AgentManager::for_vm_record(&launch_record)?;
             // Wire pre-extracted layers if this machine was created from a .smolmachine.
             let mut features = crate::api::state::build_launch_features(
                 Some(&name_for_features),
@@ -354,32 +394,19 @@ impl Supervisor {
             entry
                 .manager
                 .ensure_running_via_subprocess(mounts, ports, resources, features)
+                .map(|_| entry.manager.pid_and_start_time())
         })
         .await
         .map_err(|e| crate::Error::agent("ensure running", e.to_string()))?;
 
-        // Handle start result
         match start_result {
-            Ok(_) => {
-                // Get updated PID and persist state
-                let pid = {
-                    let entry = entry.lock();
-                    entry.manager.child_pid()
-                };
-                if let Err(e) = self
-                    .state
-                    .update_machine_state(name, RecordState::Running, pid)
-                {
-                    tracing::warn!(machine = %name, error = %e, "failed to persist running state");
-                }
-                tracing::info!(machine = %name, pid = ?pid, "machine restarted successfully");
+            Ok(execution) => {
+                state.publish_observed_start(&record, execution)?;
+                tracing::info!(machine = %name, pid = ?execution.map(|(pid, _)| pid), "machine restarted successfully");
                 Ok(())
             }
             Err(e) => {
-                if let Err(db_err) =
-                    self.state
-                        .update_machine_state(name, RecordState::Failed, None)
-                {
+                if let Err(db_err) = state.publish_supervisor_failure(&record) {
                     tracing::warn!(machine = %name, error = %db_err, "failed to persist failed state");
                 }
                 tracing::error!(machine = %name, error = %e, "failed to restart machine");
@@ -426,10 +453,131 @@ impl Supervisor {
 
 #[cfg(test)]
 mod restart_timing_tests {
-    use super::{RestartTiming, Supervisor, MIN_RESTART_DELAY};
+    use super::{
+        ApiState, Arc, RecordState, RestartTiming, Supervisor, VmRecord, MIN_RESTART_DELAY,
+    };
     use std::collections::HashMap;
     use std::time::Duration;
+    use tokio::sync::watch;
     use tokio::time::Instant;
+
+    #[test]
+    fn stale_supervisor_observation_cannot_rewrite_a_new_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let name = "supervisor-stale-observation";
+        let original = crate::config::VmRecord::new(name.into(), 1, 128, vec![], vec![], false);
+        db.insert_vm(name, &original).unwrap();
+        let reviewed = db.get_vm(name).unwrap().unwrap();
+        let current = db
+            .update_vm(name, |r| {
+                r.state = crate::config::RecordState::Running;
+                r.pid = Some(std::process::id() as i32);
+                r.pid_start_time = crate::process::process_start_time(std::process::id() as i32);
+                r.restart.restart_count = 7;
+                r.last_exit_code = Some(0);
+            })
+            .unwrap()
+            .unwrap();
+        let state = crate::api::state::ApiState::with_db(db);
+        assert!(state.publish_supervisor_exit(&reviewed, 42).is_err());
+        assert!(state.reserve_supervisor_retry(&reviewed).is_err());
+        assert!(state.publish_supervisor_stopped(&reviewed).is_err());
+        assert!(state.publish_supervisor_failure(&reviewed).is_err());
+        assert_eq!(
+            serde_json::to_value(state.db().get_vm(name).unwrap().unwrap()).unwrap(),
+            serde_json::to_value(current).unwrap(),
+            "stale supervisor observation rewrote the newer execution"
+        );
+    }
+
+    #[tokio::test]
+    async fn transfer_admission_preserves_supervisor_metadata_and_restart_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let mut record = crate::config::VmRecord::new(
+            "transfer-supervisor".into(),
+            1,
+            128,
+            vec![],
+            vec![],
+            false,
+        );
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        record.restart.restart_count = 3;
+        record.restart.max_retries = 7;
+        record.restart.max_backoff_secs = 1;
+        assert!(db.insert_vm_if_not_exists(&record.name, &record).unwrap());
+        db.claim_workload_transfer(
+            "move",
+            vec![db.review_workload_member(&record.name).unwrap()],
+            &[],
+        )
+        .unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        assert_eq!(state.load_persisted_machines(), vec![record.name.clone()]);
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        let scheduled = Instant::now();
+        supervisor
+            .next_restart_at
+            .insert(record.name.clone(), scheduled);
+        for error in [
+            supervisor.check_machine(&record.name).await.unwrap_err(),
+            supervisor
+                .restart_machine(state.db().get_vm(&record.name).unwrap().unwrap())
+                .await
+                .unwrap_err(),
+        ] {
+            assert!(
+                error.to_string().contains("environment is moving"),
+                "{error}"
+            );
+        }
+        assert_eq!(
+            supervisor.next_restart_at.get(&record.name),
+            Some(&scheduled)
+        );
+        assert_eq!(
+            serde_json::to_value(&record).unwrap(),
+            serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap()
+        );
+    }
+
+    #[tokio::test]
+    async fn discovery_does_not_boot_created_machines_or_reconcile_other_runtime_owners() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let mut record = VmRecord::new("discovery-created".into(), 1, 128, vec![], vec![], false);
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        db.insert_vm(&record.name, &record).unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+        let (_tx, rx) = watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        supervisor.check_machine(&record.name).await.unwrap();
+        let current = state.db().get_vm(&record.name).unwrap().unwrap();
+        assert_eq!(current.state, RecordState::Created);
+        assert_eq!(current.restart.restart_count, 0);
+        assert!(current.pid.is_none());
+
+        state
+            .db()
+            .update_vm(&record.name, |r| {
+                r.state = RecordState::Running;
+                r.pid = Some(i32::MAX);
+                r.runtime_managed = true;
+                r.ephemeral = true;
+            })
+            .unwrap();
+        let before =
+            serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap();
+        assert!(state.load_persisted_machines().is_empty());
+        supervisor.check_machine(&record.name).await.unwrap();
+        assert_eq!(
+            serde_json::to_value(state.db().get_vm(&record.name).unwrap().unwrap()).unwrap(),
+            before
+        );
+    }
 
     #[tokio::test]
     async fn live_database_pid_survives_missing_manager_identity() {
@@ -497,6 +645,77 @@ mod restart_timing_tests {
         assert!(state.get_machine(name).is_err());
         assert!(!supervisor.next_restart_at.contains_key(name));
         supervisor.check_machine(name).await.unwrap();
+    }
+
+    #[test]
+    fn restart_schedule_belongs_to_its_original_machine_and_execution() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let mut record =
+            crate::config::VmRecord::new("scheduled-review".into(), 1, 128, vec![], vec![], false);
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        record.restart.restart_count = 4;
+        db.insert_vm(&record.name, &record).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        let (_tx, rx) = tokio::sync::watch::channel(false);
+        let mut supervisor = Supervisor::new(state.clone(), rx);
+        let original = state.db().get_vm(&record.name).unwrap().unwrap();
+        let now = Instant::now();
+        assert_eq!(
+            supervisor.restart_timing_for_record(&original, now),
+            RestartTiming::Armed
+        );
+        state.db().remove_vm(&record.name).unwrap();
+        state.db().insert_vm(&record.name, &record).unwrap();
+        let replacement = state.db().get_vm(&record.name).unwrap().unwrap();
+        let later = now + record.restart.backoff_duration();
+        assert_eq!(
+            supervisor.restart_timing_for_record(&replacement, later),
+            RestartTiming::Armed
+        );
+        let new_execution = state
+            .db()
+            .update_vm(&record.name, |r| {
+                r.pid = Some(123);
+                r.pid_start_time = Some(456);
+            })
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            supervisor.restart_timing_for_record(
+                &new_execution,
+                later + record.restart.backoff_duration()
+            ),
+            RestartTiming::Armed
+        );
+    }
+
+    #[tokio::test]
+    async fn queued_restart_cannot_adopt_a_replacement_or_spend_its_budget() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        let mut record =
+            crate::config::VmRecord::new("queued-review".into(), 1, 128, vec![], vec![], false);
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        db.insert_vm(&record.name, &record).unwrap();
+        let state = std::sync::Arc::new(crate::api::state::ApiState::with_db(db));
+        state.load_persisted_machines();
+        let observed = state.db().get_vm(&record.name).unwrap().unwrap();
+        let lock = state.lifecycle_lock(&record.name);
+        let guard = lock.lock().await;
+        let task_state = state.clone();
+        let task =
+            tokio::spawn(
+                async move { Supervisor::restart_machine_owned(&task_state, observed).await },
+            );
+        tokio::task::yield_now().await;
+        state.db().remove_vm(&record.name).unwrap();
+        state.db().insert_vm(&record.name, &record).unwrap();
+        drop(guard);
+        assert!(task.await.unwrap().is_err());
+        let current = state.db().get_vm(&record.name).unwrap().unwrap();
+        assert_eq!(current.restart.restart_count, 0);
+        assert!(current.pid.is_none());
     }
 
     // A backoff at or below the minimum restarts immediately and schedules nothing.

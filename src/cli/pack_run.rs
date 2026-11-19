@@ -916,6 +916,7 @@ impl PackRunCmd {
                 .unwrap_or_else(|| runtime_dir.path().join("overlay.raw"));
 
             let boot_config = smolvm::agent::boot_config::BootConfig {
+                startup_ticket: None,
                 rootfs_path: rootfs_path.clone(),
                 storage_disk_path: storage_path.clone(),
                 overlay_disk_path,
@@ -2163,6 +2164,7 @@ fn run_from_cache(
             .clone()
             .unwrap_or_else(|| runtime_dir.path().join("overlay.raw"));
         let boot_config = smolvm::agent::boot_config::BootConfig {
+            startup_ticket: None,
             rootfs_path: rootfs_path.clone(),
             storage_disk_path: storage_path.clone(),
             overlay_disk_path,
@@ -2647,6 +2649,7 @@ fn daemon_start(
     let child_pid = {
         let _ = (&packed_mounts, &port_mappings, &vsock_path_clone);
         let boot_config = smolvm::agent::boot_config::BootConfig {
+            startup_ticket: None,
             rootfs_path: rootfs_path.clone(),
             storage_disk_path: storage_path.clone(),
             overlay_disk_path: overlay_daemon_path

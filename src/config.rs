@@ -125,7 +125,7 @@ impl std::str::FromStr for RestartPolicy {
 }
 
 /// Restart configuration for a machine.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RestartConfig {
     /// The restart policy.
     #[serde(default)]
@@ -435,6 +435,10 @@ pub struct AllocatedPort {
 /// is managed separately via the container commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmRecord {
+    /// Host-only identity attached by a database read; never exported or restored.
+    #[serde(skip)]
+    pub(crate) database_identity: Option<crate::db::launch_admission::RecordIdentity>,
+
     /// VM name/ID.
     pub name: String,
 
@@ -1020,6 +1024,7 @@ impl VmRecord {
         network: bool,
     ) -> Self {
         Self {
+            database_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1131,6 +1136,7 @@ impl VmRecord {
         restart: RestartConfig,
     ) -> Self {
         Self {
+            database_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,

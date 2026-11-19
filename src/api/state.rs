@@ -1,5 +1,10 @@
 //! API server state management.
 
+mod discovery;
+mod supervision;
+pub(crate) use discovery::externally_supervised;
+pub(crate) use supervision::same_observation;
+
 use crate::agent::{AgentManager, HostMount, PortMapping, VmResources};
 use crate::api::error::ApiError;
 use crate::api::types::{MachineInfo, MountSpec, PortSpec, ResourceSpec, RestartSpec};
@@ -249,7 +254,7 @@ pub struct MachineRegistration {
 pub struct ReservationGuard<'a> {
     state: &'a ApiState,
     name: String,
-    token: String,
+    creation: crate::db::VmCreationLease,
     completed: bool,
 }
 
@@ -258,10 +263,15 @@ impl<'a> ReservationGuard<'a> {
     pub fn new(state: &'a ApiState, name: String) -> Result<Self, ApiError> {
         let token = SmolvmDb::create_reservation_token();
         state.reserve_machine_name(&name, &token)?;
+        let creation = crate::db::VmCreationLease::from_reserved(state.db.clone(), &name, token)
+            .map_err(|error| {
+                state.reserved_names.write().remove(&name);
+                ApiError::database(error)
+            })?;
         Ok(Self {
             state,
             name,
-            token,
+            creation,
             completed: false,
         })
     }
@@ -271,12 +281,36 @@ impl<'a> ReservationGuard<'a> {
         &self.name
     }
 
+    pub(crate) fn creation(&self) -> crate::db::VmCreationLease {
+        self.creation.clone()
+    }
+
+    /// Keep ownership inside blocking work even if its awaiting task is aborted.
+    pub(crate) fn spawn_blocking<F, T>(&self, work: F) -> tokio::task::JoinHandle<T>
+    where
+        F: FnOnce() -> T + Send + 'static,
+        T: Send + 'static,
+    {
+        let owner = self.creation.clone();
+        tokio::task::spawn_blocking(move || {
+            let _owner = owner;
+            work()
+        })
+    }
+
     /// Complete registration, consuming the guard without releasing.
     ///
     /// This transfers ownership of the name to the machine registry.
     pub fn complete(mut self, registration: MachineRegistration) -> Result<(), ApiError> {
-        self.state
-            .complete_machine_registration(self.name.clone(), &self.token, registration)?;
+        self.creation
+            .ensure_exclusive()
+            .map_err(ApiError::database)?;
+        self.state.complete_machine_registration(
+            self.name.clone(),
+            self.creation.token(),
+            registration,
+        )?;
+        self.creation.disarm();
         self.completed = true;
         Ok(())
     }
@@ -285,23 +319,9 @@ impl<'a> ReservationGuard<'a> {
 impl Drop for ReservationGuard<'_> {
     fn drop(&mut self) {
         if !self.completed {
-            self.state
-                .release_machine_reservation(&self.name, &self.token);
-            tracing::debug!(machine = %self.name, "reservation guard released on drop");
-            // With the name released no machine owns its data directory, so
-            // whatever this create left there (an extracted pack, disks) would
-            // stay on disk with nothing to delete it. Remove it now.
-            let dir = crate::agent::vm_data_dir(&self.name);
-            smolvm_pack::extract::force_detach_layers_volume(&dir.join("pack"));
-            match std::fs::remove_dir_all(&dir) {
-                Ok(()) => {
-                    tracing::info!(machine = %self.name, "removed the data of a create that did not finish");
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-                Err(error) => {
-                    tracing::warn!(machine = %self.name, %error, "could not remove the data of a create that did not finish");
-                }
-            }
+            // The shared creation lease, including any blocking worker, cleans
+            // the files before releasing database ownership on its final drop.
+            self.state.reserved_names.write().remove(&self.name);
         }
     }
 }
@@ -315,8 +335,8 @@ fn is_vm_dir_hash(s: &str) -> bool {
             .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
 }
 
-/// Pure reaping decision for the dangling-dir sweep: a cache entry is dangling
-/// iff it has the VM-dir-hash shape AND no live machine record maps to it.
+/// Candidate filter only: removal also requires ownership of an abandoned
+/// creation, since an unpublished directory may still have a live writer.
 fn is_dangling_vm_dir(dir_name: &str, valid_hashes: &std::collections::HashSet<String>) -> bool {
     is_vm_dir_hash(dir_name) && !valid_hashes.contains(dir_name)
 }
@@ -555,12 +575,19 @@ impl ApiState {
         let mut loaded = Vec::new();
 
         for (name, mut record) in vms {
+            if externally_supervised(&record) {
+                continue;
+            }
+            // A restarting server must preserve transfer-owned metadata and
+            // still expose the machine for observation and recovery.
+            let admission = self.db.admit_machine_mutation(&name);
             // A machine that was started but whose process is gone (a host
             // reboot, a crash, a kill -9) is kept as stopped with its disks, so
             // a start boots it again. Only a dead ephemeral machine that no
             // retained clone depends on is removed. Machines in "created" state
             // (pid=None) have never been started and are preserved as they are.
-            if record.paused_checkpoint.is_none()
+            if admission.is_ok()
+                && record.paused_checkpoint.is_none()
                 && record.pid.is_some()
                 && !record.is_process_alive()
             {
@@ -596,22 +623,27 @@ impl ApiState {
                     }
                 } else {
                     tracing::info!(machine = %name, "cleaning up dead ephemeral machine from database");
-                    if let Err(e) = self.db.remove_vm(&name) {
-                        tracing::warn!(machine = %name, error = %e, "failed to remove dead machine from database");
-                    }
-                    // Reclaim the data dir too. Removing only the DB record leaks the
-                    // machine's storage + overlay images (multi-GB sparse files) — and
-                    // since the record is gone, nothing will ever clean them up later.
-                    // On a long-lived node that churns/crashes machines this is a slow
-                    // disk-fill across server restarts. Only ephemeral machines reach
-                    // here: a persistent machine's disks are its data and are kept.
-                    let dir = crate::agent::vm_data_dir(&name);
-                    if dir.exists() {
-                        if let Err(e) = std::fs::remove_dir_all(&dir) {
-                            tracing::warn!(machine = %name, error = %e, "failed to remove dead machine data dir");
+                    match self.db.remove_vm(&name) {
+                        Ok(Some(_)) => {
+                            let dir = crate::agent::vm_data_dir(&name);
+                            if let Err(error) = std::fs::remove_dir_all(&dir) {
+                                if error.kind() != std::io::ErrorKind::NotFound {
+                                    tracing::warn!(machine = %name, error = %error, "failed to remove dead machine data dir");
+                                }
+                            }
+                            continue;
+                        }
+                        Ok(None) => continue,
+                        Err(error) => {
+                            // A live startup/preparation can own the disks even
+                            // when this scan read an older process identity.
+                            tracing::warn!(machine = %name, %error, "preserving machine after refused removal");
+                            match self.db.get_vm(&name) {
+                                Ok(Some(latest)) => record = latest,
+                                _ => continue,
+                            }
                         }
                     }
-                    continue;
                 }
             }
 
@@ -642,8 +674,12 @@ impl ApiState {
             };
 
             // Create AgentManager and try to reconnect
-            match AgentManager::for_vm_with_sizes(&name, record.storage_gb, record.overlay_gb) {
+            let manager = AgentManager::for_vm(&name);
+            match manager {
                 Ok(manager) => {
+                    // Loading inventory does not transfer ownership of guests
+                    // started by another CLI, SDK, or previous API process.
+                    manager.detach();
                     // Try to reconnect to existing running VM
                     let reconnected = manager
                         .try_connect_existing_with_pid_and_start_time(
@@ -702,23 +738,10 @@ impl ApiState {
         loaded
     }
 
-    /// Remove VM data dirs under the cache root that no current machine record
-    /// references — a filesystem-level GC for the dirs the per-record path can't
-    /// see (a dir whose record was already gone: a legacy leak, or a CLI ephemeral
-    /// orphan that resolved to the wrong hash).
-    ///
-    /// Deliberately NOT called from `load_persisted_machines`: this is a global
-    /// sweep keyed off the *current* DB, so it must only run in the real `smolvm
-    /// serve` process (which owns this node's cache), never from a unit test or an
-    /// embedded library user whose DB does not describe the host's dirs — there it
-    /// would wipe live machines. The caller invokes it at server startup, before
-    /// requests are served, so it cannot race VM creation. Returns the count
-    /// removed.
-    ///
-    /// Safe by construction: only entries whose name is a VM data-dir hash (16
-    /// lowercase hex chars, the `vm_dir_hash` shape) are candidates, so the shared
-    /// pack store (`_shared`) and marker files are never touched, and every hash
-    /// backing a live DB record is skipped.
+    /// Reclaim abandoned creations after acquiring their exact ownership.
+    /// A missing VM row alone is not proof of abandonment: another CLI or an
+    /// embedded caller can still be preparing that directory. Unknown legacy
+    /// directories are preserved until their writer lifetime can be established.
     pub fn reclaim_dangling_vm_dirs(&self) -> usize {
         let valid: std::collections::HashSet<String> = match self.db.list_vms() {
             Ok(vms) => vms
@@ -727,24 +750,32 @@ impl ApiState {
                 .collect(),
             Err(_) => return 0,
         };
-        let root = crate::agent::vm_cache_root();
-        let entries = match std::fs::read_dir(&root) {
-            Ok(e) => e,
-            Err(_) => return 0,
+        let abandoned = match self.db.abandoned_vm_creations() {
+            Ok(creations) => creations,
+            Err(error) => {
+                tracing::warn!(%error, "cannot verify abandoned creation ownership");
+                return 0;
+            }
         };
         let mut removed = 0;
-        for entry in entries.flatten() {
-            let dir_name = entry.file_name().to_string_lossy().into_owned();
-            if !is_dangling_vm_dir(&dir_name, &valid) {
+        for (name, token) in abandoned {
+            if !is_dangling_vm_dir(&crate::agent::vm_dir_hash(&name), &valid) {
                 continue;
             }
-            if entry.path().is_dir() {
-                tracing::info!(dir = %dir_name, "removing dangling VM data dir (no machine record)");
-                match std::fs::remove_dir_all(entry.path()) {
-                    Ok(()) => removed += 1,
-                    Err(e) => {
-                        tracing::warn!(dir = %dir_name, error = %e, "failed to remove dangling VM data dir")
+            let dir = crate::agent::vm_data_dir(&name);
+            let existed = dir.exists();
+            match self.db.recover_vm_creation(&name, &token) {
+                Ok(Some(owner)) => {
+                    // Cleanup remains owned until the final drop releases the
+                    // name, so a concurrent creator cannot lose its new data.
+                    drop(owner);
+                    if existed && !dir.exists() {
+                        removed += 1;
                     }
+                }
+                Ok(None) => {} // the name or creation generation changed
+                Err(error) => {
+                    tracing::warn!(%name, %error, "preserving creation data after refused recovery")
                 }
             }
         }
@@ -894,33 +925,6 @@ impl ApiState {
             tracing::info!(machine = name, "forgot externally deleted machine");
         }
         Ok(true)
-    }
-
-    /// Update machine state in database (call after start/stop).
-    ///
-    /// Returns an error if the database write fails. Callers in API handlers
-    /// should propagate this error; the supervisor can log and continue.
-    pub fn update_machine_state(
-        &self,
-        name: &str,
-        state: RecordState,
-        pid: Option<i32>,
-    ) -> std::result::Result<(), crate::Error> {
-        let pid_start_time = pid.and_then(crate::process::process_start_time);
-        let result = self.db.update_vm(name, |record| {
-            record.engine_build =
-                (state == RecordState::Running).then(|| crate::ENGINE_BUILD.to_string());
-            record.state = state;
-            record.pid = pid;
-            record.pid_start_time = pid_start_time;
-        })?;
-        match result {
-            Some(_) => Ok(()),
-            None => Err(crate::Error::database(
-                "update machine state",
-                format!("machine '{}' not found in database", name),
-            )),
-        }
     }
 
     /// List all machines, in name order.
@@ -1223,8 +1227,15 @@ impl ApiState {
 
         // Complete the cross-process create reservation and insert the VM row
         // atomically. Only after that succeeds do we publish the in-memory entry.
-        match self.db.commit_reserved_vm(&name, token, &record) {
-            Ok(true) => {
+        match self.db.commit_reserved_vm_record(&name, token, &record) {
+            Ok(Some(record)) => {
+                // The preparation manager reviewed an absent row. Bind the
+                // registered observer to the exact incarnation just published.
+                let manager = reg.manager;
+                manager
+                    .bind_created_record(&self.db, &record)
+                    .map_err(ApiError::from)?;
+                manager.detach();
                 {
                     let mut reserved = self.reserved_names.write();
                     if !reserved.remove(&name) {
@@ -1237,15 +1248,12 @@ impl ApiState {
                 machines.insert(
                     name,
                     Arc::new(parking_lot::Mutex::new(
-                        crate::api::handlers::machines::machine_entry_from_record(
-                            &record,
-                            reg.manager,
-                        ),
+                        crate::api::handlers::machines::machine_entry_from_record(&record, manager),
                     )),
                 );
                 Ok(())
             }
-            Ok(false) => {
+            Ok(None) => {
                 // Name already exists or the DB reservation was lost.
                 Err(ApiError::Conflict(format!(
                     "machine '{}' already exists or is no longer reserved",
@@ -1308,13 +1316,33 @@ impl ApiState {
             .map_err(ApiError::database)
     }
 
+    /// Apply a request's metadata update to its original machine incarnation.
+    /// A stale request is a conflict, including after the blocking task waited
+    /// for another writer; never retry it by looking the name up again.
+    pub(crate) async fn update_vm_for_record<F>(
+        &self,
+        record: &VmRecord,
+        f: F,
+    ) -> Result<VmRecord, ApiError>
+    where
+        F: FnOnce(&mut VmRecord) -> crate::Result<()> + Send + 'static,
+    {
+        let db = self.db.clone();
+        let record = record.clone();
+        tokio::task::spawn_blocking(move || db.update_vm_for_record(&record, f))
+            .await
+            .map_err(|e| ApiError::internal(format!("reviewed update task join: {e}")))?
+            .map_err(ApiError::from)
+    }
+
     /// Insert a machine entry directly into the in-memory registry.
     ///
     /// Used by start_machine to register a booted VM so that exec/run/container
     /// endpoints can find it without server restart.
     ///
-    /// An existing entry is replaced in place rather than swapped for a new
-    /// one. A request that looked the machine up before a start finished (an
+    /// An existing entry for the same incarnation is replaced in place.
+    /// A different incarnation gets a new entry so old requests stay fenced.
+    /// A request that looked the machine up before a start finished (an
     /// exec queued behind the start's lifecycle lock) still holds the old
     /// entry; with a separate entry it would reconnect a stale manager to the
     /// new VM, adopt its process, and stop that VM when the request dropped
@@ -1324,9 +1352,21 @@ impl ApiState {
     pub fn insert_machine(&self, name: &str, entry: MachineEntry) {
         let existing = self.machines.read().get(name).cloned();
         if let Some(slot) = existing {
-            let replaced = std::mem::replace(&mut *slot.lock(), entry);
-            replaced.manager.detach();
-            self.machines.write().insert(name.to_string(), slot);
+            let mut old = slot.lock();
+            if old.manager.same_record_as(&entry.manager) {
+                let replaced = std::mem::replace(&mut *old, entry);
+                replaced.manager.detach();
+                drop(old);
+                self.machines.write().insert(name.to_string(), slot);
+            } else {
+                // Same name, different incarnation: old requests retain an
+                // invalidated handle rather than silently adopting this VM.
+                old.manager.detach();
+                drop(old);
+                self.machines
+                    .write()
+                    .insert(name.to_string(), Arc::new(parking_lot::Mutex::new(entry)));
+            }
             return;
         }
         let mut machines = self.machines.write();
@@ -1342,73 +1382,15 @@ impl ApiState {
         self.machines.read().keys().cloned().collect()
     }
 
-    /// Get restart config for a machine from the in-memory registry.
+    /// Read authoritative restart policy, including stops by another process.
     pub fn get_restart_config(&self, name: &str) -> Option<RestartConfig> {
-        let machines = self.machines.read();
-        machines.get(name).map(|entry| {
-            let entry = entry.lock();
-            entry.restart.clone()
-        })
-    }
-
-    /// Best-effort update to the VM database record. Logs warnings on
-    /// `Ok(None)` (row not found) and `Err` without propagating.
-    fn update_vm_best_effort(&self, name: &str, op_label: &str, f: impl FnOnce(&mut VmRecord)) {
-        match self.db.update_vm(name, f) {
-            Ok(Some(_)) => {}
-            Ok(None) => {
-                tracing::warn!(machine = %name, op = op_label, "machine not found in database");
-            }
-            Err(e) => {
-                tracing::warn!(error = %e, machine = %name, op = op_label, "failed to persist update");
+        match self.db.get_vm(name) {
+            Ok(record) => record.map(|record| record.restart),
+            Err(error) => {
+                tracing::warn!(machine = %name, %error, "cannot read restart policy; refusing automatic restart");
+                None
             }
         }
-    }
-
-    /// Increment restart count for a machine.
-    pub fn increment_restart_count(&self, name: &str) {
-        if let Some(entry) = self.machines.read().get(name) {
-            entry.lock().restart.restart_count += 1;
-        }
-        self.update_vm_best_effort(name, "increment_restart_count", |r| {
-            r.restart.restart_count += 1;
-        });
-    }
-
-    /// Mark machine as user-stopped.
-    pub fn mark_user_stopped(&self, name: &str, stopped: bool) {
-        if let Some(entry) = self.machines.read().get(name) {
-            entry.lock().restart.user_stopped = stopped;
-        }
-        self.update_vm_best_effort(name, "mark_user_stopped", |r| {
-            r.restart.user_stopped = stopped;
-        });
-    }
-
-    /// Reset restart count (on successful start).
-    pub fn reset_restart_count(&self, name: &str) {
-        if let Some(entry) = self.machines.read().get(name) {
-            entry.lock().restart.restart_count = 0;
-        }
-        self.update_vm_best_effort(name, "reset_restart_count", |r| {
-            r.restart.restart_count = 0;
-        });
-    }
-
-    /// Update last exit code for a machine.
-    pub fn set_last_exit_code(&self, name: &str, exit_code: Option<i32>) {
-        self.update_vm_best_effort(name, "set_last_exit_code", |r| {
-            r.last_exit_code = exit_code;
-        });
-    }
-
-    /// Get last exit code for a machine.
-    pub fn get_last_exit_code(&self, name: &str) -> Option<i32> {
-        self.db
-            .get_vm(name)
-            .ok()
-            .flatten()
-            .and_then(|r| r.last_exit_code)
     }
 
     /// Check if a machine process is alive.
@@ -1543,18 +1525,21 @@ pub(crate) struct QueuedBranch {
 /// workload launched.
 pub async fn ensure_machine_running(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+    record: crate::config::VmRecord,
 ) -> crate::Result<bool> {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
-        let entry = entry_clone.lock();
-        let mounts: Vec<_> = entry
-            .mounts
-            .iter()
-            .map(HostMount::try_from)
-            .collect::<crate::Result<Vec<_>>>()?;
-        let ports: Vec<_> = entry.ports.iter().map(PortMapping::from).collect();
-        let mut resources = resource_spec_to_vm_resources(&entry.resources, entry.network);
-        resources.cache_disk = entry.cache_disk.clone();
+        let mut entry = entry_clone.lock();
+        entry.manager.require_record_incarnation(&record)?;
+        let mounts = record.host_mounts();
+        let ports = record.port_mappings();
+        let resources = record.vm_resources();
+        if !entry.manager.matches_record_execution(&record) && record.is_process_alive() {
+            let observer = AgentManager::for_existing_vm_record(&record)?;
+            observer.detach();
+            entry.manager.detach();
+            entry.manager = observer;
+        }
 
         // An implicit start (exec/run/files/images) never restarts a machine
         // that is up. `update` refuses running machines, so its recorded
@@ -1577,11 +1562,24 @@ pub async fn ensure_machine_running(
         }
         // Up but not answering (busy, or still restoring): fail this request
         // rather than stop the VM and boot it fresh.
-        if entry.manager.is_process_alive() {
+        if record.is_process_alive() || entry.manager.is_process_alive() {
             return Err(crate::Error::agent_conflict(
                 "start machine",
                 "machine is running but its agent is not answering yet; retry",
             ));
+        }
+        // A server may have loaded this entry in observation mode while a
+        // transfer owned it. Prepare disks only after admission and liveness
+        // checks, when an explicit release allows a fresh start again.
+        let manager = AgentManager::for_vm_record(&record)?;
+        let interceptor = entry.external_interceptor;
+        let replaced = std::mem::replace(
+            &mut *entry,
+            crate::api::handlers::machines::machine_entry_from_record(&record, manager),
+        );
+        replaced.manager.detach();
+        if record.external_interceptor_required {
+            entry.external_interceptor = interceptor;
         }
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
         let mut features = build_launch_features(
@@ -1620,13 +1618,29 @@ fn refuse_implicit_start_of_paused(record: &crate::config::VmRecord) -> crate::R
 /// Ensure a machine is running and persist the Running state to the database.
 ///
 /// Used by handlers that implicitly start VMs (containers, exec, images).
-/// State persistence is best-effort — a DB write failure is logged but does
-/// not fail the request, matching the supervisor's error-handling pattern.
+/// Publication requires the original machine and the execution this call
+/// observed; stale completion fails before the caller proceeds with its work.
 pub async fn ensure_running_and_persist(
+    state: &Arc<ApiState>,
+    name: &str,
+    entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+) -> crate::Result<()> {
+    // A disconnected exec/files request must not abandon a boot before its
+    // PID is registered or release admission while spawn_blocking still runs.
+    let state = state.clone();
+    let name = name.to_string();
+    let entry = entry.clone();
+    tokio::spawn(async move { ensure_running_and_persist_owned(&state, &name, &entry).await })
+        .await
+        .map_err(|error| crate::Error::agent("implicit startup task", error.to_string()))?
+}
+
+async fn ensure_running_and_persist_owned(
     state: &ApiState,
     name: &str,
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
 ) -> crate::Result<()> {
+    let _admission = state.db().admit_machine_mutation(name)?;
     // Hold the per-machine lifecycle lock across the implicit-start preflight.
     // ensure_machine_running mounts the macOS layers volume (via with_packed_layers)
     // when the VM is not already up — exactly like the explicit start_machine — so
@@ -1643,37 +1657,23 @@ pub async fn ensure_running_and_persist(
             .await
             .map_err(|error| crate::Error::agent("start operation lock", error.to_string()))??;
 
-    // A nested machine waking on a server that has since turned nesting off
-    // stays down, the same as an explicit start.
-    let nested = entry.lock().resources.nested_virt.unwrap_or(false);
-    if nested && !state.nested_virt_allowed() {
-        return Err(crate::Error::agent_forbidden(
-            "start machine",
-            NESTED_VIRT_DISABLED,
-        ));
-    }
-
-    // Refresh the entry's launch config from the persisted record before an
-    // implicit start. The record is the source of truth and can change while
-    // the machine is stopped (`machine update` from the CLI edits the DB but
-    // not this server's in-memory entry), so booting from the cached entry
-    // launches with pre-update mounts/ports/resources. `update` refuses
-    // running machines, so a running machine's entry can't be stale — and for
-    // one, ensure_machine_running early-returns before the config matters.
-    let record = state.lookup_vm(name).await.ok().flatten();
+    // Load the settings used for this start once. CLI updates can change
+    // resources and policy without changing this server's cached entry.
+    let record = Some(
+        state
+            .lookup_vm(name)
+            .await
+            .map_err(|e| crate::Error::agent("read startup settings", format!("{e:?}")))?
+            .ok_or_else(|| crate::Error::vm_not_found(name))?,
+    );
     if let Some(record) = &record {
+        entry.lock().manager.require_record_incarnation(record)?;
         refuse_implicit_start_of_paused(record)?;
-        let mut e = entry.lock();
-        e.mounts = record.host_mounts().iter().map(MountSpec::from).collect();
-        e.ports = record.port_mappings().iter().map(PortSpec::from).collect();
-        e.resources.cpus = Some(record.cpus);
-        e.resources.memory_mb = Some(record.mem);
-        e.network = record.network;
-        e.forkable = record.forkable_on_start();
-        e.cuda_fork_pool_size = record.cuda_fork_pool_size;
-        e.cuda_vram_limit_mib = record.cuda_vram_limit_mib;
-        if !record.external_interceptor_required {
-            e.external_interceptor = None;
+        if record.nested_virt.unwrap_or(false) && !state.nested_virt_allowed() {
+            return Err(crate::Error::agent_forbidden(
+                "start machine",
+                NESTED_VIRT_DISABLED,
+            ));
         }
     }
 
@@ -1684,7 +1684,13 @@ pub async fn ensure_running_and_persist(
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(name)).is_some();
 
-    let freshly_booted = ensure_machine_running(entry).await?;
+    let freshly_booted = ensure_machine_running(
+        entry,
+        record
+            .clone()
+            .ok_or_else(|| crate::Error::vm_not_found(name))?,
+    )
+    .await?;
 
     if freshly_booted && restoring_checkpoint {
         if let Some(record) = record.clone() {
@@ -1706,18 +1712,13 @@ pub async fn ensure_running_and_persist(
         }
     }
 
-    let pid = {
-        let entry = entry.lock();
-        entry.manager.child_pid()
-    };
-    if let Err(e) = state.update_machine_state(name, RecordState::Running, pid) {
-        tracing::warn!(machine = %name, error = %e, "failed to persist Running state after implicit start");
-    }
-    // An implicit start (exec/file/image waking a stopped machine) re-enables
-    // supervision like the explicit start handler: clear the user-stopped flag so
-    // the restart supervisor will keep this machine up again. (Retry-budget reset
-    // stays on the explicit `start` path.) Idempotent for an already-running machine.
-    state.mark_user_stopped(name, false);
+    let execution = entry.lock().manager.pid_and_start_time();
+    state.publish_observed_start(
+        record
+            .as_ref()
+            .ok_or_else(|| crate::Error::vm_not_found(name))?,
+        execution,
+    )?;
 
     // An implicit start of an image machine (exec/files/images waking a stopped
     // machine) must relaunch the image workload just like the explicit start
@@ -2126,6 +2127,37 @@ mod tests {
         (dir, ApiState::with_db(db))
     }
 
+    #[test]
+    fn restart_policy_observes_persisted_stop_and_start_transitions() {
+        let (_dir, state) = temp_api_state();
+        let mut record =
+            crate::config::VmRecord::new("restart-policy".into(), 1, 128, vec![], vec![], false);
+        record.restart.policy = crate::config::RestartPolicy::Always;
+        state.db.insert_vm(&record.name, &record).unwrap();
+        assert!(state
+            .get_restart_config(&record.name)
+            .unwrap()
+            .should_restart(None));
+        state
+            .db
+            .update_vm(&record.name, |r| r.restart.user_stopped = true)
+            .unwrap();
+        assert!(!state
+            .get_restart_config(&record.name)
+            .unwrap()
+            .should_restart(None));
+        state
+            .db
+            .update_vm(&record.name, |r| r.restart.user_stopped = false)
+            .unwrap();
+        assert!(state
+            .get_restart_config(&record.name)
+            .unwrap()
+            .should_restart(None));
+        state.db.remove_vm(&record.name).unwrap();
+        assert!(state.get_restart_config(&record.name).is_none());
+    }
+
     /// A create dropped before it registers its machine leaves nothing on disk:
     /// the data it wrote under the reserved name goes with the reservation.
     #[test]
@@ -2134,7 +2166,8 @@ mod tests {
         let name = format!("unfinished-{}", SmolvmDb::create_reservation_token());
         let data = crate::agent::vm_data_dir(&name);
         {
-            let _guard = ReservationGuard::new(&state, name.clone()).unwrap();
+            let guard = ReservationGuard::new(&state, name.clone()).unwrap();
+            guard.creation.prepare_directory().unwrap();
             std::fs::create_dir_all(data.join("pack")).unwrap();
             std::fs::write(data.join("pack").join("layer.tar"), b"partial").unwrap();
         }
@@ -2394,8 +2427,15 @@ mod tests {
     /// would stop that VM.
     #[test]
     fn replacing_an_entry_updates_requests_already_holding_it() {
-        let (_dir, state) = temp_api_state();
-        let name = "replace-entry-qa";
+        let db = SmolvmDb::open().unwrap();
+        let state = ApiState::with_db(db.clone());
+        let owned_name = format!("replace-entry-{:032x}", rand::random::<u128>());
+        let name = owned_name.as_str();
+        db.insert_vm(
+            name,
+            &VmRecord::new(name.into(), 1, 128, vec![], vec![], false),
+        )
+        .unwrap();
         let entry = |image: &str| MachineEntry {
             credentials: None,
             external_interceptor: None,
@@ -2445,6 +2485,7 @@ mod tests {
         assert_eq!(seen.image.as_deref(), Some("started"));
         assert!(!seen.manager.is_detached());
         drop(seen);
+        db.remove_vm(name).unwrap();
         state.forget_deleted_machine(name).unwrap();
         std::fs::remove_dir_all(crate::agent::vm_data_dir(name)).ok();
     }

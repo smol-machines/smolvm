@@ -88,6 +88,7 @@ pub mod cuda_host;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
+pub mod deletion;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;

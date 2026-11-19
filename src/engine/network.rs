@@ -1331,6 +1331,8 @@ async fn connect(
     let c = engine
         .find_container(&req.container)
         .ok_or_else(|| ApiError::no_such_container(&req.container))?;
+    let _op = c.op_lock().await;
+    let _admission = c.admit_mutation(&engine, false)?;
     let record = c.record();
     if record.networks.contains_key(&n.name) {
         return Err(ApiError::new(
@@ -1399,6 +1401,8 @@ async fn disconnect(
         None if req.force => return Ok(axum::http::StatusCode::OK),
         None => return Err(ApiError::no_such_container(&req.container)),
     };
+    let _op = c.op_lock().await;
+    let _admission = c.admit_mutation(&engine, false)?;
     let record = c.record();
     if record.host_config.network_mode == "host" {
         return Err(ApiError::bad_request(

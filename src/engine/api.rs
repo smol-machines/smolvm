@@ -27,6 +27,7 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .route("/info", get(info))
         .route("/events", get(events))
         .route("/system/df", get(system_df))
+        .route("/smol/transfers/plan", post(super::transfer::plan))
         .route("/auth", post(auth))
         .route("/containers/create", post(container_create))
         .route("/containers/json", get(container_list))
@@ -1114,6 +1115,8 @@ async fn container_update(
     let update: Update = json_body(&body)?;
     let mut warnings = Vec::new();
     if let Some(policy) = update.restart_policy {
+        let _op = c.op_lock().await;
+        let _admission = c.admit_mutation(&engine, false)?;
         c.update(&engine, |r| {
             r.host_config.restart_policy = policy.clone();
             if let Some(obj) = r.host_config_raw.as_object_mut() {

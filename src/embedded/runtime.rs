@@ -257,6 +257,8 @@ impl EmbeddedRuntime {
     }
 
     fn pause_machine_inner(&self, name: &str, operation: Option<&str>) -> Result<()> {
+        // Pause recovery may itself resume a partially captured VMM.
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let mut record = control::get_record(&self.db, name)?;
@@ -304,12 +306,7 @@ impl EmbeddedRuntime {
                             "source is still running; refusing to stop newer execution",
                         ));
                     }
-                    crate::agent::AgentManager::for_vm_with_sizes(
-                        name,
-                        record.storage_gb,
-                        record.overlay_gb,
-                    )?
-                    .stop_paused()?;
+                    crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
                     self.remove_cached_handle(name)?;
                 }
             }
@@ -415,6 +412,9 @@ impl EmbeddedRuntime {
         detached: bool,
         operation: Option<&str>,
     ) -> Result<()> {
+        // Recovery can send RESUME directly to an existing VMM, bypassing
+        // ordinary boot admission. Fence that path before touching its state.
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let _source = crate::agent::fork::lock_fork_source(name)?;
@@ -455,7 +455,7 @@ impl EmbeddedRuntime {
                 if status.trim() != "OK paused" {
                     return Err(Error::agent_conflict("resume machine", "source is still running; refusing to replace its execution"));
                 }
-                crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
+                crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
             }
             self.remove_cached_handle(name)?;
             if let Some(image) = crate::portable_checkpoint::prepare_paused_restore(&record)? {
@@ -602,6 +602,7 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
@@ -625,7 +626,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -649,6 +650,7 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if control::get_record(&self.db, name)?
@@ -689,7 +691,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -704,6 +706,7 @@ impl EmbeddedRuntime {
     /// Used by the containerd shim for pod sandboxes; requires the machine to use
     /// the virtio-net backend.
     pub fn start_machine_with_netns(&self, name: &str, netns: std::path::PathBuf) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
@@ -723,6 +726,7 @@ impl EmbeddedRuntime {
     /// with [`fork_machine`](Self::fork_machine) — the basis for local RL rollout
     /// branching.
     pub fn start_forkable_machine(&self, name: &str) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
@@ -736,7 +740,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -1007,6 +1011,7 @@ impl EmbeddedRuntime {
     /// commands and transfers finish first and overriding the workload's stop
     /// timeout. New commands are refused while the stop runs.
     pub fn stop_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         let _fence = self.inflight.fence(name, "stopped", options.drain);
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
@@ -1027,17 +1032,13 @@ impl EmbeddedRuntime {
                     ),
                 ));
             }
-            if let Some(handle) = self.remove_cached_handle(name)? {
-                let mut handle = lock_handle(&handle)?;
-                if !record.staged_mounts.is_empty() {
-                    handle.sync_staged_mounts(&record)?;
-                }
-                handle.stop_with_timeout(options.stop_timeout)?;
-                control::mark_stopped(&self.db, name)?;
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.stop_persisted(&record, options.stop_timeout)?;
+                self.remove_cached_handle(name)?;
                 return Ok(());
             }
 
-            control::stop_vm_with_timeout(&self.db, name, options.stop_timeout)
+            control::stop_vm_record_with_timeout(&self.db, &record, options.stop_timeout)
         })
     }
 
@@ -1051,6 +1052,7 @@ impl EmbeddedRuntime {
     /// [`delete_machine`](Self::delete_machine), optionally letting running
     /// commands and transfers finish first.
     pub fn delete_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _admission = self.db.admit_machine_deletion(name)?;
         let _fence = self.inflight.fence(name, "deleted", options.drain);
         let result = self.delete_machine_inner(name);
         if result.is_ok() {
@@ -1081,43 +1083,12 @@ impl EmbeddedRuntime {
                 ));
             }
 
-            let state = crate::agent::state_probe::resolve_state(name, &record);
-            if matches!(
-                state,
-                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
-            ) {
-                // Paused vCPUs cannot acknowledge the normal guest shutdown.
-                // Reap the verified VMM directly instead of waiting for a
-                // response that cannot arrive.
-                self.remove_cached_handle(name)?;
-                crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
-            } else if matches!(
-                state,
-                crate::config::RecordState::Stopped
-                    | crate::config::RecordState::Created
-                    | crate::config::RecordState::Paused
-            ) {
-                // A graceful stop already synchronized staged mounts. Do not
-                // reconnect to the now-absent agent and fail a subsequent delete.
-                self.remove_cached_handle(name)?;
-            } else if let Some(handle) = self.remove_cached_handle(name)? {
-                let mut handle = lock_handle(&handle)?;
-                if !record.staged_mounts.is_empty() {
-                    handle.sync_staged_mounts(&record)?;
-                }
-                // The machine is going away: its workload has nothing to save.
-                handle.stop_with_timeout(Some(Duration::ZERO))?;
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.delete_persisted(&self.db, &record)?;
             } else {
-                control::stop_vm_with_timeout(&self.db, name, Some(Duration::ZERO))?;
+                crate::deletion::delete_machine_locked(&self.db, &record, None, true, false)?;
             }
-
-            // Idempotent: deleting an already-deleted machine is a no-op success
-            // (the desired end state — gone — already holds). Lets SDK callers
-            // call delete() more than once without an error.
-            match control::delete_vm_locked(&self.db, name) {
-                Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
-                Err(e) => return Err(e),
-            }
+            self.remove_cached_handle(name)?;
             self.remove_name_lock(name)?;
             Ok(())
         })
@@ -1132,9 +1103,14 @@ impl EmbeddedRuntime {
             if record.staged_mounts.is_empty() {
                 return Ok(());
             }
-            let handle = self.started_handle(name)?;
-            let result = lock_handle(&handle)?.sync_staged_mounts(&record);
-            result
+            if let Some(error) = crate::staged_mount::refuse_detached_sync(&record, name) {
+                return Err(error);
+            }
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.sync_staged_mounts(&record)
+            } else {
+                crate::staged_mount::sync_running_machine(&record)
+            }
         })
     }
 
@@ -2496,3 +2472,7 @@ mod tests {
         assert!(db.get_vm("delete-frozen").unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_stop_tests.rs"]
+mod stop_tests;
