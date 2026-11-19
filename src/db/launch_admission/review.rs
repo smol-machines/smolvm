@@ -109,8 +109,19 @@ impl LaunchReview {
         db: &SmolvmDb,
         child: Option<(i32, Option<u64>)>,
     ) -> Result<()> {
+        self.review_execution_record(db, child).map(|_| ())
+    }
+
+    /// Read the original execution for a subsequent durable control reservation.
+    /// The reservation must revalidate this record in its write transaction.
+    pub(crate) fn review_execution_record(
+        &self,
+        db: &SmolvmDb,
+        child: Option<(i32, Option<u64>)>,
+    ) -> Result<Option<VmRecord>> {
         db.with_read_conn(|conn| {
-            if let Some(record) = self.reviewed_record(db, conn)? {
+            let record = self.reviewed_record(db, conn)?;
+            if let Some(record) = &record {
                 let expected = child
                     .map(|(pid, start)| (Some(pid), start))
                     .or(self.execution);
@@ -120,7 +131,7 @@ impl LaunchReview {
                     ));
                 }
             }
-            Ok(())
+            Ok(record)
         })
     }
 

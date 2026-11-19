@@ -183,3 +183,130 @@ fn shutdown_and_cached_kill_refuse_a_recycled_process_identity() {
         },
     );
 }
+
+#[test]
+fn manager_control_fences_original_record_and_external_disks_until_release() {
+    isolated(
+        "manager_control_fences_original_record_and_external_disks_until_release",
+        |root| {
+            let (db, record) = fixture();
+            let manager = make_manager(root);
+            let operation = manager.reserve_control_operation().unwrap();
+            let raw = rusqlite::Connection::open(SmolvmDb::default_path().unwrap()).unwrap();
+            assert!(raw
+                .execute("DELETE FROM vms WHERE name='reviewed-control'", [])
+                .unwrap_err()
+                .to_string()
+                .contains("owned by recovery"));
+            assert!(db
+                .reserve_vm_preparation(None, manager.storage_disk.path(), &[])
+                .is_err());
+            assert!(db
+                .reserve_vm_preparation(None, manager.overlay_disk.path(), &[])
+                .is_err());
+            assert!(
+                manager.reserve_control_operation().is_err(),
+                "ownership is not reentrant"
+            );
+            let other = VmRecord::new("unrelated-control".into(), 1, 128, vec![], vec![], false);
+            db.insert_vm(&other.name, &other).unwrap();
+            assert_eq!(db.load_all().unwrap().1.len(), 2);
+            drop(operation);
+            db.update_vm(&record.name, |r| r.mem = 256).unwrap();
+            assert_eq!(
+                std::fs::read(manager.storage_disk.path()).unwrap(),
+                b"storage sentinel"
+            );
+        },
+    );
+}
+
+#[test]
+fn paused_stop_retains_ownership_through_signal_wait_and_cleanup() {
+    isolated(
+        "paused_stop_retains_ownership_through_signal_wait_and_cleanup",
+        |root| {
+            let (db, record) = fixture();
+            let ready = root.join("child-ready");
+            let mut child = Child(
+                std::process::Command::new("sh")
+                    .args([
+                        "-c",
+                        "trap '' TERM; touch \"$1\"; exec sleep 60",
+                        "owned-test",
+                    ])
+                    .arg(&ready)
+                    .spawn()
+                    .unwrap(),
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !ready.exists() {
+                assert!(Instant::now() < deadline);
+                assert!(child.0.try_wait().unwrap().is_none());
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            let pid = child.0.id() as i32;
+            let start = process::process_start_time(pid).unwrap();
+            db.update_vm(&record.name, |r| {
+                r.pid = Some(pid);
+                r.pid_start_time = Some(start);
+            })
+            .unwrap();
+            let manager = make_manager(root);
+            std::fs::write(&manager.pid_file, format!("{pid}\n{start}")).unwrap();
+            std::thread::scope(|scope| {
+                let stopping = scope.spawn(|| manager.stop_paused());
+                let raw = rusqlite::Connection::open(SmolvmDb::default_path().unwrap()).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    let count: i64 = raw
+                        .query_row("SELECT count(*) FROM vm_recovery_owners", [], |r| r.get(0))
+                        .unwrap();
+                    if count == 1 {
+                        break;
+                    }
+                    assert!(Instant::now() < deadline && !stopping.is_finished());
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(raw
+                    .execute("UPDATE vms SET data=data WHERE name='reviewed-control'", [])
+                    .unwrap_err()
+                    .to_string()
+                    .contains("owned by recovery"));
+                let other = VmRecord::new("during-stop".into(), 1, 128, vec![], vec![], false);
+                db.insert_vm(&other.name, &other).unwrap();
+                assert!(!stopping.is_finished());
+                stopping.join().unwrap().unwrap();
+                assert_eq!(
+                    raw.query_row("SELECT count(*) FROM vm_recovery_owners", [], |r| r
+                        .get::<_, i64>(0))
+                        .unwrap(),
+                    0
+                );
+            });
+            assert!(!process::is_our_process_strict(pid, Some(start)));
+            assert!(!manager.pid_file.exists());
+            db.update_vm(&record.name, |r| r.mark_stopped()).unwrap();
+        },
+    );
+}
+
+#[test]
+fn staged_sync_refuses_retargeted_settings_before_connecting() {
+    isolated(
+        "staged_sync_refuses_retargeted_settings_before_connecting",
+        |root| {
+            let (db, record) = fixture();
+            let manager = make_manager(root);
+            let mut handle = crate::embedded::handle::VmHandle::new(manager, None);
+            let mut altered = record.clone();
+            altered.staged_mounts_detached_from = Some("another-machine".into());
+            assert!(handle
+                .sync_staged_mounts(&altered)
+                .unwrap_err()
+                .to_string()
+                .contains("staged mount settings changed"));
+            db.update_vm(&record.name, |r| r.mem = 256).unwrap();
+        },
+    );
+}

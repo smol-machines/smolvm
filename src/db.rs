@@ -24,6 +24,7 @@ use std::time::Duration;
 
 mod incarnation;
 mod recovery;
+pub(crate) use recovery::VmRecoveryGuard;
 mod resize;
 pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
 pub mod launch_admission;

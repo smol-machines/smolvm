@@ -139,7 +139,7 @@ pub(super) fn refuse_conflicts(
         }
         if overlaps_recovery(&saved, &name, machine, paths)? {
             return Err(conflict(
-                "this machine is being recovered; retry after recovery finishes",
+                "another lifecycle operation owns this machine; retry after it finishes",
             ));
         }
     }
@@ -177,7 +177,7 @@ impl SmolvmDb {
             }
             if saved.owner.may_be_alive() {
                 return Err(conflict(
-                    "this machine is being recovered; retry after recovery finishes",
+                    "another lifecycle operation owns this machine; retry after it finishes",
                 ));
             }
             reclaim = true;
@@ -197,9 +197,23 @@ impl SmolvmDb {
     }
 
     pub(crate) fn reserve_vm_recovery(&self, record: &VmRecord) -> Result<VmRecoveryGuard> {
+        self.reserve_vm_control(record, &crate::agent::vm_data_dir(&record.name), &[])
+    }
+
+    /// Pin a manager's captured runtime and disks as well as its original record.
+    pub(crate) fn reserve_vm_control(
+        &self,
+        record: &VmRecord,
+        runtime: &Path,
+        disks: &[PathBuf],
+    ) -> Result<VmRecoveryGuard> {
         let admission = self.admit_machine_mutation(&record.name)?;
         let review = LaunchReview::from_record(record)?;
-        let runtime = resource_path(&crate::agent::vm_data_dir(&record.name))?;
+        let runtime = resource_path(runtime)?;
+        let disks = disks
+            .iter()
+            .map(|p| resource_path(p))
+            .collect::<std::io::Result<Vec<_>>>()?;
         let owner = ProcessIdentity::current()?;
         let token: String = rand::random::<[u8; 24]>()
             .iter()
@@ -220,7 +234,10 @@ impl SmolvmDb {
                 std::slice::from_ref(&member),
                 std::slice::from_ref(&runtime),
             )?;
-            let paths = super::launch_admission::recovery_paths(&tx, &member, &runtime)?;
+            let mut paths = super::launch_admission::recovery_paths(&tx, &member, &runtime)?;
+            paths.extend(disks.iter().cloned());
+            paths.sort();
+            paths.dedup();
             super::launch_admission::reconcile_transfer(
                 &tx,
                 std::slice::from_ref(&member),
@@ -257,6 +274,18 @@ impl SmolvmDb {
 }
 
 impl VmRecoveryGuard {
+    pub(crate) fn validate_staged_record(&self, record: &VmRecord) -> Result<()> {
+        if record.database_identity != self.record.database_identity
+            || record.name != self.record.name
+            || (record.pid, record.pid_start_time) != (self.record.pid, self.record.pid_start_time)
+            || record.host_mounts() != self.record.host_mounts()
+            || record.staged_mounts_detached_from != self.record.staged_mounts_detached_from
+        {
+            return Err(conflict("staged mount settings changed since review"));
+        }
+        Ok(())
+    }
+
     pub(crate) fn runtime_dir(&self) -> &Path {
         &self.runtime
     }

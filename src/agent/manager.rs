@@ -1717,6 +1717,27 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Own a registered execution through external control side effects. Helpers
+/// without a database record retain ordinary transfer admission.
+pub(crate) struct ControlOperation {
+    _ownership: Option<crate::db::VmRecoveryGuard>,
+    _admission: crate::db::transfer_admission::MutationGuard,
+}
+
+impl ControlOperation {
+    pub(crate) fn validate_staged_record(&self, record: &crate::config::VmRecord) -> Result<()> {
+        self._ownership
+            .as_ref()
+            .ok_or_else(|| {
+                Error::agent_conflict(
+                    "sync staged mounts",
+                    "staged synchronization requires a reviewed machine",
+                )
+            })?
+            .validate_staged_record(record)
+    }
+}
+
 /// Apply the persistent fail-closed policy before spawning a named VM. Every
 /// launch path funnels through `start_via_subprocess`, including API restarts.
 fn reject_missing_external_interceptor(
@@ -2687,6 +2708,43 @@ impl AgentManager {
         };
         self.validate_control_identity()?;
         Ok(admission)
+    }
+
+    pub(crate) fn reserve_control_operation(&self) -> Result<ControlOperation> {
+        let db = crate::db::SmolvmDb::open()?;
+        let admission = self.admit_control_mutation()?;
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|c| (c.pid(), c.start_time()));
+        let record = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .review_execution_record(&db, child)?;
+        let ownership = match record {
+            Some(record) => {
+                let runtime = self.vsock_socket.parent().ok_or_else(|| {
+                    Error::agent_conflict("control machine", "machine runtime directory is missing")
+                })?;
+                let guard = db.reserve_vm_control(
+                    &record,
+                    runtime,
+                    &[
+                        self.storage_disk.path().to_path_buf(),
+                        self.overlay_disk.path().to_path_buf(),
+                    ],
+                )?;
+                Some(guard)
+            }
+            None => None,
+        };
+        Ok(ControlOperation {
+            _ownership: ownership,
+            _admission: admission,
+        })
     }
 
     /// Check if the VM process is actually alive using start-time-aware
@@ -4381,8 +4439,8 @@ impl AgentManager {
             ));
         }
         // Whatever ends the VMM from here, smolvm asked for it.
-        if let Some(name) = self.name() {
-            crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+        if let Some(runtime) = self.vsock_socket.parent() {
+            crate::vm_exit::mark_stop_requested(runtime, pid);
         }
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
@@ -4562,7 +4620,14 @@ impl AgentManager {
 
     fn cleanup_dead_vm_runtime(&self) {
         if let Some(name) = self.name.as_deref() {
-            if let Err(error) = cleanup_dead_vm_runtime(name) {
+            let result = (|| {
+                let db = crate::db::SmolvmDb::open()?;
+                let runtime = self.vsock_socket.parent().ok_or_else(|| {
+                    Error::agent("clean runtime", "machine runtime directory is missing")
+                })?;
+                cleanup_dead_vm_runtime_at(name, &db, runtime)
+            })();
+            if let Err(error) = result {
                 tracing::warn!(%name, %error, "failed to clean dead VM runtime state");
             }
         } else {
@@ -4582,7 +4647,7 @@ impl AgentManager {
     /// Kill the VM and wait up to `timeout` before reclaiming its resources.
     /// Large disposable helpers can take longer to release their mappings.
     pub fn kill_and_wait(&self, timeout: std::time::Duration) {
-        let _admission = match self.admit_control_mutation() {
+        let _operation = match self.reserve_control_operation() {
             Ok(admission) => admission,
             Err(error) => {
                 tracing::warn!(%error, "refusing stale or transfer-owned VM cleanup");
@@ -4598,8 +4663,8 @@ impl AgentManager {
 
         // Whatever ends the VMM from here, smolvm asked for it.
         let mark = |pid| {
-            if let Some(name) = self.name() {
-                crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+            if let Some(runtime) = self.vsock_socket.parent() {
+                crate::vm_exit::mark_stop_requested(runtime, pid);
             }
         };
         let killed_pid = match owned_child {
@@ -4721,7 +4786,7 @@ impl AgentManager {
     }
 
     fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
-        let _admission = self.admit_control_mutation()?;
+        let _operation = self.reserve_control_operation()?;
         let state = {
             let inner = self.inner.lock();
             inner.state

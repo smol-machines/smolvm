@@ -137,7 +137,8 @@ impl VmHandle {
 
     /// Copy every guest-local staged mount back to its host source.
     pub fn sync_staged_mounts(&mut self, record: &crate::config::VmRecord) -> Result<()> {
-        let _admission = self.manager.admit_control_mutation()?;
+        let operation = self.manager.reserve_control_operation()?;
+        operation.validate_staged_record(record)?;
         crate::staged_mount::sync_staged_mounts(record, self.client_mut()?)
     }
 
