@@ -1,5 +1,4 @@
 use super::*;
-use crate::db::transfer_admission::Member;
 use crate::db::SmolvmDb;
 
 fn fixture() -> (tempfile::TempDir, Arc<ApiState>, VmRecord) {
@@ -10,7 +9,7 @@ fn fixture() -> (tempfile::TempDir, Arc<ApiState>, VmRecord) {
     assert!(db.insert_vm_if_not_exists(&record.name, &record).unwrap());
     db.claim_workload_transfer(
         "move",
-        vec![Member::from_record(&record.name, &record)],
+        vec![db.review_workload_member(&record.name).unwrap()],
         &[],
     )
     .unwrap();
@@ -181,7 +180,7 @@ async fn transfer_admission_survives_disconnected_start_requests() {
         .db()
         .claim_workload_transfer(
             "next",
-            vec![Member::from_record(&record.name, &record)],
+            vec![state.db().review_workload_member(&record.name).unwrap()],
             &[],
         )
         .unwrap();

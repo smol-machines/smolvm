@@ -459,10 +459,7 @@ mod restart_timing_tests {
         assert!(db.insert_vm_if_not_exists(&record.name, &record).unwrap());
         db.claim_workload_transfer(
             "move",
-            vec![crate::db::transfer_admission::Member::from_record(
-                &record.name,
-                &record,
-            )],
+            vec![db.review_workload_member(&record.name).unwrap()],
             &[],
         )
         .unwrap();

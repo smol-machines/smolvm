@@ -13,7 +13,7 @@ fn fixture() -> (tempfile::TempDir, SmolvmDb, PathBuf, VmRecord) {
 }
 
 fn member(db: &SmolvmDb) -> Member {
-    Member::from_record("web", &db.get_vm("web").unwrap().unwrap())
+    db.review_workload_member("web").unwrap()
 }
 
 #[test]

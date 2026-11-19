@@ -274,7 +274,7 @@ fn conflict(message: &str) -> Error {
 fn decode(data: &[u8]) -> Result<Launch> {
     let launch: Launch = serde_json::from_slice(data)
         .map_err(|_| conflict("cannot read saved startup ownership"))?;
-    if launch.version != 1
+    if !matches!(launch.version, 1 | 2)
         || launch.owner.pid <= 0
         || launch.child.as_ref().is_some_and(|child| child.pid <= 0)
         || !launch.storage.is_absolute()
@@ -289,6 +289,7 @@ fn decode(data: &[u8]) -> Result<Launch> {
             .is_some_and(|name| crate::data::validate_vm_name(name, "startup member").is_err())
         || launch.member.as_ref().is_some_and(|member| {
             crate::data::validate_vm_name(&member.name, "startup member").is_err()
+                || !member.identity_valid(launch.version >= 2)
         })
     {
         return Err(conflict("unsupported saved startup ownership"));
@@ -452,12 +453,12 @@ impl SmolvmDb {
                 }) {
                     return Err(conflict("the recorded machine process is still present"));
                 }
-                Some(Member::from_record(&provisional.name, &record))
+                Some(Member::read(&tx, &provisional.name)?.0)
             } else {
                 None
             };
             let launch = Launch {
-                version: 1,
+                version: 2,
                 owner,
                 member,
                 storage,
@@ -522,7 +523,7 @@ impl SmolvmDb {
                 .db_err("begin disk preparation")?;
             refuse_other_owners(&tx, name, &paths, None)?;
             let launch = Launch {
-                version: 1,
+                version: 2,
                 owner,
                 member: None,
                 storage: paths[0].clone(),
@@ -600,19 +601,8 @@ impl SmolvmDb {
                 return Err(conflict("startup controller exited before boot admission"));
             }
             let transition = if let Some(member) = &launch.member {
-                let data: Option<Vec<u8>> = tx
-                    .query_row(
-                        "SELECT data FROM vms WHERE name = ?1",
-                        [&member.name],
-                        |row| row.get(0),
-                    )
-                    .optional()
-                    .db_err("read boot member")?;
-                let mut record: VmRecord = serde_json::from_slice(
-                    &data.ok_or_else(|| conflict("startup member was removed"))?,
-                )
-                .db_err("decode boot member")?;
-                if Member::from_record(&member.name, &record) != *member {
+                let (current, mut record) = Member::read(&tx, &member.name)?;
+                if current != *member {
                     return Err(conflict("startup member changed before admission"));
                 }
                 let before = record.clone();
@@ -677,8 +667,10 @@ pub(super) fn reconcile_transfer(
         if let Some(child) = &launch.child {
             if child.may_be_alive() {
                 if !reviewed.is_some_and(|reviewed| {
-                    Some(reviewed.created_at)
-                        == launch.member.as_ref().map(|member| member.created_at)
+                    launch
+                        .member
+                        .as_ref()
+                        .is_some_and(|member| reviewed.same_incarnation(member))
                         && reviewed.pid == Some(child.pid)
                         && reviewed.pid_start_time == Some(child.start)
                 }) {

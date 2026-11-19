@@ -89,6 +89,8 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
         assert!(ok, "{error}");
         let before = db.get_vm(names[0]).unwrap().unwrap();
         let outside = db.get_vm(names[1]).unwrap().unwrap();
+        let before_member = db.review_workload_member(names[0]).unwrap();
+        let outside_member = db.review_workload_member(names[1]).unwrap();
         assert!(before.is_process_alive() && outside.is_process_alive());
         // Inventory and connection handles must not prepare a running disk.
         // An explicit growth request must refuse while its owner is alive.
@@ -110,8 +112,8 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
             .any(|name| name == names[0]));
         assert_eq!(storage.metadata().unwrap().len(), size);
         assert_eq!(
-            Member::from_record(names[0], &before),
-            Member::from_record(names[0], &db.get_vm(names[0]).unwrap().unwrap())
+            before_member.clone(),
+            db.review_workload_member(names[0]).unwrap()
         );
         // A failed probe during boot can leave a stale Unreachable record.
         // Once the guest responds, recovery must not force-kill it merely
@@ -131,7 +133,7 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
             .unwrap();
         db.claim_workload_transfer(
             "live-move",
-            vec![Member::from_record(names[0], &before)],
+            vec![before_member.clone()],
             std::slice::from_ref(&volume),
         )
         .unwrap();
@@ -191,12 +193,12 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
         );
         assert!(db.get_vm(names[2]).unwrap().unwrap().pid.is_none());
         assert_eq!(
-            Member::from_record(names[0], &before),
-            Member::from_record(names[0], &db.get_vm(names[0]).unwrap().unwrap())
+            before_member.clone(),
+            db.review_workload_member(names[0]).unwrap()
         );
         assert_eq!(
-            Member::from_record(names[1], &outside),
-            Member::from_record(names[1], &db.get_vm(names[1]).unwrap().unwrap())
+            outside_member.clone(),
+            db.review_workload_member(names[1]).unwrap()
         );
         assert!(crate::attach::shared_directories(names[1], false)
             .unwrap()
@@ -228,8 +230,8 @@ fn live_transfer_admission_preserves_guests_and_releases_shared_data_explicitly(
         });
         assert!(db.get_vm(names[2]).unwrap().unwrap().pid.is_none());
         assert_eq!(
-            Member::from_record(names[0], &before),
-            Member::from_record(names[0], &db.get_vm(names[0]).unwrap().unwrap())
+            before_member.clone(),
+            db.review_workload_member(names[0]).unwrap()
         );
 
         db.retire_workload_transfer("live-move").unwrap();

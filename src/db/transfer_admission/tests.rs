@@ -3,7 +3,7 @@ use super::*;
 fn machine(db: &SmolvmDb, name: &str) -> Member {
     let record = VmRecord::new(name.into(), 1, 128, vec![], vec![], false);
     assert!(db.insert_vm_if_not_exists(name, &record).unwrap());
-    Member::from_record(name, &record)
+    db.review_workload_member(name).unwrap()
 }
 
 #[cfg(unix)]
@@ -83,10 +83,9 @@ fn transfer_admission_survives_owner_crash_and_fences_real_entrypoints() {
             Some(db.admit_workload_mutation(Some("web"), &[]).unwrap())
         } else {
             assert_eq!(role, "claim");
-            let record = db.get_vm("web").unwrap().unwrap();
             db.claim_workload_transfer(
                 "crashed-owner",
-                vec![Member::from_record("web", &record)],
+                vec![db.review_workload_member("web").unwrap()],
                 &[root.join("volume")],
             )
             .unwrap();
@@ -138,7 +137,7 @@ fn transfer_admission_survives_owner_crash_and_fences_real_entrypoints() {
         PathBuf::from(std::fs::read_to_string(root.path().join("database-path")).unwrap());
     assert!(db_path.starts_with(root.path().join("data")));
     let db = SmolvmDb::open_at(&db_path).unwrap();
-    let member = Member::from_record("web", &db.get_vm("web").unwrap().unwrap());
+    let member = db.review_workload_member("web").unwrap();
     let wait_ready = |child: &mut std::process::Child| {
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         while !root.path().join("ready").exists() {

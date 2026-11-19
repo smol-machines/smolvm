@@ -9,7 +9,7 @@
 //! The capture coordinator must cover every writer and recover interrupted
 //! launches before using this primitive to authorize a remote handoff.
 
-use super::{params, OptionalExtension, SmolvmDb, TransactionBehavior};
+use super::{params, Connection, DbResultExt, OptionalExtension, SmolvmDb, TransactionBehavior};
 use crate::config::VmRecord;
 use crate::{Error, Result};
 use serde::{Deserialize, Serialize};
@@ -23,7 +23,12 @@ use std::path::{Path, PathBuf};
 pub struct Member {
     /// Named machine within this database's engine state root.
     pub name: String,
-    /// Creation identity observed during dependency review.
+    /// Opaque database-row identity, changed whenever the machine is recreated.
+    /// Absent only on legacy saved claims, which can fence mutations but cannot
+    /// authorize a new transfer or boot.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub generation: Option<String>,
+    /// Creation timestamp observed during dependency review.
     pub created_at: u64,
     /// VMM process observed during dependency review, if it is running.
     pub pid: Option<i32>,
@@ -32,14 +37,47 @@ pub struct Member {
 }
 
 impl Member {
-    /// Bind a reviewed machine record to its current execution generation.
-    pub fn from_record(name: &str, record: &VmRecord) -> Self {
-        Self {
-            name: name.to_owned(),
-            created_at: record.created_at,
-            pid: record.pid,
-            pid_start_time: record.pid_start_time,
-        }
+    /// Read the row identity and execution state in one SQLite snapshot.
+    pub(super) fn read(conn: &Connection, name: &str) -> Result<(Self, VmRecord)> {
+        let row: Option<(Vec<u8>, Option<String>)> = conn
+            .query_row(
+                "SELECT v.data, g.generation FROM vms v
+                 LEFT JOIN vm_incarnations g ON g.name = v.name WHERE v.name = ?1",
+                [name],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .db_err("read reviewed machine identity")?;
+        let (data, generation) = row.ok_or_else(|| Error::vm_not_found(name))?;
+        let generation = generation
+            .filter(|value| super::incarnation::valid(value))
+            .ok_or_else(|| {
+                conflict("machine identity is missing or corrupt; recover it before moving")
+            })?;
+        let record: VmRecord = serde_json::from_slice(&data).db_err("decode reviewed machine")?;
+        Ok((
+            Self {
+                name: name.to_owned(),
+                generation: Some(generation),
+                created_at: record.created_at,
+                pid: record.pid,
+                pid_start_time: record.pid_start_time,
+            },
+            record,
+        ))
+    }
+
+    pub(super) fn identity_valid(&self, require: bool) -> bool {
+        self.generation
+            .as_deref()
+            .map_or(!require, super::incarnation::valid)
+    }
+
+    pub(super) fn same_incarnation(&self, other: &Self) -> bool {
+        self.name == other.name
+            && self.generation.is_some()
+            && self.generation == other.generation
+            && self.created_at == other.created_at
     }
 }
 
@@ -99,13 +137,14 @@ fn decode(data: &[u8]) -> Result<Claim> {
         conflict("the saved transfer admission cannot be read; recover the transfer first")
     })?;
     let mut names = BTreeSet::new();
-    if claim.version != 1
+    if !matches!(claim.version, 1 | 2)
         || claim.members.is_empty()
         || claim.members.len() > 1024
         || claim.roots.len() > 1024
         || claim.roots.iter().any(|path| !path.is_absolute())
         || claim.members.iter().any(|member| {
             crate::data::validate_vm_name(&member.name, "transfer member").is_err()
+                || !member.identity_valid(claim.version >= 2)
                 || !names.insert(&member.name)
         })
     {
@@ -120,6 +159,13 @@ mod live_tests;
 mod tests;
 
 impl SmolvmDb {
+    /// Review a machine for transfer from one consistent database snapshot.
+    /// Re-read after a changed machine is reported; never synthesize a review
+    /// from a name, timestamp, or a previously serialized VM configuration.
+    pub fn review_workload_member(&self, name: &str) -> Result<Member> {
+        self.with_read_conn(|conn| Member::read(conn, name).map(|(member, _)| member))
+    }
+
     pub(super) fn transfer_gate(&self, exclusive: bool) -> Result<AdmissionGate> {
         // Resolve symlink spellings of the database to the same gate. The gate
         // is outside removable VM directories and is never unlinked on release.
@@ -261,6 +307,9 @@ impl SmolvmDb {
         for member in &members {
             crate::data::validate_vm_name(&member.name, "transfer member")
                 .map_err(|_| conflict("invalid transfer member"))?;
+            if !member.identity_valid(true) {
+                return Err(conflict("transfer review has no valid machine identity"));
+            }
             if !names.insert(member.name.clone()) {
                 return Err(conflict("duplicate transfer member"));
             }
@@ -276,7 +325,7 @@ impl SmolvmDb {
             canonical_roots.insert(root);
         }
         let claim = Claim {
-            version: 1,
+            version: 2,
             members,
             roots: canonical_roots.into_iter().collect(),
         };
@@ -296,6 +345,13 @@ impl SmolvmDb {
                         return Err(conflict(
                             "this transfer operation was completed or has different members",
                         ));
+                    }
+                    // A retry must not authorize a replacement created by a
+                    // writer that did not participate in transfer admission.
+                    for member in &claim.members {
+                        if Member::read(&tx, &member.name)?.0 != *member {
+                            return Err(conflict("an environment member changed after review"));
+                        }
                     }
                     return Ok(());
                 }
@@ -324,18 +380,7 @@ impl SmolvmDb {
                 }
                 super::launch_admission::reconcile_transfer(&tx, &claim.members, &claim.roots)?;
                 for member in &claim.members {
-                    let data: Option<Vec<u8>> = tx
-                        .query_row(
-                            "SELECT data FROM vms WHERE name = ?1",
-                            [&member.name],
-                            |row| row.get(0),
-                        )
-                        .optional()
-                        .map_err(|e| Error::database_unavailable(e.to_string()))?;
-                    let data = data.ok_or_else(|| Error::vm_not_found(&member.name))?;
-                    let record: VmRecord = serde_json::from_slice(&data)
-                        .map_err(|e| Error::database_unavailable(e.to_string()))?;
-                    if Member::from_record(&member.name, &record) != *member {
+                    if Member::read(&tx, &member.name)?.0 != *member {
                         return Err(conflict("an environment member changed after review"));
                     }
                 }

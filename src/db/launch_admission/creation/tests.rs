@@ -231,10 +231,7 @@ fn crashed_creation_is_recovered_without_reusing_partial_data_or_old_authority()
     let dir = crate::agent::vm_data_dir("crashed-import");
     db.insert_vm("transfer-member", &record("transfer-member"))
         .unwrap();
-    let members = vec![Member::from_record(
-        "transfer-member",
-        &db.get_vm("transfer-member").unwrap().unwrap(),
-    )];
+    let members = vec![db.review_workload_member("transfer-member").unwrap()];
     assert!(db
         .claim_workload_transfer("busy", members.clone(), std::slice::from_ref(&dir))
         .is_err());

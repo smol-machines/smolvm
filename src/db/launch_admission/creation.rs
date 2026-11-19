@@ -298,7 +298,7 @@ impl SmolvmDb {
             let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM vms WHERE name = ?1)", [name], |row| row.get(0)).db_err("check creation name")?;
             if exists { return Ok(false); }
             refuse_other_owners(&tx, Some(name), &paths, None)?;
-            let launch = Launch { version: 1, owner: owner.clone(), member: None, storage: paths[0].clone(), roots: vec![], child: None, purpose: Purpose::Create { name: name.to_owned() }, exclusive_paths: paths[1..].to_vec() };
+            let launch = Launch { version: 2, owner: owner.clone(), member: None, storage: paths[0].clone(), roots: vec![], child: None, purpose: Purpose::Create { name: name.to_owned() }, exclusive_paths: paths[1..].to_vec() };
             tx.execute("INSERT INTO vm_launch_admission(token, data) VALUES (?1, ?2)", params![token, serde_json::to_vec(&launch).db_err("encode creation owner")?]).db_err("reserve creation owner")?;
             tx.execute("INSERT INTO vm_create_reservations(name, owner_token, owner_pid, created_at) VALUES (?1, ?2, ?3, ?4)", params![name, token, owner.pid, crate::util::current_timestamp()]).db_err("reserve creation name")?;
             tx.commit().db_err("commit creation ownership")?;

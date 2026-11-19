@@ -22,6 +22,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+mod incarnation;
 mod resize;
 pub(crate) use resize::{ResizeIntent, ResizeReceipt, ResizeReceiptState, ResizeTarget};
 pub mod launch_admission;
@@ -274,7 +275,7 @@ impl SmolvmDb {
 
     /// Open the serialized writer, configure WAL, and ensure tables exist.
     fn open_writer_connection(path: &Path) -> Result<Connection> {
-        let conn = Connection::open(path)
+        let mut conn = Connection::open(path)
             .map_err(|e| Error::database_unavailable(format!("open database: {}", e)))?;
 
         // Install the busy handler before any pragma or schema statement that
@@ -357,6 +358,7 @@ impl SmolvmDb {
                  ON fork_leases(pool_name, state);",
         )
         .db_err("create tables")?;
+        incarnation::install(&mut conn)?;
 
         Ok(conn)
     }
