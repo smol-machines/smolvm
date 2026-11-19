@@ -1356,6 +1356,40 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                     "the checkpoint was captured on the TSI backend, which cannot enforce one",
                 ));
             }
+            // The local floor lets an allow entry re-open host loopback,
+            // because only the user writes one. A checkpoint's own entries are
+            // its author's, so one that reaches the host is refused; the user
+            // can restore with an egress policy of their own instead.
+            if allowed_cidrs.is_none() {
+                if let Some(cidr) = captured_net
+                    .allowed_cidrs
+                    .iter()
+                    .flatten()
+                    .find(|cidr| reaches_the_host(Some(cidr)))
+                {
+                    return Err(captured_reach(cidr));
+                }
+            }
+            if allowed_hosts.is_none() {
+                if let Some(host) = captured_net
+                    .dns_filter_hosts
+                    .iter()
+                    .flatten()
+                    .find(|host| names_the_host(host))
+                {
+                    return Err(captured_reach(host));
+                }
+            }
+            if egress_rules.is_empty() {
+                if let Some(rule) = captured_net.egress_rules.iter().find(|rule| {
+                    rule.action == smolvm_protocol::RuleAction::Allow
+                        && reaches_the_host(rule.cidr.as_deref())
+                }) {
+                    return Err(captured_reach(
+                        rule.cidr.as_deref().unwrap_or("every address"),
+                    ));
+                }
+            }
             let allowed_cidrs = allowed_cidrs.or_else(|| captured_net.allowed_cidrs.clone());
             let allowed_hosts = allowed_hosts.or_else(|| captured_net.dns_filter_hosts.clone());
             let block_private = block_private.or_else(|| captured_net.block_private.clone());
@@ -1908,6 +1942,56 @@ fn refuse_artifact_local_dir(image: Option<&str>) -> Result<()> {
         )),
         _ => Ok(()),
     }
+}
+
+/// Addresses that are the host itself, not the network: host loopback and
+/// link-local (where cloud metadata answers), in both families and spelled as
+/// IPv4-mapped IPv6.
+const HOST_RANGES: [&str; 7] = [
+    "127.0.0.0/8",
+    "::1/128",
+    "::ffff:127.0.0.0/104",
+    "169.254.0.0/16",
+    "fe80::/10",
+    "::ffff:169.254.0.0/112",
+    "fd00:ec2::254/128",
+];
+
+/// Whether an allow entry for `cidr` (`None` allows every address) covers any
+/// part of the host. An entry that does not parse is taken to.
+fn reaches_the_host(cidr: Option<&str>) -> bool {
+    let Some(cidr) = cidr else {
+        return true;
+    };
+    let net = match cidr.parse::<ipnet::IpNet>() {
+        Ok(net) => net,
+        Err(_) => match cidr.parse::<std::net::IpAddr>() {
+            Ok(ip) => ipnet::IpNet::from(ip),
+            Err(_) => return true,
+        },
+    };
+    HOST_RANGES.iter().any(|range| {
+        let range: ipnet::IpNet = range.parse().expect("static range");
+        range.contains(&net.network()) || net.contains(&range.network())
+    })
+}
+
+/// Whether an allowed hostname names the host itself.
+fn names_the_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || (host.parse::<std::net::IpAddr>().is_ok() && reaches_the_host(Some(&host)))
+}
+
+fn captured_reach(entry: &str) -> Error {
+    Error::config(
+        "restore checkpoint egress policy",
+        format!(
+            "the checkpoint's egress policy allows {entry}, which reaches this host; \
+             restore it with an egress policy of your own (--allow-cidr, --allow-host, --deny-cidr)"
+        ),
+    )
 }
 
 #[cfg(test)]
