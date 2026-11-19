@@ -167,6 +167,16 @@ impl Store {
         Ok(records)
     }
 
+    /// Read one reviewed dependency without accepting symlinks or special files.
+    /// The caller validates its key and embedded identity before using it.
+    pub(crate) fn transfer_object<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        key: &str,
+    ) -> crate::Result<T> {
+        required_record(&self.object_path(kind, key))
+    }
+
     /// `<root>/<kind>/<name>.json` for the flat object kinds.
     pub(crate) fn object_path(&self, kind: &str, name: &str) -> PathBuf {
         self.root.join(kind).join(format!("{name}.json"))

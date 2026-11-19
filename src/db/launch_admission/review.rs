@@ -12,6 +12,15 @@ pub(crate) struct RecordIdentity {
     generation: String,
 }
 
+impl RecordIdentity {
+    /// The row generation observed in the same snapshot as its configuration.
+    /// Including it in a preview does not authorize mutation of that row.
+    #[cfg(unix)]
+    pub(crate) fn generation(&self) -> &str {
+        &self.generation
+    }
+}
+
 /// An absent row is an explicit expectation too: a delayed new launch must
 /// never adopt a machine another caller created in the meantime.
 #[derive(Clone, Debug)]

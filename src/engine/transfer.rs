@@ -15,6 +15,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use super::containers::ContainerRecord;
+use super::images::ImageRecord;
 use super::network::NetworkRecord;
 use super::util::{ApiError, ApiResult};
 use super::volumes::VolumeRecord;
@@ -35,6 +36,7 @@ pub(super) struct Plan {
     members: Vec<Member>,
     additional_containers: Vec<String>,
     machines: Vec<String>,
+    images: Vec<String>,
     volumes: Vec<String>,
     networks: Vec<String>,
     dependencies: BTreeSet<Dependency>,
@@ -250,6 +252,26 @@ fn build_with_inventory(
         }
     }
     let mut blockers = BTreeSet::new();
+    // Read the exact image IDs the selected closure uses, never resolve mutable
+    // tags again. Unrelated images are not dependencies of this move.
+    let mut images = BTreeMap::<String, ImageRecord>::new();
+    for id in &members {
+        let image_id = &records[id].image_id;
+        if images.contains_key(image_id) {
+            continue;
+        }
+        let key = image_id
+            .strip_prefix("sha256:")
+            .filter(|key| super::store::valid_id(key))
+            .ok_or_else(|| ApiError::conflict("container image identity is invalid"))?;
+        let image: ImageRecord = engine.store.transfer_object("images", key).map_err(|_| {
+            ApiError::conflict(format!("image {image_id} is unavailable for transfer"))
+        })?;
+        if image.id != *image_id {
+            return Err(ApiError::conflict("image record identity is invalid"));
+        }
+        images.insert(image_id.clone(), image);
+    }
     let mut dependencies = BTreeSet::new();
     let mut volume_names = BTreeSet::new();
     let mut network_ids = BTreeSet::new();
@@ -497,14 +519,31 @@ fn build_with_inventory(
         }
         identities.push(value);
     }
-    let machine_identities: Vec<_> = vms.iter().filter(|(name,_)|machines.contains(name)).map(|(name,vm)| serde_json::json!({"name":name,"createdAt":vm.created_at,"mounts":vm.host_mounts()})).collect();
+    let machine_identities = vms
+        .iter()
+        .filter(|(name, _)| machines.contains(name))
+        .map(|(name, vm)| {
+            if vm.name != *name {
+                return Err(ApiError::conflict("machine record identity is invalid"));
+            }
+            let identity = vm.database_identity.as_ref().ok_or_else(|| {
+                ApiError::conflict(
+                    "machine identity is missing or corrupt; recover it before moving",
+                )
+            })?;
+            // list_vms read this generation and configuration atomically. A
+            // second name lookup could accidentally bind an older config to a
+            // replacement's identity. Hash secrets; do not return them.
+            Ok(serde_json::json!({"name":name,"generation":identity.generation(),"config":vm}))
+        })
+        .collect::<ApiResult<Vec<_>>>()?;
     use std::os::unix::fs::MetadataExt;
     let volume_identities = roots.iter().map(|(name, root)| {
         let metadata = std::fs::metadata(root).map_err(|e| ApiError::internal(e.to_string()))?;
         Ok(serde_json::json!({"name":name,"path":root,"device":metadata.dev(),"inode":metadata.ino()}))
     }).collect::<ApiResult<Vec<_>>>()?;
     let data = serde_json::to_vec(&serde_json::json!({
-        "version":2,"selected":selected,"containers":identities,
+        "version":3,"selected":selected,"containers":identities,"images":images.values().collect::<Vec<_>>(),
         "volumes":volume_names.iter().map(|name|&volumes[name]).collect::<Vec<_>>(),
         "networks":network_ids.iter().map(|id|&networks[id]).collect::<Vec<_>>(),
         "machines":machine_identities,"volumeIdentities":volume_identities,"liveShares":live_identities,"blockers":blockers,
@@ -525,6 +564,7 @@ fn build_with_inventory(
             .collect(),
         additional_containers: members.difference(&selected).cloned().collect(),
         machines: machines.into_iter().collect(),
+        images: images.into_keys().collect(),
         volumes: volume_names.into_iter().collect(),
         networks: network_ids.into_iter().collect(),
         dependencies,
@@ -543,9 +583,16 @@ mod tests {
     use super::*;
 
     fn record(engine: &Engine, byte: char, name: &str, volume: Option<&str>) -> ContainerRecord {
+        let image = image_record('e');
+        if !engine.store.object_path("images", &"e".repeat(64)).exists() {
+            engine
+                .store
+                .save_object("images", &"e".repeat(64), &image)
+                .unwrap();
+        }
         let mut record:ContainerRecord=serde_json::from_value(serde_json::json!({
-            "id":byte.to_string().repeat(64),"name":name,"created":"","image":"example","image_id":"digest",
-            "pull_ref":"example@sha256:digest","machine":format!("vm-{name}"),"config":{},"host_config":{},"host_config_raw":{},
+            "id":byte.to_string().repeat(64),"name":name,"created":"","image":"example","image_id":image.id,
+            "pull_ref":image.pull_ref,"machine":format!("vm-{name}"),"config":{},"host_config":{},"host_config_raw":{},
             "networks":{},"path":"sh","args":[],"state":StateRecord::default(),"restart_count":0,"ports":[],"mounts":[]
         })).unwrap();
         if let Some(volume) = volume {
@@ -574,6 +621,98 @@ mod tests {
         }
         engine.store.save_container(&record).unwrap();
         record
+    }
+
+    fn image_record(byte: char) -> super::super::images::ImageRecord {
+        let digest = format!("sha256:{}", byte.to_string().repeat(64));
+        super::super::images::ImageRecord {
+            id: digest.clone(),
+            repo_tags: vec!["example:latest".into()],
+            repo_digests: vec![format!("example@{digest}")],
+            pull_ref: format!("example@{digest}"),
+            config: serde_json::json!({"architecture":"arm64","os":"linux","config":{"Env":["TOKEN=image-fixture-secret"]}}),
+            size: 123,
+            pulled: String::new(),
+            last_tag_time: String::new(),
+        }
+    }
+
+    #[test]
+    fn transfer_preflight_binds_selected_image_metadata_without_returning_secrets() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        record(&engine, 'a', "web", None);
+        let first = build(&engine, &["web".into()]).unwrap();
+        assert_eq!(first.images, vec![image_record('e').id]);
+        engine
+            .store
+            .save_object("images", &"f".repeat(64), &image_record('f'))
+            .unwrap();
+        assert_eq!(
+            first.fingerprint,
+            build(&engine, &["web".into()]).unwrap().fingerprint
+        );
+        std::fs::write(engine.store.object_path("images", &"f".repeat(64)), b"{").unwrap();
+        assert_eq!(
+            first.fingerprint,
+            build(&engine, &["web".into()]).unwrap().fingerprint
+        );
+        let mut image = image_record('e');
+        image.repo_tags.push("example:retained".into());
+        engine
+            .store
+            .save_object("images", &"e".repeat(64), &image)
+            .unwrap();
+        let changed = build(&engine, &["web".into()]).unwrap();
+        assert_ne!(first.fingerprint, changed.fingerprint);
+        assert!(!serde_json::to_string(&changed)
+            .unwrap()
+            .contains("image-fixture-secret"));
+        let path = engine.store.object_path("images", &"e".repeat(64));
+        std::fs::remove_file(&path).unwrap();
+        assert!(build(&engine, &["web".into()]).is_err());
+        engine
+            .store
+            .save_object("images", &"e".repeat(64), &image_record('f'))
+            .unwrap();
+        assert!(build(&engine, &["web".into()]).is_err());
+        engine
+            .store
+            .save_object("images", &"e".repeat(64), &image)
+            .unwrap();
+        let retained = root.path().join("retained-image.json");
+        std::fs::rename(&path, &retained).unwrap();
+        std::os::unix::fs::symlink(&retained, &path).unwrap();
+        assert!(build(&engine, &["web".into()]).is_err());
+    }
+
+    #[test]
+    fn transfer_preflight_binds_machine_recreation_and_configuration() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let a = record(&engine, 'a', "web", None);
+        let mut vm = crate::config::VmRecord::new(a.machine.clone(), 1, 128, vec![], vec![], false);
+        vm.labels
+            .insert(super::super::containers::MACHINE_LABEL.into(), a.id.clone());
+        vm.env
+            .push(("TOKEN".into(), "machine-fixture-secret".into()));
+        engine.db.insert_vm(&a.machine, &vm).unwrap();
+        let first = build(&engine, &["web".into()]).unwrap();
+        engine.db.remove_vm(&a.machine).unwrap();
+        engine.db.insert_vm(&a.machine, &vm).unwrap();
+        let replaced = build(&engine, &["web".into()]).unwrap();
+        assert_ne!(first.fingerprint, replaced.fingerprint);
+        engine.db.update_vm(&a.machine, |vm| vm.mem = 256).unwrap();
+        let changed = build(&engine, &["web".into()]).unwrap();
+        assert_ne!(replaced.fingerprint, changed.fingerprint);
+        assert!(!serde_json::to_string(&changed)
+            .unwrap()
+            .contains("machine-fixture-secret"));
+        let connection = rusqlite::Connection::open(root.path().join("test.db")).unwrap();
+        connection
+            .execute("DELETE FROM vm_incarnations WHERE name = ?1", [&a.machine])
+            .unwrap();
+        assert!(build(&engine, &["web".into()]).is_err());
     }
 
     #[test]
