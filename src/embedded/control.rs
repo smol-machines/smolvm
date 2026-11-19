@@ -962,6 +962,7 @@ pub fn connect_vm(db: &SmolvmDb, name: &str) -> Result<VmHandle> {
 ///
 /// `stop_timeout` overrides how long the workload gets to exit after its stop
 /// signal; `None` keeps the timeout it was launched with.
+#[cfg(unix)]
 pub fn stop_vm_with_timeout(
     db: &SmolvmDb,
     name: &str,
