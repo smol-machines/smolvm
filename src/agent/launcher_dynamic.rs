@@ -89,24 +89,14 @@ pub struct PackedLaunchConfig<'a> {
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
-/// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
-/// begins with the qcow2 magic (`QFI\xfb`), else `0` (raw). Matches
-/// `DiskFormat::to_krun_u32`. Reading the bytes keeps the format in sync with
-/// what libkrun will parse, regardless of the file's extension.
-fn krun_disk_format(path: &Path) -> u32 {
-    use std::io::Read;
-    const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
-    let mut magic = [0u8; 4];
-    let is_qcow2 = std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && magic == QCOW2_MAGIC;
-    if is_qcow2 {
-        1
-    } else {
-        0
-    }
-}
+/// The `krun_add_disk2` image-format code for every disk this launcher
+/// attaches: raw. A packed run's disks are raw by construction (the packer
+/// flattens qcow2 disks, and runtime disks are created as sparse raw files),
+/// and their bytes are not the host's to trust: a pack's storage template is
+/// its author's, and a daemon's disks are its guest's. Reading the format
+/// from those bytes would let either one present a qcow2 header that names a
+/// host file as its backing or data file, and libkrun follows both.
+const PACKED_DISK_FORMAT: u32 = 0;
 
 /// Launch VM using dynamically loaded libkrun (for packed/sidecar mode).
 ///
@@ -618,7 +608,7 @@ pub fn launch_agent_vm_dynamic(
         path_to_cstring(config.storage_path),
         "storage path contains null byte"
     );
-    let storage_format = krun_disk_format(config.storage_path);
+    let storage_format = PACKED_DISK_FORMAT;
     let storage_result = add_dynamic_block_disk(
         krun,
         ctx,
@@ -641,7 +631,7 @@ pub fn launch_agent_vm_dynamic(
         let overlay_id = cstr("overlay");
         let overlay_disk =
             try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
-        let overlay_format = krun_disk_format(overlay);
+        let overlay_format = PACKED_DISK_FORMAT;
         let overlay_result = add_dynamic_block_disk(
             krun,
             ctx,
