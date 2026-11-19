@@ -1330,11 +1330,12 @@ fn safe_unpack_skipping<R: Read>(
             entry_type == tar::EntryType::Regular || entry_type == tar::EntryType::GNUSparse;
 
         // Where the entry lands, resolved without leaving `dest`: a link in
-        // its path is followed inside `dest`, as the guest will see it. Only a
-        // link entry may stand where a link already is; anything else there
-        // would be extracted, chmodded and chowned through it, onto a host path.
+        // its path is followed inside `dest`, as the guest will see it. The
+        // tar crate replaces a link with a file or a new link, but takes a link
+        // to a directory as that directory, so a directory entry standing on a
+        // link would be chmodded and chowned through it, onto a host path.
         let landed = resolve_in_root(dest, &entry_path, false)?;
-        if entry_type != tar::EntryType::Symlink
+        if entry_type == tar::EntryType::Directory
             && fs::symlink_metadata(&landed).is_ok_and(|m| m.file_type().is_symlink())
         {
             report.skipped += 1;
@@ -1428,6 +1429,15 @@ fn safe_unpack_skipping<R: Read>(
                         format!("failed to unpack '{}': {}", entry_path.display(), e),
                     ));
                 }
+            }
+
+            // Whatever the tar crate left at the path is what gets a mode and an
+            // owner below; never a link, which they would follow.
+            if entry_type != tar::EntryType::Symlink
+                && fs::symlink_metadata(&full_path).is_ok_and(|m| m.file_type().is_symlink())
+            {
+                report.skipped += 1;
+                continue;
             }
 
             // After extracting a directory, force it writable so subsequent
