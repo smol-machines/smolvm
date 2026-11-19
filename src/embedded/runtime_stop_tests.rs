@@ -94,6 +94,15 @@ fn failed_cached_stop_and_delete_preserve_the_guest_for_retry() {
         );
         runtime.stop_machine(name).unwrap();
         runtime.start_machine(name).unwrap();
+        assert!(
+            !runtime
+                .db
+                .get_vm(name)
+                .unwrap()
+                .unwrap()
+                .restart
+                .user_stopped
+        );
         exec("printf retry > /staged/value");
         runtime.delete_machine(name).unwrap();
         assert_eq!(

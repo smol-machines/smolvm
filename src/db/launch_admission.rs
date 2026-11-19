@@ -663,6 +663,12 @@ impl SmolvmDb {
                     record.state = RecordState::Running;
                 }
                 record.engine_build = Some(crate::ENGINE_BUILD.to_owned());
+                // An intentional stop suppresses supervision until another
+                // admitted start. Preserve the budget of automatic retries.
+                if record.restart.user_stopped {
+                    record.restart.user_stopped = false;
+                    record.restart.restart_count = 0;
+                }
                 tx.execute(
                     "UPDATE vms SET data = ?2 WHERE name = ?1",
                     params![

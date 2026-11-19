@@ -588,3 +588,22 @@ fn startup_survives_controller_crash_on_both_sides_of_boot_admission() {
         );
     }
 }
+
+#[test]
+fn startup_reenables_explicitly_stopped_work_without_resetting_automatic_retries() {
+    for explicitly_stopped in [false, true] {
+        let (_root, db, storage, mut record) = fixture();
+        record.restart.user_stopped = explicitly_stopped;
+        record.restart.restart_count = 4;
+        let reservation = db
+            .reserve_vm_launch(Some(record), &storage, &[], &[])
+            .unwrap();
+        db.admit_vm_boot(&reservation.ticket.token).unwrap();
+        let started = db.get_vm("web").unwrap().unwrap();
+        assert!(!started.restart.user_stopped);
+        assert_eq!(
+            started.restart.restart_count,
+            if explicitly_stopped { 0 } else { 4 }
+        );
+    }
+}
