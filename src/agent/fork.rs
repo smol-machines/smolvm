@@ -2708,10 +2708,6 @@ pub fn resume_golden(golden: &str, snapshot_dir: &Path) -> Result<()> {
 /// Remove every retained RAM checkpoint for a golden whose VMM is confirmed
 /// dead and which has no dependent clones. A checkpoint is tied to the exact
 /// golden PID/memfd identity and can never be valid after that process exits.
-pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<()> {
-    discard_retained_snapshots_at(db, golden, &vm_data_dir(golden).join("s"))
-}
-
 pub(crate) fn discard_retained_snapshots_at(
     db: &SmolvmDb,
     golden: &str,
