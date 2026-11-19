@@ -11,6 +11,9 @@ use crate::config::{RecordState, VmRecord};
 use crate::{Error, Result};
 use rusqlite::Transaction;
 
+pub(super) mod review;
+pub(crate) use review::{LaunchReview, RecordIdentity};
+
 mod creation;
 pub use creation::VmCreationLease;
 use serde::{Deserialize, Serialize};
@@ -256,6 +259,22 @@ pub(crate) struct LaunchReservation {
     owner: ProcessIdentity,
 }
 
+impl LaunchReservation {
+    pub(crate) fn review(&self) -> Result<LaunchReview> {
+        self.db.with_read_conn(|conn| {
+            let data: Vec<u8> = conn
+                .query_row(
+                    "SELECT data FROM vm_launch_admission WHERE token = ?1",
+                    [&self.ticket.token],
+                    |row| row.get(0),
+                )
+                .db_err("read reserved startup identity")?;
+            let launch = decode(&data)?;
+            LaunchReview::from_member(&self.db, launch.member.as_ref())
+        })
+    }
+}
+
 impl Drop for LaunchReservation {
     fn drop(&mut self) {
         if self.owner.pid != std::process::id() as i32 {
@@ -360,6 +379,7 @@ impl SmolvmDb {
         })
     }
 
+    #[cfg(test)]
     pub(crate) fn reserve_vm_launch(
         &self,
         provisional: Option<VmRecord>,
@@ -367,7 +387,20 @@ impl SmolvmDb {
         roots: &[PathBuf],
         exclusive_paths: &[PathBuf],
     ) -> Result<LaunchReservation> {
+        let review = LaunchReview::capture(self, provisional.as_ref().map(|r| r.name.as_str()))?;
+        self.reserve_reviewed_vm_launch(&review, provisional, storage, roots, exclusive_paths)
+    }
+
+    pub(crate) fn reserve_reviewed_vm_launch(
+        &self,
+        review: &LaunchReview,
+        provisional: Option<VmRecord>,
+        storage: &Path,
+        roots: &[PathBuf],
+        exclusive_paths: &[PathBuf],
+    ) -> Result<LaunchReservation> {
         let name = provisional.as_ref().map(|record| record.name.as_str());
+        review.check_name(name)?;
         let paths = std::iter::once(storage.to_path_buf())
             .chain(exclusive_paths.iter().cloned())
             .collect::<Vec<_>>();
@@ -403,6 +436,7 @@ impl SmolvmDb {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin startup reservation")?;
+            review.validate_conn(self, &tx)?;
             let mut inserted = false;
             refuse_other_owners(
                 &tx,
@@ -489,12 +523,25 @@ impl SmolvmDb {
     /// Own creation/growth before touching disks, without inventing a VM record
     /// or holding a database write lock during filesystem work. Boot and other
     /// preparation reservations use the same atomic conflict check.
+    #[cfg(test)]
     pub(crate) fn reserve_vm_preparation(
         &self,
         name: Option<&str>,
         storage: &Path,
         exclusive_paths: &[PathBuf],
     ) -> Result<LaunchReservation> {
+        let review = LaunchReview::capture(self, name)?;
+        self.reserve_reviewed_vm_preparation(&review, name, storage, exclusive_paths)
+    }
+
+    pub(crate) fn reserve_reviewed_vm_preparation(
+        &self,
+        review: &LaunchReview,
+        name: Option<&str>,
+        storage: &Path,
+        exclusive_paths: &[PathBuf],
+    ) -> Result<LaunchReservation> {
+        review.check_name(name)?;
         if let Some(name) = name {
             crate::data::validate_vm_name(name, "preparation member")
                 .map_err(|_| conflict("invalid preparation member"))?;
@@ -521,6 +568,7 @@ impl SmolvmDb {
             let tx = conn
                 .transaction_with_behavior(TransactionBehavior::Immediate)
                 .db_err("begin disk preparation")?;
+            review.validate_conn(self, &tx)?;
             refuse_other_owners(&tx, name, &paths, None)?;
             let launch = Launch {
                 version: 2,

@@ -447,10 +447,17 @@ impl SmolvmDb {
 
     /// Insert or update a VM record.
     pub fn insert_vm(&self, name: &str, record: &VmRecord) -> Result<()> {
+        self.insert_vm_for_launch(name, record).map(|_| ())
+    }
+
+    pub(crate) fn insert_vm_for_launch(&self, name: &str, record: &VmRecord) -> Result<VmRecord> {
         let json = serde_json::to_vec(record).db_err("serialize vm record")?;
         let existed = self.get_vm(name)?.is_some();
-        self.with_conn(|conn| {
-            let changed = conn
+        let published = self.with_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(TransactionBehavior::Immediate)
+                .db_err("begin machine publication")?;
+            let changed = tx
                 .execute(
                     "INSERT INTO vms (name, data)
                  SELECT ?1, ?2 WHERE NOT EXISTS (
@@ -466,12 +473,16 @@ impl SmolvmDb {
                     "machine creation is still owned",
                 ));
             }
-            Ok(())
+            let published =
+                launch_admission::review::read_record(&tx, &self.path.canonicalize()?, name)?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+            tx.commit().db_err("commit machine publication")?;
+            Ok(published)
         })?;
         if !existed {
             self.journal_insert(name, record);
         }
-        Ok(())
+        Ok(published)
     }
 
     /// Parent lookup for the usage journal's branch-depth walk.
@@ -517,25 +528,8 @@ impl SmolvmDb {
 
     /// Get a VM record by name.
     pub fn get_vm(&self, name: &str) -> Result<Option<VmRecord>> {
-        self.with_read_conn(|conn| {
-            let data: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT data FROM vms WHERE name = ?1",
-                    params![name],
-                    |row| row.get(0),
-                )
-                .optional()
-                .db_err(format!("get vm '{}'", name))?;
-
-            match data {
-                Some(bytes) => {
-                    let record: VmRecord = serde_json::from_slice(&bytes)
-                        .db_err(format!("deserialize vm record '{}'", name))?;
-                    Ok(Some(record))
-                }
-                None => Ok(None),
-            }
-        })
+        let database = self.path.canonicalize()?;
+        self.with_read_conn(|conn| launch_admission::review::read_record(conn, &database, name))
     }
 
     /// Remove a VM record by name, returning the removed record if it existed.
@@ -612,23 +606,17 @@ impl SmolvmDb {
     /// List all VM records, ordered by name so every listing of the same
     /// machines comes back in the same order.
     pub fn list_vms(&self) -> Result<Vec<(String, VmRecord)>> {
+        let database = self.path.canonicalize()?;
         self.with_read_conn(|conn| {
-            let mut stmt = conn
-                .prepare_cached("SELECT name, data FROM vms ORDER BY name")
-                .db_err("prepare list_vms")?;
-            let rows = stmt
-                .query_map([], |row| {
-                    let name: String = row.get(0)?;
-                    let data: Vec<u8> = row.get(1)?;
-                    Ok((name, data))
-                })
+            let mut stmt = conn.prepare_cached(
+                "SELECT v.name, v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name ORDER BY v.name"
+            ).db_err("prepare list_vms")?;
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<String>>(2)?)))
                 .db_err("query vms")?;
-
             let mut vms = Vec::new();
             for row in rows {
-                let (name, data) = row.db_err("read vms row")?;
-                let record: VmRecord = serde_json::from_slice(&data)
-                    .db_err(format!("deserialize vm record '{}'", name))?;
+                let (name, data, generation) = row.db_err("read vms row")?;
+                let record = launch_admission::review::decode_record(&database, &name, &data, generation)?;
                 vms.push((name, record));
             }
             Ok(vms)
@@ -735,7 +723,34 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, false, false)
+        self.update_vm_with_durability(name, f, false, false, None)
+    }
+
+    /// Startup bookkeeping may only change the row reviewed by this caller.
+    pub(crate) fn update_reviewed_vm<F>(
+        &self,
+        review: &launch_admission::LaunchReview,
+        name: &str,
+        f: F,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
+        review.check_name(Some(name))?;
+        self.update_vm_with_durability(name, f, false, false, Some(review))
+    }
+
+    pub(crate) fn update_reviewed_vm_durable<F>(
+        &self,
+        review: &launch_admission::LaunchReview,
+        name: &str,
+        f: F,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord),
+    {
+        review.check_name(Some(name))?;
+        self.update_vm_with_durability(name, f, true, false, Some(review))
     }
 
     /// Persist a recovery boundary before releasing its live execution state.
@@ -743,7 +758,7 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true, false)
+        self.update_vm_with_durability(name, f, true, false, None)
     }
 
     /// Commit resumed execution and retire retry keys in the same transaction.
@@ -751,7 +766,7 @@ impl SmolvmDb {
     where
         F: FnOnce(&mut VmRecord),
     {
-        self.update_vm_with_durability(name, f, true, true)
+        self.update_vm_with_durability(name, f, true, true, None)
     }
 
     /// A consumed key can never initiate a second pause after a successful resume.
@@ -805,6 +820,7 @@ impl SmolvmDb {
         f: F,
         durable: bool,
         finish_pause: bool,
+        review: Option<&launch_admission::LaunchReview>,
     ) -> Result<Option<VmRecord>>
     where
         F: FnOnce(&mut VmRecord),
@@ -821,6 +837,9 @@ impl SmolvmDb {
                 let tx = conn
                     .transaction_with_behavior(TransactionBehavior::Immediate)
                     .db_err("begin transaction")?;
+                if let Some(review) = review {
+                    review.validate_conn(self, &tx)?;
+                }
 
                 let data: Option<Vec<u8>> = tx
                     .query_row(
@@ -851,7 +870,7 @@ impl SmolvmDb {
                             params![name, new_data],
                         )
                         .db_err(format!("update vm '{}'", name))?;
-                        Some(record)
+                        launch_admission::review::read_record(&tx, &self.path.canonicalize()?, name)?
                     }
                     None => None,
                 };

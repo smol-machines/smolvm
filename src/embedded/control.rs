@@ -467,7 +467,7 @@ fn launch_from_record(record: &VmRecord, features: LaunchFeatures) -> Result<Sta
     let manager = if record.is_process_alive() {
         AgentManager::for_vm(&record.name)
     } else {
-        AgentManager::for_vm_with_sizes(&record.name, record.storage_gb, record.overlay_gb)
+        AgentManager::for_vm_record(record)
     }
     .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 

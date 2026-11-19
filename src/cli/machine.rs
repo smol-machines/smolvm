@@ -7787,8 +7787,7 @@ impl ImagesCmd {
         } else {
             eprintln!("Starting machine '{}' to query storage...", self.name);
             manager.detach();
-            manager =
-                AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+            manager = AgentManager::for_vm_record(&record)?;
             manager.start()?;
             true
         };
@@ -7907,8 +7906,7 @@ impl PruneCmd {
         } else {
             eprintln!("Starting machine...");
             manager.detach();
-            manager =
-                AgentManager::for_vm_with_sizes(&self.name, record.storage_gb, record.overlay_gb)?;
+            manager = AgentManager::for_vm_record(&record)?;
             manager.start()?;
             started_for_prune = true;
         }

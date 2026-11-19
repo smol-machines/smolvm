@@ -346,11 +346,7 @@ impl Supervisor {
         let entry_clone = entry.clone();
         let start_result = tokio::task::spawn_blocking(move || {
             let mut entry = entry_clone.lock();
-            entry.manager = crate::agent::AgentManager::for_vm_with_sizes(
-                &name_for_features,
-                record.storage_gb,
-                record.overlay_gb,
-            )?;
+            entry.manager = crate::agent::AgentManager::for_vm_record(&record)?;
             // Wire pre-extracted layers if this machine was created from a .smolmachine.
             let mut features = crate::api::state::build_launch_features(
                 Some(&name_for_features),

@@ -4087,7 +4087,7 @@ async fn start_machine_transaction(
     // Uses subprocess launch to avoid macOS fork-in-multithreaded-process issue.
     let name_clone = name.clone();
     let storage_gb = record.storage_gb;
-    let overlay_gb = record.overlay_gb;
+    let reviewed_record = record.clone();
     let source_smolmachine = record.packed_layer_source().map(str::to_owned);
     let image_on_storage = record.packed_image_on_storage;
     let launch_image = record.image.clone();
@@ -4176,7 +4176,7 @@ async fn start_machine_transaction(
                 tracing::warn!(machine = %name_clone, %error, "no image seed; pulling in the guest");
             }
         }
-        let manager = AgentManager::for_vm_with_sizes(&name_clone, storage_gb, overlay_gb)
+        let manager = AgentManager::for_vm_record(&reviewed_record)
             .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
         // Wire pre-extracted layers if this machine was created from a .smolmachine.
@@ -5280,9 +5280,8 @@ async fn boot_prepared_fork_inner(
         let ports = record.port_mappings();
         let resources = record.vm_resources();
 
-        let manager =
-            AgentManager::for_vm_with_sizes(&clone_b, record.storage_gb, record.overlay_gb)
-                .map_err(|e| format!("failed to create agent manager: {}", e))?;
+        let manager = AgentManager::for_vm_record(&record)
+            .map_err(|e| format!("failed to create agent manager: {}", e))?;
 
         let mut features = crate::api::state::build_launch_features(
             Some(&clone_b),

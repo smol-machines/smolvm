@@ -3691,7 +3691,7 @@ fn prepare_clone_from_snapshot(
         clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();
-        db.insert_vm(clone, &clone_rec)?;
+        clone_rec = db.insert_vm_for_launch(clone, &clone_rec)?;
 
         let t_disk = std::time::Instant::now();
         clone_fork_disks(golden_dir, snapshot_dir, &clone_dir)?;

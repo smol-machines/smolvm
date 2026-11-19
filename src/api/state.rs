@@ -1563,6 +1563,7 @@ pub(crate) struct QueuedBranch {
 /// workload launched.
 pub async fn ensure_machine_running(
     entry: &Arc<parking_lot::Mutex<MachineEntry>>,
+    record: crate::config::VmRecord,
 ) -> crate::Result<bool> {
     let entry_clone = entry.clone();
     tokio::task::spawn_blocking(move || {
@@ -1606,13 +1607,7 @@ pub async fn ensure_machine_running(
         // A server may have loaded this entry in observation mode while a
         // transfer owned it. Prepare disks only after admission and liveness
         // checks, when an explicit release allows a fresh start again.
-        if let Some(name) = entry.manager.name().map(str::to_owned) {
-            entry.manager = AgentManager::for_vm_with_sizes(
-                name,
-                entry.resources.storage_gb,
-                entry.resources.overlay_gb,
-            )?;
-        }
+        entry.manager = AgentManager::for_vm_record(&record)?;
         // Use subprocess launch to avoid macOS fork-in-multithreaded-process issue.
         let mut features = build_launch_features(
             entry.manager.name(),
@@ -1706,7 +1701,13 @@ async fn ensure_running_and_persist_owned(
     // launches with pre-update mounts/ports/resources. `update` refuses
     // running machines, so a running machine's entry can't be stale — and for
     // one, ensure_machine_running early-returns before the config matters.
-    let record = state.lookup_vm(name).await.ok().flatten();
+    let record = Some(
+        state
+            .lookup_vm(name)
+            .await
+            .map_err(|e| crate::Error::agent("read startup settings", e.to_string()))?
+            .ok_or_else(|| crate::Error::vm_not_found(name))?,
+    );
     if let Some(record) = &record {
         refuse_implicit_start_of_paused(record)?;
         let mut e = entry.lock();
@@ -1732,7 +1733,13 @@ async fn ensure_running_and_persist_owned(
     let restoring_checkpoint =
         crate::portable_checkpoint::pending_dir(&crate::agent::vm_data_dir(name)).is_some();
 
-    let freshly_booted = ensure_machine_running(entry).await?;
+    let freshly_booted = ensure_machine_running(
+        entry,
+        record
+            .clone()
+            .ok_or_else(|| crate::Error::vm_not_found(name))?,
+    )
+    .await?;
 
     if freshly_booted && restoring_checkpoint {
         if let Some(record) = record.clone() {

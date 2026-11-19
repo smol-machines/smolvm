@@ -1976,7 +1976,7 @@ fn start_vm_named_locked(
     }
 
     // Start agent VM
-    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
+    let manager = AgentManager::for_vm_record(&record)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
     let mount_info = if !mounts.is_empty() {

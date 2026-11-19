@@ -1677,6 +1677,8 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
 pub struct AgentManager {
     /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
+    /// Identity reviewed before preparing disks, retained across launch attempts.
+    launch_review: std::sync::Mutex<crate::db::launch_admission::LaunchReview>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
     /// A rootfs chosen at launch over `rootfs_path`: a branch boots its
@@ -1724,6 +1726,7 @@ fn reject_missing_external_interceptor(
 
 fn enforce_external_interceptor_requirement(
     db: &crate::db::SmolvmDb,
+    review: &crate::db::launch_admission::LaunchReview,
     name: &str,
     endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
 ) -> Result<()> {
@@ -1732,7 +1735,9 @@ fn enforce_external_interceptor_requirement(
         if endpoint.is_some() && !record.external_interceptor_required {
             // Persist before spawning the VMM. If the caller or boot fails,
             // every later start still requires interception.
-            db.update_vm(name, |record| record.external_interceptor_required = true)?;
+            db.update_reviewed_vm(review, name, |record| {
+                record.external_interceptor_required = true
+            })?;
         }
     }
     Ok(())
@@ -1789,7 +1794,7 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk)
+        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk, None)
     }
 
     /// Create a new agent manager for a named VM.
@@ -1806,6 +1811,7 @@ impl AgentManager {
             rootfs_path.into(),
             storage_disk,
             overlay_disk,
+            None,
         )
     }
 
@@ -1815,7 +1821,15 @@ impl AgentManager {
         rootfs_path: PathBuf,
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
+        review: Option<crate::db::launch_admission::LaunchReview>,
     ) -> Result<Self> {
+        let review = match review {
+            Some(review) => review,
+            None => crate::db::launch_admission::LaunchReview::capture(
+                &crate::db::SmolvmDb::open()?,
+                name.as_deref(),
+            )?,
+        };
         if let Some(ref vm_name) = name {
             validate_vm_name(vm_name, "machine name")
                 .map_err(|e| Error::config("validate machine name", e))?;
@@ -1857,6 +1871,7 @@ impl AgentManager {
 
         Ok(Self {
             name,
+            launch_review: std::sync::Mutex::new(review),
             rootfs_path,
             rootfs_override: std::sync::Mutex::new(None),
             storage_disk,
@@ -1924,6 +1939,23 @@ impl AgentManager {
         )
     }
 
+    /// Prepare the exact machine whose persisted settings the caller read.
+    /// Deserialized exports and new records are not startup authority: load the
+    /// published record from the database before using this entry point.
+    pub fn for_vm_record(record: &crate::config::VmRecord) -> Result<Self> {
+        Self::open_with_creation(
+            &record.name,
+            DiskAccess::Launch {
+                storage_gib: record.storage_gb,
+                overlay_gib: record.overlay_gb,
+            },
+            None,
+            Some(crate::db::launch_admission::LaunchReview::from_record(
+                record,
+            )?),
+        )
+    }
+
     /// Prepare a machine owned by an unpublished creation. The capability
     /// stays with its creator and workers until publication or failure cleanup.
     pub fn for_vm_creation(
@@ -1939,19 +1971,28 @@ impl AgentManager {
                 overlay_gib: overlay_gb,
             },
             Some(creation),
+            None,
         )
     }
 
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
-        Self::open_with_creation(name, access, None)
+        Self::open_with_creation(name, access, None, None)
     }
 
     fn open_with_creation(
         name: impl Into<String>,
         access: DiskAccess,
         creation: Option<&crate::db::VmCreationLease>,
+        review: Option<crate::db::launch_admission::LaunchReview>,
     ) -> Result<Self> {
         let name = name.into();
+        let db = crate::db::SmolvmDb::open()?;
+        let review = match review {
+            Some(review) => review,
+            None => crate::db::launch_admission::LaunchReview::capture(&db, Some(&name))?,
+        };
+        review.check_name(Some(&name))?;
+        review.validate(&db)?;
         // Launch access may create or grow disks before start_via_subprocess.
         // Observation remains available while a transfer owns the machine.
         let _admission = match access {
@@ -1977,7 +2018,8 @@ impl AgentManager {
             .transpose()?;
         let _preparation = match access {
             DiskAccess::Launch { .. } if creation.is_none() => {
-                Some(crate::db::SmolvmDb::open()?.reserve_vm_preparation(
+                Some(db.reserve_reviewed_vm_preparation(
+                    &review,
                     Some(&name),
                     &storage_path,
                     &[overlay_path.clone(), storage_dir.join("agent.sock")],
@@ -2004,7 +2046,13 @@ impl AgentManager {
         let storage_disk = open_storage_disk_for_manager(&storage_path, storage_format, access)?;
         let overlay_disk = open_overlay_disk_for_manager(&overlay_path, overlay_format, access)?;
 
-        Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
+        Self::new_internal(
+            Some(name),
+            rootfs_path,
+            storage_disk,
+            overlay_disk,
+            Some(review),
+        )
     }
 
     /// Open a named VM to observe or reconnect to it: status, list, stop,
@@ -3248,6 +3296,12 @@ impl AgentManager {
                 .map(|mount| mount.source.clone())
                 .collect::<Vec<_>>(),
         )?;
+        let review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        review.validate(&crate::db::SmolvmDb::open()?)?;
         let t_launch = Instant::now();
 
         // A machine created from a checkpoint carries a private,
@@ -3329,7 +3383,7 @@ impl AgentManager {
                 if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str())
                     || record.agent_rootfs_path.as_deref() != Some(rootfs_path.as_path())
                 {
-                    db.update_vm(name, |r| {
+                    db.update_reviewed_vm(&review, name, |r| {
                         r.agent_rootfs_digest = Some(rootfs_digest.clone());
                         r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
@@ -3346,7 +3400,7 @@ impl AgentManager {
                     ));
                 }
                 if features.mediated_egress && !record.mediated_egress_required {
-                    db.update_vm(name, |record| {
+                    db.update_reviewed_vm(&review, name, |record| {
                         record.mediated_egress_required = true;
                         record.external_interceptor_required = true;
                     })?;
@@ -3369,6 +3423,7 @@ impl AgentManager {
             }
             enforce_external_interceptor_requirement(
                 &db,
+                &review,
                 name,
                 features.external_interceptor.as_ref(),
             )?;
@@ -3383,9 +3438,6 @@ impl AgentManager {
                 "egress rules",
                 "redirect rules require a mediated egress interceptor on every start",
             ));
-        }
-        if let Some(snapshot) = features.snapshot_dir.as_deref() {
-            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
         }
 
         // A privileged node drops each VMM to a distinct uid. Start the shared
@@ -3506,7 +3558,8 @@ impl AgentManager {
             record.ephemeral = true;
             record
         });
-        let launch = crate::db::SmolvmDb::open()?.reserve_vm_launch(
+        let launch = crate::db::SmolvmDb::open()?.reserve_reviewed_vm_launch(
+            &review,
             provisional,
             self.storage_disk.path(),
             &mounts
@@ -3515,6 +3568,10 @@ impl AgentManager {
                 .collect::<Vec<_>>(),
             &exclusive_paths,
         )?;
+        *self.launch_review.lock().unwrap_or_else(|e| e.into_inner()) = launch.review()?;
+        if let Some(snapshot) = features.snapshot_dir.as_deref() {
+            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
+        }
         // Formatting runs outside the database transaction. Independent VMs
         // can prepare concurrently while the durable reservation fences aliases.
         self.prepare_for_launch(&mounts, &ports, resources)?;
@@ -5335,12 +5392,24 @@ mod tests {
         db.insert_vm("worker", &record).unwrap();
 
         // Existing records and ordinary machines remain bootable.
-        enforce_external_interceptor_requirement(&db, "worker", None).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            None,
+        )
+        .unwrap();
         let endpoint = smolvm_protocol::InterceptEndpoint {
             addr: "127.0.0.1:43123".parse().unwrap(),
             token: [7; smolvm_protocol::intercept::TOKEN_LEN],
         };
-        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            Some(&endpoint),
+        )
+        .unwrap();
         assert!(
             db.get_vm("worker")
                 .unwrap()
@@ -5348,11 +5417,23 @@ mod tests {
                 .external_interceptor_required
         );
 
-        let error = enforce_external_interceptor_requirement(&db, "worker", None).unwrap_err();
+        let error = enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            None,
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("requires an external interceptor"));
-        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            Some(&endpoint),
+        )
+        .unwrap();
     }
 
     /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
