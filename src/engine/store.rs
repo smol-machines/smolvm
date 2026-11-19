@@ -87,6 +87,52 @@ impl Store {
         Ok(records)
     }
 
+    /// Transfer preflight must see every possible volume user. Ordinary listing
+    /// tolerates damaged records; a transfer must refuse to proceed if one could
+    /// conceal a writer or a machine-sharing dependency.
+    pub(crate) fn transfer_containers(&self) -> crate::Result<Vec<ContainerRecord>> {
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(self.root.join("containers"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                return Err(crate::Error::config(
+                    "plan transfer",
+                    "invalid container record directory",
+                ));
+            }
+            let path = entry.path().join("config.json");
+            let record: ContainerRecord = required_record(&path)?;
+            if !valid_id(&record.id) || entry.file_name() != record.id.as_str() {
+                return Err(crate::Error::config(
+                    "plan transfer",
+                    "container record identity does not match its directory",
+                ));
+            }
+            records.push(record);
+        }
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(records)
+    }
+
+    /// Strict flat-object reader, returning the on-disk key for identity checks.
+    pub(crate) fn transfer_objects<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+    ) -> crate::Result<Vec<(String, T)>> {
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(self.root.join(kind))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+                    crate::Error::config("plan transfer", "invalid object record name")
+                })?;
+                records.push((key.to_owned(), required_record(&path)?));
+            }
+        }
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(records)
+    }
+
     /// `<root>/<kind>/<name>.json` for the flat object kinds.
     pub(crate) fn object_path(&self, kind: &str, name: &str) -> PathBuf {
         self.root.join(kind).join(format!("{name}.json"))
@@ -132,6 +178,33 @@ impl Store {
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
+}
+
+pub(super) fn valid_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn required_record<T: DeserializeOwned>(path: &Path) -> crate::Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(crate::Error::config(
+            "plan transfer",
+            "object record is not a regular file",
+        ));
+    }
+    serde_json::from_reader(file).map_err(|error| {
+        crate::Error::config(
+            "plan transfer",
+            format!("unreadable record {}: {error}", path.display()),
+        )
+    })
 }
 
 pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {

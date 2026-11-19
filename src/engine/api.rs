@@ -27,6 +27,7 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .route("/info", get(info))
         .route("/events", get(events))
         .route("/system/df", get(system_df))
+        .route("/smol/transfers/plan", post(super::transfer::plan))
         .route("/auth", post(auth))
         .route("/containers/create", post(container_create))
         .route("/containers/json", get(container_list))

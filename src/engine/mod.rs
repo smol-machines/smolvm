@@ -48,6 +48,7 @@ mod stats_clock;
 mod store;
 mod stream;
 mod supervisor;
+mod transfer;
 mod util;
 mod volumes;
 mod warm;
