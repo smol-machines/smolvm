@@ -222,6 +222,9 @@ pub struct RegistryClient {
     /// own auth service after a `WWW-Authenticate: Bearer ...` challenge.
     /// Used for Docker Hub, GHCR, ECR, GCR, and any standard OCI registry.
     basic_credentials: Option<(String, String)>,
+    /// Whether this registry's answer that a repository holds a blob may stand
+    /// in for downloading it (see [`Self::vouching_for_blobs`]).
+    vouches_for_blobs: bool,
     token_cache: Mutex<HashMap<TokenCacheKey, CachedToken>>,
     /// The most recent Bearer challenge received from this registry.
     ///
@@ -242,6 +245,7 @@ impl RegistryClient {
             auth_token: None,
             identity_token: None,
             basic_credentials: None,
+            vouches_for_blobs: false,
             token_cache: Mutex::new(HashMap::new()),
             last_challenge: Mutex::new(None),
         }
@@ -271,6 +275,42 @@ impl RegistryClient {
     pub fn with_identity_token(mut self, token: String) -> Self {
         self.identity_token = Some(token);
         self
+    }
+
+    /// Trust this registry's answer that a repository holds a blob, so a copy
+    /// already on this host or a peer can serve the pull. Only for a registry
+    /// the operator configured: any other registry could claim a blob it has
+    /// never seen (another tenant's, by digest) and be handed the cached copy.
+    pub fn vouching_for_blobs(mut self) -> Self {
+        self.vouches_for_blobs = true;
+        self
+    }
+
+    /// Whether [`Self::vouching_for_blobs`] was set.
+    pub fn vouches_for_blobs(&self) -> bool {
+        self.vouches_for_blobs
+    }
+
+    /// A fingerprint of the credential this client pulls with, so an
+    /// authorization one caller earned is never reused for another.
+    pub fn credential_fingerprint(&self) -> String {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        for part in [
+            self.auth_token.as_deref(),
+            self.identity_token.as_deref(),
+            self.basic_credentials
+                .as_ref()
+                .map(|(user, _)| user.as_str()),
+            self.basic_credentials
+                .as_ref()
+                .map(|(_, password)| password.as_str()),
+        ] {
+            hash.update([u8::from(part.is_some())]);
+            hash.update(part.unwrap_or_default().as_bytes());
+            hash.update([0]);
+        }
+        format!("{:x}", hash.finalize())
     }
 
     /// Set Basic credentials for standard Docker/OCI registry Bearer challenge auth.
