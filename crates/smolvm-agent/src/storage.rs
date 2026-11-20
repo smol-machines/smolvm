@@ -9024,6 +9024,7 @@ mod tests {
             upper_path: root.join("upper"),
             work_path: root.join("work"),
             merged_path: merged.clone(),
+            keep_tmp: false,
         };
         setup().execute_or_remount(lowerdirs.clone()).unwrap();
 
