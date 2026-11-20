@@ -5,7 +5,7 @@
 //! implementations used by those commands.
 
 use crate::cli::format_pid_suffix;
-use smolvm::agent::{vm_data_dir, AgentManager};
+use smolvm::agent::{vm_data_dir, AgentManager, ExecEvent};
 use smolvm::config::{RecordState, SmolvmConfig, VmRecord};
 use smolvm::data::network::PortMapping;
 use smolvm::data::resources::{default_microvm_memory_mib, DEFAULT_MICROVM_CPU_COUNT};
@@ -365,17 +365,49 @@ fn run_init_commands_with_output(
                 context.record_mounts,
                 context.overlay_id,
             );
-            // Interactive run streams the command's output live so the user sees
-            // progress (a slow compile, apt-get, etc.). The output isn't buffered
-            // here, so on a non-zero exit we report just the code — the detail was
-            // already printed above. Not checking the exit code would silently
-            // ignore a failed init command (e.g. a broken `apt install`).
+            // Init streams progress but must never read the host keyboard or
+            // configure its console; without streaming, its output is kept for
+            // the error report.
             let (exit_code, stdout, stderr) = if stream_output {
-                (
-                    client.run_interactive(config.with_tty(true))?,
-                    Vec::new(),
-                    Vec::new(),
-                )
+                let cancel = client.clone_stream()?;
+                let mut exit_code = 0;
+                let mut stream_error = None;
+                // Output goes straight to the terminal, with no accumulated buffer.
+                client.set_streaming_output_cap(None);
+                client.run_streaming_with(config, |event| {
+                    if stream_error.is_some() {
+                        return;
+                    }
+                    let written = match event {
+                        ExecEvent::Stdout(data) => {
+                            let mut out = std::io::stdout();
+                            out.write_all(&data).and_then(|()| out.flush())
+                        }
+                        ExecEvent::Stderr(data) => {
+                            let mut err = std::io::stderr();
+                            err.write_all(&data).and_then(|()| err.flush())
+                        }
+                        ExecEvent::Exit(code) => {
+                            exit_code = code;
+                            Ok(())
+                        }
+                        ExecEvent::Error(message) => {
+                            stream_error = Some(smolvm::Error::agent("init", message));
+                            Ok(())
+                        }
+                    };
+                    if let Err(error) = written {
+                        stream_error = Some(error.into());
+                        // Stop collecting output and let the caller clean up the
+                        // VM, as with any other init failure (no process::exit).
+                        let _ = cancel.shutdown(std::net::Shutdown::Both);
+                    }
+                })?;
+                if let Some(error) = stream_error {
+                    return Err(error);
+                }
+                // The command's diagnostics have already been printed live.
+                (exit_code, Vec::new(), Vec::new())
             } else {
                 client.run_non_interactive(config)?
             };
@@ -2066,17 +2098,6 @@ fn start_vm_named_locked(
         if let Some(dir) = record.local_image_layers_dir() {
             features.packed_layers_dir = Some(dir);
         }
-    }
-
-    // First boot pulls the base image in-guest, subject to the egress filter —
-    // fold the image's registry into the enforced policy so a hostname scope
-    // doesn't block its own pull. Subsequent starts skip the pull, so they keep
-    // the user's scope unwidened.
-    if !record.init_completed {
-        features.allow_image_pull_egress(
-            record.image.as_deref(),
-            features.packed_layers_dir.is_some() || record.packed_image_on_storage,
-        );
     }
 
     if restoring_checkpoint {
@@ -4350,6 +4371,126 @@ pub fn cleanup_orphaned_ephemeral_vms_bounded(limit: usize) {
 #[cfg(test)]
 mod init_runner_tests {
     use super::*;
+
+    /// An init step must close its input before the agent can finish a command
+    /// such as `cat`. No host keyboard or terminal is involved in this exchange.
+    fn image_init_with_responses(
+        terminal_responses: Vec<smolvm_protocol::AgentResponse>,
+    ) -> smolvm::Result<()> {
+        use smolvm::platform::uds::UdsStream;
+        use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+        use std::io::Read;
+        use std::time::Duration;
+
+        let (client_stream, mut server_stream) = UdsStream::pair().unwrap();
+        server_stream
+            .set_read_timeout(Some(Duration::from_secs(3)))
+            .unwrap();
+        let server = std::thread::spawn(move || {
+            let read_request = |stream: &mut UdsStream| {
+                let mut header = [0; 4];
+                stream.read_exact(&mut header).unwrap();
+                let mut payload = vec![0; u32::from_be_bytes(header) as usize];
+                stream.read_exact(&mut payload).unwrap();
+                serde_json::from_slice::<Envelope<AgentRequest>>(&payload)
+                    .unwrap()
+                    .body
+            };
+            for terminal in terminal_responses {
+                assert!(matches!(
+                    read_request(&mut server_stream),
+                    AgentRequest::Run {
+                        command,
+                        user: Some(user),
+                        interactive: true,
+                        tty: false,
+                        persistent_overlay_id: Some(overlay),
+                        ..
+                    } if command == ["sh", "-c", "cat"] && user == "0" && overlay == "init-vm"
+                ));
+                assert!(
+                    matches!(
+                        read_request(&mut server_stream),
+                        AgentRequest::Stdin { data } if data.is_empty()
+                    ),
+                    "init must send EOF without reading the host's stdin"
+                );
+                for response in [
+                    AgentResponse::Started,
+                    AgentResponse::Stdout {
+                        data: b"init progress\n".to_vec(),
+                    },
+                    AgentResponse::Stderr {
+                        data: b"init diagnostic\n".to_vec(),
+                    },
+                    terminal,
+                ] {
+                    server_stream
+                        .write_all(&encode_message(&response).unwrap())
+                        .unwrap();
+                }
+            }
+        });
+
+        let mut client = smolvm::agent::AgentClient::from_stream(client_stream);
+        // Init prints output immediately, so a verbose package install must
+        // not inherit the limit intended for buffered API responses.
+        client.set_streaming_output_cap(Some(1));
+        let result = run_init_commands(
+            &mut client,
+            &["cat".into(), "cat".into()],
+            InitRunContext {
+                image: Some("alpine"),
+                image_info: None,
+                env: &[],
+                workdir: None,
+                record_mounts: &[],
+                overlay_id: "init-vm",
+            },
+        );
+        server.join().unwrap();
+        result
+    }
+
+    #[test]
+    fn image_init_finishes_multiple_steps_without_keyboard_input() {
+        use smolvm_protocol::AgentResponse;
+        image_init_with_responses(vec![
+            AgentResponse::Exited {
+                exit_code: 0,
+                oom: false,
+            },
+            AgentResponse::Exited {
+                exit_code: 0,
+                oom: false,
+            },
+        ])
+        .unwrap();
+    }
+
+    #[test]
+    fn image_init_stops_after_a_failed_step_or_stream_error() {
+        use smolvm_protocol::AgentResponse;
+        for (response, expected_error) in [
+            (
+                AgentResponse::Exited {
+                    exit_code: 7,
+                    oom: false,
+                },
+                "init[0] failed (exit 7)",
+            ),
+            (
+                AgentResponse::Error {
+                    message: "init disconnected".into(),
+                    code: None,
+                },
+                "init disconnected",
+            ),
+        ] {
+            let error = image_init_with_responses(vec![response]).unwrap_err();
+            assert!(error.to_string().contains(expected_error), "{error}");
+        }
+    }
 
     #[test]
     fn bounded_clone_jobs_run_every_successful_job() {

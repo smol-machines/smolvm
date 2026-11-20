@@ -28,6 +28,11 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .route("/events", get(events))
         .route("/system/df", get(system_df))
         .route("/smol/transfers/plan", post(super::transfer::plan))
+        .route("/smol/transfers/prepare", post(super::transfer::prepare))
+        .route(
+            "/smol/transfers/{operation}",
+            get(super::transfer::status).delete(super::transfer::cancel),
+        )
         .route("/auth", post(auth))
         .route("/containers/create", post(container_create))
         .route("/containers/json", get(container_list))

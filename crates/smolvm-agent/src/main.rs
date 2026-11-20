@@ -5312,7 +5312,9 @@ fn write_exec_process_file(
     spec: &oci::OciProcess,
 ) -> Result<std::path::PathBuf, String> {
     static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let dir = std::env::temp_dir().join("smolvm-exec-process");
+    // A caller can bind a read-only directory at /tmp. Keep crun's private
+    // launch files with its runtime state, outside workload mount targets.
+    let dir = std::path::Path::new(paths::CONTAINERS_RUN_DIR).join("exec-process");
     std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
     if let Ok(entries) = std::fs::read_dir(&dir) {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
@@ -5330,7 +5332,15 @@ fn write_exec_process_file(
     let n = SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     let path = dir.join(format!("{container_id}-{}-{n}.json", std::process::id()));
     let json = serde_json::to_vec(spec).map_err(|e| format!("encode exec process: {e}"))?;
-    std::fs::write(&path, json).map_err(|e| format!("write {}: {e}", path.display()))?;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .open(&path)
+        .map_err(|e| format!("create {}: {e}", path.display()))?;
+    file.write_all(&json)
+        .map_err(|e| format!("write {}: {e}", path.display()))?;
     Ok(path)
 }
 

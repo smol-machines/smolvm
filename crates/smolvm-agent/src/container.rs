@@ -104,7 +104,7 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
     }
     crate::ensure_storage_mounted();
     let source = layer_source(spec.image_source.as_ref())?;
-    let prepared = crate::storage::prepare_for_run_persistent_from(
+    let prepared = crate::storage::prepare_for_container_from(
         &spec.image,
         &spec.overlay_id,
         source.as_layer_source(),
@@ -206,6 +206,9 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
     };
     let mut oci = crate::build_oci_spec(rootfs, &launch, &volumes, spec.tty, false, false)?;
     oci.root.readonly = spec.read_only_rootfs;
+    // VM convenience mounts are not Docker defaults: /tmp and /run belong to
+    // the image's writable layer. Explicit caller mounts are applied below.
+    oci.use_container_filesystem();
     if let Some(hostname) = spec.hostname.as_deref().filter(|h| !h.is_empty()) {
         oci.hostname = Some(hostname.to_string());
     }
@@ -562,7 +565,7 @@ pub fn handle_container_archive(
         crate::ensure_storage_mounted();
         let result = layer_source(image_source)
             .and_then(|source| {
-                crate::storage::prepare_for_run_persistent_from(
+                crate::storage::prepare_for_container_from(
                     image,
                     overlay_id,
                     source.as_layer_source(),

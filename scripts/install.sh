@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # smolvm installer
 #
-# CANONICAL SOURCE: scripts/install.sh in the smolvm repo
-# The website copy at smolmachines/static/install.sh (served at
-# https://smolmachines.com/install.sh) must be kept in sync.
-# After editing this file, copy it verbatim to smolmachines/static/install.sh.
+# https://smolmachines.com/install.sh serves this file from smolvm's main branch,
+# cached for five minutes, and serves the last good copy when GitHub cannot
+# answer. A change here reaches curl users once it merges, before any release.
 #
 # Usage:
 #   curl -sSL https://smolmachines.com/install.sh | bash

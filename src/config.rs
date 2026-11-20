@@ -439,6 +439,10 @@ pub struct VmRecord {
     #[serde(skip)]
     pub(crate) database_identity: Option<crate::db::launch_admission::RecordIdentity>,
 
+    /// Host-only execution identity, retained after stop and replaced on a new boot.
+    #[serde(skip)]
+    pub(crate) execution_identity: Option<String>,
+
     /// VM name/ID.
     pub name: String,
 
@@ -1032,6 +1036,7 @@ impl VmRecord {
     ) -> Self {
         Self {
             database_identity: None,
+            execution_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1145,6 +1150,7 @@ impl VmRecord {
     ) -> Self {
         Self {
             database_identity: None,
+            execution_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1449,7 +1455,6 @@ impl VmRecord {
     /// cannot be checked against hostnames here, so both send the pull to the
     /// host rather than guess.
     fn guest_can_pull(&self, image: &str) -> bool {
-        use smolvm_protocol::host_pattern::matches;
         if !self.launch_network_plan().outbound {
             return false;
         }
@@ -1459,16 +1464,7 @@ impl VmRecord {
         {
             return true;
         }
-        let hosts = self.dns_filter_hosts.as_deref().unwrap_or(&[]);
-        crate::registry::registry_pull_hosts(image)
-            .iter()
-            .all(|apex| {
-                let apex = apex.split(':').next().unwrap_or(apex);
-                let sub_host = format!("pull.{apex}");
-                hosts
-                    .iter()
-                    .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
-            })
+        crate::registry::hosts_cover_pull(image, self.dns_filter_hosts.as_deref().unwrap_or(&[]))
     }
 
     /// Whether this machine's staged mounts synchronize back to their host

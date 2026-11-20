@@ -21,6 +21,16 @@ use super::util::{ApiError, ApiResult};
 use super::volumes::VolumeRecord;
 use super::Engine;
 
+mod preparation;
+pub(super) use preparation::{cancel, prepare, status};
+
+struct Review {
+    plan: Plan,
+    inventory: serde_json::Value,
+    claims: Vec<crate::db::transfer_admission::Member>,
+    roots: Vec<PathBuf>,
+}
+
 #[derive(Deserialize)]
 #[serde(deny_unknown_fields)]
 pub(super) struct PlanRequest {
@@ -166,8 +176,16 @@ fn build(engine: &Engine, requested: &[String]) -> ApiResult<Plan> {
 fn build_with_inventory(
     engine: &Engine,
     requested: &[String],
-    mut inventory: impl FnMut(&str, Instant) -> crate::Result<Vec<LiveShare>>,
+    inventory: impl FnMut(&str, Instant) -> crate::Result<Vec<LiveShare>>,
 ) -> ApiResult<Plan> {
+    review_with_inventory(engine, requested, inventory).map(|review| review.plan)
+}
+
+fn review_with_inventory(
+    engine: &Engine,
+    requested: &[String],
+    mut inventory: impl FnMut(&str, Instant) -> crate::Result<Vec<LiveShare>>,
+) -> ApiResult<Review> {
     let records: BTreeMap<_, _> = engine
         .store
         .transfer_containers()?
@@ -542,34 +560,57 @@ fn build_with_inventory(
         let metadata = std::fs::metadata(root).map_err(|e| ApiError::internal(e.to_string()))?;
         Ok(serde_json::json!({"name":name,"path":root,"device":metadata.dev(),"inode":metadata.ino()}))
     }).collect::<ApiResult<Vec<_>>>()?;
-    let data = serde_json::to_vec(&serde_json::json!({
+    let inventory = serde_json::json!({
         "version":3,"selected":selected,"containers":identities,"images":images.values().collect::<Vec<_>>(),
         "volumes":volume_names.iter().map(|name|&volumes[name]).collect::<Vec<_>>(),
         "networks":network_ids.iter().map(|id|&networks[id]).collect::<Vec<_>>(),
         "machines":machine_identities,"volumeIdentities":volume_identities,"liveShares":live_identities,"blockers":blockers,
-    }))
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    });
+    let data = serde_json::to_vec(&inventory).map_err(|e| ApiError::internal(e.to_string()))?;
     let fingerprint = format!("sha256:{:x}", Sha256::digest(data));
-    Ok(Plan {
-        phase: "preflight_only",
-        selected: selected.iter().cloned().collect(),
-        members: members
-            .iter()
-            .map(|id| Member {
-                id: id.clone(),
-                name: records[id].name.clone(),
-                machine: records[&owners[id]].machine.clone(),
-                selected: selected.contains(id),
-            })
-            .collect(),
-        additional_containers: members.difference(&selected).cloned().collect(),
-        machines: machines.into_iter().collect(),
-        images: images.into_keys().collect(),
-        volumes: volume_names.into_iter().collect(),
-        networks: network_ids.into_iter().collect(),
-        dependencies,
-        blockers,
-        fingerprint,
+    let claims = vms
+        .iter()
+        .filter(|(name, _)| machines.contains(name))
+        .map(|(name, vm)| crate::db::transfer_admission::Member {
+            name: name.clone(),
+            generation: Some(
+                vm.database_identity
+                    .as_ref()
+                    .expect("identity checked above")
+                    .generation()
+                    .to_owned(),
+            ),
+            created_at: vm.created_at,
+            pid: vm.pid,
+            pid_start_time: vm.pid_start_time,
+        })
+        .collect();
+    let roots = roots.into_iter().map(|(_, root)| root).collect();
+    Ok(Review {
+        inventory,
+        claims,
+        roots,
+        plan: Plan {
+            phase: "preflight_only",
+            selected: selected.iter().cloned().collect(),
+            members: members
+                .iter()
+                .map(|id| Member {
+                    id: id.clone(),
+                    name: records[id].name.clone(),
+                    machine: records[&owners[id]].machine.clone(),
+                    selected: selected.contains(id),
+                })
+                .collect(),
+            additional_containers: members.difference(&selected).cloned().collect(),
+            machines: machines.into_iter().collect(),
+            images: images.into_keys().collect(),
+            volumes: volume_names.into_iter().collect(),
+            networks: network_ids.into_iter().collect(),
+            dependencies,
+            blockers,
+            fingerprint,
+        },
     })
 }
 
@@ -582,7 +623,12 @@ mod tests {
     use super::super::containers::{MountRecord, StateRecord};
     use super::*;
 
-    fn record(engine: &Engine, byte: char, name: &str, volume: Option<&str>) -> ContainerRecord {
+    pub(super) fn record(
+        engine: &Engine,
+        byte: char,
+        name: &str,
+        volume: Option<&str>,
+    ) -> ContainerRecord {
         let image = image_record('e');
         if !engine.store.object_path("images", &"e".repeat(64)).exists() {
             engine

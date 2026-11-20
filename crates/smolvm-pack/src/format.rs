@@ -516,6 +516,10 @@ pub struct CheckpointNetwork {
     /// Restore must provide a new host mediator binding before execution.
     #[serde(default)]
     pub mediated_egress_required: bool,
+    /// The captured machine ran behind an external egress interceptor, so a
+    /// restore must be bound to one before it runs, as the source had to be.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external_interceptor_required: bool,
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,

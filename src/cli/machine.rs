@@ -1190,6 +1190,22 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Whether a run's registry image must be fetched on the host because the
+/// run's egress policy keeps the guest from pulling it, by the rule
+/// `machine start` applies: a hostname list must name every registry host
+/// the pull talks to, and a CIDR-only list cannot be checked against
+/// hostnames. Without any policy the guest pulls.
+fn run_needs_host_fetch(reference: &str, params: &vm_common::CreateVmParams) -> bool {
+    let has_policy = params.dns_filter_hosts.is_some()
+        || params.allowed_cidrs.is_some()
+        || !params.egress_rules.is_empty();
+    has_policy
+        && !smolvm::registry::hosts_cover_pull(
+            reference,
+            params.dns_filter_hosts.as_deref().unwrap_or(&[]),
+        )
+}
+
 /// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
 /// `--no-proxy` so the one-time init pull reaches the registry through the same
 /// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
@@ -1224,6 +1240,53 @@ fn bake_start_args<'a>(
 /// the Smolfile with the workload replaced by a `/bin/true` no-op so only `init`
 /// runs, snapshot it, and delete the temp machine. The real workload command is
 /// supplied at run time against the resulting artifact.
+/// The run's private-range floor and ordered rules as `machine create` flags,
+/// for the init bake: `--block-private` with its exceptions, `--deny-cidr`,
+/// and `--allow-udp`. Rules no flag can express come from the Smolfile, which
+/// the bake is given as well.
+fn bake_policy_args(params: &vm_common::CreateVmParams) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(exceptions) = &params.block_private {
+        args.push("--block-private".to_string());
+        for cidr in exceptions {
+            args.push("--allow-private".to_string());
+            args.push(cidr.clone());
+        }
+    }
+    for rule in &params.egress_rules {
+        if let Some((flag, value)) = rule_as_create_flag(rule) {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+    }
+    args
+}
+
+/// The `machine create` flag that adds `rule`, when one exists: a plain
+/// deny is `--deny-cidr`, a UDP allow is `--allow-udp`.
+fn rule_as_create_flag(rule: &smolvm_protocol::EgressRule) -> Option<(&'static str, String)> {
+    use smolvm_protocol::{FlowTransport, RuleAction};
+    let cidr = rule.cidr.as_deref()?;
+    match (rule.action, rule.transport, rule.ports) {
+        (RuleAction::Deny, None, None) => Some(("--deny-cidr", cidr.to_string())),
+        (RuleAction::Allow, Some(FlowTransport::Udp), ports) => {
+            let ports = ports.map(|range| match range.start == range.end {
+                true => range.start.to_string(),
+                false => format!("{}-{}", range.start, range.end),
+            });
+            Some((
+                "--allow-udp",
+                match (ports, cidr.contains(':')) {
+                    (None, _) => cidr.to_string(),
+                    (Some(ports), true) => format!("[{cidr}]:{ports}"),
+                    (Some(ports), false) => format!("{cidr}:{ports}"),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn ensure_init_layer(
     params: &vm_common::CreateVmParams,
     smolfile: Option<&Path>,
@@ -1364,6 +1427,9 @@ fn ensure_init_layer(
                 create.push(h.clone());
             }
         }
+        // Init runs the image's own code as root, so it gets the run's
+        // restrictions too, not only its allow lists.
+        create.extend(bake_policy_args(params));
         create.push("--".into());
         create.push("/bin/true".into());
         let create: Vec<&str> = create.iter().map(String::as_str).collect();
@@ -2078,10 +2144,37 @@ impl RunCmd {
         // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
         let raw_image = self.image.clone().or(params.image.clone());
         let mut packed_layers_dir = None;
+        let mut host_fetched = None;
         let image = match raw_image.as_deref() {
             Some(img) => {
                 use smolvm::data::image_source::{classify, resolve, ResolvedImage};
                 match resolve(classify(img))? {
+                    // The guest pulls under the run's own egress policy. When
+                    // that policy does not let it reach the registry, fetch
+                    // the image on the host, as `machine start` does, instead
+                    // of opening the registry's domain to the workload.
+                    ResolvedImage::Registry(reference)
+                        if run_needs_host_fetch(&reference, &params) =>
+                    {
+                        let platform = smolvm::vm::rosetta::image_platform(
+                            params.oci_platform.as_deref(),
+                            params.rosetta,
+                        );
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| Error::agent("fetch image", e.to_string()))?;
+                        let fetched =
+                            rt.block_on(smolvm::image_store::fetch_image_archive_for_platform(
+                                &reference,
+                                &smolvm::registry::PullAuth::FromConfig,
+                                platform,
+                            ))?;
+                        packed_layers_dir =
+                            smolvm::data::image_source::packed_layers_dir_for_ref(&fetched.local);
+                        host_fetched = Some((reference, fetched.digest));
+                        Some(fetched.local)
+                    }
                     ResolvedImage::Registry(reference) => Some(reference),
                     ResolvedImage::Local {
                         reference,
@@ -2161,7 +2254,7 @@ impl RunCmd {
 
         let uses_packed_layers = packed_layers_dir.is_some();
 
-        let mut features = smolvm::agent::LaunchFeatures {
+        let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
@@ -2212,11 +2305,6 @@ impl RunCmd {
                 .collect(),
             ..Default::default()
         };
-
-        // This launch pulls a registry image in-guest, subject to the egress
-        // filter — fold its registry into the enforced policy so a hostname
-        // scope doesn't block its own pull.
-        features.allow_image_pull_egress(image.as_deref(), uses_packed_layers);
 
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
@@ -2455,6 +2543,12 @@ impl RunCmd {
                                 r.workdir = defaults.workdir.clone();
                                 r.user = defaults.user.clone();
                                 r.image = Some(img.clone());
+                                // A host-fetched image keeps the reference the
+                                // user named, pinned to the digest fetched.
+                                if let Some((origin, digest)) = &host_fetched {
+                                    r.image = Some(origin.clone());
+                                    r.pin_host_fetched_image(img.clone(), digest.clone());
+                                }
                                 r.entrypoint = Vec::new();
                                 r.cmd = command.clone();
                                 r.ssh_agent |= self.ssh_agent;
@@ -2727,6 +2821,41 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_udp_allow_and_plain_deny_round_trips_through_its_create_flag() {
+        for spec in [
+            "10.0.0.0/8",
+            "1.1.1.1/32:123",
+            "192.0.2.0/24:3478-3480",
+            "2001:db8::1/128:443",
+        ] {
+            let spec = if spec.contains("::") && spec.matches(':').count() > 2 {
+                let (cidr, port) = spec.rsplit_once(':').unwrap();
+                format!("[{cidr}]:{port}")
+            } else {
+                spec.to_string()
+            };
+            let rule = smolvm::smolfile::parse_allow_udp(&spec).unwrap();
+            let (flag, value) = super::rule_as_create_flag(&rule).unwrap();
+            assert_eq!(flag, "--allow-udp");
+            assert_eq!(
+                smolvm::smolfile::parse_allow_udp(&value).unwrap(),
+                rule,
+                "{spec}"
+            );
+        }
+        let deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("192.168.0.0/16".into()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        assert_eq!(
+            super::rule_as_create_flag(&deny),
+            Some(("--deny-cidr", "192.168.0.0/16".to_string()))
+        );
+    }
+
     /// Serialize tests whose asserts depend on SMOLVM_MACHINE_NAME, and shield
     /// them from an ambient value: clap reads real process env at parse time,
     /// so a value set by a concurrently running test (or exported in the

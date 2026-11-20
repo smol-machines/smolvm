@@ -922,6 +922,16 @@ pub fn generations_from_history(
         .collect()
 }
 
+/// An export forwards objects unopened and the packer follows links, so a
+/// store entry that is not a regular file is refused here the way
+/// [`decode_object`] refuses it on read.
+fn require_object_file(path: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid("checkpoint object is not a regular file"));
+    }
+    Ok(())
+}
+
 /// Export `directory` as ONE file that carries its history: the checkpoint's
 /// index, the indexes of up to `limit` retained generations, and every object
 /// any of them references, packed as a `Chunked` checkpoint. Restoring such a
@@ -976,6 +986,7 @@ pub fn export_with_history(
     let objects = directory.join("objects");
     for hash in &hashes {
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -2252,6 +2263,14 @@ fn materialize_generation(
             fs::remove_file(&destination)?;
             cloned = false;
         }
+        // macOS clonefile preserves read-only modes from the pristine base.
+        // Only our private clone needs write access while applying the diff;
+        // restore the recorded mode below once its contents are complete.
+        #[cfg(unix)]
+        if cloned {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+        }
         let file = File::options()
             .read(true)
             .write(true)
@@ -2915,6 +2934,7 @@ pub fn export_chunked(
             continue;
         }
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -4488,6 +4508,40 @@ mod tests {
         retained
     }
 
+    /// The history export moves objects into its staging tree by name and
+    /// the packer dereferences links, so an object that is a symlink would put
+    /// the target's bytes into the file: it is refused like any other object
+    /// that is not a regular file.
+    #[test]
+    #[cfg(unix)]
+    fn a_history_export_refuses_an_object_that_is_not_a_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        capture_generation(&cache, &first, &[1u8; 64], G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &[2u8; 64],
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"host secret").unwrap();
+        let hash = read_index(&second).unwrap().files[0].chunks[0]
+            .clone()
+            .unwrap();
+        let object = second.join("objects").join(&hash);
+        fs::remove_file(&object).unwrap();
+        std::os::unix::fs::symlink(&outside, &object).unwrap();
+        let file = root.path().join("history.checkpoint");
+        let error = export_with_history(&second, 32, &file, |_| {}).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(!file.exists());
+    }
+
     const G1: &str = "11111111111111111111111111111111";
     const G2: &str = "22222222222222222222222222222222";
     const G3: &str = "33333333333333333333333333333333";
@@ -4863,6 +4917,66 @@ mod tests {
         let out_a3 = root.path().join("out-a3");
         materialize_with_base(&saved_a, &out_a3, Some(&root.path().join("nope"))).unwrap();
         assert_eq!(fs::read(out_a3.join("checkpoint/memory.bin")).unwrap(), a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_base_restores_preserve_permissions_and_cached_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let base = root.path().join("base");
+        let original = vec![0xAB; 3 * CHUNK_SIZE];
+        let mut changed = original.clone();
+        changed[..CHUNK_SIZE].fill(0xCD);
+        changed[CHUNK_SIZE..2 * CHUNK_SIZE].fill(0);
+        let store = |name: &str, bytes: &[u8]| {
+            let saved = root.path().join(name);
+            capture(&objects, &saved, bytes);
+            let mut index = read_index(&saved).unwrap();
+            for entry in &mut index.files {
+                entry.mode = 0o444;
+            }
+            fs::write(saved.join(INDEX), serde_json::to_vec(&index).unwrap()).unwrap();
+            saved
+        };
+        let saved = store("saved", &original);
+        let updated = store("updated", &changed);
+        let first = root.path().join("first");
+        materialize(&saved, &first).unwrap();
+        if !promote_base(&saved, &first, &base).unwrap() {
+            assert!(std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_none());
+            return;
+        }
+        let asset = "checkpoint/memory.bin";
+        let cached_identity = file_identity(&base.join(asset));
+        for (i, (checkpoint, expected)) in [
+            (&saved, &original),
+            (&updated, &changed),
+            (&saved, &original),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = root.path().join(format!("restored-{i}"));
+            materialize_with_base(checkpoint, &output, Some(&base)).unwrap();
+            assert_eq!(fs::read(output.join(asset)).unwrap(), *expected);
+            assert_eq!(
+                fs::metadata(output.join(asset))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+            assert_eq!(fs::read(base.join(asset)).unwrap(), original);
+            assert_eq!(file_identity(&base.join(asset)), cached_identity);
+            assert_eq!(
+                fs::metadata(base.join(asset)).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
     }
 
     /// A base file whose size disagrees with the base index is not trusted:

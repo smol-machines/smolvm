@@ -132,9 +132,70 @@ fn native_roots() -> &'static [reqwest::Certificate] {
     })
 }
 
+/// Whether `url` names this host or a private network: `localhost`, or a
+/// loopback, link-local, private, unique-local, shared (CGNAT) or unspecified
+/// address, IPv4-mapped forms included.
+fn is_internal_url(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        Ok(ip) => ip,
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            return name == "localhost" || name.ends_with(".localhost");
+        }
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_private()
+                || v4.is_unspecified()
+                || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Follow at most ten redirects, never from a public host onto this host or a
+/// private network, and never from HTTPS down to plain HTTP: a registry on a
+/// public address must not turn a pull into a request to the node's own
+/// services.
+fn registry_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(first) = attempt.previous().first().cloned() else {
+            return attempt.follow();
+        };
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let next = attempt.url();
+        if first.scheme() == "https" && next.scheme() != "https" {
+            return attempt.error("refusing a redirect from https to a plain-http address");
+        }
+        if !is_internal_url(&first) && is_internal_url(next) {
+            return attempt.error("refusing a redirect to a local or private address");
+        }
+        attempt.follow()
+    })
+}
+
 /// The shared HTTP client for every registry request, with the deadlines above.
 fn http_client() -> reqwest::Client {
     registry_tls(reqwest::Client::builder())
+        .redirect(registry_redirects())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
@@ -154,6 +215,7 @@ fn http_client() -> reqwest::Client {
 /// stalled transfer without capping a slow-but-progressing one.
 fn upload_http_client() -> reqwest::Client {
     registry_tls(reqwest::Client::builder())
+        .redirect(registry_redirects())
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -222,6 +284,9 @@ pub struct RegistryClient {
     /// own auth service after a `WWW-Authenticate: Bearer ...` challenge.
     /// Used for Docker Hub, GHCR, ECR, GCR, and any standard OCI registry.
     basic_credentials: Option<(String, String)>,
+    /// Whether this registry's answer that a repository holds a blob may stand
+    /// in for downloading it (see [`Self::vouching_for_blobs`]).
+    vouches_for_blobs: bool,
     token_cache: Mutex<HashMap<TokenCacheKey, CachedToken>>,
     /// The most recent Bearer challenge received from this registry.
     ///
@@ -242,6 +307,7 @@ impl RegistryClient {
             auth_token: None,
             identity_token: None,
             basic_credentials: None,
+            vouches_for_blobs: false,
             token_cache: Mutex::new(HashMap::new()),
             last_challenge: Mutex::new(None),
         }
@@ -271,6 +337,42 @@ impl RegistryClient {
     pub fn with_identity_token(mut self, token: String) -> Self {
         self.identity_token = Some(token);
         self
+    }
+
+    /// Trust this registry's answer that a repository holds a blob, so a copy
+    /// already on this host or a peer can serve the pull. Only for a registry
+    /// the operator configured: any other registry could claim a blob it has
+    /// never seen (another tenant's, by digest) and be handed the cached copy.
+    pub fn vouching_for_blobs(mut self) -> Self {
+        self.vouches_for_blobs = true;
+        self
+    }
+
+    /// Whether [`Self::vouching_for_blobs`] was set.
+    pub fn vouches_for_blobs(&self) -> bool {
+        self.vouches_for_blobs
+    }
+
+    /// A fingerprint of the credential this client pulls with, so an
+    /// authorization one caller earned is never reused for another.
+    pub fn credential_fingerprint(&self) -> String {
+        use sha2::Digest;
+        let mut hash = sha2::Sha256::new();
+        for part in [
+            self.auth_token.as_deref(),
+            self.identity_token.as_deref(),
+            self.basic_credentials
+                .as_ref()
+                .map(|(user, _)| user.as_str()),
+            self.basic_credentials
+                .as_ref()
+                .map(|(_, password)| password.as_str()),
+        ] {
+            hash.update([u8::from(part.is_some())]);
+            hash.update(part.unwrap_or_default().as_bytes());
+            hash.update([0]);
+        }
+        format!("{:x}", hash.finalize())
     }
 
     /// Set Basic credentials for standard Docker/OCI registry Bearer challenge auth.
@@ -1420,6 +1522,28 @@ impl RegistryClient {
     /// If `force_refresh` is true the cache entry for this challenge is evicted
     /// first, guaranteeing a fresh token from the token service. This is used
     /// on the second 401 retry, when a cached token has just proven invalid.
+    /// Refuse a token realm a registry could use to reach what it may not: a
+    /// plain-http realm for an https registry, or a local or private address
+    /// for a registry that is not itself on one. Every credential branch, and
+    /// the anonymous one, sends its request to the realm.
+    fn validate_realm_destination(&self, realm: &reqwest::Url) -> Result<()> {
+        let base = reqwest::Url::parse(&self.base_url).ok();
+        if base.as_ref().is_some_and(|base| base.scheme() == "https") && realm.scheme() != "https" {
+            return Err(RegistryError::Authentication {
+                message: format!("refusing a non-HTTPS token realm: {}", realm.as_str()),
+            });
+        }
+        if is_internal_url(realm) && !base.as_ref().is_some_and(is_internal_url) {
+            return Err(RegistryError::Authentication {
+                message: format!(
+                    "refusing a token realm on a local or private address: {}",
+                    realm.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     async fn get_token(&self, challenge: &BearerChallenge, force_refresh: bool) -> Result<String> {
         let key = TokenCacheKey {
             realm: challenge.realm.clone(),
@@ -1458,6 +1582,7 @@ impl RegistryClient {
             }
         }
 
+        self.validate_realm_destination(&url)?;
         let req = self.http.get(url.clone());
         let resp = if let Some(identity_token) = &self.identity_token {
             // smolmachines path: upstream JWT exchanged with the token service.
@@ -2069,6 +2194,33 @@ mod tests {
 
     fn url(s: &str) -> reqwest::Url {
         reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_public_registry_cannot_point_its_realm_inside_the_host() {
+        let public = RegistryClient::new("https://registry.example.com".into());
+        for realm in [
+            "http://127.0.0.1:8460/internal/credentials",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.5/token",
+            "https://[::1]/token",
+            "https://[::ffff:127.0.0.1]/token",
+            "https://localhost/token",
+            "http://auth.registry.example.com/token",
+        ] {
+            let url = reqwest::Url::parse(realm).unwrap();
+            assert!(
+                public.validate_realm_destination(&url).is_err(),
+                "{realm} allowed"
+            );
+        }
+        let url = reqwest::Url::parse("https://auth.registry.example.com/token").unwrap();
+        public.validate_realm_destination(&url).unwrap();
+
+        // A local registry keeps its local token service.
+        let local = RegistryClient::new("http://127.0.0.1:5000".into());
+        let url = reqwest::Url::parse("http://127.0.0.1:5001/token").unwrap();
+        local.validate_realm_destination(&url).unwrap();
     }
 
     #[test]

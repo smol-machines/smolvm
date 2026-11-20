@@ -100,6 +100,10 @@ pub(crate) fn remove_owned_data_and_record(
     crate::process::free_vm_uid(&crate::agent::vm_uid_registry_dir(), runtime);
     remove_data_dir(name, runtime)?;
     crate::portable_checkpoint::remove_paused_layers(runtime)?;
+    // A pause's resume inputs kept beside the data directory go with it.
+    if let Err(error) = crate::portable_checkpoint::remove_paused_resume(runtime) {
+        tracing::warn!(machine = name, %error, "could not remove kept resume inputs");
+    }
     ownership.finish_delete()
 }
 

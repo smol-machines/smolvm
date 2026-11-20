@@ -347,18 +347,27 @@ fn floor_mode() -> FloorMode {
     }
 }
 
-/// The cloud-metadata link-local range (`169.254.0.0/16` / `fe80::/10`) — the
-/// one destination floored in every mode except `Off`, including via an
-/// IPv4-mapped IPv6 address so it can't be smuggled past.
+/// The cloud-metadata link-local range (`169.254.0.0/16` / `fe80::/10`) and
+/// the clouds' IPv6 metadata endpoints — the one destination floored in every
+/// mode except `Off`, including via an IPv4-mapped IPv6 address so it can't be
+/// smuggled past.
 fn is_link_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_link_local(),
         IpAddr::V6(v6) => {
             (v6.segments()[0] & 0xffc0) == 0xfe80
+                || CLOUD_METADATA_V6.contains(&v6)
                 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
         }
     }
 }
+
+/// IPv6 instance-metadata endpoints outside `fe80::/10`: AWS
+/// (`fd00:ec2::254`) and Google Cloud (`fd20:ce::254`).
+const CLOUD_METADATA_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+    Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254),
+];
 
 /// The host's own loopback / unspecified addresses — what `127.0.0.1` and `::1`
 /// mean to the guest, but which the gateway forwards to the HOST. Floored in
@@ -1008,6 +1017,23 @@ impl EgressPolicy {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_clouds_ipv6_metadata_endpoints_are_floored_in_every_mode() {
+        for address in ["fd00:ec2::254", "fd20:ce::254"] {
+            let ip: IpAddr = address.parse().unwrap();
+            for mode in [
+                FloorMode::MetadataOnly,
+                FloorMode::MetadataAndLoopback,
+                FloorMode::Private,
+                FloorMode::Strict,
+            ] {
+                assert!(is_floored(ip, mode), "{address} open under {mode:?}");
+            }
+        }
+        let neighbour: IpAddr = "fd00:ec2::253".parse().unwrap();
+        assert!(!is_floored(neighbour, FloorMode::MetadataOnly));
+    }
 
     #[test]
     fn a_replaced_allow_list_grants_and_revokes_for_every_clone() {

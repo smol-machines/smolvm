@@ -4154,6 +4154,7 @@ impl AgentManager {
             .join("boot-config.json");
         let config_json = serde_json::to_vec(&config)
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+        let config_digest = super::boot_config::boot_config_digest(&config_json);
         let mut config_file = tempfile::NamedTempFile::new_in(config_path.parent().unwrap())
             .map_err(|e| Error::agent("create boot config", e.to_string()))?;
         std::io::Write::write_all(&mut config_file, &config_json)
@@ -4264,6 +4265,7 @@ impl AgentManager {
                 smolvm_protocol::guest_env::READY_MARKER,
                 self.ready_marker_name(),
             )
+            .env(super::boot_config::BOOT_CONFIG_SHA256_ENV, &config_digest)
             .stdin(std::process::Stdio::null());
         #[cfg(unix)]
         {
@@ -4950,14 +4952,25 @@ impl AgentManager {
                 "machine has unsynchronized staged mounts but its agent is unreachable",
             ));
         }
-        self.stop_owned(
-            &operation,
-            matches!(
-                resolved,
-                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
-            ),
-            Some(Duration::ZERO),
-        )?;
+        let without_handshake = matches!(
+            resolved,
+            crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
+        );
+        if let Err(error) = self.stop_owned(&operation, without_handshake, Some(Duration::ZERO)) {
+            if without_handshake {
+                return Err(error);
+            }
+            // A guest that cannot confirm its flush (a disk that turned
+            // read-only after an error, for one) would otherwise be impossible
+            // to delete. Its disks are removed next, so end it without the
+            // handshake; its identity is still checked first.
+            tracing::warn!(
+                machine = %record.name,
+                %error,
+                "guest did not confirm shutdown; ending it without the handshake because it is being deleted"
+            );
+            self.stop_owned(&operation, true, Some(Duration::ZERO))?;
+        }
         operation._ownership.take().ok_or_else(|| {
             Error::agent_conflict("delete machine", "deletion requires a reviewed machine")
         })

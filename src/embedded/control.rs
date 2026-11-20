@@ -406,10 +406,6 @@ fn merge_record_launch_features(record: &VmRecord, mut features: LaunchFeatures)
     if features.watch_parent.is_none() && record.detached {
         features.watch_parent = Some(false);
     }
-    if !record.init_completed {
-        features
-            .allow_image_pull_egress(record.image.as_deref(), record.source_smolmachine.is_some());
-    }
     features
 }
 
@@ -1483,15 +1479,11 @@ mod tests {
         spec.allowed_hosts = vec!["api.example.com".into()];
         let mut record = spec.to_record().unwrap();
 
+        // The image's registry is never added: a first start that cannot
+        // pull under this list fetches the image on the host instead.
         let features = merge_record_launch_features(&record, LaunchFeatures::default());
-        assert_eq!(
-            features.dns_filter_hosts,
-            Some(vec![
-                "api.example.com".into(),
-                "ghcr.io".into(),
-                "githubusercontent.com".into()
-            ])
-        );
+        assert_eq!(features.dns_filter_hosts, spec.allowed_hosts.clone().into());
+        assert!(record.image_needs_host_fetch());
 
         record.init_completed = true;
         let features = merge_record_launch_features(&record, LaunchFeatures::default());

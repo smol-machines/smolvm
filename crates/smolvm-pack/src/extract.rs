@@ -775,6 +775,21 @@ fn safe_unpack<R: Read>(
     safe_unpack_with_limits(archive, dest, &SafeUnpackLimits::from_env())
 }
 
+/// `e` followed by the error at the bottom of its chain. The tar crate reports a
+/// failed entry as "failed to unpack `<path>`" and keeps the OS error (ENOSPC,
+/// EACCES, EIO) only as a source, so printing `e` alone turned a full disk into
+/// an unexplained "failed to unpack" with nothing to act on.
+fn with_causes(e: &std::io::Error) -> String {
+    let mut root = std::error::Error::source(e);
+    while let Some(next) = root.and_then(|inner| inner.source()) {
+        root = Some(next);
+    }
+    match root {
+        Some(root) => format!("{e}: {root}"),
+        None => e.to_string(),
+    }
+}
+
 /// Tunable resource ceilings and sparse-write threshold for [`safe_unpack`].
 /// Extracted into a struct so tests can inject small values (exercising the
 /// sparse-write path and the cap-rejection paths) without mutating process-wide
@@ -975,6 +990,7 @@ fn safe_unpack_with_policy<R: Read>(
         checkpoint,
         owner_xattr,
         true,
+        false,
         &[],
         &[],
     )
@@ -990,6 +1006,7 @@ fn safe_unpack_skipping<R: Read>(
     checkpoint: bool,
     owner_xattr: bool,
     translate_whiteouts: bool,
+    guest_tree: bool,
     skip: &[PathBuf],
     required: &[PathBuf],
 ) -> std::io::Result<UnpackReport> {
@@ -1181,6 +1198,20 @@ fn safe_unpack_skipping<R: Read>(
                 continue;
             }
             tar::EntryType::Symlink => {
+                // A guest tree (image layers, the agent rootfs) holds links the
+                // guest resolves, so a target is checked as the guest reads it.
+                // A pack's or checkpoint's own files are opened by the host,
+                // which would follow a link out of `dest` to any path the
+                // archive names; smolvm never writes one there.
+                if !guest_tree {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        format!(
+                            "tar symlink '{}' is not allowed among a pack's or checkpoint's own files",
+                            entry_path.display()
+                        ),
+                    ));
+                }
                 // Allow symlinks but validate the target stays within dest.
                 if let Some(link_target) = entry.link_name()? {
                     let link_target = link_target.to_path_buf();
@@ -1381,7 +1412,11 @@ fn safe_unpack_skipping<R: Read>(
             if let Err(e) = entry.unpack_in(dest) {
                 return Err(std::io::Error::new(
                     e.kind(),
-                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                    format!(
+                        "failed to unpack '{}': {}",
+                        entry_path.display(),
+                        with_causes(&e)
+                    ),
                 ));
             }
             // `Entry::unpack_in` handles the sparse extent stream, while these
@@ -1398,7 +1433,11 @@ fn safe_unpack_skipping<R: Read>(
             if let Err(e) = unpack_sparse(&mut entry, &full_path, entry_size, mode, &real_dest) {
                 return Err(std::io::Error::new(
                     e.kind(),
-                    format!("failed to unpack '{}': {}", entry_path.display(), e),
+                    format!(
+                        "failed to unpack '{}': {}",
+                        entry_path.display(),
+                        with_causes(&e)
+                    ),
                 ));
             }
             set_owner(&full_path, host_uid, host_gid);
@@ -1426,7 +1465,11 @@ fn safe_unpack_skipping<R: Read>(
                     }
                     return Err(std::io::Error::new(
                         e.kind(),
-                        format!("failed to unpack '{}': {}", entry_path.display(), e),
+                        format!(
+                            "failed to unpack '{}': {}",
+                            entry_path.display(),
+                            with_causes(&e)
+                        ),
                     ));
                 }
             }
@@ -3454,6 +3497,16 @@ fn ensure_shared_artifact_sha256(
     ensure_shared_artifact_sha256_with_identity(sidecar_path, shared_dir, None)
 }
 
+/// Record which artifact a shared entry at `shared_dir` holds, before the
+/// entry is published: the first caller writes the artifact's SHA-256, and an
+/// artifact with another digest at the same CRC32 key is refused.
+pub fn record_shared_artifact_sha256(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256(sidecar_path, shared_dir)
+}
+
 fn ensure_shared_artifact_sha256_with_observed(
     sidecar_path: &Path,
     shared_dir: &Path,
@@ -3852,6 +3905,7 @@ pub fn extract_checkpoint_sidecar(
         true,
         false,
         true,
+        false,
         &skip,
         required,
     )?;
@@ -3923,6 +3977,7 @@ fn extract_checkpoint_sidecar_checked(
             true,
             false,
             true,
+            false,
             &skip,
             required,
         )?;
@@ -4080,6 +4135,7 @@ mod resume_extract_tests {
     }
 
     /// A checkpoint sidecar holding `checkpoint/memory.bin` = `memory`.
+    #[cfg(unix)]
     fn sidecar_with_memory(artifact: &Path, memory: &[u8]) -> PackFooter {
         let encoder = zstd::stream::Encoder::new(File::create(artifact).unwrap(), 1).unwrap();
         let mut tar = tar::Builder::new(encoder);
@@ -4632,6 +4688,7 @@ fn materialize_tar_dir(
             false,
             owner_xattr,
             translate_whiteouts,
+            true,
             &[],
             &[],
         )
@@ -6493,6 +6550,33 @@ mod tests {
         assert!(!final_dir.join("would-overwrite").exists());
     }
 
+    /// A failed entry names the OS error the tar crate keeps as its source:
+    /// a checkpoint restore on a full disk said only "failed to unpack".
+    #[cfg(unix)]
+    #[test]
+    fn unpack_errors_name_the_os_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(4);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        builder
+            .append_data(&mut header, "blocked/file", &b"data"[..])
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+        // A file where the entry needs its parent directory: the tar crate's
+        // own error text is "failed to unpack `<path>`" and nothing more.
+        std::fs::write(dir.path().join("blocked"), b"").unwrap();
+        let mut archive = tar::Archive::new(&bytes[..]);
+        let err = super::safe_unpack(&mut archive, dir.path()).unwrap_err();
+        let text = err.to_string();
+        assert!(text.contains("blocked/file"), "{text}");
+        let os = std::io::Error::from_raw_os_error(libc::ENOTDIR).to_string();
+        let os = os.split(" (os error").next().unwrap().to_string();
+        assert!(text.contains(&os), "the OS error is missing: {text}");
+    }
+
     /// The preflight names the shortfall instead of letting the extraction
     /// discover it part-way through.
     #[test]
@@ -6616,6 +6700,52 @@ mod tests {
 
     use super::*;
 
+    /// Unpack a guest tree (an image layer or the agent rootfs), as
+    /// `materialize_tar_dir` does: links are allowed, read as the guest does.
+    fn safe_unpack_guest_tree<R: Read>(
+        archive: &mut tar::Archive<R>,
+        dest: &Path,
+        limits: &SafeUnpackLimits,
+        checkpoint: bool,
+        owner_xattr: bool,
+    ) -> std::io::Result<UnpackReport> {
+        safe_unpack_skipping(
+            archive,
+            dest,
+            limits,
+            checkpoint,
+            owner_xattr,
+            true,
+            true,
+            &[],
+            &[],
+        )
+    }
+
+    // A pack's or checkpoint's own files are opened by the host, which would
+    // follow a link out of the extraction directory, so none is accepted
+    // there, however harmless its target looks.
+    #[test]
+    fn pack_level_unpack_refuses_every_symlink() {
+        for (name, target) in [
+            ("layers/layer-order", "/home/alice/.bashrc"),
+            ("s", "."),
+            ("link", "target"),
+        ] {
+            let temp_dir = tempfile::tempdir().unwrap();
+            let dest = temp_dir.path().join("dest");
+            fs::create_dir(&dest).unwrap();
+            let tar_bytes = make_symlink_tar(name, target);
+            let mut archive = tar::Archive::new(tar_bytes.as_slice());
+            let error = safe_unpack(&mut archive, &dest).unwrap_err();
+            assert_eq!(error.kind(), std::io::ErrorKind::InvalidData, "{name}");
+            assert!(
+                fs::symlink_metadata(dest.join(name)).is_err(),
+                "{name} not created"
+            );
+        }
+    }
+
     /// The version that shipped in the pack this was written for. A regression
     /// here is not cosmetic: crediting an old pack with staging support hands
     /// its agent an empty `/packed_layers` and the machine never boots.
@@ -6696,6 +6826,7 @@ mod tests {
         assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
     }
 
+    #[cfg(unix)]
     fn digest_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
@@ -7462,8 +7593,8 @@ mod tests {
     }
 
     /// Build a tar archive carrying a single symlink entry whose link target
-    /// is `link_target`, plus (optionally) a trailing regular-file entry.
-    #[cfg(unix)]
+    /// is `link_target`, plus (optionally) a trailing regular-file entry. The
+    /// archive is built in memory, so every platform's tests can use it.
     fn make_symlink_tar(name: &str, link_target: &str) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
@@ -7614,7 +7745,14 @@ mod tests {
 
         let tar_bytes = make_symlink_tar("link", "target");
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack(&mut archive, &dest).unwrap();
+        safe_unpack_guest_tree(
+            &mut archive,
+            &dest,
+            &SafeUnpackLimits::from_env(),
+            false,
+            false,
+        )
+        .unwrap();
 
         let meta = fs::symlink_metadata(dest.join("link")).unwrap();
         assert!(
@@ -8396,7 +8534,7 @@ mod tests {
             let dest = root.path().join("layer");
             fs::create_dir(&dest).unwrap();
             let mut archive = tar::Archive::new(tar_bytes.as_slice());
-            let _ = safe_unpack_with_policy(
+            let _ = safe_unpack_guest_tree(
                 &mut archive,
                 &dest,
                 &SafeUnpackLimits::from_env(),
@@ -8456,7 +8594,7 @@ mod tests {
         let dest = root.path().join("layer");
         fs::create_dir(&dest).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &dest,
             &SafeUnpackLimits::from_env(),
@@ -8591,7 +8729,7 @@ mod tests {
         let dest = root.path().join("layer");
         fs::create_dir(&dest).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &dest,
             &SafeUnpackLimits::from_env(),
@@ -8681,7 +8819,7 @@ mod tests {
         fs::create_dir(&dest).unwrap();
         let layer = symlink_owner_layer();
         let mut archive = tar::Archive::new(layer.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &dest,
             &SafeUnpackLimits::from_env(),
@@ -8711,7 +8849,7 @@ mod tests {
         fs::write(layers.join("abcd.tar"), &layer).unwrap();
         // An old extraction: the tree, but no directory record.
         let mut archive = tar::Archive::new(layer.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &tree,
             &SafeUnpackLimits::from_env(),
@@ -8772,7 +8910,7 @@ mod tests {
         let dest = root.path().join("layer");
         fs::create_dir(&dest).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &dest,
             &SafeUnpackLimits::from_env(),
@@ -8834,7 +8972,7 @@ mod tests {
         let dest = root.path().join("layer");
         fs::create_dir(&dest).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &dest,
             &SafeUnpackLimits::from_env(),
@@ -8856,7 +8994,7 @@ mod tests {
         let plain = root.path().join("plain");
         fs::create_dir(&plain).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &plain,
             &SafeUnpackLimits::from_env(),
@@ -8962,7 +9100,7 @@ mod tests {
         let dest = root.path().join("layer");
         fs::create_dir(&dest).unwrap();
         let mut archive = tar::Archive::new(tar_bytes.as_slice());
-        safe_unpack_with_policy(
+        safe_unpack_guest_tree(
             &mut archive,
             &dest,
             &SafeUnpackLimits::from_env(),

@@ -66,10 +66,45 @@ fn remove_sandbox_share_at(root: &Path, id: &str) -> std::io::Result<()> {
             "invalid sandbox id for share cleanup",
         ));
     }
+    // The share is a mount of its own (see `mount_share_nodev`); detach it
+    // so the tree under it can go.
+    let _ = nix::mount::umount2(
+        &root.join(id).join("podshare"),
+        nix::mount::MntFlags::MNT_DETACH,
+    );
     match std::fs::remove_dir_all(root.join(id)) {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
         result => result,
     }
+}
+
+/// Make the pod share a `nodev,nosuid` mount of itself. The root shim copies
+/// image trees into it with `cp -a`, which recreates an image's device nodes
+/// and set-uid bits as they are; on this mount the host refuses to open such a
+/// node for any uid, the VMM's included, while the guest still sees the inode.
+fn mount_share_nodev(share_dir: &Path) -> Result<(), String> {
+    use nix::mount::{mount, umount2, MntFlags, MsFlags};
+    // A crashed shim may have left one behind; don't stack another on top.
+    let _ = umount2(share_dir, MntFlags::MNT_DETACH);
+    mount(
+        Some(share_dir),
+        share_dir,
+        None::<&str>,
+        MsFlags::MS_BIND,
+        None::<&str>,
+    )
+    .map_err(|e| format!("bind {}: {e}", share_dir.display()))?;
+    mount(
+        None::<&str>,
+        share_dir,
+        None::<&str>,
+        MsFlags::MS_BIND | MsFlags::MS_REMOUNT | MsFlags::MS_NODEV | MsFlags::MS_NOSUID,
+        None::<&str>,
+    )
+    .map_err(|e| {
+        let _ = umount2(share_dir, MntFlags::MNT_DETACH);
+        format!("remount {} nodev,nosuid: {e}", share_dir.display())
+    })
 }
 
 pub(crate) fn remove_sandbox_share(id: &str) -> std::io::Result<()> {
@@ -678,6 +713,7 @@ impl PodBackend for EnginePodBackend {
                 .join("podshare");
             std::fs::create_dir_all(&share_dir)
                 .map_err(|e| format!("mkdir {}: {e}", share_dir.display()))?;
+            mount_share_nodev(&share_dir)?;
 
             let rt = smolvm::embedded::runtime().map_err(|e| e.to_string())?;
             // Read-only: the agent only reads the share (each container runs on
@@ -1401,6 +1437,29 @@ impl PodBackend for ShimBackend {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "needs root to mount"]
+    fn share_mount_refuses_device_nodes_and_is_reaped_with_the_share() {
+        let root = tempfile::TempDir::new().unwrap();
+        let share = root.path().join("sandbox").join("podshare");
+        std::fs::create_dir_all(&share).unwrap();
+        mount_share_nodev(&share).unwrap();
+        let node = share.join("null");
+        nix::sys::stat::mknod(
+            &node,
+            nix::sys::stat::SFlag::S_IFCHR,
+            nix::sys::stat::Mode::from_bits_truncate(0o666),
+            nix::sys::stat::makedev(1, 3),
+        )
+        .unwrap();
+        let error = std::fs::File::open(&node).unwrap_err();
+        assert_eq!(error.raw_os_error(), Some(nix::errno::Errno::EACCES as i32));
+        std::fs::write(share.join("file"), b"served").unwrap();
+        assert_eq!(std::fs::read(share.join("file")).unwrap(), b"served");
+        remove_sandbox_share_at(root.path(), "sandbox").unwrap();
+        assert!(!root.path().join("sandbox").exists());
+    }
 
     fn spec_with(annotations: serde_json::Value) -> serde_json::Value {
         serde_json::json!({ "annotations": annotations })

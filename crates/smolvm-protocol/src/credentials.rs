@@ -419,10 +419,22 @@ fn valid_header_name(name: &str) -> bool {
         })
 }
 
+/// Whether a URL parser would read `host` as an IPv4 address: its last label
+/// is a number, decimal or `0x` hex (`127.1`, `127.0.0.0x1`, `2130706433`).
+/// No DNS name in use ends that way.
+fn ends_in_a_number(host: &str) -> bool {
+    let last = host.rsplit('.').next().unwrap_or(host);
+    last.bytes().all(|c| c.is_ascii_digit())
+        || last
+            .strip_prefix("0x")
+            .is_some_and(|hex| hex.bytes().all(|c| c.is_ascii_hexdigit()))
+}
+
 fn valid_exact_host(host: &str) -> bool {
     !host.is_empty()
         && host.len() <= 253
         && host.parse::<std::net::IpAddr>().is_err()
+        && !ends_in_a_number(host)
         && !host.contains(['/', ':', '*', '@', '?', '#'])
         && host.split('.').all(|label| {
             !label.is_empty()
@@ -526,6 +538,12 @@ mod tests {
             "10.0.0.1",
             "API.notion.com",
             "notion.com:443",
+            "127.0.0.0x1",
+            "0x7f000001",
+            "127.1",
+            "2130706433",
+            "169.254.169.0xfe",
+            "*.0.0x1",
         ] {
             let mut b = notion();
             b.allowed_hosts = vec![host.to_string()];
@@ -533,6 +551,14 @@ mod tests {
                 credentials: vec![b],
             };
             assert!(policy.validate(None).is_err(), "{host:?} accepted");
+        }
+        for host in ["127.0.0.1.nip.io", "0x1.example.com", "*.0x1.example.com"] {
+            let mut b = notion();
+            b.allowed_hosts = vec![host.to_string()];
+            let policy = CredentialPolicy {
+                credentials: vec![b],
+            };
+            assert!(policy.validate(None).is_ok(), "{host:?} refused");
         }
         let mut b = notion();
         b.allowed_hosts.clear();
