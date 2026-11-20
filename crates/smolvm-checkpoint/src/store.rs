@@ -2263,6 +2263,14 @@ fn materialize_generation(
             fs::remove_file(&destination)?;
             cloned = false;
         }
+        // macOS clonefile preserves read-only modes from the pristine base.
+        // Only our private clone needs write access while applying the diff;
+        // restore the recorded mode below once its contents are complete.
+        #[cfg(unix)]
+        if cloned {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+        }
         let file = File::options()
             .read(true)
             .write(true)
@@ -4909,6 +4917,66 @@ mod tests {
         let out_a3 = root.path().join("out-a3");
         materialize_with_base(&saved_a, &out_a3, Some(&root.path().join("nope"))).unwrap();
         assert_eq!(fs::read(out_a3.join("checkpoint/memory.bin")).unwrap(), a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_base_restores_preserve_permissions_and_cached_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let base = root.path().join("base");
+        let original = vec![0xAB; 3 * CHUNK_SIZE];
+        let mut changed = original.clone();
+        changed[..CHUNK_SIZE].fill(0xCD);
+        changed[CHUNK_SIZE..2 * CHUNK_SIZE].fill(0);
+        let store = |name: &str, bytes: &[u8]| {
+            let saved = root.path().join(name);
+            capture(&objects, &saved, bytes);
+            let mut index = read_index(&saved).unwrap();
+            for entry in &mut index.files {
+                entry.mode = 0o444;
+            }
+            fs::write(saved.join(INDEX), serde_json::to_vec(&index).unwrap()).unwrap();
+            saved
+        };
+        let saved = store("saved", &original);
+        let updated = store("updated", &changed);
+        let first = root.path().join("first");
+        materialize(&saved, &first).unwrap();
+        if !promote_base(&saved, &first, &base).unwrap() {
+            assert!(std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_none());
+            return;
+        }
+        let asset = "checkpoint/memory.bin";
+        let cached_identity = file_identity(&base.join(asset));
+        for (i, (checkpoint, expected)) in [
+            (&saved, &original),
+            (&updated, &changed),
+            (&saved, &original),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = root.path().join(format!("restored-{i}"));
+            materialize_with_base(checkpoint, &output, Some(&base)).unwrap();
+            assert_eq!(fs::read(output.join(asset)).unwrap(), *expected);
+            assert_eq!(
+                fs::metadata(output.join(asset))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+            assert_eq!(fs::read(base.join(asset)).unwrap(), original);
+            assert_eq!(file_identity(&base.join(asset)), cached_identity);
+            assert_eq!(
+                fs::metadata(base.join(asset)).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
     }
 
     /// A base file whose size disagrees with the base index is not trusted:
