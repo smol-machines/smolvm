@@ -2952,6 +2952,13 @@ async fn create_machine_to_end(
     if let Some(image) = req.image.take() {
         req.image = Some(resolve_api_image(&state, image).await?);
     }
+    // A tenant's image is pulled by this server, so it gets the rule a
+    // tenant's `registryRef` gets.
+    if req.registry_identity_token.is_some() {
+        if let Some(image) = req.image.as_deref() {
+            refuse_ssrf_prone_tenant_image(image)?;
+        }
+    }
 
     // Published ports need the inbound path that only virtio-net has. With an
     // UNSET backend the launcher auto-selects virtio-net when ports are present
@@ -3445,6 +3452,18 @@ async fn create_machine_to_end(
     // whatever the restored machine's network: the guest holds its device.
     let mut restored_host_image = None;
     if let Some(checkpoint) = manifest_checkpoint.as_ref() {
+        if req.registry_identity_token.is_some() {
+            if let Some(host) = checkpoint
+                .host_image
+                .as_ref()
+                .filter(|host| host.archive.is_none())
+            {
+                if let Err(error) = refuse_ssrf_prone_tenant_image(&host.reference) {
+                    let _ = std::fs::remove_dir_all(vm_data_dir(&name));
+                    return Err(error);
+                }
+            }
+        }
         let checkpoint = checkpoint.clone();
         let data = vm_data_dir(&name);
         match guard
@@ -4098,6 +4117,9 @@ async fn start_machine_transaction(
             None => crate::registry::PullAuth::FromConfig,
         };
         let image = record.image.clone().unwrap_or_default();
+        if registry_auth.is_some() {
+            refuse_ssrf_prone_tenant_image(&image)?;
+        }
         let fetched = crate::image_store::fetch_image_archive(&image, &auth).await?;
         record.pin_host_fetched_image(fetched.local.clone(), fetched.digest.clone());
         state
@@ -7338,6 +7360,23 @@ pub async fn export_machine(
 /// cloud metadata endpoint at `169.254.169.254`, or a neighbour on the private
 /// network). Hostnames that are not IP literals return false (a DNS-rebind to a
 /// private address is a residual not covered here).
+/// Refuse a tenant's image whose registry is this host's loopback, a
+/// link-local or a private address: the server would pull it, so it is held to
+/// the rule `pull_smolmachine` applies to a tenant's `registryRef`. A local
+/// image source names no registry.
+fn refuse_ssrf_prone_tenant_image(image: &str) -> Result<(), ApiError> {
+    if crate::data::image_source::is_local_ref(image) {
+        return Ok(());
+    }
+    let registry = crate::registry::extract_registry(image);
+    if is_ssrf_prone_registry_host(&registry) {
+        return Err(ApiError::BadRequest(format!(
+            "registry host '{registry}' is a private/loopback address and is not permitted for tenant image pulls"
+        )));
+    }
+    Ok(())
+}
+
 fn is_ssrf_prone_registry_host(host: &str) -> bool {
     // localhost / 127.0.0.0/8 / ::1 / 0.0.0.0 — reuse the registry classifier.
     if smolvm_registry::is_local_registry(host) {
@@ -7687,6 +7726,28 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn a_tenant_image_on_a_private_registry_is_refused() {
+        for image in [
+            "127.0.0.1:5000/app:v1",
+            "localhost:5000/app:v1",
+            "169.254.169.254/latest:v1",
+            "10.0.0.5:5000/team/app:v1",
+        ] {
+            assert!(
+                refuse_ssrf_prone_tenant_image(image).is_err(),
+                "{image} allowed"
+            );
+        }
+        for image in [
+            "alpine:3.20",
+            "ghcr.io/org/app:v1",
+            "local:0123456789abcdef",
+        ] {
+            refuse_ssrf_prone_tenant_image(image).unwrap();
+        }
+    }
 
     #[test]
     fn only_configured_registries_count_as_configured() {
