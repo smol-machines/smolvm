@@ -65,6 +65,8 @@ pub enum EffectiveNetworkBackend {
     Tsi,
     /// Virtio-net networking.
     VirtioNet,
+    /// Host TCP/UDP sockets; there is no private guest network to publish.
+    Host,
 }
 
 /// Network launch decision for a VM.
@@ -134,7 +136,8 @@ pub fn plan_launch_network_with(
         || resources.block_private.is_some();
     let has_dns_filter = dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
-    let has_fabric = resources.network_name.is_some();
+    // A container switch is fabric-like routing in the host-side stack too.
+    let has_fabric = resources.network_name.is_some() || resources.switch.is_some();
     // A custom guest subnet shapes the virtio-net link, so like a named
     // network it implies networking and picks virtio-net.
     let has_guest_subnet = resources.guest_subnet.is_some();
@@ -221,13 +224,17 @@ pub fn plan_launch_network_with(
             backend: EffectiveNetworkBackend::VirtioNet,
             outbound,
         },
+        NetworkBackend::Host => LaunchNetworkPlan {
+            backend: EffectiveNetworkBackend::Host,
+            outbound,
+        },
     }
 }
 
 /// The longest replacement allow list the egress control socket reads.
 const MAX_EGRESS_REQUEST_BYTES: u64 = 1024 * 1024;
 
-const MAX_PORTS_REQUEST_BYTES: u64 = 64 * 1024;
+const MAX_PORTS_REQUEST_BYTES: u64 = 256 * 1024;
 
 /// Serve the egress control socket in `vm_dir` for a machine whose guest may
 /// open outbound connections under an allow list: each connection sends a
@@ -263,28 +270,48 @@ pub fn serve_egress_control(
 /// complete set of `host:guest` mappings to publish and gets back `ok` or
 /// `error: <reason>`.
 pub fn serve_ports_control(ports: smolvm_network::PublishedPorts, vm_dir: &std::path::Path) {
-    serve_ports_requests(vm_dir, move |next| {
-        ports.replace(next).map_err(|error| error.to_string())
-    });
+    let allocator = ports.clone();
+    serve_ports_requests(
+        vm_dir,
+        move |guest| {
+            allocator
+                .publish_atomic(guest)
+                .map_err(|error| error.to_string())
+        },
+        move |next| ports.replace(next).map_err(|error| error.to_string()),
+    );
 }
 
 /// Serve the ports control socket in `vm_dir`, handing each request's parsed
 /// mappings to `replace`; shared by virtio-net and the TSI port forwarder.
 pub(crate) fn serve_ports_requests(
     vm_dir: &std::path::Path,
+    allocate: impl Fn(u16) -> Result<smolvm_network::PortMapping, String> + Send + 'static,
     replace: impl Fn(&[smolvm_network::PortMapping]) -> Result<(), String> + Send + 'static,
 ) {
     let path = vm_dir.join(smolvm_network::PORTS_SOCKET);
     let _ = std::fs::remove_file(&path);
-    serve_control_socket(
+    serve_control_socket_with_reply(
         path,
         "ports-control",
         MAX_PORTS_REQUEST_BYTES,
         move |request| {
+            if let Some(guest) = request.trim().strip_prefix("allocate ") {
+                let guest: u16 = guest
+                    .parse()
+                    .map_err(|_| "invalid guest port".to_string())?;
+                if guest == 0 {
+                    return Err("guest port must be positive".into());
+                }
+                let mapping = allocate(guest)?;
+                return Ok(format!("ok {}:{}\n", mapping.host, mapping.guest));
+            }
             let next = smolvm_network::parse_port_mappings(request)?;
             replace(&next)?;
+            // Auto ports leave a port `-p` now publishes to that mapping.
+            super::auto_ports::note_declared_ports(&next);
             tracing::info!(ports = %smolvm_network::render_port_mappings(&next).trim_end(), "published ports replaced");
-            Ok(())
+            Ok("ok\n".to_string())
         },
     );
 }
@@ -294,6 +321,17 @@ pub(crate) fn serve_control_socket(
     thread_name: &str,
     max_request_bytes: u64,
     apply: impl Fn(&str) -> Result<(), String> + Send + 'static,
+) {
+    serve_control_socket_with_reply(path, thread_name, max_request_bytes, move |request| {
+        apply(request).map(|()| "ok\n".to_string())
+    });
+}
+
+fn serve_control_socket_with_reply(
+    path: std::path::PathBuf,
+    thread_name: &str,
+    max_request_bytes: u64,
+    apply: impl Fn(&str) -> Result<String, String> + Send + 'static,
 ) {
     use std::io::{Read, Write};
     let listener = match crate::platform::uds::UdsListener::bind(&path) {
@@ -317,7 +355,7 @@ pub(crate) fn serve_control_socket(
                     .read_to_string(&mut request)
                 {
                     Ok(_) => match apply(&request) {
-                        Ok(()) => "ok\n".to_string(),
+                        Ok(reply) => reply,
                         Err(reason) => format!("error: {reason}\n"),
                     },
                     Err(error) => format!("error: {error}\n"),
@@ -347,6 +385,33 @@ pub fn validate_requested_network_backend(
         || resources.block_private.is_some()
         || dns_filter_hosts.is_some();
     let has_host_service = guest_host_service_configured();
+
+    if resources.network_backend == Some(NetworkBackend::Host) {
+        let reason = if !resources.network {
+            Some("host networking requires networking to be enabled")
+        } else if port_count != 0 {
+            Some("host networking binds host ports directly and cannot publish port mappings")
+        } else if has_egress_policy {
+            Some("host networking cannot be combined with an egress policy")
+        } else if resources.network_name.is_some()
+            || resources.switch.is_some()
+            || resources.guest_subnet.is_some()
+        {
+            Some("host networking cannot join a private network or use a guest subnet")
+        } else if has_host_service {
+            Some("host networking cannot use the managed guest gateway service")
+        } else if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some()
+            || std::env::var("SMOLVM_EGRESS_FLOOR")
+                .is_ok_and(|v| v.trim().eq_ignore_ascii_case("strict"))
+        {
+            Some("host networking is unavailable in fleet or strict-isolation mode")
+        } else {
+            None
+        };
+        return reason.map_or(Ok(()), |reason| {
+            Err(crate::Error::config("host network", reason))
+        });
+    }
 
     // Mirror plan_launch_network's default: unset backend + (ports OR egress
     // policy) ⇒ virtio-net. So only an EXPLICIT `--net-backend tsi` alongside
@@ -436,6 +501,39 @@ pub fn validate_requested_network_backend(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn host_network_selection_is_preserved_in_persisted_resources() {
+        let mut host = resources();
+        host.network = true;
+        host.network_backend = Some(NetworkBackend::Host);
+        let restored: VmResources =
+            serde_json::from_str(&serde_json::to_string(&host).unwrap()).unwrap();
+        let plan = plan_launch_network(&restored, None, 0);
+        assert_eq!(plan.backend, EffectiveNetworkBackend::Host);
+        assert!(plan.outbound);
+        assert!(plan.has_network());
+    }
+
+    #[test]
+    fn host_network_rejects_settings_that_would_be_ignored() {
+        let mut host = resources();
+        host.network = true;
+        host.network_backend = Some(NetworkBackend::Host);
+        assert!(validate_requested_network_backend(&host, None, 1).is_err());
+        assert!(validate_requested_network_backend(&host, Some(&[]), 0).is_err());
+        let mut denied = host.clone();
+        denied.allowed_cidrs = Some(Vec::new());
+        assert!(validate_requested_network_backend(&denied, None, 0).is_err());
+        let mut subnet = host.clone();
+        subnet.guest_subnet = Some("10.20.0.0/24".into());
+        assert!(validate_requested_network_backend(&subnet, None, 0).is_err());
+        let mut named = host.clone();
+        named.network_name = Some("private".into());
+        assert!(validate_requested_network_backend(&named, None, 0).is_err());
+        host.network = false;
+        assert!(validate_requested_network_backend(&host, None, 0).is_err());
+    }
 
     fn resources() -> VmResources {
         VmResources::default()

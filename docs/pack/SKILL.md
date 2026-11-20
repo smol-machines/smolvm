@@ -208,6 +208,15 @@ Full detail with the evidence in `references/traps.md`. The ones that cost the m
   aarch64 took one without it on v1.18.2. A machine created from a pack can be checkpointed from
   v1.18.0, and `create --from` restores the newest generation a checkpoint carries; `--at ~N` picks an earlier
   one, which `branch-and-checkpoint` covers.
+- **`machine create --from` takes every option `--image` takes, and a Smolfile (`-s`).** The pack's
+  CPUs, memory, command, environment, working directory, user, network, GPU and CUDA are defaults: a
+  flag replaces them, `-e` merges by name, and a command after `--` replaces the packed entrypoint and
+  command together. A secret the pack names has to be bound with `--secret-*` of the same name. A live
+  checkpoint fixes its CPUs, memory, disks, devices, mounts, guest ports, DNS and workload, and a flag
+  asking for something else fails naming it (`cpus cannot be set when restoring a live checkpoint`);
+  its egress policy, host ports, labels, environment, stop, health and restart settings can be set.
+  The same rules apply to the serve API and to the SDKs' `.smolmachine` images. Before v1.34 several
+  flags were dropped on `--from` without an error.
 - **On Linux, `SMOLVM_DATA_DIR` moves where the agent rootfs is looked up and the installer does
   not write it there**, so an isolated data root needs the rootfs copied in before the first boot.
 

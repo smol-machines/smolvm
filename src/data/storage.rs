@@ -91,6 +91,22 @@ pub struct HostMount {
     /// host/guest coherence for metadata-heavy workload performance.
     #[serde(default)]
     pub staged: bool,
+
+    /// Keep the guest's view of file ownership and mode in an extended
+    /// attribute on the host file instead of the host inode, so a guest's
+    /// `chown` and `chmod` succeed on a host that cannot apply them (an
+    /// unprivileged Linux host; macOS always does this). A container engine
+    /// asks for it, as a container's root expects to own its volumes.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
+
+    /// The guest owner (`uid`, `gid`) of every file in the mount that records
+    /// none of its own (`host:guest:uid=1000,gid=1000`), so a host directory
+    /// belongs to the guest user it is mounted for without a `chown`, and keeps
+    /// that owner when the host replaces a file. A guest `chown` still records
+    /// an owner per file.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<(u32, u32)>,
 }
 
 impl HostMount {
@@ -165,6 +181,8 @@ impl HostMount {
             target: target.into(),
             read_only,
             staged: false,
+            recorded_ownership: false,
+            owner: None,
         };
 
         if !mount.source.exists() {
@@ -197,11 +215,55 @@ impl HostMount {
         Ok(mount)
     }
 
-    /// Parse a mount specification (`host_path:guest_path[:ro|:rw]`).
+    /// Parse a mount specification (`host_path:guest_path[:ro|:rw][:uid=N[,gid=N]]`).
     ///
     /// If no mode is provided, the mount defaults to writable.
     /// The source path is validated, required to be a directory, and canonicalized.
     fn _parse(spec: &str, allow_system_mounts: bool) -> Result<Self> {
+        let invalid = || {
+            Error::invalid_mount_path(format!(
+                "invalid format '{}' (expected host:guest[:ro|:rw|:staged][:uid=N[,gid=N]])",
+                spec
+            ))
+        };
+        // The owner comes last; a host path cannot contain '=' in a segment of
+        // its own after the guest path.
+        let (spec_rest, owner) = match spec.rsplit_once(':') {
+            Some((head, options)) if options.contains('=') => {
+                (head, Some(Self::parse_owner(options).ok_or_else(invalid)?))
+            }
+            _ => (spec, None),
+        };
+        let mut mount = Self::parse_mode(spec_rest, allow_system_mounts, invalid)?;
+        if owner.is_some() && mount.staged {
+            return Err(Error::invalid_mount_path(format!(
+                "'{}': a staged mount is a copy on the guest disk; set its owner with chown instead",
+                spec
+            )));
+        }
+        mount.owner = owner;
+        Ok(mount)
+    }
+
+    /// `uid=N[,gid=N]`: the gid defaults to the uid, as for a user's own group.
+    fn parse_owner(options: &str) -> Option<(u32, u32)> {
+        let (mut uid, mut gid) = (None, None);
+        for option in options.split(',') {
+            match option.split_once('=')? {
+                ("uid", v) if uid.is_none() => uid = Some(v.parse().ok()?),
+                ("gid", v) if gid.is_none() => gid = Some(v.parse().ok()?),
+                _ => return None,
+            }
+        }
+        let uid = uid?;
+        Some((uid, gid.unwrap_or(uid)))
+    }
+
+    fn parse_mode(
+        spec: &str,
+        allow_system_mounts: bool,
+        invalid: impl Fn() -> Error,
+    ) -> Result<Self> {
         // Parse from the right so a Windows host path keeps its drive-letter
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
@@ -219,10 +281,7 @@ impl HostMount {
                 mount.staged = staged;
                 Ok(mount)
             }
-            _ => Err(Error::invalid_mount_path(format!(
-                "invalid format '{}' (expected host:guest[:ro|:rw|:staged])",
-                spec
-            ))),
+            _ => Err(invalid()),
         }
     }
 
@@ -394,6 +453,8 @@ impl HostMount {
             target: PathBuf::from(target),
             read_only,
             staged: false,
+            recorded_ownership: false,
+            owner: None,
         }
     }
 
@@ -404,6 +465,8 @@ impl HostMount {
             target: PathBuf::from(target),
             read_only: false,
             staged: true,
+            recorded_ownership: false,
+            owner: None,
         }
     }
 
@@ -422,6 +485,17 @@ impl HostMount {
             self.source.to_string_lossy().to_string(),
             self.target.to_string_lossy().to_string(),
         )
+    }
+
+    /// The owners of the live mounts among `mounts`, by their index among the
+    /// live mounts (`split_storage_tuples`), as a record keeps them.
+    pub fn stored_owners(mounts: &[Self]) -> Vec<(usize, u32, u32)> {
+        mounts
+            .iter()
+            .filter(|m| !m.staged)
+            .enumerate()
+            .filter_map(|(i, m)| m.owner.map(|(uid, gid)| (i, uid, gid)))
+            .collect()
     }
 
     /// Split validated mounts into their backward-compatible live-mount tuples
@@ -538,6 +612,69 @@ mod tests {
     }
 
     #[test]
+    fn a_mount_names_the_owner_its_unrecorded_files_are_served_as() {
+        let dir = tempfile::tempdir().unwrap();
+        let host = dir.path().display().to_string();
+        let mount = parse_one(&format!("{host}:/home/ubuntu/.pi:uid=1000"));
+        assert_eq!(
+            mount.owner,
+            Some((1000, 1000)),
+            "the gid defaults to the uid"
+        );
+        assert!(!mount.read_only);
+        let mount = parse_one(&format!("{host}:/data:ro:uid=1000,gid=1001"));
+        assert_eq!((mount.owner, mount.read_only), (Some((1000, 1001)), true));
+        assert_eq!(mount.target, PathBuf::from("/data"));
+        assert_eq!(parse_one(&format!("{host}:/data")).owner, None);
+        for bad in ["gid=1000", "uid=me", "uid=1,uid=2", "uid=1,size=2"] {
+            assert!(
+                HostMount::parse(&[format!("{host}:/data:{bad}")]).is_err(),
+                "{bad} is refused"
+            );
+        }
+        assert!(
+            HostMount::parse(&[format!("{host}:/data:staged:uid=1000")]).is_err(),
+            "a staged copy takes chown, not an owner"
+        );
+    }
+
+    #[test]
+    fn a_records_mount_owners_follow_the_live_mounts_through_their_index() {
+        let (a, b) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let mounts = HostMount::parse(&[
+            format!("{}:/staged:staged", a.path().display()),
+            format!("{}:/plain", a.path().display()),
+            format!("{}:/owned:uid=1000", b.path().display()),
+        ])
+        .unwrap();
+        let owners = HostMount::stored_owners(&mounts);
+        assert_eq!(
+            owners,
+            vec![(1, 1000, 1000)],
+            "indexed among the live mounts"
+        );
+        let (live, staged) = HostMount::split_storage_tuples(&mounts);
+        let mut record = crate::config::VmRecord::new("m".into(), 1, 512, live, vec![], false);
+        record.staged_mounts = staged;
+        record.mount_owners = owners;
+        let back = record.host_mounts();
+        let owned = back
+            .iter()
+            .find(|m| m.target == Path::new("/owned"))
+            .unwrap();
+        assert_eq!(owned.owner, Some((1000, 1000)));
+        assert!(back
+            .iter()
+            .filter(|m| m.target != Path::new("/owned"))
+            .all(|m| m.owner.is_none()));
+        // Linux serves an owner only where owners are virtualized.
+        assert_eq!(owned.recorded_ownership, cfg!(target_os = "linux"));
+        let json = serde_json::to_string(&record).unwrap();
+        let read: crate::config::VmRecord = serde_json::from_str(&json).unwrap();
+        assert_eq!(read.mount_owners, vec![(1, 1000, 1000)]);
+    }
+
+    #[test]
     fn test_new_mount_rejects_illegal_source_mount_path() {
         for path in ["/", "/etc", "/var", "/var/run", "/var/log"] {
             let result = HostMount::new(path, "/guest/path", true);
@@ -635,6 +772,8 @@ mod tests {
                 target: PathBuf::from("/guest/path"),
                 read_only: true,
                 staged: false,
+                recorded_ownership: false,
+                owner: None,
             };
             let err = HostMount::validate(&mount).unwrap_err().to_string();
             assert!(

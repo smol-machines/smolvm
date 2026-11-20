@@ -24,9 +24,11 @@
 //! pressure (full channels or tables) is acceptable UDP behaviour: logged, never
 //! blocking.
 
+use crate::publish_bind::{self, BoundSockets};
 use crate::queues::WakePipe;
 use crate::virtio_net_log;
 use crate::BoundPublishedPorts;
+use crate::PortMapping;
 use polling::{Event, Events};
 use smoltcp::iface::{SocketHandle, SocketSet};
 use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, UdpMetadata};
@@ -45,13 +47,11 @@ const MAX_SESSIONS: usize = 512;
 /// Packet slots per session socket buffer (per direction).
 const SESSION_PACKET_SLOTS: usize = 32;
 /// Payload bytes per session socket buffer (per direction).
-const SESSION_BUFFER_BYTES: usize = 32 * 1024;
+const SESSION_BUFFER_BYTES: usize = 64 * 1024;
 /// Largest datagram read from a published host socket.
 const MAX_DATAGRAM_BYTES: usize = 65_535;
-/// Largest payload that reaches the guest: one 1500-byte frame less the IPv4
-/// and UDP headers. The gateway does not fragment, so anything larger is
-/// dropped; game and voice protocols keep their datagrams under this anyway.
-pub const MAX_GUEST_PAYLOAD: usize = 1500 - 20 - 8;
+/// Largest IPv4 UDP payload; the interface fragments it to the link MTU.
+pub const MAX_GUEST_PAYLOAD: usize = 65_535 - 20 - 8;
 /// Drop a client's session after this much silence in both directions.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Publisher thread poll ceiling, so shutdown is noticed promptly.
@@ -114,6 +114,24 @@ struct PublishedSocket {
     socket: HostUdpSocket,
     host_port: u16,
     guest_port: u16,
+    /// Bound on the wildcard address only because loopback was refused:
+    /// datagrams from other hosts are dropped (see [`publish_bind`]).
+    loopback_only: bool,
+}
+
+/// Bind the host sockets of one published UDP mapping.
+pub fn bind_udp_port(mapping: &PortMapping) -> std::io::Result<BoundSockets<HostUdpSocket>> {
+    publish_bind::bind_udp_on(mapping.host, mapping.listen).map_err(|err| {
+        std::io::Error::new(
+            err.kind(),
+            format!(
+                "cannot publish host UDP {}:{} to guest UDP {}: {err}",
+                publish_bind::listen_display(mapping.listen),
+                mapping.host,
+                mapping.guest,
+            ),
+        )
+    })
 }
 
 /// Start the publisher thread over the UDP sockets `ports` bound. Returns
@@ -129,13 +147,15 @@ pub fn start_udp_publisher(
         return Ok(None);
     }
     let mut published = Vec::new();
-    for (mapping, socket, socket_v6) in ports.udp.drain(..) {
-        for socket in std::iter::once(socket).chain(socket_v6) {
+    for (mapping, sockets) in ports.udp.drain(..) {
+        let loopback_only = sockets.loopback_only;
+        for socket in sockets.into_sockets() {
             socket.set_nonblocking(true)?;
             published.push(PublishedSocket {
                 socket,
                 host_port: mapping.host,
                 guest_port: mapping.guest,
+                loopback_only,
             });
         }
     }
@@ -227,6 +247,9 @@ fn run_publisher(
             loop {
                 match entry.socket.recv_from(&mut recv_buf) {
                     Ok((len, client)) => {
+                        if !publish_bind::peer_allowed(entry.loopback_only, &client) {
+                            continue;
+                        }
                         let datagram = InboundUdpDatagram {
                             host_port: entry.host_port,
                             guest_port: entry.guest_port,
@@ -324,7 +347,7 @@ impl PublishedUdpTable {
         while let Ok(datagram) = from_host.try_recv() {
             if datagram.payload.len() > MAX_GUEST_PAYLOAD {
                 virtio_net_log!(
-                    "virtio-net: dropping {}-byte published UDP datagram from {} (over the {MAX_GUEST_PAYLOAD}-byte unfragmented limit)",
+                    "virtio-net: dropping {}-byte published UDP datagram from {} (over the {MAX_GUEST_PAYLOAD}-byte IPv4 UDP limit)",
                     datagram.payload.len(),
                     datagram.client
                 );

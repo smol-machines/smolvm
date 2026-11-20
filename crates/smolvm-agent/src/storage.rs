@@ -366,9 +366,14 @@ pub fn volume_bind_source(tag: &str) -> PathBuf {
 /// Add each prepared mount to a container spec as a bind of its
 /// [`volume_bind_source`]. crun applies the spec's mounts in order, so a mount
 /// goes ahead of those nested below it (see [`mounts_parents_first`]).
+///
+/// A host directory is bound through [`crate::mount_owner::bind_source`], so a
+/// container whose workload is not root sees it owned by the workload's user,
+/// also when the container's own process is the keep-alive init (root).
 pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, bool)]) {
+    let (uid, gid) = spec.workload_user();
     for (tag, container_path, read_only) in mounts_parents_first(mounts) {
-        let source = volume_bind_source(tag);
+        let source = crate::mount_owner::bind_source(&volume_bind_source(tag), uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), container_path, *read_only);
     }
     // Directories attached while the machine runs reach every container,
@@ -378,8 +383,24 @@ pub fn add_volume_bind_mounts(spec: &mut OciSpec, mounts: &[(String, String, boo
         .map(|(_, target, _)| target.as_str())
         .collect();
     for (source, target, read_only) in crate::attach::container_binds(&targets) {
+        let source = crate::mount_owner::bind_source(&source, uid, gid);
         spec.add_bind_mount(&source.to_string_lossy(), &target, read_only);
     }
+}
+
+/// Mount the boot virtiofs share `tag` at its staging path (once) and return
+/// that path, for callers that bind a file or subdirectory of it themselves.
+#[cfg(target_os = "linux")]
+pub fn mount_share(tag: &str) -> Result<PathBuf> {
+    validate_storage_id(tag, "mount tag")?;
+    let mount_point = Path::new(paths::VIRTIOFS_MOUNT_ROOT).join(tag);
+    std::fs::create_dir_all(&mount_point)?;
+    if !is_mountpoint(&mount_point) {
+        mount_virtiofs(tag, &mount_point).map_err(|e| {
+            StorageError::new(format!("failed to mount virtiofs share '{tag}': {e}"))
+        })?;
+    }
+    Ok(mount_point)
 }
 
 /// Mount a virtiofs device with one policy for every host-backed filesystem:
@@ -1052,6 +1073,9 @@ pub fn repair_boot_volume_mounts() -> Result<()> {
         if is_mountpoint(&staging) {
             detach_mount(&staging);
         }
+        // Clones of the stale mount are as dead as it is; the next container
+        // gets one of the fresh mount.
+        crate::mount_owner::forget(&staging);
         setup_volume_mounts("/", std::slice::from_ref(mount))?;
         if !is_mountpoint(Path::new(target)) {
             return Err(StorageError::new(format!(
@@ -1569,20 +1593,42 @@ pub(crate) fn archive_scratch_dir() -> PathBuf {
 /// last, so the image-info and overlay paths share one flatten within a start.
 fn ensure_archive_flattened_with_progress<F>(
     packed_dir: &Path,
-    mut progress: F,
+    progress: F,
 ) -> Result<Option<PathBuf>>
 where
     F: FnMut(&str, u64),
 {
-    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
-    if !archive.exists() {
-        return Ok(None);
-    }
     let key = packed_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("archive");
     let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
+    ensure_archive_flattened_at(
+        packed_dir,
+        out_base,
+        progress,
+        flatten_archive_with_progress,
+    )
+}
+
+mod archive_lock;
+
+fn ensure_archive_flattened_at<F, G>(
+    packed_dir: &Path,
+    out_base: PathBuf,
+    mut progress: F,
+    flatten: G,
+) -> Result<Option<PathBuf>>
+where
+    F: FnMut(&str, u64),
+    G: FnOnce(&Path, &Path, &mut F) -> Result<Option<Vec<u8>>>,
+{
+    let preparation = archive_lock::for_image(&out_base);
+    let _preparing = preparation.lock();
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    if !archive.exists() {
+        return Ok(None);
+    }
     let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
     let signature = archive_signature(&archive)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
@@ -1595,7 +1641,7 @@ where
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
     progress("flattening local image archive", 0);
-    let oci_config = flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+    let oci_config = flatten(&archive, &rootfs, &mut progress)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
@@ -4477,6 +4523,10 @@ impl OverlaySetup {
     /// remounts it preserving the upper layer (which contains previous changes).
     /// If the overlay does not exist at all, creates it fresh.
     fn execute_or_remount(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
+        // Requests run on their own threads, and two remounts of one overlay
+        // clear the work directory under each other's mount.
+        static PREPARE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _prepare = PREPARE.lock().unwrap_or_else(|e| e.into_inner());
         let mut restored_fork = false;
         // Already mounted — reuse it only if it actually answers lookups.
         if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
@@ -4720,6 +4770,10 @@ fn open_overlay_etc_file(
 }
 
 fn overlay_resolv_conf_contents() -> String {
+    // A machine branched from a base moved to its own network's resolver.
+    if let Some((dns_server, options)) = crate::network::moved_resolver() {
+        return smolvm_protocol::resolv::render(&[dns_server], &options);
+    }
     // Resolver options (`--dns-option`) ride on every file.
     let options = crate::resolv_options();
 
@@ -5155,12 +5209,31 @@ pub fn run_command(
         let identity = crate::oci::resolve_process_identity(Path::new(&prepared.rootfs_path), user)
             .map_err(StorageError::new)?;
 
+        // The keep-alive is PID 1 and runs as root like the main keep-alive
+        // (`crate::KEEPALIVE_USER`); the command itself runs as `identity`.
+        let keepalive_identity = crate::oci::resolve_process_identity(
+            Path::new(&prepared.rootfs_path),
+            Some(crate::KEEPALIVE_USER),
+        )
+        .map_err(StorageError::new)?;
+
         // Build an OCI spec for `cmd` sharing this overlay's rootfs, virtiofs
         // mounts, workspace/storage fallbacks, and the same injections. Used for
         // both the one-shot exec spec and the keep-alive spec so a container the
-        // execs join has the identical mount view as the exec itself.
-        let build_spec = |cmd: &[String], spec_env: &[(String, String)]| {
-            let mut spec = OciSpec::new(cmd, spec_env, workdir_str, false, &identity, unprivileged);
+        // execs join has the identical mount view as the exec itself. The spec
+        // runs as `process_identity` and records `identity` as the workload's.
+        let build_spec = |cmd: &[String],
+                          spec_env: &[(String, String)],
+                          process_identity: &crate::oci::ProcessIdentity| {
+            let mut spec = OciSpec::new(
+                cmd,
+                spec_env,
+                workdir_str,
+                false,
+                process_identity,
+                unprivileged,
+            );
+            spec.set_workload_user(&identity);
             spec.add_vm_devices_if_available();
             add_volume_bind_mounts(&mut spec, mounts);
             add_workspace_fallback(&mut spec, mounts);
@@ -5181,8 +5254,17 @@ pub fn run_command(
 
         // If a main workload container is running for this overlay, join it
         // via crun exec instead of creating a fresh isolated container.
+        // The command joins a keep-alive whose own user is root, so it names
+        // its user, and gets that user's environment (HOME and the rest),
+        // explicitly.
+        let exec_launch = crate::ResolvedLaunch {
+            command: command.to_vec(),
+            env: crate::oci::process_env_for(&identity, env),
+            workdir: workdir.map(str::to_string),
+            user: Some(crate::oci::user_spec_of(&identity)),
+        };
         if let Some(cid) = crate::resolve_main_container(persistent_overlay_id) {
-            let result = run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+            let result = run_exec_in_container(&cid, &exec_launch, timeout_ms, client_fd);
             let _ = mounted_paths;
             return result;
         }
@@ -5201,13 +5283,12 @@ pub fn run_command(
                 "/dev/null".to_string(),
             ];
             match establish_keepalive_container(
-                &build_spec(&keepalive, env),
+                &build_spec(&keepalive, env, &keepalive_identity),
                 &bundle_path,
                 overlay_id,
             ) {
                 Ok(cid) => {
-                    let result =
-                        run_exec_in_container(&cid, command, env, workdir, timeout_ms, client_fd);
+                    let result = run_exec_in_container(&cid, &exec_launch, timeout_ms, client_fd);
                     let _ = mounted_paths;
                     return result;
                 }
@@ -5218,7 +5299,7 @@ pub fn run_command(
         }
 
         // Ephemeral overlay (or keep-alive setup failed): one-shot fresh container.
-        let spec = build_spec(command, env);
+        let spec = build_spec(command, env, &identity);
         spec.write_to(&bundle_path)
             .map_err(|e| StorageError::new(format!("failed to write OCI spec: {}", e)))?;
         let container_id = generate_container_id();
@@ -5341,9 +5422,36 @@ pub fn prepare_for_run_persistent(image: &str, overlay_id: &str) -> Result<Prepa
     prepare_for_run_persistent_with_progress(image, overlay_id, |_, _| {})
 }
 
+/// Where a persistent overlay's image layers come from.
+#[derive(Debug, Clone, Copy)]
+pub enum LayerSource<'a> {
+    /// The machine's own image: its packed layers when it has them,
+    /// otherwise the image store.
+    Machine,
+    /// The image store, by reference, even on a machine with packed layers.
+    Store,
+    /// A packed-layers directory (or staged local archive) other than the
+    /// machine's own.
+    Packed(&'a Path),
+}
+
 pub fn prepare_for_run_persistent_with_progress<F>(
     image: &str,
     overlay_id: &str,
+    progress: F,
+) -> Result<PreparedOverlayRootfs>
+where
+    F: FnMut(&str, u64),
+{
+    prepare_for_run_persistent_from(image, overlay_id, LayerSource::Machine, progress)
+}
+
+/// [`prepare_for_run_persistent_with_progress`] with the image's layers
+/// taken from `source`.
+pub fn prepare_for_run_persistent_from<F>(
+    image: &str,
+    overlay_id: &str,
+    source: LayerSource<'_>,
     mut progress: F,
 ) -> Result<PreparedOverlayRootfs>
 where
@@ -5352,11 +5460,29 @@ where
     validate_storage_id(overlay_id, "persistent overlay id")?;
     let workload_id = format!("persistent-{}", overlay_id);
 
+    // An overlay already mounted and answering this boot is reused as it
+    // stands; its layers were resolved when it was mounted. A container
+    // started in a machine booted for another image (its exec sessions name
+    // an image this machine's store does not hold) depends on that.
+    let setup = OverlaySetup::new(&workload_id)?;
+    if is_mountpoint(&setup.merged_path) && mounted_overlay_is_healthy(&setup.merged_path) {
+        let overlay = setup.execute_or_remount(Vec::new())?;
+        return Ok(PreparedOverlayRootfs {
+            workload_id,
+            rootfs_path: overlay.rootfs_path,
+        });
+    }
+
     // Resolve image layers (same logic as prepare_overlay). A local image
     // archive is flattened into a rootfs first; a packed-layers dir is used
     // as-is. A packed machine has exactly one image, so only an image-store
     // overlay records and checks which image it was built from.
-    let (lowerdirs, image_store) = if let Some(packed_dir) = get_packed_layers_dir() {
+    let packed = match source {
+        LayerSource::Machine => get_packed_layers_dir().map(PathBuf::as_path),
+        LayerSource::Store => None,
+        LayerSource::Packed(dir) => Some(dir),
+    };
+    let (lowerdirs, image_store) = if let Some(packed_dir) = packed {
         let effective = effective_packed_dir_with_progress(packed_dir, &mut progress)?;
         (get_packed_lowerdirs(&effective)?, false)
     } else {
@@ -5750,25 +5876,37 @@ fn establish_keepalive_container(
     Ok(container_id)
 }
 
-/// Join a running container via `crun exec` (non-interactive).
+/// Join a running container via `crun exec` (non-interactive) as
+/// `launch.user` (a resolved `uid:gid`) with that user's supplementary groups,
+/// the same exec the keep-alive paths in `main` run.
 fn run_exec_in_container(
     container_id: &str,
-    command: &[String],
-    env: &[(String, String)],
-    workdir: Option<&str>,
+    launch: &crate::ResolvedLaunch,
     timeout_ms: Option<u64>,
     client_fd: Option<std::os::unix::io::RawFd>,
 ) -> Result<RunResult> {
-    info!(container_id = %container_id, command = ?command, "joining container via crun exec");
+    info!(container_id = %container_id, command = ?launch.command, "joining container via crun exec");
 
     let exec_pid_file = crate::crun::ExecPidFile::new()
         .map_err(|e| StorageError::new(format!("create crun exec pid file failed: {}", e)))?;
-    let mut child = CrunCommand::exec(container_id, env, command, workdir, false)
-        .pid_file(exec_pid_file.path())
-        .stdin_null()
-        .capture_output()
-        .spawn()
-        .map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
+    #[cfg(target_os = "linux")]
+    let spawned = crate::spawn_crun_foreground_exec(container_id, launch, &exec_pid_file, None)
+        .map_err(|e| e.to_string());
+    #[cfg(not(target_os = "linux"))]
+    let spawned = CrunCommand::exec(
+        container_id,
+        &launch.env,
+        &launch.command,
+        launch.workdir.as_deref(),
+        false,
+    )
+    .user(launch.user.as_deref())
+    .pid_file(exec_pid_file.path())
+    .stdin_null()
+    .capture_output()
+    .spawn()
+    .map_err(|e| e.to_string());
+    let mut child = spawned.map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
 
     // On timeout/disconnect, kill only the exec'd process — NOT the main
     // container. The main container hosts the shared namespace for all execs;
@@ -6461,7 +6599,64 @@ fn base64_encode(input: &str) -> String {
 /// identity token, which crane takes as `identitytoken`.
 ///
 /// The returned TempDir must be kept alive for the duration of the command.
-fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfile::TempDir> {
+/// The Docker config directory for one registry pull. With a credential it is
+/// a tmpfs of its own: a file written to the storage disk and unlinked after
+/// the pull leaves the login in a freed block, which root in the guest can
+/// read from the disk and an image seed copies to every later machine.
+struct DockerAuthDir {
+    dir: tempfile::TempDir,
+    mounted: bool,
+}
+
+impl DockerAuthDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for DockerAuthDir {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.mounted {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(target) = std::ffi::CString::new(self.dir.path().as_os_str().as_bytes()) {
+                // SAFETY: target is a valid NUL-terminated path.
+                unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+    }
+}
+
+/// Mount a small private tmpfs on `dir`, so what is written there stays in
+/// memory.
+#[cfg(target_os = "linux")]
+fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: every pointer is a valid NUL-terminated string.
+    let rc = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            c"size=64k,mode=0700".as_ptr().cast(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The agent only runs in a Linux guest; elsewhere it is built for tests.
+#[cfg(not(target_os = "linux"))]
+fn mount_private_tmpfs(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<DockerAuthDir> {
     // The guest root filesystem (and thus the default temp dir, /tmp) is
     // read-only, so create the auth config under the writable storage disk.
     let temp_dir = tempfile::Builder::new()
@@ -6470,9 +6665,20 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfil
         .map_err(|e| {
             StorageError::new(format!("failed to create temp directory for auth: {}", e))
         })?;
+    let mut auth_dir = DockerAuthDir {
+        dir: temp_dir,
+        mounted: false,
+    };
 
     let config_json = match auth {
         Some(a) => {
+            mount_private_tmpfs(auth_dir.path()).map_err(|e| {
+                StorageError::new(format!(
+                    "failed to mount tmpfs for registry credentials: {}",
+                    e
+                ))
+            })?;
+            auth_dir.mounted = true;
             let registry = extract_registry_from_image(image);
             let entry = if a.username == DOCKER_IDENTITY_TOKEN_USERNAME {
                 serde_json::json!({ "identitytoken": a.password })
@@ -6489,11 +6695,11 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfil
         None => "{}".to_string(),
     };
 
-    let config_path = temp_dir.path().join("config.json");
+    let config_path = auth_dir.path().join("config.json");
     std::fs::write(&config_path, &config_json)
         .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
 
-    Ok(temp_dir)
+    Ok(auth_dir)
 }
 
 /// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
@@ -7674,7 +7880,10 @@ mod tests {
         // `..` and absolute paths escape the layer dir — rejected.
         assert!(jailed_join(base, Path::new("../etc/passwd")).is_none());
         assert!(jailed_join(base, Path::new("tmp/../../etc")).is_none());
-        assert!(jailed_join(base, Path::new("/etc/passwd")).is_none());
+        assert_eq!(
+            jailed_join(base, Path::new("/etc/passwd")),
+            Some(base.join("etc/passwd"))
+        );
     }
 
     /// End-to-end extraction with whiteout conversion. mknod/setxattr(trusted.*)
@@ -8715,5 +8924,61 @@ mod tests {
         assert!(!names.iter().any(|name| name == "deleted"));
 
         let _ = std::process::Command::new("umount").arg(&merged).status();
+    }
+
+    /// Two requests for a persistent overlay that is not mounted, as after a
+    /// restart, must both get it mounted once. Needs root + Linux overlayfs, so
+    /// it's `#[ignore]`d; run on a Linux host with:
+    ///   cargo test -p smolvm-agent -- --ignored concurrent_remounts_mount_the_overlay_once
+    #[test]
+    #[ignore = "requires root + Linux overlayfs"]
+    #[cfg(target_os = "linux")]
+    fn concurrent_remounts_mount_the_overlay_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::write(layer.join("file"), b"x").unwrap();
+        let lowerdirs = vec![layer.to_string_lossy().into_owned()];
+        let root = tmp.path().join("overlay");
+        let merged = root.join("merged");
+        let setup = || OverlaySetup {
+            workload_id: "persistent-race".to_string(),
+            overlay_root: root.clone(),
+            upper_path: root.join("upper"),
+            work_path: root.join("work"),
+            merged_path: merged.clone(),
+        };
+        setup().execute_or_remount(lowerdirs.clone()).unwrap();
+
+        for round in 0..20 {
+            assert!(Command::new("umount")
+                .arg(&merged)
+                .status()
+                .unwrap()
+                .success());
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let remounts: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            setup().execute_or_remount(lowerdirs.clone())
+                        })
+                    })
+                    .collect();
+                for remount in remounts {
+                    if let Err(e) = remount.join().unwrap() {
+                        panic!("round {round}: {e}");
+                    }
+                }
+            });
+            let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+            let mounts = mountinfo
+                .lines()
+                .filter(|line| line.split_whitespace().nth(4) == merged.to_str())
+                .count();
+            assert_eq!(mounts, 1, "round {round}");
+        }
+        let _ = Command::new("umount").arg(&merged).status();
     }
 }

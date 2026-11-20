@@ -59,8 +59,8 @@ Treat these as attacker-controlled:
 
 Trusted (in the TCB): the invoking host user, the host OS, the hypervisor, libkrun and
 libkrunfw (the `libkrun/` and `libkrunfw/` submodules and the prebuilt libraries under
-`lib/`), and the Smolfile and command line the user wrote. `smolvm-sdk/` is a separate
-repository and out of scope here.
+`lib/`), and the Smolfile and command line the user wrote. The SDKs live in the separate
+`smol-machines/smol` repository and are out of scope here.
 
 ## Components that matter most / least
 
@@ -157,7 +157,7 @@ upstream unless it is in one of our `patches/`.
 ## Anything to leave alone
 
 - Do not report the libkrun stub used in CI, the prebuilt binaries under `lib/`, or the
-  contents of the `libkrun/`, `libkrunfw/` and `smolvm-sdk/` submodules.
+  contents of the `libkrun/` and `libkrunfw/` submodules.
 - Do not report `unsafe` FFI into libkrun in `src/agent/krun.rs` and `launcher*.rs` unless
   guest-controlled data reaches it.
 - Do not report that the HTTP API is unauthenticated, that `--volume` exposes the host

@@ -198,6 +198,12 @@ impl Watchlist {
         if self.ip.is_empty() {
             return None;
         }
+        // An IPv4-mapped IPv6 address reaches the same host as its IPv4 form,
+        // so it must hash as that form or a listed host is reached by spelling.
+        let ip = match ip {
+            IpAddr::V6(v6) => v6.to_ipv4_mapped().map_or(ip, IpAddr::V4),
+            IpAddr::V4(_) => ip,
+        };
         self.ip.get(&digest(&ip.to_string()))
     }
 }
@@ -348,6 +354,11 @@ mod tests {
             Some("w3")
         );
         assert_eq!(list.match_ip("192.0.2.8".parse().unwrap()), None);
+        // The IPv4-mapped spelling is the same host.
+        assert_eq!(
+            list.match_ip("::ffff:192.0.2.7".parse().unwrap()),
+            Some("w2")
+        );
     }
 
     #[test]

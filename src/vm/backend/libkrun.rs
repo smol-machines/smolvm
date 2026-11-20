@@ -115,7 +115,6 @@ impl LibkrunVm {
             let krun_set_workdir = krun.set_workdir;
             let krun_set_exec = krun.set_exec;
             let krun_add_virtiofs = krun.add_virtiofs;
-            let krun_add_virtiofs3 = krun.add_virtiofs3;
             let krun_set_port_map = krun.set_port_map;
             let krun_add_disk2 = krun.add_disk2;
             let krun_add_vsock = krun.add_vsock;
@@ -143,32 +142,24 @@ impl LibkrunVm {
                 return Err(Error::vm_creation("live resize configuration failed"));
             }
 
-            // Set root filesystem via the root virtiofs tag (upstream removed
-            // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
-            let root = path_to_cstring(rootfs_path)?;
-            let root_tag = CString::new("/dev/root").expect("static tag");
-            tracing::debug!("[libkrun] rootfs_path: {:?}", rootfs_path);
-            // 512 MB root DAX window (matches the removed krun_set_root); plain
-            // krun_add_virtiofs uses shm_size=0 (no DAX) → writeback caching that
-            // delays host visibility of guest writes (e.g. the agent ready marker).
-            let Some(krun_add_virtiofs3) = krun_add_virtiofs3 else {
+            let root = match path_to_cstring(rootfs_path) {
+                Ok(root) => root,
+                Err(error) => {
+                    krun_free_ctx(ctx);
+                    return Err(error);
+                }
+            };
+            if let Err(error) = crate::agent::virtiofs::configure_rootfs(&krun, ctx, &root, false) {
+                krun_free_ctx(ctx);
+                return Err(error);
+            }
+
+            let Some(krun_add_virtiofs3) = krun.add_virtiofs3 else {
                 krun_free_ctx(ctx);
                 return Err(Error::vm_creation(
-                    "root DAX requires libkrun with krun_add_virtiofs3",
+                    "mounts require libkrun with krun_add_virtiofs3",
                 ));
             };
-            let ret = krun_add_virtiofs3(
-                ctx,
-                root_tag.as_ptr(),
-                root.as_ptr(),
-                crate::agent::virtiofs::rootfs_dax_window(),
-                false,
-            );
-            tracing::debug!("[libkrun] krun_add_virtiofs3(root) returned: {}", ret);
-            if ret < 0 {
-                krun_free_ctx(ctx);
-                return Err(Error::vm_creation("failed to set root filesystem"));
-            }
 
             // Upstream libkrun no longer creates an implicit vsock; both
             // krun_set_port_map and krun_add_vsock_port2 require a vsock device
@@ -418,19 +409,10 @@ impl LibkrunVm {
     }
 }
 
-/// Raise file descriptor limits (required by libkrun).
+/// Raise the open-file limit: the VMM holds one host socket per guest
+/// connection, so this caps how many a guest can have open at once.
 fn set_rlimits() {
-    unsafe {
-        let mut limit = libc::rlimit {
-            rlim_cur: 0,
-            rlim_max: 0,
-        };
-
-        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) == 0 {
-            limit.rlim_cur = limit.rlim_max;
-            libc::setrlimit(libc::RLIMIT_NOFILE, &limit);
-        }
-    }
+    let _ = crate::process::raise_nofile_limit();
 }
 
 impl VmHandle for LibkrunVm {
@@ -521,9 +503,9 @@ fn inject_init_krun(rootfs: &Path) -> Result<()> {
     // Look for init.krun in standard locations
     let sources = [
         // User's local smolvm data directory (macOS: ~/Library/Application Support)
-        dirs::data_local_dir().map(|d| d.join("smolvm/init.krun")),
+        smolvm_paths::data_local_dir().map(|d| d.join("smolvm/init.krun")),
         // XDG data home (Linux: ~/.local/share, works on macOS too)
-        dirs::home_dir().map(|d| d.join(".local/share/smolvm/init.krun")),
+        smolvm_paths::home_dir().map(|d| d.join(".local/share/smolvm/init.krun")),
         // System-wide location
         Some(PathBuf::from("/usr/local/share/smolvm/init.krun")),
         // Homebrew location

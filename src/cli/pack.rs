@@ -79,6 +79,25 @@ impl PackCmd {
     }
 }
 
+/// Read the requirements of a portable source without interrupting it.
+#[derive(Args, Debug)]
+pub struct CheckpointRequirementsCmd {
+    /// Running machine whose transfer requirements should be inspected.
+    #[arg(long, value_name = "NAME")]
+    pub name: String,
+}
+
+impl CheckpointRequirementsCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let requirements = smolvm::portable_checkpoint::capture_requirements(&self.name)?;
+        println!(
+            "{}",
+            serde_json::to_string(&requirements).map_err(std::io::Error::other)?
+        );
+        Ok(())
+    }
+}
+
 /// Persist one running machine, including RAM and execution state, as a
 /// portable `.checkpoint` file.
 #[derive(Args, Debug)]
@@ -121,9 +140,9 @@ pub struct CheckpointCmd {
     /// Directory under which large temporary checkpoint assets are staged.
     #[arg(long = "staging-dir", value_name = "DIR", conflicts_with = "store")]
     pub staging_dir: Option<PathBuf>,
-    /// Keep the machine's host directory mounts in the checkpoint. It then
-    /// restores only on a host where the same paths exist; each is attached
-    /// again at its guest path.
+    /// Keep host directory mounts in the checkpoint (their contents are not
+    /// included). Restore at the same host paths, or transfer the contents and
+    /// use `machine create --from CHECKPOINT -v NEW_HOST:GUEST[:ro|:rw]`.
     #[arg(long = "host-mounts")]
     pub host_mounts: bool,
 
@@ -673,7 +692,7 @@ impl PackCreateCmd {
             .staging_dir
             .clone()
             .or_else(|| std::env::var_os("SMOLVM_PACK_STAGING").map(PathBuf::from))
-            .or_else(|| dirs::cache_dir().map(|c| c.join("smolvm")))
+            .or_else(|| smolvm_paths::cache_dir().map(|c| c.join("smolvm")))
             .unwrap_or_else(std::env::temp_dir);
         std::fs::create_dir_all(&root)
             .map_err(|e| Error::agent("create staging root", e.to_string()))?;
@@ -851,6 +870,7 @@ impl PackCreateCmd {
                 shm_size: None,
                 network_name: None,
                 guest_subnet: None,
+                switch: None,
                 gpu: false,
                 nested_virt: false,
                 cuda: false,
@@ -1024,6 +1044,10 @@ impl PackCreateCmd {
         manifest.cpus = pack_config.cpus;
         manifest.mem = pack_config.mem;
         manifest.network = pack_config.net.unwrap_or(false);
+        manifest.block_private = pack_config.block_private;
+        manifest.allowed_cidrs = pack_config.allowed_cidrs;
+        manifest.dns_filter_hosts = pack_config.dns_filter_hosts;
+        manifest.egress_rules = pack_config.egress_rules;
         manifest.gpu = pack_config.gpu;
 
         // Start with OCI image config as baseline
@@ -1181,7 +1205,23 @@ impl PackCreateCmd {
         // Smolfile > source VM record > default
         if let Some(net) = pack_config.net {
             manifest.network = net;
+            if !net {
+                manifest.block_private = None;
+                manifest.allowed_cidrs = None;
+                manifest.dns_filter_hosts = None;
+                manifest.egress_rules.clear();
+            }
         }
+        let policy = smolvm::pack_export::validated_manifest_egress(&manifest)?.with_cli_overrides(
+            pack_config.allowed_cidrs,
+            pack_config.dns_filter_hosts,
+            pack_config.block_private,
+            pack_config.egress_rules,
+        );
+        manifest.allowed_cidrs = policy.allowed_cidrs;
+        manifest.dns_filter_hosts = policy.dns_filter_hosts;
+        manifest.block_private = policy.block_private;
+        manifest.egress_rules = policy.egress_rules;
         // CLI --gpu > Smolfile gpu > source VM record gpu > false
         manifest.gpu = pack_config.gpu || manifest.gpu;
 
@@ -1479,7 +1519,7 @@ impl PackCreateCmd {
             // The running executable itself
             std::env::current_exe().ok(),
             // User data dir
-            dirs::data_dir().map(|d| d.join("smolvm/smolvm-bin")),
+            smolvm_paths::data_dir().map(|d| d.join("smolvm/smolvm-bin")),
         ];
 
         for candidate in candidates.into_iter().flatten() {
@@ -1617,6 +1657,8 @@ impl PackCreateCmd {
 ///   smolvm pack prune --keep 2     # keep 2 most recent
 ///   smolvm pack prune --all        # remove everything
 ///   smolvm pack prune --dry-run    # show what would be removed
+///   smolvm pack prune --artifact deadbeef          # remove one pack's extraction
+///   smolvm pack prune --artifact ./app.smolmachine # same, named by its file
 #[derive(Args, Debug)]
 pub struct PackPruneCmd {
     /// Number of unused cached entries to keep (default: 5)
@@ -1630,10 +1672,47 @@ pub struct PackPruneCmd {
     /// Show what would be removed without actually removing
     #[arg(long)]
     pub dry_run: bool,
+
+    /// Remove only this pack's shared extraction and COW bases (Linux), named
+    /// by its 8-digit checksum (its directory under _shared/) or its
+    /// .smolmachine file. Skipped if a machine still references it.
+    #[arg(long, value_name = "SHA8|PATH", conflicts_with_all = ["keep", "all"])]
+    pub artifact: Option<String>,
+}
+
+/// The cache key of an `--artifact` value: the 8-digit checksum itself, or the
+/// footer checksum of the `.smolmachine` file it names.
+fn artifact_checksum(artifact: &str) -> smolvm::Result<String> {
+    let is_checksum = artifact.len() == 8
+        && artifact
+            .bytes()
+            .all(|byte| matches!(byte, b'0'..=b'9' | b'a'..=b'f'));
+    if is_checksum {
+        return Ok(artifact.to_string());
+    }
+    let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact).map_err(|e| {
+        Error::config(
+            format!("read --artifact '{artifact}' as a .smolmachine file"),
+            e.to_string(),
+        )
+    })?;
+    Ok(format!("{:08x}", footer.checksum))
 }
 
 impl PackPruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
+        #[cfg(not(target_os = "linux"))]
+        if self.artifact.is_some() {
+            return Err(Error::config(
+                "pack prune --artifact",
+                "shared pack extractions only exist on Linux",
+            ));
+        }
+        let only = self
+            .artifact
+            .as_deref()
+            .map(artifact_checksum)
+            .transpose()?;
         let keep = if self.all { 0 } else { self.keep };
 
         let mut total_freed: u64 = 0;
@@ -1644,10 +1723,15 @@ impl PackPruneCmd {
         // without first deleting unrelated generic pack caches.
         #[cfg(target_os = "linux")]
         {
-            let report = smolvm::artifact_cache::prune_artifact_caches(keep, self.dry_run)
-                .map_err(|error| {
-                    smolvm::Error::agent("prune shared artifact caches", error.to_string())
-                })?;
+            let report = match &only {
+                Some(checksum) => {
+                    smolvm::artifact_cache::prune_artifact_cache(checksum, self.dry_run)
+                }
+                None => smolvm::artifact_cache::prune_artifact_caches(keep, self.dry_run),
+            }
+            .map_err(|error| {
+                smolvm::Error::agent("prune shared artifact caches", error.to_string())
+            })?;
             if report.referenced_entries > 0 {
                 let noun = if report.referenced_entries == 1 {
                     "entry"
@@ -1686,8 +1770,9 @@ impl PackPruneCmd {
             }
         }
 
-        // Clean pack sidecar cache
-        if let Some(base) = dirs::cache_dir() {
+        // Clean pack sidecar cache. --artifact stops at the shared extraction: a
+        // pack's entry here also holds its daemon's disks, and packs share libs.
+        if let Some(base) = smolvm_paths::cache_dir().filter(|_| only.is_none()) {
             let pack_cache = base.join("smolvm-pack");
             let (freed, removed) = self.prune_cache_dir(&pack_cache, keep, "pack cache")?;
             total_freed += freed;
@@ -1732,7 +1817,7 @@ impl PackPruneCmd {
         }
 
         // Collect entries with modification time (skip entries we can't stat)
-        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime, u64)> = vec![];
+        let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = vec![];
         let read_dir = match std::fs::read_dir(base) {
             Ok(rd) => rd,
             Err(e) => {
@@ -1759,8 +1844,7 @@ impl PackPruneCmd {
             let modified = metadata
                 .modified()
                 .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            let size = dir_size(&path);
-            entries.push((path, modified, size));
+            entries.push((path, modified));
         }
 
         // Sort by most recently modified (newest first)
@@ -1776,18 +1860,19 @@ impl PackPruneCmd {
         let mut freed: u64 = 0;
         let mut removed: usize = 0;
 
-        for (path, _, size) in to_remove {
+        for (path, _) in to_remove {
             // Skip caches that have active leases (running VMs or daemons).
             if smolvm_pack::extract::has_active_leases(path) {
                 println!("  skipping in-use cache: {} (active lease)", path.display());
                 continue;
             }
 
+            let size = dir_size(path);
             if self.dry_run {
                 println!(
                     "  would remove: {} ({})",
                     path.display(),
-                    crate::cli::format_bytes(*size)
+                    crate::cli::format_bytes(size)
                 );
             } else {
                 // Detach any mounted case-sensitive volume before removing.
@@ -2375,6 +2460,41 @@ mod tests {
         assert_eq!(format_age(3 * 86_400), "3 days ago");
     }
 
+    #[test]
+    fn prune_artifact_takes_a_checksum_or_a_smolmachine_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("app.smolmachine");
+        let footer = smolvm_pack::format::PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 0,
+            manifest_offset: 0,
+            manifest_size: 0,
+            checksum: 0x0ead_beef,
+        };
+        std::fs::write(&sidecar, footer.to_bytes()).unwrap();
+
+        assert_eq!(artifact_checksum("cafebabe").unwrap(), "cafebabe");
+        assert_eq!(
+            artifact_checksum(sidecar.to_str().unwrap()).unwrap(),
+            "0eadbeef"
+        );
+        for rejected in ["cafe", "cafebabe0", "CAFEBABE", "../cafebabe"] {
+            assert!(artifact_checksum(rejected).is_err(), "{rejected}");
+        }
+    }
+
+    #[test]
+    fn prune_artifact_excludes_keep_and_all() {
+        use clap::Args as _;
+        let parse = |args: &[&str]| {
+            PackPruneCmd::augment_args(clap::Command::new("prune")).try_get_matches_from(args)
+        };
+        assert!(parse(&["prune", "--artifact", "cafebabe", "--dry-run"]).is_ok());
+        assert!(parse(&["prune", "--artifact", "cafebabe", "--all"]).is_err());
+        assert!(parse(&["prune", "--artifact", "cafebabe", "--keep", "1"]).is_err());
+    }
+
     /// Verify that dladdr-based libkrun discovery finds the loaded library.
     ///
     /// This test works because the test binary links against libkrun the same
@@ -2573,6 +2693,9 @@ mod staging_tests {
     // removes it, but never one a running pack still holds, nor anything else.
     #[test]
     fn only_abandoned_staging_directories_are_swept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let root = tempfile::tempdir().unwrap();
         let held = create_staging(root.path()).unwrap();
         let abandoned = root.path().join("pack-staging-abandoned");

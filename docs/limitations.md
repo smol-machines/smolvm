@@ -13,18 +13,36 @@ such as Vite, nodemon, and file-watch test runners reload without polling. Set
 `SMOL_NO_HOT_RELOAD=1` in the host process to disable recursive watching for a
 machine with an unusually large directory tree.
 
-For sequential or mmap-heavy reads, `SMOLVM_MOUNT_DAX=1` enables a 2 GiB
-virtiofs DAX window for each user mount when the machine starts. This is a host
-process setting (set it on `smolvm serve` for served machines), and an existing
-machine needs a stop/start to apply it. DAX does not materially accelerate
-metadata-heavy traversal. Confirm it in the guest with
+On x86_64 hosts, `SMOLVM_MOUNT_DAX=1` enables a 2 GiB virtiofs DAX window for
+each user mount when the machine starts, which helps sequential or mmap-heavy
+reads. This is a host process setting (set it on `smolvm serve` for served
+machines), and an existing machine needs a stop/start to apply it. DAX does not
+materially accelerate metadata-heavy traversal. Confirm it in the guest with
 `grep virtiofs /proc/mounts`; an active mount includes `dax=always`.
 
-* Virtio-net accepts up to 512 simultaneous TCP relay connections per machine by
-  default. For higher-concurrency workloads, set `SMOLVM_TCP_RELAY_CAPACITY` on
-  the host process (1–4096); this bounds the number of host relay threads and
-  their buffers. Invalid values use the default. TSI networking does not use
-  this relay table.
+On arm64 hosts, including every Apple silicon Mac, virtiofs DAX is off and
+`SMOLVM_MOUNT_DAX` has no effect: Linux's filesystem DAX is not correct on
+architectures with virtually indexed caches, so the bundled arm64 guest kernel is
+built without FUSE DAX, and the engine reserves no DAX window there
+(`src/agent/virtiofs.rs`). Host mounts on these hosts always go through the
+buffered virtiofs path.
+
+* Each guest TCP connection or UDP flow holds one socket in the machine's host
+  process, on both network backends, so the host's per-process open-file limit
+  caps how many a guest can have open at once. smolvm raises the soft limit to
+  the hard limit when a machine starts (on Linux usually 524288; set
+  `LimitNOFILE` for a service). macOS caps one process at
+  `kern.maxfilesperproc` files (10240 on a Mac with 8 GB) and only root can
+  raise it, so a Mac machine holds about 9,900 connections at once. A connect
+  past the limit fails in the guest with `EMFILE` under TSI; under virtio-net
+  the guest's connection is reset and the machine log names the limit.
+  Virtio-net also caps a machine at 65,536 open TCP connections
+  (`SMOLVM_TCP_RELAY_CAPACITY`, 1 to 1,048,576 on the host process); a connect
+  past it is refused and the machine log says so. Outbound connections leave
+  from the host's own local ports, which every machine on the host shares: a
+  closed connection keeps its port for the TCP TIME-WAIT (60 s on Linux, 30 s
+  on macOS, whose range is 16,384 ports), so a guest that opens and closes
+  connections faster than the host can recycle ports sees `EADDRNOTAVAIL`.
 
 ## S3 mounts
 

@@ -85,15 +85,33 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod app_ports;
 mod attach;
+mod auto_ports;
 mod branchpoint;
+#[cfg(target_os = "linux")]
+mod builtin_exec;
+mod container;
+#[cfg(target_os = "linux")]
+mod container_session;
+mod container_stats;
+#[cfg(target_os = "linux")]
+mod controlled_exec;
 mod credentials;
 mod cuda;
+mod directory_write;
 mod dirwatch;
 mod disk_trim;
 mod docker_bridge;
 mod forkpoint;
+mod interactive_control;
+#[cfg(all(test, target_os = "linux"))]
+mod interactive_control_tests;
 mod io_target;
+mod listener_watch;
+#[cfg(target_os = "linux")]
+mod memory_trim;
+mod mount_owner;
 mod network;
 mod nsfile;
 mod oci;
@@ -107,9 +125,15 @@ mod publish_socket;
 mod relay;
 mod retry;
 mod rosetta;
+mod rosetta_tracer;
 mod s3mount;
+#[cfg(target_os = "linux")]
+mod sftp;
 mod ssh_agent;
 mod storage;
+#[cfg(target_os = "linux")]
+mod tcp_forward;
+mod terminal_modes;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
@@ -128,10 +152,9 @@ const REQUEST_BUFFER_SIZE: usize = 64 * 1024; // 64KB
 const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 
 /// Buffer size for streaming stdout/stderr in interactive mode.
-const IO_BUFFER_SIZE: usize = 4096;
-
-/// Default poll timeout in milliseconds for interactive I/O loop.
-const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
+/// Read larger ready chunks to amortize framing and socket writes; a short
+/// read is sent immediately, without waiting for the buffer to fill.
+const IO_BUFFER_SIZE: usize = 64 * 1024;
 
 /// Timeout for network connectivity test operations.
 /// Used in diagnostics/troubleshooting functions.
@@ -151,12 +174,20 @@ pub(crate) const DEFAULT_NOFILE_LIMIT: u64 = 1_048_576;
 /// OpenSearch and some JVM and database workloads refuse to start below
 /// 262144 memory maps (default 65530). A watch or a map costs memory only once
 /// used, and a higher value already set is kept.
+///
+/// The system-wide open-file cap is lifted the way systemd lifts it on a
+/// hosted runner (the kernel's default scales with guest RAM, about 400k at
+/// 4 GiB), and the half-open SYN queue matches `somaxconn`, so a server in
+/// the guest accepting a burst of connections is bounded by its own listen
+/// backlog rather than by a small-RAM default of 256.
 #[cfg(target_os = "linux")]
 fn raise_kernel_limits() {
     for (path, wanted) in [
         ("/proc/sys/fs/inotify/max_user_watches", 655_360u64),
         ("/proc/sys/fs/inotify/max_user_instances", 1_280),
         ("/proc/sys/vm/max_map_count", 262_144),
+        ("/proc/sys/fs/file-max", i64::MAX as u64),
+        ("/proc/sys/net/ipv4/tcp_max_syn_backlog", 4_096),
     ] {
         let current = std::fs::read_to_string(path)
             .ok()
@@ -168,6 +199,39 @@ fn raise_kernel_limits() {
             boot_log("WARN", &format!("raise {path} to {wanted}: {error}"));
         }
     }
+}
+
+/// Apply the host's idle-poll ceiling (`SMOLVM_IDLE_POLL_US`) to the kernel's
+/// `/proc/smolvm-idle-poll-us`, so a vCPU polls briefly for a virtio-fs reply
+/// before parking in WFI. Absent means the kernel's default. A kernel without
+/// the knob or a value it refuses leaves the machine as it was.
+#[cfg(target_os = "linux")]
+fn apply_idle_poll() {
+    if let Some(value) = std::env::var_os(guest_env::IDLE_POLL_US) {
+        let value = value.to_string_lossy();
+        if let Err(error) = write_idle_poll(std::path::Path::new(IDLE_POLL_KNOB), &value) {
+            boot_log("WARN", &format!("set idle poll to {value} us: {error}"));
+        }
+    }
+}
+
+#[cfg(target_os = "linux")]
+const IDLE_POLL_KNOB: &str = "/proc/smolvm-idle-poll-us";
+
+/// Write a microsecond ceiling to the idle-poll knob; the kernel accepts a
+/// decimal count up to 10 ms, so anything else is refused here first.
+fn write_idle_poll(knob: &std::path::Path, value: &str) -> std::io::Result<()> {
+    let micros: u32 = value
+        .trim()
+        .parse()
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "not a number"))?;
+    if micros > 10_000 {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "over the kernel's 10 ms ceiling",
+        ));
+    }
+    std::fs::write(knob, micros.to_string())
 }
 
 fn raise_nofile_limit() {
@@ -298,11 +362,25 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if builtin_exec::requested() {
+        std::process::exit(builtin_exec::run_helper());
+    }
+    #[cfg(target_os = "linux")]
+    if controlled_exec::helper_requested() {
+        std::process::exit(controlled_exec::run_helper());
+    }
     if live_resources::filesystem_helper_requested() {
         std::process::exit(live_resources::run_filesystem_helper());
     }
     if process::container_init_requested() {
         std::process::exit(process::run_container_init());
+    }
+    if rosetta_tracer::requested() {
+        std::process::exit(rosetta_tracer::run());
+    }
+    if process::exec_as_requested() {
+        std::process::exit(process::run_exec_as());
     }
     if forkpoint::worker_ready_helper_requested() {
         std::process::exit(forkpoint::run_worker_ready_helper());
@@ -371,6 +449,8 @@ fn main() {
     delegate_root_cgroup_controllers();
     #[cfg(target_os = "linux")]
     raise_kernel_limits();
+    #[cfg(target_os = "linux")]
+    apply_idle_poll();
 
     // Create /dev/dri device nodes only when GPU is enabled. The setup
     // function polls up to 500ms for the virtio-gpu driver to finish probing —
@@ -541,6 +621,10 @@ fn main() {
         );
     }
     attach::mount_devices_at_boot();
+    // A machine without an image runs its commands in this root, so the
+    // credential trust bundle its environment names is assembled here; an
+    // image machine gets its own when its container is created.
+    credentials::install_for_agent_root(boot_mounts);
 
     // Create /workspace symlink for bare VMs (no -v targeting /workspace).
     // Image-based VMs get /workspace via a bind mount in the container spec,
@@ -588,6 +672,11 @@ fn main() {
     // Forward ports published while the machine runs (no virtio-net).
     if port_forward::is_enabled() {
         port_forward::start();
+    }
+
+    // Report listening TCP ports so the host publishes them (`--auto-ports`).
+    if auto_ports::is_enabled() {
+        auto_ports::start();
     }
 
     // Start any user-published Unix-socket bridges (`--expose-socket` /
@@ -642,6 +731,10 @@ fn main() {
     // With the disks mounted, start reclaiming freed blocks back to the host
     // sparse files so disk footprint tracks live data (see disk_trim).
     disk_trim::spawn();
+    // Likewise give idle page cache back so host memory follows what the
+    // guest uses (see memory_trim).
+    #[cfg(target_os = "linux")]
+    memory_trim::spawn();
 
     // Start accepting connections (listener already bound)
     if let Err(e) = run_server_with_listener(listener) {
@@ -2126,7 +2219,18 @@ static WORK_SLOTS: std::sync::LazyLock<ConnectionSemaphore> =
 /// Whether a request waits for a work slot. Liveness pings and shutdown never
 /// queue behind real work.
 fn needs_work_slot(request: &AgentRequest) -> bool {
-    !matches!(request, AgentRequest::Ping | AgentRequest::Shutdown { .. })
+    // A container's init holds its connection for the container's whole life,
+    // like a daemon, not like a unit of work.
+    !matches!(
+        request,
+        AgentRequest::Ping
+            | AgentRequest::InteractiveControl { .. }
+            | AgentRequest::Shutdown { .. }
+            | AgentRequest::ContainerStart(_)
+            | AgentRequest::ContainerSession { .. }
+            | AgentRequest::ContainerPortConnect { .. }
+            | AgentRequest::WatchListeners
+    )
 }
 
 /// A counting semaphore for bounding concurrent connection handlers.
@@ -2293,6 +2397,8 @@ fn handle_fsnotify(events: &[FsNotifyEvent]) -> AgentResponse {
 }
 
 fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::error::Error>> {
+    let mut wire = WireStream::new(stream);
+    let stream = &mut wire;
     let mut buf = vec![0u8; REQUEST_BUFFER_SIZE];
 
     // Per-connection streaming-upload session. `Option<WriteSession>`
@@ -2300,6 +2406,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut directory_session: Option<directory_write::Session> = None;
 
     loop {
         // Read length header
@@ -2342,27 +2449,23 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         // Parse request (Envelope wraps the request with an optional trace_id).
         // Falls back to bare AgentRequest for backward compatibility with old hosts.
         let (mut request, trace_id) =
-            match serde_json::from_slice::<Envelope<AgentRequest>>(&buf[..len]) {
-                Ok(env) => (env.body, env.trace_id),
-                Err(_) => match serde_json::from_slice::<AgentRequest>(&buf[..len]) {
-                    Ok(req) => (req, None),
-                    Err(e) => {
-                        warn!(error = %e, "invalid request");
-                        // Keep the "invalid request: " prefix stable: the host
-                        // recognizes "invalid request: unknown variant `…`" as
-                        // a protocol-version skew and rewrites it into an
-                        // update-the-agent message (client.rs
-                        // `describe_agent_error`).
-                        send_response(
-                            stream,
-                            &AgentResponse::error(
-                                format!("invalid request: {}", e),
-                                error_codes::INVALID_REQUEST,
-                            ),
-                        )?;
-                        continue;
+            match smolvm_protocol::binary_stream::decode_request(&buf[..len]) {
+                Ok(env) => {
+                    if env.binary_stream == Some(smolvm_protocol::binary_stream::VERSION) {
+                        stream.binary = true;
                     }
-                },
+                    (env.body, env.trace_id)
+                }
+                Err(e) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::error(
+                            format!("invalid request: {e}"),
+                            error_codes::INVALID_REQUEST,
+                        ),
+                    )?;
+                    continue;
+                }
             };
 
         // Work around serde flatten + internally-tagged enum limitation:
@@ -2378,6 +2481,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         let _guard = _span.enter();
 
         debug!(method = %request.log_summary(), "received request");
+
+        // A new operation aborts staged uploads, including requests handled by
+        // early streaming branches below. Only upload chunks retain a session.
+        if !matches!(request, AgentRequest::FileWriteChunk { .. }) {
+            write_session = None;
+            directory_session = None;
+        }
 
         // A fork clone resumes this already-initialized agent with fresh
         // virtiofs devices. Repair hidden/stale boot mounts before replying to
@@ -2445,6 +2555,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         }
         | AgentRequest::Run { tty: true, .. } = &request
         {
+            // Admission may have waited behind other commands. Interactive
+            // work belongs to this connection and must not start after cancel.
+            if process::is_peer_closed(stream.as_raw_fd()) {
+                return Ok(());
+            }
             // Handle interactive session
             handle_interactive_run(stream, request)?;
             continue;
@@ -2460,10 +2575,48 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         if let AgentRequest::VmExec {
             interactive: true, ..
         }
-        | AgentRequest::VmExec { tty: true, .. } = &request
+        | AgentRequest::VmExec { tty: true, .. }
+        | AgentRequest::VmExecControlled { .. } = &request
         {
+            if process::is_peer_closed(stream.as_raw_fd()) {
+                return Ok(());
+            }
             // Handle interactive VM exec session
             handle_interactive_vm_exec(stream, request)?;
+            continue;
+        }
+
+        if matches!(request, AgentRequest::WatchListeners) {
+            listener_watch::serve(stream)?;
+            return Ok(());
+        }
+
+        if let AgentRequest::ContainerPortConnect { overlay_id, port } = request {
+            app_ports::connect(stream, &overlay_id, port)?;
+            return Ok(());
+        }
+
+        if let AgentRequest::ContainerSession { control } = request {
+            #[cfg(target_os = "linux")]
+            container_session::serve(stream, control)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = control;
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        "container sessions require Linux",
+                        error_codes::INVALID_REQUEST,
+                    ),
+                )?;
+            }
+            return Ok(());
+        }
+
+        // ContainerStart runs a container's command as its init and streams
+        // its I/O on this connection until it exits.
+        if let AgentRequest::ContainerStart(spec) = request {
+            container::handle_container_start(stream, *spec)?;
             continue;
         }
 
@@ -2527,6 +2680,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             continue;
         }
 
+        if let AgentRequest::ContainerDiff { ref overlay_id } = request {
+            handle_streaming_container_diff(stream, overlay_id)?;
+            continue;
+        }
+
         if let AgentRequest::FlattenLayers {
             ref lowerdirs,
             output: None,
@@ -2548,15 +2706,46 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             target,
         } = request
         {
-            // Drop any leftover session now (Drop cleans its tmp file) before
-            // starting a new one. `take()` makes the drop explicit and keeps the
-            // value from looking like a dead store.
-            let _ = write_session.take();
             let (new_session, response) =
                 handle_file_write_begin(path, mode, uid, gid, total_size, target.as_ref());
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
+        }
+        if let AgentRequest::DirectoryWriteBegin { path, target } = request {
+            let response = match directory_write::Session::begin(&path, target.as_ref()) {
+                Ok(session) => {
+                    directory_session = Some(session);
+                    AgentResponse::Ok { data: None }
+                }
+                Err(error) => error,
+            };
+            send_response(stream, &response)?;
+            continue;
+        }
+        if let AgentRequest::FileWriteChunk { ref data, done } = request {
+            if let Some(mut session) = directory_session.take() {
+                let result = session.write(data);
+                let response = match result {
+                    Err(error) => AgentResponse::error(error, error_codes::FILE_IO_FAILED),
+                    Ok(()) if done => {
+                        let client = stream.as_raw_fd();
+                        let result = with_keepalive(stream, FILE_FINALIZE_KEEPALIVE, || {
+                            session.finish(Some(client))
+                        });
+                        match result {
+                            Ok(()) => AgentResponse::Ok { data: None },
+                            Err(error) => AgentResponse::error(error, error_codes::FILE_IO_FAILED),
+                        }
+                    }
+                    Ok(()) => {
+                        directory_session = Some(session);
+                        AgentResponse::Ok { data: None }
+                    }
+                };
+                send_response(stream, &response)?;
+                continue;
+            }
         }
         if let AgentRequest::FileWriteChunk { data, done } = request {
             // The last chunk syncs the staged file and, for a running
@@ -2573,19 +2762,6 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
-        }
-
-        // Any other request mid-session is a protocol error. Drop the
-        // session (Drop cleans the staging file) and proceed — the
-        // operator's new request is honored rather than failed; the
-        // alternative (error out) buys no safety since the drop
-        // already handled cleanup.
-        if write_session.is_some() {
-            debug!(
-                method = %request.log_summary(),
-                "dropping in-flight FileWrite session: non-chunk request arrived"
-            );
-            write_session = None;
         }
 
         // Handle regular request. Pass the stream's fd so long-running
@@ -2636,6 +2812,7 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
+        | AgentRequest::InteractiveControl { .. }
         // Live growth only accepts an already-mounted disk. Never enter the
         // boot-time mount/format fallback as a side effect of this request.
         | AgentRequest::GrowFilesystem { .. }
@@ -2653,6 +2830,8 @@ fn handle_request(
             let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::WORKLOAD_TARGET_CAPABILITY.to_string(),
+                smolvm_protocol::CONTAINER_APP_PORTS_CAPABILITY.to_string(),
+                smolvm_protocol::container_session::CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
                 smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
@@ -2665,6 +2844,12 @@ fn handle_request(
             if workload::logs_enabled() {
                 capabilities.push(smolvm_protocol::WORKLOAD_LOGS_CAPABILITY.to_string());
             }
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::CAPABILITY.to_string());
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::TCP_CAPABILITY.to_string());
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::SFTP_CAPABILITY.to_string());
             if attach::available() {
                 capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
             }
@@ -2681,6 +2866,11 @@ fn handle_request(
             }
         }
 
+        AgentRequest::InteractiveControl { request } => interactive_control::handle(&request),
+        AgentRequest::VmExecControlled { .. } => AgentResponse::error(
+            "controlled VM exec requires an interactive connection",
+            error_codes::INVALID_REQUEST,
+        ),
         AgentRequest::FsNotify { events } => handle_fsnotify(&events),
 
         // Pull is handled separately in handle_streaming_pull for progress streaming
@@ -2983,21 +3173,21 @@ fn handle_request(
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
-        AgentRequest::FileWriteBegin { .. } | AgentRequest::FileWriteChunk { .. } => {
-            AgentResponse::error(
-                "streaming file write must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileWriteBegin { .. }
+        | AgentRequest::DirectoryWriteBegin { .. }
+        | AgentRequest::FileWriteChunk { .. } => AgentResponse::error(
+            "streaming file write must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
-        AgentRequest::FileRead { .. } | AgentRequest::ArchiveDirectory { .. } => {
-            AgentResponse::error(
-                "streaming read must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileRead { .. }
+        | AgentRequest::ArchiveDirectory { .. }
+        | AgentRequest::ContainerDiff { .. } => AgentResponse::error(
+            "streaming read must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Pod-container lifecycle (containerd shim v2 datapath, see pod.rs).
         AgentRequest::PodCreate {
@@ -3032,6 +3222,56 @@ fn handle_request(
         AgentRequest::PodStats { id } => pod::handle_pod_stats(&id),
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
+
+        AgentRequest::ContainerStart(_) | AgentRequest::ContainerSession { .. } => {
+            AgentResponse::error(
+                "ContainerStart is a streaming request",
+                error_codes::INVALID_REQUEST,
+            )
+        }
+
+        AgentRequest::ContainerSignal {
+            overlay_id,
+            signal,
+            all,
+        } => container::handle_container_signal(&overlay_id, &signal, all),
+
+        AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
+        AgentRequest::ContainerStats { overlay_id } => container_stats::handle(&overlay_id),
+        AgentRequest::WatchListeners => AgentResponse::error(
+            "listener watches require streaming dispatch",
+            error_codes::INVALID_REQUEST,
+        ),
+        AgentRequest::ContainerPorts { overlay_id } => app_ports::list(&overlay_id),
+        AgentRequest::ContainerPortConnect { .. } => AgentResponse::error(
+            "app connections require streaming dispatch",
+            error_codes::INVALID_REQUEST,
+        ),
+
+        AgentRequest::ContainerArchive {
+            image,
+            overlay_id,
+            archive,
+            destination,
+            image_source,
+        } => container::handle_container_archive(
+            &image,
+            &overlay_id,
+            &archive,
+            &destination,
+            image_source.as_ref(),
+        ),
+
+        AgentRequest::SetInterfaceAddresses { addresses } => {
+            container::handle_set_interface_addresses(&addresses)
+        }
+
+        AgentRequest::SetPrimaryAddress {
+            address,
+            gateway,
+            dns,
+            dns_options,
+        } => container::handle_set_primary_address(&address, &gateway, &dns, &dns_options),
     }
 }
 
@@ -3378,6 +3618,11 @@ fn install_file_atomic(
 /// An upload with no explicit owner is given to that user, so a non-root
 /// workload (an image with `USER`) can read and replace what was uploaded;
 /// root workloads and VM-level writes are left as written.
+///
+/// The workload's user is the bundle's [`oci::WORKLOAD_USER_ANNOTATION`]: the
+/// container's own `process.user` is the keep-alive init's, root. A bundle
+/// written before the annotation existed ran its init as the workload user, so
+/// `process.user` is the answer there.
 fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Some(merged) = root.overlay_merged_root() else {
         return (None, None);
@@ -3394,11 +3639,9 @@ fn workload_owner(root: &io_target::IoRoot) -> (Option<u32>, Option<u32>) {
     let Ok(spec) = serde_json::from_str::<serde_json::Value>(&text) else {
         return (None, None);
     };
-    let uid = spec["process"]["user"]["uid"].as_u64().map(|u| u as u32);
-    let gid = spec["process"]["user"]["gid"].as_u64().map(|g| g as u32);
-    match uid {
-        Some(0) | None => (None, None),
-        Some(uid) => (Some(uid), gid),
+    match oci::workload_user_of_config(&spec) {
+        Some((uid, gid)) if uid != 0 => (Some(uid), Some(gid)),
+        _ => (None, None),
     }
 }
 
@@ -3750,7 +3993,7 @@ const FILE_FINALIZE_KEEPALIVE: std::time::Duration = std::time::Duration::from_s
 /// sends a progress frame every `period` until it returns, so a slow step
 /// never leaves the host with a silent connection.
 fn with_keepalive<S: Write, T: Send>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     period: std::time::Duration,
     work: impl FnOnce() -> T + Send,
 ) -> T {
@@ -3821,7 +4064,7 @@ fn handle_file_write_chunk(
 /// and returns the `io::Error` to the caller for producer-specific
 /// cleanup (e.g., killing a child process).
 fn send_data_chunks<R: Read>(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     reader: &mut R,
     chunk_size: usize,
     error_context: &str,
@@ -3841,7 +4084,7 @@ fn send_data_chunks<R: Read>(
 /// Send data chunks without the terminal frame so a producer can verify its
 /// final status before reporting a successful end-of-stream.
 fn send_data_chunks_body<R: Read>(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     reader: &mut R,
     chunk_size: usize,
     error_context: &str,
@@ -3888,7 +4131,7 @@ fn send_data_chunks_body<R: Read>(
 /// loop (not the generic `handle_request` match) so it can emit
 /// multiple responses per request.
 fn handle_streaming_file_read(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     path: &str,
     target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4002,11 +4245,11 @@ fn handle_streaming_file_read(
 
 /// Stream a tar archive of a directory directly over vsock.
 ///
-/// This deliberately runs in the agent namespace: boot-time staged mounts are
-/// visible there even when an image workload is active, and no temporary
-/// archive needs to traverse virtiofs or occupy the guest disk.
+/// Use the selected workload namespace so its mounted folders are visible;
+/// bare machines retain the agent namespace and its boot-time staged mounts.
+/// Neither path writes a temporary archive to the guest disk.
 fn handle_streaming_archive_directory(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     path: &str,
     target: Option<&WorkloadTarget>,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -4017,6 +4260,33 @@ fn handle_streaming_archive_directory(
             return Ok(());
         }
     };
+    if let nsfile::GuestNs::Container(namespace) = root.namespace() {
+        let mut archive = match namespace.archive(path) {
+            Ok(archive) => archive,
+            Err(message) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+        send_data_chunks_body(
+            stream,
+            &mut archive,
+            smolvm_protocol::LAYER_CHUNK_SIZE,
+            "failed to read container archive",
+            error_codes::FILE_IO_FAILED,
+        )?;
+        let response = match archive.finish() {
+            Ok(()) => AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+            Err(message) => AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+        };
+        return send_response(stream, &response);
+    }
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a
@@ -4100,9 +4370,58 @@ fn handle_streaming_archive_directory(
     }
 }
 
+/// Stream a container's changes as one image layer (`ContainerDiff`): the
+/// layer is written to a file on the storage disk first, since building it
+/// walks the whole upper directory, then sent in chunks.
+fn handle_streaming_container_diff(
+    stream: &mut WireStream<impl ReadWrite>,
+    overlay_id: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let built = container::build_container_diff(overlay_id);
+    let path = match built {
+        Ok(path) => path,
+        Err(message) => {
+            send_response(
+                stream,
+                &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
+    let file = std::fs::File::open(&path);
+    let _ = std::fs::remove_file(&path);
+    let mut file = match file {
+        Ok(file) => file,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::error(
+                    format!("open container diff: {error}"),
+                    error_codes::FILE_IO_FAILED,
+                ),
+            )?;
+            return Ok(());
+        }
+    };
+    send_data_chunks_body(
+        stream,
+        &mut file,
+        smolvm_protocol::LAYER_CHUNK_SIZE,
+        "failed to read container diff",
+        error_codes::FILE_IO_FAILED,
+    )?;
+    send_response(
+        stream,
+        &AgentResponse::DataChunk {
+            data: Vec::new(),
+            done: true,
+        },
+    )
+}
+
 /// Handle an interactive run session with streaming I/O.
 fn handle_interactive_run(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     ensure_storage_mounted();
@@ -4219,6 +4538,33 @@ fn handle_interactive_run(
             }
         };
 
+    // A command that is not there fails the request, with the text a
+    // container engine reports, rather than starting and exiting at once.
+    if let Some(program) = launch.command.first() {
+        let path = launch
+            .env
+            .iter()
+            .rev()
+            .find(|(k, _)| k == "PATH")
+            .map(|(_, v)| v.clone())
+            .unwrap_or_else(|| {
+                "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin".into()
+            });
+        #[cfg(target_os = "linux")]
+        if let Err(e) = container::check_executable(
+            std::path::Path::new(&prepared.rootfs_path),
+            program,
+            launch.workdir.as_deref(),
+            &path,
+        ) {
+            maybe_cleanup(&prepared.workload_id);
+            send_response(stream, &AgentResponse::error(e, error_codes::SPAWN_FAILED))?;
+            return Ok(());
+        }
+        #[cfg(not(target_os = "linux"))]
+        let _ = (program, path);
+    }
+
     // Spawn the command with crun
     let (mut child, pty_master) = match spawn_interactive_command(
         &prepared.rootfs_path,
@@ -4311,9 +4657,16 @@ impl ResolvedLaunch {
         user: Option<String>,
         s3_volumes: Vec<smolvm_protocol::S3Volume>,
     ) -> Result<Self, Box<dyn std::error::Error>> {
-        let info = storage::query_image(image)?.ok_or_else(|| -> Box<dyn std::error::Error> {
-            format!("image not found: {image}").into()
-        })?;
+        let info = match storage::query_image(image)? {
+            Some(info) => info,
+            // An image this machine's store does not hold, with the command
+            // given: a session joining a container started from an image
+            // shared into the machine (the Docker engine's containers in
+            // another container's machine), whose settings the caller already
+            // merged. Preparing its overlay still fails for anything else.
+            None if !command.is_empty() => smolvm_protocol::ImageInfo::default(),
+            None => return Err(format!("image not found: {image}").into()),
+        };
         let command = if command.is_empty() {
             let mut resolved = info.entrypoint;
             resolved.extend(info.cmd);
@@ -4353,6 +4706,27 @@ impl ResolvedLaunch {
     }
 }
 
+/// The user the agent's keep-alive init runs as: root, like PID 1 on any Linux
+/// machine. The image's `USER` is the workload's user, not the init's, and
+/// every exec names its own user (see [`oci::resolve_exec_user_spec`]), so
+/// nothing inherits this one.
+pub(crate) const KEEPALIVE_USER: &str = "0:0";
+
+impl ResolvedLaunch {
+    /// The launch for the keep-alive init that is PID 1 in front of this
+    /// workload: the same env and workdir, the init as its command, and root
+    /// ([`KEEPALIVE_USER`]) as its user whatever user the workload runs as.
+    #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+    fn keepalive(&self) -> Self {
+        Self {
+            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
+            env: self.env.clone(),
+            workdir: self.workdir.clone(),
+            user: Some(KEEPALIVE_USER.to_string()),
+        }
+    }
+}
+
 /// Layer the request's env over an image's OCI `Env` (each `"KEY=VAL"`): the
 /// request wins on key conflicts, image entries fill in the rest — matching how
 /// a container runtime composes image + run-time environment.
@@ -4372,11 +4746,47 @@ fn merge_image_env(
     merged
 }
 
+/// The OCI spec for a container whose workload is `launch`. With
+/// `container_init` the container's own process is the keep-alive init
+/// ([`ResolvedLaunch::keepalive`], root) and the workload is exec'd into it
+/// later; otherwise the workload is the container's process. Either way the
+/// workload's `uid:gid` is recorded in [`oci::WORKLOAD_USER_ANNOTATION`].
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn container_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, String> {
+    let workload = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
+    let keepalive;
+    let (process, identity) = if container_init {
+        keepalive = launch.keepalive();
+        let identity = oci::resolve_process_identity(rootfs_path, keepalive.user.as_deref())?;
+        (&keepalive, identity)
+    } else {
+        (launch, workload.clone())
+    };
+    let mut spec = oci::OciSpec::new(
+        &process.command,
+        &process.env,
+        process.workdir.as_deref().unwrap_or("/"),
+        tty,
+        &identity,
+        unprivileged,
+    );
+    spec.set_workload_user(&workload);
+    Ok(spec)
+}
+
 /// Write an OCI bundle (`config.json`) and return a freshly generated container ID.
 ///
 /// Shared by [`handle_run_detached`] and [`spawn_interactive_command`] to avoid
 /// duplicating the identity-resolve → spec-build → mount-wiring → write sequence.
-/// The only caller-controlled variation is `tty` (detached: always `false`).
+/// The caller-controlled variations are `tty` (detached: always `false`) and
+/// `container_init`, which puts the keep-alive init in front of `launch` (see
+/// [`container_spec`]).
 #[cfg(target_os = "linux")]
 #[allow(clippy::too_many_arguments)]
 fn write_oci_bundle(
@@ -4388,16 +4798,31 @@ fn write_oci_bundle(
     unprivileged: bool,
     container_init: bool,
 ) -> Result<String, Box<dyn std::error::Error>> {
-    let workdir_str = launch.workdir.as_deref().unwrap_or("/");
-    let identity = oci::resolve_process_identity(rootfs_path, launch.user.as_deref())?;
-    let mut spec = oci::OciSpec::new(
-        &launch.command,
-        &launch.env,
-        workdir_str,
+    let spec = build_oci_spec(
+        rootfs_path,
+        launch,
+        mounts,
         tty,
-        &identity,
         unprivileged,
-    );
+        container_init,
+    )?;
+    spec.write_to(bundle_path)
+        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
+
+    Ok(oci::generate_container_id())
+}
+
+/// The OCI spec [`write_oci_bundle`] writes, for callers that add to it first.
+#[cfg(target_os = "linux")]
+fn build_oci_spec(
+    rootfs_path: &std::path::Path,
+    launch: &ResolvedLaunch,
+    mounts: &[(String, String, bool)],
+    tty: bool,
+    unprivileged: bool,
+    container_init: bool,
+) -> Result<oci::OciSpec, Box<dyn std::error::Error>> {
+    let mut spec = container_spec(rootfs_path, launch, tty, unprivileged, container_init)?;
 
     if tty {
         // Give the PTY a non-zero starting size. The host follows up with a
@@ -4433,10 +4858,7 @@ fn write_oci_bundle(
     cuda::inject_into_container(&mut spec, rootfs_path);
     vulkan::inject_into_container(&mut spec, rootfs_path);
     credentials::inject_into_container(&mut spec, rootfs_path, mounts);
-    spec.write_to(bundle_path)
-        .map_err(|e| format!("failed to write OCI spec: {}", e))?;
-
-    Ok(oci::generate_container_id())
+    Ok(spec)
 }
 
 /// Handle a detached run request: start a container in the background and
@@ -4450,7 +4872,7 @@ fn write_oci_bundle(
 /// persist across exec sessions, which requires a named overlay.
 #[cfg(target_os = "linux")]
 fn handle_run_detached(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     use std::path::Path;
@@ -4640,22 +5062,12 @@ fn handle_run_detached(
     // tear down the PID namespace and SIGKILL every exec still running in the
     // machine. Init systems are the exception: they only work as PID 1.
     let workload_is_pid1 = workload_needs_pid1(&launch.command);
-    let container_launch = if workload_is_pid1 {
-        None
-    } else {
-        Some(ResolvedLaunch {
-            command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
-            env: launch.env.clone(),
-            workdir: launch.workdir.clone(),
-            user: launch.user.clone(),
-        })
-    };
 
     // Detached containers always run non-interactively (tty: false).
     let container_id = match write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        container_launch.as_ref().unwrap_or(&launch),
+        &launch,
         &mounts,
         false,
         unprivileged,
@@ -4871,7 +5283,7 @@ fn exec_process_spec(
     terminal: bool,
 ) -> Result<Option<oci::OciProcess>, String> {
     let identity = oci::resolve_process_identity(rootfs, launch.user.as_deref())?;
-    if identity.user.additional_gids.is_empty() {
+    if !identity.user.has_supplementary_groups() {
         return Ok(None);
     }
     Ok(Some(oci::OciProcess {
@@ -4996,7 +5408,7 @@ fn launch_workload(
             Some(&pid_file),
             Some(&log),
         )
-        .user(user.as_deref())
+        .user(Some(&user))
         .stdin_null(),
     };
     let status = match workload::output_pipe() {
@@ -5149,7 +5561,7 @@ mod stop_on_exit_tests {
 /// `cargo check` on macOS compiles the dispatch in `handle_connection`.
 #[cfg(not(target_os = "linux"))]
 fn handle_run_detached(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     _request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     send_response(
@@ -5555,30 +5967,33 @@ fn restored_container_exec_command(
     let environment = crun::augmented_exec_env(&environment, container_id);
 
     // The uid:gid plus the user's supplementary groups from the container's own
-    // passwd/group (a `runner` in `docker` keeps `docker`; this path used to call
-    // setgroups(0) and drop every extra group). A rootfs whose passwd cannot be
-    // read falls back to the resolved uid:gid alone.
-    let (uid, gid, groups): (u32, u32, Vec<libc::gid_t>) =
+    // passwd/group (a `runner` in `docker` keeps `docker`). A rootfs whose
+    // passwd cannot be read falls back to the resolved uid:gid alone.
+    let (uid, gid, groups): (u32, u32, Vec<u32>) =
         match oci::resolve_process_identity(&root, launch.user.as_deref()) {
             Ok(identity) => (
                 identity.user.uid,
                 identity.user.gid,
-                identity
-                    .user
-                    .additional_gids
-                    .iter()
-                    .map(|g| *g as libc::gid_t)
-                    .collect(),
+                identity.user.additional_gids,
             ),
             Err(_) => {
-                let user = launch.user.as_deref().unwrap_or("0:0");
+                let user = launch.user.as_deref().unwrap_or(KEEPALIVE_USER);
                 let (uid, gid) = user
                     .split_once(':')
                     .ok_or_else(|| format!("resolved container user is not uid:gid: {user}"))?;
-                (uid.parse()?, gid.parse()?, Vec::new())
+                let gid = gid.parse()?;
+                (uid.parse()?, gid, vec![gid])
             }
         };
 
+    // nsenter enters the namespaces as root and runs this agent's own binary,
+    // passed as an inherited descriptor (it is not inside the container), to
+    // take on the user: `nsenter --setgid` would drop the groups set here.
+    let exe = std::fs::File::open("/proc/self/exe")?;
+    let exe_fd = {
+        use std::os::unix::io::AsRawFd as _;
+        exe.as_raw_fd()
+    };
     let mut command = Command::new("/usr/bin/nsenter");
     command
         .arg("--target")
@@ -5586,19 +6001,25 @@ fn restored_container_exec_command(
         .args(["--mount", "--uts", "--ipc", "--pid"])
         .arg(format!("--root={}", root.display()))
         .arg(format!("--wd={}", host_workdir.display()))
-        .arg(format!("--setgid={gid}"))
-        .arg(format!("--setuid={uid}"))
         .arg("--")
-        .args(&launch.command)
+        .args(process::exec_as_args(
+            &format!("/proc/self/fd/{exe_fd}"),
+            uid,
+            gid,
+            &groups,
+            &launch.command,
+        ))
         .env_clear()
         .envs(environment);
 
     use std::os::unix::process::CommandExt as _;
-    // SAFETY: setgroups is async-signal-safe and touches only child credentials;
-    // `groups` is moved into the closure and outlives the call.
+    // SAFETY: fcntl is async-signal-safe and only clears close-on-exec on the
+    // child's copy of `exe`, which the closure owns, so it stays open until
+    // the command is spawned.
     unsafe {
         command.pre_exec(move || {
-            if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
+            use std::os::unix::io::AsRawFd as _;
+            if libc::fcntl(exe.as_raw_fd(), libc::F_SETFD, 0) != 0 {
                 return Err(std::io::Error::last_os_error());
             }
             Ok(())
@@ -5726,8 +6147,9 @@ static CONSOLE_SOCKET_WORKS: std::sync::atomic::AtomicBool =
 /// Establish the long-lived "main" container for a persistent overlay and return
 /// its id. PID 1 is smolvm's image-independent keepalive and child reaper, so
 /// processes a later `crun exec` backgrounds inside it survive across exec calls
-/// for the machine's lifetime without accumulating orphan zombies. Env / workdir /
-/// user are inherited from the image so exec'd commands see the right environment.
+/// for the machine's lifetime without accumulating orphan zombies. Env and workdir
+/// are inherited from the image; PID 1 runs as root, and each exec into it names
+/// its user (the image's, or the request's) explicitly.
 /// Uses the same two-step `crun create` + `crun start` as [`handle_run_detached`]
 /// (`crun run --detach` hangs in the smolvm VM environment).
 #[cfg(target_os = "linux")]
@@ -5742,13 +6164,6 @@ fn ensure_main_container(
 ) -> Result<String, Box<dyn std::error::Error>> {
     use std::path::Path;
 
-    let keepalive = ResolvedLaunch {
-        command: vec!["/run/smolvm/init".to_string(), "container-init".to_string()],
-        env: base_launch.env.clone(),
-        workdir: base_launch.workdir.clone(),
-        user: base_launch.user.clone(),
-    };
-
     let rootfs_path = Path::new(rootfs);
     let bundle_path = rootfs_path
         .parent()
@@ -5761,7 +6176,7 @@ fn ensure_main_container(
     let container_id = write_oci_bundle(
         rootfs_path,
         &bundle_path,
-        &keepalive,
+        base_launch,
         mounts,
         false,
         unprivileged,
@@ -5844,7 +6259,10 @@ fn spawn_interactive_command(
         command: launch.command.clone(),
         env: exec_env,
         workdir: launch.workdir.clone(),
-        user: oci::resolve_exec_user_spec(Path::new(rootfs), launch.user.as_deref())?,
+        user: Some(oci::resolve_exec_user_spec(
+            Path::new(rootfs),
+            launch.user.as_deref(),
+        )?),
     };
     let launch = &launch_owned;
 
@@ -6115,8 +6533,21 @@ fn spawn_interactive_command(
 /// The client went away: kill the command and everything it started. For an
 /// image container the command is a grandchild (under `crun exec`), so killing
 /// only the direct child would leave it running.
-fn kill_child_on_disconnect(child: &mut Child) -> i32 {
+fn terminate_interactive_child(
+    child: &mut Child,
+    control: Option<&interactive_control::Registration>,
+) {
+    if let Some(control) = control {
+        control.terminate();
+    }
     process::kill_child_tree(child);
+}
+
+fn kill_child_on_disconnect(
+    child: &mut Child,
+    control: Option<&interactive_control::Registration>,
+) -> i32 {
+    terminate_interactive_child(child, control);
     124
 }
 
@@ -6154,8 +6585,7 @@ impl InteractiveFrame {
                     self.body.resize(len, 0);
                     continue;
                 }
-                let request = serde_json::from_slice(&self.body)
-                    .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidData, error))?;
+                let request = smolvm_protocol::binary_stream::decode_request(&self.body)?.body;
                 *self = Self::default();
                 return Ok(Some(request));
             }
@@ -6188,10 +6618,27 @@ impl InteractiveFrame {
     }
 }
 
+// A half-close cancels interactive execution while leaving the response
+// channel open for Exited. Linux requires POLLRDHUP to observe it while
+// backpressure temporarily disables POLLIN.
+#[cfg(target_os = "linux")]
+const INTERACTIVE_READ_HANGUP: libc::c_short = libc::POLLRDHUP;
+#[cfg(not(target_os = "linux"))]
+const INTERACTIVE_READ_HANGUP: libc::c_short = 0;
+
 fn run_interactive_loop(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    run_interactive_loop_controlled(stream, child, timeout_ms, None)
+}
+
+fn run_interactive_loop_controlled(
+    stream: &mut WireStream<impl ReadWrite>,
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+    control: Option<&interactive_control::Registration>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
@@ -6201,6 +6648,7 @@ fn run_interactive_loop(
         timeout_ms,
         &mut child_stdout,
         &mut child_stderr,
+        control,
     );
     // A pipe still open after the session is held by a process the command
     // left running in the background: keep it drained, so that process is not
@@ -6211,11 +6659,12 @@ fn run_interactive_loop(
 }
 
 fn run_interactive_loop_io(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
     child_stdout: &mut Option<std::process::ChildStdout>,
     child_stderr: &mut Option<std::process::ChildStderr>,
+    control: Option<&interactive_control::Registration>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::time::{Duration, Instant};
@@ -6274,7 +6723,7 @@ fn run_interactive_loop_io(
                 warn!("interactive command timed out, killing process");
                 // The whole tree: in an image container the command is a
                 // grandchild. Also reaps the child, avoiding a zombie.
-                process::kill_child_tree(child);
+                terminate_interactive_child(child, control);
                 send_response(
                     stream,
                     &AgentResponse::Stderr {
@@ -6285,17 +6734,7 @@ fn run_interactive_loop_io(
             }
         }
 
-        // Calculate poll timeout: either remaining time until deadline, or 100ms default
-        let poll_timeout_ms = match deadline {
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                // Cap at 100ms to periodically check child exit status
-                remaining
-                    .as_millis()
-                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
-            }
-            None => INTERACTIVE_POLL_TIMEOUT_MS,
-        };
+        let poll_timeout_ms = exit_signal.poll_timeout_ms(deadline);
 
         // Build poll fds array for stdout, stderr, and vsock stream
         let stdout_fd = child_stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
@@ -6317,11 +6756,12 @@ fn run_interactive_loop_io(
                 fd: stream_fd,
                 // Finish writing a pending frame before reading another one.
                 // This keeps guest memory bounded to a single stdin frame.
-                events: if pending_stdin.is_empty() {
-                    libc::POLLIN
-                } else {
-                    0
-                },
+                events: INTERACTIVE_READ_HANGUP
+                    | if pending_stdin.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -6355,11 +6795,12 @@ fn run_interactive_loop_io(
         // stdin frame waits for the child pipe. Without this check a client
         // disconnect can leave a child that never reads stdin running until
         // its timeout (or forever if there is no timeout).
-        if !pending_stdin.is_empty()
-            && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if poll_fds[2].revents & INTERACTIVE_READ_HANGUP != 0
+            || (!pending_stdin.is_empty()
+                && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
-            debug!("host disconnected with pending stdin");
-            return Ok(kill_child_on_disconnect(child));
+            debug!("host disconnected during interactive execution");
+            return Ok(kill_child_on_disconnect(child, control));
         }
 
         // Read available stdout. If send_response fails (host disconnected),
@@ -6387,7 +6828,7 @@ fn run_interactive_loop_io(
                             .is_err()
                             {
                                 debug!("host disconnected while sending stdout");
-                                return Ok(kill_child_on_disconnect(child));
+                                return Ok(kill_child_on_disconnect(child, control));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6428,7 +6869,7 @@ fn run_interactive_loop_io(
                             .is_err()
                             {
                                 debug!("host disconnected while sending stderr");
-                                return Ok(kill_child_on_disconnect(child));
+                                return Ok(kill_child_on_disconnect(child, control));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6453,12 +6894,12 @@ fn run_interactive_loop_io(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     // Keep the existing protocol-error behavior while also
                     // reaping the workload before returning the error.
-                    process::kill_child_tree(child);
+                    terminate_interactive_child(child, control);
                     return Err(error.into());
                 }
                 Err(error) => {
                     debug!(%error, "host disconnected during interactive exec");
-                    return Ok(kill_child_on_disconnect(child));
+                    return Ok(kill_child_on_disconnect(child, control));
                 }
             };
             match request {
@@ -6516,10 +6957,21 @@ fn run_interactive_loop_io(
 /// (PTY merges stdout and stderr) and supports terminal resize.
 #[cfg(unix)]
 fn run_interactive_loop_pty(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     pty_master: pty::PtyMaster,
     timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    run_interactive_loop_pty_controlled(stream, child, pty_master, timeout_ms, None)
+}
+
+#[cfg(unix)]
+fn run_interactive_loop_pty_controlled(
+    stream: &mut WireStream<impl ReadWrite>,
+    child: &mut Child,
+    pty_master: pty::PtyMaster,
+    timeout_ms: Option<u64>,
+    control: Option<&interactive_control::Registration>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
 
@@ -6572,7 +7024,7 @@ fn run_interactive_loop_pty(
         if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive PTY command timed out, killing process");
-                process::kill_child_tree(child);
+                terminate_interactive_child(child, control);
                 send_response(
                     stream,
                     &AgentResponse::Stdout {
@@ -6584,15 +7036,7 @@ fn run_interactive_loop_pty(
         }
 
         // Poll the PTY master fd for readable data.
-        let poll_timeout_ms = match deadline {
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                remaining
-                    .as_millis()
-                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
-            }
-            None => INTERACTIVE_POLL_TIMEOUT_MS,
-        };
+        let poll_timeout_ms = exit_signal.poll_timeout_ms(deadline);
 
         // Poll PTY master, vsock stream, and child exit signal.
         let stream_fd = stream.as_raw_fd();
@@ -6612,11 +7056,12 @@ fn run_interactive_loop_pty(
                 fd: stream_fd,
                 // Finish writing a pending frame before reading another one.
                 // This keeps guest memory bounded to a single stdin frame.
-                events: if pending_stdin.is_empty() {
-                    libc::POLLIN
-                } else {
-                    0
-                },
+                events: INTERACTIVE_READ_HANGUP
+                    | if pending_stdin.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -6639,11 +7084,12 @@ fn run_interactive_loop_pty(
         // POLLHUP/POLLERR are reported even when POLLIN is disabled while a
         // stdin frame waits for the PTY buffer. Without this check a client
         // disconnect can leave a child running until its timeout.
-        if !pending_stdin.is_empty()
-            && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if poll_fds[1].revents & INTERACTIVE_READ_HANGUP != 0
+            || (!pending_stdin.is_empty()
+                && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
-            debug!("host disconnected with pending PTY stdin");
-            return Ok(kill_child_on_disconnect(child));
+            debug!("host disconnected during interactive execution");
+            return Ok(kill_child_on_disconnect(child, control));
         }
 
         // Read available data from PTY master. If send_response fails
@@ -6663,7 +7109,7 @@ fn run_interactive_loop_pty(
                         .is_err()
                         {
                             debug!("host disconnected while sending PTY stdout");
-                            return Ok(kill_child_on_disconnect(child));
+                            return Ok(kill_child_on_disconnect(child, control));
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6696,36 +7142,21 @@ fn run_interactive_loop_pty(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     // Keep the existing protocol-error behavior while also
                     // reaping the workload before returning the error.
-                    process::kill_child_tree(child);
+                    terminate_interactive_child(child, control);
                     return Err(error.into());
                 }
                 Err(error) => {
                     debug!(%error, "host disconnected during PTY interactive exec");
-                    return Ok(kill_child_on_disconnect(child));
+                    return Ok(kill_child_on_disconnect(child, control));
                 }
             };
 
             match request {
                 Some(AgentRequest::Stdin { data }) => {
                     if data.is_empty() {
-                        // Host stdin reached EOF. A PTY cannot have one
-                        // direction closed, so signal end-of-input to the
-                        // child by writing the EOF control character (VEOF,
-                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
-                        // pending line available to the child's read()
-                        // immediately; a read() that finds an empty line
-                        // buffer returns 0, which is the EOF the child waits
-                        // for. Without it a stdin-reading child (cat, sh,
-                        // read) never terminates and the exec session hangs.
-                        //
-                        // Send it twice: if the host's final stdin chunk was
-                        // not newline-terminated, the first VEOF only flushes
-                        // that partial line (delivered as data, not EOF), so a
-                        // second VEOF — now at an empty line buffer — is what
-                        // produces the zero-length read. When the buffer is
-                        // already empty the first VEOF yields EOF and the
-                        // second is harmlessly consumed after the child exits.
-                        pending_stdin = vec![0x04, 0x04];
+                        // Honor the current VEOF (including application changes).
+                        // Raw or disabled-EOF terminals have no half-close byte.
+                        pending_stdin = pty_master.eof_input()?;
                         stdin_offset = 0;
                     } else {
                         pending_stdin = data;
@@ -6768,7 +7199,7 @@ fn run_interactive_loop_pty(
 
 /// Drain any remaining output from stdout/stderr after child exits.
 fn drain_remaining_output(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     child_stdout: &mut Option<std::process::ChildStdout>,
     child_stderr: &mut Option<std::process::ChildStderr>,
     stdout_buf: &mut [u8],
@@ -7216,8 +7647,10 @@ fn run_background_in_keepalive(
     // `crun exec --user` needs a numeric uid[:gid]; resolve any username
     // against the container's /etc/passwd, same as the foreground path.
     oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
-    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    launch.user = Some(
+        oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
 
     // Capture the detached process's PID via a pid-file so the response
     // honors the run-background contract (the host client parses a PID from
@@ -7447,8 +7880,10 @@ fn run_in_keepalive_container(
     // request user) is rejected with "invalid USERSPEC specified". Resolve it
     // against the container's /etc/passwd, matching the `crun run` path (#632).
     oci::apply_process_env(&rootfs, launch.user.as_deref(), &mut launch.env);
-    launch.user = oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    launch.user = Some(
+        oci::resolve_exec_user_spec(&rootfs, launch.user.as_deref())
+            .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?,
+    );
 
     // Spawn the exec, wire stdin, then wait with the SAME timeout + client
     // liveness contract every other exec path uses. The keep-alive path
@@ -7673,7 +8108,7 @@ fn handle_run(
 
 /// Handle image pull request with progress streaming.
 fn handle_streaming_pull<S: Read + Write>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     image: &str,
     cache_as: Option<&str>,
     oci_platform: Option<&str>,
@@ -7716,7 +8151,7 @@ const PULL_PROGRESS_HEARTBEAT: std::time::Duration = std::time::Duration::from_s
 /// host's frame timeout, so while the pull is quiet this thread (the stream's
 /// only writer) repeats the latest update every `heartbeat`.
 fn pull_with_heartbeat<S: Write, T: Send>(
-    stream: &mut S,
+    stream: &mut WireStream<S>,
     heartbeat: std::time::Duration,
     pull: impl FnOnce(&mut dyn FnMut(usize, usize, &str)) -> T + Send,
 ) -> Result<T, Box<dyn std::error::Error>> {
@@ -7870,7 +8305,7 @@ fn handle_flatten_layers(lowerdirs: &[String], output: &str) -> AgentResponse {
 /// image runs the helper out of space partway through. Streaming keeps the
 /// archive off the disk entirely, so only the source rootfs has to fit.
 fn handle_streaming_flatten_layers(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     lowerdirs: &[String],
 ) -> Result<(), Box<dyn std::error::Error>> {
     info!(
@@ -7967,7 +8402,7 @@ fn handle_format_storage() -> AgentResponse {
 /// chunks. No temp tar file is created — this allows exporting layers of any
 /// size without filling the storage disk.
 fn handle_streaming_export_layer(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     image_digest: &str,
     layer_index: usize,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -8622,10 +9057,10 @@ fn handle_vm_exec(
 
 /// Handle interactive VM-level exec with streaming I/O.
 fn handle_interactive_vm_exec(
-    stream: &mut impl ReadWrite,
+    stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (command, env, workdir, timeout_ms, tty) = match request {
+    let (command, env, workdir, timeout_ms, tty, control, terminal) = match request {
         AgentRequest::VmExec {
             command,
             env,
@@ -8633,17 +9068,81 @@ fn handle_interactive_vm_exec(
             timeout_ms,
             tty,
             ..
-        } => (command, env, workdir, timeout_ms, tty),
+        } => (command, env, workdir, timeout_ms, tty, None, None),
+        AgentRequest::VmExecControlled { session } => {
+            if let Err(error) = session.validate_operation() {
+                send_response(
+                    stream,
+                    &AgentResponse::error(error, error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            if matches!(session.target, Some(WorkloadTarget::Container { .. })) {
+                return controlled_exec::serve(stream, session);
+            }
+            if session.user.is_some()
+                || matches!(session.target, Some(WorkloadTarget::Container { .. }))
+            {
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        "controlled target or user is unsupported on this guest",
+                        error_codes::INVALID_REQUEST,
+                    ),
+                )?;
+                return Ok(());
+            }
+            let registration = match interactive_control::Registration::reserve(&session.id) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::from_err(error, error_codes::INVALID_REQUEST),
+                    )?;
+                    return Ok(());
+                }
+            };
+            let command = match &session.builtin {
+                Some(builtin) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        std::iter::once("/proc/self/exe".to_string())
+                            .chain(builtin_exec::command(builtin))
+                            .collect()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = builtin;
+                        return Err("builtin operations require a Linux guest".into());
+                    }
+                }
+                None => session.command,
+            };
+            (
+                command,
+                session.env,
+                session.workdir,
+                session.timeout_ms,
+                session.terminal.is_some(),
+                Some(registration),
+                session.terminal,
+            )
+        }
         _ => {
             send_response(
                 stream,
-                &AgentResponse::error("expected VmExec request", error_codes::INVALID_REQUEST),
+                &AgentResponse::error("expected VM exec request", error_codes::INVALID_REQUEST),
             )?;
             return Ok(());
         }
     };
 
-    info!(command = ?command, tty = tty, "starting interactive VM exec");
+    info!(
+        tty,
+        controlled = control.is_some(),
+        "starting interactive VM exec"
+    );
 
     if command.is_empty() {
         send_response(
@@ -8653,42 +9152,68 @@ fn handle_interactive_vm_exec(
         return Ok(());
     }
 
-    // Spawn the command directly
-    let (mut child, pty_master) =
-        match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty) {
-            Ok(result) => result,
-            Err(e) => {
-                send_response(
-                    stream,
-                    &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
-                )?;
-                return Ok(());
-            }
-        };
-
-    // Send Started response
-    send_response(stream, &AgentResponse::Started)?;
-
-    // Run the appropriate interactive I/O loop. Every Ok path inside the loops
-    // already reaps the child (try_wait auto-reaps on exit; timeout and host
-    // disconnect both kill+wait). The Err paths — a malformed/oversized inbound
-    // frame, a Stdin parse failure, a try_wait/drain error — do NOT, so reap
-    // here before propagating. The agent is PID 1 with no global waitpid(-1)
-    // reaper, so an unreaped interactive child would linger as a zombie holding
-    // its stdio/PTY fds. Mirrors the loop's own kill_child_on_disconnect.
-    let loop_result = match pty_master {
-        #[cfg(unix)]
-        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
-        _ => run_interactive_loop(stream, &mut child, timeout_ms),
+    let spawned = if control.is_some() {
+        spawn_direct_interactive_command_controlled(
+            &command,
+            &env,
+            workdir.as_deref(),
+            tty,
+            true,
+            terminal.as_ref(),
+        )
+    } else {
+        spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty)
     };
-    let exit_code = match loop_result {
-        Ok(code) => code,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
+    let (mut child, pty_master) = match spawned {
+        Ok(result) => result,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(error, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
         }
     };
+    if let Some(control) = &control {
+        #[cfg(unix)]
+        let terminal = pty_master.as_ref().map(|pty| pty.as_raw_fd());
+        #[cfg(not(unix))]
+        let terminal = None;
+        if let Err(error) = control.activate(&child, terminal) {
+            process::kill_child_tree(&mut child);
+            let _ = child.wait();
+            send_response(
+                stream,
+                &AgentResponse::from_err(error, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    }
+
+    // Started delivery is part of the owned session: a failed first write must
+    // reap the command just like a later data-stream failure.
+    let loop_result = (|| {
+        send_response(stream, &AgentResponse::Started)?;
+        match pty_master {
+            #[cfg(unix)]
+            Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
+            _ => run_interactive_loop(stream, &mut child, timeout_ms),
+        }
+    })();
+    let exit_code = match loop_result {
+        Ok(code) => code,
+        Err(error) => {
+            // A loop may already have reaped the command before a final output
+            // write failed. Never use that released PID to scan descendants.
+            if matches!(child.try_wait(), Ok(None)) {
+                process::kill_child_tree(&mut child);
+            }
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    // Revoke before writing Exited, which may block on an unread connection.
+    drop(control);
 
     // Send Exited response
     send_response(
@@ -8713,7 +9238,19 @@ fn spawn_direct_interactive_command(
     workdir: Option<&str>,
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    spawn_direct_interactive_command_controlled(command, env, workdir, tty, false, None)
+}
+
+#[cfg(unix)]
+fn spawn_direct_interactive_command_controlled(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    tty: bool,
+    controlled: bool,
+    terminal: Option<&smolvm_protocol::interactive_control::Terminal>,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(&command[0]);
@@ -8727,18 +9264,26 @@ fn spawn_direct_interactive_command(
     }
 
     if tty {
-        // Allocate a PTY pair with default 80x24 size (host will send Resize).
-        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
-        let slave_raw = slave_fd.as_raw_fd();
-
-        // Set up stdio from the slave fd. We dup because Stdio::from_raw_fd
-        // takes ownership and we need the fd for all three handles + pre_exec.
-        // SAFETY: slave_fd is a valid open fd from openpty.
-        unsafe {
-            cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_raw)));
-            cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_raw)));
-            cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+        // Apply the initial dimensions and modes before the child can read them.
+        let (cols, rows) = terminal.map_or((80, 24), |t| (t.cols, t.rows));
+        if cols == 0 || rows == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal dimensions must be nonzero",
+            )
+            .into());
         }
+        let (pty_master, slave_fd) = pty::open_pty(cols, rows)?;
+        let slave_raw = slave_fd.as_raw_fd();
+        if let Some(terminal) = terminal {
+            terminal_modes::apply(slave_raw, &terminal.modes)?;
+        }
+
+        // Owned clones report fd exhaustion instead of constructing Stdio
+        // from a failed dup() result. Keep the original for pre_exec.
+        cmd.stdin(Stdio::from(slave_fd.try_clone()?));
+        cmd.stdout(Stdio::from(slave_fd.try_clone()?));
+        cmd.stderr(Stdio::from(slave_fd.try_clone()?));
 
         // SAFETY: pre_exec closure calls only async-signal-safe functions.
         unsafe {
@@ -8752,6 +9297,9 @@ fn spawn_direct_interactive_command(
 
         Ok((child, Some(pty_master)))
     } else {
+        if controlled {
+            cmd.process_group(0);
+        }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -8763,11 +9311,13 @@ fn spawn_direct_interactive_command(
 
 /// Stub for non-Unix platforms.
 #[cfg(not(unix))]
-fn spawn_direct_interactive_command(
+fn spawn_direct_interactive_command_controlled(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
     _tty: bool,
+    _controlled: bool,
+    _terminal: Option<&smolvm_protocol::interactive_control::Terminal>,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -8789,10 +9339,19 @@ fn spawn_direct_interactive_command(
 
 /// Send a response to the client.
 fn send_response(
-    stream: &mut impl Write,
+    stream: &mut WireStream<impl Write>,
     response: &AgentResponse,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let json = serde_json::to_vec(response)?;
+    if stream.binary && smolvm_protocol::binary_stream::write_response(&mut stream.inner, response)?
+    {
+        stream.flush()?;
+        return Ok(());
+    }
+    let mut envelope = Envelope::new(response);
+    if stream.binary {
+        envelope.binary_stream = Some(smolvm_protocol::binary_stream::VERSION);
+    }
+    let json = serde_json::to_vec(&envelope)?;
     let len = json.len() as u32;
 
     stream.write_all(&len.to_be_bytes())?;
@@ -8801,6 +9360,39 @@ fn send_response(
 
     debug!(?response, "sent response");
     Ok(())
+}
+
+/// Negotiation belongs to this connection, never to a process or worker thread.
+struct WireStream<'a, T> {
+    inner: &'a mut T,
+    binary: bool,
+}
+
+impl<'a, T> WireStream<'a, T> {
+    fn new(inner: &'a mut T) -> Self {
+        Self {
+            inner,
+            binary: false,
+        }
+    }
+}
+impl<T: Read> Read for WireStream<'_, T> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.inner.read(bytes)
+    }
+}
+impl<T: Write> Write for WireStream<'_, T> {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.inner.write(bytes)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+impl<T: AsRawFd> AsRawFd for WireStream<'_, T> {
+    fn as_raw_fd(&self) -> std::os::unix::io::RawFd {
+        self.inner.as_raw_fd()
+    }
 }
 
 /// Trait for read+write streams with raw fd access.
@@ -8821,6 +9413,27 @@ impl<T: Read + Write + AsRawFd> ReadWrite for T {}
 /// is Linux-specific. `cargo test -p smolvm-agent --target
 /// aarch64-unknown-linux-musl` on a Linux runner.
 #[cfg(test)]
+mod idle_poll_tests {
+    use super::write_idle_poll;
+
+    #[test]
+    fn the_idle_poll_ceiling_is_written_as_a_bounded_decimal() {
+        let dir = std::env::temp_dir().join(format!("smolvm-idle-poll-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let knob = dir.join("knob");
+        write_idle_poll(&knob, " 50\n").unwrap();
+        assert_eq!(std::fs::read_to_string(&knob).unwrap(), "50");
+        write_idle_poll(&knob, "0").unwrap();
+        assert_eq!(std::fs::read_to_string(&knob).unwrap(), "0");
+        assert!(write_idle_poll(&knob, "10001").is_err());
+        assert!(write_idle_poll(&knob, "fifty").is_err());
+        assert!(write_idle_poll(&knob, "-1").is_err());
+        assert_eq!(std::fs::read_to_string(&knob).unwrap(), "0");
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+}
+
+#[cfg(test)]
 #[cfg(target_os = "linux")]
 mod work_slot_tests {
     use super::*;
@@ -8828,11 +9441,24 @@ mod work_slot_tests {
     use std::time::Duration;
 
     #[test]
-    fn only_pings_and_shutdown_skip_the_work_slots() {
+    fn control_and_long_lived_streams_do_not_consume_work_slots() {
         assert!(!needs_work_slot(&AgentRequest::Ping));
+        assert!(!needs_work_slot(&AgentRequest::InteractiveControl {
+            request: smolvm_protocol::interactive_control::Request {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                action: smolvm_protocol::interactive_control::Action::Signal { signal: 15 },
+            },
+        }));
         assert!(!needs_work_slot(&AgentRequest::Shutdown {
             progress: false,
             stop_timeout_secs: None,
+        }));
+        assert!(!needs_work_slot(&AgentRequest::ContainerPortConnect {
+            overlay_id: "test-overlay".into(),
+            port: 8080,
+        }));
+        assert!(needs_work_slot(&AgentRequest::ContainerPorts {
+            overlay_id: "test-overlay".into(),
         }));
         assert!(needs_work_slot(&AgentRequest::ListImages));
     }
@@ -8860,7 +9486,8 @@ mod work_slot_tests {
             .unwrap();
 
         let before = thread_cpu();
-        let code = run_interactive_loop(&mut guest, &mut child, None).unwrap();
+        let code =
+            run_interactive_loop(&mut WireStream::new(&mut guest), &mut child, None).unwrap();
         let spent = thread_cpu() - before;
 
         assert_eq!(code, 0);
@@ -8873,7 +9500,7 @@ mod work_slot_tests {
     }
 
     #[test]
-    fn a_ping_is_answered_while_every_work_slot_is_taken() {
+    fn liveness_and_session_controls_answer_while_every_work_slot_is_taken() {
         let held: Vec<_> = (0..MAX_CONCURRENT_WORK)
             .map(|_| WORK_SLOTS.acquire())
             .collect();
@@ -8882,13 +9509,29 @@ mod work_slot_tests {
             let mut guest = guest;
             let _ = handle_connection(&mut guest);
         });
-        let frame = serde_json::to_vec(&AgentRequest::Ping).unwrap();
-        host.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
-        host.write_all(&frame).unwrap();
-        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut header = [0u8; 4];
-        host.read_exact(&mut header)
-            .expect("a ping must be answered even with every work slot taken");
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        for request in [
+            AgentRequest::Ping,
+            AgentRequest::InteractiveControl {
+                request: smolvm_protocol::interactive_control::Request {
+                    id: "ffffffffffffffffffffffffffffffff".into(),
+                    action: smolvm_protocol::interactive_control::Action::Signal { signal: 15 },
+                },
+            },
+        ] {
+            let frame = smolvm_protocol::encode_message(&request).unwrap();
+            host.write_all(&frame).unwrap();
+            let mut header = [0u8; 4];
+            host.read_exact(&mut header)
+                .expect("liveness and control requests must bypass occupied work slots");
+            let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+            host.read_exact(&mut bytes).unwrap();
+            let response: AgentResponse = serde_json::from_slice(&bytes).unwrap();
+            assert!(matches!(
+                response,
+                AgentResponse::Pong { .. } | AgentResponse::Error { .. }
+            ));
+        }
         drop(held);
     }
 }
@@ -9734,8 +10377,10 @@ mod tests {
                 )
                 .unwrap();
                 assert!(pty.is_none());
-                send_response(&mut agent, &AgentResponse::Started).unwrap();
-                let code = run_interactive_loop(&mut agent, &mut child, Some(500)).unwrap();
+                send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+                let code =
+                    run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(500))
+                        .unwrap();
                 finished.send(code).unwrap();
             });
 
@@ -9774,7 +10419,7 @@ mod tests {
         .unwrap();
         assert!(pty.is_none());
         assert_eq!(
-            run_interactive_loop(&mut agent, &mut child, Some(100)).unwrap(),
+            run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(100)).unwrap(),
             124
         );
 
@@ -9807,7 +10452,13 @@ mod tests {
         )
         .unwrap();
         assert_eq!(
-            run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100)).unwrap(),
+            run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty.unwrap(),
+                Some(100)
+            )
+            .unwrap(),
             124
         );
 
@@ -9826,6 +10477,12 @@ mod tests {
     #[test]
     #[cfg(unix)]
     fn streamed_cat_drains_stdout_while_writing_large_stdin() {
+        for binary in [false, true] {
+            streamed_cat_with_encoding(binary);
+        }
+    }
+
+    fn streamed_cat_with_encoding(binary: bool) {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -9837,6 +10494,8 @@ mod tests {
             .set_write_timeout(Some(std::time::Duration::from_secs(5)))
             .unwrap();
         let guest = std::thread::spawn(move || {
+            let mut agent = WireStream::new(&mut agent);
+            agent.binary = binary;
             let (mut child, pty) =
                 spawn_direct_interactive_command(&["cat".to_string()], &[], None, false).unwrap();
             assert!(pty.is_none());
@@ -9852,15 +10511,23 @@ mod tests {
             .unwrap();
         });
 
-        let input = vec![b'x'; 512 * 1024];
+        let input: Vec<u8> = (0..=255).cycle().take(512 * 1024).collect();
         let mut writer = client.try_clone().unwrap();
         let payload = input.clone();
         let sender = std::thread::spawn(move || {
+            let encode = |request: &AgentRequest| {
+                if binary {
+                    smolvm_protocol::binary_stream::encode_request(request, None)
+                        .unwrap()
+                        .unwrap()
+                } else {
+                    smolvm_protocol::encode_message(request).unwrap()
+                }
+            };
             for chunk in payload.chunks(32 * 1024) {
-                let frame = smolvm_protocol::encode_message(&AgentRequest::Stdin {
+                let frame = encode(&AgentRequest::Stdin {
                     data: chunk.to_vec(),
-                })
-                .unwrap();
+                });
                 if chunk.as_ptr() == payload.as_ptr() {
                     // Fragments across both the prefix and payload must be
                     // assembled without losing the command's streamed output.
@@ -9874,10 +10541,7 @@ mod tests {
                 }
             }
             writer
-                .write_all(
-                    &smolvm_protocol::encode_message(&AgentRequest::Stdin { data: Vec::new() })
-                        .unwrap(),
-                )
+                .write_all(&encode(&AgentRequest::Stdin { data: Vec::new() }))
                 .unwrap();
         });
 
@@ -9887,7 +10551,10 @@ mod tests {
             client.read_exact(&mut header).unwrap();
             let mut body = vec![0; u32::from_be_bytes(header) as usize];
             client.read_exact(&mut body).unwrap();
-            match serde_json::from_slice::<AgentResponse>(&body).unwrap() {
+            match smolvm_protocol::binary_stream::decode_response(&body)
+                .unwrap()
+                .0
+            {
                 AgentResponse::Started => {}
                 AgentResponse::Stdout { data } => stdout.extend(data),
                 AgentResponse::Exited { exit_code, .. } => {
@@ -9928,10 +10595,16 @@ mod tests {
             )
             .unwrap();
             let pty = pty.unwrap();
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
-            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(5000)).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+            let code = run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty,
+                Some(5000),
+            )
+            .unwrap();
             send_response(
-                &mut agent,
+                &mut WireStream::new(&mut agent),
                 &AgentResponse::Exited {
                     exit_code: code,
                     oom: false,
@@ -10039,10 +10712,14 @@ mod tests {
                     true,
                 )
                 .unwrap();
-                send_response(&mut agent, &AgentResponse::Started).unwrap();
-                let code =
-                    run_interactive_loop_pty(&mut agent, &mut child, pty.unwrap(), Some(100))
-                        .unwrap();
+                send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
+                let code = run_interactive_loop_pty(
+                    &mut WireStream::new(&mut agent),
+                    &mut child,
+                    pty.unwrap(),
+                    Some(100),
+                )
+                .unwrap();
                 tx.send(code).unwrap();
             });
 
@@ -10082,9 +10759,15 @@ mod tests {
             )
             .unwrap();
             let pty = pty.unwrap();
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop_pty(&mut agent, &mut child, pty, Some(2000)).unwrap();
+            let code = run_interactive_loop_pty(
+                &mut WireStream::new(&mut agent),
+                &mut child,
+                pty,
+                Some(2000),
+            )
+            .unwrap();
             (code, started.elapsed())
         });
 
@@ -10119,6 +10802,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn streamed_exec_reaps_child_on_disconnect_with_pending_stdin() {
+        check_disconnect_with_pending_stdin(false);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_exec_reaps_child_on_half_close_with_pending_stdin() {
+        check_disconnect_with_pending_stdin(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_disconnect_with_pending_stdin(half_close: bool) {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -10135,9 +10829,11 @@ mod tests {
             )
             .unwrap();
             assert!(pty.is_none());
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            let code =
+                run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(2000))
+                    .unwrap();
             (code, started.elapsed())
         });
 
@@ -10157,7 +10853,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        drop(client);
+        if half_close {
+            // Keep the response channel open so the host can confirm exit.
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+        } else {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
 
         let (code, elapsed) = guest.join().unwrap();
         assert_eq!(code, 124);
@@ -10190,9 +10891,11 @@ mod tests {
             )
             .unwrap();
             assert!(pty.is_none());
-            send_response(&mut agent, &AgentResponse::Started).unwrap();
+            send_response(&mut WireStream::new(&mut agent), &AgentResponse::Started).unwrap();
             let started = std::time::Instant::now();
-            let code = run_interactive_loop(&mut agent, &mut child, Some(2000)).unwrap();
+            let code =
+                run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, Some(2000))
+                    .unwrap();
             (code, started.elapsed())
         });
 
@@ -10372,7 +11075,7 @@ mod tests {
         .unwrap();
         assert!(pty.is_none());
         assert_eq!(
-            run_interactive_loop(&mut agent, &mut child, None).unwrap(),
+            run_interactive_loop(&mut WireStream::new(&mut agent), &mut child, None).unwrap(),
             0
         );
         let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
@@ -10453,7 +11156,12 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let absent = tmp.path().join("absent");
         let (mut agent, mut client) = UnixStream::pair().unwrap();
-        handle_streaming_file_read(&mut agent, absent.to_str().unwrap(), None).unwrap();
+        handle_streaming_file_read(
+            &mut WireStream::new(&mut agent),
+            absent.to_str().unwrap(),
+            None,
+        )
+        .unwrap();
         let mut header = [0u8; 4];
         client.read_exact(&mut header).unwrap();
         let mut frame = vec![0u8; u32::from_be_bytes(header) as usize];
@@ -10471,7 +11179,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut empty: &[u8] = &[];
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut empty,
             4096,
             "test",
@@ -10500,7 +11208,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut src = std::io::Cursor::new(payload.clone());
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut src,
             256,
             "test",
@@ -10539,7 +11247,7 @@ mod tests {
         let mut sink: Vec<u8> = Vec::new();
         let mut src = std::io::Cursor::new(payload.clone());
         send_data_chunks(
-            &mut sink,
+            &mut WireStream::new(&mut sink),
             &mut src,
             256,
             "test",
@@ -11324,13 +12032,14 @@ mod pull_heartbeat_tests {
     fn a_quiet_pull_keeps_sending_its_latest_progress() {
         let heartbeat = Duration::from_millis(40);
         let mut stream = Vec::new();
-        let result = pull_with_heartbeat(&mut stream, heartbeat, |progress| {
-            std::thread::sleep(heartbeat * 5);
-            progress(1, 2, "sha256:big");
-            std::thread::sleep(heartbeat * 5);
-            "pulled"
-        })
-        .unwrap();
+        let result =
+            pull_with_heartbeat(&mut WireStream::new(&mut stream), heartbeat, |progress| {
+                std::thread::sleep(heartbeat * 5);
+                progress(1, 2, "sha256:big");
+                std::thread::sleep(heartbeat * 5);
+                "pulled"
+            })
+            .unwrap();
         assert_eq!(result, "pulled");
         let frames = progress_frames(&stream);
         let before = frames
@@ -11349,10 +12058,14 @@ mod pull_heartbeat_tests {
     #[test]
     fn a_pull_that_finishes_at_once_sends_nothing_extra() {
         let mut stream = Vec::new();
-        let result = pull_with_heartbeat(&mut stream, Duration::from_secs(60), |progress| {
-            progress(1, 1, "sha256:small");
-            7
-        })
+        let result = pull_with_heartbeat(
+            &mut WireStream::new(&mut stream),
+            Duration::from_secs(60),
+            |progress| {
+                progress(1, 1, "sha256:small");
+                7
+            },
+        )
         .unwrap();
         assert_eq!(result, 7);
         assert_eq!(
@@ -11409,6 +12122,163 @@ mod workload_owner_tests {
     }
 }
 
+#[cfg(test)]
+mod workload_owner_annotation_tests {
+    use super::*;
+
+    fn root_with_spec(dir: &std::path::Path, spec: &str) -> io_target::IoRoot {
+        let merged = dir.join("merged");
+        std::fs::create_dir_all(&merged).unwrap();
+        std::fs::create_dir_all(dir.join("bundle")).unwrap();
+        std::fs::write(dir.join("bundle").join("config.json"), spec).unwrap();
+        io_target::IoRoot::Overlay {
+            workload_id: "persistent-test".into(),
+            merged,
+        }
+    }
+
+    #[test]
+    fn uploads_go_to_the_annotated_workload_user_not_the_root_init() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_spec(
+            dir.path(),
+            &format!(
+                r#"{{"process":{{"user":{{"uid":0,"gid":0}},"args":["/run/smolvm/init"]}},"annotations":{{"{}":"1001:123"}}}}"#,
+                oci::WORKLOAD_USER_ANNOTATION
+            ),
+        );
+        assert_eq!(workload_owner(&root), (Some(1001), Some(123)));
+    }
+
+    #[test]
+    fn an_annotated_root_workload_leaves_ownership_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = root_with_spec(
+            dir.path(),
+            &format!(
+                r#"{{"process":{{"user":{{"uid":0,"gid":0}},"args":["sh"]}},"annotations":{{"{}":"0:0"}}}}"#,
+                oci::WORKLOAD_USER_ANNOTATION
+            ),
+        );
+        assert_eq!(workload_owner(&root), (None, None));
+    }
+}
+
+/// The keep-alive init is root; the workload, and so every exec, is the
+/// image's (or the request's) user.
+#[cfg(test)]
+mod keepalive_user_tests {
+    use super::*;
+
+    fn rootfs() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("etc")).unwrap();
+        std::fs::write(
+            dir.path().join("etc/passwd"),
+            "root:x:0:0:root:/root:/bin/bash\nrunner:x:1001:1001::/home/runner:/bin/bash\n",
+        )
+        .unwrap();
+        std::fs::write(
+            dir.path().join("etc/group"),
+            "root:x:0:\nrunner:x:1001:\ndocker:x:123:runner\nsudo:x:27:runner\n",
+        )
+        .unwrap();
+        dir
+    }
+
+    fn launch(user: Option<&str>) -> ResolvedLaunch {
+        ResolvedLaunch {
+            command: vec!["./run.sh".into()],
+            env: vec![("RUNNER_ALLOW_RUNASROOT".into(), "0".into())],
+            workdir: Some("/home/runner".into()),
+            user: user.map(str::to_string),
+        }
+    }
+
+    #[test]
+    fn the_keepalive_launch_is_root_and_keeps_the_workload_env() {
+        let workload = launch(Some("runner"));
+        let init = workload.keepalive();
+        assert_eq!(init.user.as_deref(), Some(KEEPALIVE_USER));
+        assert_eq!(init.command, ["/run/smolvm/init", "container-init"]);
+        assert_eq!(init.env, workload.env);
+        assert_eq!(init.workdir, workload.workdir);
+        // the workload itself is untouched
+        assert_eq!(workload.user.as_deref(), Some("runner"));
+    }
+
+    #[test]
+    fn a_keepalive_container_runs_its_init_as_root_and_records_the_workload_user() {
+        let root = rootfs();
+        let spec =
+            container_spec(root.path(), &launch(Some("runner")), false, false, true).unwrap();
+        assert_eq!(spec.process.args, ["/run/smolvm/init", "container-init"]);
+        assert_eq!((spec.process.user.uid, spec.process.user.gid), (0, 0));
+        assert!(spec.process.env.iter().any(|e| e == "HOME=/root"));
+        assert_eq!(
+            spec.annotations
+                .get(oci::WORKLOAD_USER_ANNOTATION)
+                .map(String::as_str),
+            Some("1001:1001")
+        );
+    }
+
+    #[test]
+    fn a_workload_that_is_its_own_pid1_keeps_its_user_and_groups() {
+        let root = rootfs();
+        let spec =
+            container_spec(root.path(), &launch(Some("runner")), false, false, false).unwrap();
+        assert_eq!(spec.process.args, ["./run.sh"]);
+        assert_eq!((spec.process.user.uid, spec.process.user.gid), (1001, 1001));
+        assert_eq!(spec.process.user.additional_gids, vec![1001, 123, 27]);
+        assert!(spec.process.env.iter().any(|e| e == "HOME=/home/runner"));
+        assert_eq!(
+            spec.annotations
+                .get(oci::WORKLOAD_USER_ANNOTATION)
+                .map(String::as_str),
+            Some("1001:1001")
+        );
+    }
+
+    #[test]
+    fn an_image_without_a_user_is_root_everywhere() {
+        let root = rootfs();
+        for init in [true, false] {
+            let spec = container_spec(root.path(), &launch(None), false, false, init).unwrap();
+            assert_eq!((spec.process.user.uid, spec.process.user.gid), (0, 0));
+            assert_eq!(
+                spec.annotations
+                    .get(oci::WORKLOAD_USER_ANNOTATION)
+                    .map(String::as_str),
+                Some("0:0")
+            );
+        }
+        assert_eq!(
+            oci::resolve_exec_user_spec(root.path(), None).unwrap(),
+            "0:0"
+        );
+    }
+
+    #[test]
+    fn every_exec_names_its_user_whatever_the_container_runs_as() {
+        let root = rootfs();
+        // The image's USER, a request's numeric override and no user at all all
+        // resolve to an explicit uid:gid for `crun exec --user`.
+        for (user, expected) in [
+            (Some("runner"), "1001:1001"),
+            (Some("1001"), "1001:1001"),
+            (Some("root"), "0:0"),
+            (None, "0:0"),
+        ] {
+            assert_eq!(
+                oci::resolve_exec_user_spec(root.path(), user).unwrap(),
+                expected,
+                "{user:?}"
+            );
+        }
+    }
+}
+
 #[cfg(all(test, target_os = "linux"))]
 mod exec_process_spec_tests {
     use super::{exec_process_spec, ResolvedLaunch};
@@ -11448,17 +12318,17 @@ mod exec_process_spec_tests {
             .unwrap()
             .expect("runner is in docker and sudo");
         assert_eq!((spec.user.uid, spec.user.gid), (1001, 1001));
-        assert_eq!(spec.user.additional_gids, vec![999, 27]);
+        assert_eq!(spec.user.additional_gids, vec![1001, 999, 27]);
         assert_eq!(spec.cwd, "/home/runner");
         assert!(!spec.terminal);
         let json = serde_json::to_string(&spec).unwrap();
-        assert!(json.contains("\"additionalGids\":[999,27]"), "{json}");
+        assert!(json.contains("\"additionalGids\":[1001,999,27]"), "{json}");
         assert!(json.contains("\"env\":[\"PATH=/usr/bin\"]"), "{json}");
         let by_name = exec_process_spec(root.path(), &launch(Some("runner")), &env, true)
             .unwrap()
             .unwrap();
         assert!(by_name.terminal);
-        assert_eq!(by_name.user.additional_gids, vec![999, 27]);
+        assert_eq!(by_name.user.additional_gids, vec![1001, 999, 27]);
     }
 
     #[test]

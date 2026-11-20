@@ -1,0 +1,17 @@
+on:
+  pull_request:
+  merge_group:
+
+name: Fuzz
+
+jobs:
+  fuzz:
+    runs-on: ubuntu-22.04
+    env:
+      RUSTUP_TOOLCHAIN: nightly
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install cargo-fuzz
+        run: cargo install cargo-fuzz
+      - name: Fuzz
+        run: cargo fuzz run packet_parser -- -max_len=1536 -max_total_time=30

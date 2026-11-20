@@ -202,7 +202,7 @@ jobs:
           # driver and its closure RUNPATH=$ORIGIN so nothing in the bundle
           # has to be exposed to workloads through LD_LIBRARY_PATH.
           sudo apt-get update
-          sudo apt-get install -y patchelf
+          sudo apt-get install -y patchelf make patch pkg-config python3
           chmod +x /tmp/agent/smolvm-agent /tmp/cuda/smolvm-cuda-run
           AGENT_BINARY=/tmp/agent/smolvm-agent \
           CUDA_GUEST_BINARY=/tmp/cuda/smolvm-cuda-run \
@@ -612,6 +612,7 @@ jobs:
     name: Update Nix flake
     needs: release
     permissions:
+      actions: write
       contents: write
       pull-requests: write
     uses: ./.github/workflows/update-nix-flake.yml

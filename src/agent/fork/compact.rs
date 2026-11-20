@@ -7,14 +7,16 @@
 //! Once the chain reaches [`COMPACT_AT_DEPTH`], the newest immutable generation is
 //! flattened: its content, and everything beneath it, is written into one new file
 //! backed by the disk the machine started from, or standalone when that inherited
-//! disk is itself deep, which then replaces it at the same path by an atomic
-//! rename. A child may also flatten its ancestor's immutable generation. Every
+//! disk is itself deep (a cache disk's chain never: it is merged onto its
+//! shared base, see [`kept_floor`]), which then replaces it at the same path by
+//! an atomic rename. A child may also flatten its ancestor's immutable generation. Every
 //! chain that names that path reads the same bytes
 //! through a short chain from then on, and nothing ever copies a layer a VMM can
 //! still write. A process that already opened the old file keeps reading it, and
 //! nothing a branch made earlier is deleted while a chain still reaches it.
 
-use super::qcow2_backing_name;
+use super::{qcow2_backing_format, qcow2_backing_name};
+use crate::data::disk::DiskFormat;
 use crate::{Error, Result};
 use imago::file::File as ImagoFile;
 use imago::qcow2::Qcow2;
@@ -146,31 +148,48 @@ fn is_qcow2(path: &Path) -> Result<bool> {
 
 /// The chain from `top` downward, each entry canonical, `top` first.
 fn chain(top: &Path) -> Result<Vec<PathBuf>> {
-    let mut layers = Vec::new();
+    Ok(chain_formats(top, None)?
+        .into_iter()
+        .map(|(layer, _)| layer)
+        .collect())
+}
+
+/// [`chain`] with the format each layer is read as. A backing's format is
+/// the one the layer above declares for it, so a raw layer ends the chain
+/// whatever its own bytes say: it is a guest's disk, and a guest can write a
+/// qcow2 header naming any host file into it. Only a layer whose format
+/// nothing declares (`top` when `top_format` is `None`, or a backing its
+/// parent leaves undeclared) is probed, as imago does.
+fn chain_formats(top: &Path, top_format: Option<DiskFormat>) -> Result<Vec<(PathBuf, DiskFormat)>> {
+    let mut layers: Vec<(PathBuf, DiskFormat)> = Vec::new();
     let mut current = top
         .canonicalize()
         .map_err(|e| compact_err("resolve layer", e))?;
+    let mut format = match top_format {
+        Some(format) => format,
+        None => probed_format(&current)?,
+    };
     loop {
-        if layers.contains(&current) {
+        if layers.iter().any(|(layer, _)| *layer == current) {
             return Err(compact_err(
                 "walk chain",
                 format!("cycle at {}", current.display()),
             ));
         }
-        layers.push(current.clone());
+        layers.push((current.clone(), format));
         if layers.len() > 4 * super::MAX_FORK_DISK_CHAIN_DEPTH {
             return Err(compact_err(
                 "walk chain",
                 "chain is deeper than any branch can make",
             ));
         }
-        let Some(backing) = (if is_qcow2(&current)? {
-            qcow2_backing_name(&current)?
-        } else {
-            None
-        }) else {
+        if format == DiskFormat::Raw {
+            return Ok(layers);
+        }
+        let Some(backing) = qcow2_backing_name(&current)? else {
             return Ok(layers);
         };
+        let declared = qcow2_backing_format(&current)?;
         let next = if backing.is_absolute() {
             backing
         } else {
@@ -182,7 +201,19 @@ fn chain(top: &Path) -> Result<Vec<PathBuf>> {
         current = next
             .canonicalize()
             .map_err(|e| compact_err("resolve backing", e))?;
+        format = match declared {
+            Some(format) => format,
+            None => probed_format(&current)?,
+        };
     }
+}
+
+fn probed_format(path: &Path) -> Result<DiskFormat> {
+    Ok(if is_qcow2(path)? {
+        DiskFormat::Qcow2
+    } else {
+        DiskFormat::Raw
+    })
 }
 
 /// A layer this module or a live branch wrote under the source's `d/`, which may
@@ -205,8 +236,40 @@ fn is_generation_layer(gdir_d: &Path, id: &str, layer: &Path) -> bool {
     }
 }
 
+/// A backing layer a checkpoint restore installed beneath a machine's writable
+/// top: `.smolcheckpoint-<role>-<n>.qcow2`, or `.smolcheckpoint-<role>-layer<n>.qcow2`
+/// for a captured top shared as one more layer. Restore links these from its
+/// extraction cache and never writes them, and a live branch hard-links them
+/// beside a generation, so like a generation they may be replaced by a file
+/// holding the same bytes. The writable top itself is never named this way.
+fn is_restored_layer(id: &str, layer: &Path) -> bool {
+    let Some(name) = layer.file_name().and_then(|n| n.to_str()) else {
+        return false;
+    };
+    let Some(index) = name
+        .strip_prefix(".smolcheckpoint-")
+        .and_then(|rest| rest.strip_prefix(id))
+        .and_then(|rest| rest.strip_prefix('-'))
+        .and_then(|rest| rest.strip_suffix(".qcow2"))
+    else {
+        return false;
+    };
+    let digits = index.strip_prefix("layer").unwrap_or(index);
+    !digits.is_empty() && digits.bytes().all(|b| b.is_ascii_digit()) && index != "0"
+}
+
+/// The machine directory that owns a layer this module may replace in place: a
+/// generation under its `d/`, or a layer its checkpoint restore installed.
+/// `None` for every other file, which may be read but must never be replaced.
 fn generation_owner(id: &str, layer: &Path) -> Option<PathBuf> {
     let generation = layer.parent()?;
+    if is_restored_layer(id, layer) {
+        let directory = generation.parent()?;
+        if directory.file_name()? == "d" && super::snapshot_generation_id(generation).is_some() {
+            return Some(directory.parent()?.to_path_buf());
+        }
+        return Some(generation.to_path_buf());
+    }
     let directory = generation.parent()?;
     if directory.file_name()? != "d"
         || !is_generation_layer(directory, id, layer)
@@ -215,6 +278,21 @@ fn generation_owner(id: &str, layer: &Path) -> Option<PathBuf> {
         return None;
     }
     Some(directory.parent()?.to_path_buf())
+}
+
+/// The layer a flatten of `id`'s chain keeps beneath it instead of folding in.
+///
+/// A cache disk's chain bottoms out on its shared base, the file the machine
+/// records and every checkpoint of it names instead of carrying. Folding that
+/// base into a standalone layer keeps the bytes but drops the name: the machine
+/// can no longer be checkpointed, and the copy costs the whole base. So a cache
+/// chain is only ever merged down onto its bottom. Other disks have no such
+/// base and may be flattened standalone.
+fn kept_floor(id: &str, layers: &[PathBuf]) -> Option<PathBuf> {
+    if id != crate::agent::launcher::CACHE_BLOCK_ID || layers.len() < 2 {
+        return None;
+    }
+    layers.last().cloned()
 }
 
 fn compaction_key(gdir: &Path, id: &str, target: &Path) -> PathBuf {
@@ -262,8 +340,11 @@ fn open_readonly(path: &Path, with_backing: bool) -> Result<SyncFormatAccess<Ima
 }
 
 /// Create `out` as an empty qcow2 of `size` bytes backed by `backing`.
-fn create_overlay(out: &Path, size: u64, backing: &Path) -> Result<()> {
-    let format = if is_qcow2(backing)? { "qcow2" } else { "raw" };
+fn create_overlay(out: &Path, size: u64, backing: &Path, format: DiskFormat) -> Result<()> {
+    let format = match format {
+        DiskFormat::Qcow2 => "qcow2",
+        DiskFormat::Raw => "raw",
+    };
     let backing = backing
         .to_str()
         .ok_or_else(|| compact_err("backing path", "not UTF-8"))?;
@@ -476,15 +557,14 @@ struct ChainData {
 }
 
 fn chain_data(top: &Path) -> Result<ChainData> {
-    let layers = chain(top)?;
+    let layers = chain_formats(top, None)?;
     let view = open_readonly(top, true)?;
     let size = view.size();
     let mut ranges = Vec::new();
-    for layer in &layers {
-        if is_qcow2(layer)? {
-            defined_ranges(layer, size, &mut ranges)?;
-        } else {
-            raw_data_ranges(layer, size, &mut ranges)?;
+    for (layer, format) in &layers {
+        match format {
+            DiskFormat::Qcow2 => defined_ranges(layer, size, &mut ranges)?,
+            DiskFormat::Raw => raw_data_ranges(layer, size, &mut ranges)?,
         }
     }
     Ok(ChainData { view, size, ranges })
@@ -545,7 +625,18 @@ fn coalesce(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 /// given that `new_backing` reads exactly as `stop` (a layer in `top`'s chain).
 /// Only the ranges the layers above `stop` define are copied.
 pub(super) fn merge_onto(top: &Path, stop: &Path, new_backing: &Path, out: &Path) -> Result<()> {
-    let layers = chain(top)?;
+    let formats = chain_formats(top, None)?;
+    let layers: Vec<PathBuf> = formats.iter().map(|(layer, _)| layer.clone()).collect();
+    // The new backing's format is the one the chain declares for it; only a
+    // layer outside the chain, which this module wrote, is probed.
+    let backing_format = match new_backing
+        .canonicalize()
+        .ok()
+        .and_then(|backing| formats.iter().find(|(layer, _)| *layer == backing))
+    {
+        Some((_, format)) => *format,
+        None => probed_format(new_backing)?,
+    };
     let stop = stop
         .canonicalize()
         .map_err(|e| compact_err("resolve stop", e))?;
@@ -559,7 +650,7 @@ pub(super) fn merge_onto(top: &Path, stop: &Path, new_backing: &Path, out: &Path
     for layer in &layers[..above] {
         defined_ranges(layer, size, &mut ranges)?;
     }
-    create_overlay(out, size, new_backing)?;
+    create_overlay(out, size, new_backing, backing_format)?;
     let result = (|| {
         let qcow = Qcow2::<ImagoFile>::builder_path(out)
             .data_file(None)
@@ -617,23 +708,26 @@ fn flatten_target(
     if layers.len() <= threshold || layers.len() < 3 {
         return Ok(None);
     }
-    let gdir_d = gdir
+    let gdir = gdir
         .canonicalize()
-        .map_err(|e| compact_err("resolve machine", e))?
-        .join("d");
+        .map_err(|e| compact_err("resolve machine", e))?;
+    let own = |layer: &Path| generation_owner(id, layer).as_deref() == Some(gdir.as_path());
     let target = &layers[1];
-    if !is_generation_layer(&gdir_d, id, target) {
-        return Ok(layers[1..]
+    if !own(target) {
+        // The nearest layer some machine may replace that still has a backing
+        // to fold in; the chain's bottom has none.
+        return Ok(layers[1..layers.len() - 1]
             .iter()
             .find(|layer| generation_owner(id, layer).is_some())
             .map(|target| (target.clone(), None)));
     }
-    let Some(root) = layers[2..]
+    // The disk the machine started from: the first layer below the target it
+    // did not write. A chain it wrote all the way down (a standalone flatten
+    // left at its bottom, or a restored checkpoint) folds onto its bottom.
+    let root = layers[2..]
         .iter()
-        .find(|layer| !is_generation_layer(&gdir_d, id, layer))
-    else {
-        return Ok(None);
-    };
+        .find(|layer| !own(layer))
+        .unwrap_or_else(|| layers.last().expect("chain has at least three layers"));
     let root_depth = layers.iter().position(|layer| layer == root).unwrap();
     if layers.len() - root_depth + 2 > COMPACT_AT_DEPTH {
         return Ok(Some((target.clone(), None)));
@@ -681,32 +775,193 @@ pub(super) fn maybe_start_compaction(
 /// waiting for a running merge first. The source keeps running meanwhile: only
 /// layers beneath its active disk are read.
 pub(super) fn compact_if_near_limit(gdir: &Path, vm_ids: Option<(u32, u32)>) -> Result<()> {
+    compact_if_deeper_than(gdir, vm_ids, SYNC_COMPACT_AT_DEPTH)
+}
+
+/// [`compact_if_near_limit`] for chains longer than `threshold` layers.
+pub(super) fn compact_if_deeper_than(
+    gdir: &Path,
+    vm_ids: Option<(u32, u32)>,
+    threshold: usize,
+) -> Result<()> {
     for (id, raw) in super::FORK_DISK_ROLES {
-        let (active, _) = crate::agent::resolve_disk_image(gdir, raw);
-        if !active.is_file() {
+        let (active, format) = crate::agent::resolve_disk_image(gdir, raw);
+        // A raw active disk is the guest's own and has no chain to fold.
+        if format != DiskFormat::Qcow2 || !active.is_file() {
             continue;
         }
-        if matches!(
-            flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH),
-            Ok(None)
-        ) {
-            continue;
-        }
-        let _gc_guard = lock_disk_gc(gdir, libc::LOCK_SH)?;
-        let Some((target, _)) = flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH)? else {
-            continue;
-        };
-        let _claim = Claim::wait(compaction_key(gdir, id, &target));
-        let Some((target, root)) = flatten_target(gdir, id, &active, SYNC_COMPACT_AT_DEPTH)? else {
-            continue;
-        };
-        flatten_in_place(gdir, id, &target, root.as_deref(), vm_ids)?;
+        compact_disk(gdir, id, &active, vm_ids, threshold)?;
     }
     Ok(())
 }
 
+/// Fold the layer [`flatten_target`] names under `live` when its chain is
+/// longer than `threshold` layers, waiting for a merge of it already running.
+fn compact_disk(
+    gdir: &Path,
+    id: &str,
+    live: &Path,
+    vm_ids: Option<(u32, u32)>,
+    threshold: usize,
+) -> Result<()> {
+    if matches!(flatten_target(gdir, id, live, threshold), Ok(None)) {
+        return Ok(());
+    }
+    let _gc_guard = lock_disk_gc(gdir, libc::LOCK_SH)?;
+    let Some((target, _)) = flatten_target(gdir, id, live, threshold)? else {
+        return Ok(());
+    };
+    let _claim = Claim::wait(compaction_key(gdir, id, &target));
+    let Some((target, root)) = flatten_target(gdir, id, live, threshold)? else {
+        return Ok(());
+    };
+    flatten_in_place(gdir, id, &target, root.as_deref(), vm_ids)
+}
+
+/// Depth of a clone's base from which it is shortened before the clone is
+/// layered over it. A clone of a frozen source sits on that source's active
+/// disk, which nothing may replace while branches read it, so a lineage of
+/// frozen sources (a CI golden that is each run's finished job, frozen and
+/// branched again) would otherwise grow one layer per hop that no flatten can
+/// fold, until its first live branch is refused. Kept well under
+/// [`COMPACT_AT_DEPTH`] so a clone's own live branches merge onto its base
+/// rather than each copying the whole disk.
+pub(super) const CLONE_BASE_COMPACT_AT_DEPTH: usize = 8;
+
+/// The disk a new clone of a frozen source should be layered over in place of
+/// `base`, the source's own `id` disk: `base` itself while its chain is
+/// shallow, or once the layers beneath it have been folded in place; else a
+/// standalone copy of it that the source owns and every later clone of the
+/// same disk shares. `base` is never written: a frozen source cannot run while
+/// its branches read it. The returned guard keeps the copy from being
+/// collected until the clone's overlay names it.
+pub(super) fn shallow_clone_base(
+    gdir: &Path,
+    id: &str,
+    base: &Path,
+) -> Result<(PathBuf, Option<std::fs::File>)> {
+    let deep = |path: &Path| -> Result<bool> {
+        Ok(is_qcow2(path)? && chain(path)?.len() > CLONE_BASE_COMPACT_AT_DEPTH)
+    };
+    if !deep(base)? {
+        return Ok((base.to_path_buf(), None));
+    }
+    // Folding what lies beneath the base in place shortens every chain that
+    // passes through it, so it comes first.
+    compact_disk(gdir, id, base, None, CLONE_BASE_COMPACT_AT_DEPTH)?;
+    if !deep(base)? {
+        return Ok((base.to_path_buf(), None));
+    }
+    let gc_guard = lock_disk_gc(gdir, libc::LOCK_SH)?;
+    let copy = clone_base_copy_path(gdir, id, base)?;
+    if !copy.is_file() {
+        let _claim = Claim::wait(copy.clone());
+        build_clone_base_copy(gdir, id, base, &copy)?;
+    }
+    Ok((copy, gc_guard))
+}
+
+/// Where the shared short copy of `base` lives: under the source's merge
+/// directory, so it is a layer the source owns, reachable through its clones
+/// and collected once none reads it, named for the exact file it copies.
+fn clone_base_copy_path(gdir: &Path, id: &str, base: &Path) -> Result<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let meta = std::fs::metadata(base).map_err(|e| compact_err("stat clone base", e))?;
+    let gdir = gdir
+        .canonicalize()
+        .map_err(|e| compact_err("resolve machine", e))?;
+    Ok(compact_dir(&gdir).join(format!(
+        "{id}.base-{:x}-{:x}-{:x}-{:x}.qcow2",
+        meta.dev(),
+        meta.ino(),
+        meta.size(),
+        meta.mtime_nsec() as u64 ^ ((meta.mtime() as u64) << 30),
+    )))
+}
+
+fn build_clone_base_copy(gdir: &Path, id: &str, base: &Path, copy: &Path) -> Result<()> {
+    let started = std::time::Instant::now();
+    let _disk_guard = super::ForkSourceLock::acquire_at(&disk_lock_path(gdir, id))?;
+    if copy.is_file() {
+        return Ok(());
+    }
+    let dir = compact_dir(gdir);
+    std::fs::create_dir_all(&dir).map_err(|e| compact_err("create merge dir", e))?;
+    // A branch's VMM runs as the source's user, not the service's: it must be
+    // able to reach the copy whatever the service's umask.
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for traversed in [gdir.join("d"), dir.clone()] {
+            let mode = std::fs::metadata(&traversed)
+                .map_err(|e| compact_err("stat merge dir", e))?
+                .permissions()
+                .mode();
+            if mode & 0o111 != 0o111 {
+                std::fs::set_permissions(
+                    &traversed,
+                    std::fs::Permissions::from_mode((mode | 0o711) & 0o7777),
+                )
+                .map_err(|e| compact_err("open merge dir to branches", e))?;
+            }
+        }
+    }
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or_default();
+    let _busy = Busy::announce(dir.join(format!("{id}.{}.{stamp}.busy", std::process::id())))?;
+    let partial = dir.join(format!("{id}.{}.{stamp}.base.partial", std::process::id()));
+    let layers = chain(base)?;
+    let depth = layers.len() - 1;
+    let floor = kept_floor(id, &layers);
+    let result = (|| -> Result<()> {
+        match &floor {
+            Some(floor) => merge_onto(base, floor, floor, &partial)?,
+            None => flatten_standalone(base, &partial, &|| {})?,
+        }
+        let meta = std::fs::metadata(base).map_err(|e| compact_err("stat clone base", e))?;
+        std::fs::set_permissions(&partial, meta.permissions())
+            .map_err(|e| compact_err("copy mode", e))?;
+        {
+            use std::os::unix::fs::MetadataExt;
+            let current = std::fs::metadata(&partial).map_err(|e| compact_err("stat copy", e))?;
+            if (current.uid(), current.gid()) != (meta.uid(), meta.gid()) {
+                std::os::unix::fs::chown(&partial, Some(meta.uid()), Some(meta.gid()))
+                    .map_err(|e| compact_err("hand clone base to its owner", e))?;
+            }
+        }
+        std::fs::File::open(&partial)
+            .and_then(|file| file.sync_all())
+            .map_err(|e| compact_err("sync clone base", e))?;
+        // The copy stands for the file it was named after; a base that changed
+        // while it was read (it never should) is not what the name promises.
+        if clone_base_copy_path(gdir, id, base)? != copy {
+            return Err(compact_err(
+                "copy clone base",
+                format!("{} changed while it was copied", base.display()),
+            ));
+        }
+        std::fs::rename(&partial, copy).map_err(|e| compact_err("publish clone base", e))?;
+        std::fs::File::open(&dir)
+            .and_then(|d| d.sync_all())
+            .map_err(|e| compact_err("sync merge dir", e))
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&partial);
+    }
+    result?;
+    tracing::info!(
+        disk = %base.display(),
+        previous_depth = depth,
+        elapsed_ms = started.elapsed().as_millis() as u64,
+        "copied a frozen source's disk into a short base for its branches"
+    );
+    Ok(())
+}
+
 /// Replace the immutable `target` with one file holding the same bytes, backed
-/// directly by `root`, or standalone: given its owner and mode, synced, then
+/// directly by `root`, or standalone (a cache chain by its base instead, see
+/// [`kept_floor`]): given its owner and mode, synced, then
 /// renamed over it. Readers that already opened `target` keep the old file.
 fn flatten_in_place(
     gdir: &Path,
@@ -723,7 +978,10 @@ fn flatten_in_place(
     if layers.len() == 1 {
         return Ok(());
     }
-    let root = root.filter(|root| layers.iter().any(|layer| layer == root));
+    let floor = kept_floor(id, &layers);
+    let root = root
+        .filter(|root| layers.iter().any(|layer| layer == root))
+        .or(floor.as_deref());
     if root.is_some_and(|root| layers.get(1).is_some_and(|backing| backing == root)) {
         return Ok(());
     }
@@ -816,15 +1074,27 @@ const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// a chain cannot be read, which keeps everything.
 fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
     let mut reachable = HashSet::new();
-    let mut walk = |top: &Path| -> Option<()> {
-        reachable.extend(chain(top).ok()?);
+    let mut walk = |top: &Path, format: Option<DiskFormat>| -> Option<()> {
+        reachable.extend(
+            chain_formats(top, format)
+                .ok()?
+                .into_iter()
+                .map(|(layer, _)| layer),
+        );
         Some(())
     };
     for dir in machine_dirs {
-        for (_, raw) in super::FORK_DISK_ROLES {
-            let (active, _) = crate::agent::resolve_disk_image(dir, raw);
+        for (id, raw) in super::FORK_DISK_ROLES {
+            let (active, format) = crate::agent::resolve_disk_image(dir, raw);
             if active.exists() {
-                walk(&active)?;
+                walk(&active, Some(format))?;
+                // A frozen source's short copy for its branches stays while the
+                // disk it copies does, so the next branch need not copy again.
+                if let Ok(copy) = clone_base_copy_path(dir, id, &active) {
+                    if copy.is_file() {
+                        walk(&copy, Some(DiskFormat::Qcow2))?;
+                    }
+                }
             }
         }
         let Ok(snapshots) = std::fs::read_dir(dir.join("s")) else {
@@ -836,8 +1106,13 @@ fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
                 continue;
             };
             for line in listing.lines() {
-                if let Some(base) = line.split('\t').nth(1) {
-                    walk(Path::new(base))?;
+                let mut fields = line.split('\t').skip(1);
+                if let Some(base) = fields.next() {
+                    let format = match fields.next() {
+                        Some("raw") => DiskFormat::Raw,
+                        _ => DiskFormat::Qcow2,
+                    };
+                    walk(Path::new(base), Some(format))?;
                 }
             }
         }
@@ -987,6 +1262,63 @@ fn remove_unreachable_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests build their chains from host-written layers, whose format the
+    /// probe reads correctly.
+    fn create_overlay(out: &Path, size: u64, backing: &Path) -> Result<()> {
+        super::create_overlay(out, size, backing, probed_format(backing)?)
+    }
+
+    /// A guest owns its raw disk's bytes and can make them a qcow2 header
+    /// naming any host file. The chain must end at the raw layer the host
+    /// declared, never follow that header.
+    #[test]
+    fn a_raw_disk_that_looks_like_qcow2_ends_its_chain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let secret = temp.path().join("host-secret");
+        std::fs::write(&secret, b"host-only").unwrap();
+        let machine = temp.path().join("machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        // The guest's raw disk, holding a real qcow2 header backed by the secret.
+        let raw = machine.join(crate::data::storage::STORAGE_DISK_FILENAME);
+        create_overlay(&raw, SIZE, &secret).unwrap();
+        let secret = secret.canonicalize().unwrap();
+
+        let reachable = reachable_layers(std::slice::from_ref(&machine)).unwrap();
+        assert!(!reachable.contains(&secret), "{reachable:?}");
+
+        // A branch overlay declares its base raw, and the walk stops there.
+        let overlay = temp.path().join("overlay.qcow2");
+        super::create_overlay(&overlay, SIZE, &raw, DiskFormat::Raw).unwrap();
+        assert_eq!(
+            super::super::qcow2_backing_format(&overlay).unwrap(),
+            Some(DiskFormat::Raw)
+        );
+        let layers = chain(&overlay).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert!(!layers.contains(&secret));
+        let formats = chain_formats(&overlay, None).unwrap();
+        assert_eq!(formats[1].1, DiskFormat::Raw);
+    }
+
+    #[test]
+    fn a_qcow2_backing_declares_its_format() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path().join("base.qcow2");
+        std::fs::write(temp.path().join("bottom"), vec![0_u8; 4096]).unwrap();
+        super::create_overlay(&base, SIZE, &temp.path().join("bottom"), DiskFormat::Raw).unwrap();
+        let top = temp.path().join("top.qcow2");
+        super::create_overlay(&top, SIZE, &base, DiskFormat::Qcow2).unwrap();
+        assert_eq!(
+            super::super::qcow2_backing_format(&top).unwrap(),
+            Some(DiskFormat::Qcow2)
+        );
+        assert_eq!(
+            super::super::qcow2_backing_format(&temp.path().join("bottom")).unwrap(),
+            None
+        );
+        assert_eq!(chain(&top).unwrap().len(), 3);
+    }
 
     struct TestProcess(std::process::Child);
 
@@ -1466,6 +1798,244 @@ mod tests {
         }
     }
 
+    /// A machine as a checkpoint restore installs it: `files` captured layers,
+    /// the writable top at `storage.qcow2`, every backing beside it under the
+    /// reserved `.smolcheckpoint-storage-<n>` names and named relative to the
+    /// layer above, the deepest a raw image. Each layer writes its own cluster.
+    fn restored_machine(dir: &Path, files: usize) -> PathBuf {
+        let gdir = dir.join("restored");
+        std::fs::create_dir_all(&gdir).unwrap();
+        let bottom = gdir.join(format!(".smolcheckpoint-storage-{}.raw", files - 1));
+        let mut bytes = vec![0_u8; SIZE as usize];
+        for (i, byte) in bytes.iter_mut().enumerate() {
+            *byte = (i / CLUSTER as usize) as u8 | 1;
+        }
+        std::fs::write(&bottom, bytes).unwrap();
+        let mut below = bottom;
+        for index in (0..files - 1).rev() {
+            let layer = if index == 0 {
+                gdir.join("storage.qcow2")
+            } else {
+                gdir.join(format!(".smolcheckpoint-storage-{index}.qcow2"))
+            };
+            create_overlay(&layer, SIZE, &below.canonicalize().unwrap()).unwrap();
+            crate::portable_checkpoint::rewrite_qcow2_backing(
+                &layer,
+                below.file_name().unwrap().to_str().unwrap(),
+            )
+            .unwrap();
+            let access = writable(&layer);
+            let at = (index as u64 * 7 % (SIZE / CLUSTER)) * CLUSTER;
+            access
+                .write(&vec![0x10 + index as u8; 4096][..], at + 1024)
+                .unwrap();
+            access.flush().unwrap();
+            drop(access);
+            below = layer;
+        }
+        gdir
+    }
+
+    fn depth(path: &Path) -> usize {
+        super::super::qcow2_backing_depth(path).unwrap()
+    }
+
+    /// Production, 2026-11-08: a CI golden restored from a 38-file checkpoint
+    /// was frozen and branched; its job machine sat 38 layers deep, and every
+    /// live branch of it was refused, because no layer in its chain was one
+    /// compaction recognised. The restored layers are folded instead, and the
+    /// golden's own active disk, which its branches read, is left alone.
+    #[test]
+    fn a_job_branched_from_a_golden_restored_from_a_deep_checkpoint_can_branch_live() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let golden = restored_machine(dir.path(), 38);
+        let golden_active = golden.join("storage.qcow2");
+        assert_eq!(depth(&golden_active), 37);
+        let job = dir.path().join("job");
+        std::fs::create_dir_all(&job).unwrap();
+        let job_active = job.join("storage.qcow2");
+        create_overlay(&job_active, SIZE, &golden_active.canonicalize().unwrap()).unwrap();
+        let access = writable(&job_active);
+        access.write(&[0xEE; 4096][..], 3 * CLUSTER).unwrap();
+        access.flush().unwrap();
+        drop(access);
+        assert_eq!(depth(&job_active), 38);
+        let job_expected = read_all(&job_active);
+        let golden_expected = read_all(&golden_active);
+        let golden_inode = std::fs::metadata(&golden_active).unwrap().ino();
+
+        // What a live branch of the job runs before it freezes the job's disk.
+        compact_if_near_limit(&job, None).unwrap();
+        super::super::ensure_fork_disk_chain_is_bounded(&job).unwrap();
+
+        assert!(
+            depth(&job_active) < COMPACT_AT_DEPTH,
+            "{}",
+            depth(&job_active)
+        );
+        assert_eq!(read_all(&job_active), job_expected);
+        assert_eq!(read_all(&golden_active), golden_expected);
+        assert_eq!(
+            std::fs::metadata(&golden_active).unwrap().ino(),
+            golden_inode
+        );
+    }
+
+    /// The restored golden itself folds its checkpoint layers before its first
+    /// branch, keeping the layer its writable top names.
+    #[test]
+    fn a_machine_restored_from_a_deep_checkpoint_compacts_before_branching() {
+        let dir = tempfile::tempdir().unwrap();
+        let golden = restored_machine(dir.path(), 38);
+        let active = golden.join("storage.qcow2");
+        let expected = read_all(&active);
+        compact_if_near_limit(&golden, None).unwrap();
+        assert!(depth(&active) < COMPACT_AT_DEPTH, "{}", depth(&active));
+        assert_eq!(read_all(&active), expected);
+        assert!(golden.join(".smolcheckpoint-storage-1.qcow2").is_file());
+    }
+
+    /// After a standalone flatten the bottom of a chain is a generation the
+    /// machine wrote itself. Generations stacked on it later still fold.
+    #[test]
+    fn generations_on_a_standalone_flattened_bottom_keep_compacting() {
+        let dir = tempfile::tempdir().unwrap();
+        let (gdir, live, generations) = branched_machine(dir.path(), 30);
+        let bottom = &generations[0];
+        let flat = dir.path().join("flat.qcow2");
+        flatten_standalone(bottom, &flat, &|| {}).unwrap();
+        std::fs::rename(&flat, bottom).unwrap();
+        assert!(qcow2_backing_name(bottom).unwrap().is_none());
+        assert_eq!(depth(&live), 30);
+        let expected = read_all(&live);
+        compact_if_near_limit(&gdir, None).unwrap();
+        assert!(depth(&live) < COMPACT_AT_DEPTH, "{}", depth(&live));
+        assert_eq!(read_all(&live), expected);
+    }
+
+    /// `count` frozen machines, each a branch of the one before: every one's
+    /// active disk is the next one's base, and none may be replaced.
+    fn frozen_lineage(dir: &Path, count: usize) -> Vec<PathBuf> {
+        let first = dir.join("frozen-0");
+        std::fs::create_dir_all(&first).unwrap();
+        let root = first.join("storage.raw");
+        std::fs::write(&root, vec![1_u8; SIZE as usize]).unwrap();
+        let mut below = root.canonicalize().unwrap();
+        let mut machines = Vec::new();
+        for index in 0..count {
+            let machine = dir.join(format!("frozen-{index}"));
+            std::fs::create_dir_all(&machine).unwrap();
+            let active = machine.join("storage.qcow2");
+            create_overlay(&active, SIZE, &below).unwrap();
+            let access = writable(&active);
+            let at = (index as u64 * 3 % (SIZE / CLUSTER)) * CLUSTER;
+            access
+                .write(&vec![0x30 + index as u8; 4096][..], at + 2048)
+                .unwrap();
+            access.flush().unwrap();
+            drop(access);
+            below = active.canonicalize().unwrap();
+            machines.push(machine);
+        }
+        machines
+    }
+
+    /// A clone of the last of 20 frozen sources gets a short base the source
+    /// owns, read exactly as its active disk, made once and kept for the next
+    /// clone while the disk it copies stays the same; the frozen disks keep
+    /// their inodes.
+    #[test]
+    fn a_clone_of_a_deep_frozen_lineage_gets_a_short_shared_base() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let machines = frozen_lineage(dir.path(), 20);
+        let source = machines.last().unwrap();
+        let active = source.join("storage.qcow2").canonicalize().unwrap();
+        let inode = std::fs::metadata(&active).unwrap().ino();
+        let expected = read_all(&active);
+
+        let (base, guard) = shallow_clone_base(source, "storage", &active).unwrap();
+        assert!(guard.is_some());
+        drop(guard);
+        assert_ne!(base, active);
+        assert_eq!(chain(&base).unwrap().len(), 1);
+        assert_eq!(read_all(&base), expected);
+        assert_eq!(std::fs::metadata(&active).unwrap().ino(), inode);
+        let built = std::fs::metadata(&base).unwrap().ino();
+
+        let (again, _) = shallow_clone_base(source, "storage", &active).unwrap();
+        assert_eq!(again, base);
+        assert_eq!(std::fs::metadata(&again).unwrap().ino(), built);
+        let dirs: Vec<PathBuf> = machines.clone();
+        collect_unreachable_layers(source, &dirs).unwrap();
+        assert!(base.is_file(), "kept while the disk it copies is unchanged");
+
+        // A shallow source is left as it is.
+        let first = machines[0].join("storage.qcow2").canonicalize().unwrap();
+        let (same, guard) = shallow_clone_base(&machines[0], "storage", &first).unwrap();
+        assert_eq!(same, first);
+        assert!(guard.is_none());
+    }
+
+    /// One hundred CI cycles at the engine's level: each run's job is branched
+    /// from the previous golden, written, sometimes branched live a few times,
+    /// then frozen as the next golden. Restored-checkpoint layers start the
+    /// lineage 37 deep. No disk ever reaches the limit, and earlier jobs still
+    /// read what they wrote.
+    #[test]
+    fn a_hundred_frozen_golden_cycles_stay_shallow() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let mut golden = restored_machine(dir.path(), 38);
+        let mut deepest = 0;
+        let mut kept = Vec::new();
+        for cycle in 0..100_u64 {
+            // The branch that freezes the golden compacts it first.
+            compact_if_near_limit(&golden, None).unwrap();
+            let active = golden.join("storage.qcow2").canonicalize().unwrap();
+            let (base, guard) = shallow_clone_base(&golden, "storage", &active).unwrap();
+            let job = dir.path().join(format!("job-{cycle}"));
+            std::fs::create_dir_all(&job).unwrap();
+            let live = job.join("storage.qcow2");
+            create_overlay(&live, SIZE, &base).unwrap();
+            drop(guard);
+            deepest = deepest.max(depth(&live));
+            let access = writable(&live);
+            access
+                .write(&[cycle as u8 + 1; 4096][..], (cycle % 64) * CLUSTER)
+                .unwrap();
+            access.flush().unwrap();
+            drop(access);
+            // Every third job fans out: live branches rotate its disk.
+            for step in 0..(if cycle % 3 == 0 { 3 } else { 0 }) {
+                compact_if_near_limit(&job, None).unwrap();
+                super::super::ensure_fork_disk_chain_is_bounded(&job).unwrap();
+                let target = job.join(format!("d/{step:08x}/storage.base.qcow2"));
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::rename(&live, &target).unwrap();
+                create_overlay(&live, SIZE, &target.canonicalize().unwrap()).unwrap();
+                deepest = deepest.max(depth(&live));
+            }
+            if cycle % 10 == 0 {
+                kept.push((live.clone(), read_all(&live)));
+            }
+            golden = job;
+        }
+        assert!(
+            deepest <= CLONE_BASE_COMPACT_AT_DEPTH + 3,
+            "deepest chain was {deepest}"
+        );
+        for (disk, expected) in kept {
+            assert_eq!(read_all(&disk), expected, "{}", disk.display());
+        }
+    }
+
     #[test]
     fn measured_depth_includes_cache_disks_and_does_not_truncate_at_32() {
         let dir = tempfile::tempdir().unwrap();
@@ -1538,6 +2108,9 @@ mod tests {
     /// reads the same as before, plus every write made meanwhile.
     #[test]
     fn writes_to_the_live_layer_during_a_flatten_are_never_lost() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (gdir, live, gens) = branched_machine(dir.path(), 20);
         let before = read_all(&live);
@@ -1591,6 +2164,9 @@ mod tests {
     /// reads the same bytes it always did.
     #[test]
     fn an_open_reader_keeps_the_file_it_opened() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (gdir, live, _) = branched_machine(dir.path(), 20);
         let (target, root) = flatten_target(&gdir, "storage", &live, COMPACT_AT_DEPTH)
@@ -1685,6 +2261,9 @@ mod tests {
     /// reaches it; everything something can still read stays.
     #[test]
     fn only_layers_nothing_reads_are_collected() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let branch = tmp.path().join("branch");
@@ -1756,6 +2335,9 @@ mod tests {
     /// branch's cache chain reads them, never mistaken for orphans.
     #[test]
     fn a_cache_generation_a_branch_reads_is_kept() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let tmp = tempfile::tempdir().unwrap();
         let source = tmp.path().join("source");
         let branch = tmp.path().join("branch");
@@ -1785,6 +2367,115 @@ mod tests {
         );
         assert!(generation.exists() && !below_branch.exists());
         assert!(base.exists());
+    }
+
+    /// A published cache base the way a node holds one: a standalone qcow2 in
+    /// the cache disk directory, every cluster written.
+    fn cache_base(dir: &Path) -> PathBuf {
+        let raw = raw_root(dir);
+        let over = dir.join("publish.qcow2");
+        create_overlay(&over, SIZE, &raw).unwrap();
+        let base = dir.join("cache-disks/cdisk-v87.qcow2");
+        std::fs::create_dir_all(base.parent().unwrap()).unwrap();
+        flatten_standalone(&over, &base, &|| {}).unwrap();
+        std::fs::remove_file(over).unwrap();
+        std::fs::remove_file(raw).unwrap();
+        base.canonicalize().unwrap()
+    }
+
+    /// A layer at `path` over `below` that writes one cluster of its own.
+    fn cache_layer(path: &Path, below: &Path, n: u64) -> PathBuf {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        create_overlay(path, SIZE, below).unwrap();
+        let access = writable(path);
+        let at = (n * 3 % (SIZE / CLUSTER)) * CLUSTER;
+        access
+            .write(&vec![0x50 + n as u8; 4096][..], at + 1024)
+            .unwrap();
+        access.flush().unwrap();
+        path.canonicalize().unwrap()
+    }
+
+    /// The 2026-11-11 Specific lineage: a cache-disk machine branched live
+    /// (one generation), then frozen and branched again and again. A clone of
+    /// the deep end used to fold the root's generation standalone and copy
+    /// the whole chain, base included, into its short base: the bytes stayed,
+    /// but no chain reached the recorded base, and every checkpoint of a
+    /// branch failed with "the cache disk's layers do not sit on its recorded
+    /// base". Cache chains now merge down onto their base instead.
+    #[test]
+    fn a_cache_chain_keeps_its_shared_base_when_a_frozen_lineage_is_shortened() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let base = cache_base(dir.path());
+        let root = dir.path().join("root");
+        let generation = cache_layer(&root.join("d/1d64752a/cache.base.qcow2"), &base, 0);
+        let mut below = cache_layer(&root.join("cache.qcow2"), &generation, 1);
+        let mut machines = vec![root];
+        for n in 1..10 {
+            let machine = dir.path().join(format!("frozen-{n}"));
+            below = cache_layer(&machine.join("cache.qcow2"), &below, n + 1);
+            machines.push(machine);
+        }
+        let source = machines.last().unwrap();
+        let active = below;
+        let frozen: Vec<_> = machines
+            .iter()
+            .map(|machine| {
+                let disk = machine.join("cache.qcow2");
+                (disk.clone(), std::fs::metadata(&disk).unwrap().ino())
+            })
+            .collect();
+        let expected = read_all(&active);
+        assert!(chain(&active).unwrap().len() > CLONE_BASE_COMPACT_AT_DEPTH);
+
+        let (short, guard) = shallow_clone_base(source, "cache", &active).unwrap();
+        drop(guard);
+        assert_eq!(read_all(&short), expected);
+        assert_eq!(chain(&short).unwrap(), [short.clone(), base.clone()]);
+        // Every chain still ends on the base: the generation was not folded.
+        assert_eq!(
+            chain(&generation).unwrap(),
+            [generation.clone(), base.clone()]
+        );
+        assert_eq!(chain(&active).unwrap().last(), Some(&base));
+        assert_eq!(read_all(&active), expected);
+        for (disk, inode) in frozen {
+            assert_eq!(std::fs::metadata(&disk).unwrap().ino(), inode);
+        }
+
+        // Storage disks are still copied standalone.
+        let storage = source.join("storage.qcow2");
+        create_overlay(&storage, SIZE, &active).unwrap();
+        let (copy, _) = shallow_clone_base(source, "storage", &storage).unwrap();
+        assert_eq!(chain(&copy).unwrap().len(), 1);
+    }
+
+    /// A cache generation over a deep inherited cache chain is merged onto the
+    /// base rather than made standalone, and reads the same.
+    #[test]
+    fn a_cache_generation_on_a_deep_inherited_chain_stays_on_its_base() {
+        let dir = tempfile::tempdir().unwrap();
+        let base = cache_base(dir.path());
+        let parent = dir.path().join("parent");
+        let mut below = base.clone();
+        for n in 0..25 {
+            below = cache_layer(
+                &parent.join(format!("d/{n:08x}/cache.base.qcow2")),
+                &below,
+                n,
+            );
+        }
+        let child = dir.path().join("child");
+        let target = cache_layer(&child.join("d/00000001/cache.base.qcow2"), &below, 30);
+        let live = cache_layer(&child.join("cache.qcow2"), &target, 31);
+        let before = read_all(&live);
+        compact_if_near_limit(&child, None).unwrap();
+        assert_eq!(chain(&live).unwrap(), [live.clone(), target, base]);
+        assert_eq!(read_all(&live), before);
     }
 
     /// A second claim on a disk whose merge is running is refused, and the
@@ -1879,6 +2570,9 @@ mod tests {
 
     #[test]
     fn a_killed_process_releases_gc_and_disk_locks_and_stale_markers() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (source, live, _) = branched_machine(dir.path(), 30);
         let before = read_all(&live);
@@ -1906,6 +2600,9 @@ mod tests {
 
     #[test]
     fn separate_processes_compact_one_shared_ancestor_without_changing_children() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (source, _, generations) = branched_machine(dir.path(), 30);
         let mut workers = Vec::new();
@@ -1940,6 +2637,9 @@ mod tests {
 
     #[test]
     fn disk_lock_cleanup_keeps_live_and_inflight_owners() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let owner = dir.path().join("machine");
         std::fs::create_dir(&owner).unwrap();
@@ -1963,6 +2663,9 @@ mod tests {
 
     #[test]
     fn crashing_on_either_side_of_publication_keeps_data_and_retry_safe() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         use std::os::unix::fs::MetadataExt;
         for phase in ["before-rename", "after-rename"] {
             let dir = tempfile::tempdir().unwrap();
@@ -2019,6 +2722,9 @@ mod tests {
 
     #[test]
     fn shallow_sources_do_not_wait_for_other_machines_disk_gc() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let dir = tempfile::tempdir().unwrap();
         let (source, _, _) = branched_machine(dir.path(), 0);
         let gc_guard = lock_disk_gc(&source, libc::LOCK_EX).unwrap();

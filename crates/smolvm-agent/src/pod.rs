@@ -345,7 +345,7 @@ fn crun_state_pid(id: &str) -> Option<u32> {
 /// process, so this is normally a few ms; the deadline caps a container that
 /// exits instantly (nothing to wait for) so Start still returns promptly.
 #[cfg(target_os = "linux")]
-fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
+pub(crate) fn wait_for_crun_running(id: &str, child: &mut std::process::Child) -> Option<u32> {
     use std::time::{Duration, Instant};
     let deadline = Instant::now() + Duration::from_secs(2);
     loop {
@@ -402,7 +402,7 @@ fn proc_parent_pairs() -> Vec<(u32, u32)> {
 /// `root` plus all its descendants, from a single /proc snapshot. Used for
 /// `PodPids` — with the crun cgroup manager disabled there is no per-container
 /// cgroup.procs file to read, so the process tree under init IS the container.
-fn descendant_pids(root: u32) -> Vec<u32> {
+pub(crate) fn descendant_pids(root: u32) -> Vec<u32> {
     let pairs = proc_parent_pairs();
     let mut pids = vec![root];
     let mut i = 0;
@@ -844,7 +844,7 @@ pub fn handle_pod_delete(id: &str, exec_id: Option<&str>) -> AgentResponse {
 /// requests handled by the reused I/O pumps.
 #[cfg(target_os = "linux")]
 pub fn handle_pod_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     request: smolvm_protocol::AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let (id, exec_id) = match request {
@@ -866,7 +866,7 @@ pub fn handle_pod_start(
 /// Non-Linux stub so `cargo test` on macOS compiles the dispatch.
 #[cfg(not(target_os = "linux"))]
 pub fn handle_pod_start(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     _request: smolvm_protocol::AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::send_response(
@@ -968,8 +968,13 @@ fn write_pod_bundle(
     // CRI mounts (volumes + generated /etc/resolv.conf, /etc/hosts) as bind mounts.
     // Added last so they layer on TOP of the default mounts (e.g. a volume at
     // /tmp/foo mounts over the default tmpfs at /tmp).
+    let read_only = read_only_destinations(&pod.host_spec);
     for (source, destination) in mount_binds {
-        spec.add_bind_mount(&source.to_string_lossy(), destination, false);
+        spec.add_bind_mount(
+            &source.to_string_lossy(),
+            destination,
+            read_only.contains(destination.as_str()),
+        );
     }
 
     // Preserve synthetic CRI mounts the shim did NOT rewrite to the pod share:
@@ -1127,6 +1132,25 @@ fn materialize_pod_mounts(id: &str, mounts: &[PodMount]) -> Vec<(PathBuf, String
         }
     }
     binds
+}
+
+/// The CRI mount destinations a volumeMount asked to be read-only (`ro` in its
+/// options); the copy is bound read-only there too.
+#[cfg(target_os = "linux")]
+fn read_only_destinations(host_spec: &serde_json::Value) -> std::collections::HashSet<&str> {
+    host_spec
+        .get("mounts")
+        .and_then(|mounts| mounts.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|mount| {
+            mount
+                .get("options")
+                .and_then(|options| options.as_array())
+                .is_some_and(|options| options.iter().any(|option| option.as_str() == Some("ro")))
+        })
+        .filter_map(|mount| mount.get("destination").and_then(|d| d.as_str()))
+        .collect()
 }
 
 /// Recursively copy `src` to `dst`, following symlinks (so a symlinked volume
@@ -1360,7 +1384,7 @@ fn mount_writable_rootfs(id: &str, lower: &std::path::Path) -> Result<PathBuf, S
 
 #[cfg(target_os = "linux")]
 fn start_init_process(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
     crate::ensure_storage_mounted();
@@ -1584,7 +1608,7 @@ fn prepare_exec_process_json(raw: &str) -> Result<String, Box<dyn std::error::Er
 /// and pump its I/O until exit. Same streaming contract as the init path.
 #[cfg(target_os = "linux")]
 fn start_exec_process(
-    stream: &mut impl crate::ReadWrite,
+    stream: &mut crate::WireStream<impl crate::ReadWrite>,
     id: &str,
     exec_id: &str,
 ) -> Result<(), Box<dyn std::error::Error>> {
@@ -1717,6 +1741,22 @@ fn start_exec_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_only_volume_mount_is_bound_read_only() {
+        let host_spec = serde_json::json!({
+            "mounts": [
+                {"destination": "/etc/config", "type": "bind", "options": ["rbind", "ro"]},
+                {"destination": "/data", "type": "bind", "options": ["rbind", "rw"]},
+                {"destination": "/etc/hosts", "type": "bind"},
+            ],
+        });
+        let read_only = read_only_destinations(&host_spec);
+        assert!(read_only.contains("/etc/config"));
+        assert!(!read_only.contains("/data"));
+        assert!(!read_only.contains("/etc/hosts"));
+    }
 
     #[test]
     fn id_validation() {

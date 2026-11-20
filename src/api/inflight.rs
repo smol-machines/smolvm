@@ -75,6 +75,10 @@ pub struct InFlightSnapshot {
     /// there is none. A roll that recorded when it began waiting knows every
     /// request older than that has finished once this is below its own wait.
     pub oldest_ms: u64,
+    /// Exec sessions whose command is running. They belong to this process (a
+    /// restart kills them), so they count in `in_flight` and `execs` too,
+    /// though no request may be open for them.
+    pub exec_sessions: usize,
 }
 
 impl InFlight {
@@ -97,6 +101,7 @@ impl InFlight {
             execs: 0,
             open_streams: 0,
             oldest_ms: 0,
+            exec_sessions: 0,
         };
         let mut oldest: Option<Instant> = None;
         for (started, kind) in live.values() {
@@ -192,9 +197,28 @@ impl http_body::Body for GuardedBody {
     }
 }
 
+impl InFlightSnapshot {
+    /// Count running exec sessions, given their ages in milliseconds.
+    pub fn with_exec_sessions(mut self, ages_ms: &[u64]) -> Self {
+        self.exec_sessions = ages_ms.len();
+        self.in_flight += ages_ms.len();
+        self.execs += ages_ms.len();
+        if let Some(oldest) = ages_ms.iter().max() {
+            self.oldest_ms = self.oldest_ms.max(*oldest);
+        }
+        self
+    }
+}
+
 /// `GET /inflight` on the loopback door: what a restart now would cut off.
-pub async fn inflight_status() -> Json<InFlightSnapshot> {
-    Json(global().snapshot())
+pub async fn inflight_status(
+    State(state): State<Arc<crate::api::state::ApiState>>,
+) -> Json<InFlightSnapshot> {
+    Json(
+        global()
+            .snapshot()
+            .with_exec_sessions(&state.exec_sessions().running_ages_ms()),
+    )
 }
 
 #[cfg(test)]
@@ -249,6 +273,14 @@ mod tests {
     }
 
     #[test]
+    fn running_exec_sessions_count_as_execs_a_restart_would_cut() {
+        let tracker = Arc::new(InFlight::default());
+        let s = tracker.snapshot().with_exec_sessions(&[5_000, 90_000]);
+        assert_eq!((s.in_flight, s.execs, s.exec_sessions), (2, 2, 2));
+        assert_eq!(s.oldest_ms, 90_000);
+    }
+
+    #[test]
     fn snapshot_counts_kinds_and_ages_the_oldest() {
         let tracker = Arc::new(InFlight::default());
         assert_eq!(
@@ -257,7 +289,8 @@ mod tests {
                 in_flight: 0,
                 execs: 0,
                 open_streams: 0,
-                oldest_ms: 0
+                oldest_ms: 0,
+                exec_sessions: 0,
             }
         );
         let stream = tracker.begin(RequestKind::OpenStream);

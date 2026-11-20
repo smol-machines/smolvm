@@ -16,6 +16,8 @@ const DNS_U32_LEN: usize = 4;
 const DNS_FLAGS_OFFSET: usize = 2;
 const DNS_QDCOUNT_OFFSET: usize = 4;
 const DNS_ANCOUNT_OFFSET: usize = 6;
+const DNS_NSCOUNT_OFFSET: usize = 8;
+const DNS_OPCODE_MASK: u16 = 0x7800;
 const DNS_QUESTION_FIXED_LEN: usize = 4;
 const DNS_RR_FIXED_LEN: usize = 10;
 const DNS_RR_TYPE_OFFSET: usize = 0;
@@ -45,6 +47,22 @@ const DNS_MAX_LABEL_LEN: usize = 63;
 /// authoritatively by the gateway so guests need not hardcode its address.
 /// Mirrors Docker's `host.docker.internal`.
 pub const GATEWAY_HOSTNAME: &str = "host.smolvm.internal";
+
+/// Every name the gateway answers with its own address: its own name, and
+/// the names containers conventionally use for the host
+/// (`host.docker.internal`) and its gateway (`gateway.docker.internal`), so
+/// software that expects them reaches the host unchanged.
+pub const GATEWAY_HOSTNAMES: [&str; 3] = [
+    GATEWAY_HOSTNAME,
+    "host.docker.internal",
+    "gateway.docker.internal",
+];
+
+/// Whether `name` (already normalized: lowercase, no trailing dot) is one of
+/// [`GATEWAY_HOSTNAMES`].
+pub fn is_gateway_hostname(name: &str) -> bool {
+    GATEWAY_HOSTNAMES.contains(&name)
+}
 
 /// TTL for the gateway's self-answer. Short so a stack restart with a
 /// different gateway address is picked up quickly.
@@ -84,8 +102,28 @@ pub fn answer_ip_records(packet: &[u8]) -> Vec<(IpAddr, u32)> {
     parse_answer_ip_records(packet).unwrap_or_default()
 }
 
+/// Whether `packet` is a plain standard query: not a response, opcode QUERY,
+/// one question and no answer or authority records. Only such a message is
+/// forwarded for a name the allow list learns addresses from.
+pub fn is_plain_query(packet: &[u8]) -> bool {
+    let read = |offset| read_u16(packet, offset);
+    packet.len() >= DNS_HEADER_LEN
+        && read(DNS_FLAGS_OFFSET)
+            .is_some_and(|flags| flags & (DNS_FLAG_RESPONSE | DNS_OPCODE_MASK) == 0)
+        && read(DNS_QDCOUNT_OFFSET) == Some(DNS_ONE_QUESTION)
+        && read(DNS_ANCOUNT_OFFSET) == Some(0)
+        && read(DNS_NSCOUNT_OFFSET) == Some(0)
+}
+
 fn parse_answer_ip_records(packet: &[u8]) -> Option<Vec<(IpAddr, u32)>> {
     if packet.len() < DNS_HEADER_LEN {
+        return None;
+    }
+    // Only a successful answer teaches addresses. An error reply (a resolver
+    // echoing a malformed query back as FORMERR, say) can carry whatever
+    // records the guest put in its own query.
+    let flags = read_u16(packet, DNS_FLAGS_OFFSET)?;
+    if flags & DNS_FLAG_RESPONSE == 0 || flags & DNS_RCODE_MASK != 0 {
         return None;
     }
     let qdcount = read_u16(packet, DNS_QDCOUNT_OFFSET)? as usize;
@@ -159,6 +197,42 @@ pub fn gateway_response(query: &[u8], gateway: Ipv4Addr) -> Vec<u8> {
     response.extend_from_slice(&GATEWAY_TTL_SECS.to_be_bytes());
     response.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
     response.extend_from_slice(&gateway.octets());
+    response
+}
+
+/// A NOERROR answer with `ips` for an A query, and an empty one for any
+/// other type (AAAA: resolvers then use the A records).
+pub fn addresses_response(query: &[u8], ips: &[std::net::IpAddr], ttl: u32) -> Vec<u8> {
+    let mut response = error_response(query, 0);
+    let Some(end) = question_section_end(query) else {
+        return response;
+    };
+    // An A question gets the IPv4 addresses, an AAAA question the IPv6 ones;
+    // anything else, or a name without that family, an empty answer.
+    let qtype = read_u16(query, end - DNS_QUESTION_FIXED_LEN);
+    let rdata: Vec<Vec<u8>> = ips
+        .iter()
+        .filter_map(|ip| match (qtype, ip) {
+            (Some(DNS_TYPE_A), std::net::IpAddr::V4(v4)) => Some(v4.octets().to_vec()),
+            (Some(DNS_TYPE_AAAA), std::net::IpAddr::V6(v6)) => Some(v6.octets().to_vec()),
+            _ => None,
+        })
+        .take(32)
+        .collect();
+    let Some(qtype) = qtype else {
+        return response;
+    };
+    let count = rdata.len() as u16;
+    response[DNS_ANCOUNT_OFFSET..DNS_ANCOUNT_OFFSET + DNS_U16_LEN]
+        .copy_from_slice(&count.to_be_bytes());
+    for data in rdata {
+        response.extend_from_slice(&[DNS_POINTER_TAG, DNS_HEADER_LEN as u8]);
+        response.extend_from_slice(&qtype.to_be_bytes());
+        response.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        response.extend_from_slice(&ttl.to_be_bytes());
+        response.extend_from_slice(&(data.len() as u16).to_be_bytes());
+        response.extend_from_slice(&data);
+    }
     response
 }
 
@@ -291,6 +365,44 @@ mod tests {
         q.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
         q.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
         q
+    }
+
+    /// `name`'s query carrying one forged A record in its answer section.
+    fn query_with_forged_answer(name: &str) -> Vec<u8> {
+        let mut q = query_for(name);
+        q[7] = 0x01; // ancount = 1
+        q.extend_from_slice(&[0xc0, 0x0c]);
+        q.extend_from_slice(&DNS_TYPE_A.to_be_bytes());
+        q.extend_from_slice(&DNS_CLASS_IN.to_be_bytes());
+        q.extend_from_slice(&3600u32.to_be_bytes());
+        q.extend_from_slice(&(DNS_A_RDATA_LEN as u16).to_be_bytes());
+        q.extend_from_slice(&[203, 0, 113, 9]);
+        q
+    }
+
+    // Only a plain query is forwarded for a learned name, and only a
+    // successful answer teaches addresses: a resolver that echoes a malformed
+    // query back as an error must not hand the guest's own records to the
+    // allow list.
+    #[test]
+    fn addresses_come_only_from_a_successful_answer_to_a_plain_query() {
+        assert!(is_plain_query(&query_for("api.example.com")));
+        let forged = query_with_forged_answer("api.example.com");
+        assert!(!is_plain_query(&forged));
+        let mut response = query_for("api.example.com");
+        response[2] |= 0x80;
+        assert!(!is_plain_query(&response), "a response is not a query");
+        let mut notify = query_for("api.example.com");
+        notify[2] |= 4 << 3; // opcode NOTIFY
+        assert!(!is_plain_query(&notify));
+
+        let mut echoed = forged.clone();
+        echoed[2] |= 0x80; // QR
+        echoed[3] |= 0x01; // FORMERR
+        assert!(answer_ip_records(&echoed).is_empty());
+        let mut answered = forged;
+        answered[2] |= 0x80;
+        assert_eq!(answer_ip_records(&answered).len(), 1);
     }
 
     #[test]

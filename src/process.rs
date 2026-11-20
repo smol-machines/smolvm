@@ -242,6 +242,35 @@ pub fn close_inherited_fds_from(min_fd: i32) {
 #[cfg(not(unix))]
 pub fn close_inherited_fds_from(_min_fd: i32) {}
 
+/// Do not pass the launching command's original pipes to a detached Windows VM.
+/// Rust duplicates any explicitly selected child stdio handles, but its spawn
+/// also inherits other handles already marked inheritable by the caller (for
+/// example .NET Process). Redirecting the child's stdio alone leaves those
+/// original pipes open and prevents Studio/SDK readers from observing EOF.
+#[cfg(windows)]
+pub fn prevent_inherited_stdio_leaks() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: each constant selects a standard handle owned by this process.
+        let handle = unsafe { GetStdHandle(which) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: clear only inheritance, without closing or replacing the
+        // handle; subsequent Rust spawns duplicate their requested stdio.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn close_fds_from_dev_fd(min_fd: i32) -> bool {
     let entries = match std::fs::read_dir("/dev/fd") {
@@ -338,6 +367,74 @@ pub fn harden_self() {
         };
         libc::setrlimit(libc::RLIMIT_CORE, &lim);
     }
+}
+
+/// Raise this process's open-file soft limit as far as the host allows and
+/// return the limit now in force (`None` where there is no such limit).
+///
+/// A machine's VMM holds one host socket per guest connection (TSI and
+/// virtio-net alike), so this limit caps how many connections a guest can
+/// have open at once. The soft limit goes to the hard limit; macOS refuses
+/// an unlimited soft limit on older releases, so there it is capped at
+/// `kern.maxfilesperproc`, the per-process ceiling only root can raise.
+#[cfg(unix)]
+pub fn raise_nofile_limit() -> Option<libc::rlim_t> {
+    // SAFETY: getrlimit/setrlimit on a local struct.
+    unsafe {
+        let mut limit = libc::rlimit {
+            rlim_cur: 0,
+            rlim_max: 0,
+        };
+        if libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit) != 0 {
+            return None;
+        }
+        #[cfg(target_os = "macos")]
+        let wanted = match macos_max_files_per_process() {
+            Some(per_process) => limit.rlim_max.min(per_process),
+            None => limit.rlim_max,
+        };
+        #[cfg(not(target_os = "macos"))]
+        let wanted = limit.rlim_max;
+        // A soft limit above `kern.maxfilesperproc` (a shell with `ulimit -n`
+        // past it) is not the one in force: macOS holds the process to the
+        // per-process cap anyway. Set it to the cap so what we report, and
+        // what children inherit, is the limit that applies.
+        if wanted != limit.rlim_cur {
+            let raised = libc::rlimit {
+                rlim_cur: wanted,
+                rlim_max: limit.rlim_max,
+            };
+            if libc::setrlimit(libc::RLIMIT_NOFILE, &raised) == 0 {
+                limit.rlim_cur = wanted;
+            }
+        }
+        Some(limit.rlim_cur)
+    }
+}
+
+/// No per-process open-file limit to raise on this platform.
+#[cfg(not(unix))]
+pub fn raise_nofile_limit() -> Option<u64> {
+    None
+}
+
+/// `kern.maxfilesperproc`: the most files one macOS process may hold.
+#[cfg(target_os = "macos")]
+fn macos_max_files_per_process() -> Option<libc::rlim_t> {
+    let mut value: libc::c_int = 0;
+    let mut size = std::mem::size_of::<libc::c_int>();
+    // SAFETY: the name is NUL-terminated and `value`/`size` describe a
+    // writable c_int.
+    let rc = unsafe {
+        libc::sysctlbyname(
+            c"kern.maxfilesperproc".as_ptr(),
+            (&mut value as *mut libc::c_int).cast(),
+            &mut size,
+            std::ptr::null_mut(),
+            0,
+        )
+    };
+    (rc == 0 && value > 0).then_some(value as libc::rlim_t)
 }
 
 /// `PR_SET_PTRACER` / `PR_SET_PTRACER_ANY` (yama LSM; absent from the `libc`
@@ -1433,8 +1530,19 @@ pub fn vm_uid_drop_active() -> bool {
     false
 }
 
+#[cfg(unix)]
+static EXPLICIT_DATA_ROOT: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+
+/// Whether the user named the data root (`--state-dir` or `SMOLVM_DATA_DIR`),
+/// as opposed to smolvm using or choosing its default one. Such a run sits
+/// beside the default install and must leave the user's own setup alone.
+#[cfg(unix)]
+pub fn data_root_is_explicit() -> bool {
+    EXPLICIT_DATA_ROOT.get().copied().unwrap_or(false)
+}
+
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
-/// at it before any path is computed — every `dirs::`-derived path (VM dirs,
+/// at it before any path is computed — every `smolvm_paths::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
 /// isolation's dropped uids traverse to their data (an XDG-under-a-700-home
 /// layout can't). `SMOLVM_DATA_DIR` is honored for **every** command (so the CLI
@@ -1442,11 +1550,18 @@ pub fn vm_uid_drop_active() -> bool {
 /// privileged with the uid drop active and no XDG override (serve only — a
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 pub fn apply_system_data_root(allow_auto: bool) {
+    // Only the first pass sees what the user asked for: a later one (serve
+    // runs its own) finds the variable this function set itself.
+    EXPLICIT_DATA_ROOT.get_or_init(|| std::env::var_os("SMOLVM_DATA_DIR").is_some());
+    #[cfg(target_os = "linux")]
+    let overlay_root = overlay_workspace_root();
+    #[cfg(not(target_os = "linux"))]
+    let overlay_root: Option<std::path::PathBuf> = None;
     let root = if let Some(explicit) = std::env::var_os("SMOLVM_DATA_DIR") {
         std::path::PathBuf::from(explicit)
-    } else if let Some(workspace_root) = overlay_workspace_root() {
+    } else if let Some(workspace_root) = overlay_root {
         // Name the choice so a second pass (`serve` runs one of its own, after
         // HOME has already moved off overlayfs) and every child keep this root
         // instead of falling through to /var/lib/smolvm.
@@ -1480,7 +1595,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
     // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
     // private image pulls keep finding their credentials after the relocation.
     if std::env::var_os("DOCKER_CONFIG").is_none() {
-        if let Some(dir) = dirs::home_dir()
+        if let Some(dir) = smolvm_paths::home_dir()
             .map(|h| h.join(".docker"))
             .filter(|d| d.is_dir())
         {
@@ -1491,8 +1606,9 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
-    if let Some(src) = carry_rootfs_from {
-        let dst = root.join(".local/share/smolvm/agent-rootfs");
+    // Resolved after HOME moved, so it is the relocated data dir on every OS.
+    let rootfs_dst = smolvm_paths::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
+    if let (Some(src), Some(dst)) = (carry_rootfs_from, rootfs_dst) {
         if src != dst {
             if let Err(e) = sync_agent_rootfs(&src, &dst) {
                 eprintln!(
@@ -1534,7 +1650,7 @@ fn overlay_workspace_root() -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    let home = dirs::home_dir()?;
+    let home = smolvm_paths::home_dir()?;
     let workspace = std::path::Path::new("/workspace");
     choose_workspace_root(
         fs_magic(&home),
@@ -1550,14 +1666,14 @@ fn choose_workspace_root(home_fs: Option<i64>, workspace_fs: Option<i64>) -> boo
 }
 
 /// The agent rootfs the installer put in the data dir, when nothing else names one.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
     if std::env::var_os("SMOLVM_AGENT_ROOTFS").is_some()
         || crate::embedded::bundle::agent_rootfs_tar().is_some()
     {
         return None;
     }
-    dirs::data_local_dir()
+    smolvm_paths::data_local_dir()
         .map(|d| d.join("smolvm/agent-rootfs"))
         .filter(|d| d.is_dir())
 }
@@ -1565,7 +1681,7 @@ fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
 /// Copy the agent rootfs to `dst` unless the copy there is already current.
 /// The agent binary's size and mtime stand for its version: `cp -a` keeps both,
 /// and an upgrade replaces the binary, so a stale copy is replaced too.
-#[cfg(target_os = "linux")]
+#[cfg(unix)]
 fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::Result<()> {
     use std::os::fd::AsRawFd;
     let parent = dst
@@ -1610,9 +1726,25 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     std::fs::rename(&staging, dst)
 }
 
-/// No-op where the data root isn't applicable (macOS dev).
-#[cfg(not(target_os = "linux"))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+/// Windows state directories are resolved by the shared paths library; make
+/// the inherited root absolute before a child can start in another directory.
+#[cfg(not(unix))]
+pub fn apply_system_data_root(_allow_auto: bool) {
+    let Some(root) = std::env::var_os("SMOLVM_DATA_DIR") else {
+        return;
+    };
+    if let Ok(root) = std::path::absolute(root) {
+        std::env::set_var("SMOLVM_DATA_DIR", root);
+    }
+    if std::env::var_os("DOCKER_CONFIG").is_none() {
+        if let Some(dir) = smolvm_paths::user_home_dir()
+            .map(|h| h.join(".docker"))
+            .filter(|d| d.is_dir())
+        {
+            std::env::set_var("DOCKER_CONFIG", dir);
+        }
+    }
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own
@@ -2560,6 +2692,10 @@ pub fn is_alive(pid: Pid) -> bool {
     if pid <= 0 {
         return false;
     }
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return true;
+    }
     if unsafe { libc::kill(pid, 0) } != 0 {
         // Permission to signal a process is independent of its liveness.
         return std::io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
@@ -2785,6 +2921,10 @@ pub fn process_start_time(pid: Pid) -> Option<u64> {
 /// Get the start time of a process (clock ticks since boot from /proc/pid/stat field 22).
 #[cfg(target_os = "linux")]
 pub fn process_start_time(pid: Pid) -> Option<u64> {
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return Some(fake_held::START_TIME);
+    }
     let stat = std::fs::read_to_string(format!("/proc/{}/stat", pid)).ok()?;
     // Format: pid (comm) state ppid ... starttime ...
     // comm can contain spaces and parentheses, so find the last ')' first.
@@ -3338,7 +3478,87 @@ fn require_resize_memory_controller(root: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// What the VM slice holds and may hold, read from its cgroup files.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct VmSliceMemory {
+    /// `memory.high` (`None` = no limit).
+    high_bytes: Option<u64>,
+    /// `memory.max` (`None` = no limit).
+    max_bytes: Option<u64>,
+    /// `memory.current`, page cache included.
+    current_bytes: u64,
+    /// Page cache the kernel can drop: `file` minus `shmem` from `memory.stat`
+    /// (guest RAM is shmem and counts under `file`).
+    reclaimable_cache_bytes: u64,
+}
+
+/// Host memory still available to VMs once the VM slice's own limit is
+/// counted, in the units `available_bytes` uses (host memory, the reserve the
+/// slice keeps out of reach included), or `None` when the slice has no limit.
+///
+/// The slice is used up to `limit = min(high, max)`; past that the kernel
+/// throttles or reclaims inside VM threads that may hold filesystem locks, and
+/// the node's own API stalls behind them. Page cache counts as free only above
+/// [`crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT`] of the limit,
+/// where proactive reclaim keeps it; below that line the kernel still charges it.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn vm_slice_available_bytes(total_bytes: u64, slice: &VmSliceMemory) -> Option<u64> {
+    let limit = match (slice.high_bytes, slice.max_bytes) {
+        (Some(high), Some(max)) => high.min(max),
+        (Some(limit), None) | (None, Some(limit)) => limit,
+        (None, None) => return None,
+    };
+    let reclaim_line = (u128::from(limit)
+        * u128::from(crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT)
+        / 100) as u64;
+    let without_cache = slice
+        .current_bytes
+        .saturating_sub(slice.reclaimable_cache_bytes);
+    let used = without_cache.max(slice.current_bytes.min(reclaim_line));
+    // Memory outside the slice's hard cap is what the host keeps for itself;
+    // callers subtract their own reserve from the result, so add it back here.
+    let outside_slice = total_bytes.saturating_sub(slice.max_bytes.unwrap_or(limit));
+    Some(limit.saturating_sub(used).saturating_add(outside_slice))
+}
+
+#[cfg(target_os = "linux")]
+fn parse_cgroup_limit(contents: &str) -> Option<Option<u64>> {
+    match contents.trim() {
+        "max" => Some(None),
+        value => value.parse::<u64>().ok().map(Some),
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn parse_memory_stat_field(contents: &str, field: &str) -> Option<u64> {
+    contents.lines().find_map(|line| {
+        let (name, value) = line.split_once(' ')?;
+        (name == field).then(|| value.trim().parse::<u64>().ok())?
+    })
+}
+
+#[cfg(target_os = "linux")]
+fn read_vm_slice_memory() -> Option<VmSliceMemory> {
+    let dir = std::path::Path::new("/sys/fs/cgroup").join(crate::systemd_scope::VM_SLICE);
+    let read = |name: &str| std::fs::read_to_string(dir.join(name)).ok();
+    let stat = read("memory.stat")?;
+    let file = parse_memory_stat_field(&stat, "file")?;
+    let shmem = parse_memory_stat_field(&stat, "shmem").unwrap_or(0);
+    Some(VmSliceMemory {
+        high_bytes: parse_cgroup_limit(&read("memory.high")?)?,
+        max_bytes: parse_cgroup_limit(&read("memory.max")?)?,
+        current_bytes: read("memory.current")?.trim().parse().ok()?,
+        reclaimable_cache_bytes: file.saturating_sub(shmem),
+    })
+}
+
 /// Report effective host memory available to SmolVM.
+///
+/// On a node that runs VMs in [`crate::systemd_scope::VM_SLICE`], this is also
+/// bounded by that slice's limit: VMs (branch children included) are charged
+/// there, not to this process's cgroup, and host `MemAvailable` counts the
+/// node's own page cache as free while the slice is already at its limit.
 pub fn host_memory_stats() -> Option<HostMemoryStats> {
     #[cfg(target_os = "linux")]
     {
@@ -3348,6 +3568,11 @@ pub fn host_memory_stats() -> Option<HostMemoryStats> {
                 stats.total_bytes = stats.total_bytes.min(limit);
                 stats.available_bytes = stats.available_bytes.min(headroom);
             }
+        }
+        if let Some(available) = read_vm_slice_memory()
+            .and_then(|slice| vm_slice_available_bytes(stats.total_bytes, &slice))
+        {
+            stats.available_bytes = stats.available_bytes.min(available);
         }
         Some(stats)
     }
@@ -3729,6 +3954,192 @@ pub const VM_SIGTERM_TIMEOUT: Duration = Duration::from_secs(3);
 /// down VM resources. This timeout must be long enough for that cleanup.
 pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 
+/// A process that is still present after SIGKILL was delivered to it.
+///
+/// SIGKILL cannot be blocked or handled, so the only way to outlive it is a
+/// thread that is inside a kernel call the kernel will not interrupt (for
+/// example an `open()` of a device whose driver is not responding). Such a
+/// thread keeps the process entry, its open files and its listening ports
+/// until the call returns or the host reboots; no signal changes that.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HeldProcess {
+    /// The process (thread group) id.
+    pub pid: Pid,
+    /// The threads that have not exited, with their scheduler state letter
+    /// from `/proc` (`D` is uninterruptible sleep).
+    pub blocked_threads: Vec<(Pid, char)>,
+}
+
+impl HeldProcess {
+    /// One sentence for the user: which PID was left behind and why.
+    pub fn explain(&self) -> String {
+        let threads = match self.blocked_threads.as_slice() {
+            [] => "a thread of it is".to_string(),
+            [(tid, state)] => format!("its thread {tid} (state {state}) is"),
+            many => format!(
+                "its threads {} are",
+                many.iter()
+                    .map(|(tid, state)| format!("{tid} (state {state})"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        };
+        format!(
+            "process {} is still present after SIGKILL: {threads} blocked inside the \
+             kernel and cannot be killed. The kernel is holding it; it goes away when \
+             that kernel call returns or when the host is rebooted",
+            self.pid
+        )
+    }
+}
+
+impl HeldProcess {
+    /// Why a machine whose previous process is held cannot be started. Every
+    /// start path (CLI, API server, embedded runtime) refuses with this text.
+    pub fn start_refusal(&self) -> String {
+        format!(
+            "the previous run of this machine was stopped, but {}; refusing a second \
+             launch on its disks until then (delete the machine with --force to remove it)",
+            self.explain()
+        )
+    }
+}
+
+/// How [`stop_vm_process_bounded`] ended.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VmStop {
+    /// The process exited with this code.
+    Exited(i32),
+    /// SIGKILL was delivered and the kernel has not let the process go.
+    Held(HeldProcess),
+}
+
+/// The process operations a VM stop needs. A trait so a test can stand in a
+/// process that survives SIGKILL, which cannot be produced on demand.
+pub(crate) trait ProcessControl {
+    fn is_alive(&self, pid: Pid) -> bool;
+    fn try_wait(&self, pid: Pid) -> Option<i32>;
+    fn terminate(&self, pid: Pid) -> bool;
+    fn kill(&self, pid: Pid) -> bool;
+    fn poll_for_exit(&self, pid: Pid, timeout: Duration) -> Option<i32>;
+    fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess>;
+}
+
+/// The host's real processes.
+pub(crate) struct HostProcesses;
+
+impl ProcessControl for HostProcesses {
+    fn is_alive(&self, pid: Pid) -> bool {
+        is_alive(pid)
+    }
+    fn try_wait(&self, pid: Pid) -> Option<i32> {
+        try_wait(pid)
+    }
+    fn terminate(&self, pid: Pid) -> bool {
+        terminate(pid)
+    }
+    fn kill(&self, pid: Pid) -> bool {
+        kill(pid)
+    }
+    fn poll_for_exit(&self, pid: Pid, timeout: Duration) -> Option<i32> {
+        poll_for_exit(pid, timeout)
+    }
+    fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess> {
+        held_after_kill(pid)
+    }
+}
+
+/// Whether `pid` has been killed and is still present: SIGKILL is pending on
+/// one of its threads, or its main thread has exited while others remain.
+///
+/// Right after a kill this is briefly true for any process, so callers ask
+/// only once the wait for SIGKILL to take effect has run out, or to explain
+/// a process they already found alive.
+#[cfg(target_os = "linux")]
+pub fn held_after_kill(pid: Pid) -> Option<HeldProcess> {
+    if pid <= 0 || !is_alive(pid) {
+        return None;
+    }
+    #[cfg(test)]
+    if fake_held::is_held(pid) {
+        return Some(fake_held::held(pid));
+    }
+    let leader_stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).ok()?;
+    let leader_exited = matches!(linux_stat_state(&leader_stat), Some('Z' | 'X' | 'x'));
+    let mut kill_pending = false;
+    let mut blocked_threads = Vec::new();
+    for entry in std::fs::read_dir(format!("/proc/{pid}/task"))
+        .ok()?
+        .flatten()
+    {
+        let Some(tid) = entry
+            .file_name()
+            .to_str()
+            .and_then(|name| name.parse::<Pid>().ok())
+        else {
+            continue;
+        };
+        let Some(state) = std::fs::read_to_string(entry.path().join("stat"))
+            .ok()
+            .as_deref()
+            .and_then(linux_stat_state)
+        else {
+            continue;
+        };
+        if matches!(state, 'Z' | 'X' | 'x') {
+            continue;
+        }
+        blocked_threads.push((tid, state));
+        if std::fs::read_to_string(entry.path().join("status"))
+            .is_ok_and(|status| linux_status_sigkill_pending(&status))
+        {
+            kill_pending = true;
+        }
+    }
+    blocked_threads.sort_unstable();
+    ((leader_exited && !blocked_threads.is_empty()) || kill_pending).then_some(HeldProcess {
+        pid,
+        blocked_threads,
+    })
+}
+
+/// Only Linux exposes what is needed to tell a held process from a slow exit.
+#[cfg(not(target_os = "linux"))]
+pub fn held_after_kill(_pid: Pid) -> Option<HeldProcess> {
+    None
+}
+
+/// The scheduler state letter from a `/proc/<pid>/stat` line.
+#[cfg(target_os = "linux")]
+fn linux_stat_state(stat: &str) -> Option<char> {
+    let (_, fields) = stat.rsplit_once(") ")?;
+    fields.split_ascii_whitespace().next()?.chars().next()
+}
+
+/// Whether a `/proc/<pid>/task/<tid>/status` text shows SIGKILL pending on
+/// the thread (`SigPnd`) or on its process (`ShdPnd`).
+#[cfg(target_os = "linux")]
+fn linux_status_sigkill_pending(status: &str) -> bool {
+    const SIGKILL_BIT: u64 = 1 << (libc::SIGKILL - 1);
+    status.lines().any(|line| {
+        line.strip_prefix("SigPnd:")
+            .or_else(|| line.strip_prefix("ShdPnd:"))
+            .and_then(|mask| u64::from_str_radix(mask.trim(), 16).ok())
+            .is_some_and(|mask| mask & SIGKILL_BIT != 0)
+    })
+}
+
+/// Whether `pid` can still run guest or VMM code: it is alive and has not
+/// been left behind by a SIGKILL the kernel has yet to finish.
+///
+/// Use after a stop instead of [`is_alive`] where the question is "may its
+/// files be removed and its record marked stopped". A held process executes
+/// nothing more: every thread that could still run has exited, and a blocked
+/// thread dies as soon as its kernel call returns.
+pub fn can_still_run(pid: Pid) -> bool {
+    is_alive(pid) && held_after_kill(pid).is_none()
+}
+
 /// Stop a VM process with Hypervisor-aware timeouts.
 ///
 /// Two-phase shutdown:
@@ -3737,25 +4148,134 @@ pub const VM_SIGKILL_TIMEOUT: Duration = Duration::from_secs(3);
 ///
 /// Callers must verify process identity BEFORE calling this function.
 ///
-/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive.
+/// Returns `Ok(exit_code)` if the process exited, `Err` if still alive. A
+/// process the kernel is holding after SIGKILL is an `Err` whose text says
+/// so; callers that can finish their work without the exit use
+/// [`stop_vm_process_bounded`].
 pub fn stop_vm_process(
     pid: Pid,
     sigterm_timeout: Duration,
     sigkill_timeout: Duration,
 ) -> Result<i32> {
-    if !is_alive(pid) {
-        return Ok(try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE));
+    match stop_vm_process_bounded(pid, sigterm_timeout, sigkill_timeout)? {
+        VmStop::Exited(code) => Ok(code),
+        VmStop::Held(held) => Err(Error::agent("stop vm process", held.explain())),
+    }
+}
+
+/// [`stop_vm_process`], reporting a process the kernel is holding after
+/// SIGKILL as [`VmStop::Held`] instead of an error.
+///
+/// Either way the call returns within the two timeouts. A held process runs
+/// no more code, so a stop or delete can complete around it: the caller
+/// marks the machine stopped, tells the user which PID was left behind, and
+/// does not wait for an exit that may only come with a reboot.
+pub fn stop_vm_process_bounded(
+    pid: Pid,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<VmStop> {
+    #[cfg(all(test, target_os = "linux"))]
+    if fake_held::is_held(pid) {
+        return Ok(VmStop::Held(fake_held::held(pid)));
+    }
+    stop_vm_process_with(&HostProcesses, pid, sigterm_timeout, sigkill_timeout)
+}
+
+/// A stand-in for a process the kernel is holding after SIGKILL, for tests of
+/// the code that stops, deletes and restarts machines. Such a process cannot
+/// be produced on demand, so a test registers a PID here and the liveness,
+/// start-time, held-state and stop functions above answer for it as they
+/// would for the real thing. The PIDs are above the kernel's largest
+/// possible PID, so no real process is ever looked at or signalled.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) mod fake_held {
+    use super::{HeldProcess, Pid};
+    use std::collections::BTreeSet;
+    use std::sync::atomic::{AtomicI32, Ordering};
+    use std::sync::Mutex;
+
+    /// The start time every fake process reports.
+    pub(crate) const START_TIME: u64 = 424_242;
+
+    /// Linux caps PIDs at 4194304.
+    static NEXT_PID: AtomicI32 = AtomicI32::new(5_000_000);
+    static HELD: Mutex<BTreeSet<Pid>> = Mutex::new(BTreeSet::new());
+
+    /// A fake held process. Dropping it, or calling [`FakeHeld::disappear`],
+    /// is the host reboot: the process is gone.
+    pub(crate) struct FakeHeld {
+        pub(crate) pid: Pid,
+    }
+
+    impl FakeHeld {
+        /// The process goes away, as it does when the host reboots.
+        pub(crate) fn disappear(&self) {
+            HELD.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&self.pid);
+        }
+    }
+
+    impl Drop for FakeHeld {
+        fn drop(&mut self) {
+            self.disappear();
+        }
+    }
+
+    /// Register a new fake held process with a PID of its own.
+    pub(crate) fn hold() -> FakeHeld {
+        let pid = NEXT_PID.fetch_add(1, Ordering::Relaxed);
+        HELD.lock().unwrap_or_else(|e| e.into_inner()).insert(pid);
+        FakeHeld { pid }
+    }
+
+    pub(crate) fn is_held(pid: Pid) -> bool {
+        HELD.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&pid)
+    }
+
+    pub(crate) fn held(pid: Pid) -> HeldProcess {
+        HeldProcess {
+            pid,
+            blocked_threads: vec![(pid + 1_000_000, 'D')],
+        }
+    }
+}
+
+pub(crate) fn stop_vm_process_with(
+    processes: &dyn ProcessControl,
+    pid: Pid,
+    sigterm_timeout: Duration,
+    sigkill_timeout: Duration,
+) -> Result<VmStop> {
+    if !processes.is_alive(pid) {
+        return Ok(VmStop::Exited(
+            processes.try_wait(pid).unwrap_or(UNKNOWN_EXIT_CODE),
+        ));
+    }
+    // Already killed, by an earlier stop or by its own exit: another signal
+    // changes nothing. Give the exit the SIGKILL wait to finish, since a
+    // process that is exiting normally looks the same for a moment.
+    if processes.held_after_kill(pid).is_some() {
+        if let Some(code) = processes.poll_for_exit(pid, sigkill_timeout) {
+            return Ok(VmStop::Exited(code));
+        }
+        if let Some(held) = processes.held_after_kill(pid) {
+            return Ok(VmStop::Held(held));
+        }
     }
 
     // Phase 1: SIGTERM + poll
-    if !terminate(pid) {
+    if !processes.terminate(pid) {
         // A failed signal is not evidence of exit: EPERM leaves the VMM alive.
         // Only return success when the child has exited or the PID is gone.
-        if let Some(code) = try_wait(pid) {
-            return Ok(code);
+        if let Some(code) = processes.try_wait(pid) {
+            return Ok(VmStop::Exited(code));
         }
-        if !is_alive(pid) {
-            return Ok(UNKNOWN_EXIT_CODE);
+        if !processes.is_alive(pid) {
+            return Ok(VmStop::Exited(UNKNOWN_EXIT_CODE));
         }
         return Err(Error::agent(
             "stop vm process",
@@ -3763,16 +4283,22 @@ pub fn stop_vm_process(
         ));
     }
 
-    if let Some(code) = poll_for_exit(pid, sigterm_timeout) {
-        return Ok(code);
+    if let Some(code) = processes.poll_for_exit(pid, sigterm_timeout) {
+        return Ok(VmStop::Exited(code));
     }
 
     // Phase 2: SIGKILL + poll
     tracing::debug!(pid, "SIGTERM timeout, sending SIGKILL");
-    kill(pid);
+    processes.kill(pid);
 
-    if let Some(code) = poll_for_exit(pid, sigkill_timeout) {
-        return Ok(code);
+    if let Some(code) = processes.poll_for_exit(pid, sigkill_timeout) {
+        return Ok(VmStop::Exited(code));
+    }
+
+    // SIGKILL was delivered and the wait for it ran out. What is left is
+    // inside the kernel; more waiting or more signals do not help.
+    if let Some(held) = processes.held_after_kill(pid) {
+        return Ok(VmStop::Held(held));
     }
 
     Err(Error::agent(
@@ -3910,6 +4436,11 @@ fn wait_for_exit_event(_pid: Pid, _timeout: Duration) -> ExitEvent {
 /// seen when it happens. Elsewhere it polls, aggressively at first and then
 /// backing off.
 pub(crate) fn poll_for_exit(pid: Pid, timeout: Duration) -> Option<i32> {
+    #[cfg(all(test, target_os = "linux"))]
+    if fake_held::is_held(pid) {
+        let _ = timeout;
+        return None;
+    }
     if let Some(code) = try_wait(pid) {
         return Some(code);
     }
@@ -4229,9 +4760,15 @@ pub struct ChildProcess {
 impl ChildProcess {
     /// Create a new child process handle, capturing start time immediately.
     pub fn new(pid: Pid) -> Self {
+        Self::from_identity(pid, process_start_time(pid))
+    }
+
+    /// Reattach using the identity already verified by the caller; resampling
+    /// here could silently bind this handle to a recycled PID.
+    pub(crate) fn from_identity(pid: Pid, start_time: Option<u64>) -> Self {
         Self {
             pid,
-            start_time: process_start_time(pid),
+            start_time,
             exit_code: None,
         }
     }
@@ -4324,6 +4861,11 @@ impl SigintGuard {
     /// Install a SIGINT handler that will SIGTERM+SIGKILL the given PID.
     #[cfg(unix)]
     pub fn new(pid: Pid) -> Self {
+        // The SSH proxy owns the boot process from spawn through the durable
+        // Running commit. Killing it here could undo a committed resume.
+        if crate::ssh::ownership::managed() {
+            return Self(());
+        }
         SIGINT_CHILD_PID.store(pid, Ordering::SeqCst);
         unsafe {
             libc::signal(
@@ -4966,7 +5508,7 @@ mod tests {
         }
         let directory = tempfile::tempdir().unwrap();
         let ready = directory.path().join("ready");
-        let fixture = Fixture(
+        let mut fixture = Fixture(
             std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -4999,8 +5541,10 @@ mod tests {
             "stop must wait for workers, not just the leader"
         );
         assert!(try_wait(pid).is_none());
-        drop(fixture);
-        assert!(std::net::TcpListener::bind(address).is_ok());
+        // Closing stdin lets the worker exit. Rebinding the freed port here
+        // would race other tests that bind ephemeral ports in parallel.
+        drop(fixture.0.stdin.take());
+        assert!(fixture.0.wait().unwrap().success());
     }
 
     #[cfg(target_os = "linux")]
@@ -5959,6 +6503,77 @@ mod tests {
         assert_eq!(stats.available_bytes, 4_096_000 * 1024);
     }
 
+    const GIB: u64 = 1024 * 1024 * 1024;
+
+    fn slice(high: Option<u64>, max: Option<u64>, current: u64, cache: u64) -> VmSliceMemory {
+        VmSliceMemory {
+            high_bytes: high.map(|g| g * GIB),
+            max_bytes: max.map(|g| g * GIB),
+            current_bytes: current * GIB,
+            reclaimable_cache_bytes: cache * GIB,
+        }
+    }
+
+    #[test]
+    fn vm_slice_without_a_limit_does_not_bound_available_memory() {
+        assert_eq!(
+            vm_slice_available_bytes(755 * GIB, &slice(None, None, 700, 0)),
+            None
+        );
+    }
+
+    #[test]
+    fn vm_slice_at_its_throttle_has_no_headroom_however_much_the_host_caches() {
+        // x86-xfs-worker-0 on 2026-11-12: high 702 GiB, max 710 GiB on a 755 GiB
+        // host, the slice at its throttle while MemAvailable still looked large.
+        let available = vm_slice_available_bytes(755 * GIB, &slice(Some(702), Some(710), 702, 0));
+        assert_eq!(
+            available,
+            Some(45 * GIB),
+            "only the host's own reserve is left"
+        );
+    }
+
+    #[test]
+    fn vm_slice_page_cache_counts_as_free_only_above_the_reclaim_line() {
+        let limit = 700;
+        let line = limit * crate::systemd_scope::VM_SLICE_RECLAIM_TARGET_PERCENT / 100;
+        // 680 GiB used, 300 GiB of it cache: the cache above the line is free,
+        // the cache below it is not.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 680, 300)).unwrap();
+        assert_eq!(available, (limit - line) * GIB);
+        // Mostly guest RAM: what is not cache counts in full.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 680, 10)).unwrap();
+        assert_eq!(available, (limit - 670) * GIB);
+        // Below the line nothing changes: memory.current is what counts.
+        let available =
+            vm_slice_available_bytes(limit * GIB, &slice(None, Some(limit), 200, 150)).unwrap();
+        assert_eq!(available, (limit - 200) * GIB);
+    }
+
+    #[test]
+    fn vm_slice_uses_memory_max_when_memory_high_is_unlimited() {
+        let available = vm_slice_available_bytes(755 * GIB, &slice(None, Some(710), 600, 0));
+        assert_eq!(available, Some((710 - 600 + 45) * GIB));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn cgroup_memory_files_parse() {
+        assert_eq!(parse_cgroup_limit("max\n"), Some(None));
+        assert_eq!(
+            parse_cgroup_limit("753583259648\n"),
+            Some(Some(753_583_259_648))
+        );
+        assert_eq!(parse_cgroup_limit("bogus"), None);
+        let stat = "anon 10737418240\nfile 109521666048\nshmem 78383153152\nfile_mapped 1\n";
+        assert_eq!(parse_memory_stat_field(stat, "file"), Some(109_521_666_048));
+        assert_eq!(parse_memory_stat_field(stat, "shmem"), Some(78_383_153_152));
+        assert_eq!(parse_memory_stat_field(stat, "file_dirty"), None);
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn process_memory_stats_samples_self() {
@@ -6051,5 +6666,204 @@ mod oom_victim_order_tests {
         );
         assert_eq!(oom_score_adj_for(true, false), -500, "a branch source");
         assert_eq!(oom_score_adj_for(false, false), 0, "a plain machine");
+    }
+}
+
+#[cfg(all(test, unix))]
+mod nofile_limit_tests {
+    use super::*;
+
+    /// The tests below change this process's open-file limit; one must not
+    /// move it between another's raise and its check.
+    static RLIMIT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn the_open_file_limit_rises_to_the_hard_limit_or_the_macos_cap() {
+        let _guard = RLIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let raised = raise_nofile_limit().expect("getrlimit works");
+        // SAFETY: getrlimit on a local struct.
+        let hard = unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            assert_eq!(
+                limit.rlim_cur, raised,
+                "the returned limit is the one in force"
+            );
+            limit.rlim_max
+        };
+        #[cfg(target_os = "macos")]
+        let wanted = macos_max_files_per_process().map_or(hard, |cap| hard.min(cap));
+        #[cfg(not(target_os = "macos"))]
+        let wanted = hard;
+        assert_eq!(raised, wanted);
+    }
+
+    /// A shell can hand a process a soft limit above `kern.maxfilesperproc`
+    /// (`ulimit -n` past it). macOS holds the process to the cap regardless,
+    /// so the raise must bring the soft limit down to the cap instead of
+    /// reporting a limit that is not in force.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_soft_limit_above_the_macos_cap_comes_down_to_it() {
+        let _guard = RLIMIT_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let cap = macos_max_files_per_process().expect("kern.maxfilesperproc");
+        // SAFETY: getrlimit/setrlimit on local structs.
+        unsafe {
+            let mut limit = libc::rlimit {
+                rlim_cur: 0,
+                rlim_max: 0,
+            };
+            assert_eq!(libc::getrlimit(libc::RLIMIT_NOFILE, &mut limit), 0);
+            if limit.rlim_max <= cap {
+                // No soft limit above the cap is possible on this host.
+                return;
+            }
+            let above = libc::rlimit {
+                rlim_cur: limit.rlim_max.min(cap * 2),
+                rlim_max: limit.rlim_max,
+            };
+            assert_eq!(libc::setrlimit(libc::RLIMIT_NOFILE, &above), 0);
+        }
+        assert_eq!(raise_nofile_limit(), Some(cap));
+    }
+}
+
+#[cfg(test)]
+mod held_process_tests {
+    use super::*;
+    use std::cell::{Cell, RefCell};
+
+    /// A process that ignores SIGTERM and, when `survives_kill` is set, is
+    /// still present after SIGKILL the way a thread blocked in the kernel
+    /// keeps it.
+    struct FakeProcess {
+        survives_kill: bool,
+        killed: Cell<bool>,
+        signals: RefCell<Vec<&'static str>>,
+        waited: RefCell<Vec<Duration>>,
+    }
+
+    impl FakeProcess {
+        fn new(survives_kill: bool) -> Self {
+            Self {
+                survives_kill,
+                killed: Cell::new(false),
+                signals: RefCell::new(Vec::new()),
+                waited: RefCell::new(Vec::new()),
+            }
+        }
+        fn gone(&self) -> bool {
+            self.killed.get() && !self.survives_kill
+        }
+    }
+
+    impl ProcessControl for FakeProcess {
+        fn is_alive(&self, _pid: Pid) -> bool {
+            !self.gone()
+        }
+        fn try_wait(&self, _pid: Pid) -> Option<i32> {
+            self.gone().then_some(137)
+        }
+        fn terminate(&self, _pid: Pid) -> bool {
+            self.signals.borrow_mut().push("TERM");
+            true
+        }
+        fn kill(&self, _pid: Pid) -> bool {
+            self.signals.borrow_mut().push("KILL");
+            self.killed.set(true);
+            true
+        }
+        fn poll_for_exit(&self, _pid: Pid, timeout: Duration) -> Option<i32> {
+            self.waited.borrow_mut().push(timeout);
+            self.gone().then_some(137)
+        }
+        fn held_after_kill(&self, pid: Pid) -> Option<HeldProcess> {
+            (self.killed.get() && self.survives_kill).then(|| HeldProcess {
+                pid,
+                blocked_threads: vec![(pid + 7, 'D')],
+            })
+        }
+    }
+
+    const TERM_WAIT: Duration = Duration::from_millis(20);
+    const KILL_WAIT: Duration = Duration::from_millis(30);
+
+    #[test]
+    fn process_that_survives_sigkill_is_reported_held_within_the_two_waits() {
+        let process = FakeProcess::new(true);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert_eq!(
+            outcome,
+            VmStop::Held(HeldProcess {
+                pid: 4242,
+                blocked_threads: vec![(4249, 'D')],
+            })
+        );
+        // One SIGTERM, one SIGKILL, and no wait beyond the two given.
+        assert_eq!(*process.signals.borrow(), ["TERM", "KILL"]);
+        assert_eq!(*process.waited.borrow(), [TERM_WAIT, KILL_WAIT]);
+    }
+
+    #[test]
+    fn process_that_dies_on_sigkill_is_reported_exited() {
+        let process = FakeProcess::new(false);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert_eq!(outcome, VmStop::Exited(137));
+    }
+
+    #[test]
+    fn stopping_an_already_held_process_sends_no_further_signal() {
+        let process = FakeProcess::new(true);
+        process.killed.set(true);
+        let outcome = stop_vm_process_with(&process, 4242, TERM_WAIT, KILL_WAIT).unwrap();
+        assert!(matches!(outcome, VmStop::Held(_)));
+        assert!(process.signals.borrow().is_empty());
+        assert_eq!(*process.waited.borrow(), [KILL_WAIT]);
+    }
+
+    #[test]
+    fn explanation_names_the_pid_the_thread_and_the_reboot() {
+        let text = HeldProcess {
+            pid: 2768452,
+            blocked_threads: vec![(2768460, 'D')],
+        }
+        .explain();
+        assert_eq!(
+            text,
+            "process 2768452 is still present after SIGKILL: its thread 2768460 (state D) \
+             is blocked inside the kernel and cannot be killed. The kernel is holding it; \
+             it goes away when that kernel call returns or when the host is rebooted"
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn sigkill_pending_is_read_from_the_thread_and_process_masks() {
+        let thread = "Name:\tgpu worker\nSigPnd:\t0000000000000100\nShdPnd:\t0000000000000000\n";
+        let process = "SigPnd:\t0000000000000000\nShdPnd:\t0000000000000100\n";
+        let term_only = "SigPnd:\t0000000000004000\nShdPnd:\t0000000000004000\n";
+        assert!(linux_status_sigkill_pending(thread));
+        assert!(linux_status_sigkill_pending(process));
+        assert!(!linux_status_sigkill_pending(term_only));
+        assert!(!linux_status_sigkill_pending(""));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn state_letter_is_read_past_a_name_with_spaces_and_parentheses() {
+        assert_eq!(linux_stat_state("2768460 (gpu worker) D 1 2 3"), Some('D'));
+        assert_eq!(linux_stat_state("7 (a) b) Z 1"), Some('Z'));
+        assert_eq!(linux_stat_state("garbage"), None);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_running_process_is_not_held() {
+        let me = std::process::id() as Pid;
+        assert_eq!(held_after_kill(me), None);
+        assert!(can_still_run(me));
     }
 }

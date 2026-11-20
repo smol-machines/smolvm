@@ -25,6 +25,7 @@ pub(crate) mod cache_base_fetch;
 pub(crate) mod device_handoff;
 #[path = "errors.rs"]
 pub mod error;
+pub mod exec_sessions;
 pub mod guest_rollout;
 pub mod handlers;
 pub mod inflight;
@@ -41,7 +42,7 @@ use axum::{
     extract::{DefaultBodyLimit, Request},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::Response,
+    response::{IntoResponse, Response},
     routing::{delete, get, post, put},
     Router,
 };
@@ -88,6 +89,12 @@ use state::ApiState;
         handlers::exec::exec_stream,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
+        handlers::exec_sessions::create_exec_session,
+        handlers::exec_sessions::list_exec_sessions,
+        handlers::exec_sessions::read_exec_session,
+        handlers::exec_sessions::exec_session_stdin,
+        handlers::exec_sessions::resize_exec_session,
+        handlers::exec_sessions::delete_exec_session,
         // Files
         handlers::files::upload_file,
         handlers::files::download_file,
@@ -151,6 +158,10 @@ use state::ApiState;
         types::PortSpec,
         types::ResourceSpec,
         types::ExecRequest,
+        types::CreateExecSessionRequest,
+        types::ExecSessionReadQuery,
+        types::ExecStdinRequest,
+        types::ExecResizeRequest,
         types::RunRequest,
         types::EnvVar,
         types::PullImageRequest,
@@ -198,6 +209,12 @@ use state::ApiState;
         types::MountInfo,
         types::ListMachinesResponse,
         types::ExecResponse,
+        types::ExecSessionResponse,
+        types::ExecOutputChunk,
+        types::ExecOutputGap,
+        types::ExecStdinResponse,
+        types::ListExecSessionsResponse,
+        exec_sessions::SessionSummary,
         types::ExportResponse,
         types::ImageInfo,
         types::ListImagesResponse,
@@ -295,6 +312,7 @@ pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
 /// `cors_origins` specifies allowed CORS origins. If empty, defaults to
 /// localhost:8080 and localhost:3000 (both http and 127.0.0.1 variants).
 pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+    let origins = Arc::new(allowed_origins(&cors_origins));
     // Health check route. `/health` is liveness (pure-async, always answers);
     // `/readyz` is a dispatch-path readiness probe that exercises the blocking pool
     // so the control can detect — and cordon — a node whose start/exec are wedged
@@ -350,6 +368,11 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route(
             "/{id}/exec/interactive",
             get(handlers::exec::exec_interactive),
+        )
+        // A terminal attached to an exec session; it lasts as long as the user.
+        .route(
+            "/{id}/execs/{exec}/attach",
+            get(handlers::exec_sessions::attach_exec_session),
         );
 
     // Bounded metadata and lifecycle routes. These have no caller-selected
@@ -439,6 +462,27 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/exec", post(handlers::exec::exec_command))
         .route("/{id}/exec/stream", post(handlers::exec::exec_stream))
         .route("/{id}/run", post(handlers::exec::run_command))
+        // Exec sessions: a start answers once its command runs (it may boot the
+        // machine and pull its image first), and a read may wait up to a minute
+        // for output, so neither takes the five-minute request timeout.
+        .route(
+            "/{id}/execs",
+            post(handlers::exec_sessions::create_exec_session)
+                .get(handlers::exec_sessions::list_exec_sessions),
+        )
+        .route(
+            "/{id}/execs/{exec}",
+            get(handlers::exec_sessions::read_exec_session)
+                .delete(handlers::exec_sessions::delete_exec_session),
+        )
+        .route(
+            "/{id}/execs/{exec}/stdin",
+            post(handlers::exec_sessions::exec_session_stdin),
+        )
+        .route(
+            "/{id}/execs/{exec}/resize",
+            post(handlers::exec_sessions::resize_exec_session),
+        )
         .route("/{id}/images/pull", post(handlers::images::pull_image))
         // Flattening and uploading a cache disk scales with its size: a 32 GB
         // publish ran past the five-minute timeout every time and answered 408
@@ -549,6 +593,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
             tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
         }))
+        // Inside the CORS layer, so preflights are still answered by it.
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            refuse_foreign_web_origins(origins.clone(), req, next)
+        }))
         .layer(cors)
         // Outermost, so a request counts from arrival until its body is sent.
         .layer(middleware::from_fn_with_state(
@@ -558,9 +606,9 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .with_state(state)
 }
 
-/// Build the shared CORS layer from the configured origins (falling back to the
-/// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
-fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
+/// The origins a browser page may call the API from: the configured
+/// `--cors-origin`s, or the localhost defaults when none are valid.
+fn allowed_origins(cors_origins: &[String]) -> Vec<HeaderValue> {
     let default_origins = || {
         vec![
             "http://localhost:8080"
@@ -577,11 +625,11 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
                 .expect("hardcoded CORS origin"),
         ]
     };
-    let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+    if cors_origins.is_empty() {
         default_origins()
     } else {
         let mut valid = Vec::new();
-        for origin in &cors_origins {
+        for origin in cors_origins {
             match origin.parse() {
                 Ok(v) => valid.push(v),
                 Err(e) => {
@@ -595,9 +643,14 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
         } else {
             valid
         }
-    };
+    }
+}
+
+/// Build the shared CORS layer from the configured origins (falling back to the
+/// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
+fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(AllowOrigin::list(allowed_origins(&cors_origins)))
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -605,6 +658,116 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
             axum::http::Method::DELETE,
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE])
+}
+
+/// Refuse requests a browser sends on behalf of a page from a foreign site.
+///
+/// The CORS layer only decides which responses a page may read; a body-less
+/// POST or a WebSocket handshake still reaches its handler without a
+/// preflight. So a request that carries an `Origin` is served only when that
+/// origin is allowed, or is the server's own page (the API docs) reached at
+/// `localhost` or an IP address. A request without `Origin` is refused when
+/// `Sec-Fetch-Site` says another site sent it. Clients that are not browsers
+/// send neither header and are unaffected.
+async fn refuse_foreign_web_origins(
+    allowed: Arc<Vec<HeaderValue>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_foreign_web_request(&allowed, req.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "requests from web pages are only served for origins allowed with --cors-origin",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn is_foreign_web_request(allowed: &[HeaderValue], headers: &axum::http::HeaderMap) -> bool {
+    use axum::http::header::{HOST, ORIGIN};
+    if let Some(origin) = headers.get(ORIGIN) {
+        if allowed
+            .iter()
+            .any(|a| a.as_bytes().eq_ignore_ascii_case(origin.as_bytes()))
+        {
+            return false;
+        }
+        let Some(authority) = origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .map(|(_, authority)| authority)
+        else {
+            return true;
+        };
+        let own_page = headers
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|host| host.eq_ignore_ascii_case(authority) && is_local_host_name(host));
+        return !own_page;
+    }
+    match headers.get("sec-fetch-site").map(|v| v.as_bytes()) {
+        None | Some(b"same-origin") | Some(b"none") => false,
+        Some(_) => true,
+    }
+}
+
+/// Whether a `Host` value names this machine without DNS: `localhost` or an IP
+/// address. A page can re-point any other name at 127.0.0.1 (DNS rebinding).
+fn is_local_host_name(host: &str) -> bool {
+    let name = host_name(host);
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// The host part of a `Host` value or URL authority, without port or brackets.
+fn host_name(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match authority.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => authority,
+    }
+}
+
+/// Wrap the router served on a plain loopback TCP listener so it refuses a
+/// `Host` that is not `localhost`, an IP address or the host of an allowed
+/// origin. A page that re-pointed its own name at 127.0.0.1 is same-origin
+/// with the API for the browser and sends no `Origin` on reads; its `Host`
+/// is what gives it away. Unix-socket, mTLS and network listeners are left
+/// alone, since their clients may address the server by a DNS name.
+pub fn guard_loopback_listener(router: Router, cors_origins: &[String]) -> Router {
+    let allowed_hosts: Arc<Vec<String>> = Arc::new(
+        allowed_origins(cors_origins)
+            .iter()
+            .filter_map(|o| o.to_str().ok()?.split_once("://"))
+            .map(|(_, authority)| host_name(authority).to_ascii_lowercase())
+            .collect(),
+    );
+    router.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let allowed_hosts = allowed_hosts.clone();
+        async move {
+            let host = req
+                .headers()
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_owned)
+                .or_else(|| req.uri().authority().map(|a| a.to_string()));
+            if let Some(host) = host {
+                if !is_local_host_name(&host)
+                    && !allowed_hosts.contains(&host_name(&host).to_ascii_lowercase())
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "this listener only answers to localhost, an IP address or a --cors-origin host",
+                    )
+                        .into_response();
+                }
+            }
+            next.run(req).await
+        }
+    }))
 }
 
 /// The router served on the plain-HTTP LOOPBACK door (fleet mode), as distinct
@@ -965,5 +1128,110 @@ mod nested_virt_gate_test {
         let spec = crate::api::state::vm_resources_to_spec(res);
         assert_eq!(spec.nested_virt, Some(true));
         assert!(crate::api::state::resource_spec_to_vm_resources(&spec, false).nested_virt);
+    }
+}
+
+#[cfg(test)]
+mod web_origin_test {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn router(dir: &tempfile::TempDir) -> Router {
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
+        create_router(Arc::new(ApiState::with_db(db)), vec![])
+    }
+
+    async fn send(
+        router: Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        let mut request = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        router
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_foreign_page_cannot_drive_the_api() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = router(&dir);
+        let host = ("host", "127.0.0.1:8080");
+        for headers in [
+            vec![
+                host,
+                ("origin", "https://evil.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            vec![host, ("origin", "null")],
+            vec![host, ("sec-fetch-site", "cross-site")],
+            vec![
+                ("host", "evil.example:8080"),
+                ("origin", "http://evil.example:8080"),
+            ],
+        ] {
+            for (method, path) in [
+                ("POST", "/api/v1/machines/dev/stop"),
+                ("POST", "/drain"),
+                ("GET", "/api/v1/machines/dev/exec/interactive?cmd=sh"),
+            ] {
+                assert_eq!(
+                    send(app.clone(), method, path, &headers).await,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} with {headers:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clients_and_allowed_pages_are_served() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = router(&dir);
+        for headers in [
+            vec![("host", "127.0.0.1:8080")],
+            vec![("host", "node.internal:8443")],
+            vec![
+                ("host", "127.0.0.1:8080"),
+                ("origin", "http://localhost:3000"),
+            ],
+            vec![
+                ("host", "127.0.0.1:9000"),
+                ("origin", "http://127.0.0.1:9000"),
+            ],
+            vec![
+                ("host", "127.0.0.1:8080"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        ] {
+            assert_eq!(
+                send(app.clone(), "GET", "/api/v1/machines", &headers).await,
+                StatusCode::OK,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loopback_listener_refuses_a_rebound_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = guard_loopback_listener(router(&dir), &["http://dev.box:8080".into()]);
+        let get = |host: &'static str| {
+            let app = app.clone();
+            async move { send(app, "GET", "/api/v1/machines", &[("host", host)]).await }
+        };
+        assert_eq!(get("evil.example:8080").await, StatusCode::FORBIDDEN);
+        assert_eq!(get("127.0.0.1:8080").await, StatusCode::OK);
+        assert_eq!(get("[::1]:8080").await, StatusCode::OK);
+        assert_eq!(get("localhost:8080").await, StatusCode::OK);
+        assert_eq!(get("dev.box:8080").await, StatusCode::OK);
     }
 }

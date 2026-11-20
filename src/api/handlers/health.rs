@@ -38,7 +38,7 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
     // machines). Falls back to `None` if the DB read fails.
     let machines = state.list_vm_records().await.ok().map(|vms| {
         let total = vms.len();
-        let running = vms.iter().filter(|(_, r)| r.is_process_alive()).count();
+        let running = vms.iter().filter(|(_, r)| r.process_can_run()).count();
         MachineCountsResponse { total, running }
     });
     let uptime = SERVER_START.get().map(|t| t.elapsed().as_secs());
@@ -49,6 +49,12 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
         machines,
         uptime_seconds: uptime,
         nested_virt: state.nested_virt_allowed(),
+        checkpoint_device_profiles: crate::portable_checkpoint::SUPPORTED_DEVICE_PROFILES.to_vec(),
+        checkpoint_format_versions: vec![
+            crate::portable_checkpoint::FORMAT_VERSION,
+            crate::portable_checkpoint::HISTORY_FORMAT_VERSION,
+            crate::portable_checkpoint::DELTA_FORMAT_VERSION,
+        ],
     })
 }
 
@@ -84,6 +90,29 @@ pub async fn readyz() -> StatusCode {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn health_reports_image_archive_restore_support_without_starting_machines() {
+        let root = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&root.path().join("machines.db")).unwrap();
+        db.init_tables().unwrap();
+        let state = Arc::new(ApiState::with_db(db));
+        let Json(response) = health(State(state.clone())).await;
+        let wire = serde_json::to_value(response).unwrap();
+        let profiles = wire["checkpoint_device_profiles"].as_array().unwrap();
+        assert!(profiles
+            .iter()
+            .any(|profile| profile == "smolvm-image-archive-v1"));
+        assert!(profiles.iter().any(|profile| profile == "smolvm-basic-v1"));
+        assert_eq!(wire["machines"]["total"], 0);
+        assert!(wire["checkpoint_format_versions"]
+            .as_array()
+            .unwrap()
+            .contains(&serde_json::json!(
+                crate::portable_checkpoint::FORMAT_VERSION
+            )));
+        assert!(state.list_vm_records().await.unwrap().is_empty());
+    }
 
     // On a healthy runtime the blocking-pool round-trip completes well inside the
     // budget, so readiness reports OK.

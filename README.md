@@ -12,7 +12,7 @@
 </p>
 
 <p align="center">
-  <sub><b>English</b> · <a href="docs/readme/README.zh-CN.md">中文</a> · <a href="docs/readme/README.ja.md">日本語</a> · <a href="docs/readme/README.ko.md">한국어</a></sub>
+  <sub><b>English</b> · <a href="docs/readme/README.zh-CN.md">中文</a> · <a href="docs/readme/README.ja.md">日本語</a> · <a href="docs/readme/README.ko.md">한국어</a> · <a href="docs/readme/README.ru.md">Русский</a> · <a href="docs/readme/README.es.md">Español</a> · <a href="docs/readme/README.de.md">Deutsch</a></sub>
 </p>
 
 smolvm
@@ -55,6 +55,8 @@ docker save myapp | smolvm machine run --image - -- ./app    # local image, no r
 Mount an S3, R2 or MinIO bucket with `-v s3://bucket/prefix:/data`, see [volumes](docs/volumes.md).
 
 Declare a machine in a [Smolfile](docs/smolfile.md): image, resources, ports, mounts and network policy in one checked-in file.
+
+Start it with `--auto-ports` and every TCP port a process inside listens on appears on `127.0.0.1` at the same number while it listens, so dev servers, `docker compose` and Testcontainers inside the machine need no `-p`, see [publishing ports](docs/throwaway-machine/README.md#ports-that-appear-on-their-own---auto-ports).
 
 Embeddable
 ----------
@@ -133,7 +135,7 @@ How It Works
 
 Each workload runs in a hardware-virtualized VM with its own guest kernel on [Hypervisor.framework](https://developer.apple.com/documentation/hypervisor) (macOS), KVM (Linux), or the [Windows Hypervisor Platform](https://learn.microsoft.com/en-us/virtualization/api/) (Windows). [libkrun](https://github.com/containers/libkrun) is the VMM and [libkrunfw](https://github.com/smol-machines/libkrunfw) supplies the guest kernel. Images use the [OCI](https://opencontainers.org/) format, so anything on Docker Hub, ghcr.io or another registry boots as a microVM, with no Docker daemon.
 
-Defaults: 4 vCPUs, 8 GiB RAM. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`.
+Defaults: 4 vCPUs, and half the host's RAM up to 8 GiB. Memory is elastic via virtio balloon and idle vCPUs sleep in the hypervisor, so over-provisioning costs almost nothing. Override with `--cpus` and `--mem`.
 
 Comparison
 ----------

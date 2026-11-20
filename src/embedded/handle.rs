@@ -62,14 +62,52 @@ impl VmHandle {
         self.client_mut()?.use_target(target)
     }
 
-    /// Pull an OCI image into the VM storage.
-    pub fn pull_image(&mut self, image: &str) -> Result<ImageInfo> {
-        self.client_mut()?.pull_with_registry_config(image)
+    /// Pull an OCI image into the VM storage for `platform` (`os/arch`), or for
+    /// the guest's own architecture when `None`. A machine keeps one platform
+    /// per reference, so every pull of its image passes
+    /// [`VmRecord::image_platform`].
+    pub fn pull_image(&mut self, image: &str, platform: Option<&str>) -> Result<ImageInfo> {
+        let mut options = crate::agent::PullOptions::new().use_registry_config(true);
+        if let Some(platform) = platform {
+            options = options.oci_platform(platform);
+        }
+        self.client_mut()?.pull(image, options)
     }
 
     /// List cached OCI images in the VM storage.
     pub fn list_images(&mut self) -> Result<Vec<ImageInfo>> {
         self.client_mut()?.list_images()
+    }
+
+    /// Prepare the saved machine using the CLI's initialization semantics.
+    /// The runtime owns the startup lock and commits init_completed only after
+    /// every command succeeds, so another client cannot attach halfway through.
+    pub(crate) fn initialize_machine(&mut self, name: &str, record: &VmRecord) -> Result<()> {
+        let packed = record.source_smolmachine.is_some()
+            || record
+                .image
+                .as_deref()
+                .is_some_and(crate::data::image_source::is_local_ref);
+        let image_info = if packed {
+            None
+        } else if let Some(image) = record.image.as_deref() {
+            Some(self.pull_image(image, record.image_platform())?)
+        } else {
+            None
+        };
+        let env = crate::secrets::record_env_with_secrets(record)?;
+        crate::cli::vm_common::run_init_commands_captured(
+            self.client_mut()?,
+            &record.init,
+            crate::cli::vm_common::InitRunContext {
+                image: record.image.as_deref(),
+                image_info: image_info.as_ref(),
+                env: &env,
+                workdir: record.workdir.as_deref(),
+                record_mounts: &record.mounts,
+                overlay_id: name,
+            },
+        )
     }
 
     /// Pull and launch an image machine's persistent workload before the SDK
@@ -78,10 +116,11 @@ impl VmHandle {
         let Some(image) = record.image.as_deref() else {
             return Ok(());
         };
+        if !record.init_completed {
+            self.pull_image(image, record.image_platform())?;
+        }
         let client = self.client_mut()?;
-        client.pull_with_registry_config(image)?;
-        let mut env = record.env.clone();
-        env.extend(crate::embedded::control::credential_env(record));
+        let env = crate::secrets::record_env_with_secrets(record)?;
         crate::workload::launch_image_workload(client, name, record, env)?;
         Ok(())
     }
@@ -98,7 +137,27 @@ impl VmHandle {
 
     /// Copy every guest-local staged mount back to its host source.
     pub fn sync_staged_mounts(&mut self, record: &crate::config::VmRecord) -> Result<()> {
-        crate::staged_mount::sync_staged_mounts(record, self.client_mut()?)
+        crate::staged_mount::sync_with_manager(record, &self.manager)
+    }
+
+    pub(crate) fn delete_persisted(
+        &mut self,
+        db: &crate::db::SmolvmDb,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        crate::deletion::delete_machine_locked(db, record, Some(&self.manager), true, false)?;
+        self.client = None;
+        Ok(())
+    }
+
+    pub(crate) fn stop_persisted(
+        &mut self,
+        record: &VmRecord,
+        stop_timeout: Option<std::time::Duration>,
+    ) -> Result<()> {
+        self.manager.stop_persisted(record, stop_timeout)?;
+        self.client = None;
+        Ok(())
     }
 
     /// Stop the VM and drop the cached agent client.
@@ -114,6 +173,14 @@ impl VmHandle {
             Some(stop_timeout) => self.manager.stop_with_timeout(stop_timeout),
             None => self.manager.stop(),
         }
+    }
+
+    /// Stop a VM whose guest is paused (a frozen branch base): its agent
+    /// cannot answer a shutdown request, so the VMM is ended directly.
+    #[cfg(unix)]
+    pub fn stop_paused(&mut self) -> Result<()> {
+        self.client = None;
+        self.manager.stop_paused()
     }
 
     /// Let a CLI-started VM outlive the process that launched it.

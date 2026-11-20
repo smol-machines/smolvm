@@ -125,10 +125,15 @@ impl Drop for FrameStreamBridge {
     }
 }
 
+/// How much the reader takes from the socket at once, and how much the writer
+/// gathers into one write: a frame per syscall (two, header and body) was a
+/// large share of the bridge's CPU.
+const STREAM_BATCH_BYTES: usize = 256 * 1024;
+
 fn run_reader(reader: Arc<Socket>, queues: Arc<NetworkFrameQueues>) {
     // Reader thread:
     // libkrun -> Unix stream -> guest_to_host queue -> smoltcp poll loop
-    let mut sock: &Socket = &reader;
+    let mut sock = io::BufReader::with_capacity(STREAM_BATCH_BYTES, &*reader);
     loop {
         match read_frame(&mut sock) {
             Ok(frame) => {
@@ -165,11 +170,28 @@ fn run_writer(writer: Arc<Socket>, queues: Arc<NetworkFrameQueues>) {
             }
         }
 
-        while let Some(frame) = queues.host_to_guest.pop() {
-            if let Err(err) = write_frame(&mut sock, &frame) {
-                queues.begin_shutdown();
-                tracing::debug!(error = %err, "virtio-net writer thread stopped");
-                return;
+        // Gather the queued frames, each with its length prefix, and hand them
+        // to the socket in as few writes as possible.
+        let mut batch = Vec::with_capacity(STREAM_BATCH_BYTES);
+        loop {
+            let frame = queues.host_to_guest.pop();
+            if let Some(frame) = &frame {
+                if let Err(err) = encode_frame(&mut batch, frame) {
+                    tracing::warn!(error = %err, "dropping host ethernet frame");
+                }
+            }
+            if frame.is_none() || batch.len() >= STREAM_BATCH_BYTES {
+                if !batch.is_empty() {
+                    if let Err(err) = write_all(&mut sock, &batch) {
+                        queues.begin_shutdown();
+                        tracing::debug!(error = %err, "virtio-net writer thread stopped");
+                        return;
+                    }
+                    batch.clear();
+                }
+                if frame.is_none() {
+                    break;
+                }
             }
         }
     }
@@ -211,30 +233,31 @@ pub(crate) fn read_frame<R: Read>(reader: &mut R) -> io::Result<Vec<u8>> {
     Ok(frame)
 }
 
-/// Write one raw Ethernet frame using libkrun's 4-byte big-endian length prefix.
-///
-/// This is the inverse of [`read_frame`]:
-///
-/// ```text
-/// write 4-byte BE length
-/// write raw frame bytes
-/// flush stream
-/// ```
-///
-/// `write_all` is used instead of a single `write` because stream sockets may
-/// accept only part of the buffer. The caller should not need to reason about
-/// partial-write state; this helper completes the logical frame write or fails.
-pub(crate) fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> io::Result<()> {
+/// Append one raw Ethernet frame to `out` with libkrun's 4-byte big-endian
+/// length prefix, the encoding [`write_frame`] writes.
+pub(crate) fn encode_frame(out: &mut Vec<u8>, frame: &[u8]) -> io::Result<()> {
     if frame.is_empty() || frame.len() > MAX_FRAME_LEN {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid ethernet frame length: {}", frame.len()),
         ));
     }
+    out.extend_from_slice(&(frame.len() as u32).to_be_bytes());
+    out.extend_from_slice(frame);
+    Ok(())
+}
 
-    let header = (frame.len() as u32).to_be_bytes();
-    write_all(writer, &header)?;
-    write_all(writer, frame)?;
+/// Write one raw Ethernet frame using libkrun's 4-byte big-endian length prefix.
+///
+/// This is the inverse of [`read_frame`]: the prefix and the frame go out in
+/// one write, completed with `write_all` since a stream socket may take only
+/// part of a buffer. Used by the pod tap bridge, which forwards one frame at a
+/// time; the gateway bridge batches with [`encode_frame`] instead.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+pub(crate) fn write_frame<W: Write>(writer: &mut W, frame: &[u8]) -> io::Result<()> {
+    let mut buf = Vec::with_capacity(FRAME_HEADER_LEN + frame.len());
+    encode_frame(&mut buf, frame)?;
+    write_all(writer, &buf)?;
     writer.flush()
 }
 
@@ -288,6 +311,22 @@ mod tests {
         fn flush(&mut self) -> io::Result<()> {
             Ok(())
         }
+    }
+
+    #[test]
+    fn a_batch_of_encoded_frames_reads_back_frame_by_frame() {
+        let frames: Vec<Vec<u8>> = vec![vec![1, 2, 3], vec![9; 65_534], vec![7]];
+        let mut batch = Vec::new();
+        for frame in &frames {
+            encode_frame(&mut batch, frame).unwrap();
+        }
+        assert!(encode_frame(&mut batch, &[]).is_err());
+        assert!(encode_frame(&mut batch, &vec![0; MAX_FRAME_LEN + 1]).is_err());
+        let mut reader = io::BufReader::with_capacity(16, std::io::Cursor::new(batch));
+        for frame in &frames {
+            assert_eq!(&read_frame(&mut reader).unwrap(), frame);
+        }
+        assert!(read_frame(&mut reader).is_err(), "nothing after the batch");
     }
 
     #[test]

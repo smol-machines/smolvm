@@ -241,7 +241,7 @@ install_crane "$CRANE_BINARY"
 echo "Installing additional packages..."
 # GNU tar replaces busybox tar, which never sets a symlink's owner when it
 # unpacks image layers.
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd tar"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra json-c libseccomp util-linux libcap seatd tar"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -280,23 +280,15 @@ install_packages_apk_static() {
     # code 127. The minirootfs already ships busybox symlinks, and seatd runs
     # as root in the VM so the 'seat' group creation is not required.
     local -a APK_STATIC_COMMAND=("$WORK_DIR/apk-static/sbin/apk.static")
-    local -a APK_STATIC_OWNERSHIP_ARGS=()
     local -a APK_STATIC_INITDB_ARGS=()
     if [[ "$EUID" != "0" ]]; then
-        # apk reconciles package directory ownership even with --no-chown. In
-        # an ordinary user namespace, uid 0 maps back to the invoking user, so
-        # both file and directory metadata can be installed without spurious
-        # EPERM diagnostics or privileged host writes.
-        if command -v unshare &> /dev/null \
-            && unshare --user --map-root-user true 2>/dev/null; then
-            APK_STATIC_COMMAND=(unshare --user --map-root-user "${APK_STATIC_COMMAND[@]}")
-            APK_STATIC_OWNERSHIP_ARGS=(--no-chown)
-        else
-            # apk-tools 3 refuses to create a database as non-root unless
-            # --usermode is given; files keep the invoking user's ownership.
-            echo "Warning: user namespaces are unavailable; apk runs in --usermode and files retain invoking-user ownership"
-            APK_STATIC_INITDB_ARGS=(--usermode)
-        fi
+        # apk-tools 3 refuses to create a database as non-root unless
+        # --usermode is given; files keep the invoking user's ownership, as
+        # they would from any non-root build. (A user namespace mapping only
+        # root cannot do better: apk then fails to chown setgid binaries to
+        # their groups, and from apk-tools 3.0.9 --no-chown means --usermode,
+        # which apk refuses as root.)
+        APK_STATIC_INITDB_ARGS=(--usermode)
     fi
     "${APK_STATIC_COMMAND[@]}" \
         --root "$OUTPUT_DIR" \
@@ -305,7 +297,6 @@ install_packages_apk_static() {
         --no-cache \
         --allow-untrusted \
         --no-scripts \
-        "${APK_STATIC_OWNERSHIP_ARGS[@]}" \
         --arch "$ALPINE_ARCH" \
         add $APK_PACKAGES
     if [[ "$NO_UPGRADE" != "1" ]]; then
@@ -315,7 +306,6 @@ install_packages_apk_static() {
             --no-cache \
             --allow-untrusted \
             --no-scripts \
-            "${APK_STATIC_OWNERSHIP_ARGS[@]}" \
             --arch "$ALPINE_ARCH" \
             upgrade
     fi
@@ -371,7 +361,8 @@ normalize_owner_only_modes() {
     # a public release page and byte-identical for every user: `shadow` carries no
     # hashes (root:*, every other account !), /etc/crontabs/root is the stock
     # run-parts schedule, /root is empty, and lib/apk/db/lock is zero bytes.
-    # Ownership and write bits are left alone.
+    # These paths keep their ownership and write bits; shared temporary
+    # directories are normalized separately below.
     echo "Normalizing owner-only permissions..."
     local owner_only_dirs=(
         # The tree root itself: created by this script under the builder's umask,
@@ -393,6 +384,16 @@ normalize_owner_only_modes() {
     for path in "${owner_only_files[@]}"; do
         if [[ -f "$path" ]]; then
             chmod 0644 "$path"
+        fi
+    done
+
+    # /tmp is mounted as tmpfs during early init, but pivot_root leaves that
+    # mount under /oldroot. The workload uses this directory on its writable
+    # overlay, so it needs the usual sticky, shared permissions in the base.
+    # The non-root apk build can leave these directories at 0755.
+    for path in "$rootfs_dir/tmp" "$rootfs_dir/var/tmp"; do
+        if [[ -d "$path" && ! -L "$path" ]]; then
+            chmod 1777 "$path"
         fi
     done
 
@@ -442,6 +443,10 @@ else
     echo "Install smolvm first: https://github.com/smolvm/smolvm"
     exit 1
 fi
+
+# Use the same pinned runtime and cleanup patch for native and cross builds.
+# A failed build must stop packaging rather than fall back to a different crun.
+python3 "$SCRIPT_DIR/build-crun.py" "$ALPINE_ARCH" "$OUTPUT_DIR"
 
 repair_executable_modes "$OUTPUT_DIR"
 

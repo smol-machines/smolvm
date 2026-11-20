@@ -30,8 +30,8 @@ pub struct Store {
 /// The host's store, `<cache_dir>/smolvm/agent-rootfs-store`.
 pub fn host() -> Store {
     Store::at(
-        dirs::cache_dir()
-            .or_else(dirs::data_local_dir)
+        smolvm_paths::cache_dir()
+            .or_else(smolvm_paths::data_local_dir)
             .unwrap_or_else(|| PathBuf::from("/tmp"))
             .join("smolvm")
             .join("agent-rootfs-store"),
@@ -57,14 +57,27 @@ pub fn resolve(digest: &str) -> Result<PathBuf> {
 /// the store's copy. `None` when the host has neither.
 pub fn golden_rootfs(booted: Option<&Path>, digest: &str, store: &Store) -> Option<PathBuf> {
     booted
-        .filter(|path| {
-            smolvm_pack::assets::cached_agent_rootfs_digest(path)
-                .ok()
-                .as_deref()
-                == Some(digest)
-        })
+        .filter(|path| tree_has_digest(path, digest))
         .map(Path::to_path_buf)
         .or_else(|| store.installed(digest))
+}
+
+/// Whether the rootfs at `path` has `digest`. On macOS a machine started by
+/// smolvm 1.34.3 or older recorded the legacy digest, which counts symlink
+/// modes, so that one matches too; on Linux the two are always equal.
+fn tree_has_digest(path: &Path, digest: &str) -> bool {
+    if smolvm_pack::assets::cached_agent_rootfs_digest(path)
+        .ok()
+        .as_deref()
+        == Some(digest)
+    {
+        return true;
+    }
+    cfg!(target_os = "macos")
+        && smolvm_pack::assets::legacy_agent_rootfs_digest(path)
+            .ok()
+            .as_deref()
+            == Some(digest)
 }
 
 /// The hex part of a `sha256:<hex>` digest, refusing anything that could name
@@ -108,11 +121,7 @@ impl Store {
     /// The rootfs a machine pinned to `digest` boots: `default` when its digest
     /// matches, else this store's copy.
     pub fn resolve_with(&self, digest: &str, default: &Path) -> Result<PathBuf> {
-        if smolvm_pack::assets::cached_agent_rootfs_digest(default)
-            .ok()
-            .as_deref()
-            == Some(digest)
-        {
+        if tree_has_digest(default, digest) {
             return Ok(default.to_path_buf());
         }
         self.installed(digest).ok_or_else(|| {
@@ -201,13 +210,18 @@ impl Store {
         result
     }
 
-    /// A free staging path under the store for a tree being installed.
+    /// A free staging path under the store for a tree being installed. Each
+    /// call gets its own: installs run concurrently in one server, and one
+    /// clearing a path another is still unpacking into would let the second
+    /// tree's files land in the first after it was hashed.
     fn staging_dir(&self, label: &str, what: &str) -> Result<PathBuf> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::fs::create_dir_all(&self.root)?;
         let label = hex_of(label).map(|hex| &hex[..16]).unwrap_or(label);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let staging = self
             .root
-            .join(format!(".{label}-{}.{what}", std::process::id()));
+            .join(format!(".{label}-{}-{sequence}.{what}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         Ok(staging)
     }
@@ -288,6 +302,19 @@ mod tests {
         std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
         std::fs::write(dir.join("usr/local/bin/smolvm-agent"), agent).unwrap();
         std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", dir.join("sbin/init")).unwrap();
+    }
+
+    #[test]
+    fn concurrent_installs_never_share_a_staging_tree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let first = store.staging_dir("unknown", "unpack").unwrap();
+        std::fs::create_dir(&first).unwrap();
+        std::fs::write(first.join("busybox"), b"first").unwrap();
+        let second = store.staging_dir("unknown", "unpack").unwrap();
+        assert_ne!(first, second);
+        // The second install leaves the first one's tree alone.
+        assert_eq!(std::fs::read(first.join("busybox")).unwrap(), b"first");
     }
 
     #[test]

@@ -50,6 +50,12 @@ pub struct S3Volume {
     pub session_token: Option<String>,
 }
 
+/// Guest support for owned container TCP listener discovery and raw app connections.
+pub const CONTAINER_APP_PORTS_CAPABILITY: &str = "container-app-ports-v1";
+
+pub mod auto_ports;
+pub mod binary_stream;
+pub mod container_session;
 pub mod credentials;
 pub mod disk_volume;
 pub mod egress_rule;
@@ -57,6 +63,7 @@ pub mod forkpoint;
 pub mod guest_env;
 pub mod host_pattern;
 pub mod image_ref;
+pub mod interactive_control;
 pub mod intercept;
 pub mod mediated_egress;
 pub mod publish_socket;
@@ -64,6 +71,7 @@ pub mod resolv;
 pub mod retry;
 pub mod secrets;
 pub mod sni;
+pub mod tcp_forward;
 pub mod workload_target;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};
@@ -302,6 +310,10 @@ pub mod ports {
     /// on this port, reads the target guest port as one decimal line, then
     /// relays the connection to `127.0.0.1:<port>` inside the guest.
     pub const PORT_FORWARD: u32 = 6005;
+    /// Automatic port publishing: the guest connects OUT to this port and
+    /// sends the set of TCP ports it listens on whenever that set changes
+    /// (see [`crate::auto_ports`]). Outbound, like the readiness doorbell.
+    pub const AUTO_PORTS: u32 = 6006;
     /// CUDA-over-vsock (experimental): guest CUDA client forwards Driver-API
     /// calls to a host CUDA server that runs them on the host NVIDIA GPU.
     pub const CUDA: u32 = 7000;
@@ -594,6 +606,37 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Execute a connection-owned command with independently addressable controls.
+    VmExecControlled {
+        /// Command and its caller-generated lifetime identifier.
+        session: interactive_control::Session,
+    },
+    /// Signal or resize an active command over a separate connection.
+    InteractiveControl {
+        /// Lifetime identifier and operation; never a raw PID.
+        request: interactive_control::Request,
+    },
+    /// Control a container execution whose lifetime is independent of this connection.
+    ContainerSession {
+        /// Start, attach, or exchange sequenced container I/O.
+        control: container_session::Control,
+    },
+    /// Watch guest TCP listener changes; after protocol confirmation, receive
+    /// coalesced little-endian u64 generations until this connection closes.
+    WatchListeners,
+    /// Discover TCP listeners owned by one running Docker workload's cgroup.
+    ContainerPorts {
+        /// Persistent workload overlay identity.
+        overlay_id: String,
+    },
+    /// Connect to an owned TCP listener; after a successful `Ok` with
+    /// `protocol: smol-app-tcp-v1`, this connection carries raw TCP bytes.
+    ContainerPortConnect {
+        /// Persistent workload overlay identity.
+        overlay_id: String,
+        /// A currently listening TCP port belonging to that workload.
+        port: u16,
+    },
     /// Offline trailing CPUs after the host verifies runtime shrink support.
     OfflineCpus {
         /// Retained online CPU count, starting at CPU0; must be nonzero.
@@ -1035,16 +1078,29 @@ pub enum AgentRequest {
         target: Option<WorkloadTarget>,
     },
 
-    /// Append a chunk to the currently open streaming upload.
-    /// If `done` is true, the agent fsyncs and atomically renames the
-    /// staging file onto the target path.
+    /// Begin a streamed directory upload using tar data in [`Self::FileWriteChunk`].
+    /// The archive is bounded by [`FILE_TRANSFER_MAX_TOTAL`] and staged until
+    /// the final chunk, then merged into exactly `path`. Aborting before the
+    /// final chunk leaves the destination untouched; interrupted extraction
+    /// can leave a partial merge. Symbolic links are preserved, not followed.
+    DirectoryWriteBegin {
+        /// Absolute destination directory; its parent must already exist.
+        path: String,
+        /// Filesystem to modify; absent means the agent infers the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
+    },
+
+    /// Append a chunk to the currently open file or directory upload.
+    /// If `done` is true, a file upload fsyncs and atomically renames its
+    /// staging file; a directory upload validates and merges its archive.
     FileWriteChunk {
         /// Chunk bytes. Typically [`FILE_WRITE_CHUNK_SIZE`] except
         /// for the last chunk.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
-        /// True on the final chunk; closes and renames the staging
-        /// file. False on intermediate chunks.
+        /// True on the final chunk, committing the file or extracting the
+        /// directory. False on intermediate chunks.
         done: bool,
     },
 
@@ -1169,6 +1225,278 @@ pub enum AgentRequest {
         #[serde(default, skip_serializing_if = "Option::is_none")]
         exec_id: Option<String>,
     },
+
+    /// Start a container the way a Docker engine does: the command runs as the
+    /// container's own init (PID 1) on the image overlay `overlay_id`, and its
+    /// I/O streams on THIS connection: `Started`, then `Stdout`/`Stderr`, then
+    /// `Exited` with the command's exit status. Stdin (when `open_stdin`) and
+    /// PTY resizes arrive as `Stdin`/`Resize` requests. Commands run with
+    /// `Run` on the same overlay join this container while it runs. The host
+    /// closing the connection kills the container.
+    ContainerStart(Box<ContainerStartSpec>),
+
+    /// Send a signal to the init process of the container `ContainerStart`
+    /// started on `overlay_id`.
+    ContainerSignal {
+        /// Overlay the container runs on.
+        overlay_id: String,
+        /// Signal name (`SIGTERM`, `HUP`) or number.
+        signal: String,
+        /// Signal every process of the container, not only its init (how
+        /// `SIGSTOP`/`SIGCONT` pause and resume it).
+        #[serde(default)]
+        all: bool,
+    },
+
+    /// Unpack the tar archive at guest path `archive` into `destination` of
+    /// the container root filesystem on overlay `overlay_id` (built from
+    /// `image`), then remove the archive. Works whether or not the container
+    /// runs.
+    ContainerArchive {
+        /// Image the overlay is built from.
+        image: String,
+        /// Overlay the container's root filesystem lives on.
+        overlay_id: String,
+        /// Guest path of the archive.
+        archive: String,
+        /// Directory in the container to unpack into.
+        destination: String,
+        /// Where the image's layers come from, when not the machine's own
+        /// image (see [`ContainerImageSource`]).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_source: Option<ContainerImageSource>,
+    },
+
+    /// List the processes of the container `ContainerStart` started on
+    /// `overlay_id`. Replies `Ok` with `{"titles": [...], "processes": [[...]]}`.
+    ContainerTop {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
+    /// Sample the running container's cgroup and network namespace.
+    /// Replies `Ok` with a [`ContainerResourceUsage`].
+    ContainerStats {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
+    /// Stream what the container on `overlay_id` changed against its image,
+    /// as one image layer: a tar of the overlay's upper directory with
+    /// overlayfs whiteouts turned into OCI `.wh.` markers, and the files the
+    /// engine generates for every container left out (`docker commit`).
+    /// Replies with `DataChunk`s, the last one `done`.
+    ContainerDiff {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
+    /// Replace the extra addresses on the guest's network interface (IPv4
+    /// and IPv6): every listed `address/prefix` is present afterwards, and any address
+    /// added by an earlier call and not listed is removed. The primary address
+    /// the guest booted with is never touched. Lets a running machine join and
+    /// leave networks.
+    SetInterfaceAddresses {
+        /// `a.b.c.d/len` or `ipv6/len` entries.
+        addresses: Vec<String>,
+    },
+
+    /// Move the guest's primary IPv4 address, default route and resolver to
+    /// another network. A machine branched from a base that booted on one
+    /// network takes its own address this way before anything in it runs.
+    SetPrimaryAddress {
+        /// The new primary address, `a.b.c.d/len`.
+        address: String,
+        /// The default gateway on that network.
+        gateway: String,
+        /// The resolver the guest uses.
+        dns: String,
+        /// Resolver options (`ndots:2`, ...).
+        #[serde(default)]
+        dns_options: Vec<String>,
+    },
+}
+
+/// What [`AgentRequest::ContainerStart`] runs, and how.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
+pub struct ContainerStartSpec {
+    /// Caller's container id, used for logs and guest paths.
+    pub id: String,
+    /// Image reference (must be pulled first).
+    pub image: String,
+    /// Persistent overlay the container's root filesystem lives on.
+    pub overlay_id: String,
+    /// The command, resolved by the caller (entrypoint + cmd).
+    pub command: Vec<String>,
+    /// The complete environment, resolved by the caller.
+    #[serde(default)]
+    pub env: Vec<(String, String)>,
+    /// Working directory; the image's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workdir: Option<String>,
+    /// `user[:group]`, by name or number; the image's when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user: Option<String>,
+    /// Allocate a PTY for the command.
+    #[serde(default)]
+    pub tty: bool,
+    /// Keep the command's stdin open for `Stdin` requests. Without it the
+    /// command reads end of file at once.
+    #[serde(default)]
+    pub open_stdin: bool,
+    /// Container hostname.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub hostname: Option<String>,
+    /// Extra `/etc/hosts` lines as `(address, names)`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub hosts: Vec<(String, String)>,
+    /// Mounts, in the order given (parents before children is the caller's job).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mounts: Vec<ContainerMount>,
+    /// Mount the root filesystem read-only.
+    #[serde(default)]
+    pub read_only_rootfs: bool,
+    /// Size of `/dev/shm` in bytes; the runtime default when unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub shm_size: Option<u64>,
+    /// Where the image's layers come from, when not the machine's own image:
+    /// a container started in a machine booted for another container.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub image_source: Option<ContainerImageSource>,
+}
+
+/// Kernel accounting for one running container, including exited children.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerResourceUsage {
+    /// Cumulative CPU time, including exited descendants, in nanoseconds.
+    pub cpu_usage_ns: u64,
+    /// Cumulative user CPU time in nanoseconds.
+    pub cpu_user_ns: u64,
+    /// Cumulative kernel CPU time in nanoseconds.
+    pub cpu_system_ns: u64,
+    /// CPU bandwidth enforcement periods.
+    pub cpu_periods: u64,
+    /// Periods during which the container was throttled.
+    pub cpu_throttled_periods: u64,
+    /// Cumulative CPU throttling duration in nanoseconds.
+    pub cpu_throttled_ns: u64,
+    /// Current cgroup memory charge, including file cache, in bytes.
+    pub memory_bytes: u64,
+    /// Effective memory ceiling, capped by guest RAM, in bytes.
+    pub memory_limit_bytes: u64,
+    /// Inactive file cache subtracted by Docker when displaying memory.
+    pub inactive_file_bytes: u64,
+    /// Anonymous memory charged to the cgroup, in bytes.
+    pub anonymous_bytes: u64,
+    /// File-backed memory charged to the cgroup, in bytes.
+    pub file_bytes: u64,
+    /// Kernel tasks (threads), as Docker's PIDs column reports them.
+    pub pids: u64,
+    /// Cumulative device I/O, including exited descendants.
+    pub block_io: Vec<ContainerBlockIo>,
+    /// Network-namespace counters; containers sharing a namespace share these.
+    pub networks: std::collections::BTreeMap<String, ContainerNetworkUsage>,
+}
+
+/// Block-device accounting for one container cgroup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerBlockIo {
+    /// Kernel block device major number.
+    pub major: u32,
+    /// Kernel block device minor number.
+    pub minor: u32,
+    /// Bytes read from this block device.
+    pub read_bytes: u64,
+    /// Bytes written to this block device.
+    pub write_bytes: u64,
+}
+
+/// Counters for one interface in the container's network namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerNetworkUsage {
+    /// Received bytes.
+    pub rx_bytes: u64,
+    /// Received packets.
+    pub rx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Dropped received packets.
+    pub rx_dropped: u64,
+    /// Transmitted bytes.
+    pub tx_bytes: u64,
+    /// Transmitted packets.
+    pub tx_packets: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+    /// Dropped transmitted packets.
+    pub tx_dropped: u64,
+}
+
+/// Where a container's image layers come from when the machine it runs in
+/// was booted for another image.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerImageSource {
+    /// The machine's image store, by the image reference (pulled there).
+    Store,
+    /// A local image archive's directory (the one holding `archive.tar`),
+    /// added to the machine's read-only live device as `share`.
+    Attached {
+        /// Share name on the read-only live device.
+        share: String,
+    },
+}
+
+/// One mount of a [`ContainerStartSpec`].
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ContainerMount {
+    /// The host directory shared at boot under virtiofs `tag`, or one file or
+    /// directory below it (`subpath`), bound at `target`.
+    Share {
+        /// Virtiofs tag of the shared directory.
+        tag: String,
+        /// Path below the shared directory to bind instead of all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        /// Container path.
+        target: String,
+        /// Bind read-only.
+        #[serde(default)]
+        read_only: bool,
+        /// When the shared directory is empty, first fill it with what the
+        /// image has at `target`, as a container engine does for a new volume.
+        #[serde(default)]
+        copy_up: bool,
+    },
+    /// A directory the host added to the machine's live virtio-fs device
+    /// (`share`, on the read-only device when `read_only`) while it runs, or
+    /// one file or directory below it (`subpath`), bound at `target`. For a
+    /// container started in a machine booted for another one.
+    Attached {
+        /// Share name on the live device.
+        share: String,
+        /// Path below the share to bind instead of all of it.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subpath: Option<String>,
+        /// Container path.
+        target: String,
+        /// Bind read-only (from the read-only device).
+        #[serde(default)]
+        read_only: bool,
+        /// When the share is empty, first fill it with what the image has at
+        /// `target`.
+        #[serde(default)]
+        copy_up: bool,
+    },
+    /// A memory-backed filesystem at `target`.
+    Tmpfs {
+        /// Container path.
+        target: String,
+        /// Mount options (`size=64m`, `mode=1777`, `noexec`, ...).
+        #[serde(default)]
+        options: Vec<String>,
+    },
 }
 
 impl AgentRequest {
@@ -1185,6 +1513,7 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::ContainerSession { .. } => "ContainerSession".into(),
             AgentRequest::OnlineMemory {
                 start_address,
                 length_bytes,
@@ -1227,12 +1556,19 @@ impl AgentRequest {
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
             AgentRequest::PressureStatus => "PressureStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
+            AgentRequest::WatchListeners => "WatchListeners".into(),
+            AgentRequest::ContainerPorts { .. } => "ContainerPorts".into(),
+            AgentRequest::ContainerPortConnect { port, .. } => {
+                format!("ContainerPortConnect {{ port: {port} }}")
+            }
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
             AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::VmExecControlled { .. } => "VmExecControlled".into(),
+            AgentRequest::InteractiveControl { .. } => "InteractiveControl".into(),
             AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
             AgentRequest::BranchpointArm => "BranchpointArm".into(),
             AgentRequest::BranchpointPark => "BranchpointPark".into(),
@@ -1244,6 +1580,7 @@ impl AgentRequest {
             AgentRequest::Resize { .. } => "Resize".into(),
             AgentRequest::FileWrite { .. } => "FileWrite".into(),
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
+            AgentRequest::DirectoryWriteBegin { .. } => "DirectoryWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
             AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
@@ -1266,6 +1603,42 @@ impl AgentRequest {
                 Some(e) => format!("PodDelete {{ id: {id}, exec: {e} }}"),
                 None => format!("PodDelete {{ id: {id} }}"),
             },
+            AgentRequest::ContainerStart(spec) => format!(
+                "ContainerStart {{ id: {}, image: {}, tty: {}, mounts: {} }}",
+                spec.id,
+                spec.image,
+                spec.tty,
+                spec.mounts.len()
+            ),
+            AgentRequest::ContainerSignal {
+                overlay_id,
+                signal,
+                all,
+            } => {
+                format!("ContainerSignal {{ overlay: {overlay_id}, signal: {signal}, all: {all} }}")
+            }
+            AgentRequest::ContainerArchive {
+                overlay_id,
+                destination,
+                ..
+            } => {
+                format!("ContainerArchive {{ overlay: {overlay_id}, destination: {destination} }}")
+            }
+            AgentRequest::ContainerTop { overlay_id } => {
+                format!("ContainerTop {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerStats { overlay_id } => {
+                format!("ContainerStats {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerDiff { overlay_id } => {
+                format!("ContainerDiff {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::SetInterfaceAddresses { addresses } => {
+                format!("SetInterfaceAddresses {{ addresses: {addresses:?} }}")
+            }
+            AgentRequest::SetPrimaryAddress {
+                address, gateway, ..
+            } => format!("SetPrimaryAddress {{ address: {address}, gateway: {gateway} }}"),
         }
     }
 }
@@ -1291,6 +1664,11 @@ pub struct DirectoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AgentResponse {
+    /// Acknowledgement or sequenced I/O from a durable container execution.
+    ContainerSession {
+        /// Session event, scoped to the execution confirmed by attachment.
+        event: container_session::Event,
+    },
     /// Operation completed successfully.
     Ok {
         /// Response data (varies by request type).
@@ -1546,7 +1924,7 @@ impl AgentResponse {
 }
 
 /// Image information returned by Query/ListImages.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct ImageInfo {
     /// Image reference.
     pub reference: String,
@@ -1831,6 +2209,9 @@ pub struct Envelope<T> {
     /// Trace ID for correlating host API requests to agent operations.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub trace_id: Option<String>,
+    /// Binary streaming version understood by the sender. Old peers ignore it.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub binary_stream: Option<u8>,
     /// The wrapped message.
     #[serde(flatten)]
     pub body: T,
@@ -1841,13 +2222,18 @@ impl<T> Envelope<T> {
     pub fn new(body: T) -> Self {
         Self {
             trace_id: None,
+            binary_stream: None,
             body,
         }
     }
 
     /// Create an envelope with an optional trace ID.
     pub fn with_trace_id(body: T, trace_id: Option<String>) -> Self {
-        Self { trace_id, body }
+        Self {
+            trace_id,
+            binary_stream: None,
+            body,
+        }
     }
 }
 

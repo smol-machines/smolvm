@@ -8,6 +8,9 @@ on:
     types: [opened, edited, reopened, synchronize]
   push:
     branches: [main]
+  # A run by hand on a branch checks its commits against main. It does not count
+  # for a PR's required check: the Nix flake bump approves its PR's held run.
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -23,4 +26,11 @@ jobs:
           fetch-depth: 0
           persist-credentials: false
       - name: Check commits and PR text
-        run: python3 .github/scripts/no-ai-attribution.py ${{ github.event_name == 'pull_request' && 'pr' || 'push' }}
+        env:
+          EVENT: ${{ github.event_name }}
+        run: |
+          case "$EVENT" in
+            pull_request) python3 .github/scripts/no-ai-attribution.py pr ;;
+            push) python3 .github/scripts/no-ai-attribution.py push ;;
+            *) python3 .github/scripts/no-ai-attribution.py range origin/main HEAD ;;
+          esac

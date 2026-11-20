@@ -301,7 +301,7 @@ pub fn docker_config_dir() -> Option<PathBuf> {
     }
 
     // Fall back to ~/.docker/
-    if let Some(home) = dirs::home_dir() {
+    if let Some(home) = smolvm_paths::home_dir() {
         let docker_dir = home.join(".docker");
         if docker_dir.exists() {
             return Some(docker_dir);
@@ -330,6 +330,8 @@ pub fn docker_config_mount() -> Option<HostMount> {
         target: PathBuf::from("/root/.docker"),
         read_only: true,
         staged: false,
+        recorded_ownership: false,
+        owner: None,
     })
 }
 
@@ -391,6 +393,43 @@ pub fn vm_data_dir(name: &str) -> PathBuf {
     vm_cache_root().join(vm_dir_hash(name))
 }
 
+/// Whether the VM named `name` is running as a branch source: what its running
+/// configuration (`agent.config.json` in its data directory, written at launch
+/// and removed at stop) says. `None` when there is none to read: the machine is
+/// not running, or an engine that predates the record started it.
+pub fn running_forkable(name: &str) -> Option<bool> {
+    forkable_in_running_config(&vm_data_dir(name).join("agent.config.json"))
+}
+
+fn forkable_in_running_config(path: &Path) -> Option<bool> {
+    let content = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<RunningVmConfig>(&content)
+        .ok()
+        .map(|config| config.forkable)
+}
+
+/// Whether `record`'s machine can be branched as it is now. A running machine is
+/// what it was launched as: `machine start --branchable` on a machine created
+/// without it makes a branch source that the record alone would deny, and the
+/// record alone would promise a source of a machine that was started plain.
+/// A machine that is not running is what its next ordinary start launches,
+/// [`VmRecord::forkable_on_start`].
+pub fn branchable_now(
+    record: &crate::config::VmRecord,
+    state: &crate::config::RecordState,
+) -> bool {
+    let running = (*state == crate::config::RecordState::Running)
+        .then(|| running_forkable(&record.name))
+        .flatten();
+    branchable_from(record, running)
+}
+
+/// [`branchable_now`] with the running configuration's answer already read:
+/// it decides for a running machine, the record for every other.
+fn branchable_from(record: &crate::config::VmRecord, running_forkable: Option<bool>) -> bool {
+    running_forkable.unwrap_or_else(|| record.forkable_on_start())
+}
+
 /// Reclaim CUDA transport state after a named VM process is confirmed dead.
 ///
 /// Some teardown paths terminate a VMM directly because its guest agent is
@@ -404,14 +443,22 @@ pub fn cleanup_dead_vm_runtime(name: &str) -> Result<()> {
 }
 
 pub(crate) fn cleanup_dead_vm_runtime_in_db(name: &str, db: &crate::db::SmolvmDb) -> Result<()> {
+    cleanup_dead_vm_runtime_at(name, db, &vm_data_dir(name))
+}
+
+pub(crate) fn cleanup_dead_vm_runtime_at(
+    name: &str,
+    db: &crate::db::SmolvmDb,
+    runtime: &Path,
+) -> Result<()> {
     #[cfg(target_os = "linux")]
-    launcher::cleanup_cuda_ring_dir(&vm_data_dir(name))
+    launcher::cleanup_cuda_ring_dir(runtime)
         .map_err(|error| Error::agent("clean CUDA ring directory", error.to_string()))?;
     #[cfg(not(target_os = "linux"))]
     let _ = name;
 
     if db.dependent_clones(name)?.is_empty() {
-        crate::agent::fork::discard_retained_snapshots(db, name)?;
+        crate::agent::fork::discard_retained_snapshots_at(db, name, &runtime.join("s"))?;
     }
     Ok(())
 }
@@ -616,10 +663,13 @@ fn live_egress_refusal(reason: String, with_rules: bool) -> String {
 /// Publish exactly `ports` on a running machine through the ports control
 /// socket its network runtime serves. Returns once the listeners match.
 pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()> {
-    let mappings: Vec<smolvm_network::PortMapping> = ports
-        .iter()
-        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
-        .collect();
+    // A replace names the whole set, so it keeps the ports this run picked
+    // itself: they are not in `ports`, which holds the configured ones.
+    let allocated = crate::db::SmolvmDb::open()?
+        .get_vm(name)?
+        .map(|record| record.live_allocated_ports())
+        .unwrap_or_default();
+    let mappings = published_set(ports, &allocated);
     let rendered = smolvm_network::render_port_mappings(&mappings);
     send_live_change(name, smolvm_network::PORTS_SOCKET, &rendered).map_err(|reason| {
         Error::config(
@@ -627,6 +677,25 @@ pub fn apply_live_published_ports(name: &str, ports: &[(u16, u16)]) -> Result<()
             format!("could not change machine '{name}''s published ports while it runs: {reason}"),
         )
     })
+}
+
+/// The whole TCP set a running machine publishes: its configured `ports`, then
+/// the `allocated` ones its run picked that the configured set does not already
+/// name by host port.
+fn published_set(
+    ports: &[(u16, u16)],
+    allocated: &[(u16, u16)],
+) -> Vec<smolvm_network::PortMapping> {
+    let mut mappings: Vec<smolvm_network::PortMapping> = ports
+        .iter()
+        .map(|&(host, guest)| smolvm_network::PortMapping::new(host, guest))
+        .collect();
+    for &(host, guest) in allocated {
+        if !mappings.iter().any(|mapping| mapping.host == host) {
+            mappings.push(smolvm_network::PortMapping::new(host, guest));
+        }
+    }
+    mappings
 }
 
 /// Hand running machine `name` new values for its credential bindings, by
@@ -651,6 +720,45 @@ pub fn apply_live_credential_values(
 }
 
 fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Result<(), String> {
+    let reply = send_live_request(name, socket, rendered)?;
+    match reply.trim() {
+        "ok" => Ok(()),
+        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
+    }
+}
+
+pub(crate) fn allocate_live_port(name: &str, guest: u16) -> Result<u16> {
+    let reply = send_live_request(
+        name,
+        smolvm_network::PORTS_SOCKET,
+        &format!("allocate {guest}\n"),
+    )
+    .map_err(|reason| Error::config("atomic port publication", reason))?;
+    let mapping = reply
+        .trim()
+        .strip_prefix("ok ")
+        .and_then(|ports| ports.split_once(':'))
+        .and_then(|(host, returned_guest)| {
+            Some((
+                host.parse::<u16>().ok()?,
+                returned_guest.parse::<u16>().ok()?,
+            ))
+        })
+        .filter(|(host, returned_guest)| *host != 0 && *returned_guest == guest)
+        .ok_or_else(|| {
+            Error::config(
+                "atomic port publication",
+                "machine does not support atomic port allocation",
+            )
+        })?;
+    Ok(mapping.0)
+}
+
+fn send_live_request(
+    name: &str,
+    socket: &str,
+    rendered: &str,
+) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
     let path = vm_data_dir(name).join(socket);
     let mut stream =
@@ -668,10 +776,7 @@ fn send_live_change(name: &str, socket: &str, rendered: &str) -> std::result::Re
     stream
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
-    match reply.trim() {
-        "ok" => Ok(()),
-        other => Err(other.strip_prefix("error: ").unwrap_or(other).to_string()),
-    }
+    Ok(reply)
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
@@ -877,13 +982,85 @@ pub fn spawn_egress_flush(
     path: std::path::PathBuf,
     counter: std::sync::Arc<std::sync::atomic::AtomicU64>,
 ) {
-    std::thread::spawn(move || loop {
-        let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
-        if let Err(e) = write_egress_telemetry_at(&path, bytes) {
-            tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+    std::thread::spawn(move || {
+        let mut file = SampleFile::new(path.clone());
+        loop {
+            let bytes = counter.load(std::sync::atomic::Ordering::Relaxed);
+            if let Err(e) = write_egress_telemetry(&mut file, bytes) {
+                tracing::debug!(path = ?path, error = %e, "egress telemetry flush failed");
+            }
+            std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
         }
-        std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
     });
+}
+
+/// Bytes every per-VM sample file is padded to with trailing spaces, which
+/// JSON and integer parsing both ignore. A shorter sample then overwrites a
+/// longer one whole, with no truncate between.
+const SAMPLE_FILE_PAD: usize = 1024;
+
+/// A small per-VM sample file a thread in the VM subprocess rewrites every
+/// few seconds, kept open and overwritten in place.
+///
+/// These files used to be written to a temp file renamed over the old one.
+/// On XFS each such rename frees the replaced inode through the allocation
+/// group's AGI buffer and holds the directory's lock meanwhile; on 2026-11-12
+/// a VMM throttled for memory inside an XFS create held that AGI lock, every
+/// VMM's sampler queued on it holding its VM directory's lock, and serve
+/// blocked opening files in those directories. An in-place overwrite of
+/// already allocated bytes creates, frees and renames nothing. One `write` of
+/// the whole padded buffer is atomic against a reader on XFS (buffered reads
+/// and writes take the inode's I/O lock); elsewhere a torn read fails to parse
+/// and reads as no sample, as a missing file does.
+struct SampleFile {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    buf: Vec<u8>,
+}
+
+impl SampleFile {
+    fn new(path: PathBuf) -> Self {
+        Self {
+            path,
+            file: None,
+            buf: Vec::with_capacity(SAMPLE_FILE_PAD),
+        }
+    }
+
+    /// Replace the file's content with `content`.
+    fn write(&mut self, content: &[u8]) -> std::io::Result<()> {
+        self.buf.clear();
+        self.buf.extend_from_slice(content);
+        let len = self.buf.len().max(SAMPLE_FILE_PAD);
+        self.buf.resize(len, b' ');
+        if self.file.is_none() {
+            self.file = Some(
+                std::fs::OpenOptions::new()
+                    .write(true)
+                    .create(true)
+                    .truncate(false)
+                    .open(&self.path)?,
+            );
+        }
+        let file = self.file.as_mut().expect("opened above");
+        let written = overwrite_whole(file, &self.buf);
+        if written.is_err() {
+            // Reopen next time (the file may have been removed).
+            self.file = None;
+        }
+        written
+    }
+}
+
+fn overwrite_whole(file: &mut std::fs::File, buf: &[u8]) -> std::io::Result<()> {
+    use std::io::{Seek, SeekFrom, Write};
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(buf)?;
+    // Only a file left longer by an older writer needs trimming.
+    if file.metadata()?.len() > buf.len() as u64 {
+        file.set_len(buf.len() as u64)?;
+    }
+    Ok(())
 }
 
 /// Open TCP flows of a running machine, as last flushed by its network stack.
@@ -926,9 +1103,8 @@ impl EgressFlowSummary {
 const EGRESS_FLOWS_STALE_SECS: u64 = 120;
 
 /// Spawn a detached thread (in the VM subprocess) that rewrites the per-VM
-/// open-flow summary file from `slot` every [`EGRESS_FLUSH_SECS`]. Each write
-/// goes to a temp file renamed over the old one, so serve never reads a torn
-/// summary. Best-effort, like [`spawn_egress_flush`].
+/// open-flow summary file from `slot` every [`EGRESS_FLUSH_SECS`], in place
+/// (see [`SampleFile`]). Best-effort, like [`spawn_egress_flush`].
 #[cfg_attr(not(unix), allow(dead_code))]
 pub fn spawn_egress_flows_flush(
     path: std::path::PathBuf,
@@ -936,29 +1112,30 @@ pub fn spawn_egress_flows_flush(
 ) {
     let spawned = std::thread::Builder::new()
         .name("smolvm-egress-flows".into())
-        .spawn(move || loop {
+        .spawn(move || {
+            let mut file = SampleFile::new(path.clone());
+            loop {
             let latest = slot
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             if let Some((at, summary)) = latest {
                 if let Err(e) =
-                    write_egress_flows(&path, &EgressFlowSummary::from_network(at, &summary))
+                    write_egress_flows(&mut file, &EgressFlowSummary::from_network(at, &summary))
                 {
                     tracing::debug!(path = ?path, error = %e, "egress flow summary flush failed");
                 }
             }
             std::thread::sleep(std::time::Duration::from_secs(EGRESS_FLUSH_SECS));
+            }
         });
     if let Err(e) = spawned {
         tracing::debug!(error = %e, "egress flow summary flusher did not start");
     }
 }
 
-fn write_egress_flows(path: &std::path::Path, summary: &EgressFlowSummary) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(summary)?)?;
-    std::fs::rename(&tmp, path)
+fn write_egress_flows(file: &mut SampleFile, summary: &EgressFlowSummary) -> std::io::Result<()> {
+    file.write(&serde_json::to_vec(summary)?)
 }
 
 /// Read a running machine's open-flow summary written by
@@ -1072,7 +1249,7 @@ impl GuestPressure {
 
 /// Spawn a detached thread (in the VM subprocess) that asks the guest agent
 /// for its pressure stalls every [`PRESSURE_SAMPLE_SECS`] and rewrites `path`
-/// with the answer (temp file + rename, so serve never reads a torn sample).
+/// with the answer, in place (see [`SampleFile`]).
 ///
 /// Best-effort, like [`spawn_egress_flows_flush`]: a guest that is not up yet
 /// or is paused costs one short timeout and the sample is retried next tick.
@@ -1084,6 +1261,7 @@ pub fn spawn_pressure_sampler(vsock_socket: PathBuf, path: PathBuf) {
         .name("smolvm-pressure".into())
         .spawn(move || {
             let mut client: Option<super::AgentClient> = None;
+            let mut file = SampleFile::new(path.clone());
             loop {
                 std::thread::sleep(Duration::from_secs(PRESSURE_SAMPLE_SECS));
                 let connected = match client.as_mut() {
@@ -1103,7 +1281,7 @@ pub fn spawn_pressure_sampler(vsock_socket: PathBuf, path: PathBuf) {
                     Ok(status) => {
                         let sample =
                             GuestPressure::from_status(std::time::SystemTime::now(), status);
-                        if let Err(e) = write_pressure(&path, &sample) {
+                        if let Err(e) = write_pressure(&mut file, &sample) {
                             tracing::debug!(path = ?path, error = %e, "pressure sample write failed");
                         }
                     }
@@ -1138,10 +1316,8 @@ fn sample_pressure(
     }
 }
 
-fn write_pressure(path: &Path, sample: &GuestPressure) -> std::io::Result<()> {
-    let tmp = path.with_extension("tmp");
-    std::fs::write(&tmp, serde_json::to_vec(sample)?)?;
-    std::fs::rename(&tmp, path)
+fn write_pressure(file: &mut SampleFile, sample: &GuestPressure) -> std::io::Result<()> {
+    file.write(&serde_json::to_vec(sample)?)
 }
 
 /// Read a running machine's guest pressure sample written by
@@ -1205,7 +1381,8 @@ mod pressure_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(PRESSURE_FILE);
         let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
-        write_pressure(&path, &sample).unwrap();
+        write_pressure(&mut SampleFile::new(path.clone()), &sample).unwrap();
+        // Rewritten in place: no staging file, no rename.
         assert!(!path.with_extension("tmp").exists());
         let text = std::fs::read_to_string(&path).unwrap();
         assert_eq!(
@@ -1217,21 +1394,58 @@ mod pressure_tests {
             None
         );
     }
+
+    #[test]
+    fn a_sample_file_is_overwritten_in_place_and_a_shorter_value_reads_whole() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress");
+        let mut file = SampleFile::new(path.clone());
+        file.write(b"123456789").unwrap();
+        #[cfg(unix)]
+        let inode = {
+            use std::os::unix::fs::MetadataExt;
+            std::fs::metadata(&path).unwrap().ino()
+        };
+        file.write(b"42").unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(text.len(), SAMPLE_FILE_PAD);
+        assert_eq!(text.trim().parse::<u64>().unwrap(), 42);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(
+                std::fs::metadata(&path).unwrap().ino(),
+                inode,
+                "same inode, no rename"
+            );
+        }
+        // JSON samples parse with the padding.
+        let sample = GuestPressure::from_status(std::time::SystemTime::now(), status());
+        write_pressure(&mut file, &sample).unwrap();
+        let text = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(
+            parse_guest_pressure(&text, std::time::SystemTime::now()),
+            Some(sample)
+        );
+        // A file left longer by an older writer is trimmed to the padded size.
+        std::fs::write(&path, vec![b'9'; SAMPLE_FILE_PAD * 2]).unwrap();
+        let mut fresh = SampleFile::new(path.clone());
+        fresh.write(b"7").unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap().trim(), "7");
+    }
 }
 
-/// Staging path the flusher writes before renaming over the telemetry file.
+/// Staging path older flushers wrote before renaming over the telemetry file;
+/// still removed with it.
 fn egress_telemetry_staging(path: &Path) -> PathBuf {
     path.with_extension("tmp")
 }
 
-/// Replace the telemetry file with `bytes` atomically (write a staging file,
-/// then rename it over the target), so a concurrent reader sees either the
-/// previous value or the new one, never a truncated or partial file.
+/// Replace the telemetry file's value with `bytes`, in place (see
+/// [`SampleFile`]).
 #[cfg_attr(not(unix), allow(dead_code))]
-fn write_egress_telemetry_at(path: &Path, bytes: u64) -> std::io::Result<()> {
-    let staging = egress_telemetry_staging(path);
-    std::fs::write(&staging, bytes.to_string())?;
-    std::fs::rename(&staging, path)
+fn write_egress_telemetry(file: &mut SampleFile, bytes: u64) -> std::io::Result<()> {
+    file.write(bytes.to_string().as_bytes())
 }
 
 /// Drop the previous VMM process's egress total before a new one launches.
@@ -1257,8 +1471,8 @@ fn read_egress_telemetry_at(path: &Path) -> Option<u64> {
 
 /// Cache root: `<cache_dir>/smolvm/vms/`.
 pub fn vm_cache_root() -> PathBuf {
-    dirs::cache_dir()
-        .or_else(dirs::data_local_dir)
+    smolvm_paths::cache_dir()
+        .or_else(smolvm_paths::data_local_dir)
         .unwrap_or_else(|| PathBuf::from("/tmp"))
         .join("smolvm")
         .join("vms")
@@ -1471,6 +1685,8 @@ pub fn ensure_vm_dir_at(dir: &std::path::Path, name: &str) -> std::io::Result<Pa
 pub struct AgentManager {
     /// VM name (None only for low-level `new()` callers; CLI always sets a name).
     name: Option<String>,
+    /// Identity reviewed before preparing disks, retained across launch attempts.
+    launch_review: std::sync::Mutex<crate::db::launch_admission::LaunchReview>,
     /// Path to the agent rootfs.
     rootfs_path: PathBuf,
     /// A rootfs chosen at launch over `rootfs_path`: a branch boots its
@@ -1501,6 +1717,49 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+/// Own a registered execution through external control side effects. Helpers
+/// without a database record retain ordinary transfer admission.
+pub(crate) struct ControlOperation {
+    manager: Arc<Mutex<AgentInner>>,
+    _ownership: Option<crate::db::VmRecoveryGuard>,
+    _admission: crate::db::transfer_admission::MutationGuard,
+}
+
+impl ControlOperation {
+    pub(crate) fn validate_manager(&self, manager: &AgentManager) -> Result<()> {
+        if !Arc::ptr_eq(&self.manager, &manager.inner) {
+            return Err(Error::agent_conflict(
+                "control machine",
+                "operation belongs to another manager",
+            ));
+        }
+        Ok(())
+    }
+
+    fn finish_stop(self) -> Result<crate::config::VmRecord> {
+        self._ownership
+            .ok_or_else(|| {
+                Error::agent_conflict(
+                    "stop machine",
+                    "stop publication requires a reviewed machine",
+                )
+            })?
+            .finish_stop(true)
+    }
+
+    pub(crate) fn validate_staged_record(&self, record: &crate::config::VmRecord) -> Result<()> {
+        self._ownership
+            .as_ref()
+            .ok_or_else(|| {
+                Error::agent_conflict(
+                    "sync staged mounts",
+                    "staged synchronization requires a reviewed machine",
+                )
+            })?
+            .validate_staged_record(record)
+    }
+}
+
 /// Apply the persistent fail-closed policy before spawning a named VM. Every
 /// launch path funnels through `start_via_subprocess`, including API restarts.
 fn reject_missing_external_interceptor(
@@ -1518,6 +1777,7 @@ fn reject_missing_external_interceptor(
 
 fn enforce_external_interceptor_requirement(
     db: &crate::db::SmolvmDb,
+    review: &crate::db::launch_admission::LaunchReview,
     name: &str,
     endpoint: Option<&smolvm_protocol::InterceptEndpoint>,
 ) -> Result<()> {
@@ -1526,7 +1786,9 @@ fn enforce_external_interceptor_requirement(
         if endpoint.is_some() && !record.external_interceptor_required {
             // Persist before spawning the VMM. If the caller or boot fails,
             // every later start still requires interception.
-            db.update_vm(name, |record| record.external_interceptor_required = true)?;
+            db.update_reviewed_vm(review, name, |record| {
+                record.external_interceptor_required = true
+            })?;
         }
     }
     Ok(())
@@ -1583,7 +1845,7 @@ impl AgentManager {
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
     ) -> Result<Self> {
-        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk)
+        Self::new_internal(None, rootfs_path.into(), storage_disk, overlay_disk, None)
     }
 
     /// Create a new agent manager for a named VM.
@@ -1600,6 +1862,7 @@ impl AgentManager {
             rootfs_path.into(),
             storage_disk,
             overlay_disk,
+            None,
         )
     }
 
@@ -1609,7 +1872,15 @@ impl AgentManager {
         rootfs_path: PathBuf,
         storage_disk: StorageDisk,
         overlay_disk: OverlayDisk,
+        review: Option<crate::db::launch_admission::LaunchReview>,
     ) -> Result<Self> {
+        let review = match review {
+            Some(review) => review,
+            None => crate::db::launch_admission::LaunchReview::capture(
+                &crate::db::SmolvmDb::open()?,
+                name.as_deref(),
+            )?,
+        };
         if let Some(ref vm_name) = name {
             validate_vm_name(vm_name, "machine name")
                 .map_err(|e| Error::config("validate machine name", e))?;
@@ -1628,12 +1899,18 @@ impl AgentManager {
         let smolvm_runtime = if let Some(ref vm_name) = name {
             vm_data_dir(vm_name)
         } else {
-            dirs::runtime_dir()
-                .or_else(dirs::cache_dir)
+            smolvm_paths::runtime_dir()
+                .or_else(smolvm_paths::cache_dir)
                 .unwrap_or_else(|| PathBuf::from("/tmp"))
                 .join("smolvm")
         };
-        std::fs::create_dir_all(&smolvm_runtime)?;
+        // A named machine's directory is made by `ensure_vm_dir` when it is
+        // launched. Observing one (status, exec, stop) must create nothing,
+        // or a name that was never created leaves an empty `vms/<hash>/`
+        // behind. Only the shared runtime dir of ephemeral runs is made here.
+        if name.is_none() {
+            std::fs::create_dir_all(&smolvm_runtime)?;
+        }
 
         let vsock_socket = smolvm_runtime.join("agent.sock");
         let pid_file = smolvm_runtime.join("agent.pid");
@@ -1645,6 +1922,7 @@ impl AgentManager {
 
         Ok(Self {
             name,
+            launch_review: std::sync::Mutex::new(review),
             rootfs_path,
             rootfs_override: std::sync::Mutex::new(None),
             storage_disk,
@@ -1712,8 +1990,107 @@ impl AgentManager {
         )
     }
 
+    /// Prepare the exact machine whose persisted settings the caller read.
+    /// Deserialized exports and new records are not startup authority: load the
+    /// published record from the database before using this entry point.
+    pub fn for_vm_record(record: &crate::config::VmRecord) -> Result<Self> {
+        Self::open_with_creation(
+            &record.name,
+            DiskAccess::Launch {
+                storage_gib: record.storage_gb,
+                overlay_gib: record.overlay_gb,
+            },
+            None,
+            Some(crate::db::launch_admission::LaunchReview::from_record(
+                record,
+            )?),
+        )
+    }
+
+    /// Observe or reconnect to the exact persisted machine the caller read,
+    /// without preparing or growing its disks.
+    pub fn for_existing_vm_record(record: &crate::config::VmRecord) -> Result<Self> {
+        Self::open_with_creation(
+            &record.name,
+            DiskAccess::Observe,
+            None,
+            Some(crate::db::launch_admission::LaunchReview::from_record(
+                record,
+            )?),
+        )
+    }
+
+    /// Prepare a machine owned by an unpublished creation. The capability
+    /// stays with its creator and workers until publication or failure cleanup.
+    pub fn for_vm_creation(
+        creation: &crate::db::VmCreationLease,
+        storage_gb: Option<u64>,
+        overlay_gb: Option<u64>,
+    ) -> Result<Self> {
+        creation.prepare_directory()?;
+        Self::open_with_creation(
+            creation.name(),
+            DiskAccess::Launch {
+                storage_gib: storage_gb,
+                overlay_gib: overlay_gb,
+            },
+            Some(creation),
+            None,
+        )
+    }
+
     fn open(name: impl Into<String>, access: DiskAccess) -> Result<Self> {
+        Self::open_with_creation(name, access, None, None)
+    }
+
+    fn open_with_creation(
+        name: impl Into<String>,
+        access: DiskAccess,
+        creation: Option<&crate::db::VmCreationLease>,
+        review: Option<crate::db::launch_admission::LaunchReview>,
+    ) -> Result<Self> {
         let name = name.into();
+        let db = crate::db::SmolvmDb::open()?;
+        let review = match review {
+            Some(review) => review,
+            None => crate::db::launch_admission::LaunchReview::capture(&db, Some(&name))?,
+        };
+        review.check_name(Some(&name))?;
+        review.validate(&db)?;
+        // Launch access may create or grow disks before start_via_subprocess.
+        // Observation remains available while a transfer owns the machine.
+        let _admission = match access {
+            DiskAccess::Launch { .. } if creation.is_some() => None,
+            DiskAccess::Launch { .. } => {
+                Some(crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(&name), &[])?)
+            }
+            DiskAccess::Observe => None,
+        };
+        let storage_dir = vm_data_dir(&name);
+        let (storage_path, storage_format) =
+            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
+        let (overlay_path, overlay_format) =
+            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
+        let _creation_preparation = creation
+            .map(|owner| {
+                owner.admit_preparation(&[
+                    storage_path.clone(),
+                    overlay_path.clone(),
+                    storage_dir.join("agent.sock"),
+                ])
+            })
+            .transpose()?;
+        let _preparation = match access {
+            DiskAccess::Launch { .. } if creation.is_none() => {
+                Some(db.reserve_reviewed_vm_preparation(
+                    &review,
+                    Some(&name),
+                    &storage_path,
+                    &[overlay_path.clone(), storage_dir.join("agent.sock")],
+                )?)
+            }
+            _ => None,
+        };
         let rootfs_path = match access {
             DiskAccess::Launch { .. } => Self::launch_rootfs_path(&name)?,
             DiskAccess::Observe => Self::default_rootfs_path()?,
@@ -1722,7 +2099,7 @@ impl AgentManager {
         // binding on first call and detects collisions on subsequent calls
         // (refusing to open a hash dir that belongs to a different name); an
         // observation only verifies an existing binding.
-        let storage_dir = match access {
+        match access {
             DiskAccess::Observe => observe_vm_dir(&name)?,
             DiskAccess::Launch { .. } => ensure_vm_dir(&name)?,
         };
@@ -1730,15 +2107,16 @@ impl AgentManager {
         // A fork clone has a `.qcow2` copy-on-write overlay in place of the
         // `.raw` disk; detect it by file presence (the on-disk file is the
         // source of truth) and open it as-is rather than creating/formatting.
-        let (storage_path, storage_format) =
-            resolve_disk_image(&storage_dir, crate::storage::STORAGE_DISK_FILENAME);
         let storage_disk = open_storage_disk_for_manager(&storage_path, storage_format, access)?;
-
-        let (overlay_path, overlay_format) =
-            resolve_disk_image(&storage_dir, crate::storage::OVERLAY_DISK_FILENAME);
         let overlay_disk = open_overlay_disk_for_manager(&overlay_path, overlay_format, access)?;
 
-        Self::new_named(name, rootfs_path, storage_disk, overlay_disk)
+        Self::new_internal(
+            Some(name),
+            rootfs_path,
+            storage_disk,
+            overlay_disk,
+            Some(review),
+        )
     }
 
     /// Open a named VM to observe or reconnect to it: status, list, stop,
@@ -1833,8 +2211,8 @@ impl AgentManager {
             }
         }
 
-        let data_dir = dirs::data_local_dir()
-            .or_else(dirs::data_dir)
+        let data_dir = smolvm_paths::data_local_dir()
+            .or_else(smolvm_paths::data_dir)
             .ok_or_else(|| Error::storage("resolve path", "could not determine data directory"))?;
 
         Ok(data_dir.join("smolvm").join("agent-rootfs"))
@@ -1905,7 +2283,7 @@ impl AgentManager {
             .unwrap_or(0);
         let key = format!("{:x}-{:x}", meta.len(), mtime);
 
-        let base = dirs::cache_dir()
+        let base = smolvm_paths::cache_dir()
             .ok_or_else(|| Error::storage("resolve cache dir", "no cache directory"))?
             .join("smolvm")
             .join("rootfs");
@@ -2129,6 +2507,7 @@ impl AgentManager {
         pid: Option<i32>,
         expected_start_time: Option<u64>,
     ) -> Option<()> {
+        self.validate_control_identity().ok()?;
         if !self.vsock_socket.exists() {
             return None;
         }
@@ -2162,6 +2541,16 @@ impl AgentManager {
         // before binding its port.
         if let Ok(mut client) = super::AgentClient::connect_for_state_probe(&self.vsock_socket) {
             if client.ping().is_ok() {
+                // The socket may have been replaced while connect/ping waited.
+                self.validate_control_identity().ok()?;
+                self.launch_review
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .validate_execution(
+                        &crate::db::SmolvmDb::open().ok()?,
+                        effective_pid.map(|pid| (pid, pid_start_time)),
+                    )
+                    .ok()?;
                 // Update internal state to reflect running
                 let mut inner = self.inner.lock();
                 inner.state = AgentState::Running;
@@ -2169,7 +2558,7 @@ impl AgentManager {
                 // Without verification, stop() could signal the wrong process.
                 if let Some(p) = effective_pid {
                     if process::is_our_process_strict(p, pid_start_time) {
-                        inner.child = Some(ChildProcess::new(p));
+                        inner.child = Some(ChildProcess::from_identity(p, pid_start_time));
                     } else {
                         tracing::debug!(
                             pid = p,
@@ -2297,7 +2686,8 @@ impl AgentManager {
     /// Get the VM process ID and its captured start time for verified external cleanup.
     ///
     /// Prefers the in-memory child handle (start time captured at spawn).
-    /// Falls back to the PID file if no in-memory handle is present.
+    /// Otherwise retains the PID from the original database review. Only an
+    /// unregistered helper falls back to its runtime PID file.
     /// Returns `None` if neither source has a PID.
     pub fn pid_and_start_time(&self) -> Option<(i32, Option<u64>)> {
         {
@@ -2306,7 +2696,78 @@ impl AgentManager {
                 return Some((child.pid(), child.start_time()));
             }
         }
+        if let Some((pid, start)) = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observed_execution()
+        {
+            return pid.map(|pid| (pid, start));
+        }
         self.read_pid_file_with_start_time()
+    }
+
+    fn validate_control_identity(&self) -> Result<()> {
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|child| (child.pid(), child.start_time()));
+        self.launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .validate_execution(&crate::db::SmolvmDb::open()?, child)
+    }
+
+    pub(crate) fn admit_control_mutation(
+        &self,
+    ) -> Result<crate::db::transfer_admission::MutationGuard> {
+        let db = crate::db::SmolvmDb::open()?;
+        let admission = match self.name() {
+            Some(name) => db.admit_machine_mutation(name)?,
+            None => db.admit_workload_mutation(None, &[self.storage_disk.path().to_path_buf()])?,
+        };
+        self.validate_control_identity()?;
+        Ok(admission)
+    }
+
+    pub(crate) fn reserve_control_operation(&self) -> Result<ControlOperation> {
+        let db = crate::db::SmolvmDb::open()?;
+        let admission = self.admit_control_mutation()?;
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|c| (c.pid(), c.start_time()));
+        let record = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .review_execution_record(&db, child)?;
+        let ownership = match record {
+            Some(record) => {
+                let runtime = self.vsock_socket.parent().ok_or_else(|| {
+                    Error::agent_conflict("control machine", "machine runtime directory is missing")
+                })?;
+                let guard = db.reserve_vm_control(
+                    &record,
+                    runtime,
+                    &[
+                        self.storage_disk.path().to_path_buf(),
+                        self.overlay_disk.path().to_path_buf(),
+                    ],
+                )?;
+                Some(guard)
+            }
+            None => None,
+        };
+        Ok(ControlOperation {
+            manager: self.inner.clone(),
+            _ownership: ownership,
+            _admission: admission,
+        })
     }
 
     /// Check if the VM process is actually alive using start-time-aware
@@ -2344,7 +2805,106 @@ impl AgentManager {
     ///
     /// Uses retry logic to handle transient connection failures.
     pub fn connect(&self) -> crate::error::Result<super::AgentClient> {
-        super::AgentClient::connect_with_retry(&self.vsock_socket)
+        let validate = || {
+            self.launch_review
+                .lock()
+                .unwrap_or_else(|error| error.into_inner())
+                .validate(&crate::db::SmolvmDb::open()?)
+        };
+        // A queued caller may still hold an entry retired by discovery. A
+        // name-derived socket is not authority to connect to its replacement.
+        validate()?;
+        let mut client = super::AgentClient::connect_with_retry(&self.vsock_socket)?;
+        validate()?;
+        // Every pull through this connection follows the machine's provenance:
+        // an image a pack or checkpoint chose never gets this host's logins.
+        if let Some(name) = &self.name {
+            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+                if record.image_from_artifact || record.source_smolmachine.is_some() {
+                    client.withhold_registry_logins();
+                }
+            }
+        }
+        Ok(client)
+    }
+
+    pub(crate) fn matches_record_incarnation(&self, record: &crate::config::VmRecord) -> bool {
+        self.launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .matches_record(record)
+    }
+
+    /// Finish an owned creation using the record returned by its publication
+    /// transaction. An existing machine/controller cannot be rebound this way.
+    pub(crate) fn bind_created_record(
+        &self,
+        db: &crate::db::SmolvmDb,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        if self.name() != Some(record.name.as_str()) || self.inner.lock().child.is_some() {
+            return Err(Error::agent_conflict(
+                "register creation",
+                "manager is not this unpublished creation",
+            ));
+        }
+        let mut review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        if review.identity().is_some() {
+            return Err(Error::agent_conflict(
+                "register creation",
+                "manager already belongs to a published machine",
+            ));
+        }
+        let published = crate::db::launch_admission::LaunchReview::from_record(record)?;
+        published.validate(db)?;
+        *review = published;
+        Ok(())
+    }
+
+    pub(crate) fn same_record_as(&self, other: &Self) -> bool {
+        let identity = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .identity();
+        identity.is_some()
+            && identity
+                == other
+                    .launch_review
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner())
+                    .identity()
+    }
+
+    pub(crate) fn matches_record_execution(&self, record: &crate::config::VmRecord) -> bool {
+        let child = self
+            .inner
+            .lock()
+            .child
+            .as_ref()
+            .map(|child| (Some(child.pid()), child.start_time()));
+        let review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        review.matches_record(record)
+            && child.or(review.observed_execution()) == Some((record.pid, record.pid_start_time))
+    }
+
+    pub(crate) fn require_record_incarnation(
+        &self,
+        record: &crate::config::VmRecord,
+    ) -> Result<()> {
+        if !self.matches_record_incarnation(record) {
+            return Err(Error::agent_conflict(
+                "use machine entry",
+                "machine changed since this request acquired its entry; look it up again",
+            ));
+        }
+        Ok(())
     }
 
     /// Get the currently configured mounts.
@@ -2455,6 +3015,13 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         if let Some(name) = self.name() {
             if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
                 if record.paused_checkpoint.is_some() && !features.resume_paused {
@@ -2830,7 +3397,11 @@ impl AgentManager {
         }
         // The database can retain identity when a PID file is missing.
         if let Some(name) = self.name() {
-            if let Some(record) = crate::db::SmolvmDb::open()?.get_vm(name)? {
+            let db = crate::db::SmolvmDb::open()?;
+            // A stopped machine keeps the PID of a process the kernel is
+            // holding: refused while it is present, forgotten once it is gone.
+            super::state_probe::refuse_start_while_held(&db, name)?;
+            if let Some(record) = db.get_vm(name)? {
                 if let Some(pid) = record.pid {
                     refuse_live_launch_pid(pid)?;
                 }
@@ -2962,6 +3533,21 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
+        // Retain the gate through boot and PID-file registration. Callers that
+        // publish the PID to the database must hold an outer guard until then.
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let review = self
+            .launch_review
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        review.validate(&crate::db::SmolvmDb::open()?)?;
         let t_launch = Instant::now();
 
         // A machine created from a checkpoint carries a private,
@@ -2976,6 +3562,17 @@ impl AgentManager {
                 }
             }
         }
+
+        // Before anything is locked or spawned: a machine that asked for the
+        // host GPU only gets it when the host's device nodes answer. A VM
+        // process that opens a device whose driver is not responding blocks
+        // in the kernel and can never be stopped.
+        super::host_gpu::resolve_for_boot(
+            self.name().unwrap_or("default"),
+            &mut resources,
+            super::requested_display().is_some(),
+            features.snapshot_dir.is_some(),
+        )?;
 
         if let Some(endpoint) = &features.external_interceptor {
             launcher::validate_external_interceptor(
@@ -3032,7 +3629,7 @@ impl AgentManager {
                 if record.agent_rootfs_digest.as_deref() != Some(rootfs_digest.as_str())
                     || record.agent_rootfs_path.as_deref() != Some(rootfs_path.as_path())
                 {
-                    db.update_vm(name, |r| {
+                    db.update_reviewed_vm(&review, name, |r| {
                         r.agent_rootfs_digest = Some(rootfs_digest.clone());
                         r.agent_rootfs_path = Some(rootfs_path.clone());
                     })?;
@@ -3049,7 +3646,7 @@ impl AgentManager {
                     ));
                 }
                 if features.mediated_egress && !record.mediated_egress_required {
-                    db.update_vm(name, |record| {
+                    db.update_reviewed_vm(&review, name, |record| {
                         record.mediated_egress_required = true;
                         record.external_interceptor_required = true;
                     })?;
@@ -3072,6 +3669,7 @@ impl AgentManager {
             }
             enforce_external_interceptor_requirement(
                 &db,
+                &review,
                 name,
                 features.external_interceptor.as_ref(),
             )?;
@@ -3086,9 +3684,6 @@ impl AgentManager {
                 "egress rules",
                 "redirect rules require a mediated egress interceptor on every start",
             ));
-        }
-        if let Some(snapshot) = features.snapshot_dir.as_deref() {
-            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
         }
 
         // A privileged node drops each VMM to a distinct uid. Start the shared
@@ -3144,11 +3739,87 @@ impl AgentManager {
             }
         }
         let resources_for_config = resources.clone();
-        // Per-boot disk-prep (template copy). Formerly bounded by a process-wide
-        // boot gate to avoid host-disk thrash on slow/shared storage; removed
-        // after metal measurements showed disk-prep at ~1ms (NVMe + qcow2 thin
-        // clone) with flat boot latency from 8 → 32 concurrent boots — the gate
-        // was non-binding and only serialized needlessly.
+        let extra_disks = {
+            let mut __d = features.extra_disks;
+            // `--disk` values recorded on the machine, re-attached on every
+            // start in the order given. Format is read from the file's magic
+            // rather than assumed: a block device and a raw image are both
+            // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
+            // exposes its header as the whole device.
+            for disk in &resources_for_config.disks {
+                __d.push((
+                    disk.path.clone(),
+                    disk.read_only,
+                    disk.boot_format()
+                        .map_err(|e| crate::Error::agent("attach disk", e))?,
+                ));
+            }
+            if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
+                for entry in spec.split(',').filter(|s| !s.is_empty()) {
+                    let (path, ro) = match entry.strip_suffix(":ro") {
+                        Some(p) => (p, true),
+                        None => (entry, false),
+                    };
+                    __d.push((
+                        std::path::PathBuf::from(path),
+                        ro,
+                        crate::data::disk::DiskFormat::Raw,
+                    ));
+                }
+            }
+            __d
+        };
+        let mut exclusive_paths = vec![
+            self.overlay_disk.path().to_path_buf(),
+            self.vsock_socket.clone(),
+            self.pid_file.clone(),
+            self.config_file.clone(),
+        ];
+        exclusive_paths.push(
+            features
+                .control_socket
+                .clone()
+                .unwrap_or_else(|| self.vsock_socket.with_file_name("control.sock")),
+        );
+        exclusive_paths.extend(
+            extra_disks
+                .iter()
+                .filter(|(_, read_only, _)| !read_only)
+                .map(|(path, _, _)| path.clone()),
+        );
+        // Own disks and runtime paths before formatting or clearing old files.
+        // The same ticket becomes child ownership before the helper boots.
+        let provisional = self.name().map(|name| {
+            let (live, staged) = HostMount::split_storage_tuples(&mounts);
+            let mut record = crate::config::VmRecord::new(
+                name.to_owned(),
+                resources_for_config.cpus,
+                resources_for_config.memory_mib,
+                live,
+                vec![],
+                resources_for_config.network,
+            );
+            record.staged_mounts = staged;
+            record.mount_owners = HostMount::stored_owners(&mounts);
+            record.ephemeral = true;
+            record
+        });
+        let launch = crate::db::SmolvmDb::open()?.reserve_reviewed_vm_launch(
+            &review,
+            provisional,
+            self.storage_disk.path(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+            &exclusive_paths,
+        )?;
+        *self.launch_review.lock().unwrap_or_else(|e| e.into_inner()) = launch.review()?;
+        if let Some(snapshot) = features.snapshot_dir.as_deref() {
+            crate::portable_checkpoint::prepare_memory_backend(snapshot, features.forkable)?;
+        }
+        // Formatting runs outside the database transaction. Independent VMs
+        // can prepare concurrently while the durable reservation fences aliases.
         self.prepare_for_launch(&mounts, &ports, resources)?;
         tracing::info!(
             elapsed_ms = t_launch.elapsed().as_millis(),
@@ -3182,12 +3853,14 @@ impl AgentManager {
             if let Some(ref ctl) = features.control_socket {
                 v.push(("SMOLVM_CONTROL_SOCKET", ctl.to_string_lossy().into_owned()));
             }
-            // Idle reclaim is on by default (SMOLVM_IDLE_RECLAIM=0/off
-            // disables); a pulse without host-side release is pure waste, so
-            // the libkrun reclaim gate follows the same switch. libkrun
-            // additionally hard-disables reclaim for forkable (CoW-shared)
-            // guest RAM regardless of this env.
-            if crate::agent::launcher::idle_reclaim_minutes().is_some() {
+            // Hand the pages the guest frees back to the host. On macOS a
+            // free page report or balloon page is only released with this
+            // gate on (Linux and Windows always release), and without it the
+            // guest's idle page-cache reclaim and the idle balloon pulse free
+            // memory the host never gets back. An explicit setting in the
+            // host env wins. libkrun only punches RAM files it owns, so
+            // forkable (CoW-shared) guest RAM stays intact either way.
+            if std::env::var_os("SMOLVM_BALLOON_RECLAIM").is_none() {
                 v.push(("SMOLVM_BALLOON_RECLAIM", "1".to_string()));
             }
             if let Some(ref snap) = features.snapshot_dir {
@@ -3351,7 +4024,7 @@ impl AgentManager {
                     crate::process::ensure_traversable(parent);
                 }
                 crate::process::ensure_traversable(&self.rootfs_path());
-                if let Some(home) = dirs::home_dir() {
+                if let Some(home) = smolvm_paths::home_dir() {
                     crate::process::ensure_traversable(&home.join(".smolvm"));
                 }
                 #[cfg(target_os = "linux")]
@@ -3431,6 +4104,7 @@ impl AgentManager {
 
         // Write boot config to a file the subprocess will read
         let config = BootConfig {
+            startup_ticket: Some(launch.ticket.clone()),
             rootfs_path: self.rootfs_path(),
             storage_disk_path: self.storage_disk.path().to_path_buf(),
             overlay_disk_path: self.overlay_disk.path().to_path_buf(),
@@ -3447,6 +4121,7 @@ impl AgentManager {
             // the machine's resources (the embedded SDK/CLI path sets the latter).
             cuda: features.cuda || resources_for_config.cuda,
             expose_docker: features.expose_docker,
+            auto_ports: features.auto_ports,
             published_sockets: features.published_sockets,
             dns_filter_hosts: features.dns_filter_hosts,
             credentials: features.credentials,
@@ -3456,36 +4131,7 @@ impl AgentManager {
             packed_layers_dir: features.packed_layers_dir,
             packed_layers_dax_window,
             pack_idmap_source,
-            extra_disks: {
-                let mut __d = features.extra_disks;
-                // `--disk` values recorded on the machine, re-attached on every
-                // start in the order given. Format is read from the file's magic
-                // rather than assumed: a block device and a raw image are both
-                // `Raw`, but an attached qcow2 must be declared qcow2 or libkrun
-                // exposes its header as the whole device.
-                for disk in &resources_for_config.disks {
-                    __d.push((
-                        disk.path.clone(),
-                        disk.read_only,
-                        disk.boot_format()
-                            .map_err(|e| crate::Error::agent("attach disk", e))?,
-                    ));
-                }
-                if let Ok(spec) = std::env::var("SMOLVM_EXTRA_DISK") {
-                    for entry in spec.split(',').filter(|s| !s.is_empty()) {
-                        let (path, ro) = match entry.strip_suffix(":ro") {
-                            Some(p) => (p, true),
-                            None => (entry, false),
-                        };
-                        __d.push((
-                            std::path::PathBuf::from(path),
-                            ro,
-                            crate::data::disk::DiskFormat::Raw,
-                        ));
-                    }
-                }
-                __d
-            },
+            extra_disks,
             pod_netns: features.pod_netns,
             // Ephemeral machines share one runtime directory, so only a named
             // machine keeps a workload log of its own.
@@ -3508,6 +4154,7 @@ impl AgentManager {
             .join("boot-config.json");
         let config_json = serde_json::to_vec(&config)
             .map_err(|e| Error::agent("serialize boot config", e.to_string()))?;
+        let config_digest = super::boot_config::boot_config_digest(&config_json);
         let mut config_file = tempfile::NamedTempFile::new_in(config_path.parent().unwrap())
             .map_err(|e| Error::agent("create boot config", e.to_string()))?;
         std::io::Write::write_all(&mut config_file, &config_json)
@@ -3598,7 +4245,9 @@ impl AgentManager {
                 None => cmd.env_remove(var),
             };
         }
-        cmd.args(["_boot-vm", &config_path.to_string_lossy()])
+        cmd.arg("_boot-vm-owned")
+            .arg(&config_path)
+            .arg(&launch.ticket.token)
             .env_remove("SMOLVM_INTERCEPTOR_TOKEN")
             .env(
                 "SMOLVM_BOOT_WATCH_PARENT",
@@ -3616,7 +4265,21 @@ impl AgentManager {
                 smolvm_protocol::guest_env::READY_MARKER,
                 self.ready_marker_name(),
             )
+            .env(super::boot_config::BOOT_CONFIG_SHA256_ENV, &config_digest)
             .stdin(std::process::Stdio::null());
+        #[cfg(unix)]
+        {
+            cmd.env_remove(super::startup_transaction::PARENT_ENV);
+            if let Some(commit) = &features.startup_commit {
+                cmd.stdin(std::process::Stdio::from(commit.try_clone().map_err(
+                    |error| Error::agent("pass startup commit", error.to_string()),
+                )?));
+                cmd.env(
+                    super::startup_transaction::PARENT_ENV,
+                    std::process::id().to_string(),
+                );
+            }
+        }
         // SMOLVM_BOOT_DEBUG=1 surfaces the boot subprocess's stdout/stderr so
         // embedded-host launch failures can be diagnosed (normally silenced).
         //
@@ -3652,7 +4315,16 @@ impl AgentManager {
         #[cfg(unix)]
         {
             use std::os::unix::process::CommandExt;
-            cmd.process_group(0);
+            if crate::ssh::ownership::managed() {
+                // Stay in the startup request's group until _boot-vm registers
+                // its exact process identity with the on-demand SSH proxy.
+                cmd.env(
+                    crate::ssh::ownership::MACHINE_ENV,
+                    self.name().unwrap_or("default"),
+                );
+            } else {
+                cmd.process_group(0);
+            }
         }
         // Windows analogue: detach the VM from the launching process's console so
         // it survives that shell closing (a closing console delivers
@@ -3669,6 +4341,8 @@ impl AgentManager {
             use std::os::windows::process::CommandExt;
             const DETACHED_PROCESS: u32 = 0x0000_0008;
             const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+            crate::process::prevent_inherited_stdio_leaks()
+                .map_err(|error| Error::agent("detach boot process pipes", error.to_string()))?;
             cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
         }
         let child = cmd
@@ -3762,6 +4436,13 @@ impl AgentManager {
         resources: VmResources,
         mut features: launcher::LaunchFeatures,
     ) -> Result<bool> {
+        let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(
+            self.name(),
+            &mounts
+                .iter()
+                .map(|mount| mount.source.clone())
+                .collect::<Vec<_>>(),
+        )?;
         // Check if agent is already running (same logic as ensure_running_with_full_config)
         let reachable = self.try_connect_existing().is_some();
         if reachable {
@@ -3866,20 +4547,34 @@ impl AgentManager {
         guest_is_paused: bool,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
+        self.validate_control_identity()?;
+        // An acknowledgment from a path is not authority over an arbitrary PID.
+        // Verify before opening the agent socket or writing a stop marker.
+        if !process::is_alive(pid) {
+            return Ok(());
+        }
+        let verified = process::is_our_process_strict(pid, start_time)
+            || (start_time.is_none()
+                && process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy()));
+        if !verified {
+            return Err(Error::agent_conflict(
+                "stop agent",
+                "machine process identity changed",
+            ));
+        }
         // Whatever ends the VMM from here, smolvm asked for it.
-        if let Some(name) = self.name() {
-            crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+        if let Some(runtime) = self.vsock_socket.parent() {
+            crate::vm_exit::mark_stop_requested(runtime, pid);
         }
         // A paused guest has no vCPU to service the request and nothing left to
         // flush, so skip the handshake rather than wait out its deadline and
         // then refuse the stop. Identity is still verified below, from the PID
         // start time or this VM's own boot-config path.
-        let shutdown_acked = if guest_is_paused {
+        if guest_is_paused {
             tracing::debug!(
                 pid,
                 "guest is paused; terminating without a shutdown handshake"
             );
-            false
         } else {
             // Use short timeout — the agent may already be gone (ephemeral run exited).
             // A 100ms connect timeout avoids blocking the exit path.
@@ -3891,11 +4586,13 @@ impl AgentManager {
                 connected = connection.is_ok(),
                 "shutdown agent connect finished"
             );
-            let shutdown = connection.and_then(|mut client| match stop_timeout {
-                Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
-                None => client.shutdown(),
+            let shutdown = connection.and_then(|mut client| {
+                self.validate_control_identity()?;
+                match stop_timeout {
+                    Some(stop_timeout) => client.shutdown_with_stop_timeout(stop_timeout),
+                    None => client.shutdown(),
+                }
             });
-            let acked = shutdown.is_ok();
 
             // Process identity is not proof that guest writes reached disk. A slow
             // flush must not turn a graceful stop into an unannounced power cut.
@@ -3908,6 +4605,20 @@ impl AgentManager {
                         && process::poll_for_exit(pid, AGENT_STOP_TIMEOUT).is_some()
                         && !process::is_alive(pid));
                 if !exited {
+                    // A process already killed and held by the kernel has no
+                    // guest left to confirm anything and cannot be retried.
+                    if process::held_after_kill(pid).is_some()
+                        && process::poll_for_exit(pid, process::VM_SIGKILL_TIMEOUT).is_none()
+                    {
+                        if let Some(held) = process::held_after_kill(pid) {
+                            tracing::warn!(
+                                "machine '{}' is stopped, but {}",
+                                self.name().unwrap_or("default"),
+                                held.explain()
+                            );
+                            return Ok(());
+                        }
+                    }
                     return Err(Error::agent(
                         "stop agent",
                         format!("guest did not confirm filesystem synchronization; left the VM alive for retry: {error}"),
@@ -3919,35 +4630,45 @@ impl AgentManager {
                 );
                 return Ok(());
             }
-            acked
-        };
+        }
 
-        // Identity check: vsock acknowledgement OR strict PID start-time match OR
-        // an argv match on this VM's unique boot-config path. We intentionally do
-        // NOT use the lenient is_our_process() here because it treats any alive
-        // PID as "ours" when start_time is None — which risks killing an unrelated
-        // process if the OS reused the PID. The cmdline fallback is safe for the
-        // same reason it's specific: only our `_boot-vm <this-vm>/boot-config.json`
-        // process carries that exact path, so it recovers the case where the agent
-        // vsock is wedged (no ack) AND the start-time record is missing — the exact
-        // combination that otherwise leaks a live orphan the control can never see.
-        let identity_ok = shutdown_acked
-            || process::is_our_process_strict(pid, start_time)
-            || process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy());
+        // Recheck after the guest flush: an acknowledgment does not identify a
+        // host PID. Legacy records without a start time may use the exact boot
+        // path, but a mismatched known start time never falls back to argv.
+        let identity_ok = process::is_our_process_strict(pid, start_time)
+            || (start_time.is_none()
+                && process::cmdline_contains(pid, &self.boot_config_path().to_string_lossy()));
 
         let exit_confirmed = if identity_ok {
             if !process::is_our_process_strict(pid, start_time) {
                 tracing::debug!(
                     pid,
-                    "PID start-time not verified, identity confirmed via vsock"
+                    "legacy process identity confirmed by its boot-config path"
                 );
             }
             // The stop helper observes the kernel's exit event or reaps our
             // child. On macOS kill(pid, 0) can still see an exited child until
             // it is reaped, so a second liveness probe must not override that
             // confirmed exit (or mistake a recycled PID for this VM).
-            process::stop_vm_process(pid, VM_EXIT_FLUSH_TIMEOUT, process::VM_SIGKILL_TIMEOUT)
-                .is_ok()
+            match process::stop_vm_process_bounded(
+                pid,
+                VM_EXIT_FLUSH_TIMEOUT,
+                process::VM_SIGKILL_TIMEOUT,
+            ) {
+                Ok(process::VmStop::Exited(_)) => true,
+                Ok(process::VmStop::Held(held)) => {
+                    // The kernel will not let the process exit, and waiting
+                    // longer does not change that. It runs no more code, so
+                    // the stop completes around it and says what was left.
+                    tracing::warn!(
+                        "machine '{}' is stopped, but {}",
+                        self.name().unwrap_or("default"),
+                        held.explain()
+                    );
+                    return Ok(());
+                }
+                Err(_) => false,
+            }
         } else {
             false
         };
@@ -4023,7 +4744,14 @@ impl AgentManager {
 
     fn cleanup_dead_vm_runtime(&self) {
         if let Some(name) = self.name.as_deref() {
-            if let Err(error) = cleanup_dead_vm_runtime(name) {
+            let result = (|| {
+                let db = crate::db::SmolvmDb::open()?;
+                let runtime = self.vsock_socket.parent().ok_or_else(|| {
+                    Error::agent("clean runtime", "machine runtime directory is missing")
+                })?;
+                cleanup_dead_vm_runtime_at(name, &db, runtime)
+            })();
+            if let Err(error) = result {
                 tracing::warn!(%name, %error, "failed to clean dead VM runtime state");
             }
         } else {
@@ -4043,41 +4771,49 @@ impl AgentManager {
     /// Kill the VM and wait up to `timeout` before reclaiming its resources.
     /// Large disposable helpers can take longer to release their mappings.
     pub fn kill_and_wait(&self, timeout: std::time::Duration) {
-        // Two PID sources with very different PID-reuse risk:
-        //   - the in-memory child: a direct child we still own, so the kernel
-        //     cannot recycle its PID until we reap it → safe to SIGKILL by PID.
-        //   - the pid-file: a process we did NOT spawn as our child (recovered
-        //     after a re-attach), so between the pid-file write and now the OS
-        //     may have reused the PID. Verify the recorded start-time before
-        //     SIGKILL (`kill_verified`) so we never signal an unrelated process.
+        let _operation = match self.reserve_control_operation() {
+            Ok(admission) => admission,
+            Err(error) => {
+                tracing::warn!(%error, "refusing stale or transfer-owned VM cleanup");
+                return;
+            }
+        };
+        // A cached child may have been reattached rather than spawned here.
+        // Retain and verify its original start time before signaling it.
         let owned_child = {
             let inner = self.inner.lock();
-            inner.child.as_ref().map(|c| c.pid())
+            inner.child.as_ref().map(|c| (c.pid(), c.start_time()))
         };
 
         // Whatever ends the VMM from here, smolvm asked for it.
         let mark = |pid| {
-            if let Some(name) = self.name() {
-                crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+            if let Some(runtime) = self.vsock_socket.parent() {
+                crate::vm_exit::mark_stop_requested(runtime, pid);
             }
         };
         let killed_pid = match owned_child {
-            Some(pid) => {
+            Some((pid, start_time)) => {
                 if process::is_alive(pid) {
+                    if !process::is_our_process_strict(pid, start_time) {
+                        tracing::warn!(pid, "refusing kill of a changed process identity");
+                        return;
+                    }
                     mark(pid);
-                    process::kill(pid);
+                    process::kill_verified(pid, start_time);
                 }
                 Some(pid)
             }
-            None => match self.read_pid_file_with_start_time() {
+            None => match self.pid_and_start_time() {
                 Some((pid, start_time)) => {
                     mark(pid);
                     if process::kill_verified(pid, start_time) {
                         Some(pid)
-                    } else if process::cmdline_contains(
-                        pid,
-                        &self.boot_config_path().to_string_lossy(),
-                    ) {
+                    } else if start_time.is_none()
+                        && process::cmdline_contains(
+                            pid,
+                            &self.boot_config_path().to_string_lossy(),
+                        )
+                    {
                         // Start-time unverifiable, but the live PID's argv carries
                         // this VM's unique boot-config path — unambiguously ours,
                         // so kill it rather than leak a live orphan.
@@ -4160,6 +4896,75 @@ impl AgentManager {
         self.stop_inner(false, Some(stop_timeout))
     }
 
+    /// Synchronize and stop the reviewed registered machine, then publish its
+    /// stopped state while retaining the same execution and disk ownership.
+    /// The caller must hold its fork-source/lifecycle lock. On sync failure the
+    /// guest and its authoritative working copy remain available for retry.
+    pub fn stop_persisted(
+        &self,
+        record: &crate::config::VmRecord,
+        stop_timeout: Option<Duration>,
+    ) -> Result<crate::config::VmRecord> {
+        let operation = self.reserve_control_operation()?;
+        operation.validate_staged_record(record)?;
+        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
+        let frozen = resolved == crate::config::RecordState::Frozen;
+        if frozen {
+            let dependents = super::fork::stop_blocking_dependent_clones(
+                &crate::db::SmolvmDb::open()?,
+                &record.name,
+            )?;
+            if !dependents.is_empty() {
+                return Err(Error::agent_conflict(
+                    "stop machine",
+                    "frozen machine still has running dependent clones",
+                ));
+            }
+        }
+        if !frozen && record.is_process_alive() {
+            crate::staged_mount::sync_with_operation(record, self, &operation)?;
+        }
+        self.stop_owned(&operation, frozen, stop_timeout)?;
+        // Use the manager's captured path, never a fresh home/name resolution.
+        let runtime = operation
+            ._ownership
+            .as_ref()
+            .expect("reviewed by validate_staged_record")
+            .runtime_dir();
+        smolvm_pack::extract::force_detach_layers_volume(&runtime.join("pack"));
+        operation.finish_stop()
+    }
+
+    /// Retain control ownership after shutdown for destructive deletion.
+    pub(crate) fn stop_for_deletion(
+        &self,
+        record: &crate::config::VmRecord,
+    ) -> Result<crate::db::VmRecoveryGuard> {
+        let mut operation = self.reserve_control_operation()?;
+        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
+        if resolved == crate::config::RecordState::Running {
+            crate::staged_mount::sync_with_operation(record, self, &operation)?;
+        } else if resolved == crate::config::RecordState::Unreachable
+            && !record.staged_mounts.is_empty()
+        {
+            return Err(Error::agent_conflict(
+                "delete machine",
+                "machine has unsynchronized staged mounts but its agent is unreachable",
+            ));
+        }
+        self.stop_owned(
+            &operation,
+            matches!(
+                resolved,
+                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
+            ),
+            Some(Duration::ZERO),
+        )?;
+        operation._ownership.take().ok_or_else(|| {
+            Error::agent_conflict("delete machine", "deletion requires a reviewed machine")
+        })
+    }
+
     /// Stop a machine whose guest is paused and already quiesced.
     ///
     /// A frozen fork base is snapshot-paused: its vCPUs are not running, so its
@@ -4174,6 +4979,17 @@ impl AgentManager {
     }
 
     fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
+        let operation = self.reserve_control_operation()?;
+        self.stop_owned(&operation, guest_is_paused, stop_timeout)
+    }
+
+    fn stop_owned(
+        &self,
+        operation: &ControlOperation,
+        guest_is_paused: bool,
+        stop_timeout: Option<Duration>,
+    ) -> Result<()> {
+        operation.validate_manager(self)?;
         let state = {
             let inner = self.inner.lock();
             inner.state
@@ -4182,7 +4998,7 @@ impl AgentManager {
         if state == AgentState::Stopped {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
-            if let Some((pid, start_time)) = self.read_pid_file_with_start_time() {
+            if let Some((pid, start_time)) = self.pid_and_start_time() {
                 if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
                 {
                     tracing::warn!(
@@ -4207,20 +5023,10 @@ impl AgentManager {
         // Get the child PID and start time — try in-memory first, then PID file.
         // The PID file fallback is critical for default VMs where a fresh
         // AgentManager doesn't know the PID from a previous CLI invocation.
-        let (child_pid, pid_start_time) = {
-            let inner = self.inner.lock();
-            if let Some(child) = inner.child.as_ref() {
-                // Use the start time captured when the child handle was created,
-                // not recomputed from the PID (which would be self-fulfilling
-                // if the PID was recycled by the OS).
-                (Some(child.pid()), child.start_time())
-            } else {
-                match self.read_pid_file_with_start_time() {
-                    Some((pid, start_time)) => (Some(pid), start_time),
-                    None => (None, None),
-                }
-            }
-        };
+        let (child_pid, pid_start_time) = self
+            .pid_and_start_time()
+            .map(|(pid, start)| (Some(pid), start))
+            .unwrap_or((None, None));
 
         if let Some(pid) = child_pid {
             if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
@@ -4555,6 +5361,11 @@ impl AgentManager {
 }
 
 fn refuse_live_launch_pid(pid: crate::process::Pid) -> Result<()> {
+    if let Some(held) = process::held_after_kill(pid) {
+        // Its files and published ports stay open until the kernel lets it
+        // go, and a write it had in flight can still land on the disks.
+        return Err(Error::agent("start agent", held.start_refusal()));
+    }
     if process::is_alive(pid) {
         return Err(Error::agent(
             "start agent",
@@ -4742,9 +5553,71 @@ pub(crate) fn vm_boot_executable() -> std::io::Result<PathBuf> {
 
 #[cfg(test)]
 mod tests {
+    /// A live replace keeps the ports this run picked itself, without
+    /// publishing one twice when the configured set already names its host port.
+    #[test]
+    fn a_live_replace_keeps_the_runs_own_ports() {
+        let set = |ports: &[(u16, u16)], allocated: &[(u16, u16)]| -> Vec<(u16, u16)> {
+            super::published_set(ports, allocated)
+                .iter()
+                .map(|m| (m.host, m.guest))
+                .collect()
+        };
+        assert_eq!(
+            set(&[(8080, 80)], &[(49152, 3000)]),
+            [(8080, 80), (49152, 3000)]
+        );
+        assert_eq!(set(&[], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(49152, 3000)], &[(49152, 3000)]), [(49152, 3000)]);
+        assert_eq!(set(&[(8080, 80)], &[]), [(8080, 80)]);
+    }
+
+    #[test]
+    fn a_running_configuration_says_whether_the_vm_was_launched_forkable() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        assert_eq!(
+            super::forkable_in_running_config(&path),
+            None,
+            "no file: nothing is running"
+        );
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mounts":[],"ports":[],"resources":{"cpus":1,"memory_mib":256,"network":false},"forkable":true}"#,
+        )
+        .unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), Some(true));
+        // an engine that predates the field launched it plain
+        std::fs::write(
+            &path,
+            r#"{"version":1,"mounts":[],"ports":[],"resources":{"cpus":1,"memory_mib":256,"network":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), Some(false));
+        std::fs::write(&path, "not json").unwrap();
+        assert_eq!(super::forkable_in_running_config(&path), None);
+    }
+
+    #[test]
+    fn a_running_machine_reports_how_it_was_launched_and_a_stopped_one_its_record() {
+        use crate::config::VmRecord;
+        let mut record = VmRecord::new("m".to_string(), 1, 256, vec![], vec![], false);
+        assert!(!record.forkable_on_start());
+        // created plain, started --branchable: branchable now
+        assert!(super::branchable_from(&record, Some(true)));
+        // created branchable, started plain by an older path: not branchable now
+        record.forkable = true;
+        assert!(!super::branchable_from(&record, Some(false)));
+        // nothing running: the record decides
+        assert!(super::branchable_from(&record, None));
+        record.forkable = false;
+        assert!(!super::branchable_from(&record, None));
+    }
+
     #[test]
     fn egress_flow_summary_round_trips_through_its_file_and_goes_stale() {
         use super::*;
+
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join(EGRESS_FLOWS_FILE);
         let taken = std::time::UNIX_EPOCH + std::time::Duration::from_secs(1_800_000_000);
@@ -4758,7 +5631,7 @@ mod tests {
                 oldest_outbound_dest: Some("198.51.100.7:3333".parse().unwrap()),
             },
         );
-        write_egress_flows(&path, &summary).unwrap();
+        write_egress_flows(&mut SampleFile::new(path.clone()), &summary).unwrap();
         assert!(!path.with_extension("tmp").exists());
         let text = std::fs::read_to_string(&path).unwrap();
         assert!(text.contains("\"oldestOutboundDest\":\"198.51.100.7:3333\""));
@@ -4861,12 +5734,24 @@ mod tests {
         db.insert_vm("worker", &record).unwrap();
 
         // Existing records and ordinary machines remain bootable.
-        enforce_external_interceptor_requirement(&db, "worker", None).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            None,
+        )
+        .unwrap();
         let endpoint = smolvm_protocol::InterceptEndpoint {
             addr: "127.0.0.1:43123".parse().unwrap(),
             token: [7; smolvm_protocol::intercept::TOKEN_LEN],
         };
-        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            Some(&endpoint),
+        )
+        .unwrap();
         assert!(
             db.get_vm("worker")
                 .unwrap()
@@ -4874,11 +5759,23 @@ mod tests {
                 .external_interceptor_required
         );
 
-        let error = enforce_external_interceptor_requirement(&db, "worker", None).unwrap_err();
+        let error = enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            None,
+        )
+        .unwrap_err();
         assert!(error
             .to_string()
             .contains("requires an external interceptor"));
-        enforce_external_interceptor_requirement(&db, "worker", Some(&endpoint)).unwrap();
+        enforce_external_interceptor_requirement(
+            &db,
+            &crate::db::launch_admission::LaunchReview::capture(&db, Some("worker")).unwrap(),
+            "worker",
+            Some(&endpoint),
+        )
+        .unwrap();
     }
 
     /// A frozen fork base is snapshot-paused, so no shutdown acknowledgement is
@@ -5097,7 +5994,7 @@ mod tests {
         let egress = temp.path().join(EGRESS_TELEMETRY_FILE);
 
         // The previous VMM's final flush is still on disk after it stopped.
-        write_egress_telemetry_at(&egress, 1_000_000).unwrap();
+        write_egress_telemetry(&mut SampleFile::new(egress.clone()), 1_000_000).unwrap();
         assert_eq!(read_egress_telemetry_at(&egress), Some(1_000_000));
 
         // A new launch clears it, so before the new VMM's first flush there is
@@ -5106,7 +6003,7 @@ mod tests {
         assert_eq!(read_egress_telemetry_at(&egress), None);
 
         // After the first flush, only the new run's bytes are reported.
-        write_egress_telemetry_at(&egress, 42).unwrap();
+        write_egress_telemetry(&mut SampleFile::new(egress.clone()), 42).unwrap();
         assert_eq!(read_egress_telemetry_at(&egress), Some(42));
         assert!(!egress_telemetry_staging(&egress).exists());
 
@@ -5126,6 +6023,9 @@ mod tests {
 
     #[test]
     fn launch_refuses_live_persisted_pid_without_agent_reachability() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
         let temp = tempfile::tempdir().unwrap();
         let storage = StorageDisk::open_or_create_at(&temp.path().join("storage.raw"), 1).unwrap();
         let overlay = OverlayDisk::open_or_create_at(&temp.path().join("overlay.raw"), 1).unwrap();
@@ -5229,6 +6129,40 @@ mod tests {
         ensure_vm_dir_at(&dir, "real").unwrap();
         let err = ensure_vm_dir_at(&dir, "impostor").unwrap_err();
         assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+    }
+
+    /// `machine status`, `exec` and `stop` open a machine to observe it. On a
+    /// name that was never created that must leave no `vms/<hash>/` behind;
+    /// only a launch makes the machine's directory.
+    #[test]
+    fn observing_a_machine_that_was_never_created_leaves_no_data_dir() {
+        let name = format!(
+            "never-created-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let dir = vm_data_dir(&name);
+        assert!(!dir.exists(), "fresh name already has {}", dir.display());
+        // Whatever a failing run leaves behind is removed, so the host is not
+        // littered by the very bug under test.
+        struct RemoveOnDrop(PathBuf);
+        impl Drop for RemoveOnDrop {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = RemoveOnDrop(dir.clone());
+
+        let manager = AgentManager::for_vm(&name).unwrap();
+        assert_eq!(manager.name(), Some(name.as_str()));
+        assert!(
+            !dir.exists(),
+            "observing a machine that was never created made {}",
+            dir.display()
+        );
     }
 
     #[test]
@@ -5871,3 +6805,7 @@ mod egress_signal_tests {
         assert!(read_egress_signals_at(&log).is_none());
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "manager_reviewed_control_tests.rs"]
+mod reviewed_control_tests;

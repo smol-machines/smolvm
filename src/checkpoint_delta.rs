@@ -27,9 +27,20 @@ fn published_dir(store: &Path) -> PathBuf {
 }
 
 /// Where the materialized tree of checkpoint `id` is recorded.
-fn materialized_record(store: &Path, id: &str) -> PathBuf {
-    store.join("materialized").join(id)
+///
+/// Lineage records written before ids were checked may name anything, so a
+/// path is only built for an id of the checkpoint form.
+fn materialized_record(store: &Path, id: &str) -> Option<PathBuf> {
+    store::is_checkpoint_id(id).then(|| store.join("materialized").join(id))
 }
+
+/// Materialized trees a restore can build over, whatever their lineage.
+fn restore_bases(store: &Path) -> PathBuf {
+    store.join("restore-bases")
+}
+
+/// How many trees [`restore_bases`] keeps; each costs a copy of its index.
+const RESTORE_BASES_KEPT: usize = 128;
 
 fn io(context: &'static str) -> impl Fn(std::io::Error) -> Error {
     move |error| Error::agent(context, error.to_string())
@@ -153,15 +164,55 @@ fn held_checkpoint(store: &Path, id: &str) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// File inside a materialized tree holding the token its record repeats.
+const MATERIALIZED_TOKEN: &str = ".smolvm-materialized";
+
+/// The materialized tree recorded for checkpoint `id`, if it is still the
+/// tree the record was written for. The tree lives at a path keyed by a
+/// CRC32 that a file can choose, and is evicted and re-extracted there by
+/// other restores; only the random token written into it at publication and
+/// repeated in the record ties the two together.
+fn materialized_tree(store: &Path, id: &str) -> Option<PathBuf> {
+    let record = std::fs::read_to_string(materialized_record(store, id)?).ok()?;
+    let mut lines = record.lines();
+    let tree = PathBuf::from(lines.next()?.trim());
+    let token = lines.next()?.trim();
+    if token.is_empty() || !smolvm_pack::extract::is_extracted(&tree) {
+        return None;
+    }
+    let marker = tree.join(MATERIALIZED_TOKEN);
+    let metadata = std::fs::symlink_metadata(&marker).ok()?;
+    if !metadata.is_file() || metadata.len() > 64 {
+        return None;
+    }
+    (std::fs::read_to_string(&marker).ok()?.trim() == token).then_some(tree)
+}
+
+/// Write a fresh token into the tree at `partial`, replacing any file of that
+/// name the checkpoint's index put there, and return it.
+fn write_materialized_token(partial: &Path) -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let token = hex::encode(bytes);
+    let marker = partial.join(MATERIALIZED_TOKEN);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    use std::io::Write;
+    options.open(&marker)?.write_all(token.as_bytes())?;
+    Ok(token)
+}
+
 /// Read-only files of the materialized tree of checkpoint `parent`, by inode,
 /// so a capture of a machine restored from it skips re-reading its shared
 /// disk bases. Empty when this node has no untouched tree of it.
 #[cfg(unix)]
 pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
-    let tree = std::fs::read_to_string(materialized_record(store, parent))
-        .ok()
-        .map(|tree| PathBuf::from(tree.trim()))
-        .filter(|tree| smolvm_pack::extract::is_extracted(tree));
+    let tree = materialized_tree(store, parent);
     let (Some(tree), Ok(Some(stored))) = (tree, held_checkpoint(store, parent)) else {
         return store::KnownFiles::default();
     };
@@ -173,6 +224,44 @@ pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
 #[cfg(not(unix))]
 pub fn known_files_for(_store: &Path, _parent: &str) -> store::KnownFiles {
     store::KnownFiles::default()
+}
+
+/// SHA-256 of the index a chunked checkpoint file carries, read without
+/// unpacking its objects.
+fn carried_index_digest(
+    store: &Path,
+    artifact: &Path,
+    footer: &smolvm_pack::format::PackFooter,
+) -> Result<String> {
+    let staging_root = store.join("staging");
+    std::fs::create_dir_all(&staging_root).map_err(io("create checkpoint staging"))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".index-")
+        .tempdir_in(&staging_root)
+        .map_err(io("create checkpoint staging"))?;
+    smolvm_pack::extract::extract_checkpoint_sidecar(
+        artifact,
+        staging.path(),
+        footer,
+        &[PathBuf::from("objects"), PathBuf::from("generations")],
+        &[PathBuf::from("checkpoint.json")],
+    )
+    .map_err(io("read checkpoint index"))?;
+    store::index_digest(staging.path()).map_err(io("read checkpoint index"))
+}
+
+/// Refuse to treat the stored `directory` as checkpoint `id` from a file
+/// whose index digest is `carried`: ids are random per capture and say
+/// nothing about content, so only an equal index means the same checkpoint.
+fn ensure_same_checkpoint(id: &str, carried: &str, directory: &Path) -> Result<()> {
+    let held = store::index_digest(directory).map_err(io("read stored checkpoint"))?;
+    if held != carried {
+        return Err(Error::agent_conflict(
+            "restore checkpoint",
+            format!("this node holds a different checkpoint with id {id}"),
+        ));
+    }
+    Ok(())
 }
 
 /// How a chunked checkpoint file became available on this node.
@@ -220,6 +309,10 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         .map_err(io("pin checkpoint"))?
         .map(std::sync::Arc::new);
     if let Some(directory) = held_checkpoint(&store, &id)? {
+        // The id is the file's own claim; the held checkpoint stands in for
+        // it only when the index the file carries is the one held.
+        let carried = carried_index_digest(&store, artifact, &footer)?;
+        ensure_same_checkpoint(&id, &carried, &directory)?;
         return Ok(Some(Imported {
             pin,
             id,
@@ -279,12 +372,27 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
             format!("checkpoint is missing {} object(s)", missing.len()),
         ));
     }
+    let indexed_id = store::read_manifest(&unpacked)
+        .map_err(io("read checkpoint index"))?
+        .checkpoint
+        .and_then(|checkpoint| checkpoint.lineage)
+        .map(|lineage| lineage.id);
+    if indexed_id.as_deref() != Some(id.as_str()) {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "the checkpoint's index names a different checkpoint id than its manifest",
+        ));
+    }
     let published = published_dir(&store);
     std::fs::create_dir_all(&published).map_err(io("create checkpoint store"))?;
     let directory = published.join(format!("{id}.checkpoint"));
     match store::publish(&unpacked, &directory) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let unpacked_digest =
+                store::index_digest(&unpacked).map_err(io("read checkpoint index"))?;
+            ensure_same_checkpoint(&id, &unpacked_digest, &directory)?;
+        }
         Err(error) => return Err(io("publish checkpoint")(error)),
     }
     store::adopt_objects(&store, &directory).map_err(io("adopt checkpoint objects"))?;
@@ -378,20 +486,34 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         let Some(id) = cursor else { break };
         let pinned =
             crate::checkpoint_retention::pin(&store, &id).map_err(io("pin checkpoint base"))?;
-        if let (Ok(tree), Some(stored)) = (
-            std::fs::read_to_string(materialized_record(&store, &id)),
+        if let (Some(tree), Some(stored)) = (
+            materialized_tree(&store, &id),
             held_checkpoint(&store, &id)?,
         ) {
-            let tree = PathBuf::from(tree.trim());
-            if smolvm_pack::extract::is_extracted(&tree) {
-                base_tree = Some((stored, tree));
-                _base_pin = pinned;
-                break;
-            }
+            base_tree = Some((stored, tree));
+            _base_pin = pinned;
+            break;
         }
         cursor = store::find_lineage(&store, &id)
             .map_err(io("read checkpoint lineage"))?
             .and_then(|record| record.parent);
+    }
+    // Without a held ancestor, the tree that shares the most chunks: a
+    // branch of the same machine shares nearly all of its disks.
+    let mut similarity = None;
+    if base_tree.is_none() {
+        match store::closest_base(
+            &restore_bases(&store),
+            &imported.directory,
+            smolvm_pack::extract::is_extracted,
+        ) {
+            Ok(Some((entry, tree, score))) => {
+                base_tree = Some((entry, tree));
+                similarity = Some(score);
+            }
+            Ok(None) => {}
+            Err(error) => tracing::warn!(%error, "could not look for a restore base"),
+        }
     }
     let partial = shared_root.join(format!(
         ".{:08x}-materialize-{}",
@@ -403,14 +525,28 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     // RAM written below reaches the disk later, as for a deferred extraction.
     smolvm_pack::extract::mark_unsynced(&smolvm_pack::extract::unsynced_marker_path(&shared))
         .map_err(io("mark checkpoint memory unsynced"))?;
-    let stats = store::materialize_over(
+    let materialized = store::materialize_over(
         &imported.directory,
         &partial,
         base_tree.as_ref().map(|(s, t)| (s.as_path(), t.as_path())),
-    )
-    .map_err(|error| {
+    );
+    // A base is only a shortcut: if it fails, build the tree from the objects.
+    let materialized = match materialized {
+        Err(error) if base_tree.is_some() => {
+            tracing::warn!(%error, "building over a restore base failed; materializing in full");
+            let _ = std::fs::remove_dir_all(&partial);
+            base_tree = None;
+            store::materialize_over(&imported.directory, &partial, None)
+        }
+        other => other,
+    };
+    let stats = materialized.map_err(|error| {
         let _ = std::fs::remove_dir_all(&partial);
         Error::agent("materialize checkpoint", error.to_string())
+    })?;
+    let token = write_materialized_token(&partial).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&partial);
+        io("mark materialized checkpoint")(error)
     })?;
     smolvm_pack::extract::mark_extracted(&partial).map_err(io("mark checkpoint extracted"))?;
     #[cfg(unix)]
@@ -418,6 +554,14 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o700));
     }
+    // The key is a CRC32 the file chooses, and the request may still be
+    // refused after this returns. Record whose payload the entry holds before
+    // it can be found, so another artifact with the same key is refused
+    // rather than served this tree.
+    smolvm_pack::extract::record_shared_artifact_sha256(artifact, &shared).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&partial);
+        io("record materialized checkpoint")(error)
+    })?;
     match std::fs::rename(&partial, &shared) {
         Ok(()) => {}
         Err(_) if smolvm_pack::extract::is_extracted(&shared) => {
@@ -428,17 +572,27 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             return Err(io("publish materialized checkpoint")(error));
         }
     }
-    let record = materialized_record(&store, &imported.id);
-    if let Some(parent) = record.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(record) = materialized_record(&store, &imported.id) {
+        if let Some(parent) = record.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&record, format!("{}\n{token}\n", shared.to_string_lossy()));
     }
-    let _ = std::fs::write(&record, shared.to_string_lossy().as_bytes());
+    if let Err(error) = store::remember_base(
+        &restore_bases(&store),
+        &imported.directory,
+        &shared,
+        RESTORE_BASES_KEPT,
+    ) {
+        tracing::warn!(%error, "could not keep the restored tree as a base");
+    }
     tracing::info!(
         id = %imported.id,
         delta_base = ?imported.base,
         already_held = imported.already_held,
         base_objects = imported.base_objects,
         materialize_base = ?base_tree.as_ref().map(|(_, tree)| tree.display().to_string()),
+        base_similarity = ?similarity,
         linked_files = stats.linked_files,
         linked_bytes = stats.linked_bytes,
         copied_chunks = stats.copied_chunks,
@@ -448,4 +602,69 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         "chunked checkpoint prepared for restore"
     );
     Ok(Some(shared))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_checkpoint_stands_in_only_for_the_same_index() {
+        let held = tempfile::TempDir::new().unwrap();
+        std::fs::write(held.path().join("checkpoint.json"), b"{\"genuine\":1}").unwrap();
+        let same = store::index_digest(held.path()).unwrap();
+        ensure_same_checkpoint("id", &same, held.path()).unwrap();
+
+        let forged = tempfile::TempDir::new().unwrap();
+        std::fs::write(forged.path().join("checkpoint.json"), b"{\"forged\":1}").unwrap();
+        let other = store::index_digest(forged.path()).unwrap();
+        let error = ensure_same_checkpoint("id", &other, held.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("different checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn a_record_names_only_the_tree_it_was_written_for() {
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::TempDir::new().unwrap();
+        let store = root.path().join("store");
+        let tree = root.path().join("_shared").join("0000beef");
+        std::fs::create_dir_all(store.join("materialized")).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        let token = write_materialized_token(&tree).unwrap();
+        smolvm_pack::extract::mark_extracted(&tree).unwrap();
+        let record = materialized_record(&store, ID).unwrap();
+        let write_record = |body: String| std::fs::write(&record, body).unwrap();
+
+        write_record(format!("{}\n{token}\n", tree.display()));
+        assert_eq!(materialized_tree(&store, ID), Some(tree.clone()));
+
+        // A record from before tokens, or naming another token, is ignored.
+        write_record(format!("{}\n", tree.display()));
+        assert_eq!(materialized_tree(&store, ID), None);
+        write_record(format!("{}\n{}\n", tree.display(), "f".repeat(32)));
+        assert_eq!(materialized_tree(&store, ID), None);
+
+        // The tree evicted and another extracted at the same path.
+        write_record(format!("{}\n{token}\n", tree.display()));
+        std::fs::remove_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        smolvm_pack::extract::mark_extracted(&tree).unwrap();
+        assert_eq!(materialized_tree(&store, ID), None);
+        write_materialized_token(&tree).unwrap();
+        assert_eq!(materialized_tree(&store, ID), None);
+    }
+
+    #[test]
+    fn no_record_path_is_built_for_an_id_of_another_form() {
+        let store = Path::new("/store");
+        assert!(materialized_record(store, "/dev/zero").is_none());
+        assert!(materialized_record(store, "../x").is_none());
+        assert_eq!(
+            materialized_record(store, "0123456789abcdef0123456789abcdef"),
+            Some(store.join("materialized/0123456789abcdef0123456789abcdef"))
+        );
+    }
 }

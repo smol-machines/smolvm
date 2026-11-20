@@ -27,3 +27,7 @@ smolvm-protocol = { path = "../smolvm-protocol" }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 tempfile = "3"
+
+[[test]]
+name = "child_ownership"
+harness = false

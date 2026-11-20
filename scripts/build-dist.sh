@@ -404,6 +404,7 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
             echo "Bundled GPU library: $gpu_lib ($(du -h "$DIST_DIR/lib/$gpu_lib" | cut -f1))"
         fi
     done
+    python3 "$SCRIPT_DIR/check-macos-deployment-target.py" "$DIST_DIR"/lib/*.dylib
 
     # libkrun.dylib links GPU libraries at either their Homebrew build paths or
     # @rpath when it was built against the already-relocated bundled library.
@@ -417,7 +418,10 @@ if [[ "$(uname -s)" == "Darwin" ]]; then
     # @loader_path so libkrun always loads the dylibs bundled beside it, then
     # re-sign (install_name_tool invalidates the signature).
     RELOCATED=0
+    KRUN_INSTALL_ID="$(otool -D "$DIST_DIR/lib/libkrun.dylib" | sed -n '2p')"
     while read -r dep; do
+        # otool -L includes LC_ID_DYLIB; it is not a dependency to bundle.
+        [[ "$dep" == "$KRUN_INSTALL_ID" ]] && continue
         leaf="$(basename "$dep")"
         if [[ ! -f "$DIST_DIR/lib/$leaf" ]]; then
             echo "Error: libkrun.dylib depends on $dep but $leaf is not bundled in lib/"
@@ -741,13 +745,15 @@ fi
 
 # Create tarball. Preserve sparseness so the 20/10 GiB-virtual disk templates
 # (a few hundred KiB physical) don't balloon to full size on extraction. GNU tar
-# needs --sparse; bsdtar (macOS) detects holes automatically.
+# needs --sparse; bsdtar (macOS) detects holes automatically. Store every entry
+# as root: the builder's uid/gid means nothing on the host that extracts it,
+# and a root extraction would otherwise give the files to that uid.
 echo "Creating tarball..."
 cd dist
 if tar --version 2>/dev/null | grep -qi gnu; then
-    tar --sparse -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+    tar --sparse --owner=0 --group=0 --numeric-owner -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
 else
-    tar -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
+    tar --uid 0 --gid 0 --uname root --gname root -czf "${DIST_NAME}.tar.gz" "${DIST_NAME}"
 fi
 cd ..
 

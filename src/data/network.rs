@@ -170,7 +170,7 @@ fn select_dns(
         EffectiveNetworkBackend::None => None,
         // The gateway forwards guest queries from a host UDP socket, so a host
         // loopback stub is reachable and is taken as-is.
-        EffectiveNetworkBackend::VirtioNet => v4(host)
+        EffectiveNetworkBackend::VirtioNet | EffectiveNetworkBackend::Host => v4(host)
             .next()
             .map(|addr| (addr, DnsSource::HostResolvConf)),
         // TSI does not translate a guest loopback destination to the host's
@@ -194,6 +194,53 @@ fn select_dns(
             source: DnsSource::BackendDefault,
         },
     }
+}
+
+/// The resolvers a machine's DNS forwarder queries, in order: `--dns` alone
+/// when given, otherwise every resolver the host's resolver config names (as
+/// glibc tries `resolv.conf`), then systemd-resolved's uplinks when the config
+/// names none, then the public defaults. At most
+/// [`smolvm_network::MAX_UPSTREAM_RESOLVERS`].
+///
+/// The forwarder runs on the host for either backend, so a host loopback stub
+/// is as usable as any other entry, and IPv6 resolvers count too.
+pub fn dns_forwarder_upstreams(
+    dns_override: Option<Ipv4Addr>,
+) -> [Option<IpAddr>; smolvm_network::MAX_UPSTREAM_RESOLVERS] {
+    let uplink = resolv_conf_nameservers(
+        &std::fs::read_to_string(SYSTEMD_RESOLVED_UPLINK).unwrap_or_default(),
+    );
+    select_forwarder_upstreams(dns_override, &host_nameservers(), &uplink)
+}
+
+/// The pure half of [`dns_forwarder_upstreams`].
+fn select_forwarder_upstreams(
+    dns_override: Option<Ipv4Addr>,
+    host: &[IpAddr],
+    systemd_uplink: &[IpAddr],
+) -> [Option<IpAddr>; smolvm_network::MAX_UPSTREAM_RESOLVERS] {
+    let defaults: Vec<IpAddr> = smolvm_protocol::resolv::DEFAULT_NAMESERVERS
+        .iter()
+        .filter_map(|addr| addr.parse().ok())
+        .collect();
+    let list: &[IpAddr] = match dns_override {
+        Some(addr) => &[IpAddr::V4(addr)],
+        None if !host.is_empty() => host,
+        None if !systemd_uplink.is_empty() => systemd_uplink,
+        None => &defaults,
+    };
+    let mut out = [None; smolvm_network::MAX_UPSTREAM_RESOLVERS];
+    let mut n = 0;
+    for addr in list {
+        if n == out.len() {
+            break;
+        }
+        if !out[..n].contains(&Some(*addr)) {
+            out[n] = Some(*addr);
+            n += 1;
+        }
+    }
+    out
 }
 
 /// Every nameserver in a resolv.conf, in file order.
@@ -278,14 +325,58 @@ pub struct PortMapping {
     /// Transport forwarded; omitted for TCP.
     #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
     pub protocol: PortProtocol,
+    /// The host address the port listens on; omitted for the default
+    /// publish address (loopback unless `SMOLVM_PUBLISH_ADDR` widens it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub listen: Option<IpAddr>,
+}
+
+/// The host address one published port listens on, as a machine record
+/// keeps it beside its `(host, guest)` port pairs.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ListenAddress {
+    /// The host port.
+    pub host: u16,
+    /// Its transport.
+    #[serde(default, skip_serializing_if = "PortProtocol::is_tcp")]
+    pub protocol: PortProtocol,
+    /// The address it listens on.
+    pub address: IpAddr,
+}
+
+/// Automatic port publishing (`--auto-ports`): while a machine runs, every
+/// TCP port a process in it listens on is published on the host's loopback at
+/// the same port number, and closed again once nothing listens on it. Only
+/// machines the local CLI starts use it; see `crate::network::auto_ports`.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AutoPorts {
+    /// Guest ports never published automatically, ascending.
+    pub exclude: Vec<u16>,
+}
+
+impl AutoPorts {
+    /// Auto ports with `exclude` left out, sorted and without duplicates so
+    /// two settings that mean the same compare equal.
+    pub fn excluding(exclude: impl IntoIterator<Item = u16>) -> Self {
+        let mut exclude: Vec<u16> = exclude.into_iter().collect();
+        exclude.sort_unstable();
+        exclude.dedup();
+        Self { exclude }
+    }
+
+    /// `self` with `other`'s exclusions added.
+    pub fn merged(self, other: AutoPorts) -> Self {
+        Self::excluding(self.exclude.into_iter().chain(other.exclude))
+    }
 }
 
 /// Maximum concrete mappings permitted for one machine.
 ///
-/// The current forwarding implementation starts listener thread(s) per mapping,
-/// so raising this limit requires multiplexing listeners or bounding the worker
-/// pool in `smolvm-network` first.
-pub const MAX_PORT_MAPPINGS: usize = 64;
+/// Published listeners share one accept thread (`smolvm_network::acceptor`),
+/// so a mapping costs only its sockets: two (IPv4 and IPv6) each, which keeps
+/// the maximum well inside macOS's default 10240 open files per process.
+pub const MAX_PORT_MAPPINGS: usize = 4096;
 
 /// A CLI or Smolfile port mapping before range expansion.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -470,7 +561,28 @@ impl PortMapping {
             host,
             guest,
             protocol,
+            listen: None,
         }
+    }
+
+    /// This mapping, listening on `listen` instead of the default address.
+    pub fn listening_on(mut self, listen: Option<IpAddr>) -> Self {
+        self.listen = listen;
+        self
+    }
+
+    /// The listen addresses of `ports` that name one, for a machine record.
+    pub fn listen_addresses(ports: &[Self]) -> Vec<ListenAddress> {
+        ports
+            .iter()
+            .filter_map(|p| {
+                p.listen.map(|address| ListenAddress {
+                    host: p.host,
+                    protocol: p.protocol,
+                    address,
+                })
+            })
+            .collect()
     }
 
     /// Create a TCP port mapping where host and guest ports are the same.
@@ -924,12 +1036,15 @@ mod tests {
     #[test]
     fn port_mapping_spec_limits_total_expanded_mappings() {
         let specs = [
-            PortMappingSpec::parse("1-32").unwrap(),
-            PortMappingSpec::parse("33-64").unwrap(),
+            PortMappingSpec::parse("1-2048").unwrap(),
+            PortMappingSpec::parse("32768-34815").unwrap(),
         ];
-        assert_eq!(PortMappingSpec::expand_all(&specs).unwrap().len(), 64);
+        assert_eq!(
+            PortMappingSpec::expand_all(&specs).unwrap().len(),
+            MAX_PORT_MAPPINGS
+        );
 
-        let too_many = [PortMappingSpec::parse("1-65").unwrap()];
+        let too_many = [PortMappingSpec::parse("1-4097").unwrap()];
         assert!(PortMappingSpec::expand_all(&too_many).is_err());
     }
 
@@ -998,5 +1113,78 @@ impl EgressPolicy {
             cidrs: Vec::new(),
             hosts: hosts.into_iter().map(Into::into).collect(),
         }
+    }
+}
+
+/// A machine's place on a container switch (see `smolvm_network::switch`):
+/// the switch directory and the machine's endpoint in it. The engine that
+/// owns the switch decides the machine's networks and addresses; the machine
+/// reads them from its endpoint file at every start.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct SwitchAttachment {
+    /// The switch directory.
+    pub dir: std::path::PathBuf,
+    /// The machine's endpoint name.
+    pub endpoint: String,
+}
+
+#[cfg(test)]
+mod forwarder_upstream_tests {
+    use super::*;
+
+    fn ip(s: &str) -> IpAddr {
+        s.parse().unwrap()
+    }
+
+    #[test]
+    fn every_host_resolver_is_used_in_order_up_to_three() {
+        let host = [
+            ip("10.0.0.2"),
+            ip("fd00::53"),
+            ip("10.0.0.3"),
+            ip("10.0.0.4"),
+        ];
+        assert_eq!(
+            select_forwarder_upstreams(None, &host, &[]),
+            [
+                Some(ip("10.0.0.2")),
+                Some(ip("fd00::53")),
+                Some(ip("10.0.0.3"))
+            ]
+        );
+    }
+
+    #[test]
+    fn dns_override_stands_alone() {
+        let host = [ip("10.0.0.2"), ip("10.0.0.3")];
+        assert_eq!(
+            select_forwarder_upstreams(Some("192.0.2.53".parse().unwrap()), &host, &[]),
+            [Some(ip("192.0.2.53")), None, None]
+        );
+    }
+
+    #[test]
+    fn a_host_stub_is_kept_and_an_empty_config_falls_back() {
+        assert_eq!(
+            select_forwarder_upstreams(None, &[ip("127.0.0.53")], &[ip("10.1.1.1")]),
+            [Some(ip("127.0.0.53")), None, None]
+        );
+        assert_eq!(
+            select_forwarder_upstreams(None, &[], &[ip("10.1.1.1"), ip("10.1.1.2")]),
+            [Some(ip("10.1.1.1")), Some(ip("10.1.1.2")), None]
+        );
+        assert_eq!(
+            select_forwarder_upstreams(None, &[], &[]),
+            [Some(ip("1.1.1.1")), Some(ip("8.8.8.8")), None]
+        );
+    }
+
+    #[test]
+    fn repeated_entries_count_once() {
+        let host = [ip("10.0.0.2"), ip("10.0.0.2"), ip("10.0.0.3")];
+        assert_eq!(
+            select_forwarder_upstreams(None, &host, &[]),
+            [Some(ip("10.0.0.2")), Some(ip("10.0.0.3")), None]
+        );
     }
 }
