@@ -132,9 +132,70 @@ fn native_roots() -> &'static [reqwest::Certificate] {
     })
 }
 
+/// Whether `url` names this host or a private network: `localhost`, or a
+/// loopback, link-local, private, unique-local, shared (CGNAT) or unspecified
+/// address, IPv4-mapped forms included.
+fn is_internal_url(url: &reqwest::Url) -> bool {
+    use std::net::IpAddr;
+    let Some(host) = url.host_str() else {
+        return true;
+    };
+    let host = host.trim_start_matches('[').trim_end_matches(']');
+    let ip = match host.parse::<IpAddr>() {
+        Ok(IpAddr::V6(v6)) => v6
+            .to_ipv4_mapped()
+            .map(IpAddr::V4)
+            .unwrap_or(IpAddr::V6(v6)),
+        Ok(ip) => ip,
+        Err(_) => {
+            let name = host.trim_end_matches('.').to_ascii_lowercase();
+            return name == "localhost" || name.ends_with(".localhost");
+        }
+    };
+    match ip {
+        IpAddr::V4(v4) => {
+            v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_private()
+                || v4.is_unspecified()
+                || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
+        }
+        IpAddr::V6(v6) => {
+            v6.is_loopback()
+                || v6.is_unspecified()
+                || (v6.segments()[0] & 0xffc0) == 0xfe80
+                || (v6.segments()[0] & 0xfe00) == 0xfc00
+        }
+    }
+}
+
+/// Follow at most ten redirects, never from a public host onto this host or a
+/// private network, and never from HTTPS down to plain HTTP: a registry on a
+/// public address must not turn a pull into a request to the node's own
+/// services.
+fn registry_redirects() -> reqwest::redirect::Policy {
+    reqwest::redirect::Policy::custom(|attempt| {
+        let Some(first) = attempt.previous().first().cloned() else {
+            return attempt.follow();
+        };
+        if attempt.previous().len() >= 10 {
+            return attempt.error("too many redirects");
+        }
+        let next = attempt.url();
+        if first.scheme() == "https" && next.scheme() != "https" {
+            return attempt.error("refusing a redirect from https to a plain-http address");
+        }
+        if !is_internal_url(&first) && is_internal_url(next) {
+            return attempt.error("refusing a redirect to a local or private address");
+        }
+        attempt.follow()
+    })
+}
+
 /// The shared HTTP client for every registry request, with the deadlines above.
 fn http_client() -> reqwest::Client {
     registry_tls(reqwest::Client::builder())
+        .redirect(registry_redirects())
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(READ_TIMEOUT)
         .build()
@@ -154,6 +215,7 @@ fn http_client() -> reqwest::Client {
 /// stalled transfer without capping a slow-but-progressing one.
 fn upload_http_client() -> reqwest::Client {
     registry_tls(reqwest::Client::builder())
+        .redirect(registry_redirects())
         .connect_timeout(CONNECT_TIMEOUT)
         .build()
         .unwrap_or_else(|_| reqwest::Client::new())
@@ -1420,6 +1482,28 @@ impl RegistryClient {
     /// If `force_refresh` is true the cache entry for this challenge is evicted
     /// first, guaranteeing a fresh token from the token service. This is used
     /// on the second 401 retry, when a cached token has just proven invalid.
+    /// Refuse a token realm a registry could use to reach what it may not: a
+    /// plain-http realm for an https registry, or a local or private address
+    /// for a registry that is not itself on one. Every credential branch, and
+    /// the anonymous one, sends its request to the realm.
+    fn validate_realm_destination(&self, realm: &reqwest::Url) -> Result<()> {
+        let base = reqwest::Url::parse(&self.base_url).ok();
+        if base.as_ref().is_some_and(|base| base.scheme() == "https") && realm.scheme() != "https" {
+            return Err(RegistryError::Authentication {
+                message: format!("refusing a non-HTTPS token realm: {}", realm.as_str()),
+            });
+        }
+        if is_internal_url(realm) && !base.as_ref().is_some_and(is_internal_url) {
+            return Err(RegistryError::Authentication {
+                message: format!(
+                    "refusing a token realm on a local or private address: {}",
+                    realm.as_str()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     async fn get_token(&self, challenge: &BearerChallenge, force_refresh: bool) -> Result<String> {
         let key = TokenCacheKey {
             realm: challenge.realm.clone(),
@@ -1458,6 +1542,7 @@ impl RegistryClient {
             }
         }
 
+        self.validate_realm_destination(&url)?;
         let req = self.http.get(url.clone());
         let resp = if let Some(identity_token) = &self.identity_token {
             // smolmachines path: upstream JWT exchanged with the token service.
@@ -2069,6 +2154,33 @@ mod tests {
 
     fn url(s: &str) -> reqwest::Url {
         reqwest::Url::parse(s).unwrap()
+    }
+
+    #[test]
+    fn a_public_registry_cannot_point_its_realm_inside_the_host() {
+        let public = RegistryClient::new("https://registry.example.com".into());
+        for realm in [
+            "http://127.0.0.1:8460/internal/credentials",
+            "https://169.254.169.254/latest/meta-data",
+            "https://10.0.0.5/token",
+            "https://[::1]/token",
+            "https://[::ffff:127.0.0.1]/token",
+            "https://localhost/token",
+            "http://auth.registry.example.com/token",
+        ] {
+            let url = reqwest::Url::parse(realm).unwrap();
+            assert!(
+                public.validate_realm_destination(&url).is_err(),
+                "{realm} allowed"
+            );
+        }
+        let url = reqwest::Url::parse("https://auth.registry.example.com/token").unwrap();
+        public.validate_realm_destination(&url).unwrap();
+
+        // A local registry keeps its local token service.
+        let local = RegistryClient::new("http://127.0.0.1:5000".into());
+        let url = reqwest::Url::parse("http://127.0.0.1:5001/token").unwrap();
+        local.validate_realm_destination(&url).unwrap();
     }
 
     #[test]
