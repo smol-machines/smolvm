@@ -478,16 +478,16 @@ pub struct ResolvedEgressPolicy {
 /// Outbound-network decision for a pack-run boot: a resolved policy's override
 /// is absolute (matching the direct `machine run` path, where ports and the
 /// artifact manifest never re-enable networking); otherwise the manifest and
-/// flags decide as before.
+/// flags decide. A published port is an inbound path, not a request for
+/// egress: the launcher serves it with outbound traffic denied.
 fn effective_network(
     egress: Option<&ResolvedEgressPolicy>,
     net_flag: bool,
     manifest_network: bool,
-    has_ports: bool,
 ) -> bool {
     match egress.and_then(|policy| policy.network_override) {
         Some(network) => network,
-        None => net_flag || manifest_network || has_ports,
+        None => net_flag || manifest_network,
     }
 }
 
@@ -658,7 +658,6 @@ impl PackRunCmd {
                 || effective_allowed_cidrs.is_some()
                 || effective_dns_filter_hosts.is_some()
                 || !effective_egress_rules.is_empty(),
-            !self.port.is_empty(),
         );
         if network_enabled {
             resolve_pack_allow_list_hosts(
@@ -2043,8 +2042,7 @@ fn run_from_cache(
         || effective_block_private.is_some()
         || effective_allowed_cidrs.is_some()
         || effective_dns_filter_hosts.is_some()
-        || !effective_egress_rules.is_empty()
-        || !ports.is_empty();
+        || !effective_egress_rules.is_empty();
     if network_enabled {
         resolve_pack_allow_list_hosts(
             &mut effective_allowed_cidrs,
@@ -2559,8 +2557,7 @@ fn daemon_start(
         || effective_block_private.is_some()
         || effective_allowed_cidrs.is_some()
         || effective_dns_filter_hosts.is_some()
-        || !effective_egress_rules.is_empty()
-        || !ports.is_empty();
+        || !effective_egress_rules.is_empty();
     if network_enabled {
         resolve_pack_allow_list_hosts(
             &mut effective_allowed_cidrs,
@@ -3021,7 +3018,7 @@ mod tests {
     fn resolved_policy_decides_network_instead_of_the_baked_manifest() {
         // The baked artifact's manifest records the bake VM's networking
         // (enabled, for the pull); the workload asked for none. The override
-        // must win, and ports must not re-enable it either.
+        // must win.
         let closed = ResolvedEgressPolicy {
             network_override: Some(false),
             allowed_cidrs: None,
@@ -3029,13 +3026,13 @@ mod tests {
             block_private: None,
             egress_rules: Vec::new(),
         };
-        assert!(!effective_network(Some(&closed), false, true, true));
+        assert!(!effective_network(Some(&closed), false, true));
 
         let open = ResolvedEgressPolicy {
             network_override: Some(true),
             ..Default::default()
         };
-        assert!(effective_network(Some(&open), false, false, false));
+        assert!(effective_network(Some(&open), false, false));
     }
 
     #[test]
@@ -3049,16 +3046,28 @@ mod tests {
             block_private: None,
             egress_rules: Vec::new(),
         };
-        assert!(effective_network(Some(&policy), false, true, false));
-        assert!(!effective_network(Some(&policy), false, false, false));
+        assert!(effective_network(Some(&policy), false, true));
+        assert!(!effective_network(Some(&policy), false, false));
     }
 
     #[test]
-    fn no_policy_preserves_the_flag_manifest_port_default() {
-        assert!(!effective_network(None, false, false, false));
-        assert!(effective_network(None, true, false, false));
-        assert!(effective_network(None, false, true, false));
-        assert!(effective_network(None, false, false, true));
+    fn no_policy_leaves_the_flag_and_manifest_to_decide() {
+        assert!(!effective_network(None, false, false));
+        assert!(effective_network(None, true, false));
+        assert!(effective_network(None, false, true));
+    }
+
+    #[test]
+    fn a_published_port_alone_gives_a_pack_no_egress() {
+        // `pack run -p` without --net on a pack built without networking:
+        // the port is served, and the launcher denies every outbound flow.
+        let resources = VmResources {
+            network: effective_network(None, false, false),
+            ..Default::default()
+        };
+        let plan = smolvm::network::plan_launch_network(&resources, None, 1);
+        assert_ne!(plan.backend, smolvm::network::EffectiveNetworkBackend::None);
+        assert!(!plan.outbound);
     }
 
     #[test]
