@@ -716,7 +716,10 @@ fn sparse_copy_with_kernel(
     mut kernel_copy: impl FnMut(&mut std::fs::File, &mut std::fs::File, u64) -> std::io::Result<u64>,
 ) -> std::io::Result<u64> {
     use std::io::{Seek, SeekFrom};
+    use std::os::unix::fs::FileExt;
     use std::os::unix::io::AsRawFd;
+
+    const CHUNK: usize = 256 * 1024;
 
     let mut src_file = std::fs::File::open(src)?;
     let src_len = src_file.metadata()?.len();
@@ -736,7 +739,7 @@ fn sparse_copy_with_kernel(
     let mut total: u64 = 0;
     let mut offset: i64 = 0;
     let mut kernel_available = true;
-    // No userspace buffer is needed when the filesystem can clone the ranges.
+    // Allocate the scan buffer only when the kernel cannot copy the whole extent.
     let mut buf = Vec::new();
 
     loop {
@@ -761,18 +764,36 @@ fn sparse_copy_with_kernel(
         src_file.seek(SeekFrom::Start(data_start as u64))?;
         dst_file.seek(SeekFrom::Start(data_start as u64))?;
         let length = (data_end - data_start) as u64;
-        let remaining = if kernel_available {
-            kernel_copy(&mut src_file, &mut dst_file, length)?
-        } else {
-            length
-        };
-        if remaining != 0 {
-            kernel_available = false;
-            if buf.is_empty() {
-                buf.resize(256 * 1024, 0);
+        // SEEK_DATA can include written zeros. A nonzero witness proves this
+        // chunk would be written by copy_extent_exact, even on filesystems
+        // where copy_file_range makes a physical copy rather than a reflink.
+        let mut prefix = 0;
+        if kernel_available {
+            let mut witness = [0];
+            while prefix < length {
+                src_file.read_exact_at(&mut witness, data_start as u64 + prefix)?;
+                if witness[0] == 0 {
+                    break;
+                }
+                prefix += (length - prefix).min(CHUNK as u64);
             }
-            // Both file offsets already include any successful kernel copies.
-            copy_extent_exact(&mut src_file, &mut dst_file, remaining, &mut buf)?;
+        }
+        let uncopied = if prefix != 0 {
+            kernel_copy(&mut src_file, &mut dst_file, prefix)?
+        } else {
+            0
+        };
+        if uncopied != 0 || prefix < length {
+            if buf.is_empty() {
+                buf.resize(CHUNK, 0);
+            }
+            if uncopied != 0 {
+                kernel_available = false;
+                // Finish the partial transfer before scanning the tail, so
+                // a short kernel write cannot shift the zero-scan boundaries.
+                copy_extent_exact(&mut src_file, &mut dst_file, uncopied, &mut buf)?;
+            }
+            copy_extent_exact(&mut src_file, &mut dst_file, length - prefix, &mut buf)?;
         }
         total += length;
         offset = data_end;
@@ -1038,8 +1059,7 @@ mod tests {
             "the source must really hold its zeros"
         );
 
-        // Exercise zero elision when the kernel copy operation is unavailable.
-        sparse_copy_with_kernel(&src, &dst, |_, _, remaining| Ok(remaining)).unwrap();
+        sparse_copy(&src, &dst).unwrap();
 
         assert_eq!(std::fs::read(&src).unwrap(), std::fs::read(&dst).unwrap());
         let allocated = std::fs::metadata(&dst).unwrap().blocks() * 512;

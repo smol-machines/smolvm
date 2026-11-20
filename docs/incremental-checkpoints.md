@@ -42,14 +42,15 @@ then resumes while retained RAM is streamed, hashed and compressed. The command
 returns only after the checkpoint has been durably published. An output is never
 overwritten. A failed capture does not publish a partially usable checkpoint.
 
-On Linux, disk staging first tries `FICLONE`, then `copy_file_range` over the
-source's data extents. This lets filesystems use kernel-side copying or block
-sharing even when `FICLONE` is unavailable, without copying sparse holes. If the
-kernel or filesystem cannot copy a range, staging continues from the current
-file offsets with userspace sparse copying. That fallback also skips written
-zero-filled chunks; the kernel path, like reflinking, preserves the source's
-allocated data regions. The benefit depends on the filesystem and disk contents,
-not just the logical disk size.
+On Linux, disk staging first tries `FICLONE`. If that fails, it skips holes
+using `SEEK_DATA`/`SEEK_HOLE`. Within each data extent, staging checks the first
+byte of each 256 KiB chunk. A run of chunks starting with nonzero bytes can
+use `copy_file_range`: none would have been skipped by the sparse copier.
+At the first zero prefix byte, staging scans the rest of the extent normally,
+leaving all-zero chunks as holes. This preserves written-zero elision even
+when the filesystem implements kernel copies as physical writes. An unsupported
+kernel copy falls back at the current offsets. Speed depends on the data and
+filesystem; kernel-copy success does not imply reflinking.
 
 This is incremental **storage**, not dirty-page-only capture: RAM is still read
 for each checkpoint, while unchanged chunks are reused instead of compressed
