@@ -9,6 +9,7 @@ pub mod backend;
 pub mod config;
 pub mod rosetta;
 pub mod state;
+pub mod waypipe;
 
 use crate::error::Result;
 pub use config::{
