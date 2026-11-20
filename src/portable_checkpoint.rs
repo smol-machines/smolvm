@@ -5833,6 +5833,28 @@ pub fn checkpoint_image_on_storage(checkpoint: &PortableCheckpointManifest) -> b
             .is_some_and(|workload| crate::data::image_source::is_local_ref(&workload.image))
 }
 
+/// Every id a checkpoint file declares is later joined into a path in the
+/// node store, so each must have the form of a checkpoint id before any is
+/// used: an id of `../x` or `/etc/x` would otherwise name a place outside it.
+fn validate_lineage_ids(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    let lineage = checkpoint
+        .lineage
+        .iter()
+        .chain(checkpoint.history.iter().map(|g| &g.lineage));
+    let ids = lineage
+        .flat_map(|lineage| std::iter::once(&lineage.id).chain(lineage.parent.as_ref()))
+        .chain(checkpoint.base.as_ref().map(|base| &base.id));
+    for id in ids {
+        if !crate::checkpoint_store::is_checkpoint_id(id) {
+            return Err(Error::agent(
+                "restore checkpoint",
+                "invalid checkpoint lineage id: ids are 32 lowercase hex characters",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
     let required = match checkpoint.payload {
@@ -5852,6 +5874,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
         ));
     }
     validate_runtime_abi(checkpoint)?;
+    validate_lineage_ids(checkpoint)?;
     let host_platform = crate::platform::Platform::current()
         .host_oci_platform()
         .to_string();
@@ -10847,5 +10870,64 @@ mod aarch64_live_host_tests {
         sorted.sort();
         assert_eq!(sorted, features, "contract must be sorted for stability");
         eprintln!("host provides {} guest-visible features", features.len());
+    }
+}
+
+#[cfg(test)]
+mod lineage_id_tests {
+    use super::*;
+    use smolvm_pack::format::{CheckpointBase, CheckpointGeneration, CheckpointLineage};
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn lineage(id: &str, parent: Option<&str>) -> CheckpointLineage {
+        CheckpointLineage {
+            id: id.into(),
+            parent: parent.map(Into::into),
+            machine: "m".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_lineage_id_that_is_not_a_checkpoint_id_is_rejected() {
+        let mut good = test_checkpoint_manifest();
+        good.lineage = Some(lineage(ID, Some(ID)));
+        good.base = Some(CheckpointBase {
+            id: ID.into(),
+            index_sha256: "x".into(),
+        });
+        good.history = vec![CheckpointGeneration {
+            lineage: lineage(ID, Some(ID)),
+            data_bytes: 0,
+        }];
+        validate_lineage_ids(&good).unwrap();
+
+        for bad in [
+            "/etc/planted",
+            "../escape",
+            "",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "/dev/zero",
+        ] {
+            let mut id = good.clone();
+            id.lineage = Some(lineage(bad, None));
+            let mut parent = good.clone();
+            parent.lineage = Some(lineage(ID, Some(bad)));
+            let mut base = good.clone();
+            base.base = Some(CheckpointBase {
+                id: bad.into(),
+                index_sha256: "x".into(),
+            });
+            let mut history = good.clone();
+            history.history[0].lineage = lineage(ID, Some(bad));
+            for manifest in [id, parent, base, history] {
+                assert!(validate_lineage_ids(&manifest).is_err(), "{bad:?} accepted");
+                assert!(
+                    validate_compatibility(&manifest).is_err(),
+                    "{bad:?} accepted"
+                );
+            }
+        }
     }
 }

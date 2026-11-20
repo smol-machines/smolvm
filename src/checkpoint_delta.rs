@@ -27,8 +27,11 @@ fn published_dir(store: &Path) -> PathBuf {
 }
 
 /// Where the materialized tree of checkpoint `id` is recorded.
-fn materialized_record(store: &Path, id: &str) -> PathBuf {
-    store.join("materialized").join(id)
+///
+/// Lineage records written before ids were checked may name anything, so a
+/// path is only built for an id of the checkpoint form.
+fn materialized_record(store: &Path, id: &str) -> Option<PathBuf> {
+    store::is_checkpoint_id(id).then(|| store.join("materialized").join(id))
 }
 
 /// Materialized trees a restore can build over, whatever their lineage.
@@ -166,8 +169,8 @@ fn held_checkpoint(store: &Path, id: &str) -> Result<Option<PathBuf>> {
 /// disk bases. Empty when this node has no untouched tree of it.
 #[cfg(unix)]
 pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
-    let tree = std::fs::read_to_string(materialized_record(store, parent))
-        .ok()
+    let tree = materialized_record(store, parent)
+        .and_then(|record| std::fs::read_to_string(record).ok())
         .map(|tree| PathBuf::from(tree.trim()))
         .filter(|tree| smolvm_pack::extract::is_extracted(tree));
     let (Some(tree), Ok(Some(stored))) = (tree, held_checkpoint(store, parent)) else {
@@ -181,6 +184,44 @@ pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
 #[cfg(not(unix))]
 pub fn known_files_for(_store: &Path, _parent: &str) -> store::KnownFiles {
     store::KnownFiles::default()
+}
+
+/// SHA-256 of the index a chunked checkpoint file carries, read without
+/// unpacking its objects.
+fn carried_index_digest(
+    store: &Path,
+    artifact: &Path,
+    footer: &smolvm_pack::format::PackFooter,
+) -> Result<String> {
+    let staging_root = store.join("staging");
+    std::fs::create_dir_all(&staging_root).map_err(io("create checkpoint staging"))?;
+    let staging = tempfile::Builder::new()
+        .prefix(".index-")
+        .tempdir_in(&staging_root)
+        .map_err(io("create checkpoint staging"))?;
+    smolvm_pack::extract::extract_checkpoint_sidecar(
+        artifact,
+        staging.path(),
+        footer,
+        &[PathBuf::from("objects"), PathBuf::from("generations")],
+        &[PathBuf::from("checkpoint.json")],
+    )
+    .map_err(io("read checkpoint index"))?;
+    store::index_digest(staging.path()).map_err(io("read checkpoint index"))
+}
+
+/// Refuse to treat the stored `directory` as checkpoint `id` from a file
+/// whose index digest is `carried`: ids are random per capture and say
+/// nothing about content, so only an equal index means the same checkpoint.
+fn ensure_same_checkpoint(id: &str, carried: &str, directory: &Path) -> Result<()> {
+    let held = store::index_digest(directory).map_err(io("read stored checkpoint"))?;
+    if held != carried {
+        return Err(Error::agent_conflict(
+            "restore checkpoint",
+            format!("this node holds a different checkpoint with id {id}"),
+        ));
+    }
+    Ok(())
 }
 
 /// How a chunked checkpoint file became available on this node.
@@ -228,6 +269,10 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         .map_err(io("pin checkpoint"))?
         .map(std::sync::Arc::new);
     if let Some(directory) = held_checkpoint(&store, &id)? {
+        // The id is the file's own claim; the held checkpoint stands in for
+        // it only when the index the file carries is the one held.
+        let carried = carried_index_digest(&store, artifact, &footer)?;
+        ensure_same_checkpoint(&id, &carried, &directory)?;
         return Ok(Some(Imported {
             pin,
             id,
@@ -287,12 +332,27 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
             format!("checkpoint is missing {} object(s)", missing.len()),
         ));
     }
+    let indexed_id = store::read_manifest(&unpacked)
+        .map_err(io("read checkpoint index"))?
+        .checkpoint
+        .and_then(|checkpoint| checkpoint.lineage)
+        .map(|lineage| lineage.id);
+    if indexed_id.as_deref() != Some(id.as_str()) {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "the checkpoint's index names a different checkpoint id than its manifest",
+        ));
+    }
     let published = published_dir(&store);
     std::fs::create_dir_all(&published).map_err(io("create checkpoint store"))?;
     let directory = published.join(format!("{id}.checkpoint"));
     match store::publish(&unpacked, &directory) {
         Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let unpacked_digest =
+                store::index_digest(&unpacked).map_err(io("read checkpoint index"))?;
+            ensure_same_checkpoint(&id, &unpacked_digest, &directory)?;
+        }
         Err(error) => return Err(io("publish checkpoint")(error)),
     }
     store::adopt_objects(&store, &directory).map_err(io("adopt checkpoint objects"))?;
@@ -386,10 +446,9 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         let Some(id) = cursor else { break };
         let pinned =
             crate::checkpoint_retention::pin(&store, &id).map_err(io("pin checkpoint base"))?;
-        if let (Ok(tree), Some(stored)) = (
-            std::fs::read_to_string(materialized_record(&store, &id)),
-            held_checkpoint(&store, &id)?,
-        ) {
+        let recorded = materialized_record(&store, &id)
+            .and_then(|record| std::fs::read_to_string(record).ok());
+        if let (Some(tree), Some(stored)) = (recorded, held_checkpoint(&store, &id)?) {
             let tree = PathBuf::from(tree.trim());
             if smolvm_pack::extract::is_extracted(&tree) {
                 base_tree = Some((stored, tree));
@@ -463,11 +522,12 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             return Err(io("publish materialized checkpoint")(error));
         }
     }
-    let record = materialized_record(&store, &imported.id);
-    if let Some(parent) = record.parent() {
-        let _ = std::fs::create_dir_all(parent);
+    if let Some(record) = materialized_record(&store, &imported.id) {
+        if let Some(parent) = record.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        let _ = std::fs::write(&record, shared.to_string_lossy().as_bytes());
     }
-    let _ = std::fs::write(&record, shared.to_string_lossy().as_bytes());
     if let Err(error) = store::remember_base(
         &restore_bases(&store),
         &imported.directory,
@@ -492,4 +552,37 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         "chunked checkpoint prepared for restore"
     );
     Ok(Some(shared))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_held_checkpoint_stands_in_only_for_the_same_index() {
+        let held = tempfile::TempDir::new().unwrap();
+        std::fs::write(held.path().join("checkpoint.json"), b"{\"genuine\":1}").unwrap();
+        let same = store::index_digest(held.path()).unwrap();
+        ensure_same_checkpoint("id", &same, held.path()).unwrap();
+
+        let forged = tempfile::TempDir::new().unwrap();
+        std::fs::write(forged.path().join("checkpoint.json"), b"{\"forged\":1}").unwrap();
+        let other = store::index_digest(forged.path()).unwrap();
+        let error = ensure_same_checkpoint("id", &other, held.path()).unwrap_err();
+        assert!(
+            error.to_string().contains("different checkpoint"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn no_record_path_is_built_for_an_id_of_another_form() {
+        let store = Path::new("/store");
+        assert!(materialized_record(store, "/dev/zero").is_none());
+        assert!(materialized_record(store, "../x").is_none());
+        assert_eq!(
+            materialized_record(store, "0123456789abcdef0123456789abcdef"),
+            Some(store.join("materialized/0123456789abcdef0123456789abcdef"))
+        );
+    }
 }
