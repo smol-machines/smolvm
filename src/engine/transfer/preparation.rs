@@ -56,15 +56,27 @@ pub(in crate::engine) async fn prepare(
     State(engine): State<Arc<Engine>>,
     Json(request): Json<PrepareRequest>,
 ) -> ApiResult<Json<PreparationStatus>> {
-    tokio::task::spawn_blocking(move || {
-        prepare_with_review(&engine, request, |engine, selected| {
+    let operation = request.operation.clone();
+    let reviewed_engine = engine.clone();
+    let result = tokio::task::spawn_blocking(move || {
+        prepare_with_review(&reviewed_engine, request, |engine, selected| {
             review_with_inventory(engine, selected, live_shares)
         })
         .and_then(response)
     })
     .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map(Json)
+    .map_err(|error| ApiError::internal(error.to_string()))?;
+    if result.is_err() {
+        // Recheck failure can cancel a reservation after an older owner exited.
+        // Recover that committed cancellation just like the explicit endpoint.
+        if let Err(error) =
+            super::super::containers::preparation_recovery::recover_cancelled(&engine, &operation)
+                .await
+        {
+            tracing::warn!(error=%error.message,"failed preparation cleanup requires retry");
+        }
+    }
+    result.map(Json)
 }
 
 fn checked(review: &Review, request: &PrepareRequest) -> ApiResult<()> {
@@ -133,9 +145,16 @@ fn prepare_with_review(
     } else {
         let reviewed = review(engine, &request.containers)?;
         checked(&reviewed, &request)?;
+        let recovery = super::super::containers::preparation_recovery::capture(
+            engine,
+            &request.operation,
+            &request.fingerprint,
+            &request.containers,
+            &reviewed.roots,
+        )?;
         engine
             .db
-            .reserve_workload_preparation(
+            .reserve_workload_preparation_with_recovery(
                 Preparation {
                     version: 1,
                     operation: request.operation.clone(),
@@ -145,6 +164,7 @@ fn prepare_with_review(
                 },
                 reviewed.claims,
                 &reviewed.roots,
+                recovery.as_deref(),
             )
             .map_err(ApiError::mutation)?
     };
@@ -154,7 +174,9 @@ fn prepare_with_review(
     let rechecked =
         review(engine, &request.containers).and_then(|review| checked(&review, &request));
     if let Err(error) = rechecked {
-        engine.db.cancel_workload_preparation(&request.operation).map_err(|_| {
+        engine.db.cancel_workload_preparation_checked(&request.operation, |record, bytes| {
+            super::super::containers::preparation_recovery::check_cancel(engine, record, bytes)
+        }).map_err(|_| {
             ApiError::conflict("preparation could not be released; inspect or cancel this operation before retrying")
         })?;
         return Err(error);
@@ -186,16 +208,30 @@ pub(in crate::engine) async fn cancel(
     State(engine): State<Arc<Engine>>,
     ApiPath(operation): ApiPath<String>,
 ) -> ApiResult<Json<PreparationStatus>> {
-    tokio::task::spawn_blocking(move || {
-        engine
+    let recovery_engine = engine.clone();
+    let record = tokio::task::spawn_blocking(move || {
+        recovery_engine
             .db
-            .cancel_workload_preparation(&operation)
+            .cancel_workload_preparation_checked(&operation, |record, bytes| {
+                super::super::containers::preparation_recovery::check_cancel(
+                    &recovery_engine,
+                    record,
+                    bytes,
+                )
+            })
             .map_err(ApiError::mutation)
-            .and_then(response)
     })
     .await
-    .map_err(|error| ApiError::internal(error.to_string()))?
-    .map(Json)
+    .map_err(|error| ApiError::internal(error.to_string()))??;
+    super::super::containers::preparation_recovery::recover_cancelled(&engine, &record.operation)
+        .await?;
+    // Cancellation and adapter startup share the same idempotent wake-up.
+    for id in selection(&record)? {
+        super::super::containers::wake_pending(&engine, &id)
+            .await
+            .map_err(|_| ApiError::conflict("preparation was cancelled but cleanup recovery could not start; retry cancellation"))?;
+    }
+    response(record).map(Json)
 }
 
 #[cfg(test)]

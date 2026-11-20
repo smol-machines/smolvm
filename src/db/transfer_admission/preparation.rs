@@ -106,13 +106,101 @@ fn read(conn: &Connection, operation: &str) -> Result<Option<Preparation>> {
     .transpose()
 }
 
+/// A read-only journal snapshot. Per-VM recovery ownership, acquired separately,
+/// protects adoption without blocking ordinary operations on unrelated VMs.
+#[cfg(unix)]
+pub(crate) struct RecoverySnapshot {
+    db: crate::db::SmolvmDb,
+    pub preparation: Preparation,
+    pub data: Vec<u8>,
+}
+
+#[cfg(unix)]
+impl RecoverySnapshot {
+    /// Only after every retained execution is obsolete or its canonical exit
+    /// record has been synced. Failure leaves the journal available for retry.
+    pub(crate) fn retire(self) -> Result<()> {
+        self.db.with_durable_conn(|conn| {
+            let tx = conn
+                .transaction_with_behavior(crate::db::TransactionBehavior::Immediate)
+                .db_err("begin recovery journal retirement")?;
+            let current = read(&tx, &self.preparation.operation)?
+                .ok_or_else(|| conflict("preparation disappeared during recovery"))?;
+            if current.phase != Phase::Cancelled || !same_review(&current, &self.preparation) {
+                return Err(conflict("preparation changed during recovery"));
+            }
+            let removed = tx
+                .execute(
+                    "DELETE FROM workload_preparation_recovery WHERE operation=?1 AND data=?2",
+                    crate::db::params![current.operation, self.data],
+                )
+                .db_err("retire recovered preparation journal")?;
+            if removed == 0 {
+                let exists: bool = tx.query_row("SELECT EXISTS(SELECT 1 FROM workload_preparation_recovery WHERE operation=?1)",
+                    [&current.operation],|row|row.get(0)).db_err("check recovery journal retirement")?;
+                if exists { return Err(conflict("preparation recovery ownership changed")); }
+            }
+            tx.commit().db_err("commit recovery journal retirement")
+        })
+    }
+}
+
 #[cfg(unix)]
 impl crate::db::SmolvmDb {
+    pub(crate) fn preparation_recovery(&self, operation: &str) -> Result<Option<RecoverySnapshot>> {
+        if !operation_valid(operation) {
+            return Err(conflict("invalid transfer operation"));
+        }
+        let retained = self.with_read_conn(|conn| {
+            let Some(preparation) = read(conn, operation)? else {
+                return Ok(None);
+            };
+            if preparation.phase != Phase::Cancelled {
+                return Ok(None);
+            }
+            let data: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT data FROM workload_preparation_recovery WHERE operation=?1",
+                    [operation],
+                    |row| row.get(0),
+                )
+                .optional()
+                .db_err("read preparation recovery journal")?;
+            Ok(data.map(|data| (preparation, data)))
+        })?;
+        Ok(retained.map(|(preparation, data)| RecoverySnapshot {
+            db: self.clone(),
+            preparation,
+            data,
+        }))
+    }
+
+    pub(crate) fn pending_preparation_recoveries(&self) -> Result<Vec<String>> {
+        self.with_read_conn(|conn| {
+            let mut statement = conn.prepare(
+                "SELECT r.operation FROM workload_preparation_recovery r JOIN workload_transfer_admission a ON a.operation=r.operation WHERE a.retired=1 ORDER BY r.operation",
+            ).db_err("list cancelled preparation journals")?;
+            let operations = statement.query_map([], |row| row.get(0)).db_err("read cancelled preparation operations")?
+                .collect::<rusqlite::Result<Vec<_>>>().db_err("decode cancelled preparation operations")?;
+            Ok(operations)
+        })
+    }
+    #[cfg(test)]
     pub(crate) fn reserve_workload_preparation(
         &self,
         record: Preparation,
         members: Vec<super::Member>,
         roots: &[std::path::PathBuf],
+    ) -> Result<Preparation> {
+        self.reserve_workload_preparation_with_recovery(record, members, roots, None)
+    }
+
+    pub(crate) fn reserve_workload_preparation_with_recovery(
+        &self,
+        record: Preparation,
+        members: Vec<super::Member>,
+        roots: &[std::path::PathBuf],
+        recovery: Option<&[u8]>,
     ) -> Result<Preparation> {
         if record.phase != Phase::Reserved {
             return Err(conflict(
@@ -126,6 +214,7 @@ impl crate::db::SmolvmDb {
             members,
             roots,
             Some(&bytes),
+            recovery,
         )?;
         self.workload_preparation(&record.operation)?
             .ok_or_else(|| conflict("workload preparation disappeared after reservation"))
@@ -142,20 +231,41 @@ impl crate::db::SmolvmDb {
         &self,
         reviewed: &Preparation,
     ) -> Result<Preparation> {
-        self.transition_workload_preparation(&reviewed.operation, Some(reviewed))
+        self.transition_workload_preparation(&reviewed.operation, Some(reviewed), |_, _| Ok(()))
     }
 
     /// Safe only before capture: neither supported active phase changes source
     /// execution or creates a destination. Future capture phases must provide
     /// their own recovery, and must never be admitted by this transition.
+    #[cfg(test)]
     pub(crate) fn cancel_workload_preparation(&self, operation: &str) -> Result<Preparation> {
-        self.transition_workload_preparation(operation, None)
+        self.cancel_workload_preparation_checked(operation, |_, recovery| {
+            if recovery.is_some() {
+                return Err(conflict(
+                    "preparation has retained executions; recover them before cancellation",
+                ));
+            }
+            Ok(())
+        })
+    }
+
+    /// Check retained ownership while holding the exclusive admission gate.
+    /// Older supervisors can fail cleanup against this gate after the check,
+    /// so cancellation must keep the journal for post-cancellation recovery.
+    /// The callback must not acquire database or admission locks recursively.
+    pub(crate) fn cancel_workload_preparation_checked(
+        &self,
+        operation: &str,
+        check: impl FnOnce(&Preparation, Option<&[u8]>) -> Result<()>,
+    ) -> Result<Preparation> {
+        self.transition_workload_preparation(operation, None, check)
     }
 
     fn transition_workload_preparation(
         &self,
         operation: &str,
         reviewed: Option<&Preparation>,
+        check: impl FnOnce(&Preparation, Option<&[u8]>) -> Result<()>,
     ) -> Result<Preparation> {
         if !operation_valid(operation) {
             return Err(conflict("invalid transfer operation"));
@@ -180,9 +290,13 @@ impl crate::db::SmolvmDb {
                         current.phase = Phase::Prepared;
                     }
                     None => {
-                        match current.phase {
-                            Phase::Reserved | Phase::Prepared => {}
-                            Phase::Cancelled => return Ok(current),
+                        let recovery: Option<Vec<u8>> = tx.query_row(
+                            "SELECT data FROM workload_preparation_recovery WHERE operation = ?1",
+                            [operation], |row| row.get(0),
+                        ).optional().db_err("read preparation recovery before cancellation")?;
+                        check(&current, recovery.as_deref())?;
+                        if current.phase == Phase::Cancelled {
+                            return Ok(current);
                         }
                         current.phase = Phase::Cancelled;
                         tx.execute(
@@ -190,6 +304,8 @@ impl crate::db::SmolvmDb {
                             [operation],
                         )
                         .db_err("retire cancelled workload preparation")?;
+                        // The claim ending does not prove the older owner
+                        // finished cleanup. Keep its recovery authority.
                     }
                 }
                 let bytes = serde_json::to_vec(&current).db_err("encode preparation transition")?;

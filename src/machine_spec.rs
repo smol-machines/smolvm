@@ -1830,6 +1830,7 @@ impl ResolvedSpec {
         // Every record field, named, so a new one has to be decided here.
         Ok(VmRecord {
             database_identity: None,
+            execution_identity: None,
             name: name.to_string(),
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,

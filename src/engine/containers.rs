@@ -15,6 +15,10 @@ use super::runtime::{Exit, InputQueue, Output};
 use super::util::{ApiError, ApiResult};
 use super::Engine;
 
+mod exit_cleanup;
+pub(in crate::engine) mod preparation_recovery;
+pub(super) use exit_cleanup::{spawn_pending_recovery, wake_pending};
+
 /// Label naming the engine container a machine belongs to.
 pub(crate) const MACHINE_LABEL: &str = "smolvm.engine/container";
 
@@ -154,6 +158,12 @@ pub(crate) struct EndpointRecord {
 /// The machine generation and guest execution retained across a saved VM.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SavedExecution {
+    #[serde(default)]
+    container_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine_execution: Option<crate::db::transfer_admission::Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine_execution_identity: Option<String>,
     session: super::container_session::SavedSession,
     machine: String,
     machine_created_at: u64,
@@ -1412,12 +1422,17 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
             "only the owning supervisor may start this workload",
         ));
     }
-    if c.is_running() {
+    if c.is_running() && !exit_cleanup::pending(&c.record()) {
         return Ok(false);
     }
     // A machine still shutting down after the last exit must finish first.
     let _vm = c.vm.clone().lock_owned().await;
     let record = c.record();
+    if exit_cleanup::pending(&record) {
+        return Err(ApiError::conflict(
+            "container exit cleanup requires recovery",
+        ));
+    }
     if record.state.status == "removing" {
         return Err(ApiError::conflict("container is being removed"));
     }
@@ -1674,6 +1689,7 @@ fn supervise_container<'a>(
             r.state.exit_code = 0;
             r.state.error.clear();
             r.state.oom_killed = false;
+            r.running_at_shutdown = false;
             r.state.started_at = origin.started_at.clone();
             r.state.finished_at = super::util::ZERO_TIME.into();
             r.pending_archives.clear();
@@ -1739,12 +1755,9 @@ fn supervise_container<'a>(
             )
             .await;
             let exit = match result {
-                Ok(exit) => {
-                    if let Err(error) = session.forget().await {
-                        tracing::warn!(container = %record.id, error = %error, "could not release completed container session");
-                    }
-                    exit
-                }
+                // Retain the guest's terminal result until host cleanup is
+                // durable: admission may defer teardown across cancellation.
+                Ok(exit) => exit,
                 Err(error) => {
                     if retain_saved_execution(&e, &container, &session, pid, process_started).await
                     {
@@ -1775,10 +1788,10 @@ fn supervise_container<'a>(
                 log.flush();
             }
             container.log_written.notify_waiters();
-            if let Some(lease) = image_lease {
-                lease.release().await;
-            }
-            on_exit(e, container, exit).await;
+            // saved_execution retains the image reference until admitted,
+            // recoverable cleanup of the original VM's exports succeeds.
+            drop(image_lease);
+            on_exit(e, container, exit, Some(&mut session)).await;
         });
         Ok(true)
     })
@@ -1806,7 +1819,22 @@ fn saved_execution(
     if vm.labels.get(MACHINE_LABEL) != Some(&owner.id) {
         return Err(ApiError::conflict("container machine ownership changed"));
     }
+    let identity = vm
+        .database_identity
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("container machine has no durable identity"))?;
     Ok(SavedExecution {
+        container_generation: session.origin().generation,
+        machine_execution_identity: Some(vm.execution_identity.clone().ok_or_else(|| {
+            ApiError::conflict("container machine has no durable execution identity")
+        })?),
+        machine_execution: Some(crate::db::transfer_admission::Member {
+            name: vm.name.clone(),
+            generation: Some(identity.generation().to_owned()),
+            created_at: vm.created_at,
+            pid: vm.pid,
+            pid_start_time: vm.pid_start_time,
+        }),
         session: session.saved(),
         machine: vm.name,
         machine_created_at: vm.created_at,
@@ -1908,7 +1936,10 @@ pub(crate) async fn reconcile_owner(engine: &Arc<Engine>) -> ApiResult<()> {
     else {
         return Ok(());
     };
-    if c.running.lock().is_some() || c.record().saved_execution.is_none() {
+    if c.running.lock().is_some()
+        || c.record().saved_execution.is_none()
+        || exit_cleanup::pending(&c.record())
+    {
         return Ok(());
     }
     let _op = c.op.lock().await;
@@ -2112,79 +2143,93 @@ pub(crate) fn overlay_id(record: &ContainerRecord) -> String {
 
 /// The container's command ended: record it, stop the machine, and apply the
 /// restart policy.
-async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
-    // Once the record becomes exited it no longer keeps its supervisor alive.
-    // VM/network teardown and auto-removal still belong to this supervisor.
+async fn on_exit(
+    engine: Arc<Engine>,
+    c: Arc<Container>,
+    exit: Exit,
+    session: Option<&mut super::container_session::Session>,
+) {
+    // An exited command can still own deferred VM/volume cleanup. Keep its
+    // existing supervisor alive until that work completes or reports an error.
     let activity = engine.activity.hold();
-    tracing::info!(container = %c.id(), name = %c.name(), code = exit.code, oom = exit.oom, "container exited");
     let vm_guard = c.vm.clone().lock_owned().await;
-    let running = c.running.lock().take();
-    let started_at = c.record().state.started_at;
-    c.input.finish();
-    c.update(&engine, |r| {
-        r.state.status = "exited".into();
-        r.saved_execution = None;
-        r.execution_suspended = false;
-        r.state.pid = 0;
-        r.state.exit_code = exit.code;
-        r.state.oom_killed = exit.oom;
-        r.state.finished_at = super::util::now_rfc3339();
-        if let Some(h) = r.state.health.as_mut() {
-            h.status = "unhealthy".into();
+    let already_reported = exit_cleanup::pending(&c.record());
+    if !already_reported {
+        // Keep saved_execution alongside the terminal status. Together they
+        // journal pending cleanup without depending on a live VM handle.
+        let mut delay = Duration::from_millis(100);
+        loop {
+            match c.update_durable(&engine, |r| {
+                r.state.status = "exited".into();
+                r.execution_suspended = false;
+                r.state.pid = 0;
+                r.state.exit_code = exit.code;
+                r.state.oom_killed = exit.oom;
+                r.state.finished_at = super::util::now_rfc3339();
+                if let Some(h) = r.state.health.as_mut() {
+                    h.status = "unhealthy".into();
+                }
+            }) {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(container = %c.id(), error = %error.message, "could not retain container exit; cleanup deferred");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+            }
         }
-    });
-    let _ = c.output.send(Output::End);
-    c.emit(&engine, "die", &[("exitCode", exit.code.to_string())]);
-    c.exits.send_modify(|s| {
-        s.exits += 1;
-        s.code = exit.code;
-    });
-
-    // The command is gone; stop its machine. Nothing is left to flush but
-    // the disks, so no grace period.
-    let record = c.record();
-    if let Some(mut handle) = running.and_then(|mut r| r.vm.take()) {
-        let _ = tokio::task::spawn_blocking(move || handle.stop_with_timeout(Some(Duration::ZERO)))
-            .await;
     }
-    if record.network_host().is_some() {
-        release_guest_shares(&engine, &record).await;
-    } else {
-        stop_machine(&engine, &record.machine, Some(Duration::ZERO)).await;
+    // The journal owns recovery now; dropping a handle must not bypass admission.
+    if let Some(handle) = c.running.lock().take().and_then(|mut r| r.vm.take()) {
+        handle.detach();
+    }
+    c.input.finish();
+    if !already_reported {
+        let _ = c.output.send(Output::End);
+        c.emit(&engine, "die", &[("exitCode", exit.code.to_string())]);
+        c.exits.send_modify(|s| {
+            s.exits += 1;
+            s.code = exit.code;
+        });
+    }
+    let admission = exit_cleanup::wait_for_admission(&engine, &c).await;
+    // Forgetting a guest result before this point would make a supervisor crash
+    // during a reservation indistinguishable from a lost execution.
+    if let Some(session) = session {
+        if let Err(error) = session.forget().await {
+            tracing::warn!(container = %c.id(), error = %error, "could not release completed container session");
+        }
+    }
+    let record = c.record();
+    if let Err(error) = exit_cleanup::stop_original_machine(&engine, &record).await {
+        c.update(&engine, |r| r.state.error = error.message.clone());
+        tracing::error!(container = %c.id(), error = %error.message, "container exit cleanup requires recovery");
+        return;
     }
     super::network::after_stop(&engine, &c).await;
+    let restart = if record.host_config.auto_remove {
+        None
+    } else {
+        match exit_cleanup::finish(&engine, &c) {
+            Ok(restart) => restart,
+            Err(error) => {
+                tracing::error!(container = %c.id(), error = %error.message, "could not complete container exit cleanup");
+                return;
+            }
+        }
+    };
     drop(vm_guard);
+    drop(admission);
 
     if record.host_config.auto_remove {
         let _ = remove(&engine, &c, true, true).await;
         return;
     }
-    if !should_restart(&record, exit.code) {
-        return;
-    }
-    let ran = super::util::unix_seconds(&super::util::now_rfc3339())
-        - super::util::unix_seconds(&started_at);
-    let attempt = if ran >= 10 { 0 } else { record.restart_count };
-    let delay = Duration::from_millis(100u64.saturating_mul(1 << attempt.min(10)))
-        .min(Duration::from_secs(60));
-    c.update(&engine, |r| {
-        r.state.status = "restarting".into();
-        r.restart_count += 1;
-    });
-    // The restarting state owns the lifetime during backoff; cleanup is done.
+    // The durable restarting state owns the lifetime during backoff. A new
+    // transfer may defer this start, but cannot discard the queued policy.
     drop(activity);
-    tokio::time::sleep(delay).await;
-    let _op = c.op.lock().await;
-    let current = c.record();
-    if current.state.status != "restarting" || current.user_stopped {
-        return;
-    }
-    if let Err(e) = start_boxed(engine.clone(), c.clone()).await {
-        tracing::warn!(container = %current.id, error = %e.message, "restart failed");
-        c.update(&engine, |r| {
-            r.state.status = "exited".into();
-            r.state.error = e.message.clone();
-        });
+    if let Some(generation) = restart {
+        exit_cleanup::resume_restart(engine, c, generation).await;
     }
 }
 
@@ -2421,11 +2466,13 @@ async fn stop_locked(
         restore_saved_execution(engine, c, true).await?;
     }
     let record = c.record();
-    if record.state.status == "restarting" {
-        c.update(engine, |r| {
+    if record.state.status == "restarting" || exit_cleanup::pending(&record) {
+        // Stop also cancels a queued restart while teardown is finishing.
+        c.update_durable(engine, |r| {
             r.user_stopped = true;
+            r.running_at_shutdown = false;
             r.state.status = "exited".into();
-        });
+        })?;
         return Ok(true);
     }
     if !c.is_running() {
@@ -2555,15 +2602,38 @@ pub(crate) async fn remove(
         stop_locked(engine, c, Some(0), Some("SIGKILL".into())).await?;
     }
     let _vm = c.vm.lock().await;
+    // Stop or exit recovery may have changed the execution while we waited.
+    // A shared guest's record is its cleanup journal: do not erase it until
+    // its exports and image ownership have been released successfully.
+    let record = c.record();
+    if exit_cleanup::pending(&record) && record.network_host().is_some() {
+        exit_cleanup::stop_original_machine(engine, &record).await?;
+    }
     let e = engine.clone();
     let machine = record.machine.clone();
+    let pending_exit = exit_cleanup::pending(&record).then(|| record.clone());
     tokio::task::spawn_blocking(move || {
-        if let Some(vm) = e.db.get_vm(&machine)? {
-            crate::embedded::control::delete_vm(&e.db, &machine)?;
-            // The last container branched from a retired base takes it along.
-            if vm.golden.is_some() {
-                super::warm::collect(&e);
+        let deleted = if machine.is_empty() {
+            None
+        } else if let Some(record) = pending_exit {
+            let _source_lock = crate::agent::fork::lock_fork_source(&machine)?;
+            let vm = exit_cleanup::reviewed_machine(&e, &record).map_err(|error| {
+                crate::Error::agent_conflict("remove exited container", error.message)
+            })?;
+            if let Some(vm) = &vm {
+                crate::deletion::delete_machine_locked(&e.db, vm, None, false, false)?;
             }
+            vm
+        } else {
+            let vm = e.db.get_vm(&machine)?;
+            if vm.is_some() {
+                crate::embedded::control::delete_vm(&e.db, &machine)?;
+            }
+            vm
+        };
+        // The last container branched from a retired base takes it along.
+        if deleted.is_some_and(|vm| vm.golden.is_some()) {
+            super::warm::collect(&e);
         }
         Ok::<_, crate::Error>(())
     })
@@ -2839,6 +2909,33 @@ pub(crate) async fn recover(engine: &Arc<Engine>) {
         if engine.owner.as_deref() != Some(c.id().as_str()) {
             continue;
         }
+        if exit_cleanup::pending(&c.record()) {
+            let activity = engine.activity.hold();
+            let (engine, c) = (engine.clone(), c.clone());
+            tokio::spawn(async move {
+                let _activity = activity;
+                let state = c.record().state;
+                on_exit(
+                    engine,
+                    c,
+                    Exit {
+                        code: state.exit_code,
+                        oom: state.oom_killed,
+                    },
+                    None,
+                )
+                .await;
+            });
+            continue;
+        }
+        if c.record().state.status == "restarting" && c.record().saved_execution.is_none() {
+            let generation = c.record().execution_generation;
+            let (engine, c) = (engine.clone(), c.clone());
+            tokio::spawn(async move {
+                exit_cleanup::resume_restart(engine, c, generation).await;
+            });
+            continue;
+        }
         if c.record().saved_execution.is_some() {
             match restore_saved_execution(engine, &c, false).await {
                 Ok(true) => continue,
@@ -2910,7 +3007,10 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
             let user_stopped = c.record().user_stopped;
             c.update(&e, |r| r.running_at_shutdown = true);
             let _ = stop(&e, &c, None, None).await;
-            c.update(&e, |r| r.user_stopped = user_stopped);
+            c.update(&e, |r| {
+                r.user_stopped = user_stopped;
+                r.running_at_shutdown = true;
+            });
         }));
     }
     for t in tasks {

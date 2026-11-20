@@ -30,6 +30,30 @@ trait Exports {
     fn remove(&self, name: &str) -> crate::Result<()>;
 }
 struct Machine<'a>(&'a str);
+
+// None means the original VM record is gone; only its old ownership metadata
+// can remain, and no name-derived control operation is authorized.
+struct CleanupExports<'a>(Option<&'a crate::attach::OwnedShares>);
+impl Exports for CleanupExports<'_> {
+    fn source(&self, name: &str) -> crate::Result<Option<PathBuf>> {
+        self.0.map_or(Ok(None), |shares| shares.source(name, true))
+    }
+    fn add(&self, _name: &str, _source: &Path) -> crate::Result<()> {
+        Err(crate::Error::config(
+            "image share",
+            "cleanup cannot add exports",
+        ))
+    }
+    fn remove(&self, name: &str) -> crate::Result<()> {
+        if let Some(shares) = self.0 {
+            if let Some(source) = shares.source(name, true)? {
+                shares.remove(name, &source, true)?;
+            }
+        }
+        Ok(())
+    }
+}
+
 impl Exports for Machine<'_> {
     fn source(&self, name: &str) -> crate::Result<Option<PathBuf>> {
         Ok(crate::attach::shared_directories(self.0, true)?
@@ -78,6 +102,35 @@ fn lock(path: &Path) -> crate::Result<File> {
 impl Lease {
     pub(super) fn generation(&self) -> &str {
         &self.generation
+    }
+
+    /// Replay terminal cleanup, including a crash after the export disappeared
+    /// but before its retained owner was removed. A newer boot's lease is kept.
+    pub(super) fn release_retained(
+        root: &Path,
+        machine: &str,
+        host: &str,
+        generation: &str,
+        owner: &str,
+        name: String,
+        exports: Option<&crate::attach::OwnedShares>,
+    ) -> crate::Result<()> {
+        let path = root
+            .join("guest-image-shares")
+            .join(host)
+            .join(format!("{name}.json"));
+        if !path.try_exists()? {
+            return Ok(());
+        }
+        Self {
+            path,
+            machine: machine.to_owned(),
+            name,
+            owner: owner.to_owned(),
+            generation: generation.to_owned(),
+            preparing: None,
+        }
+        .unclaim(&CleanupExports(exports))
     }
 
     /// Recover an existing reference without changing the running guest's exports.
@@ -195,7 +248,14 @@ impl Lease {
         let Some(mut owners) = read_json::<Owners>(&self.path)? else {
             return Ok(());
         };
-        if owners.generation != self.generation || !owners.containers.remove(&self.owner) {
+        if owners.generation != self.generation {
+            return Ok(());
+        }
+        if !owners.containers.remove(&self.owner) {
+            // A previous rename may have succeeded before its directory sync
+            // failed. Complete durability before clearing the exit journal.
+            File::open(&self.path)?.sync_all()?;
+            File::open(self.path.parent().unwrap())?.sync_all()?;
             return Ok(());
         }
         if owners.containers.is_empty() {
@@ -209,7 +269,15 @@ impl Lease {
                 exports.remove(&self.name)?;
             }
         }
-        write_json(&self.path, &owners)
+        let mut staged = tempfile::NamedTempFile::new_in(self.path.parent().unwrap())?;
+        use std::io::Write;
+        serde_json::to_writer_pretty(&mut staged, &owners)
+            .map_err(|error| crate::Error::config("image share", error.to_string()))?;
+        staged.flush()?;
+        staged.as_file().sync_all()?;
+        staged.persist(&self.path).map_err(|error| error.error)?;
+        File::open(self.path.parent().unwrap())?.sync_all()?;
+        Ok(())
     }
 
     pub(super) async fn release(mut self) {
@@ -322,6 +390,58 @@ mod tests {
         recovered.unclaim(&device).unwrap();
         assert!(device.0.lock().unwrap().is_empty());
         assert!(recovered.verify_retained(&device).is_err());
+    }
+
+    #[test]
+    fn failed_export_removal_keeps_ownership_for_a_later_retry() {
+        struct Refuse<'a>(&'a Device);
+        impl Exports for Refuse<'_> {
+            fn source(&self, name: &str) -> crate::Result<Option<PathBuf>> {
+                self.0.source(name)
+            }
+            fn add(&self, name: &str, source: &Path) -> crate::Result<()> {
+                self.0.add(name, source)
+            }
+            fn remove(&self, _name: &str) -> crate::Result<()> {
+                Err(crate::Error::agent_conflict("fixture", "reserved export"))
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::default();
+        let mut first = lease(dir.path(), "exited", "boot1");
+        first.claim(dir.path(), &device).unwrap();
+        first.prepared();
+        assert!(first.unclaim(&Refuse(&device)).is_err());
+        assert!(read_json::<Owners>(&first.path)
+            .unwrap()
+            .unwrap()
+            .containers
+            .contains("exited"));
+        drop(first);
+        let mut recovered = lease(dir.path(), "exited", "boot1");
+        recovered.verify_retained(&device).unwrap();
+        recovered.unclaim(&device).unwrap();
+        assert!(device.0.lock().unwrap().is_empty());
+        recovered.unclaim(&device).unwrap();
+    }
+
+    #[test]
+    fn terminal_cleanup_replays_after_an_export_was_already_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let device = Device::default();
+        let mut first = lease(dir.path(), "exited", "boot1");
+        first.claim(dir.path(), &device).unwrap();
+        first.prepared();
+        device.remove(&first.name).unwrap();
+        drop(first); // Crash before the ownership file was updated.
+        let mut recovered = lease(dir.path(), "exited", "boot1");
+        recovered.unclaim(&device).unwrap();
+        assert!(read_json::<Owners>(&recovered.path)
+            .unwrap()
+            .unwrap()
+            .containers
+            .is_empty());
+        recovered.unclaim(&device).unwrap();
     }
 
     #[test]

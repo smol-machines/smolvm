@@ -23,6 +23,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 mod deletion_intent;
+mod execution;
 mod incarnation;
 mod recovery;
 pub(crate) use recovery::VmRecoveryGuard;
@@ -337,6 +338,10 @@ impl SmolvmDb {
                  operation TEXT PRIMARY KEY NOT NULL,
                  data BLOB NOT NULL
              );
+             CREATE TABLE IF NOT EXISTS workload_preparation_recovery (
+                 operation TEXT PRIMARY KEY NOT NULL,
+                 data BLOB NOT NULL
+             );
              CREATE TABLE IF NOT EXISTS fork_pools (
                  name TEXT PRIMARY KEY NOT NULL,
                  data BLOB NOT NULL
@@ -366,6 +371,7 @@ impl SmolvmDb {
         )
         .db_err("create tables")?;
         incarnation::install(&mut conn)?;
+        execution::install(&mut conn)?;
         recovery::install(&mut conn)?;
         deletion_intent::install(&mut conn)?;
 
@@ -629,14 +635,14 @@ impl SmolvmDb {
         let database = self.path.canonicalize()?;
         self.with_read_conn(|conn| {
             let mut stmt = conn.prepare_cached(
-                "SELECT v.name, v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name ORDER BY v.name"
+                "SELECT v.name, v.data, i.generation, e.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name LEFT JOIN vm_execution_epochs e ON e.name = v.name ORDER BY v.name"
             ).db_err("prepare list_vms")?;
-            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<String>>(2)?)))
+            let rows = stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?, row.get::<_, Option<String>>(2)?, row.get::<_, Option<String>>(3)?)))
                 .db_err("query vms")?;
             let mut vms = Vec::new();
             for row in rows {
-                let (name, data, generation) = row.db_err("read vms row")?;
-                let record = launch_admission::review::decode_record(&database, &name, &data, generation)?;
+                let (name, data, generation, execution) = row.db_err("read vms row")?;
+                let record = launch_admission::review::decode_record(&database, &name, &data, generation, execution)?;
                 vms.push((name, record));
             }
             Ok(vms)
@@ -2313,20 +2319,20 @@ impl SmolvmDb {
             let mut vms = BTreeMap::new();
             {
                 let mut stmt = tx
-                    .prepare_cached("SELECT v.name, v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name")
+                    .prepare_cached("SELECT v.name, v.data, i.generation, e.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name LEFT JOIN vm_execution_epochs e ON e.name = v.name")
                     .db_err("prepare list vms")?;
                 let rows = stmt
                     .query_map([], |row| {
                         let name: String = row.get(0)?;
                         let data: Vec<u8> = row.get(1)?;
                         let generation: Option<String> = row.get(2)?;
-                        Ok((name, data, generation))
+                        Ok((name, data, generation, row.get::<_, Option<String>>(3)?))
                     })
                     .db_err("query vms")?;
                 for row in rows {
-                    let (name, data, generation) = row.db_err("read vms row")?;
+                    let (name, data, generation, execution) = row.db_err("read vms row")?;
                     let record = launch_admission::review::decode_record(
-                        &database, &name, &data, generation,
+                        &database, &name, &data, generation, execution,
                     )?;
                     vms.insert(name, record);
                 }
