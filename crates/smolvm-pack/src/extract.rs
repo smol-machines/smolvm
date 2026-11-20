@@ -3470,6 +3470,16 @@ fn ensure_shared_artifact_sha256(
     ensure_shared_artifact_sha256_with_identity(sidecar_path, shared_dir, None)
 }
 
+/// Record which artifact a shared entry at `shared_dir` holds, before the
+/// entry is published: the first caller writes the artifact's SHA-256, and an
+/// artifact with another digest at the same CRC32 key is refused.
+pub fn record_shared_artifact_sha256(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256(sidecar_path, shared_dir)
+}
+
 fn ensure_shared_artifact_sha256_with_observed(
     sidecar_path: &Path,
     shared_dir: &Path,

@@ -164,15 +164,55 @@ fn held_checkpoint(store: &Path, id: &str) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
+/// File inside a materialized tree holding the token its record repeats.
+const MATERIALIZED_TOKEN: &str = ".smolvm-materialized";
+
+/// The materialized tree recorded for checkpoint `id`, if it is still the
+/// tree the record was written for. The tree lives at a path keyed by a
+/// CRC32 that a file can choose, and is evicted and re-extracted there by
+/// other restores; only the random token written into it at publication and
+/// repeated in the record ties the two together.
+fn materialized_tree(store: &Path, id: &str) -> Option<PathBuf> {
+    let record = std::fs::read_to_string(materialized_record(store, id)?).ok()?;
+    let mut lines = record.lines();
+    let tree = PathBuf::from(lines.next()?.trim());
+    let token = lines.next()?.trim();
+    if token.is_empty() || !smolvm_pack::extract::is_extracted(&tree) {
+        return None;
+    }
+    let marker = tree.join(MATERIALIZED_TOKEN);
+    let metadata = std::fs::symlink_metadata(&marker).ok()?;
+    if !metadata.is_file() || metadata.len() > 64 {
+        return None;
+    }
+    (std::fs::read_to_string(&marker).ok()?.trim() == token).then_some(tree)
+}
+
+/// Write a fresh token into the tree at `partial`, replacing any file of that
+/// name the checkpoint's index put there, and return it.
+fn write_materialized_token(partial: &Path) -> std::io::Result<String> {
+    let mut bytes = [0u8; 16];
+    getrandom::fill(&mut bytes).map_err(|error| std::io::Error::other(error.to_string()))?;
+    let token = hex::encode(bytes);
+    let marker = partial.join(MATERIALIZED_TOKEN);
+    match std::fs::remove_file(&marker) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error),
+    }
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    use std::io::Write;
+    options.open(&marker)?.write_all(token.as_bytes())?;
+    Ok(token)
+}
+
 /// Read-only files of the materialized tree of checkpoint `parent`, by inode,
 /// so a capture of a machine restored from it skips re-reading its shared
 /// disk bases. Empty when this node has no untouched tree of it.
 #[cfg(unix)]
 pub fn known_files_for(store: &Path, parent: &str) -> store::KnownFiles {
-    let tree = materialized_record(store, parent)
-        .and_then(|record| std::fs::read_to_string(record).ok())
-        .map(|tree| PathBuf::from(tree.trim()))
-        .filter(|tree| smolvm_pack::extract::is_extracted(tree));
+    let tree = materialized_tree(store, parent);
     let (Some(tree), Ok(Some(stored))) = (tree, held_checkpoint(store, parent)) else {
         return store::KnownFiles::default();
     };
@@ -446,15 +486,13 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         let Some(id) = cursor else { break };
         let pinned =
             crate::checkpoint_retention::pin(&store, &id).map_err(io("pin checkpoint base"))?;
-        let recorded = materialized_record(&store, &id)
-            .and_then(|record| std::fs::read_to_string(record).ok());
-        if let (Some(tree), Some(stored)) = (recorded, held_checkpoint(&store, &id)?) {
-            let tree = PathBuf::from(tree.trim());
-            if smolvm_pack::extract::is_extracted(&tree) {
-                base_tree = Some((stored, tree));
-                _base_pin = pinned;
-                break;
-            }
+        if let (Some(tree), Some(stored)) = (
+            materialized_tree(&store, &id),
+            held_checkpoint(&store, &id)?,
+        ) {
+            base_tree = Some((stored, tree));
+            _base_pin = pinned;
+            break;
         }
         cursor = store::find_lineage(&store, &id)
             .map_err(io("read checkpoint lineage"))?
@@ -506,12 +544,24 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         let _ = std::fs::remove_dir_all(&partial);
         Error::agent("materialize checkpoint", error.to_string())
     })?;
+    let token = write_materialized_token(&partial).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&partial);
+        io("mark materialized checkpoint")(error)
+    })?;
     smolvm_pack::extract::mark_extracted(&partial).map_err(io("mark checkpoint extracted"))?;
     #[cfg(unix)]
     {
         use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(&partial, std::fs::Permissions::from_mode(0o700));
     }
+    // The key is a CRC32 the file chooses, and the request may still be
+    // refused after this returns. Record whose payload the entry holds before
+    // it can be found, so another artifact with the same key is refused
+    // rather than served this tree.
+    smolvm_pack::extract::record_shared_artifact_sha256(artifact, &shared).map_err(|error| {
+        let _ = std::fs::remove_dir_all(&partial);
+        io("record materialized checkpoint")(error)
+    })?;
     match std::fs::rename(&partial, &shared) {
         Ok(()) => {}
         Err(_) if smolvm_pack::extract::is_extracted(&shared) => {
@@ -526,7 +576,7 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         if let Some(parent) = record.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        let _ = std::fs::write(&record, shared.to_string_lossy().as_bytes());
+        let _ = std::fs::write(&record, format!("{}\n{token}\n", shared.to_string_lossy()));
     }
     if let Err(error) = store::remember_base(
         &restore_bases(&store),
@@ -573,6 +623,38 @@ mod tests {
             error.to_string().contains("different checkpoint"),
             "{error}"
         );
+    }
+
+    #[test]
+    fn a_record_names_only_the_tree_it_was_written_for() {
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::TempDir::new().unwrap();
+        let store = root.path().join("store");
+        let tree = root.path().join("_shared").join("0000beef");
+        std::fs::create_dir_all(store.join("materialized")).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        let token = write_materialized_token(&tree).unwrap();
+        smolvm_pack::extract::mark_extracted(&tree).unwrap();
+        let record = materialized_record(&store, ID).unwrap();
+        let write_record = |body: String| std::fs::write(&record, body).unwrap();
+
+        write_record(format!("{}\n{token}\n", tree.display()));
+        assert_eq!(materialized_tree(&store, ID), Some(tree.clone()));
+
+        // A record from before tokens, or naming another token, is ignored.
+        write_record(format!("{}\n", tree.display()));
+        assert_eq!(materialized_tree(&store, ID), None);
+        write_record(format!("{}\n{}\n", tree.display(), "f".repeat(32)));
+        assert_eq!(materialized_tree(&store, ID), None);
+
+        // The tree evicted and another extracted at the same path.
+        write_record(format!("{}\n{token}\n", tree.display()));
+        std::fs::remove_dir_all(&tree).unwrap();
+        std::fs::create_dir_all(&tree).unwrap();
+        smolvm_pack::extract::mark_extracted(&tree).unwrap();
+        assert_eq!(materialized_tree(&store, ID), None);
+        write_materialized_token(&tree).unwrap();
+        assert_eq!(materialized_tree(&store, ID), None);
     }
 
     #[test]
