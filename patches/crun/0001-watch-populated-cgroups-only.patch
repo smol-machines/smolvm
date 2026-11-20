@@ -1,0 +1,53 @@
+--- a/src/libcrun/cgroup-utils.c
++++ b/src/libcrun/cgroup-utils.c
+@@ -985,10 +985,11 @@
+ /* Wait up to a short timeout for the cgroup to have no processes left.
+    Return 1 if the cgroup is not populated anymore, 0 otherwise.  */
+ static int
+-wait_cgroup_unpopulated (const char *path, int inotify_fd)
++wait_cgroup_unpopulated (const char *path)
+ {
+   cleanup_free char *events_file = NULL;
+   libcrun_error_t tmp_err = NULL;
++  cleanup_close int inotify_fd = -1;
+   struct timespec timeout = {
+     .tv_sec = CGROUP_KILL_WAIT_SEC,
+     .tv_nsec = 0,
+@@ -1018,6 +1019,17 @@
+       if (strstr (content, "populated 0"))
+         return 1;
+ 
++      /* Empty groups need no watcher.  Register only while tasks remain,
++         then re-read cgroup.events before polling so an exit between
++         the initial read and registration cannot be missed.  */
++      if (inotify_fd < 0)
++        {
++          inotify_fd = watch_cgroup_events (path);
++          if (inotify_fd < 0)
++            return 0;
++          continue;
++        }
++
+       ret = TEMP_FAILURE_RETRY (ppoll (&pfd, 1, &timeout, NULL));
+       if (ret <= 0)
+         return 0;
+@@ -1031,7 +1043,6 @@
+ cgroup_killall_path (const char *path, int signal, libcrun_error_t *err)
+ {
+   bool frozen = false;
+-  cleanup_close int inotify_fd = -1;
+   int ret;
+   size_t i;
+   cleanup_free pid_t *pids = NULL;
+@@ -1052,10 +1063,8 @@
+       if (UNLIKELY (ret < 0))
+         return ret;
+ 
+-      inotify_fd = watch_cgroup_events (path);
+-
+       ret = write_cgroup_file (AT_FDCWD, kill_file, "1", 1, err);
+-      if (ret >= 0 && inotify_fd >= 0 && wait_cgroup_unpopulated (path, inotify_fd))
++      if (ret >= 0 && wait_cgroup_unpopulated (path))
+         return 0;
+ 
+       if (UNLIKELY (ret < 0))

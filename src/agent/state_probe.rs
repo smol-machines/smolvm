@@ -19,6 +19,9 @@
 //! | Running | yes | no  | **Unreachable** ← the bug 2 case |
 //! | Running | no  | yes | Running (macOS PID-not-visible edge case) |
 //! | Running | no  | no  | Stopped |
+//! | Unreachable | * | yes | Running |
+//! | Unreachable | yes | no | Unreachable |
+//! | Unreachable | no | no | Stopped |
 //! | Stopped/Created/Failed | * | * | record.state (no probe) |
 //!
 //! Used by:
@@ -39,7 +42,14 @@ use crate::db::SmolvmDb;
 /// but short enough that a `machine list` over a handful of stale
 /// records doesn't take seconds.
 pub fn resolve_state(name: &str, record: &VmRecord) -> RecordState {
-    if record.state != RecordState::Running {
+    // Unreachable is a previous observation, not permission to kill a VM.
+    // In particular, a command can arrive after the child publishes its PID
+    // but before the guest agent is ready. Probe again before recovery so a
+    // now-responsive guest gets an orderly shutdown and can flush its disks.
+    if !matches!(
+        record.state,
+        RecordState::Running | RecordState::Unreachable
+    ) {
         return record.state.clone();
     }
 
@@ -160,6 +170,23 @@ pub(crate) fn recover_unreachable_machine_in_db(
     record: &VmRecord,
     db: &SmolvmDb,
 ) -> crate::Result<()> {
+    recover_unreachable_machine_with(record, db, |pid| {
+        crate::process::stop_vm_process_bounded(
+            pid,
+            crate::process::VM_SIGTERM_TIMEOUT,
+            crate::process::VM_SIGKILL_TIMEOUT,
+        )
+    })
+}
+
+fn recover_unreachable_machine_with(
+    record: &VmRecord,
+    db: &SmolvmDb,
+    stop: impl FnOnce(i32) -> crate::Result<crate::process::VmStop>,
+) -> crate::Result<()> {
+    // Retain the caller's review across a potentially slow process teardown.
+    // A transfer must refuse recovery before even the stop marker is written.
+    let ownership = db.reserve_vm_recovery(record)?;
     if let Some(pid) = record.pid {
         if crate::process::is_alive(pid) {
             if !crate::process::is_our_process_strict(pid, record.pid_start_time) {
@@ -171,12 +198,8 @@ pub(crate) fn recover_unreachable_machine_in_db(
                     ),
                 ));
             }
-            crate::vm_exit::mark_stop_requested(&crate::agent::vm_data_dir(&record.name), pid);
-            if let crate::process::VmStop::Held(held) = crate::process::stop_vm_process_bounded(
-                pid,
-                crate::process::VM_SIGTERM_TIMEOUT,
-                crate::process::VM_SIGKILL_TIMEOUT,
-            )? {
+            crate::vm_exit::mark_stop_requested(ownership.runtime_dir(), pid);
+            if let crate::process::VmStop::Held(held) = stop(pid)? {
                 // Nothing can make the process exit, and it runs no more
                 // code. Finish the teardown and keep its PID in the record,
                 // so a later start is refused while it still holds the disks.
@@ -189,17 +212,12 @@ pub(crate) fn recover_unreachable_machine_in_db(
         }
     }
 
-    if let Err(error) = crate::agent::cleanup_dead_vm_runtime_in_db(&record.name, db) {
-        tracing::warn!(
-            machine = %record.name,
-            %error,
-            "failed to clean runtime after unreachable VM teardown"
-        );
+    if let Err(error) =
+        crate::agent::cleanup_dead_vm_runtime_at(&record.name, db, ownership.runtime_dir())
+    {
+        tracing::warn!(machine = %record.name, %error, "failed to clean runtime after unreachable VM teardown");
     }
-
-    // Write via SmolvmDb (not SmolvmConfig) to avoid pulling the full
-    // in-memory config load; the update is targeted to the one record.
-    db.update_vm(&record.name, VmRecord::mark_process_stopped)?;
+    ownership.mark_stopped()?;
     Ok(())
 }
 
@@ -216,6 +234,13 @@ pub fn refuse_start_while_held(db: &SmolvmDb, name: &str) -> crate::Result<()> {
     let Some(record) = db.get_vm(name)? else {
         return Ok(());
     };
+    refuse_start_while_held_record(db, &record)
+}
+
+pub(crate) fn refuse_start_while_held_record(
+    db: &SmolvmDb,
+    record: &VmRecord,
+) -> crate::Result<()> {
     let (RecordState::Stopped, Some(pid)) = (&record.state, record.pid) else {
         return Ok(());
     };
@@ -223,11 +248,18 @@ pub fn refuse_start_while_held(db: &SmolvmDb, name: &str) -> crate::Result<()> {
         return Err(crate::Error::agent("start agent", held.start_refusal()));
     }
     if !record.is_process_alive() {
-        db.update_vm(name, |r| {
-            if r.state == RecordState::Stopped && r.pid == Some(pid) {
+        db.update_vm_for_record(record, |r| {
+            if (r.pid, r.pid_start_time) != (Some(pid), record.pid_start_time) {
+                return Err(crate::Error::agent_conflict(
+                    "recover held process",
+                    "machine execution changed",
+                ));
+            }
+            if r.state == RecordState::Stopped {
                 r.pid = None;
                 r.pid_start_time = None;
             }
+            Ok(())
         })?;
     }
     Ok(())
@@ -300,8 +332,8 @@ mod tests {
 
     #[test]
     fn non_running_states_pass_through_without_probing() {
-        // The resolver short-circuits on any state other than
-        // Running — never touches the agent socket. This matters
+        // The resolver short-circuits on inactive lifecycle states
+        // without touching the agent socket. This matters
         // both for performance (no per-record probe on big lists)
         // and for correctness (Stopped should never randomly
         // become Unreachable just because some unrelated socket
@@ -310,7 +342,6 @@ mod tests {
             RecordState::Created,
             RecordState::Stopped,
             RecordState::Failed,
-            RecordState::Unreachable, // already-unreachable stays unreachable
         ] {
             let r = record(s.clone(), Some(99999));
             // Pass a name that won't match any real agent socket on
@@ -334,6 +365,15 @@ mod tests {
         let r = record(RecordState::Running, None);
         let resolved = resolve_state("ghost-does-not-exist", &r);
         assert_eq!(resolved, RecordState::Stopped);
+    }
+
+    #[test]
+    fn unreachable_without_a_process_or_agent_resolves_to_stopped() {
+        let r = record(RecordState::Unreachable, None);
+        assert_eq!(
+            resolve_state("unreachable-ghost-does-not-exist", &r),
+            RecordState::Stopped
+        );
     }
 
     /// The cases that require a live agent socket (Running with PID
@@ -487,6 +527,7 @@ mod tests {
         let mut r = record(RecordState::Unreachable, Some(std::process::id() as i32));
         r.pid_start_time = None;
         db.insert_vm(&r.name, &r).unwrap();
+        let r = db.get_vm(&r.name).unwrap().unwrap();
 
         let error = recover_unreachable_machine_in_db(&r, &db).unwrap_err();
 
@@ -519,7 +560,7 @@ mod held_process_tests {
         record.pid = Some(pid);
         record.pid_start_time = start_time;
         db.insert_vm(name, &record).unwrap();
-        record
+        db.get_vm(name).unwrap().unwrap()
     }
 
     /// What `machine stop` does for a machine whose agent no longer answers.
@@ -614,3 +655,7 @@ mod held_process_tests {
         refuse_start_while_held(&db, "no-such-machine").unwrap();
     }
 }
+
+#[cfg(all(test, unix))]
+#[path = "state_probe_reviewed_tests.rs"]
+mod reviewed_recovery_tests;

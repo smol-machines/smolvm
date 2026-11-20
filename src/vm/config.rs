@@ -471,6 +471,7 @@ mod tests {
                 read_only: true,
                 staged: false,
                 recorded_ownership: false,
+                owner: None,
             })
             .command(vec!["/bin/sh".to_string()])
             .workdir("/app")

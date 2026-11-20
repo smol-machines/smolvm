@@ -161,6 +161,10 @@ impl AttachedDisk {
                 }
             )
         })?;
+        // A qcow2 header can name another host file for libkrun to read and
+        // write. The guest of any machine this disk was attached to before
+        // could have written one, and each attach reads the format afresh.
+        ensure_self_contained(&self.path, "disk")?;
         Ok(())
     }
 }
@@ -259,7 +263,7 @@ impl CacheDisk {
         validate_base_name(name)?;
         let cache = Self::parse(&format!("{}:{mount_path}", dir.join(name).display()))?;
         cache.validate()?;
-        ensure_self_contained(&cache.base)?;
+        ensure_self_contained(&cache.base, "cache base")?;
         Ok(cache)
     }
 
@@ -423,8 +427,8 @@ pub fn validate_base_name(name: &str) -> Result<(), String> {
 }
 
 /// Refuse a disk image that reads any file but itself: a qcow2 naming a
-/// backing file or an external data file.
-fn ensure_self_contained(path: &std::path::Path) -> Result<(), String> {
+/// backing file or an external data file. `what` names the disk in the error.
+fn ensure_self_contained(path: &std::path::Path, what: &str) -> Result<(), String> {
     use std::io::Read;
     const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
     const EXTERNAL_DATA_FILE: u64 = 1 << 2;
@@ -446,7 +450,7 @@ fn ensure_self_contained(path: &std::path::Path) -> Result<(), String> {
     let backing_len = u32::from_be_bytes(header[16..20].try_into().unwrap());
     if backing_offset != 0 || backing_len != 0 {
         return Err(format!(
-            "{display}: cache base names a backing file; publish a self-contained base"
+            "{display}: {what} names a backing file; use a self-contained image"
         ));
     }
     let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
@@ -456,7 +460,7 @@ fn ensure_self_contained(path: &std::path::Path) -> Result<(), String> {
         }
         if be64(72) & EXTERNAL_DATA_FILE != 0 {
             return Err(format!(
-                "{display}: cache base uses an external data file; publish a self-contained base"
+                "{display}: {what} uses an external data file; use a self-contained image"
             ));
         }
     }
@@ -601,6 +605,27 @@ mod tests {
         ] {
             assert!(validate_base_name(bad).is_err(), "{bad:?}");
         }
+    }
+
+    // A guest that had a writable --disk can leave a qcow2 header naming a
+    // host file on it. The next attach of that file must refuse it, not hand
+    // libkrun a disk that reads and writes the named file.
+    #[test]
+    fn an_attached_disk_must_read_only_itself() {
+        let dir = tempfile::tempdir().unwrap();
+        let attach = |name: &str, bytes: Vec<u8>| {
+            let path = dir.path().join(name);
+            std::fs::write(&path, bytes).unwrap();
+            AttachedDisk::parse(&path.display().to_string())
+                .unwrap()
+                .validate()
+        };
+        assert!(attach("raw.img", vec![0u8; 4096]).is_ok());
+        assert!(attach("plain.qcow2", qcow2_header(false, false)).is_ok());
+        let backed = attach("backed.img", qcow2_header(true, false)).unwrap_err();
+        assert!(backed.contains("backing file"), "{backed}");
+        let external = attach("external.img", qcow2_header(false, true)).unwrap_err();
+        assert!(external.contains("external data file"), "{external}");
     }
 
     #[test]

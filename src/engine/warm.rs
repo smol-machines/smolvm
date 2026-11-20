@@ -34,7 +34,7 @@
 //! deleted with the last one.
 
 use std::collections::{BTreeMap, HashMap};
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
 use super::Engine;
@@ -64,6 +64,8 @@ const RUNNING_BEFORE_BASE: usize = 2;
 #[derive(Default)]
 pub(crate) struct Bases {
     inner: parking_lot::Mutex<HashMap<String, Base>>,
+    /// Resolve once per supervisor, not on every container start.
+    guest_digest: OnceLock<Option<String>>,
     /// The running bases' machines, by name. A handle owns its machine:
     /// dropping it stops the machine.
     handles: parking_lot::Mutex<HashMap<String, crate::embedded::handle::VmHandle>>,
@@ -136,13 +138,13 @@ impl Bases {
     /// Whether the machine would branch from a ready base, so creating it
     /// need not seed its storage.
     pub(crate) fn ready_for(&self, engine: &Engine, vm: &VmRecord) -> bool {
-        key(vm).is_some_and(|key| {
-            shared_base(engine, &key).is_some()
-                || matches!(
-                    self.inner.lock().get(&key).map(|b| &b.status),
-                    Some(Status::Ready(_))
-                )
-        })
+        key(vm).is_some_and(|key| shared_base(engine, &key).is_some())
+    }
+
+    fn guest_digest(&self) -> Option<&str> {
+        self.guest_digest
+            .get_or_init(crate::agent::rootfs_store::installed_default_digest)
+            .as_deref()
     }
 
     /// Note a start of `vm`'s key; returns the base to branch from, if one
@@ -327,6 +329,13 @@ pub(crate) fn branch(
     // A ready base belongs to a workload supervisor, not the disposable adapter.
     let shared = shared_base(engine, &key);
     let base = shared.or_else(|| engine.bases.note_start(engine, &own, &key))?;
+    // A cached local entry must obey the same compatibility rule as a base
+    // discovered from another supervisor. Leave old bases and clones intact.
+    let record = engine.db.get_vm(&base).ok().flatten()?;
+    let digest = engine.bases.guest_digest()?;
+    if record.agent_rootfs_digest.as_deref() != Some(digest) {
+        return None;
+    }
     // The created machine's record says what the container needs; the
     // branch takes its place under the same name.
     if let Err(error) = crate::embedded::control::delete_vm(&engine.db, machine) {
@@ -403,14 +412,18 @@ fn stop_base(engine: &Arc<Engine>, name: &str, vm: &VmRecord) {
         Some(mut handle) if frozen => handle.stop_paused(),
         Some(mut handle) => handle.stop_with_timeout(Some(Duration::ZERO)),
         None if !vm.is_process_alive() => Ok(()),
-        None if frozen => crate::agent::AgentManager::for_vm(name).and_then(|m| m.stop_paused()),
-        None => {
-            crate::embedded::control::stop_vm_with_timeout(&engine.db, name, Some(Duration::ZERO))
+        None if frozen => {
+            crate::agent::AgentManager::for_existing_vm_record(vm).and_then(|m| m.stop_paused())
         }
+        None => crate::embedded::control::stop_vm_record_with_timeout(
+            &engine.db,
+            vm,
+            Some(Duration::ZERO),
+        ),
     };
     match stopped {
         Ok(()) => {
-            let _ = crate::embedded::control::mark_stopped(&engine.db, name);
+            let _ = crate::embedded::control::mark_stopped_for_record(&engine.db, vm);
         }
         Err(error) => tracing::warn!(base = %name, %error, "could not stop a retired base"),
     }
@@ -462,6 +475,11 @@ fn shared_base(engine: &Engine, key: &str) -> Option<String> {
                     == Some(engine.config.root.to_string_lossy().as_ref())
                 && vm.labels.contains_key(BASE_READY)
                 && vm.is_process_alive()
+                // Do not scan the installed rootfs for ordinary cold starts
+                // when there is no reusable base in the first place.
+                && engine.bases.guest_digest().is_some_and(|digest| {
+                    vm.agent_rootfs_digest.as_deref() == Some(digest)
+                })
         })
         .map(|(name, _)| name)
 }
@@ -563,6 +581,54 @@ mod tests {
     }
 
     #[test]
+    fn an_upgrade_skips_old_bases_without_changing_their_records() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(dir.path());
+        engine
+            .bases
+            .guest_digest
+            .set(Some("sha256:new".into()))
+            .unwrap();
+        let mut old = record();
+        let key = key(&old).unwrap();
+        old.pid = Some(std::process::id() as i32);
+        old.agent_rootfs_digest = Some("sha256:old".into());
+        old.labels.insert(BASE_LABEL.into(), key.clone());
+        old.labels.insert(BASE_READY.into(), "true".into());
+        old.labels.insert(
+            BASE_ENGINE.into(),
+            engine.config.root.to_string_lossy().into_owned(),
+        );
+        engine.db.insert_vm("old-base", &old).unwrap();
+        assert!(shared_base(&engine, &key).is_none());
+        assert!(!engine.bases.ready_for(&engine, &record()));
+
+        let mut current = old.clone();
+        current.agent_rootfs_digest = Some("sha256:new".into());
+        engine.db.insert_vm("current-base", &current).unwrap();
+        assert_eq!(shared_base(&engine, &key).as_deref(), Some("current-base"));
+        assert!(engine.bases.ready_for(&engine, &record()));
+        assert_eq!(
+            engine
+                .db
+                .get_vm("old-base")
+                .unwrap()
+                .unwrap()
+                .agent_rootfs_digest,
+            old.agent_rootfs_digest
+        );
+
+        engine
+            .db
+            .update_vm("current-base", |vm| vm.agent_rootfs_digest = None)
+            .unwrap();
+        assert!(shared_base(&engine, &key).is_none());
+        let unknown = super::super::test_engine(dir.path());
+        unknown.bases.guest_digest.set(None).unwrap();
+        assert!(shared_base(&unknown, &key).is_none());
+    }
+
+    #[test]
     fn a_held_base_lock_is_given_up_on_instead_of_waited_for() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("warm.lock");
@@ -572,7 +638,11 @@ mod tests {
         assert!(lock_within(&path, Duration::from_millis(50)).is_none());
         assert!(started.elapsed() < Duration::from_secs(5));
         drop(held);
-        assert!(lock_within(&path, Duration::ZERO).is_some());
+        // Parallel tests spawn processes: a fork can retain this descriptor
+        // until exec closes it, even though our own descriptor was dropped.
+        // Keep the held-lock assertions nonblocking, but allow that transient
+        // inherited reference to close before proving the lock is reusable.
+        assert!(lock_within(&path, Duration::from_secs(1)).is_some());
     }
 
     #[test]

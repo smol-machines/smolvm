@@ -412,6 +412,44 @@ impl CrunCommand {
         self
     }
 
+    /// Carry only the trusted helper executable and its private handshake
+    /// socket through crun. Do not overwrite fixed fd numbers: Rust's spawn
+    /// error pipe and unrelated agent connections may occupy them.
+    #[cfg(target_os = "linux")]
+    pub fn controlled_exec_fds(
+        mut self,
+        executable: std::os::fd::OwnedFd,
+        handshake: std::os::fd::OwnedFd,
+    ) -> std::io::Result<Self> {
+        use std::os::{fd::AsRawFd, unix::process::CommandExt};
+        let maximum = executable.as_raw_fd().max(handshake.as_raw_fd());
+        if executable.as_raw_fd() < 3 || handshake.as_raw_fd() < 3 {
+            return Err(std::io::Error::other(
+                "controlled exec requires open standard descriptors",
+            ));
+        }
+        self.cmd
+            .arg("--preserve-fds")
+            .arg((maximum - 2).to_string());
+        // SAFETY: only raw syscalls run after fork; owned captures remain live
+        // through spawn. CLOEXEC retains Rust's error pipe until exec fails or
+        // succeeds, without leaking any unrelated descriptor into the runtime.
+        unsafe {
+            self.cmd.pre_exec(move || {
+                if libc::syscall(libc::SYS_close_range, 3u32, u32::MAX, 1u32 << 2) < 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                for fd in [executable.as_raw_fd(), handshake.as_raw_fd()] {
+                    if libc::fcntl(fd, libc::F_SETFD, 0) < 0 {
+                        return Err(std::io::Error::last_os_error());
+                    }
+                }
+                Ok(())
+            });
+        }
+        Ok(self)
+    }
+
     /// Start a container: `crun start <id>`
     pub fn start(container_id: &str) -> Self {
         let mut c = Self::new();

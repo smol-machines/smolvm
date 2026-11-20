@@ -126,6 +126,9 @@ async fn pull_unrecorded(
     let manifest_bytes = match cache.manifest_by_digest(client.base_url(), repo, reference) {
         Some(bytes) => {
             tracing::info!(repo = %repo, reference = %reference, "manifest found in cache");
+            // The cache was filled by whoever pulled first; this caller must
+            // still be one the registry serves the manifest to.
+            authorize_cached_manifest(client, repo, reference).await?;
             bytes
         }
         None => {
@@ -169,8 +172,17 @@ async fn pull_unrecorded(
     //    queued behind one fetching the same blob finds it cached here instead of
     //    streaming into the partial file the first one is about to rename away.
     let _download_lock = lock_blob_download(cache, digest).await?;
-    if let Some(cached_path) = cache.get(digest) {
+    // A copy already here or on a peer serves this pull only when this
+    // repository is known to hold the blob. The manifest that names it may
+    // come from a registry the caller controls, and naming another tenant's
+    // digest must not hand over that tenant's cached pack.
+    let vouched = blob_vouched(client, cache, repo, digest).await;
+    if !vouched {
+        discard_partial(&cache.blob_path_for(digest).with_extension("partial")).await;
+    }
+    if let Some(cached_path) = cache.get(digest).filter(|_| vouched) {
         tracing::info!(digest = %digest, "blob found in cache");
+        record_origin(cache, client, repo, digest);
 
         if let Some(out) = output {
             tokio::fs::copy(&cached_path, out).await?;
@@ -189,12 +201,13 @@ async fn pull_unrecorded(
     //    byte-for-byte as before. Peers arrive only from the control plane, and
     //    a node with no serve-TLS identity has no peer client, so this is also a
     //    no-op there.
-    if !blob_peers.is_empty() {
+    if vouched && !blob_peers.is_empty() {
         if let Some(peer_client) = crate::peer::peer_client() {
             if let Some(result) =
                 crate::peer::fetch_blob_from_peers(peer_client, blob_peers, digest, output, cache)
                     .await
             {
+                record_origin(cache, client, repo, digest);
                 return Ok(result);
             }
             tracing::info!(digest = %digest, "no peer served the blob; falling back to registry");
@@ -216,10 +229,72 @@ async fn pull_unrecorded(
         on_progress,
     )
     .await?;
+    record_origin(cache, client, repo, digest);
 
     tracing::info!(digest = %digest, size = result.size, "pull complete");
 
     Ok(result)
+}
+
+/// Whether `repo` on this registry is known to hold `digest`: it delivered
+/// the blob here before, or it is a registry trusted to say so
+/// ([`RegistryClient::vouching_for_blobs`]) and confirms it for this caller.
+async fn blob_vouched(
+    client: &RegistryClient,
+    cache: &BlobCache,
+    repo: &str,
+    digest: &str,
+) -> bool {
+    cache.has_origin(client.base_url(), repo, digest)
+        || (client.vouches_for_blobs() && client.blob_exists(repo, digest).await.unwrap_or(false))
+}
+
+fn record_origin(cache: &BlobCache, client: &RegistryClient, repo: &str, digest: &str) {
+    if let Err(error) = cache.record_origin(client.base_url(), repo, digest) {
+        tracing::debug!(%error, "could not record where a blob came from");
+    }
+}
+
+/// How long a registry's confirmation that a credential may read a
+/// repository's manifest is reused for cached manifests.
+const MANIFEST_AUTHORIZATION_TTL: Duration = Duration::from_secs(240);
+
+/// Confirm with the registry that this client's credential may read `repo`'s
+/// manifest `reference` before a cached copy is served. A confirmation is
+/// reused for a few minutes per credential and repository, so a burst of
+/// pulls costs one round trip.
+async fn authorize_cached_manifest(
+    client: &RegistryClient,
+    repo: &str,
+    reference: &str,
+) -> Result<()> {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    use std::time::Instant;
+    type Key = (String, String, String);
+    static CONFIRMED: Mutex<Option<HashMap<Key, Instant>>> = Mutex::new(None);
+    let key = (
+        client.credential_fingerprint(),
+        client.base_url().to_string(),
+        repo.to_string(),
+    );
+    {
+        let mut confirmed = CONFIRMED
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let confirmed = confirmed.get_or_insert_with(HashMap::new);
+        confirmed.retain(|_, at| at.elapsed() < MANIFEST_AUTHORIZATION_TTL);
+        if confirmed.contains_key(&key) {
+            return Ok(());
+        }
+    }
+    client.head_manifest_digest(repo, reference).await?;
+    CONFIRMED
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner())
+        .get_or_insert_with(HashMap::new)
+        .insert(key, Instant::now());
+    Ok(())
 }
 
 /// How long an abandoned partial download is kept for a retry to resume.
@@ -846,12 +921,24 @@ mod tests {
             .expect(1)
             .mount(&server)
             .await;
-        Mock::given(method("GET"))
-            .and(path(format!("/v2/myrepo/blobs/{layer}")))
-            .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
+        // A cached manifest is still authorized with the registry, once for
+        // the burst of pulls by the same credential.
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/myrepo/manifests/{pinned}")))
+            .respond_with(
+                ResponseTemplate::new(200).insert_header("docker-content-digest", pinned.as_str()),
+            )
             .expect(1)
             .mount(&server)
             .await;
+        for repo in ["myrepo", "other"] {
+            Mock::given(method("GET"))
+                .and(path(format!("/v2/{repo}/blobs/{layer}")))
+                .respond_with(ResponseTemplate::new(200).set_body_bytes(data.clone()))
+                .expect(1)
+                .mount(&server)
+                .await;
+        }
 
         let tmp = tempfile::tempdir().unwrap();
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
@@ -871,7 +958,10 @@ mod tests {
         let other = pull(&client, "other", &pinned, None, &cache, &[])
             .await
             .unwrap();
-        assert!(other.cached, "the layer blob itself is shared by digest");
+        assert!(
+            !other.cached,
+            "a blob another repository delivered is not served to this one"
+        );
         // MockServer drop asserts each manifest endpoint's expected hit count.
     }
 
@@ -1116,6 +1206,10 @@ mod tests {
         let server = registry_refusing_ranges(&data, &digest, 0, 0).await;
         let tmp = tempfile::tempdir().unwrap();
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        // Left by an earlier pull of this repository.
+        cache
+            .record_origin(&server.uri(), "myrepo", &digest)
+            .unwrap();
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, &data).unwrap();
 
@@ -1155,6 +1249,10 @@ mod tests {
         let server = registry_refusing_ranges(&data, &digest, 1, 1).await;
         let tmp = tempfile::tempdir().unwrap();
         let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        // Left by an earlier pull of this repository.
+        cache
+            .record_origin(&server.uri(), "myrepo", &digest)
+            .unwrap();
         let partial = cache.blob_path_for(&digest).with_extension("partial");
         std::fs::write(&partial, &data[..100]).unwrap();
 
@@ -1162,6 +1260,55 @@ mod tests {
             .await
             .expect("a 416 on resume must restart from zero");
         assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
+    }
+
+    /// A partial no earlier pull of this repository left (another repository
+    /// may have) is thrown away and the blob downloaded from the registry.
+    #[tokio::test]
+    async fn a_partial_this_repository_never_delivered_is_not_adopted() {
+        let (data, digest) = test_blob();
+        let server = registry_refusing_ranges(&data, &digest, 0, 1).await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        let partial = cache.blob_path_for(&digest).with_extension("partial");
+        std::fs::write(&partial, &data).unwrap();
+
+        let result = pull(&client_for(&server), "myrepo", "latest", None, &cache, &[])
+            .await
+            .unwrap();
+        assert_eq!(tokio::fs::read(&result.path).await.unwrap(), data);
+    }
+
+    /// A registry trusted to vouch lets a cached copy serve another repository
+    /// once it confirms that repository holds the blob.
+    #[tokio::test]
+    async fn a_vouching_registry_serves_a_cached_blob_it_confirms() {
+        let (data, digest) = test_blob();
+        let server = MockServer::start().await;
+        Mock::given(method("GET"))
+            .and(path("/v2/myrepo/manifests/latest"))
+            .respond_with(ResponseTemplate::new(200).set_body_raw(
+                serde_json::to_vec(&manifest_for(&digest, data.len())).unwrap(),
+                MANIFEST_MEDIA_TYPE,
+            ))
+            .mount(&server)
+            .await;
+        Mock::given(method("HEAD"))
+            .and(path(format!("/v2/myrepo/blobs/{digest}")))
+            .respond_with(ResponseTemplate::new(200))
+            .expect(1)
+            .mount(&server)
+            .await;
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = BlobCache::open(tmp.path().to_path_buf(), 1024 * 1024).unwrap();
+        cache.put(&digest, &data).unwrap();
+
+        let client = client_for(&server).vouching_for_blobs();
+        let result = pull(&client, "myrepo", "latest", None, &cache, &[])
+            .await
+            .unwrap();
+        assert!(result.cached);
+        assert!(cache.has_origin(&server.uri(), "myrepo", &digest));
     }
 
     fn client_for(server: &MockServer) -> RegistryClient {

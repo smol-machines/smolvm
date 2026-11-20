@@ -47,13 +47,11 @@ const MAX_SESSIONS: usize = 512;
 /// Packet slots per session socket buffer (per direction).
 const SESSION_PACKET_SLOTS: usize = 32;
 /// Payload bytes per session socket buffer (per direction).
-const SESSION_BUFFER_BYTES: usize = 32 * 1024;
+const SESSION_BUFFER_BYTES: usize = 64 * 1024;
 /// Largest datagram read from a published host socket.
 const MAX_DATAGRAM_BYTES: usize = 65_535;
-/// Largest payload that reaches the guest: one 1500-byte frame less the IPv4
-/// and UDP headers. The gateway does not fragment, so anything larger is
-/// dropped; game and voice protocols keep their datagrams under this anyway.
-pub const MAX_GUEST_PAYLOAD: usize = 1500 - 20 - 8;
+/// Largest IPv4 UDP payload; the interface fragments it to the link MTU.
+pub const MAX_GUEST_PAYLOAD: usize = 65_535 - 20 - 8;
 /// Drop a client's session after this much silence in both directions.
 const SESSION_IDLE_TIMEOUT: Duration = Duration::from_secs(120);
 /// Publisher thread poll ceiling, so shutdown is noticed promptly.
@@ -349,7 +347,7 @@ impl PublishedUdpTable {
         while let Ok(datagram) = from_host.try_recv() {
             if datagram.payload.len() > MAX_GUEST_PAYLOAD {
                 virtio_net_log!(
-                    "virtio-net: dropping {}-byte published UDP datagram from {} (over the {MAX_GUEST_PAYLOAD}-byte unfragmented limit)",
+                    "virtio-net: dropping {}-byte published UDP datagram from {} (over the {MAX_GUEST_PAYLOAD}-byte IPv4 UDP limit)",
                     datagram.payload.len(),
                     datagram.client
                 );

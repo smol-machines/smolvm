@@ -12,6 +12,13 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    pub(crate) fn mutation(error: crate::Error) -> Self {
+        if error.code() == "CONFLICT" {
+            Self::conflict(error.to_string())
+        } else {
+            Self::from(error)
+        }
+    }
     pub(crate) fn new(status: StatusCode, message: impl Into<String>) -> Self {
         Self {
             status,

@@ -43,12 +43,12 @@ pub(super) fn install_command(config: &EngineConfig, command: &str) -> smolvm::R
         ));
     }
     let exe = std::env::current_exe()?;
-    let home =
-        dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
+    let home = smolvm_paths::home_dir()
+        .ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
     let name = service_name(config);
     #[cfg(target_os = "linux")]
     {
-        let dir = dirs::config_dir()
+        let dir = smolvm_paths::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("systemd/user");
         std::fs::create_dir_all(&dir)?;
@@ -134,14 +134,14 @@ pub(super) fn install_command(config: &EngineConfig, command: &str) -> smolvm::R
 
 pub(super) fn uninstall(config: &EngineConfig) -> smolvm::Result<()> {
     let name = service_name(config);
-    let home =
-        dirs::home_dir().ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
+    let home = smolvm_paths::home_dir()
+        .ok_or_else(|| smolvm::Error::config("engine", "no home directory"))?;
     // The service manager keeps a registration made from a state directory
     // after that directory, and the unit files in it, are deleted. So the
     // registration is removed by name, whether or not its files are there.
     #[cfg(target_os = "linux")]
     {
-        let dir = dirs::config_dir()
+        let dir = smolvm_paths::config_dir()
             .unwrap_or_else(|| home.join(".config"))
             .join("systemd/user");
         let (socket, service) = (format!("{name}.socket"), format!("{name}.service"));

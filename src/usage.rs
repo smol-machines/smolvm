@@ -153,8 +153,8 @@ pub fn journal_dir() -> Option<PathBuf> {
     #[cfg(not(test))]
     {
         dir_from(std::env::var_os("SMOLVM_USAGE_DIR")).unwrap_or_else(|| {
-            dirs::data_local_dir()
-                .or_else(dirs::cache_dir)
+            smolvm_paths::data_local_dir()
+                .or_else(smolvm_paths::cache_dir)
                 .map(|d| d.join("smolvm").join("usage"))
         })
     }

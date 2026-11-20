@@ -11,9 +11,13 @@ use serde::{Deserialize, Serialize};
 use super::filters::Filters;
 use super::images::ImageRecord;
 use super::model::{ContainerConfig, CreateRequest, HealthConfig, HostConfig};
-use super::runtime::{Exit, Input, InputQueue, Output};
+use super::runtime::{Exit, InputQueue, Output};
 use super::util::{ApiError, ApiResult};
 use super::Engine;
+
+mod exit_cleanup;
+pub(in crate::engine) mod preparation_recovery;
+pub(super) use exit_cleanup::{spawn_pending_recovery, wake_pending};
 
 /// Label naming the engine container a machine belongs to.
 pub(crate) const MACHINE_LABEL: &str = "smolvm.engine/container";
@@ -151,6 +155,25 @@ pub(crate) struct EndpointRecord {
     pub gateway6: String,
 }
 
+/// The machine generation and guest execution retained across a saved VM.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct SavedExecution {
+    #[serde(default)]
+    container_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine_execution: Option<crate::db::transfer_admission::Member>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    machine_execution_identity: Option<String>,
+    session: super::container_session::SavedSession,
+    machine: String,
+    machine_created_at: u64,
+    owner: String,
+    #[serde(default)]
+    process_paused: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    image_generation: Option<String>,
+}
+
 /// Everything persisted about one container.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct ContainerRecord {
@@ -176,6 +199,14 @@ pub(crate) struct ContainerRecord {
     pub args: Vec<String>,
     pub state: StateRecord,
     pub restart_count: u32,
+    /// Monotonic host start order; raw VM checkpoints do not roll it back.
+    #[serde(default)]
+    pub execution_generation: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub saved_execution: Option<SavedExecution>,
+    /// The guest execution exists in a checkpoint rather than a live attachment.
+    #[serde(default)]
+    pub execution_suspended: bool,
     pub ports: Vec<PublishedPort>,
     pub mounts: Vec<MountRecord>,
     /// Stopped by a user, so `unless-stopped` and `always` keep it down.
@@ -222,7 +253,7 @@ impl ContainerRecord {
     /// The share a local image archive is added to the host container's
     /// machine under, for a container that runs there.
     fn guest_image_share(&self) -> String {
-        format!("g{}img", &self.id[..12])
+        super::image_share::name(&self.pull_ref)
     }
 
     /// Where the image's layers come from in the machine the container runs
@@ -322,6 +353,82 @@ impl Container {
         self.record.lock().clone()
     }
 
+    /// Keep the machine and container data available to the transfer that owns
+    /// them, including mounts of a container whose VM has not been created yet.
+    pub(crate) fn admit_mutation(
+        &self,
+        engine: &Engine,
+        deleting: bool,
+    ) -> ApiResult<Vec<crate::db::transfer_admission::MutationGuard>> {
+        let record = self.record();
+        let mut paths = vec![engine.store.container_dir(&record.id)];
+        for mount in &record.mounts {
+            match mount.kind.as_str() {
+                "volume" => paths.push(engine.volumes.mountpoint(&mount.source)),
+                "bind" => paths.push(PathBuf::from(&mount.source)),
+                _ => {}
+            }
+        }
+        let storage = engine
+            .db
+            .admit_storage_mutation(&paths)
+            .map_err(mutation_error)?;
+        let owner = if record.network_host().is_some() {
+            let mut records: BTreeMap<_, _> = engine
+                .store
+                .transfer_containers()?
+                .into_iter()
+                .map(|record| (record.id.clone(), record))
+                .collect();
+            records.insert(record.id.clone(), record.clone());
+            match super::transfer::machine_owner(&records, &record.id) {
+                Ok(owner) => records[owner].machine.clone(),
+                Err(error)
+                    if deleting
+                        && record.machine.is_empty()
+                        && !storage.has_active_transfers()
+                        && !self.owns_live_execution()
+                        && error.status == axum::http::StatusCode::NOT_FOUND =>
+                {
+                    // A stopped shared container has no VM of its own. Permit
+                    // removing its orphaned record when the host is gone, but
+                    // never treat a missing owner as authority during a move.
+                    record.machine.clone()
+                }
+                Err(error) => return Err(error),
+            }
+        } else {
+            record.machine.clone()
+        };
+        let machine = if deleting {
+            engine.db.admit_machine_deletion(&owner)
+        } else {
+            engine.db.admit_machine_mutation(&owner)
+        }
+        .map_err(mutation_error)?;
+        let active = storage.has_active_transfers();
+        let mut guards = vec![machine, storage];
+        if active {
+            for endpoint in record.networks.values() {
+                if let Some(network) = engine.networks.find(&endpoint.network_id) {
+                    guards.extend(engine.networks.admit_mutation(&engine.store, &network)?);
+                }
+            }
+        }
+        Ok(guards)
+    }
+
+    pub(crate) fn owns_live_execution(&self) -> bool {
+        self.running.lock().is_some() || {
+            let record = self.record.lock();
+            !record.execution_suspended
+                && matches!(
+                    record.state.status.as_str(),
+                    "running" | "paused" | "restarting"
+                )
+        }
+    }
+
     pub(crate) fn is_running(&self) -> bool {
         self.running.lock().is_some()
             || matches!(
@@ -352,6 +459,39 @@ impl Container {
         if let Err(e) = engine.store.save_container(&record) {
             tracing::warn!(container = %record.id, error = %e, "could not save container record");
         }
+    }
+
+    fn update_durable(
+        &self,
+        engine: &Engine,
+        f: impl FnOnce(&mut ContainerRecord),
+    ) -> ApiResult<()> {
+        let mut record = self.record.lock();
+        let mut updated = record.clone();
+        f(&mut updated);
+        engine
+            .store
+            .save_container_durable(&updated)
+            .map_err(internal_execution)?;
+        *record = updated;
+        Ok(())
+    }
+
+    fn reserve_execution_generation(&self, engine: &Engine) -> ApiResult<u64> {
+        let mut record = self.record.lock();
+        let mut updated = record.clone();
+        updated.execution_generation = updated
+            .execution_generation
+            .checked_add(1)
+            .ok_or_else(|| ApiError::internal("container execution generation exhausted"))?;
+        // Refuse the start if its lineage cannot be persisted. A failed attempt
+        // may consume a generation, but must never reuse one for a new process.
+        engine
+            .store
+            .save_container(&updated)
+            .map_err(|error| ApiError::internal(error.to_string()))?;
+        *record = updated;
+        Ok(record.execution_generation)
     }
 
     pub(crate) fn subscribe_exits(&self) -> tokio::sync::watch::Receiver<ExitState> {
@@ -455,25 +595,50 @@ pub(crate) async fn create(
         }
         host_config.network_mode = format!("container:{}", target.id());
     }
-    if host_config.network_mode == "host" {
-        warnings.push(
-            "host networking is not available: each container is its own machine; it uses the default network instead".into(),
-        );
+    if engine
+        .networks
+        .find(&host_config.network_mode)
+        .is_some_and(|n| n.driver == "host")
+    {
+        host_config.network_mode = "host".into();
+    }
+    if host_config.network_mode == "host"
+        && (!host_config.port_bindings.is_empty() || host_config.publish_all_ports)
+    {
+        warnings.push("Published ports are discarded when using host network mode".into());
     }
 
-    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     let guest = host_config.network_mode.starts_with("container:");
+    let networks = if guest {
+        BTreeMap::new()
+    } else {
+        super::network::attach_at_create(engine, &id, &name, &req)?
+    };
+    let mut _network_admission = Vec::new();
+    for endpoint in networks.values() {
+        let network = engine
+            .networks
+            .find(&endpoint.network_id)
+            .ok_or_else(|| ApiError::conflict("network changed before container creation"))?;
+        _network_admission.extend(engine.networks.admit_mutation(&engine.store, &network)?);
+    }
+    let _host_admission = if let Some(host) = host_config.network_mode.strip_prefix("container:") {
+        Some(
+            engine
+                .find_container(host)
+                .ok_or_else(|| ApiError::no_such_container(host))?
+                .admit_mutation(engine, false)?,
+        )
+    } else {
+        None
+    };
+    let (mounts, shares, sockets) = resolve_mounts(engine, &req, &image, &id)?;
     if guest && !sockets.is_empty() {
         return Err(ApiError::bad_request(
             "a container that shares another container's network cannot mount a Unix socket",
         ));
     }
     let ports = resolve_ports(engine, &mut config, &host_config)?;
-    let networks = if guest {
-        BTreeMap::new()
-    } else {
-        super::network::attach_at_create(engine, &id, &name, &req)?
-    };
 
     // A container that shares another's network has no machine of its own.
     let machine = if guest {
@@ -496,8 +661,11 @@ pub(crate) async fn create(
     labels.insert(MACHINE_LABEL.to_string(), id.clone());
     let spec = crate::machine_spec::CreateSpec {
         net: host_config.network_mode != "none",
-        network_backend: (host_config.network_mode != "none")
-            .then_some(crate::network::NetworkBackend::VirtioNet),
+        network_backend: match host_config.network_mode.as_str() {
+            "none" => None,
+            "host" => Some(crate::network::NetworkBackend::Host),
+            _ => Some(crate::network::NetworkBackend::VirtioNet),
+        },
         mounts: shares,
         published_sockets: sockets,
         ports: ports
@@ -522,7 +690,8 @@ pub(crate) async fn create(
         dns_options: host_config.dns_options.clone(),
         // On an internal network only, a container has no way out.
         allowed_cidrs: super::network::internal_only(engine, &networks).then(Vec::new),
-        switch: (!networks.is_empty()).then(|| super::network::attachment(engine, &id)),
+        switch: (!networks.is_empty() && host_config.network_mode != "host")
+            .then(|| super::network::attachment(engine, &id)),
         labels,
         ..Default::default()
     };
@@ -543,6 +712,9 @@ pub(crate) async fn create(
         args,
         state: StateRecord::default(),
         restart_count: 0,
+        execution_generation: 0,
+        saved_execution: None,
+        execution_suspended: false,
         ports,
         mounts,
         user_stopped: false,
@@ -1024,6 +1196,7 @@ fn resolve_mounts(
                     read_only: m.read_only,
                     staged: false,
                     recorded_ownership: true,
+                    owner: None,
                 });
                 shares.len() - 1
             }
@@ -1094,6 +1267,9 @@ fn resolve_ports(
     config: &mut ContainerConfig,
     host: &HostConfig,
 ) -> ApiResult<Vec<PublishedPort>> {
+    if host.network_mode == "host" {
+        return Ok(Vec::new());
+    }
     let taken: BTreeSet<(u16, String)> = engine
         .containers
         .read()
@@ -1240,34 +1416,79 @@ pub(crate) async fn start(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult
 }
 
 async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<bool> {
+    let _admission = c.admit_mutation(engine, false)?;
     if engine.owner.as_deref() != Some(c.id().as_str()) {
         return Err(ApiError::internal(
             "only the owning supervisor may start this workload",
         ));
     }
-    if c.is_running() {
+    if c.is_running() && !exit_cleanup::pending(&c.record()) {
         return Ok(false);
     }
     // A machine still shutting down after the last exit must finish first.
     let _vm = c.vm.clone().lock_owned().await;
     let record = c.record();
+    if exit_cleanup::pending(&record) {
+        return Err(ApiError::conflict(
+            "container exit cleanup requires recovery",
+        ));
+    }
     if record.state.status == "removing" {
         return Err(ApiError::conflict("container is being removed"));
+    }
+    let execution_generation = c.reserve_execution_generation(engine)?;
+    if record.host_config.network_mode == "host" {
+        // Older versions stored host mode while creating a bridge VM. Correct
+        // that stopped machine in place, preserving its image and disk data.
+        let stored = engine
+            .db
+            .get_vm(&record.machine)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+            .ok_or_else(|| ApiError::internal("host-network container machine is missing"))?;
+        if stored.network_backend != Some(crate::network::NetworkBackend::Host) {
+            engine
+                .db
+                .update_vm_durable(&record.machine, |vm| {
+                    vm.network = true;
+                    vm.network_backend = Some(crate::network::NetworkBackend::Host);
+                    vm.switch = None;
+                    vm.ports.clear();
+                    vm.udp_ports.clear();
+                    vm.listen_addresses.clear();
+                })
+                .map_err(|e| ApiError::internal(e.to_string()))?;
+        }
+        if !record.networks.contains_key("host") || !record.ports.is_empty() {
+            let networks = super::network::host_membership(engine, &record.name)?;
+            c.update(engine, |r| {
+                r.networks = networks;
+                r.ports.clear();
+            });
+        }
     }
     super::network::before_start(engine, c).await?;
     let record = c.record();
 
     // A container that shares another's network runs in its machine.
     if let Some(host) = record.network_host().map(str::to_string) {
-        let socket = match guest_machine(engine, &record, &host).await {
-            Ok(socket) => socket,
+        let (socket, image_lease) = match guest_machine(engine, &record, &host).await {
+            Ok(prepared) => prepared,
             Err(e) => {
                 c.update(engine, |r| r.state.error = e.message.clone());
                 remove_after_failed_start(engine, c);
                 return Err(e);
             }
         };
-        return run_container(engine, c, &record, None, socket).await;
+        return run_container(
+            engine,
+            c,
+            &record,
+            None,
+            socket,
+            image_lease,
+            execution_generation,
+        )
+        .await;
     }
 
     // Boot the machine and make sure the image is in its storage.
@@ -1323,7 +1544,16 @@ async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<boo
         remove_after_failed_start(engine, c);
         return Err(e);
     }
-    run_container(engine, c, &record, Some(handle), socket).await
+    run_container(
+        engine,
+        c,
+        &record,
+        Some(handle),
+        socket,
+        None,
+        execution_generation,
+    )
+    .await
 }
 
 /// Run the container's command in the booted machine behind `socket`
@@ -1335,6 +1565,8 @@ async fn run_container(
     record: &ContainerRecord,
     handle: Option<crate::embedded::handle::VmHandle>,
     socket: PathBuf,
+    mut image_lease: Option<super::image_share::Lease>,
+    execution_generation: u64,
 ) -> ApiResult<bool> {
     let record = record.clone();
     // Files uploaded before the first start go in now, before the command.
@@ -1350,24 +1582,29 @@ async fn run_container(
     }
 
     let spec = start_spec(engine, &record);
-    let started = async {
-        let (mut reader, mut writer) = super::runtime::connect(&socket).await?;
-        writer
-            .send(&smolvm_protocol::AgentRequest::ContainerStart(Box::new(
-                spec,
-            )))
-            .await?;
-        match reader.recv().await? {
-            smolvm_protocol::AgentResponse::Started => Ok((reader, writer)),
-            other => Err(std::io::Error::other(
-                super::runtime::error_text(&other).unwrap_or_else(|| format!("{other:?}")),
-            )),
+    let origin = smolvm_protocol::container_session::Origin {
+        generation: execution_generation,
+        started_at: super::util::now_rfc3339(),
+    };
+    let mut session = super::container_session::Session::new(
+        socket.clone(),
+        spec.overlay_id.clone(),
+        origin.clone(),
+    );
+    match session.start(spec).await {
+        Ok(()) => {
+            if let Some(lease) = &mut image_lease {
+                lease.prepared();
+            }
         }
-    }
-    .await;
-    let (reader, writer) = match started {
-        Ok(rw) => rw,
         Err(err) => {
+            c.input.finish();
+            if let Err(cleanup) = session.cancel_and_forget().await {
+                tracing::warn!(container = %record.id, error = %cleanup, "could not release failed container session");
+            }
+            if let Some(lease) = image_lease {
+                lease.release().await;
+            }
             let msg = format!(
                 "failed to create task for container: failed to create shim task: OCI runtime create failed: {err}"
             );
@@ -1385,11 +1622,12 @@ async fn run_container(
                 r.state.exit_code = code;
             });
             if let Some(mut handle) = handle {
-                let _ = tokio::task::spawn_blocking(move || handle.stop()).await;
                 let e = engine.clone();
                 let machine = record.machine.clone();
                 let _ = tokio::task::spawn_blocking(move || {
-                    crate::embedded::control::mark_stopped(&e.db, &machine)
+                    let reviewed = crate::embedded::control::get_record(&e.db, &machine)?;
+                    handle.stop()?;
+                    crate::embedded::control::mark_stopped_for_record(&e.db, &reviewed)
                 })
                 .await;
             } else {
@@ -1400,69 +1638,394 @@ async fn run_container(
         }
     };
 
-    let pid = match &handle {
-        Some(handle) => handle.child_pid().unwrap_or(0) as i64,
-        None => record
-            .network_host()
-            .and_then(|h| engine.find_container(h))
-            .map(|h| h.record().state.pid)
-            .unwrap_or(0),
-    };
-    c.update(engine, |r| {
-        r.agent_socket = Some(socket.clone());
-        r.state.status = "running".into();
-        r.state.pid = pid;
-        r.state.exit_code = 0;
-        r.state.error.clear();
-        r.state.oom_killed = false;
-        r.state.started_at = super::util::now_rfc3339();
-        r.state.finished_at = super::util::ZERO_TIME.into();
-        r.pending_archives.clear();
-        if r.config.healthcheck.as_ref().is_some_and(health_enabled) {
-            r.state.health = Some(HealthRecord {
-                status: "starting".into(),
-                failing_streak: 0,
-                log: Vec::new(),
-            });
-        }
-    });
-    let health = record
-        .config
-        .healthcheck
-        .clone()
-        .filter(health_enabled)
-        .map(|h| tokio::spawn(health_loop(engine.clone(), c.clone(), h)).abort_handle());
-    *c.running.lock() = Some(Running {
-        socket,
-        vm: handle,
-        _health: health,
-    });
-    c.emit(engine, "start", &[]);
+    supervise_container(engine, c, record, handle, socket, image_lease, session).await
+}
 
-    // Carry the container's I/O until its command exits.
-    let e = engine.clone();
-    let container = c.clone();
-    let tty = record.config.tty;
-    let log_path = super::logs::path(&engine.store, &record.id);
-    tokio::spawn(async move {
-        let mut log = super::logs::LogWriter::open(&log_path, tty).ok();
-        let exit = super::runtime::pump(reader, writer, &container.input, |stream, data| {
+fn supervise_container<'a>(
+    engine: &'a Arc<Engine>,
+    c: &'a Arc<Container>,
+    record: ContainerRecord,
+    handle: Option<crate::embedded::handle::VmHandle>,
+    socket: PathBuf,
+    image_lease: Option<super::image_share::Lease>,
+    mut session: super::container_session::Session,
+) -> futures_util::future::BoxFuture<'a, ApiResult<bool>> {
+    Box::pin(async move {
+        let origin = session.origin().clone();
+        let mut saved = saved_execution(engine, &record, &session)?;
+        saved.image_generation = image_lease
+            .as_ref()
+            .map(|lease| lease.generation().to_owned());
+        let process_paused = saved.process_paused;
+        // Failure to retain the identity must not silently create unrecoverable
+        // execution; the caller still owns the VM handle until this succeeds.
+        if let Err(error) = c.update_durable(engine, |r| {
+            r.saved_execution = Some(saved);
+            r.execution_suspended = false;
+        }) {
+            if record.saved_execution.is_none() {
+                let _ = session.cancel_and_forget().await;
+                if let Some(lease) = image_lease {
+                    lease.release().await;
+                }
+            }
+            return Err(error);
+        }
+        let pid = match &handle {
+            Some(handle) => handle.child_pid().unwrap_or(0) as i64,
+            // Recovery already verified the backing VM and read its current PID;
+            // another container's persisted status may still describe the pause.
+            None if record.saved_execution.is_some() => record.state.pid,
+            None => record
+                .network_host()
+                .and_then(|h| engine.find_container(h))
+                .map(|h| h.record().state.pid)
+                .unwrap_or(record.state.pid),
+        };
+        c.update(engine, |r| {
+            r.agent_socket = Some(socket.clone());
+            r.state.status = if process_paused { "paused" } else { "running" }.into();
+            r.state.pid = pid;
+            r.state.exit_code = 0;
+            r.state.error.clear();
+            r.state.oom_killed = false;
+            r.running_at_shutdown = false;
+            r.state.started_at = origin.started_at.clone();
+            r.state.finished_at = super::util::ZERO_TIME.into();
+            r.pending_archives.clear();
+            if r.config.healthcheck.as_ref().is_some_and(health_enabled) {
+                r.state.health = Some(HealthRecord {
+                    status: "starting".into(),
+                    failing_streak: 0,
+                    log: Vec::new(),
+                });
+            }
+        });
+        let health = record
+            .config
+            .healthcheck
+            .clone()
+            .filter(health_enabled)
+            .map(|h| tokio::spawn(health_loop(engine.clone(), c.clone(), h)).abort_handle());
+        let process_started = crate::process::process_start_time(pid as i32);
+        *c.running.lock() = Some(Running {
+            socket,
+            vm: handle,
+            _health: health,
+        });
+        if record.saved_execution.is_none() {
+            c.emit(engine, "start", &[]);
+        } else if !process_paused && (record.execution_suspended || record.state.status == "paused")
+        {
+            c.emit(engine, "unpause", &[]);
+        }
+
+        // Carry the container's I/O until its command exits.
+        let e = engine.clone();
+        let container = c.clone();
+        let tty = record.config.tty;
+        let log_path = super::logs::path(&engine.store, &record.id);
+        tokio::spawn(async move {
+            let mut log = super::logs::LogWriter::open(&log_path, tty).ok();
+            let alive = || {
+                crate::process::reap_vm_children();
+                pid > 0 && crate::process::is_our_process(pid as i32, process_started)
+            };
+            let result = session
+            .pump(
+                &container.input,
+                |stream, data| {
+                    if let Some(log) = log.as_mut() {
+                        log.write(stream, &data);
+                    }
+                    container.log_written.notify_waiters();
+                    let _ = container
+                        .output
+                        .send(Output::Data(stream, axum::body::Bytes::from(data)));
+                },
+                |message| {
+                    tracing::warn!(container = %record.id, message, "container session recovery");
+                    container.update(&e, |r| r.state.error = message.to_string());
+                    container.emit(&e, "smol-recovery", &[("message", message.to_string())]);
+                },
+                |origin| {
+                    container.update(&e, |r| r.state.started_at = origin.started_at.clone());
+                },
+                alive,
+            )
+            .await;
+            let exit = match result {
+                // Retain the guest's terminal result until host cleanup is
+                // durable: admission may defer teardown across cancellation.
+                Ok(exit) => exit,
+                Err(error) => {
+                    if retain_saved_execution(&e, &container, &session, pid, process_started).await
+                    {
+                        if let Some(log) = log.as_mut() {
+                            log.flush();
+                        }
+                        container.log_written.notify_waiters();
+                        // A shared-VM container retains its durable image reference
+                        // until that execution exits, including across supervisor exit.
+                        drop(image_lease);
+                        return;
+                    }
+                    // This is an execution-management failure, not an observed
+                    // process status or OOM kill. Keep the reason in Docker inspect.
+                    container.update(&e, |r| {
+                        r.state.error = format!("Container execution lost: {error}")
+                    });
+                    if alive() {
+                        let _ = session.cancel_and_forget().await;
+                    }
+                    Exit {
+                        code: 255,
+                        oom: false,
+                    }
+                }
+            };
             if let Some(log) = log.as_mut() {
-                log.write(stream, &data);
+                log.flush();
             }
             container.log_written.notify_waiters();
-            let _ = container
-                .output
-                .send(Output::Data(stream, axum::body::Bytes::from(data)));
-        })
-        .await;
-        if let Some(log) = log.as_mut() {
-            log.flush();
+            // saved_execution retains the image reference until admitted,
+            // recoverable cleanup of the original VM's exports succeeds.
+            drop(image_lease);
+            on_exit(e, container, exit, Some(&mut session)).await;
+        });
+        Ok(true)
+    })
+}
+
+fn internal_execution(error: impl std::fmt::Display) -> ApiError {
+    ApiError::internal(format!("retain container execution: {error}"))
+}
+
+fn saved_execution(
+    engine: &Engine,
+    record: &ContainerRecord,
+    session: &super::container_session::Session,
+) -> ApiResult<SavedExecution> {
+    let host = record
+        .network_host()
+        .and_then(|id| engine.find_container(id))
+        .map(|c| c.record());
+    let owner = host.as_ref().unwrap_or(record);
+    let vm = engine
+        .db
+        .get_vm(&owner.machine)
+        .map_err(internal_execution)?
+        .ok_or_else(|| ApiError::conflict("container machine is missing"))?;
+    if vm.labels.get(MACHINE_LABEL) != Some(&owner.id) {
+        return Err(ApiError::conflict("container machine ownership changed"));
+    }
+    let identity = vm
+        .database_identity
+        .as_ref()
+        .ok_or_else(|| ApiError::conflict("container machine has no durable identity"))?;
+    Ok(SavedExecution {
+        container_generation: session.origin().generation,
+        machine_execution_identity: Some(vm.execution_identity.clone().ok_or_else(|| {
+            ApiError::conflict("container machine has no durable execution identity")
+        })?),
+        machine_execution: Some(crate::db::transfer_admission::Member {
+            name: vm.name.clone(),
+            generation: Some(identity.generation().to_owned()),
+            created_at: vm.created_at,
+            pid: vm.pid,
+            pid_start_time: vm.pid_start_time,
+        }),
+        session: session.saved(),
+        machine: vm.name,
+        machine_created_at: vm.created_at,
+        owner: owner.id.clone(),
+        process_paused: record
+            .saved_execution
+            .as_ref()
+            .is_some_and(|saved| saved.process_paused),
+        image_generation: None,
+    })
+}
+
+fn retained_machine(
+    engine: &Engine,
+    saved: &SavedExecution,
+) -> ApiResult<Option<crate::config::VmRecord>> {
+    let vm = engine
+        .db
+        .get_vm(&saved.machine)
+        .map_err(internal_execution)?;
+    if vm.as_ref().is_some_and(|vm| {
+        vm.created_at != saved.machine_created_at
+            || vm.labels.get(MACHINE_LABEL) != Some(&saved.owner)
+    }) {
+        return Err(ApiError::conflict(
+            "saved container machine ownership changed",
+        ));
+    }
+    Ok(vm)
+}
+
+async fn retain_saved_execution(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+    session: &super::container_session::Session,
+    original_pid: i64,
+    original_start: Option<u64>,
+) -> bool {
+    let _vm_guard = c.vm.lock().await;
+    let record = c.record();
+    let Some(mut saved) = record.saved_execution else {
+        return false;
+    };
+    let uncertainty = match retained_machine(engine, &saved) {
+        Ok(Some(vm)) => {
+            let paused = vm.paused_checkpoint.is_some()
+                && matches!(
+                    vm.state,
+                    crate::config::RecordState::Paused | crate::config::RecordState::Pausing
+                );
+            let resumed = vm.is_process_alive()
+                && !crate::process::is_our_process(original_pid as i32, original_start);
+            if !paused && !resumed {
+                return false;
+            }
+            None
         }
-        container.log_written.notify_waiters();
-        on_exit(e, container, exit).await;
-    });
-    Ok(true)
+        Ok(None) => return false,
+        // An unreadable or replaced owner is not proof that this execution
+        // ended. Keep its authority for recovery without touching another VM.
+        Err(error) => Some(error.message),
+    };
+    saved.session = session.saved();
+    if let Err(error) = c.update_durable(engine, |record| {
+        record.saved_execution = Some(saved);
+        record.execution_suspended = true;
+        record.state.status = "paused".into();
+        record.state.pid = 0;
+        record.state.error = uncertainty.unwrap_or_default();
+    }) {
+        // The start's identity is already durable. Keep that recovery authority
+        // and never translate a storage error into process cleanup or restart.
+        tracing::error!(container = %c.id(), error = %error.message, "cannot retain current container cursors");
+        let mut record = c.record.lock();
+        record.execution_suspended = true;
+        record.state.status = "paused".into();
+        record.state.error = error.message;
+    }
+    if let Some(mut running) = c.running.lock().take() {
+        if let Some(health) = running._health.take() {
+            health.abort();
+        }
+        if let Some(handle) = running.vm.take() {
+            handle.detach();
+        }
+    }
+    c.input.finish();
+    let _ = c.output.send(Output::End);
+    true
+}
+
+/// Reconcile only the private supervisor's own saved execution before serving
+/// a request. Observation never resumes a paused machine.
+pub(crate) async fn reconcile_owner(engine: &Arc<Engine>) -> ApiResult<()> {
+    let Some(c) = engine
+        .owner
+        .as_deref()
+        .and_then(|id| engine.find_container(id))
+    else {
+        return Ok(());
+    };
+    if c.running.lock().is_some()
+        || c.record().saved_execution.is_none()
+        || exit_cleanup::pending(&c.record())
+    {
+        return Ok(());
+    }
+    let _op = c.op.lock().await;
+    if c.running.lock().is_none() {
+        restore_saved_execution(engine, &c, false).await?;
+    }
+    Ok(())
+}
+
+async fn restore_saved_execution(
+    engine: &Arc<Engine>,
+    c: &Arc<Container>,
+    resume: bool,
+) -> ApiResult<bool> {
+    let _vm_guard = c.vm.lock().await;
+    if c.running.lock().is_some() {
+        return Ok(true);
+    }
+    let mut record = c.record();
+    let Some(saved) = record.saved_execution.clone() else {
+        return Ok(false);
+    };
+    let Some(mut vm) = retained_machine(engine, &saved)? else {
+        return Ok(false);
+    };
+    if vm.paused_checkpoint.is_some() {
+        if !resume {
+            if !record.execution_suspended
+                || record.state.status != "paused"
+                || record.state.pid != 0
+            {
+                c.update(engine, |record| {
+                    record.execution_suspended = true;
+                    record.state.status = "paused".into();
+                    record.state.pid = 0;
+                });
+            }
+            return Ok(true);
+        }
+        let name = saved.machine.clone();
+        tokio::task::spawn_blocking(move || {
+            crate::embedded::EmbeddedRuntime::new()?.resume_machine_detached(&name)
+        })
+        .await
+        .map_err(internal_execution)?
+        .map_err(internal_execution)?;
+        vm = retained_machine(engine, &saved)?
+            .ok_or_else(|| ApiError::conflict("saved machine disappeared"))?;
+    }
+    if !vm.is_process_alive() {
+        return Ok(false);
+    }
+    let name = saved.machine.clone();
+    let socket = tokio::task::spawn_blocking(move || {
+        crate::agent::AgentManager::for_vm(&name)
+            .map(|manager| manager.vsock_socket().to_path_buf())
+    })
+    .await
+    .map_err(internal_execution)?
+    .map_err(internal_execution)?;
+    let image_lease = if let Some(generation) = saved.image_generation {
+        let root = engine.store.root().to_path_buf();
+        let machine = saved.machine.clone();
+        let host = saved.owner.clone();
+        let owner = record.id.clone();
+        let share = record.guest_image_share();
+        Some(
+            tokio::task::spawn_blocking(move || {
+                super::image_share::Lease::recover(&root, machine, &host, generation, owner, share)
+            })
+            .await
+            .map_err(internal_execution)?
+            .map_err(internal_execution)?,
+        )
+    } else {
+        None
+    };
+    let session = super::container_session::Session::from_saved(
+        socket.clone(),
+        overlay_id(&record),
+        saved.session,
+    )
+    .await
+    .map_err(internal_execution)?;
+    record.state.pid = vm.pid.unwrap_or(0) as i64;
+    supervise_container(engine, c, record, None, socket, image_lease, session).await
 }
 
 /// A start that failed leaves an auto-remove container to be removed, as the
@@ -1471,7 +2034,10 @@ fn remove_after_failed_start(engine: &Arc<Engine>, c: &Arc<Container>) {
     let _ = c.output.send(Output::End);
     if c.record().host_config.auto_remove {
         let (e, c) = (engine.clone(), c.clone());
+        // Transfer lifetime ownership before the failed start request returns.
+        let activity = engine.activity.hold();
         tokio::spawn(async move {
+            let _activity = activity;
             let _ = remove(&e, &c, true, true).await;
         });
     }
@@ -1577,71 +2143,93 @@ pub(crate) fn overlay_id(record: &ContainerRecord) -> String {
 
 /// The container's command ended: record it, stop the machine, and apply the
 /// restart policy.
-async fn on_exit(engine: Arc<Engine>, c: Arc<Container>, exit: Exit) {
-    tracing::info!(container = %c.id(), name = %c.name(), code = exit.code, oom = exit.oom, "container exited");
+async fn on_exit(
+    engine: Arc<Engine>,
+    c: Arc<Container>,
+    exit: Exit,
+    session: Option<&mut super::container_session::Session>,
+) {
+    // An exited command can still own deferred VM/volume cleanup. Keep its
+    // existing supervisor alive until that work completes or reports an error.
+    let activity = engine.activity.hold();
     let vm_guard = c.vm.clone().lock_owned().await;
-    let running = c.running.lock().take();
-    let started_at = c.record().state.started_at;
-    c.update(&engine, |r| {
-        r.state.status = "exited".into();
-        r.state.pid = 0;
-        r.state.exit_code = exit.code;
-        r.state.oom_killed = exit.oom;
-        r.state.finished_at = super::util::now_rfc3339();
-        if let Some(h) = r.state.health.as_mut() {
-            h.status = "unhealthy".into();
+    let already_reported = exit_cleanup::pending(&c.record());
+    if !already_reported {
+        // Keep saved_execution alongside the terminal status. Together they
+        // journal pending cleanup without depending on a live VM handle.
+        let mut delay = Duration::from_millis(100);
+        loop {
+            match c.update_durable(&engine, |r| {
+                r.state.status = "exited".into();
+                r.execution_suspended = false;
+                r.state.pid = 0;
+                r.state.exit_code = exit.code;
+                r.state.oom_killed = exit.oom;
+                r.state.finished_at = super::util::now_rfc3339();
+                if let Some(h) = r.state.health.as_mut() {
+                    h.status = "unhealthy".into();
+                }
+            }) {
+                Ok(()) => break,
+                Err(error) => {
+                    tracing::warn!(container = %c.id(), error = %error.message, "could not retain container exit; cleanup deferred");
+                    tokio::time::sleep(delay).await;
+                    delay = (delay * 2).min(Duration::from_secs(2));
+                }
+            }
         }
-    });
-    let _ = c.output.send(Output::End);
-    c.emit(&engine, "die", &[("exitCode", exit.code.to_string())]);
-    c.exits.send_modify(|s| {
-        s.exits += 1;
-        s.code = exit.code;
-    });
-
-    // The command is gone; stop its machine. Nothing is left to flush but
-    // the disks, so no grace period.
-    let record = c.record();
-    if let Some(mut handle) = running.and_then(|mut r| r.vm.take()) {
-        let _ = tokio::task::spawn_blocking(move || handle.stop_with_timeout(Some(Duration::ZERO)))
-            .await;
     }
-    if record.network_host().is_some() {
-        release_guest_shares(&engine, &record).await;
-    } else {
-        stop_machine(&engine, &record.machine, Some(Duration::ZERO)).await;
+    // The journal owns recovery now; dropping a handle must not bypass admission.
+    if let Some(handle) = c.running.lock().take().and_then(|mut r| r.vm.take()) {
+        handle.detach();
+    }
+    c.input.finish();
+    if !already_reported {
+        let _ = c.output.send(Output::End);
+        c.emit(&engine, "die", &[("exitCode", exit.code.to_string())]);
+        c.exits.send_modify(|s| {
+            s.exits += 1;
+            s.code = exit.code;
+        });
+    }
+    let admission = exit_cleanup::wait_for_admission(&engine, &c).await;
+    // Forgetting a guest result before this point would make a supervisor crash
+    // during a reservation indistinguishable from a lost execution.
+    if let Some(session) = session {
+        if let Err(error) = session.forget().await {
+            tracing::warn!(container = %c.id(), error = %error, "could not release completed container session");
+        }
+    }
+    let record = c.record();
+    if let Err(error) = exit_cleanup::stop_original_machine(&engine, &record).await {
+        c.update(&engine, |r| r.state.error = error.message.clone());
+        tracing::error!(container = %c.id(), error = %error.message, "container exit cleanup requires recovery");
+        return;
     }
     super::network::after_stop(&engine, &c).await;
+    let restart = if record.host_config.auto_remove {
+        None
+    } else {
+        match exit_cleanup::finish(&engine, &c) {
+            Ok(restart) => restart,
+            Err(error) => {
+                tracing::error!(container = %c.id(), error = %error.message, "could not complete container exit cleanup");
+                return;
+            }
+        }
+    };
     drop(vm_guard);
+    drop(admission);
 
     if record.host_config.auto_remove {
         let _ = remove(&engine, &c, true, true).await;
         return;
     }
-    if !should_restart(&record, exit.code) {
-        return;
-    }
-    let ran = super::util::unix_seconds(&super::util::now_rfc3339())
-        - super::util::unix_seconds(&started_at);
-    let attempt = if ran >= 10 { 0 } else { record.restart_count };
-    let delay = Duration::from_millis(100u64.saturating_mul(1 << attempt.min(10)))
-        .min(Duration::from_secs(60));
-    c.update(&engine, |r| {
-        r.state.status = "restarting".into();
-        r.restart_count += 1;
-    });
-    tokio::time::sleep(delay).await;
-    let _op = c.op.lock().await;
-    let current = c.record();
-    if current.state.status != "restarting" || current.user_stopped {
-        return;
-    }
-    if let Err(e) = start_boxed(engine.clone(), c.clone()).await {
-        tracing::warn!(container = %current.id, error = %e.message, "restart failed");
-        c.update(&engine, |r| {
-            r.state.status = "exited".into();
-            r.state.error = e.message.clone();
-        });
+    // The durable restarting state owns the lifetime during backoff. A new
+    // transfer may defer this start, but cannot discard the queued policy.
+    drop(activity);
+    if let Some(generation) = restart {
+        exit_cleanup::resume_restart(engine, c, generation).await;
     }
 }
 
@@ -1678,7 +2266,7 @@ async fn guest_machine(
     engine: &Arc<Engine>,
     record: &ContainerRecord,
     host: &str,
-) -> ApiResult<PathBuf> {
+) -> ApiResult<(PathBuf, Option<super::image_share::Lease>)> {
     let host = engine
         .find_container(host)
         .ok_or_else(|| ApiError::no_such_container(host))?;
@@ -1688,7 +2276,12 @@ async fn guest_machine(
             host.id()
         ))
     })?;
-    let machine = host.record().machine;
+    let host_record = host.record();
+    let machine = host_record.machine;
+    let host_id = host_record.id;
+    let generation = host_record.state.started_at;
+    let owner = record.id.clone();
+    let root = engine.store.root().to_path_buf();
     let shares: Vec<(String, GuestShare)> = record
         .guest_shares
         .iter()
@@ -1698,26 +2291,36 @@ async fn guest_machine(
     let pull_ref = record.pull_ref.clone();
     let image_share = record.guest_image_share();
     let agent_socket = socket.clone();
-    tokio::task::spawn_blocking(move || -> crate::Result<()> {
-        for (name, share) in &shares {
-            // A share left by an earlier run of this container goes first.
-            let _ = crate::attach::remove_share(&machine, name, share.read_only);
-            crate::attach::add_share(&machine, name, &share.source, share.read_only)?;
-        }
-        if crate::data::image_source::is_local_ref(&pull_ref) {
-            // A local image goes in as its archive, which the guest unpacks.
-            let dir = crate::data::image_source::packed_layers_dir_for_ref(&pull_ref)
-                .ok_or_else(|| crate::Error::config("image", format!("{pull_ref} is gone")))?;
-            let _ = crate::attach::remove_share(&machine, &image_share, true);
-            crate::attach::add_share(&machine, &image_share, &dir, true)?;
-        } else {
-            let mut client = crate::agent::AgentClient::connect_with_retry(&agent_socket)?;
-            if client.query(&pull_ref)?.is_none() {
-                client.pull_with_registry_config(&pull_ref)?;
+    let lease = tokio::task::spawn_blocking(
+        move || -> crate::Result<Option<super::image_share::Lease>> {
+            for (name, share) in &shares {
+                // A share left by an earlier run of this container goes first.
+                let _ = crate::attach::remove_share(&machine, name, share.read_only);
+                crate::attach::add_share(&machine, name, &share.source, share.read_only)?;
             }
-        }
-        Ok(())
-    })
+            if crate::data::image_source::is_local_ref(&pull_ref) {
+                // A local image goes in as its archive, which the guest unpacks.
+                let dir = crate::data::image_source::packed_layers_dir_for_ref(&pull_ref)
+                    .ok_or_else(|| crate::Error::config("image", format!("{pull_ref} is gone")))?;
+                return super::image_share::Lease::acquire(
+                    &root,
+                    machine,
+                    &host_id,
+                    generation,
+                    owner,
+                    image_share,
+                    &dir,
+                )
+                .map(Some);
+            } else {
+                let mut client = crate::agent::AgentClient::connect_with_retry(&agent_socket)?;
+                if client.query(&pull_ref)?.is_none() {
+                    client.pull_with_registry_config(&pull_ref)?;
+                }
+            }
+            Ok(None)
+        },
+    )
     .await
     .map_err(|e| ApiError::internal(e.to_string()))?
     .map_err(|e| {
@@ -1726,7 +2329,7 @@ async fn guest_machine(
             host.name()
         ))
     })?;
-    Ok(socket)
+    Ok((socket, lease))
 }
 
 /// Take a container's host directories back out of the machine it ran in.
@@ -1738,15 +2341,12 @@ async fn release_guest_shares(engine: &Arc<Engine>, record: &ContainerRecord) {
         return;
     }
     let machine = host.record().machine;
-    let mut shares: Vec<(String, bool)> = record
+    let shares: Vec<(String, bool)> = record
         .guest_shares
         .iter()
         .enumerate()
         .map(|(i, s)| (record.guest_share_name(i), s.read_only))
         .collect();
-    if crate::data::image_source::is_local_ref(&record.pull_ref) {
-        shares.push((record.guest_image_share(), true));
-    }
     let _ = tokio::task::spawn_blocking(move || {
         for (name, read_only) in shares {
             let _ = crate::attach::remove_share(&machine, &name, read_only);
@@ -1760,15 +2360,14 @@ pub(crate) async fn stop_machine(engine: &Arc<Engine>, machine: &str, timeout: O
     let e = engine.clone();
     let machine = machine.to_string();
     let _ = tokio::task::spawn_blocking(move || {
-        let alive =
-            e.db.get_vm(&machine)
-                .ok()
-                .flatten()
-                .is_some_and(|r| r.state == crate::config::RecordState::Running);
-        if alive {
-            let _ = crate::embedded::control::stop_vm_with_timeout(&e.db, &machine, timeout);
+        let Ok(Some(reviewed)) = e.db.get_vm(&machine) else {
+            return;
+        };
+        if reviewed.state == crate::config::RecordState::Running {
+            let _ =
+                crate::embedded::control::stop_vm_record_with_timeout(&e.db, &reviewed, timeout);
         } else {
-            let _ = crate::embedded::control::mark_stopped(&e.db, &machine);
+            let _ = crate::embedded::control::mark_stopped_for_record(&e.db, &reviewed);
         }
     })
     .await;
@@ -1803,8 +2402,13 @@ async fn signal_processes(c: &Container, signal: &str, all: bool) -> ApiResult<(
 
 /// `POST /containers/{id}/kill`.
 pub(crate) async fn kill(engine: &Arc<Engine>, c: &Arc<Container>, sig: &str) -> ApiResult<()> {
+    let _admission = c.admit_mutation(engine, false)?;
     let number = super::util::signal_number(sig)
         .ok_or_else(|| ApiError::bad_request(format!("Invalid signal: {sig}")))?;
+    if c.record().execution_suspended {
+        let _op = c.op.lock().await;
+        restore_saved_execution(engine, c, true).await?;
+    }
     if !c.is_running() {
         return Err(ApiError::conflict(format!(
             "Cannot kill container: {}: Container {} is not running",
@@ -1857,12 +2461,18 @@ async fn stop_locked(
     timeout: Option<i64>,
     sig: Option<String>,
 ) -> ApiResult<bool> {
+    let _admission = c.admit_mutation(engine, false)?;
+    if c.record().execution_suspended {
+        restore_saved_execution(engine, c, true).await?;
+    }
     let record = c.record();
-    if record.state.status == "restarting" {
-        c.update(engine, |r| {
+    if record.state.status == "restarting" || exit_cleanup::pending(&record) {
+        // Stop also cancels a queued restart while teardown is finishing.
+        c.update_durable(engine, |r| {
             r.user_stopped = true;
+            r.running_at_shutdown = false;
             r.state.status = "exited".into();
-        });
+        })?;
         return Ok(true);
     }
     if !c.is_running() {
@@ -1900,6 +2510,11 @@ async fn stop_locked(
             Duration::from_secs(timeout as u64)
         };
         if !exited(&mut exits, wait).await {
+            // A machine save can race a stop begun while the command was live.
+            // Resume that same execution before enforcing the elapsed timeout.
+            if c.record().execution_suspended {
+                restore_saved_execution(engine, c, true).await?;
+            }
             c.emit(engine, "kill", &[("signal", "9".into())]);
             let _ = signal(c, "9").await;
         }
@@ -1908,12 +2523,20 @@ async fn stop_locked(
         let _ = signal(c, "9").await;
     }
     if !exited(&mut exits, Duration::from_secs(10)).await {
+        if c.record().execution_suspended {
+            restore_saved_execution(engine, c, true).await?;
+            let _ = signal(c, "9").await;
+        }
         // The agent did not end it; stop the machine, which ends everything.
         let socket_gone = c.running.lock().as_mut().and_then(|r| r.vm.take());
         if let Some(mut handle) = socket_gone {
             let _ =
                 tokio::task::spawn_blocking(move || handle.stop_with_timeout(Some(Duration::ZERO)))
                     .await;
+        } else if !record.machine.is_empty() {
+            // Reattached execution has no launching-process handle in this
+            // supervisor; its owned machine must still be stoppable.
+            stop_machine(engine, &record.machine, Some(Duration::ZERO)).await;
         }
         let _ = exited(&mut exits, Duration::from_secs(30)).await;
     }
@@ -1931,6 +2554,7 @@ pub(crate) async fn restart(
     sig: Option<String>,
 ) -> ApiResult<()> {
     let _op = c.op.lock().await;
+    let _admission = c.admit_mutation(engine, false)?;
     stop_locked(engine, c, timeout, sig).await?;
     c.update(engine, |r| r.user_stopped = false);
     start_locked(engine, c).await?;
@@ -1945,6 +2569,7 @@ pub(crate) async fn remove(
     force: bool,
     volumes: bool,
 ) -> ApiResult<()> {
+    let _admission = c.admit_mutation(engine, true)?;
     if engine.owner.is_none() {
         let request = axum::http::Request::builder()
             .method("DELETE")
@@ -1953,7 +2578,15 @@ pub(crate) async fn remove(
             .map_err(|e| ApiError::internal(e.to_string()))?;
         let response = super::supervisor::forward(engine, &c.id(), request).await?;
         if !response.status().is_success() {
-            return Err(ApiError::internal("supervisor refused container removal"));
+            let status = response.status();
+            let bytes = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                .await
+                .map_err(|error| ApiError::internal(error.to_string()))?;
+            let message = serde_json::from_slice::<serde_json::Value>(&bytes)
+                .ok()
+                .and_then(|value| value["message"].as_str().map(str::to_owned))
+                .unwrap_or_else(|| "supervisor refused container removal".into());
+            return Err(ApiError::new(status, message));
         }
         return Ok(());
     }
@@ -1968,35 +2601,68 @@ pub(crate) async fn remove(
         }
         stop_locked(engine, c, Some(0), Some("SIGKILL".into())).await?;
     }
-    c.update(engine, |r| r.state.status = "removing".into());
     let _vm = c.vm.lock().await;
+    // Stop or exit recovery may have changed the execution while we waited.
+    // A shared guest's record is its cleanup journal: do not erase it until
+    // its exports and image ownership have been released successfully.
+    let record = c.record();
+    if exit_cleanup::pending(&record) && record.network_host().is_some() {
+        exit_cleanup::stop_original_machine(engine, &record).await?;
+    }
     let e = engine.clone();
     let machine = record.machine.clone();
+    let pending_exit = exit_cleanup::pending(&record).then(|| record.clone());
     tokio::task::spawn_blocking(move || {
-        if let Some(vm) = e.db.get_vm(&machine).ok().flatten() {
-            if let Err(error) = crate::embedded::control::delete_vm(&e.db, &machine) {
-                tracing::warn!(%machine, %error, "could not delete the container's machine");
+        let deleted = if machine.is_empty() {
+            None
+        } else if let Some(record) = pending_exit {
+            let _source_lock = crate::agent::fork::lock_fork_source(&machine)?;
+            let vm = exit_cleanup::reviewed_machine(&e, &record).map_err(|error| {
+                crate::Error::agent_conflict("remove exited container", error.message)
+            })?;
+            if let Some(vm) = &vm {
+                crate::deletion::delete_machine_locked(&e.db, vm, None, false, false)?;
             }
-            // The last container branched from a retired base takes it along.
-            if vm.golden.is_some() {
-                super::warm::collect(&e);
+            vm
+        } else {
+            let vm = e.db.get_vm(&machine)?;
+            if vm.is_some() {
+                crate::embedded::control::delete_vm(&e.db, &machine)?;
             }
+            vm
+        };
+        // The last container branched from a retired base takes it along.
+        if deleted.is_some_and(|vm| vm.golden.is_some()) {
+            super::warm::collect(&e);
         }
+        Ok::<_, crate::Error>(())
     })
     .await
-    .map_err(|e| ApiError::internal(e.to_string()))?;
+    .map_err(|e| ApiError::internal(e.to_string()))?
+    .map_err(mutation_error)?;
+    c.input.finish();
+    c.update(engine, |r| r.state.status = "removing".into());
     super::network::detach_all(engine, c).await;
     engine.containers.write().remove(&record.id);
     engine.store.remove_container(&record.id);
+    let mut volume_error = None;
     if volumes {
         for m in &record.mounts {
             if m.kind == "volume" {
                 if let Some(v) = engine.volumes.get(&m.source) {
                     if v.anonymous && !volume_in_use(engine, &v.name) {
-                        let _ = engine.volumes.remove(&engine.store, &v.name);
-                        engine
-                            .events
-                            .emit("volume", "destroy", &v.name, BTreeMap::new());
+                        match engine.volumes.remove(&engine.store, &v.name) {
+                            Ok(()) => {
+                                engine
+                                    .events
+                                    .emit("volume", "destroy", &v.name, BTreeMap::new())
+                            }
+                            Err(error) => {
+                                volume_error.get_or_insert_with(|| ApiError::internal(format!(
+                                    "Container removed, but volume {} could not be removed: {}. Repair the filesystem and retry volume removal.", v.name, error.message
+                                )));
+                            }
+                        }
                     }
                 }
             }
@@ -2005,7 +2671,7 @@ pub(crate) async fn remove(
     let _ = c.output.send(Output::End);
     c.emit(engine, "destroy", &[]);
     c.exits.send_modify(|s| s.removed = true);
-    Ok(())
+    volume_error.map_or(Ok(()), Err)
 }
 
 /// Whether any container mounts the volume.
@@ -2057,6 +2723,21 @@ pub(crate) async fn wait(c: &Arc<Container>, condition: &str) -> ApiResult<i64> 
 /// process of the container.
 pub(crate) async fn pause(engine: &Arc<Engine>, c: &Arc<Container>, pause: bool) -> ApiResult<()> {
     let _op = c.op.lock().await;
+    let _admission = c.admit_mutation(engine, false)?;
+    if !pause && c.record().execution_suspended {
+        restore_saved_execution(engine, c, true).await?;
+        if c.record().state.status == "paused" {
+            signal_processes(c, "SIGCONT", true).await?;
+            c.update(engine, |record| {
+                record.state.status = "running".into();
+                if let Some(saved) = &mut record.saved_execution {
+                    saved.process_paused = false;
+                }
+            });
+            c.emit(engine, "unpause", &[]);
+        }
+        return Ok(());
+    }
     let status = c.record().state.status;
     match (pause, status.as_str()) {
         (true, "running") => {}
@@ -2082,7 +2763,10 @@ pub(crate) async fn pause(engine: &Arc<Engine>, c: &Arc<Container>, pause: bool)
     }
     signal_processes(c, if pause { "SIGSTOP" } else { "SIGCONT" }, true).await?;
     c.update(engine, |r| {
-        r.state.status = if pause { "paused" } else { "running" }.into()
+        r.state.status = if pause { "paused" } else { "running" }.into();
+        if let Some(saved) = &mut r.saved_execution {
+            saved.process_paused = pause;
+        }
     });
     c.emit(engine, if pause { "pause" } else { "unpause" }, &[]);
     Ok(())
@@ -2090,6 +2774,8 @@ pub(crate) async fn pause(engine: &Arc<Engine>, c: &Arc<Container>, pause: bool)
 
 /// `POST /containers/{id}/rename`.
 pub(crate) async fn rename(engine: &Engine, c: &Container, new_name: &str) -> ApiResult<()> {
+    let _op = c.op.lock().await;
+    let _admission = c.admit_mutation(engine, false)?;
     let _catalog = super::supervisor::lock(engine.config.root.join("containers.lock"))
         .await
         .map_err(|e| ApiError::internal(e.to_string()))?;
@@ -2111,9 +2797,17 @@ pub(crate) async fn rename(engine: &Engine, c: &Container, new_name: &str) -> Ap
         }
     }
     let old = c.name();
-    c.update(engine, |r| r.name = new_name.to_string());
+    c.update_durable(engine, |r| r.name = new_name.to_string())?;
     c.emit(engine, "rename", &[("oldName", format!("/{old}"))]);
     Ok(())
+}
+
+fn mutation_error(error: crate::Error) -> ApiError {
+    if error.code() == "CONFLICT" {
+        ApiError::conflict(error.to_string())
+    } else {
+        ApiError::from(error)
+    }
 }
 
 // ============================================================================
@@ -2215,6 +2909,43 @@ pub(crate) async fn recover(engine: &Arc<Engine>) {
         if engine.owner.as_deref() != Some(c.id().as_str()) {
             continue;
         }
+        if exit_cleanup::pending(&c.record()) {
+            let activity = engine.activity.hold();
+            let (engine, c) = (engine.clone(), c.clone());
+            tokio::spawn(async move {
+                let _activity = activity;
+                let state = c.record().state;
+                on_exit(
+                    engine,
+                    c,
+                    Exit {
+                        code: state.exit_code,
+                        oom: state.oom_killed,
+                    },
+                    None,
+                )
+                .await;
+            });
+            continue;
+        }
+        if c.record().state.status == "restarting" && c.record().saved_execution.is_none() {
+            let generation = c.record().execution_generation;
+            let (engine, c) = (engine.clone(), c.clone());
+            tokio::spawn(async move {
+                exit_cleanup::resume_restart(engine, c, generation).await;
+            });
+            continue;
+        }
+        if c.record().saved_execution.is_some() {
+            match restore_saved_execution(engine, &c, false).await {
+                Ok(true) => continue,
+                Ok(false) => {}
+                Err(error) => {
+                    tracing::error!(container = %c.id(), error = %error.message, "saved container execution requires recovery");
+                    continue;
+                }
+            }
+        }
         let record = c.record();
         let was_running = matches!(
             record.state.status.as_str(),
@@ -2266,7 +2997,7 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
         .containers
         .read()
         .values()
-        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()) && c.is_running())
+        .filter(|c| engine.owner.as_deref() == Some(c.id().as_str()) && c.owns_live_execution())
         .cloned()
         .collect();
     let mut tasks = Vec::new();
@@ -2276,7 +3007,10 @@ pub(crate) async fn shutdown_all(engine: &Arc<Engine>) {
             let user_stopped = c.record().user_stopped;
             c.update(&e, |r| r.running_at_shutdown = true);
             let _ = stop(&e, &c, None, None).await;
-            c.update(&e, |r| r.user_stopped = user_stopped);
+            c.update(&e, |r| {
+                r.user_stopped = user_stopped;
+                r.running_at_shutdown = true;
+            });
         }));
     }
     for t in tasks {
@@ -2603,21 +3337,7 @@ pub(crate) fn matches(engine: &Engine, c: &Container, filters: &Filters) -> bool
     let r = c.record();
     let running = c.is_running();
     filters.any("id", |id| r.id.starts_with(id))
-        && filters.any("name", |n| {
-            let n = n.trim_start_matches('/');
-            let anchored = n.starts_with('^');
-            let n = n.trim_start_matches('^');
-            let (n, end) = match n.strip_suffix('$') {
-                Some(n) => (n, true),
-                None => (n, false),
-            };
-            match (anchored, end) {
-                (true, true) => r.name == n,
-                (true, false) => r.name.starts_with(n),
-                (false, true) => r.name.ends_with(n),
-                (false, false) => r.name.contains(n),
-            }
-        })
+        && filters.container_name_matches(&r.name)
         && filters.labels_match("label", &r.config.labels)
         && filters.any("status", |s| s == r.state.status)
         && filters.any("exited", |code| {
@@ -2663,14 +3383,265 @@ pub(crate) fn matches(engine: &Engine, c: &Container, filters: &Filters) -> bool
             || filters.get("status").iter().any(|s| s != "running"))
 }
 
-/// Push `input` to a running container's process.
-pub(crate) fn send_input(c: &Container, input: Input) {
-    c.input.push(input);
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn orphaned_shared_container_remains_removable_without_an_active_transfer() {
+        let root = tempfile::tempdir().unwrap();
+        let id = super::super::util::new_id();
+        let engine = Engine::open_with_db(
+            super::super::EngineConfig {
+                root: root.path().join("engine"),
+                socket: root.path().join("api.sock"),
+            },
+            Some(id.clone()),
+            crate::db::SmolvmDb::open_at(&root.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id":id,"name":"orphan","created":"","image":"","image_id":"",
+            "pull_ref":"","machine":"","config":{},
+            "host_config":{"NetworkMode":format!("container:{}", "d".repeat(64))},
+            "host_config_raw":{},"networks":{},"path":"sh","args":[],
+            "state":StateRecord::default(),"restart_count":0,"ports":[],"mounts":[]
+        }))
+        .unwrap();
+        engine.store.save_container(&record).unwrap();
+        let container = Container::from_record(record);
+        engine
+            .containers
+            .write()
+            .insert(id.clone(), container.clone());
+        let owner = format!("orphan-transfer-{:032x}", rand::random::<u128>());
+        engine
+            .db
+            .insert_vm(
+                &owner,
+                &crate::config::VmRecord::new(owner.clone(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        engine
+            .db
+            .claim_workload_transfer(
+                "orphan-move",
+                vec![engine.db.review_workload_member(&owner).unwrap()],
+                &[],
+            )
+            .unwrap();
+        assert!(remove(&engine, &container, true, false).await.is_err());
+        assert!(engine.store.load_container(&id).unwrap().is_some());
+        engine.db.retire_workload_transfer("orphan-move").unwrap();
+        engine.db.remove_vm(&owner).unwrap();
+
+        // Neither a potentially live execution nor cyclic ownership is an
+        // orphaned stopped record that can be discarded.
+        container.update(&engine, |record| record.state.status = "running".into());
+        assert!(remove(&engine, &container, true, false).await.is_err());
+        container.update(&engine, |record| {
+            record.state.status = "created".into();
+            record.host_config.network_mode = format!("container:{id}");
+        });
+        assert_eq!(
+            remove(&engine, &container, false, false)
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        container.update(&engine, |record| {
+            record.host_config.network_mode = format!("container:{}", "d".repeat(64))
+        });
+        container.update(&engine, |record| record.machine = "unexpected-owner".into());
+        assert!(remove(&engine, &container, false, false).await.is_err());
+        container.update(&engine, |record| record.machine.clear());
+        remove(&engine, &container, false, false).await.unwrap();
+        assert!(engine.find_container(&id).is_none());
+        assert!(engine.store.load_container(&id).unwrap().is_none());
+        assert!(engine.db.list_vms().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn transfer_claim_preserves_container_removal_and_rename() {
+        use tower::ServiceExt;
+        for operation in [
+            "remove",
+            "force-remove",
+            "rename",
+            "start",
+            "stop",
+            "restart",
+            "kill",
+            "pause",
+            "unpause",
+            "update",
+            "connect",
+            "disconnect",
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let id = super::super::util::new_id();
+            let engine = Engine::open_with_db(
+                super::super::EngineConfig {
+                    root: root.path().join("engine"),
+                    socket: root.path().join("api.sock"),
+                },
+                Some(id.clone()),
+                crate::db::SmolvmDb::open_at(&root.path().join("test.db")).unwrap(),
+            )
+            .unwrap();
+            let name = format!("container-transfer-{:032x}", rand::random::<u128>());
+            let vm = crate::config::VmRecord::new(name.clone(), 1, 128, vec![], vec![], false);
+            engine.db.insert_vm(&name, &vm).unwrap();
+            let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+                "id": id, "name": "moving", "created": "", "image": "", "image_id": "",
+                "pull_ref": "", "machine": name, "config": {}, "host_config": {}, "host_config_raw": {},
+                "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+                "restart_count": 0, "ports": [], "mounts": []
+            })).unwrap();
+            engine.store.save_container(&record).unwrap();
+            let before = serde_json::to_value(&record).unwrap();
+            let container = Container::from_record(record);
+            engine
+                .containers
+                .write()
+                .insert(id.clone(), container.clone());
+            let shared = root.path().join("shared");
+            std::fs::create_dir(&shared).unwrap();
+            std::fs::write(shared.join("payload"), b"keep shared data").unwrap();
+            engine
+                .db
+                .claim_workload_transfer(
+                    "container-move",
+                    vec![engine.db.review_workload_member(&name).unwrap()],
+                    std::slice::from_ref(&shared),
+                )
+                .unwrap();
+            let result = match operation {
+                "remove" => remove(&engine, &container, false, false).await,
+                "force-remove" => remove(&engine, &container, true, true).await,
+                "start" => start(&engine, &container).await.map(|_| ()),
+                "stop" => stop(&engine, &container, None, None).await.map(|_| ()),
+                "restart" => restart(&engine, &container, None, None).await,
+                "kill" => kill(&engine, &container, "SIGKILL").await,
+                "pause" => pause(&engine, &container, true).await,
+                "unpause" => pause(&engine, &container, false).await,
+                "update" | "connect" | "disconnect" => {
+                    let (path, body) = if operation == "update" {
+                        (
+                            format!("/containers/{id}/update"),
+                            serde_json::json!({"RestartPolicy":{"Name":"always"}}),
+                        )
+                    } else {
+                        (
+                            format!("/networks/bridge/{operation}"),
+                            serde_json::json!({"Container":id}),
+                        )
+                    };
+                    let response = super::super::api::router(engine.clone())
+                        .oneshot(
+                            axum::http::Request::builder()
+                                .method("POST")
+                                .uri(path)
+                                .header("content-type", "application/json")
+                                .body(axum::body::Body::from(body.to_string()))
+                                .unwrap(),
+                        )
+                        .await
+                        .unwrap();
+                    let status = response.status();
+                    let body = axum::body::to_bytes(response.into_body(), 64 * 1024)
+                        .await
+                        .unwrap();
+                    Err(ApiError::new(
+                        status,
+                        String::from_utf8(body.to_vec()).unwrap(),
+                    ))
+                }
+                _ => rename(&engine, &container, "renamed").await,
+            };
+            let error = result.unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+            assert!(
+                error.message.contains("moving"),
+                "{operation}: {}",
+                error.message
+            );
+            assert_eq!(serde_json::to_value(container.record()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(engine.store.load_container(&id).unwrap().unwrap()).unwrap(),
+                before
+            );
+            assert!(engine.find_container(&id).is_some());
+            assert!(engine.db.get_vm(&name).unwrap().is_some());
+
+            // Unrelated containers remain usable. A container without a VM
+            // must still respect the claim if it binds an alias of shared data.
+            let mut other = container.record();
+            other.id = super::super::util::new_id();
+            other.name = "unrelated".into();
+            other.machine = format!("{name}-unrelated");
+            engine.store.save_container(&other).unwrap();
+            let other = Container::from_record(other);
+            engine.containers.write().insert(other.id(), other.clone());
+            rename(&engine, &other, "still-usable").await.unwrap();
+            let alias = root.path().join("alias");
+            std::os::unix::fs::symlink(&shared, &alias).unwrap();
+            other.update(&engine, |record| {
+                record.mounts.push(MountRecord {
+                    kind: "bind".into(),
+                    source: alias.to_string_lossy().into_owned(),
+                    destination: "/data".into(),
+                    read_only: true,
+                    share: None,
+                    subpath: None,
+                    mode: "ro".into(),
+                    options: vec![],
+                    copy_up: false,
+                    socket: false,
+                })
+            });
+            assert_eq!(
+                rename(&engine, &other, "blocked").await.unwrap_err().status,
+                axum::http::StatusCode::CONFLICT
+            );
+            assert_eq!(other.name(), "still-usable");
+            engine
+                .db
+                .retire_workload_transfer("container-move")
+                .unwrap();
+            remove(&engine, &other, false, false).await.unwrap();
+            assert_eq!(
+                std::fs::read(shared.join("payload")).unwrap(),
+                b"keep shared data"
+            );
+
+            // A different deletion refusal must also keep the container visible
+            // and retryable, without publishing a false removal or losing data.
+            let child_name = format!("{name}-child");
+            let mut child =
+                crate::config::VmRecord::new(child_name.clone(), 1, 128, vec![], vec![], false);
+            child.golden = Some(name.clone());
+            engine.db.insert_vm(&child_name, &child).unwrap();
+            let error = remove(&engine, &container, false, false).await.unwrap_err();
+            assert_eq!(error.status, axum::http::StatusCode::CONFLICT);
+            assert!(error.message.contains("dependent fork"));
+            assert_eq!(serde_json::to_value(container.record()).unwrap(), before);
+            assert_eq!(
+                serde_json::to_value(engine.store.load_container(&id).unwrap().unwrap()).unwrap(),
+                before
+            );
+            assert!(!container.subscribe_exits().borrow().removed);
+            engine.db.remove_vm(&child_name).unwrap();
+            rename(&engine, &container, "renamed").await.unwrap();
+            assert_eq!(container.name(), "renamed");
+            remove(&engine, &container, false, false).await.unwrap();
+            assert!(engine.find_container(&id).is_none());
+            assert!(engine.store.load_container(&id).unwrap().is_none());
+            assert!(engine.db.get_vm(&name).unwrap().is_none());
+            assert!(container.subscribe_exits().borrow().removed);
+        }
+    }
 
     fn image(config: serde_json::Value) -> ImageRecord {
         ImageRecord {
@@ -2691,6 +3662,153 @@ mod tests {
             cmd: cmd.map(|v| v.into_iter().map(String::from).collect()),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn execution_generations_survive_reload_and_fail_closed_on_storage_error() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id": "a".repeat(64), "name": "generation", "created": "", "image": "", "image_id": "",
+            "pull_ref": "", "machine": "", "config": {}, "host_config": {}, "host_config_raw": {},
+            "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+            "restart_count": 0, "ports": [], "mounts": []
+        }))
+        .unwrap();
+        // Records written by older engines begin at generation zero.
+        assert_eq!(record.execution_generation, 0);
+        let container = Container::from_record(record);
+        assert_eq!(container.reserve_execution_generation(&engine).unwrap(), 1);
+        let restored = Container::from_record(
+            engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .unwrap(),
+        );
+        assert_eq!(restored.reserve_execution_generation(&engine).unwrap(), 2);
+        let directory = engine.store.container_dir(&container.id());
+        let backup = root.path().join("saved-container");
+        std::fs::rename(&directory, &backup).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        assert!(restored.reserve_execution_generation(&engine).is_err());
+        assert_eq!(restored.record.lock().execution_generation, 2);
+        std::fs::remove_file(&directory).unwrap();
+        std::fs::rename(&backup, &directory).unwrap();
+        assert_eq!(restored.reserve_execution_generation(&engine).unwrap(), 3);
+        assert_eq!(
+            engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .unwrap()
+                .execution_generation,
+            3
+        );
+        restored.update(&engine, |r| r.execution_generation = u64::MAX);
+        assert!(restored.reserve_execution_generation(&engine).is_err());
+        assert_eq!(restored.record.lock().execution_generation, u64::MAX);
+    }
+
+    #[tokio::test]
+    async fn observing_saved_execution_keeps_restart_and_remove_policies_dormant() {
+        for policy in ["always", "auto-remove"] {
+            let root = tempfile::tempdir().unwrap();
+            let engine = super::super::test_engine(root.path());
+            let id = "a".repeat(64);
+            let mut vm =
+                crate::config::VmRecord::new("saved-owner".into(), 1, 512, vec![], vec![], false);
+            vm.labels.insert(MACHINE_LABEL.into(), id.clone());
+            vm.state = crate::config::RecordState::Paused;
+            vm.paused_checkpoint = Some(root.path().join("owned.checkpoint"));
+            engine.db.insert_vm(&vm.name, &vm).unwrap();
+            let mut record: ContainerRecord = serde_json::from_value(serde_json::json!({
+                "id": id, "name": "saved", "created": "", "image": "", "image_id": "",
+                "pull_ref": "", "machine": vm.name, "config": {}, "host_config": {}, "host_config_raw": {},
+                "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+                "restart_count": 0, "ports": [], "mounts": []
+            })).unwrap();
+            record.state.status = "running".into();
+            record.host_config.auto_remove = policy == "auto-remove";
+            if policy == "always" {
+                record.host_config.restart_policy.name = "always".into();
+            }
+            let session = super::super::container_session::Session::new(
+                root.path().join("agent.sock"),
+                vm.name.clone(),
+                smolvm_protocol::container_session::Origin {
+                    generation: 1,
+                    started_at: "2026-11-18T00:00:00Z".into(),
+                },
+            );
+            record.saved_execution = Some(saved_execution(&engine, &record, &session).unwrap());
+            engine.store.save_container(&record).unwrap();
+            let container = Container::from_record(record);
+            assert!(restore_saved_execution(&engine, &container, false)
+                .await
+                .unwrap());
+            let stored = engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .unwrap();
+            assert_eq!(stored.state.status, "paused");
+            assert!(stored.saved_execution.is_some() && stored.execution_suspended);
+            assert!(!container.owns_live_execution());
+            assert_eq!(stored.restart_count, 0);
+            assert_eq!(
+                engine
+                    .db
+                    .get_vm(&vm.name)
+                    .unwrap()
+                    .unwrap()
+                    .paused_checkpoint,
+                vm.paused_checkpoint
+            );
+            // A replacement with the same name must not inherit this authority.
+            engine
+                .db
+                .update_vm(&vm.name, |vm| vm.created_at += 1)
+                .unwrap();
+            assert!(restore_saved_execution(&engine, &container, false)
+                .await
+                .is_err());
+            assert!(engine
+                .store
+                .load_container(&container.id())
+                .unwrap()
+                .is_some());
+            assert!(retain_saved_execution(&engine, &container, &session, 0, None).await);
+            assert!(container.record().state.error.contains("ownership changed"));
+            assert_eq!(
+                engine.db.get_vm(&vm.name).unwrap().unwrap().created_at,
+                vm.created_at + 1
+            );
+        }
+    }
+
+    #[test]
+    fn failed_execution_persistence_does_not_change_in_memory_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let record: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id": "b".repeat(64), "name": "saved", "created": "", "image": "", "image_id": "",
+            "pull_ref": "", "machine": "", "config": {}, "host_config": {}, "host_config_raw": {},
+            "networks": {}, "path": "sh", "args": [], "state": StateRecord::default(),
+            "restart_count": 0, "ports": [], "mounts": []
+        }))
+        .unwrap();
+        engine.store.save_container(&record).unwrap();
+        let container = Container::from_record(record);
+        let directory = engine.store.container_dir(&container.id());
+        let retained = root.path().join("retained");
+        std::fs::rename(&directory, &retained).unwrap();
+        std::fs::write(&directory, b"not a directory").unwrap();
+        assert!(container
+            .update_durable(&engine, |r| r.execution_suspended = true)
+            .is_err());
+        assert!(!container.record().execution_suspended);
+        assert_eq!(container.record().state.status, "created");
     }
 
     #[test]

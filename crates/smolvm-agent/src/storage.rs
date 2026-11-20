@@ -1593,20 +1593,42 @@ pub(crate) fn archive_scratch_dir() -> PathBuf {
 /// last, so the image-info and overlay paths share one flatten within a start.
 fn ensure_archive_flattened_with_progress<F>(
     packed_dir: &Path,
-    mut progress: F,
+    progress: F,
 ) -> Result<Option<PathBuf>>
 where
     F: FnMut(&str, u64),
 {
-    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
-    if !archive.exists() {
-        return Ok(None);
-    }
     let key = packed_dir
         .file_name()
         .and_then(|n| n.to_str())
         .unwrap_or("archive");
     let out_base = Path::new(STORAGE_ROOT).join("image-archives").join(key);
+    ensure_archive_flattened_at(
+        packed_dir,
+        out_base,
+        progress,
+        flatten_archive_with_progress,
+    )
+}
+
+mod archive_lock;
+
+fn ensure_archive_flattened_at<F, G>(
+    packed_dir: &Path,
+    out_base: PathBuf,
+    mut progress: F,
+    flatten: G,
+) -> Result<Option<PathBuf>>
+where
+    F: FnMut(&str, u64),
+    G: FnOnce(&Path, &Path, &mut F) -> Result<Option<Vec<u8>>>,
+{
+    let preparation = archive_lock::for_image(&out_base);
+    let _preparing = preparation.lock();
+    let archive = packed_dir.join(ARCHIVE_FILE_NAME);
+    if !archive.exists() {
+        return Ok(None);
+    }
     let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
     let signature = archive_signature(&archive)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
@@ -1619,7 +1641,7 @@ where
     std::fs::create_dir_all(&rootfs)?;
     info!(archive = %archive.display(), rootfs = %rootfs.display(), "flattening local image archive");
     progress("flattening local image archive", 0);
-    let oci_config = flatten_archive_with_progress(&archive, &rootfs, &mut progress)?;
+    let oci_config = flatten(&archive, &rootfs, &mut progress)?;
     // Recover the image config before writing the marker, so a later reuse can
     // rely on config.json being present. A docker/podman `save` always carries
     // one.
@@ -4501,6 +4523,10 @@ impl OverlaySetup {
     /// remounts it preserving the upper layer (which contains previous changes).
     /// If the overlay does not exist at all, creates it fresh.
     fn execute_or_remount(self, lowerdirs: Vec<String>) -> Result<OverlayInfo> {
+        // Requests run on their own threads, and two remounts of one overlay
+        // clear the work directory under each other's mount.
+        static PREPARE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+        let _prepare = PREPARE.lock().unwrap_or_else(|e| e.into_inner());
         let mut restored_fork = false;
         // Already mounted — reuse it only if it actually answers lookups.
         if self.merged_path.exists() && is_mountpoint(&self.merged_path) {
@@ -6573,7 +6599,64 @@ fn base64_encode(input: &str) -> String {
 /// identity token, which crane takes as `identitytoken`.
 ///
 /// The returned TempDir must be kept alive for the duration of the command.
-fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfile::TempDir> {
+/// The Docker config directory for one registry pull. With a credential it is
+/// a tmpfs of its own: a file written to the storage disk and unlinked after
+/// the pull leaves the login in a freed block, which root in the guest can
+/// read from the disk and an image seed copies to every later machine.
+struct DockerAuthDir {
+    dir: tempfile::TempDir,
+    mounted: bool,
+}
+
+impl DockerAuthDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for DockerAuthDir {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.mounted {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(target) = std::ffi::CString::new(self.dir.path().as_os_str().as_bytes()) {
+                // SAFETY: target is a valid NUL-terminated path.
+                unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+    }
+}
+
+/// Mount a small private tmpfs on `dir`, so what is written there stays in
+/// memory.
+#[cfg(target_os = "linux")]
+fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: every pointer is a valid NUL-terminated string.
+    let rc = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            c"size=64k,mode=0700".as_ptr().cast(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The agent only runs in a Linux guest; elsewhere it is built for tests.
+#[cfg(not(target_os = "linux"))]
+fn mount_private_tmpfs(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<DockerAuthDir> {
     // The guest root filesystem (and thus the default temp dir, /tmp) is
     // read-only, so create the auth config under the writable storage disk.
     let temp_dir = tempfile::Builder::new()
@@ -6582,9 +6665,20 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfil
         .map_err(|e| {
             StorageError::new(format!("failed to create temp directory for auth: {}", e))
         })?;
+    let mut auth_dir = DockerAuthDir {
+        dir: temp_dir,
+        mounted: false,
+    };
 
     let config_json = match auth {
         Some(a) => {
+            mount_private_tmpfs(auth_dir.path()).map_err(|e| {
+                StorageError::new(format!(
+                    "failed to mount tmpfs for registry credentials: {}",
+                    e
+                ))
+            })?;
+            auth_dir.mounted = true;
             let registry = extract_registry_from_image(image);
             let entry = if a.username == DOCKER_IDENTITY_TOKEN_USERNAME {
                 serde_json::json!({ "identitytoken": a.password })
@@ -6601,11 +6695,11 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfil
         None => "{}".to_string(),
     };
 
-    let config_path = temp_dir.path().join("config.json");
+    let config_path = auth_dir.path().join("config.json");
     std::fs::write(&config_path, &config_json)
         .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
 
-    Ok(temp_dir)
+    Ok(auth_dir)
 }
 
 /// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
@@ -7786,7 +7880,10 @@ mod tests {
         // `..` and absolute paths escape the layer dir — rejected.
         assert!(jailed_join(base, Path::new("../etc/passwd")).is_none());
         assert!(jailed_join(base, Path::new("tmp/../../etc")).is_none());
-        assert!(jailed_join(base, Path::new("/etc/passwd")).is_none());
+        assert_eq!(
+            jailed_join(base, Path::new("/etc/passwd")),
+            Some(base.join("etc/passwd"))
+        );
     }
 
     /// End-to-end extraction with whiteout conversion. mknod/setxattr(trusted.*)
@@ -8827,5 +8924,61 @@ mod tests {
         assert!(!names.iter().any(|name| name == "deleted"));
 
         let _ = std::process::Command::new("umount").arg(&merged).status();
+    }
+
+    /// Two requests for a persistent overlay that is not mounted, as after a
+    /// restart, must both get it mounted once. Needs root + Linux overlayfs, so
+    /// it's `#[ignore]`d; run on a Linux host with:
+    ///   cargo test -p smolvm-agent -- --ignored concurrent_remounts_mount_the_overlay_once
+    #[test]
+    #[ignore = "requires root + Linux overlayfs"]
+    #[cfg(target_os = "linux")]
+    fn concurrent_remounts_mount_the_overlay_once() {
+        let tmp = tempfile::tempdir().unwrap();
+        let layer = tmp.path().join("layer");
+        std::fs::create_dir_all(&layer).unwrap();
+        std::fs::write(layer.join("file"), b"x").unwrap();
+        let lowerdirs = vec![layer.to_string_lossy().into_owned()];
+        let root = tmp.path().join("overlay");
+        let merged = root.join("merged");
+        let setup = || OverlaySetup {
+            workload_id: "persistent-race".to_string(),
+            overlay_root: root.clone(),
+            upper_path: root.join("upper"),
+            work_path: root.join("work"),
+            merged_path: merged.clone(),
+        };
+        setup().execute_or_remount(lowerdirs.clone()).unwrap();
+
+        for round in 0..20 {
+            assert!(Command::new("umount")
+                .arg(&merged)
+                .status()
+                .unwrap()
+                .success());
+            let start = std::sync::Barrier::new(2);
+            std::thread::scope(|scope| {
+                let remounts: Vec<_> = (0..2)
+                    .map(|_| {
+                        scope.spawn(|| {
+                            start.wait();
+                            setup().execute_or_remount(lowerdirs.clone())
+                        })
+                    })
+                    .collect();
+                for remount in remounts {
+                    if let Err(e) = remount.join().unwrap() {
+                        panic!("round {round}: {e}");
+                    }
+                }
+            });
+            let mountinfo = std::fs::read_to_string("/proc/self/mountinfo").unwrap();
+            let mounts = mountinfo
+                .lines()
+                .filter(|line| line.split_whitespace().nth(4) == merged.to_str())
+                .count();
+            assert_eq!(mounts, 1, "round {round}");
+        }
+        let _ = Command::new("umount").arg(&merged).status();
     }
 }

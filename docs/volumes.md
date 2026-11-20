@@ -1,6 +1,8 @@
 # Volumes
 
-Besides host directories (`-v HOST:GUEST[:ro]`), a volume can be an S3 bucket
+Besides host directories (`-v HOST:GUEST[:ro][:uid=N[,gid=N]]`, where `uid=`/`gid=`
+make the guest user own every file that records no owner of its own, so a host
+directory belongs to that user without a `chown`), a volume can be an S3 bucket
 or a staged copy of a host directory.
 
 ## S3 buckets

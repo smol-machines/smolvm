@@ -328,6 +328,10 @@ pub struct LaunchFeatures {
     /// `SMOLVM_BOOT_BINARY` (so `current_exe` need not handle `_boot-vm`) yet
     /// DETACHES the VM to persist after the CLI exits (e.g. `smol start`/`fork`).
     pub watch_parent: Option<bool>,
+    /// Internal batch startup commit file, passed through the boot helper's
+    /// unused stdin on Unix; provisional children exit if their owner dies.
+    #[doc(hidden)]
+    pub startup_commit: Option<std::sync::Arc<std::fs::File>>,
     /// Kubernetes pod network namespace to attach the VM's virtio-net device to
     /// (the CNI-provisioned netns for a shim-booted pod sandbox). When set, the
     /// launcher bridges the guest NIC L2 to a tap inside this netns (tc-redirect
@@ -365,41 +369,6 @@ fn shared_layers_populated(layers: &Path) -> bool {
 }
 
 impl LaunchFeatures {
-    /// Fold an image's own registry into the enforced DNS egress filter so a
-    /// scoped machine's in-guest base-image pull isn't blocked by its own
-    /// allow-list.
-    ///
-    /// An image-based machine pulls its base image inside the guest on first
-    /// boot, subject to `dns_filter_hosts` (applied at VM boot). Scoping egress
-    /// to only, say, an LLM API would otherwise fail the pull with a DNS-lookup
-    /// error for the registry. Call this only when a fresh remote pull will
-    /// happen (first boot, registry-sourced). No-op when the filter is unset or
-    /// empty, when layers are packed/local (`uses_packed_layers`), or when the
-    /// reference is a `local:` source — none of which pull over the network.
-    ///
-    /// Only the enforced launch policy is widened; the caller's stored
-    /// `dns_filter_hosts` on the record keeps exactly the hosts the user asked
-    /// for. Mirrors the control plane's `create_body` registry-fold.
-    pub fn allow_image_pull_egress(&mut self, image: Option<&str>, uses_packed_layers: bool) {
-        let Some(hosts) = self.dns_filter_hosts.as_mut() else {
-            return;
-        };
-        if hosts.is_empty() || uses_packed_layers {
-            return;
-        }
-        let Some(image) = image else {
-            return;
-        };
-        if crate::data::image_source::is_local_ref(image) {
-            return;
-        }
-        for host in crate::registry::registry_pull_hosts(image) {
-            if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
-                hosts.push(host);
-            }
-        }
-    }
-
     /// Wire pre-extracted OCI layers for a machine created from a `.smolmachine`.
     ///
     /// `layers_cache_dir` is the machine's OWN extraction directory (under its
@@ -729,6 +698,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         egress_refresh_hosts.as_deref(),
         port_mappings.len(),
     )?;
+    if resources.network_backend == Some(crate::network::NetworkBackend::Host)
+        && (auto_ports.is_some()
+            || credentials.is_some()
+            || external_interceptor.is_some()
+            || pod_net.is_some())
+    {
+        return Err(Error::config("host network", "host networking cannot use automatic port publishing, credentials, interception or pod networks"));
+    }
     if let Some(endpoint) = external_interceptor {
         validate_external_interceptor(
             endpoint,
@@ -821,6 +798,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         read_only: false,
                         staged: false,
                         recorded_ownership: false,
+                        owner: None,
                     });
                 }
             }
@@ -1128,61 +1106,14 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             };
         }
 
-        // Set root filesystem via the root virtiofs tag ("/dev/root").
-        //
-        // Upstream libkrun removed krun_set_root in favor of krun_add_virtiofs*
-        // with KRUN_FS_ROOT_TAG. Use virtiofs3 for both policy states so every
-        // launcher interprets the shared rootfs DAX setting identically.
         let root = try_or_free_ctx!(
             path_to_cstring(rootfs_path),
             "set rootfs",
             "path contains null byte"
         );
-        let root_tag = cstr("/dev/root");
-        let rootfs_dax_window = super::virtiofs::rootfs_dax_window();
-        if rootfs_dax_window == 0 {
-            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "SMOLVM_ROOTFS_DAX=0 requires libkrun with krun_add_virtiofs3",
-                ));
-            };
-
-            if add_virtiofs3(ctx, root_tag.as_ptr(), root.as_ptr(), 0, true) < 0 {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "krun_add_virtiofs3 failed for root filesystem",
-                ));
-            }
-            tracing::info!("rootfs configured via virtiofs without DAX");
-        } else {
-            // Default: restore the 512 MB root DAX window the removed krun_set_root
-            // configured. Plain krun_add_virtiofs passes shm_size=0 (no DAX), which
-            // drops virtiofs to writeback caching and hides the guest's ready-marker
-            // write from the host until the socket-probe grace — a boot-time regression.
-            let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "root DAX requires libkrun with krun_add_virtiofs3",
-                ));
-            };
-            if add_virtiofs3(
-                ctx,
-                root_tag.as_ptr(),
-                root.as_ptr(),
-                rootfs_dax_window,
-                true,
-            ) < 0
-            {
-                krun_free_ctx(ctx);
-                return Err(Error::agent(
-                    "set rootfs",
-                    "krun_add_virtiofs3 failed for root filesystem",
-                ));
-            }
+        if let Err(error) = super::virtiofs::configure_rootfs(&krun, ctx, &root, true) {
+            krun_free_ctx(ctx);
+            return Err(error);
         }
 
         let network_plan = select_network_plan(
@@ -1281,6 +1212,27 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 }
 
                 tracing::info!("network backend: tsi");
+                None
+            }
+            EffectiveNetworkBackend::Host => {
+                krun.ensure_host_network().map_err(|reason| {
+                    krun_free_ctx(ctx);
+                    Error::agent("configure host network", reason)
+                })?;
+                if krun_add_vsock(
+                    ctx,
+                    TSI_FEATURE_HIJACK_INET | crate::network::backend::TSI_FEATURE_HOST_BIND,
+                ) < 0
+                {
+                    krun_free_ctx(ctx);
+                    return Err(Error::agent(
+                        "configure host network",
+                        "krun_add_vsock rejected host networking",
+                    ));
+                }
+                // A port map, even empty, intentionally forbids direct host binds.
+                start_tsi_dns_forwarder(ctx, krun.set_dns_forwarder, resources.dns);
+                tracing::info!("network backend: host");
                 None
             }
             EffectiveNetworkBackend::VirtioNet => {
@@ -1913,7 +1865,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // ports use the forwarder on every backend: it reaches a guest port at
         // the guest's loopback, where dev servers often listen. A socket path
         // too long for the platform only costs those live changes.
-        let live_ports_via_forwarder = network_plan.backend != EffectiveNetworkBackend::VirtioNet;
+        let live_ports_via_forwarder = matches!(
+            network_plan.backend,
+            EffectiveNetworkBackend::None | EffectiveNetworkBackend::Tsi
+        );
         let port_forward_socket = if live_ports_via_forwarder || auto_ports.is_some() {
             vsock_socket
                 .parent()
@@ -2206,6 +2161,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // The guest must mount these manually (or via the agent)
         for (i, mount) in mounts.iter().enumerate() {
             let mount_tag = HostMount::mount_tag(i);
+            // The guest only reads a staged share, to seed its working copy;
+            // its changes come back through the agent. A writable share would
+            // let it change the host tree while a sync applies to it.
+            let share_read_only = mount.read_only || mount.staged;
             let tag = try_or_free_ctx!(
                 CString::new(mount_tag.clone()),
                 "configure mount",
@@ -2221,7 +2180,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 tag = %mount_tag,
                 host = %mount.source.display(),
                 guest = %mount.target.display(),
-                read_only = mount.read_only,
+                read_only = share_read_only,
                 "adding virtiofs mount"
             );
 
@@ -2234,6 +2193,8 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             // the COW wall entirely. The shared policy keeps this launcher,
             // packed VMs, and the direct backend on the same window size.
             let dax_window = super::virtiofs::user_mount_dax_window(&mount.target);
+            // The mount's owner (`uid=`/`gid=`) is set on its share once added.
+            let set_owner = || set_mount_owner(&krun, ctx, &tag, mount);
             // Recorded ownership keeps guest permissions separate from host
             // access, including on macOS where overlayfs uses mode-000 workdirs.
             if mount.recorded_ownership {
@@ -2249,7 +2210,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                 ) < 0
                 {
@@ -2261,6 +2222,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                             mount.source.display()
                         ),
                     ));
+                }
+                if let Err(e) = set_owner() {
+                    krun_free_ctx(ctx);
+                    return Err(e);
                 }
                 continue;
             }
@@ -2283,7 +2248,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
                 );
                 if ret >= 0 {
@@ -2308,9 +2273,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // EINVAL: a libkrun that does not know the flag; attach as before.
             }
             if attached {
-            } else if mount.read_only || dax_window > 0 {
+            } else if share_read_only || dax_window > 0 {
                 let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                    if mount.read_only {
+                    if share_read_only {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "add virtiofs mount",
@@ -2328,7 +2293,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                 ) < 0
                 {
                     krun_free_ctx(ctx);
@@ -2356,6 +2321,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                         mount.source.display()
                     ),
                 ));
+            }
+            if let Err(e) = set_owner() {
+                krun_free_ctx(ctx);
+                return Err(e);
             }
         }
 
@@ -2895,7 +2864,10 @@ pub fn validate_external_interceptor(
         Some(
             "interceptor requires a loopback address, nonzero port and random authentication token",
         )
-    } else if resources.network_backend == Some(crate::network::NetworkBackend::Tsi) {
+    } else if matches!(
+        resources.network_backend,
+        Some(crate::network::NetworkBackend::Tsi | crate::network::NetworkBackend::Host)
+    ) {
         Some("external interception requires virtio-net")
     } else if resources.network_name.is_some() || has_pod_network {
         Some("external interception cannot use named or pod networks")
@@ -3373,6 +3345,34 @@ pub(crate) fn tsi_port_map(mappings: &[PortMapping]) -> Result<Vec<CString>> {
         .collect())
 }
 
+/// Serve the files of `mount`'s share that record no owner of their own as its
+/// `uid=`/`gid=` owner. Fails when the library cannot, rather than boot the
+/// mount owned by root.
+fn set_mount_owner(
+    krun: &super::krun::KrunFunctions,
+    ctx: u32,
+    tag: &std::ffi::CStr,
+    mount: &HostMount,
+) -> Result<()> {
+    let Some((uid, gid)) = mount.owner else {
+        return Ok(());
+    };
+    let Some(set_virtiofs_owner) = krun.set_virtiofs_owner else {
+        return Err(Error::agent(
+            "set mount owner",
+            "a mount's uid=/gid= needs libkrun with krun_set_virtiofs_owner",
+        ));
+    };
+    // SAFETY: `tag` names a share just added to the live context `ctx`.
+    if unsafe { set_virtiofs_owner(ctx, tag.as_ptr(), uid, gid) } < 0 {
+        return Err(Error::agent(
+            "set mount owner",
+            format!("could not set the owner of '{}'", mount.source.display()),
+        ));
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     /// A VM-mode pack has no image layers, so launching its machines must not
@@ -3529,66 +3529,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(target.is_dir());
         assert!(link.symlink_metadata().is_ok());
-    }
-
-    fn scoped(hosts: &[&str]) -> LaunchFeatures {
-        LaunchFeatures {
-            dns_filter_hosts: Some(hosts.iter().map(|h| h.to_string()).collect()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn allow_image_pull_egress_folds_registry_into_scope() {
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(Some("ghcr.io/acme/app:1"), false);
-        assert_eq!(
-            f.dns_filter_hosts.unwrap(),
-            vec![
-                "api.anthropic.com".to_string(),
-                "ghcr.io".to_string(),
-                "githubusercontent.com".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn allow_image_pull_egress_dockerhub_adds_both_apexes_without_dupes() {
-        // docker.io already listed by the user; the fold must add docker.com but
-        // not re-add docker.io.
-        let mut f = scoped(&["docker.io", "pypi.org"]);
-        f.allow_image_pull_egress(Some("alpine"), false);
-        assert_eq!(
-            f.dns_filter_hosts.unwrap(),
-            vec![
-                "docker.io".to_string(),
-                "pypi.org".to_string(),
-                "docker.com".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn allow_image_pull_egress_noop_when_unscoped_or_packed_or_local() {
-        // No filter set → unscoped machine, nothing to widen.
-        let mut f = LaunchFeatures::default();
-        f.allow_image_pull_egress(Some("alpine"), false);
-        assert!(f.dns_filter_hosts.is_none());
-
-        // Packed layers (.smolmachine / local dir) → no in-guest pull.
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(Some("alpine"), true);
-        assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
-
-        // A `local:` reference is host-assembled, never pulled.
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(Some("local:abc123"), false);
-        assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
-
-        // Bare VM (no image) → nothing to fold.
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(None, false);
-        assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
     }
 
     /// Build a machine `pack` dir plus a `.pack-shared` pointer in its parent that

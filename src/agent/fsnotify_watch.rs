@@ -19,22 +19,31 @@
 //! inode, a watcher inside the container wakes up exactly as if the change had
 //! happened locally.
 //!
-//! The watcher is best-effort and self-contained: if the kernel lacks the patch,
-//! or the connection drops when the VM exits, propagation simply stops — the
-//! mount still serves reads. Dropping [`FsNotifyWatcher`] stops the thread.
+//! The watcher is best-effort and follows the VM lifetime: pending changes are
+//! bounded and coalesced, and a dropped agent connection is retried. A kernel
+//! without the injection hook still serves mount reads. Dropping
+//! [`FsNotifyWatcher`] stops the thread.
 
 use crate::agent::AgentClient;
 use crate::data::storage::HostMount;
-use notify::{Event, EventKind, RecursiveMode, Watcher};
+#[cfg(all(test, unix))]
+use notify::{Event, EventKind};
+use notify::{RecursiveMode, Watcher};
 use smolvm_protocol::{fsnotify_mask, FsNotifyEvent};
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::thread::JoinHandle;
-use std::time::{Duration, Instant, SystemTime};
+use std::time::Duration;
+#[cfg(test)]
+use std::time::Instant;
 use tracing::{debug, info, warn};
+
+mod queue;
+use queue::{EventQueue, Work};
+mod reconcile;
+use reconcile::{Change, Sink, Snapshot};
 
 /// Whether host directories are watched at all. Setting SMOL_NO_HOT_RELOAD
 /// disables it (e.g. very large trees, or privacy preference); the launcher
@@ -49,16 +58,12 @@ pub fn watching_enabled() -> bool {
 /// that path reach the container's bind of the same inode.
 const GUEST_VIRTIOFS_ROOT: &str = "/run/smolvm/virtiofs";
 
-/// How long to coalesce a burst of change events before sending. An editor save
-/// typically emits several events (write, close, attrib); batching de-dupes them
-/// into one round-trip while keeping latency well under a human-perceptible
-/// reload delay.
-const COALESCE_WINDOW: Duration = Duration::from_millis(25);
 /// Watcher startup is independent of VM readiness. Poll in short increments so
 /// a failed launch can tear down immediately instead of joining a sleeping
 /// exponential-backoff thread.
 const CONNECT_RETRY_INTERVAL: Duration = Duration::from_millis(50);
-const CONNECT_RETRY_LIMIT: usize = 200;
+const MAX_BATCH_EVENTS: usize = 256;
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(250);
 
 /// A single watched mount: host source directory → guest virtiofs staging base.
 struct WatchTarget {
@@ -70,7 +75,7 @@ struct WatchTarget {
 /// Propagates host file changes under `-v` mounts into the guest as fsnotify
 /// events for the lifetime of the value. Drop to stop.
 pub struct FsNotifyWatcher {
-    stop: Arc<AtomicBool>,
+    queue: Arc<EventQueue>,
     handle: Option<JoinHandle<()>>,
 }
 
@@ -80,7 +85,7 @@ impl FsNotifyWatcher {
     /// index `i` maps to virtiofs tag `smolvm{i}`.
     ///
     /// Returns `None` (non-fatal) when there is nothing to watch or the watcher
-    /// thread can't be spawned — the mount still works, only live change
+    /// thread or watch initialization fails — the mount still works, only live change
     /// notifications are unavailable.
     pub fn start(socket_path: PathBuf, mounts: &[HostMount]) -> Option<Self> {
         Self::start_tagged(
@@ -132,10 +137,15 @@ impl FsNotifyWatcher {
         // (that is exactly the read-only-source hot-reload case).
         let targets: Vec<WatchTarget> = mounts
             .into_iter()
-            .filter(|(source, _)| source.is_dir())
-            .map(|(host_source, tag)| WatchTarget {
-                host_source,
-                guest_base: format!("{GUEST_VIRTIOFS_ROOT}/{tag}"),
+            .filter_map(|(source, tag)| {
+                // FSEvents reports resolved paths (e.g. /private/var for
+                // /var). Match the same directory even if the caller used an
+                // alias; virtiofs holds that directory for the mount lifetime.
+                let host_source = source.canonicalize().ok()?;
+                host_source.is_dir().then_some(WatchTarget {
+                    host_source,
+                    guest_base: format!("{GUEST_VIRTIOFS_ROOT}/{tag}"),
+                })
             })
             .collect();
         if targets.is_empty() {
@@ -143,22 +153,31 @@ impl FsNotifyWatcher {
         }
 
         let stop = Arc::new(AtomicBool::new(false));
-        let stop_thread = stop.clone();
+        let queue = Arc::new(EventQueue::new(stop));
+        let queue_thread = queue.clone();
+        let (initialized, ready) = mpsc::sync_channel(1);
         let handle = std::thread::Builder::new()
             .name("fsnotify-watch".into())
-            .spawn(move || run_watch(socket_path, targets, stop_thread, poll))
+            .spawn(move || run_watch(socket_path, targets, queue_thread, poll, initialized))
             .ok()?;
 
-        Some(Self {
-            stop,
+        let watcher = Self {
+            queue,
             handle: Some(handle),
-        })
+        };
+        // Establish the baseline and OS watches before the guest can read or
+        // watch these files. An asynchronous baseline can silently absorb an
+        // edit made just after boot, leaving the guest's cached content stale.
+        // Registration never waits for guest delivery: callbacks only mark
+        // bounded dirty paths, so a cold guest cannot deadlock initialization.
+        ready.recv().ok()?;
+        Some(watcher)
     }
 }
 
 impl Drop for FsNotifyWatcher {
     fn drop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        self.queue.shutdown();
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
@@ -169,14 +188,100 @@ impl Drop for FsNotifyWatcher {
 /// How often the polling watcher (forked children on macOS) rescans.
 const POLL_INTERVAL: Duration = Duration::from_secs(1);
 
-fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBool>, poll: bool) {
-    let (tx, rx) = mpsc::channel::<notify::Result<Event>>();
+struct StopOnExit(Option<Arc<EventQueue>>);
+impl Drop for StopOnExit {
+    fn drop(&mut self) {
+        if let Some(queue) = &self.0 {
+            queue.shutdown();
+        }
+    }
+}
 
-    // The receiver is dropped only when this thread exits, so a send error
-    // just means we're shutting down.
-    let handler = move |res| {
-        let _ = tx.send(res);
+fn run_watch(
+    socket_path: PathBuf,
+    targets: Vec<WatchTarget>,
+    queue: Arc<EventQueue>,
+    poll: bool,
+    initialized: mpsc::SyncSender<()>,
+) {
+    run_with_registration(socket_path, targets, queue, move |queue, targets, stop| {
+        let watcher = register_watches(queue, targets, stop, poll);
+        if watcher.is_some() {
+            let _ = initialized.send(());
+        }
+        watcher
+    });
+}
+
+/// Register mounts alongside delivery; native callbacks only mark dirty paths
+/// and never wait for the guest or for recovery scans.
+fn run_with_registration<R: Send>(
+    socket_path: PathBuf,
+    targets: Vec<WatchTarget>,
+    rx: Arc<EventQueue>,
+    register: impl FnOnce(Arc<EventQueue>, &[WatchTarget], &Arc<AtomicBool>) -> Option<R> + Send,
+) {
+    let stop = rx.stop_flag().clone();
+    let mut snapshot = match Snapshot::new() {
+        Ok(snapshot) => snapshot,
+        Err(error) => {
+            warn!(%error,"cannot initialize host notification recovery");
+            return;
+        }
     };
+    // Prime before installing OS watches, then reconcile once registration is
+    // complete to cover changes between the baseline and watch installation.
+    // The worker signals readiness after registration, before guest launch.
+    let roots = watched_roots(&targets);
+    if let Err(error) = snapshot.reconcile(&roots, &stop, |_| true) {
+        if stop.load(Ordering::SeqCst) {
+            return;
+        }
+        warn!(%error,"initial host notification snapshot was incomplete");
+    }
+
+    std::thread::scope(|scope| {
+        let registration = std::thread::Builder::new()
+            .name("fsnotify-register".into())
+            .spawn_scoped(scope, || {
+                // Failed or panicked setup must also release the delivery
+                // worker, including while it waits for a cold guest.
+                let mut failed = StopOnExit(Some(rx.clone()));
+                let watcher = register(rx.clone(), &targets, &stop);
+                if watcher.is_some() {
+                    failed.0.take();
+                    rx.retry_all();
+                }
+                watcher
+            });
+        let registration = match registration {
+            Ok(handle) => handle,
+            Err(error) => {
+                warn!(%error, "failed to start host watch registration");
+                return;
+            }
+        };
+        // Declared after the handle: on return or unwinding, unblock callbacks
+        // before joining setup or destroying its returned OS watcher. The
+        // registration thread exits after setup; its result owns the watcher
+        // for the rest of this VM's lifetime.
+        let _stop_on_exit = StopOnExit(Some(rx.clone()));
+        run_delivery(&socket_path, &targets, &stop, &rx, &mut snapshot);
+        drop(_stop_on_exit);
+        if registration.join().is_err() {
+            warn!("host watch registration panicked");
+        }
+    });
+}
+
+fn register_watches(
+    queue: Arc<EventQueue>,
+    targets: &[WatchTarget],
+    stop: &Arc<AtomicBool>,
+    poll: bool,
+) -> Option<Box<dyn Watcher + Send>> {
+    let events = queue.clone();
+    let handler = move |res| events.push(res);
     let watcher: notify::Result<Box<dyn Watcher + Send>> = if poll {
         notify::PollWatcher::new(
             handler,
@@ -190,312 +295,223 @@ fn run_watch(socket_path: PathBuf, targets: Vec<WatchTarget>, stop: Arc<AtomicBo
         Ok(w) => w,
         Err(e) => {
             warn!(error = %e, "failed to create host fs watcher; hot-reload propagation disabled");
-            return;
+            return None;
         }
     };
+    // If a backend panics in watch(), release its callback before unwinding
+    // destroys the OS watcher and joins the callback thread.
+    let mut failed = StopOnExit(Some(queue));
 
-    for t in &targets {
+    for t in targets {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
         if let Err(e) = watcher.watch(&t.host_source, RecursiveMode::Recursive) {
             warn!(path = %t.host_source.display(), error = %e, "failed to watch mount source");
         }
     }
+    failed.0.take();
+    Some(watcher)
+}
 
-    // A dedicated connection so injected events never interleave with the
-    // command's own request/response stream on the primary connection.
-    let mut client = match connect_to_agent(&socket_path, &stop) {
-        Some(client) => client,
-        None => return,
+fn run_delivery(
+    socket_path: &Path,
+    targets: &[WatchTarget],
+    stop: &AtomicBool,
+    rx: &EventQueue,
+    snapshot: &mut Snapshot,
+) {
+    let Some(mut client) = connect_to_agent(socket_path, stop) else {
+        return;
     };
-
     info!(
         mounts = targets.len(),
-        "host→guest fsnotify propagation active (hot-reload)"
+        "host→guest fsnotify delivery connected (hot-reload)"
     );
-    let mut announced = Announced::default();
-
+    let mut last_error = None;
     while !stop.load(Ordering::SeqCst) {
-        // Block briefly so we notice `stop` without a busy loop.
-        let first = match rx.recv_timeout(Duration::from_millis(200)) {
-            Ok(Ok(ev)) => ev,
-            Ok(Err(_)) => continue, // watcher-level error event; ignore
-            Err(mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(mpsc::RecvTimeoutError::Disconnected) => break,
+        let Some(work) = rx.wait() else {
+            return;
         };
-
-        let mut batch = Vec::new();
-        announced.prune();
-        collect_events(&first, &targets, &mut announced, &mut batch);
-
-        // Coalesce the rest of the burst (a save fans out into several events).
-        let deadline = Instant::now() + COALESCE_WINDOW;
-        while let Some(remaining) = deadline.checked_duration_since(Instant::now()) {
-            match rx.recv_timeout(remaining) {
-                Ok(Ok(ev)) => collect_events(&ev, &targets, &mut announced, &mut batch),
-                Ok(Err(_)) => {}
-                Err(_) => break,
-            }
-        }
-
-        if batch.is_empty() {
+        let roots = match work {
+            Work::All => watched_roots(targets),
+            Work::Paths(paths) => paths
+                .into_iter()
+                .filter(|p| matching_target(p, targets).is_some())
+                .collect(),
+        };
+        if roots.is_empty() {
             continue;
         }
-        dedup(&mut batch);
-
-        if let Err(e) = client.fsnotify(batch) {
-            // The VM has almost certainly gone away (the command exited). Stop
-            // quietly rather than spinning on a dead socket.
-            debug!(error = %e, "fsnotify inject failed; stopping watcher");
-            break;
+        let sink = Delivery {
+            client: &mut client,
+            socket_path,
+            targets,
+            stop,
+            batch: Vec::new(),
+        };
+        match snapshot.reconcile_sink(&roots, stop, sink) {
+            Ok(()) => last_error = None,
+            Err(error) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let message = error.to_string();
+                if last_error.as_ref() != Some(&message) {
+                    warn!(%error,"host file reconciliation incomplete; retrying");
+                    last_error = Some(message);
+                }
+                rx.retry_all();
+                // Back off a failing filesystem/database while keeping teardown
+                // responsive; permission errors never become synthetic deletes.
+                for _ in 0..10 {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                    std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                }
+            }
         }
     }
 }
 
+struct Delivery<'a> {
+    client: &'a mut AgentClient,
+    socket_path: &'a Path,
+    targets: &'a [WatchTarget],
+    stop: &'a AtomicBool,
+    batch: Vec<FsNotifyEvent>,
+}
+impl Delivery<'_> {
+    fn flush(&mut self) -> bool {
+        if self.batch.is_empty() {
+            return !self.stop.load(Ordering::SeqCst);
+        }
+        dedup(&mut self.batch);
+        let success = deliver(self.client, &self.batch, self.socket_path, self.stop);
+        self.batch.clear();
+        success
+    }
+}
+impl Sink for Delivery<'_> {
+    fn emit(&mut self, change: Change) -> bool {
+        for event in translate_change(change, self.targets) {
+            self.batch.push(event);
+            if self.batch.len() == MAX_BATCH_EVENTS && !self.flush() {
+                return false;
+            }
+        }
+        !self.stop.load(Ordering::SeqCst)
+    }
+    fn finish(&mut self) -> bool {
+        self.flush()
+    }
+}
+
+fn translate_change(change: Change, targets: &[WatchTarget]) -> Vec<FsNotifyEvent> {
+    let (host_path, mask, removed) = match change {
+        Change::Present {
+            path,
+            created,
+            directory,
+        } => {
+            let mask = fsnotify_mask::FS_MODIFY
+                | fsnotify_mask::FS_ATTRIB
+                | if created { fsnotify_mask::FS_CREATE } else { 0 }
+                | if directory {
+                    fsnotify_mask::FS_ISDIR
+                } else {
+                    0
+                };
+            (path, mask, false)
+        }
+        Change::Removed { path, directory } => (
+            path,
+            fsnotify_mask::FS_DELETE
+                | if directory {
+                    fsnotify_mask::FS_ISDIR
+                } else {
+                    0
+                },
+            true,
+        ),
+    };
+    let mut events = Vec::new();
+    // Each virtiofs mount has its own guest inode/cache namespace, including
+    // repeated or overlapping host sources. Every matching view must wake.
+    for target in targets {
+        let Ok(relative) = host_path.strip_prefix(&target.host_source) else {
+            continue;
+        };
+        events.push(FsNotifyEvent {
+            path: join_guest(&target.guest_base, relative),
+            mask,
+        });
+        if removed {
+            if let Some(parent) = relative.parent() {
+                events.push(FsNotifyEvent {
+                    path: join_guest(&target.guest_base, parent),
+                    mask: fsnotify_mask::FS_MODIFY | fsnotify_mask::FS_ISDIR,
+                });
+            }
+        }
+    }
+    events
+}
+
+fn watched_roots(targets: &[WatchTarget]) -> Vec<PathBuf> {
+    let mut roots: Vec<PathBuf> = Vec::new();
+    for target in targets {
+        if roots
+            .iter()
+            .any(|root| target.host_source.starts_with(root))
+        {
+            continue;
+        }
+        roots.retain(|root| !root.starts_with(&target.host_source));
+        roots.push(target.host_source.clone());
+    }
+    roots
+}
+
 fn connect_to_agent(socket_path: &Path, stop: &AtomicBool) -> Option<AgentClient> {
     let mut last_error = None;
-    for _ in 0..CONNECT_RETRY_LIMIT {
-        if stop.load(Ordering::SeqCst) {
-            return None;
-        }
-        match AgentClient::connect(socket_path) {
+    // A cold boot can spend more than ten seconds preparing disks before the
+    // guest accepts connections. The VM process owns this watcher: only its
+    // shutdown signal, not an arbitrary startup deadline, ends the watch.
+    while !stop.load(Ordering::SeqCst) {
+        match AgentClient::connect_for_sampling(socket_path, CONNECT_TIMEOUT) {
             Ok(client) => return Some(client),
             Err(error) => last_error = Some(error),
         }
         std::thread::sleep(CONNECT_RETRY_INTERVAL);
     }
     if let Some(error) = last_error {
-        debug!(%error, "fsnotify watcher could not connect to agent; disabled");
+        debug!(%error, "fsnotify watcher stopped before the agent became available");
     }
     None
 }
 
-/// Maximum depth to inspect for recent file modifications when a directory event fires.
-const MAX_DIR_SCAN_DEPTH: usize = 3;
-
-/// Maximum number of recent child events to emit from a single directory event
-/// to avoid flooding vsock if a large directory is touched.
-const MAX_DIR_SCAN_EVENTS: usize = 64;
-
-/// Time window within which a file's mtime is considered to match the event.
-const RECENT_MTIME_WINDOW: Duration = Duration::from_secs(2);
-/// More files than this remembered at once means an event storm; the memory is
-/// cleared rather than grown, at the cost of a few repeated announcements.
-const ANNOUNCED_MAX: usize = 8192;
-
-/// The host's modification time of a file and, where the host keeps one, its
-/// change time: together they move with any write, truncate, rename, chmod or
-/// chown.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-struct Stamp {
-    mtime: Option<SystemTime>,
-    ctime: Option<(i64, i64)>,
-}
-
-impl Stamp {
-    fn of(meta: &std::fs::Metadata) -> Self {
-        #[cfg(unix)]
-        let ctime = {
-            use std::os::unix::fs::MetadataExt;
-            Some((meta.ctime(), meta.ctime_nsec()))
-        };
-        #[cfg(not(unix))]
-        let ctime = None;
-        Stamp {
-            mtime: meta.modified().ok(),
-            ctime,
-        }
-    }
-}
-
-/// Files already announced to the guest, by guest path, with the host stamp
-/// they carried then. On macOS a burst of writes arrives mostly as events on the
-/// directory, each of which makes the watcher scan for recently modified files,
-/// and the same files turn up scan after scan while the burst lasts. Every
-/// announcement makes the guest kernel expire its cached entry for the file and
-/// look it up again on next use, so during a build or an install the guest paid
-/// two or more extra round trips per file it had itself just written. A file is
-/// announced once per change: again only when its stamp has moved.
-#[derive(Default)]
-struct Announced {
-    files: HashMap<String, (Stamp, Instant)>,
-}
-
-impl Announced {
-    /// Whether `path` carrying `stamp` is news to the guest; records it so.
-    fn is_news(&mut self, path: &str, stamp: Stamp) -> bool {
-        if matches!(self.files.get(path), Some((seen, _)) if *seen == stamp) {
-            return false;
-        }
-        if self.files.len() >= ANNOUNCED_MAX {
-            self.files.clear();
-        }
-        self.files.insert(path.to_string(), (stamp, Instant::now()));
-        true
-    }
-
-    /// Forget files a scan can no longer turn up: one modified before the
-    /// window was announced at least that long ago.
-    fn prune(&mut self) {
-        let now = Instant::now();
-        self.files
-            .retain(|_, (_, at)| now.duration_since(*at) <= RECENT_MTIME_WINDOW);
-    }
-}
-
-/// Directories that should not be traversed during directory rescans.
-fn is_ignored_dir(name: &str) -> bool {
-    matches!(
-        name,
-        ".git"
-            | "node_modules"
-            | "target"
-            | "dist"
-            | "build"
-            | ".next"
-            | ".cache"
-            | ".turbo"
-            | ".venv"
-            | "__pycache__"
-    )
-}
-
-/// Recursively find files within `dir` modified within `threshold`.
-fn find_recent_files(
-    dir: &Path,
-    threshold: Duration,
-    max_depth: usize,
-    results: &mut Vec<(PathBuf, Stamp)>,
-) {
-    if max_depth == 0 || results.len() >= MAX_DIR_SCAN_EVENTS {
-        return;
-    }
-
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return;
-    };
-
-    let now = std::time::SystemTime::now();
-
-    for entry in entries.flatten() {
-        if results.len() >= MAX_DIR_SCAN_EVENTS {
-            break;
-        }
-
-        let Ok(file_type) = entry.file_type() else {
-            continue;
-        };
-
-        let file_name = entry.file_name();
-        let name_str = file_name.to_string_lossy();
-
-        if file_type.is_dir() {
-            if is_ignored_dir(&name_str) {
-                continue;
-            }
-            find_recent_files(&entry.path(), threshold, max_depth - 1, results);
-        } else if file_type.is_file() || file_type.is_symlink() {
-            if let Ok(meta) = entry.metadata() {
-                if let Ok(mtime) = meta.modified() {
-                    let is_recent = if let Ok(elapsed) = now.duration_since(mtime) {
-                        elapsed <= threshold
-                    } else if let Ok(future) = mtime.duration_since(now) {
-                        future <= threshold
-                    } else {
-                        false
-                    };
-
-                    if is_recent {
-                        results.push((entry.path(), Stamp::of(&meta)));
-                    }
-                }
-            }
-        }
-    }
-}
-
-/// Translate one host event into guest-side [`FsNotifyEvent`]s, appended to `out`.
-fn collect_events(
-    event: &Event,
-    targets: &[WatchTarget],
-    announced: &mut Announced,
-    out: &mut Vec<FsNotifyEvent>,
-) {
-    for host_path in &event.paths {
-        let Some(t) = matching_target(host_path, targets) else {
-            continue;
-        };
-        let Ok(rel) = host_path.strip_prefix(&t.host_source) else {
-            continue;
-        };
-
-        if host_path.exists() {
-            if host_path.is_dir() {
-                // On macOS, FSEvents often notifies at the directory level rather
-                // than reporting individual file changes. Scan the directory for
-                // files modified within the coalesce window so file-level watchers
-                // in the guest (e.g. Vite HMR, Webpack, Chokidar) receive events
-                // for the actual changed files rather than only an anonymous
-                // directory-level modification.
-                let mut recent_files = Vec::new();
-                find_recent_files(
-                    host_path,
-                    RECENT_MTIME_WINDOW,
-                    MAX_DIR_SCAN_DEPTH,
-                    &mut recent_files,
-                );
-
-                for (child_path, stamp) in recent_files {
-                    if let Ok(child_rel) = child_path.strip_prefix(&t.host_source) {
-                        let path = join_guest(&t.guest_base, child_rel);
-                        if announced.is_news(&path, stamp) {
-                            out.push(FsNotifyEvent {
-                                path,
-                                mask: mask_for(&event.kind, &child_path),
-                            });
-                        }
-                    }
-                }
-
-                // If this is a subdirectory (not the watched root itself), also
-                // fire on the directory itself so directory-level watchers wake.
-                if !rel.as_os_str().is_empty() {
-                    out.push(FsNotifyEvent {
-                        path: join_guest(&t.guest_base, rel),
-                        mask: mask_for(&event.kind, host_path),
-                    });
-                }
-            } else {
-                // Regular file: fire directly on it. fsnotify_dentry() in the
-                // guest propagates to the parent dir's watchers with the child
-                // name, so both file- and dir-watches fire. Remembered with
-                // its stamp so the directory scans that follow the same
-                // change do not announce it a second time.
-                let path = join_guest(&t.guest_base, rel);
-                let news = match std::fs::metadata(host_path) {
-                    Ok(meta) => announced.is_news(&path, Stamp::of(&meta)),
-                    Err(_) => true,
+fn deliver(
+    client: &mut AgentClient,
+    batch: &[FsNotifyEvent],
+    socket_path: &Path,
+    stop: &AtomicBool,
+) -> bool {
+    while !stop.load(Ordering::SeqCst) {
+        match client.fsnotify(batch.to_vec()) {
+            Ok(()) => return true,
+            Err(error) => {
+                debug!(%error, "fsnotify connection lost; reconnecting before replaying events");
+                std::thread::sleep(CONNECT_RETRY_INTERVAL);
+                let Some(next) = connect_to_agent(socket_path, stop) else {
+                    return false;
                 };
-                if news {
-                    out.push(FsNotifyEvent {
-                        path,
-                        mask: mask_for(&event.kind, host_path),
-                    });
-                }
+                *client = next;
             }
-        } else if let Some(parent) = rel.parent() {
-            // The guest may still cache the removed path. Send the exact name
-            // so the kernel can expire that entry and preserve the filename in
-            // directory-watch events, plus the surviving parent as a fallback
-            // when the guest had never looked the path up.
-            out.push(FsNotifyEvent {
-                path: join_guest(&t.guest_base, rel),
-                mask: fsnotify_mask::FS_DELETE,
-            });
-            out.push(FsNotifyEvent {
-                path: join_guest(&t.guest_base, parent),
-                mask: fsnotify_mask::FS_MODIFY | fsnotify_mask::FS_ISDIR,
-            });
         }
     }
+    false
 }
 
 fn matching_target<'a>(path: &Path, targets: &'a [WatchTarget]) -> Option<&'a WatchTarget> {
@@ -507,34 +523,15 @@ fn matching_target<'a>(path: &Path, targets: &'a [WatchTarget]) -> Option<&'a Wa
 
 /// Join a guest base path with a host-relative path, normalizing separators.
 fn join_guest(base: &str, rel: &Path) -> String {
-    let rel = rel.to_string_lossy();
-    if rel.is_empty() {
-        base.to_string()
-    } else {
-        format!("{base}/{rel}")
+    // Host separators differ on Windows; guest paths always use '/'. Keep a
+    // literal backslash in a Unix filename instead of replacing it globally.
+    let mut path = String::with_capacity(base.len() + rel.as_os_str().len() + 1);
+    path.push_str(base);
+    for part in rel.components() {
+        path.push('/');
+        path.push_str(&part.as_os_str().to_string_lossy());
     }
-}
-
-/// Map a notify [`EventKind`] to the closest `FS_*` mask.
-fn mask_for(kind: &EventKind, path: &Path) -> u32 {
-    use notify::event::ModifyKind;
-
-    let base = match kind {
-        EventKind::Create(_) => fsnotify_mask::FS_CREATE,
-        EventKind::Modify(ModifyKind::Metadata(_)) => fsnotify_mask::FS_ATTRIB,
-        // A rename whose destination exists reads as a create in the new dir.
-        EventKind::Modify(ModifyKind::Name(_)) => fsnotify_mask::FS_CREATE,
-        EventKind::Modify(_) => fsnotify_mask::FS_MODIFY,
-        // Anything else that left the file present is treated as a content change
-        // — the safe default that wakes content watchers.
-        _ => fsnotify_mask::FS_MODIFY,
-    };
-
-    if path.is_dir() {
-        base | fsnotify_mask::FS_ISDIR
-    } else {
-        base
-    }
+    path
 }
 
 /// Sort + drop duplicate (path, mask) pairs produced within one burst.
@@ -556,6 +553,240 @@ fn dedup(batch: &mut Vec<FsNotifyEvent>) {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn registration_can_fill_the_queue_before_finishing_without_blocking_delivery() {
+        use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+        use std::io::{Read, Write};
+        use std::os::unix::net::UnixListener;
+
+        struct OwnedWatch(Arc<AtomicBool>);
+        impl Drop for OwnedWatch {
+            fn drop(&mut self) {
+                self.0.store(true, Ordering::SeqCst);
+            }
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let socket = root.path().join("agent.sock");
+        let source = root.path().join("source");
+        std::fs::create_dir(&source).unwrap();
+        for index in 0..512 {
+            std::fs::write(source.join(format!("file-{index}")), b"changed").unwrap();
+        }
+        let listener = UnixListener::bind(&socket).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let queue = Arc::new(EventQueue::new(stop));
+        let stopped = queue.clone();
+        let released = Arc::new(AtomicBool::new(false));
+        let owned = released.clone();
+        let (registered, complete) = mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            run_with_registration(
+                socket,
+                vec![WatchTarget {
+                    host_source: source,
+                    guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
+                }],
+                stopped,
+                move |queue, targets, _| {
+                    // Models a backend's callback filling the queue before
+                    // watch() can finish registering another mount.
+                    for index in 0..512 {
+                        let path = targets[0].host_source.join(format!("file-{index}"));
+                        std::fs::write(&path, b"changed after baseline").unwrap();
+                        queue.push(Ok(Event::new(EventKind::Any).add_path(path)));
+                    }
+                    registered.send(()).unwrap();
+                    Some(OwnedWatch(owned))
+                },
+            );
+        });
+        // Own shutdown even if a socket assertion panics.
+        let watcher = FsNotifyWatcher {
+            queue,
+            handle: Some(handle),
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut peer = loop {
+            if let Ok((peer, _)) = listener.accept() {
+                break peer;
+            }
+            assert!(Instant::now() < deadline, "registration blocked delivery");
+            std::thread::sleep(Duration::from_millis(5));
+        };
+        peer.set_nonblocking(false).unwrap();
+        peer.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut seen = std::collections::HashSet::new();
+        while seen.len() < 512 {
+            let mut header = [0; 4];
+            peer.read_exact(&mut header).unwrap();
+            let size = u32::from_be_bytes(header) as usize;
+            assert!(size < 1024 * 1024);
+            let mut frame = vec![0; size];
+            peer.read_exact(&mut frame).unwrap();
+            let request: Envelope<AgentRequest> = serde_json::from_slice(&frame).unwrap();
+            let AgentRequest::FsNotify { events } = request.body else {
+                panic!("unexpected request");
+            };
+            assert!(events.len() <= MAX_BATCH_EVENTS);
+            seen.extend(events.into_iter().map(|event| event.path));
+            peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                .unwrap();
+        }
+        complete.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert!(!released.load(Ordering::SeqCst));
+        for index in 0..512 {
+            assert!(seen.contains(&format!("/run/smolvm/virtiofs/smolvm0/file-{index}")));
+        }
+        drop(watcher);
+        assert!(released.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn failed_registration_stops_delivery_waiting_for_an_absent_guest() {
+        for panic in [false, true] {
+            let root = tempfile::tempdir().unwrap();
+            let socket = root.path().join("absent.sock");
+            let stop = Arc::new(AtomicBool::new(false));
+            let queue = Arc::new(EventQueue::new(stop));
+            let stopped = queue.clone();
+            let (finished, done) = mpsc::channel();
+            let handle = std::thread::spawn(move || {
+                run_with_registration(socket, vec![], stopped, move |_, _, _| {
+                    assert!(!panic, "injected backend setup panic");
+                    None::<()>
+                });
+                finished.send(()).unwrap();
+            });
+            let watcher = FsNotifyWatcher {
+                queue,
+                handle: Some(handle),
+            };
+            let result = done.recv_timeout(Duration::from_secs(2));
+            drop(watcher);
+            result.expect("failed setup left delivery running");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cold_agent_can_become_ready_after_the_old_ten_second_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let socket = socket.clone();
+            let stop = stop.clone();
+            std::thread::spawn(move || connect_to_agent(&socket, &stop))
+        };
+        std::thread::sleep(Duration::from_millis(10_500));
+        let waiting = !worker.is_finished();
+        let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
+        let connected = worker.join().unwrap();
+        assert!(waiting, "watcher abandoned a VM that was still booting");
+        assert!(connected.is_some());
+        drop(listener);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_lost_connection_replays_the_pending_events() {
+        use smolvm_protocol::{encode_message, AgentRequest, AgentResponse, Envelope};
+        use std::io::{Read, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("agent.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let mut client = AgentClient::connect(&socket).unwrap();
+        let (peer, _) = listener.accept().unwrap();
+        drop(peer); // A connection accepted before the guest was ready went away.
+        let stop = Arc::new(AtomicBool::new(false));
+        let server = {
+            let stop = stop.clone();
+            std::thread::spawn(move || {
+                struct Stop(Arc<AtomicBool>);
+                impl Drop for Stop {
+                    fn drop(&mut self) {
+                        self.0.store(true, Ordering::SeqCst);
+                    }
+                }
+                let _stop = Stop(stop);
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(3);
+                let mut peer = loop {
+                    if let Ok((peer, _)) = listener.accept() {
+                        break peer;
+                    }
+                    assert!(Instant::now() < deadline, "watcher did not reconnect");
+                    std::thread::sleep(Duration::from_millis(5));
+                };
+                // BSD accepts inherit O_NONBLOCK from the listener.
+                peer.set_nonblocking(false).unwrap();
+                peer.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+                let mut header = [0; 4];
+                peer.read_exact(&mut header).unwrap();
+                let mut frame = vec![0; u32::from_be_bytes(header) as usize];
+                peer.read_exact(&mut frame).unwrap();
+                let request: Envelope<AgentRequest> = serde_json::from_slice(&frame).unwrap();
+                let AgentRequest::FsNotify { events } = request.body else {
+                    panic!("expected fsnotify")
+                };
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].path, "/run/smolvm/virtiofs/smolvm0/first.tar");
+                peer.write_all(&encode_message(&AgentResponse::Ok { data: None }).unwrap())
+                    .unwrap();
+            })
+        };
+        assert!(deliver(
+            &mut client,
+            &[FsNotifyEvent {
+                path: "/run/smolvm/virtiofs/smolvm0/first.tar".into(),
+                mask: fsnotify_mask::FS_CREATE,
+            }],
+            &socket,
+            &stop
+        ));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn an_agent_that_never_reads_has_a_bounded_notification_write() {
+        let (stream, peer) = crate::platform::uds::UdsStream::pair().unwrap();
+        stream.as_socket().set_send_buffer_size(4096).unwrap();
+        peer.as_socket().set_recv_buffer_size(4096).unwrap();
+        stream.set_write_timeout(Some(CONNECT_TIMEOUT)).unwrap();
+        let mut client = AgentClient::from_stream(stream);
+        let started = Instant::now();
+        let error = client
+            .fsnotify(vec![
+                FsNotifyEvent {
+                    path: format!("/run/smolvm/virtiofs/smolvm0/{}", "x".repeat(4000)),
+                    mask: fsnotify_mask::FS_MODIFY,
+                };
+                MAX_BATCH_EVENTS
+            ])
+            .unwrap_err();
+        assert!(error.to_string().contains("write progress"), "{error}");
+        assert!(started.elapsed() < Duration::from_secs(3));
+    }
+
+    #[test]
+    fn shutting_down_the_vm_cancels_waiting_for_its_agent() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("absent.sock");
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker = {
+            let stop = stop.clone();
+            std::thread::spawn(move || connect_to_agent(&socket, &stop))
+        };
+        std::thread::sleep(Duration::from_millis(100));
+        let start = Instant::now();
+        stop.store(true, Ordering::SeqCst);
+        assert!(worker.join().unwrap().is_none());
+        assert!(start.elapsed() < Duration::from_secs(2));
+    }
+
     fn target() -> WatchTarget {
         WatchTarget {
             host_source: PathBuf::from("/host/project"),
@@ -566,48 +797,16 @@ mod tests {
     #[test]
     fn join_guest_maps_relative_paths() {
         assert_eq!(
-            join_guest("/run/smolvm/virtiofs/smolvm0", Path::new("src/app.js")),
+            join_guest(
+                "/run/smolvm/virtiofs/smolvm0",
+                &Path::new("src").join("app.js")
+            ),
             "/run/smolvm/virtiofs/smolvm0/src/app.js"
         );
         assert_eq!(
             join_guest("/run/smolvm/virtiofs/smolvm0", Path::new("")),
             "/run/smolvm/virtiofs/smolvm0"
         );
-    }
-
-    #[test]
-    fn deleted_path_expires_exact_name_and_wakes_parent() {
-        let targets = vec![target()];
-        let ev = Event {
-            kind: EventKind::Remove(notify::event::RemoveKind::File),
-            paths: vec![PathBuf::from("/host/project/src/gone.js")],
-            attrs: Default::default(),
-        };
-        let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
-        assert_eq!(out.len(), 2);
-        assert_eq!(out[0].path, "/run/smolvm/virtiofs/smolvm0/src/gone.js");
-        assert_eq!(out[0].mask, fsnotify_mask::FS_DELETE);
-        assert_eq!(out[1].path, "/run/smolvm/virtiofs/smolvm0/src");
-        assert_eq!(
-            out[1].mask & fsnotify_mask::FS_MODIFY,
-            fsnotify_mask::FS_MODIFY
-        );
-    }
-
-    #[test]
-    fn path_outside_any_mount_is_ignored() {
-        let targets = vec![target()];
-        let ev = Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Any,
-            )),
-            paths: vec![PathBuf::from("/somewhere/else/x.js")],
-            attrs: Default::default(),
-        };
-        let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
-        assert!(out.is_empty());
     }
 
     #[test]
@@ -652,166 +851,90 @@ mod tests {
     }
 
     #[test]
-    fn a_scanned_file_is_announced_once_until_it_changes() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let project_dir = temp_dir.path().to_path_buf();
-        let file = project_dir.join("out.txt");
-        std::fs::write(&file, "one").expect("write");
-        let targets = vec![WatchTarget {
-            host_source: project_dir.clone(),
-            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
-        }];
-        let dir_event = Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Any),
-            paths: vec![project_dir.clone()],
-            attrs: Default::default(),
-        };
-        let mut announced = Announced::default();
-        let file_path = "/run/smolvm/virtiofs/smolvm0/out.txt";
-
-        let mut first = Vec::new();
-        collect_events(&dir_event, &targets, &mut announced, &mut first);
-        assert!(first.iter().any(|e| e.path == file_path), "{first:?}");
-
-        // the same burst, another directory event: the file is not news
-        let mut second = Vec::new();
-        collect_events(&dir_event, &targets, &mut announced, &mut second);
-        assert!(second.is_empty(), "{second:?}");
-
-        // nor is a file event for the unchanged file
-        let file_event = Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Data(
-                notify::event::DataChange::Content,
-            )),
-            paths: vec![file.clone()],
-            attrs: Default::default(),
-        };
-        let mut third = Vec::new();
-        collect_events(&file_event, &targets, &mut announced, &mut third);
-        assert!(third.is_empty(), "{third:?}");
-
-        // a change moves the stamp, and the file is announced again
-        std::thread::sleep(Duration::from_millis(20));
-        std::fs::write(&file, "two").expect("rewrite");
-        let mut fourth = Vec::new();
-        collect_events(&dir_event, &targets, &mut announced, &mut fourth);
-        assert!(fourth.iter().any(|e| e.path == file_path), "{fourth:?}");
-
-        // pruning within the window keeps the memory
-        announced.prune();
-        let mut fifth = Vec::new();
-        collect_events(&dir_event, &targets, &mut announced, &mut fifth);
-        assert!(fifth.is_empty(), "{fifth:?}");
-    }
-
-    #[test]
-    fn nested_mount_uses_most_specific_target() {
+    fn nested_mounts_receive_changes_in_each_guest_view() {
         let targets = vec![
             WatchTarget {
-                host_source: PathBuf::from("/host/project/vendor"),
+                host_source: "/host/project/vendor".into(),
                 guest_base: "/run/smolvm/virtiofs/smolvm1".into(),
             },
             target(),
         ];
-        let selected = matching_target(Path::new("/host/project/vendor/lib.js"), &targets)
-            .expect("nested path should match");
-        assert_eq!(selected.guest_base, "/run/smolvm/virtiofs/smolvm1");
-    }
-
-    #[test]
-    fn directory_event_uncovers_recent_child_files() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let project_dir = temp_dir.path().to_path_buf();
-        let src_dir = project_dir.join("src");
-        std::fs::create_dir_all(&src_dir).expect("create src dir");
-        let app_file = src_dir.join("app.js");
-        std::fs::write(&app_file, "console.log('hello')").expect("write app.js");
-
-        let targets = vec![WatchTarget {
-            host_source: project_dir,
-            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
-        }];
-
-        let ev = Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Any),
-            paths: vec![src_dir],
-            attrs: Default::default(),
-        };
-
-        let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
-
-        // Should contain both the child file event (for Vite/Chokidar) and the directory event
-        assert!(
-            out.iter()
-                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/src/app.js"
-                    && (e.mask & fsnotify_mask::FS_MODIFY) != 0
-                    && (e.mask & fsnotify_mask::FS_ISDIR) == 0),
-            "expected file-level event for app.js without FS_ISDIR, got: {out:?}"
+        let events = translate_change(
+            Change::Present {
+                path: "/host/project/vendor/lib.js".into(),
+                created: false,
+                directory: false,
+            },
+            &targets,
         );
-        assert!(
-            out.iter()
-                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/src"
-                    && (e.mask & fsnotify_mask::FS_ISDIR) != 0),
-            "expected directory-level event for src with FS_ISDIR, got: {out:?}"
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/vendor/lib.js"));
+        assert!(events
+            .iter()
+            .any(|e| e.path == "/run/smolvm/virtiofs/smolvm1/lib.js"));
+        assert_eq!(
+            watched_roots(&targets),
+            vec![PathBuf::from("/host/project")]
         );
     }
-
     #[test]
-    fn root_directory_event_uncovers_recent_top_level_files() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let project_dir = temp_dir.path().to_path_buf();
-        let config_file = project_dir.join("vite.config.ts");
-        std::fs::write(&config_file, "export default {}").expect("write vite.config.ts");
-
-        let targets = vec![WatchTarget {
-            host_source: project_dir.clone(),
-            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
-        }];
-
-        let ev = Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Any),
-            paths: vec![project_dir],
-            attrs: Default::default(),
-        };
-
-        let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
-
-        assert!(
-            out.iter()
-                .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/vite.config.ts"
-                    && (e.mask & fsnotify_mask::FS_MODIFY) != 0),
-            "expected file-level event for top-level vite.config.ts, got: {out:?}"
+    fn repeated_host_sources_receive_changes_in_each_guest_view() {
+        let targets = vec![
+            target(),
+            WatchTarget {
+                host_source: "/host/project".into(),
+                guest_base: "/run/smolvm/virtiofs/smolvm1".into(),
+            },
+        ];
+        let events = translate_change(
+            Change::Present {
+                path: "/host/project/app.js".into(),
+                created: false,
+                directory: false,
+            },
+            &targets,
+        );
+        assert_eq!(events.len(), 2);
+        assert!(events
+            .iter()
+            .any(|e| e.path == "/run/smolvm/virtiofs/smolvm0/app.js"));
+        assert!(events
+            .iter()
+            .any(|e| e.path == "/run/smolvm/virtiofs/smolvm1/app.js"));
+        assert_eq!(
+            watched_roots(&targets),
+            vec![PathBuf::from("/host/project")]
         );
     }
 
     #[test]
-    fn ignored_directories_are_skipped() {
-        let temp_dir = tempfile::tempdir().expect("temp dir");
-        let project_dir = temp_dir.path().to_path_buf();
-        let node_modules_dir = project_dir.join("node_modules").join("dep");
-        std::fs::create_dir_all(&node_modules_dir).expect("create node_modules");
-        let dep_file = node_modules_dir.join("index.js");
-        std::fs::write(&dep_file, "module.exports = {}").expect("write dep index.js");
-
-        let targets = vec![WatchTarget {
-            host_source: project_dir.clone(),
-            guest_base: "/run/smolvm/virtiofs/smolvm0".into(),
-        }];
-
-        let ev = Event {
-            kind: EventKind::Modify(notify::event::ModifyKind::Any),
-            paths: vec![project_dir],
-            attrs: Default::default(),
-        };
-
-        let mut out = Vec::new();
-        collect_events(&ev, &targets, &mut Announced::default(), &mut out);
-
-        assert!(
-            !out.iter().any(|e| e.path.contains("node_modules")),
-            "expected node_modules files to be ignored, got: {out:?}"
+    fn removed_names_invalidate_the_exact_entry_and_wake_the_parent() {
+        let events = translate_change(
+            Change::Removed {
+                path: "/host/project/src/removed.js".into(),
+                directory: false,
+            },
+            &[target()],
         );
+        assert_eq!(events.len(), 2);
+        assert_eq!(
+            events[0].path,
+            "/run/smolvm/virtiofs/smolvm0/src/removed.js"
+        );
+        assert_eq!(events[0].mask, fsnotify_mask::FS_DELETE);
+        assert_eq!(events[1].path, "/run/smolvm/virtiofs/smolvm0/src");
+    }
+    #[test]
+    fn changes_outside_the_mount_do_not_reach_the_guest() {
+        assert!(translate_change(
+            Change::Removed {
+                path: "/outside/x".into(),
+                directory: false
+            },
+            &[target()]
+        )
+        .is_empty());
     }
 }

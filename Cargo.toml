@@ -1,6 +1,6 @@
 [workspace]
+# The root package is implicit; listing "." overrides the vendor exclusions.
 members = [
-    ".",
     "crates/smolvm-checkpoint",
     "crates/smolvm-agent",
     "crates/smolvm-cuda",
@@ -13,12 +13,14 @@ members = [
     "crates/smolvm-credentials",
     "crates/smolvm-oci-layer",
     "crates/smolvm-pack",
+    "crates/smolvm-paths",
     "crates/smolvm-protocol",
     "crates/smolvm-registry",
     "crates/smolvm-s3fs",
     "crates/smolvm-shim",
     "crates/smolvm-smolfile",
 ]
+exclude = ["vendor/smoltcp", "vendor/russh", "vendor/tar"]
 resolver = "2"
 
 [package]
@@ -40,6 +42,9 @@ name = "smolvm"
 path = "src/main.rs"
 
 [dependencies]
+anyhow = "1"
+rand = "0.10"
+russh = { path = "vendor/russh", version = "=0.65.2", default-features = false, features = ["ring"] }
 smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.35.0" }
 smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.35.0" }
 smolvm-network = { path = "crates/smolvm-network", version = "1.35.0" }
@@ -61,6 +66,7 @@ serde_yaml = "0.9"
 toml = "0.8"
 rusqlite = { version = "0.41", features = ["bundled", "fallible_uint"] }
 libc = "0.2"
+same-file = "1"
 # Cross-platform dynamic library loading for libkrun (dlopen on Unix,
 # LoadLibraryW on Windows). Replaces the previous direct libc::dlopen path.
 libloading = "0.8"
@@ -68,7 +74,8 @@ libloading = "0.8"
 # bridges. std has no UnixStream on Windows, but socket2 (Domain::UNIX) works
 # on Windows 10 1809+. See src/platform/uds.rs.
 socket2 = "0.6"
-dirs = "5"
+krun-socket = { git = "https://github.com/smol-machines/libkrun", rev = "4d910e78891e657072abf9c5de7c7c9af2b63f08" }
+smolvm-paths = { path = "crates/smolvm-paths", version = "1.35.0" }
 sha1 = "0.10"
 sha2 = "0.10"
 ring = "0.17.14"
@@ -88,12 +95,13 @@ base64 = { workspace = true }
 zeroize = { version = "1", features = ["zeroize_derive"] }
 humantime = "2"
 tempfile = "3"
-tar = "0.4"
+tar = { workspace = true }
 # Inspect and safely rebase qcow2 backing chains in portable checkpoints.
 imago = { version = "0.2.3", features = ["sync-wrappers"] }
 
 # HTTP API server
-tokio = { version = "1", features = ["full"] }
+# I/O-safe AsyncFd registration for the macOS engine event watcher.
+tokio = { version = "1.54", features = ["full"] }
 axum = { version = "0.8", features = ["macros", "ws"] }
 # mTLS for the fleet serve API (control↔node). axum-server's rustls acceptor
 # does the TLS handshake + client-cert verification; rustls-pemfile parses the
@@ -117,6 +125,7 @@ tokio-stream = "0.1"
 # ReaderStream for streaming a cached blob from disk to a peer (GET /p2p/blob).
 tokio-util = { version = "0.7", features = ["io"] }
 parking_lot = "0.12"
+regex = "1"
 async-stream = "0.3"
 futures-util = "0.3"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "rustls-tls-native-roots", "stream", "json"] }
@@ -134,6 +143,12 @@ metrics-exporter-prometheus = { version = "0.16", default-features = false }
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = "0.4"
 landlock = "0.4"
+secret-service = { version = "5.2", default-features = false, features = ["rt-async-io-crypto-rust"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+security-framework = "3.7"
+security-framework-sys = "2.17"
 
 # Windows process management (OpenProcess / TerminateProcess / Wait) and
 # DLL-search-path control (SetDllDirectoryW). Used to replace the Unix
@@ -142,6 +157,8 @@ landlock = "0.4"
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.60", features = [
     "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
     "Win32_System_Threading",
     "Win32_System_ProcessStatus",
     "Win32_System_SystemInformation",
@@ -159,7 +176,6 @@ rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"]
 # WebSocket client for the interactive exec tests (already locked through axum).
 tokio-tungstenite = "0.29"
 smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.35.0" }
-regex = "1"
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 
@@ -167,6 +183,7 @@ wiremock = "0.6"
 pkg-config = "0.3"
 
 [workspace.dependencies]
+tar = { package = "smolvm-tar", path = "vendor/tar", version = "=0.4.46-smol.1" }
 base64 = "0.22"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"

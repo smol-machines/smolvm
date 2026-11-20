@@ -56,17 +56,14 @@ pub const SECTION_MAGIC: &[u8; 8] = b"SMOLSECT";
 /// Magic bytes for libs footer appended to the stub binary.
 pub const LIBS_MAGIC: &[u8; 8] = b"SMOLLIBS";
 
-/// Current format version — the version stamped into newly written packs.
-pub const FORMAT_VERSION: u32 = 1;
+/// Current format version, stamped into newly written packs. Version 4
+/// requires readers to enforce the manifest's outbound network policy;
+/// older engines must reject these packs rather than ignore restrictions.
+pub const FORMAT_VERSION: u32 = 4;
 
-/// Format versions this build can READ. New packs are always WRITTEN at
-/// `FORMAT_VERSION`, but older `.smolmachine` artifacts stay readable: the
-/// on-disk layout (footer, manifest, assets blob) is identical across these
-/// versions — only the version number ever differed. It was reset 3→1 in a
-/// format refactor, which orphaned pre-reset packs behind a strict
-/// `version == FORMAT_VERSION` check. Accepting the older numbers keeps those
-/// artifacts runnable instead of failing with "unsupported version: 3".
-pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3];
+/// Existing versions retain the same byte layout and remain readable.
+/// Version 4 adds required network-policy semantics to the manifest.
+pub const SUPPORTED_READ_VERSIONS: &[u32] = &[1, 2, 3, 4];
 
 /// Whether a pack stamped with `version` can be read by this build.
 pub fn is_supported_read_version(version: u32) -> bool {
@@ -445,10 +442,10 @@ pub struct CheckpointWorkload {
 }
 
 /// A host directory the captured machine had mounted. Recorded only when the
-/// capture opted in (`host_mounts`), because it binds the artifact to a host
-/// where the same paths exist; a restore re-attaches each one at its guest path
-/// so the saved VM finds the device topology it was captured with.
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+/// capture opted in (`host_mounts`); its contents must be transferred separately
+/// to move hosts. A restore can relocate its host directory but retains its
+/// guest path, access and device order.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointHostMount {
     /// Host directory, as given at `machine create`.
     pub host_path: String,
@@ -457,6 +454,13 @@ pub struct CheckpointHostMount {
     /// Whether the guest sees it read-only.
     #[serde(default)]
     pub read_only: bool,
+    /// Keep guest ownership and permissions separate from host inode access.
+    /// A checkpoint with this setting requires an ownership-aware device profile.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub recorded_ownership: bool,
+    /// Guest uid/gid for files that have no individually recorded owner.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub owner: Option<(u32, u32)>,
 }
 
 /// One host-to-guest TCP forward restored around a live VM.
@@ -512,6 +516,10 @@ pub struct CheckpointNetwork {
     /// Restore must provide a new host mediator binding before execution.
     #[serde(default)]
     pub mediated_egress_required: bool,
+    /// The captured machine ran behind an external egress interceptor, so a
+    /// restore must be bound to one before it runs, as the source had to be.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub external_interceptor_required: bool,
     /// Captured outbound DNS hostname allow-list.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub dns_filter_hosts: Option<Vec<String>>,
@@ -793,15 +801,16 @@ pub struct CheckpointPackedLayers {
     pub dax_window_bytes: Option<u64>,
 }
 
-/// Identity of the registry image a checkpointed machine booted from a
-/// host-fetched archive.
+/// Identity and optional portable archive of a host-backed image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CheckpointHostImage {
     /// Registry reference to fetch, pinned to the manifest digest the source
     /// host fetched when it recorded one.
     pub reference: String,
-    /// Digest of the image config the archive carries. A restore refuses an
-    /// archive with any other config, so a moved tag cannot swap the image.
+    /// Config identity checked by legacy registry-based restores. Carried
+    /// archives instead verify every byte with `archive.sha256`, including
+    /// OCI layouts and compressed archives without a Docker manifest.json.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
     pub config_digest: String,
     /// Size in bytes of the archive the guest read.
     pub archive_size: u64,
@@ -809,6 +818,10 @@ pub struct CheckpointHostImage {
     /// read. The guest keys its flattened copy of the image on size and
     /// modification time, so a restore must serve an archive with both.
     pub archive_mtime: u64,
+    /// Exact archive bytes carried by newer checkpoints; legacy checkpoints
+    /// fetch `reference` from its registry instead.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub archive: Option<CheckpointAsset>,
 }
 
 /// Manifest describing the packed image and configuration.
@@ -868,6 +881,27 @@ pub struct PackManifest {
     /// Whether outbound networking is enabled by default.
     #[serde(default)]
     pub network: bool,
+
+    /// Outbound CIDR allow-list carried with the pack (`--allow-cidr` /
+    /// `--outbound-localhost-only` / resolved `--allow-host`). Absent means
+    /// no CIDR restriction (or unrestricted when `dns_filter_hosts` is also absent).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_cidrs: Option<Vec<String>>,
+
+    /// Hostnames and patterns permitted by the guest DNS filter (`--allow-host` /
+    /// `--allow-host-pattern`). Absent means no hostname filter.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub dns_filter_hosts: Option<Vec<String>>,
+
+    /// Block private destinations, except these explicitly allowed CIDRs.
+    /// `Some([])` blocks all private ranges; `None` leaves the policy unset.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub block_private: Option<Vec<String>>,
+
+    /// Ordered outbound egress rules carried with the pack (`--deny-cidr` /
+    /// `--allow-udp`), deny rules first.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub egress_rules: Vec<smolvm_protocol::EgressRule>,
 
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
@@ -998,6 +1032,10 @@ impl PackManifest {
             mem: 256,
             image_size: 0,
             network: false,
+            block_private: None,
+            allowed_cidrs: None,
+            dns_filter_hosts: None,
+            egress_rules: Vec::new(),
             gpu: false,
             cuda: false,
             host_platform,
@@ -1061,8 +1099,25 @@ mod tests {
             !json.contains("secret_refs"),
             "empty secret_refs must not be serialized"
         );
+        assert!(
+            !json.contains("allowed_cidrs")
+                && !json.contains("dns_filter_hosts")
+                && !json.contains("egress_rules"),
+            "absent egress fields must not be serialized"
+        );
 
         let mut m = empty;
+        m.allowed_cidrs = Some(vec!["198.51.100.10/32".to_string()]);
+        m.dns_filter_hosts = Some(vec![
+            "pypi.org".to_string(),
+            "*.files.pythonhosted.org".to_string(),
+        ]);
+        m.egress_rules = vec![smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("10.0.0.0/8".to_string()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        }];
         m.secret_refs.insert(
             "DB_PASSWORD".to_string(),
             smolvm_protocol::SecretRef {
@@ -1077,6 +1132,9 @@ mod tests {
             restored.secret_refs["DB_PASSWORD"].from_env.as_deref(),
             Some("PGPASSWORD")
         );
+        assert_eq!(restored.allowed_cidrs, m.allowed_cidrs);
+        assert_eq!(restored.dns_filter_hosts, m.dns_filter_hosts);
+        assert_eq!(restored.egress_rules, m.egress_rules);
     }
 
     #[test]
@@ -1122,11 +1180,31 @@ mod tests {
     }
 
     #[test]
-    fn test_footer_reads_legacy_v2_v3() {
+    fn new_packs_require_a_policy_aware_reader() {
+        let footer = PackFooter {
+            stub_size: 0,
+            assets_offset: 0,
+            assets_size: 10,
+            manifest_offset: 10,
+            manifest_size: 20,
+            checksum: 0,
+        };
+        let bytes = footer.to_bytes();
+        let version = u32::from_le_bytes(bytes[8..12].try_into().unwrap());
+        assert_eq!(version, 4);
+        assert!(
+            ![1, 2, 3].contains(&version),
+            "legacy readers must refuse new packs"
+        );
+        assert!(PackFooter::from_bytes(&bytes).is_ok());
+    }
+
+    #[test]
+    fn test_footer_reads_legacy_v1_v2_v3() {
         // Packs written before FORMAT_VERSION was reset 3->1 stamp version 2 or 3
         // but share the identical byte layout, so they must still read. Regression
         // for "read footer: unsupported version: 3" on pre-reset .smolmachine files.
-        for legacy in [2u32, 3u32] {
+        for legacy in [1u32, 2u32, 3u32] {
             let footer = PackFooter {
                 stub_size: 0,
                 assets_offset: 0,
