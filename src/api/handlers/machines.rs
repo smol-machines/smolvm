@@ -4288,7 +4288,7 @@ async fn start_machine_transaction(
         let mut command = record.entrypoint.clone();
         command.extend(record.cmd.clone());
         let mut env = record.env.clone();
-        env.extend(super::record_secret_refs_env(&entry)?);
+        env.extend(super::record_secret_refs_env(&entry, Some(&record))?);
         // Remote volumes mount inside the workload container; build the mount
         // script here and let the agent run it ahead of the image-resolved
         // command, so a service image's own entrypoint is preserved.
