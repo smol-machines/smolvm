@@ -208,7 +208,9 @@ pub(crate) fn validate_fork_secrets(
                 rule
             ))
         })?;
-        crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::TrustedLocal)
+        // An HTTP caller is untrusted, as on create, exec and run: a ref it
+        // names would be resolved on this host at every exec in the child.
+        crate::secrets::validate_ref(r, crate::secrets::ResolutionScope::Untrusted)
             .map_err(|e| ApiError::BadRequest(format!("fork secret '{}': {}", name, e)))?;
     }
     Ok(())
@@ -301,24 +303,28 @@ mod tests {
     }
 
     #[test]
-    fn validate_fork_secrets_accepts_host_refs_but_rejects_bad_shape() {
-        // Fork secrets are operator-declared (TrustedLocal), so unlike the
-        // untrusted request path they MAY resolve from host env/absolute files —
-        // they become the clone's persisted secret_refs.
-        let mut refs = BTreeMap::new();
-        refs.insert("GUEST_TOKEN".to_string(), env_ref("HOST_TOKEN"));
-        refs.insert(
+    fn validate_fork_secrets_refuses_host_refs_and_bad_shape() {
+        // A branch or fork request comes from an HTTP caller, so like create,
+        // exec and run it may name no host environment variable or file.
+        let mut env = BTreeMap::new();
+        env.insert("GUEST_TOKEN".to_string(), env_ref("HOST_TOKEN"));
+        assert!(matches!(
+            validate_fork_secrets(&env),
+            Err(ApiError::BadRequest(_))
+        ));
+        let mut file = BTreeMap::new();
+        file.insert(
             "GUEST_KEY".to_string(),
             SecretRef {
                 from_env: None,
-                from_file: Some("/abs/key".into()),
+                from_file: Some("/etc/shadow".into()),
                 from_keychain: None,
             },
         );
-        assert!(
-            validate_fork_secrets(&refs).is_ok(),
-            "host refs must be allowed for fork"
-        );
+        assert!(matches!(
+            validate_fork_secrets(&file),
+            Err(ApiError::BadRequest(_))
+        ));
 
         // Empty is fine (the common case).
         assert!(validate_fork_secrets(&BTreeMap::new()).is_ok());
@@ -328,21 +334,6 @@ mod tests {
         bad.insert("HAS=EQ".to_string(), env_ref("HOST"));
         assert!(matches!(
             validate_fork_secrets(&bad),
-            Err(ApiError::BadRequest(_))
-        ));
-
-        // A relative file path is rejected (validate_ref TrustedLocal).
-        let mut rel = BTreeMap::new();
-        rel.insert(
-            "K".to_string(),
-            SecretRef {
-                from_env: None,
-                from_file: Some("relative/path".into()),
-                from_keychain: None,
-            },
-        );
-        assert!(matches!(
-            validate_fork_secrets(&rel),
             Err(ApiError::BadRequest(_))
         ));
     }
