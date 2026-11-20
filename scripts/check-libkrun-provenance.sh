@@ -57,6 +57,17 @@ for dir in "${LIB_DIRS[@]}"; do
       dir_ok=0; fail=1
     fi
   fi
+
+  # The guest kernel must be built with gcc. The stamp above records the commit,
+  # not the compiler; the kernel's version banner names it.
+  for fw in "$dir"/libkrunfw.*; do
+    [[ -f "$fw" && ! -L "$fw" ]] || continue
+    banner="$(grep -a -o -m1 'Linux version [^#]*' "$fw" | head -n1 || true)"
+    if [[ "$banner" != *"(gcc "* ]]; then
+      echo "FAIL  $fw: guest kernel not built with gcc (${banner:-no kernel banner})"
+      dir_ok=0; fail=1
+    fi
+  done
   [[ "$dir_ok" == "1" ]] && echo "OK    $dir (libkrun=$got_krun)"
 done
 

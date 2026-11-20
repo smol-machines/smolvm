@@ -374,6 +374,20 @@ pub fn registry_pull_hosts(image: &str) -> Vec<String> {
     }
 }
 
+/// Whether a hostname allow list lets the guest pull `image` itself: it names
+/// every apex the pull talks to ([`registry_pull_hosts`]), either the apex or
+/// its subdomains, since registries answer from sub-hosts.
+pub fn hosts_cover_pull(image: &str, hosts: &[String]) -> bool {
+    use smolvm_protocol::host_pattern::matches;
+    registry_pull_hosts(image).iter().all(|apex| {
+        let apex = apex.split(':').next().unwrap_or(apex);
+        let sub_host = format!("pull.{apex}");
+        hosts
+            .iter()
+            .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
+    })
+}
+
 /// Rewrite an image reference to use a different registry.
 ///
 /// # Examples
@@ -678,6 +692,30 @@ fn validate_digest(raw_input: &str, digest: &str) -> std::result::Result<(), Ref
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hostname_list_covers_a_pull_only_when_it_names_every_registry_host() {
+        let list = |hosts: &[&str]| hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        assert!(!hosts_cover_pull(
+            "ghcr.io/acme/app:1",
+            &list(&["api.example.com"])
+        ));
+        assert!(!hosts_cover_pull("ghcr.io/acme/app:1", &list(&["ghcr.io"])));
+        assert!(hosts_cover_pull(
+            "ghcr.io/acme/app:1",
+            &list(&["ghcr.io", "githubusercontent.com"])
+        ));
+        assert!(!hosts_cover_pull("alpine", &list(&["docker.io"])));
+        assert!(hosts_cover_pull(
+            "alpine",
+            &list(&["docker.io", "docker.com"])
+        ));
+        assert!(hosts_cover_pull(
+            "registry.vendor.example/tool:1",
+            &list(&["registry.vendor.example"])
+        ));
+        assert!(!hosts_cover_pull("registry.vendor.example/tool:1", &[]));
+    }
 
     #[test]
     fn expired_credential_warning_fires_only_when_past() {

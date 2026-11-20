@@ -1566,6 +1566,10 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
         let Some(backing) = qcow2_backing_name(&current)? else {
             return Ok(depth);
         };
+        // A backing declared raw is a guest's disk: it ends the chain, whatever
+        // header its own bytes hold.
+        let backing_is_raw =
+            qcow2_backing_format(&current)? == Some(crate::data::disk::DiskFormat::Raw);
         let next = if backing.is_absolute() {
             backing
         } else {
@@ -1583,6 +1587,9 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
         depth = depth
             .checked_add(1)
             .ok_or_else(|| Error::agent("inspect fork disk chain", "backing depth overflow"))?;
+        if backing_is_raw {
+            return Ok(depth);
+        }
         if depth > 4 * MAX_FORK_DISK_CHAIN_DEPTH {
             return Err(Error::agent(
                 "inspect fork disk chain",
@@ -1688,6 +1695,87 @@ fn qcow2_backing_name(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(backing)))
 }
 
+/// The format a qcow2 layer declares for its backing file (header extension
+/// `0xE2792ACA`), or `None` when it declares none. A backing's own first
+/// bytes cannot say: a raw backing is a guest's disk, which may start with any
+/// header the guest wrote. A header too short or malformed to carry
+/// extensions declares nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn qcow2_backing_format(path: &Path) -> Result<Option<crate::data::disk::DiskFormat>> {
+    use crate::data::disk::DiskFormat;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const BACKING_FORMAT: u32 = 0xE279_2ACA;
+    let fail = |reason: String| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{}: {reason}", path.display()),
+        )
+    };
+    let mut file = File::open(path).map_err(|error| fail(error.to_string()))?;
+    let mut header = Vec::with_capacity(104);
+    (&mut file)
+        .take(104)
+        .read_to_end(&mut header)
+        .map_err(|error| fail(error.to_string()))?;
+    if header.len() < 72 || header[..4] != *b"QFI\xfb" {
+        return Ok(None);
+    }
+    let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    let header_length = if version >= 3 {
+        if header.len() < 104 {
+            return Ok(None);
+        }
+        u32::from_be_bytes(header[100..104].try_into().unwrap()) as u64
+    } else {
+        72
+    };
+    let cluster_bits = u32::from_be_bytes(header[20..24].try_into().unwrap());
+    if !(9..=21).contains(&cluster_bits) {
+        return Ok(None);
+    }
+    let cluster_size = 1_u64 << cluster_bits;
+    if header_length < 72 || header_length >= cluster_size {
+        return Ok(None);
+    }
+    // Extensions follow the header, within its first cluster.
+    let mut offset = header_length;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| fail(error.to_string()))?;
+    while offset + 8 <= cluster_size {
+        let mut extension = [0_u8; 8];
+        if file.read_exact(&mut extension).is_err() {
+            return Ok(None);
+        }
+        let kind = u32::from_be_bytes(extension[..4].try_into().unwrap());
+        let length = u32::from_be_bytes(extension[4..].try_into().unwrap()) as u64;
+        if kind == 0 {
+            return Ok(None);
+        }
+        let padded = length.div_ceil(8) * 8;
+        if offset + 8 + padded > cluster_size {
+            return Ok(None);
+        }
+        if kind == BACKING_FORMAT {
+            let mut name = vec![0_u8; length as usize];
+            file.read_exact(&mut name)
+                .map_err(|error| fail(error.to_string()))?;
+            return match name.as_slice() {
+                b"raw" => Ok(Some(DiskFormat::Raw)),
+                b"qcow2" => Ok(Some(DiskFormat::Qcow2)),
+                other => Err(fail(format!(
+                    "unsupported backing format '{}'",
+                    String::from_utf8_lossy(other)
+                ))),
+            };
+        }
+        file.seek(SeekFrom::Current(padded as i64))
+            .map_err(|error| fail(error.to_string()))?;
+        offset += 8 + padded;
+    }
+    Ok(None)
+}
+
 /// Preserve relative backing names when an active qcow2 image is moved into a
 /// fork-generation directory. Portable checkpoint disks deliberately use
 /// compact relative names (`0`, `1`, ...); moving only the top image would make
@@ -1717,6 +1805,8 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
         let Some(backing) = qcow2_backing_name(&source)? else {
             return Ok(());
         };
+        let backing_is_raw =
+            qcow2_backing_format(&source)? == Some(crate::data::disk::DiskFormat::Raw);
         if backing.is_absolute() {
             return Ok(());
         }
@@ -1783,6 +1873,10 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
                     ),
                 ));
             }
+        }
+        // A raw backing is linked like any other, but never read as qcow2.
+        if backing_is_raw {
+            return Ok(());
         }
         source = source_next;
         relocated = relocated_next;

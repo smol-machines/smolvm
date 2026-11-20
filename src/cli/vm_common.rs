@@ -2068,17 +2068,6 @@ fn start_vm_named_locked(
         }
     }
 
-    // First boot pulls the base image in-guest, subject to the egress filter —
-    // fold the image's registry into the enforced policy so a hostname scope
-    // doesn't block its own pull. Subsequent starts skip the pull, so they keep
-    // the user's scope unwidened.
-    if !record.init_completed {
-        features.allow_image_pull_egress(
-            record.image.as_deref(),
-            features.packed_layers_dir.is_some() || record.packed_image_on_storage,
-        );
-    }
-
     if restoring_checkpoint {
         smolvm::portable_checkpoint::prefetch_restore_memory(&smolvm::agent::vm_data_dir(name));
     }

@@ -6599,7 +6599,64 @@ fn base64_encode(input: &str) -> String {
 /// identity token, which crane takes as `identitytoken`.
 ///
 /// The returned TempDir must be kept alive for the duration of the command.
-fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfile::TempDir> {
+/// The Docker config directory for one registry pull. With a credential it is
+/// a tmpfs of its own: a file written to the storage disk and unlinked after
+/// the pull leaves the login in a freed block, which root in the guest can
+/// read from the disk and an image seed copies to every later machine.
+struct DockerAuthDir {
+    dir: tempfile::TempDir,
+    mounted: bool,
+}
+
+impl DockerAuthDir {
+    fn path(&self) -> &Path {
+        self.dir.path()
+    }
+}
+
+impl Drop for DockerAuthDir {
+    fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
+        if self.mounted {
+            use std::os::unix::ffi::OsStrExt;
+            if let Ok(target) = std::ffi::CString::new(self.dir.path().as_os_str().as_bytes()) {
+                // SAFETY: target is a valid NUL-terminated path.
+                unsafe { libc::umount2(target.as_ptr(), libc::MNT_DETACH) };
+            }
+        }
+    }
+}
+
+/// Mount a small private tmpfs on `dir`, so what is written there stays in
+/// memory.
+#[cfg(target_os = "linux")]
+fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let target = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
+    // SAFETY: every pointer is a valid NUL-terminated string.
+    let rc = unsafe {
+        libc::mount(
+            c"tmpfs".as_ptr(),
+            target.as_ptr(),
+            c"tmpfs".as_ptr(),
+            libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            c"size=64k,mode=0700".as_ptr().cast(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// The agent only runs in a Linux guest; elsewhere it is built for tests.
+#[cfg(not(target_os = "linux"))]
+fn mount_private_tmpfs(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
+}
+
+fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<DockerAuthDir> {
     // The guest root filesystem (and thus the default temp dir, /tmp) is
     // read-only, so create the auth config under the writable storage disk.
     let temp_dir = tempfile::Builder::new()
@@ -6608,9 +6665,20 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfil
         .map_err(|e| {
             StorageError::new(format!("failed to create temp directory for auth: {}", e))
         })?;
+    let mut auth_dir = DockerAuthDir {
+        dir: temp_dir,
+        mounted: false,
+    };
 
     let config_json = match auth {
         Some(a) => {
+            mount_private_tmpfs(auth_dir.path()).map_err(|e| {
+                StorageError::new(format!(
+                    "failed to mount tmpfs for registry credentials: {}",
+                    e
+                ))
+            })?;
+            auth_dir.mounted = true;
             let registry = extract_registry_from_image(image);
             let entry = if a.username == DOCKER_IDENTITY_TOKEN_USERNAME {
                 serde_json::json!({ "identitytoken": a.password })
@@ -6627,11 +6695,11 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<tempfil
         None => "{}".to_string(),
     };
 
-    let config_path = temp_dir.path().join("config.json");
+    let config_path = auth_dir.path().join("config.json");
     std::fs::write(&config_path, &config_json)
         .map_err(|e| StorageError::new(format!("failed to write docker auth config: {}", e)))?;
 
-    Ok(temp_dir)
+    Ok(auth_dir)
 }
 
 /// Set HTTP_PROXY / HTTPS_PROXY / NO_PROXY on a crane subprocess so the
