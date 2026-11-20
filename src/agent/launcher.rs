@@ -369,41 +369,6 @@ fn shared_layers_populated(layers: &Path) -> bool {
 }
 
 impl LaunchFeatures {
-    /// Fold an image's own registry into the enforced DNS egress filter so a
-    /// scoped machine's in-guest base-image pull isn't blocked by its own
-    /// allow-list.
-    ///
-    /// An image-based machine pulls its base image inside the guest on first
-    /// boot, subject to `dns_filter_hosts` (applied at VM boot). Scoping egress
-    /// to only, say, an LLM API would otherwise fail the pull with a DNS-lookup
-    /// error for the registry. Call this only when a fresh remote pull will
-    /// happen (first boot, registry-sourced). No-op when the filter is unset or
-    /// empty, when layers are packed/local (`uses_packed_layers`), or when the
-    /// reference is a `local:` source — none of which pull over the network.
-    ///
-    /// Only the enforced launch policy is widened; the caller's stored
-    /// `dns_filter_hosts` on the record keeps exactly the hosts the user asked
-    /// for. Mirrors the control plane's `create_body` registry-fold.
-    pub fn allow_image_pull_egress(&mut self, image: Option<&str>, uses_packed_layers: bool) {
-        let Some(hosts) = self.dns_filter_hosts.as_mut() else {
-            return;
-        };
-        if hosts.is_empty() || uses_packed_layers {
-            return;
-        }
-        let Some(image) = image else {
-            return;
-        };
-        if crate::data::image_source::is_local_ref(image) {
-            return;
-        }
-        for host in crate::registry::registry_pull_hosts(image) {
-            if !hosts.iter().any(|h| h.eq_ignore_ascii_case(&host)) {
-                hosts.push(host);
-            }
-        }
-    }
-
     /// Wire pre-extracted OCI layers for a machine created from a `.smolmachine`.
     ///
     /// `layers_cache_dir` is the machine's OWN extraction directory (under its
@@ -3560,66 +3525,6 @@ mod tests {
         assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
         assert!(target.is_dir());
         assert!(link.symlink_metadata().is_ok());
-    }
-
-    fn scoped(hosts: &[&str]) -> LaunchFeatures {
-        LaunchFeatures {
-            dns_filter_hosts: Some(hosts.iter().map(|h| h.to_string()).collect()),
-            ..Default::default()
-        }
-    }
-
-    #[test]
-    fn allow_image_pull_egress_folds_registry_into_scope() {
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(Some("ghcr.io/acme/app:1"), false);
-        assert_eq!(
-            f.dns_filter_hosts.unwrap(),
-            vec![
-                "api.anthropic.com".to_string(),
-                "ghcr.io".to_string(),
-                "githubusercontent.com".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn allow_image_pull_egress_dockerhub_adds_both_apexes_without_dupes() {
-        // docker.io already listed by the user; the fold must add docker.com but
-        // not re-add docker.io.
-        let mut f = scoped(&["docker.io", "pypi.org"]);
-        f.allow_image_pull_egress(Some("alpine"), false);
-        assert_eq!(
-            f.dns_filter_hosts.unwrap(),
-            vec![
-                "docker.io".to_string(),
-                "pypi.org".to_string(),
-                "docker.com".to_string()
-            ]
-        );
-    }
-
-    #[test]
-    fn allow_image_pull_egress_noop_when_unscoped_or_packed_or_local() {
-        // No filter set → unscoped machine, nothing to widen.
-        let mut f = LaunchFeatures::default();
-        f.allow_image_pull_egress(Some("alpine"), false);
-        assert!(f.dns_filter_hosts.is_none());
-
-        // Packed layers (.smolmachine / local dir) → no in-guest pull.
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(Some("alpine"), true);
-        assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
-
-        // A `local:` reference is host-assembled, never pulled.
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(Some("local:abc123"), false);
-        assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
-
-        // Bare VM (no image) → nothing to fold.
-        let mut f = scoped(&["api.anthropic.com"]);
-        f.allow_image_pull_egress(None, false);
-        assert_eq!(f.dns_filter_hosts.unwrap(), vec!["api.anthropic.com"]);
     }
 
     /// Build a machine `pack` dir plus a `.pack-shared` pointer in its parent that

@@ -303,25 +303,34 @@ pub struct FetchedImage {
 /// size before anything is staged. A repeat fetch of the same image from the
 /// same registry and repository reuses the staged archive.
 pub async fn fetch_image_archive(reference: &str, auth: &PullAuth) -> Result<FetchedImage> {
-    let (client, repo, manifest_bytes) =
-        resolve_manifest(reference, auth, None)
-            .await
-            .map_err(|error| match &error {
-                // Say what the guest's own pull says for a reference that does not
-                // exist, so callers tell a typo (never retryable) from a fault.
-                Error::Agent { reason, .. }
-                    if reason.contains("registry returned 404")
-                        || reason.contains("blob not found")
-                        || reason.contains("MANIFEST_UNKNOWN")
-                        || reason.contains("NAME_UNKNOWN") =>
-                {
-                    Error::agent_not_found(
-                        "fetch image",
-                        format!("image not found in the registry: {reference}"),
-                    )
-                }
-                _ => error,
-            })?;
+    fetch_image_archive_for_platform(reference, auth, None).await
+}
+
+/// [`fetch_image_archive`] for the OCI platform the guest runs, when it is
+/// not the host's (`--oci-platform`, or Rosetta's `linux/amd64`).
+pub async fn fetch_image_archive_for_platform(
+    reference: &str,
+    auth: &PullAuth,
+    oci_platform: Option<&str>,
+) -> Result<FetchedImage> {
+    let (client, repo, manifest_bytes) = resolve_manifest(reference, auth, oci_platform)
+        .await
+        .map_err(|error| match &error {
+            // Say what the guest's own pull says for a reference that does not
+            // exist, so callers tell a typo (never retryable) from a fault.
+            Error::Agent { reason, .. }
+                if reason.contains("registry returned 404")
+                    || reason.contains("blob not found")
+                    || reason.contains("MANIFEST_UNKNOWN")
+                    || reason.contains("NAME_UNKNOWN") =>
+            {
+                Error::agent_not_found(
+                    "fetch image",
+                    format!("image not found in the registry: {reference}"),
+                )
+            }
+            _ => error,
+        })?;
     let digest = manifest_digest(&manifest_bytes);
     let key = fetched_key(
         &crate::registry::extract_registry(reference),
