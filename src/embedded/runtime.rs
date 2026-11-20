@@ -374,6 +374,9 @@ impl EmbeddedRuntime {
                             tracing::warn!(%cleanup, "could not remove failed pause artifact");
                         }
                     }
+                    let _ = crate::portable_checkpoint::remove_paused_resume(
+                        &crate::agent::vm_data_dir(name),
+                    );
                 }
                 return Err(error);
             }
@@ -480,6 +483,9 @@ impl EmbeddedRuntime {
             let vm_data = crate::agent::vm_data_dir(name);
             if let Err(error) = crate::portable_checkpoint::remove_paused_layers(&vm_data) {
                 tracing::warn!(%error, "could not remove consumed pause's pinned layers");
+            }
+            if let Err(error) = crate::portable_checkpoint::remove_paused_resume(&vm_data) {
+                tracing::warn!(%error, "could not remove consumed pause's kept inputs");
             }
             Ok(())
         })
