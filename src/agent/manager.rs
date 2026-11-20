@@ -4952,14 +4952,25 @@ impl AgentManager {
                 "machine has unsynchronized staged mounts but its agent is unreachable",
             ));
         }
-        self.stop_owned(
-            &operation,
-            matches!(
-                resolved,
-                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
-            ),
-            Some(Duration::ZERO),
-        )?;
+        let without_handshake = matches!(
+            resolved,
+            crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
+        );
+        if let Err(error) = self.stop_owned(&operation, without_handshake, Some(Duration::ZERO)) {
+            if without_handshake {
+                return Err(error);
+            }
+            // A guest that cannot confirm its flush (a disk that turned
+            // read-only after an error, for one) would otherwise be impossible
+            // to delete. Its disks are removed next, so end it without the
+            // handshake; its identity is still checked first.
+            tracing::warn!(
+                machine = %record.name,
+                %error,
+                "guest did not confirm shutdown; ending it without the handshake because it is being deleted"
+            );
+            self.stop_owned(&operation, true, Some(Duration::ZERO))?;
+        }
         operation._ownership.take().ok_or_else(|| {
             Error::agent_conflict("delete machine", "deletion requires a reviewed machine")
         })
