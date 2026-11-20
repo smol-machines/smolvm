@@ -922,6 +922,16 @@ pub fn generations_from_history(
         .collect()
 }
 
+/// An export forwards objects unopened and the packer follows links, so a
+/// store entry that is not a regular file is refused here the way
+/// [`decode_object`] refuses it on read.
+fn require_object_file(path: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid("checkpoint object is not a regular file"));
+    }
+    Ok(())
+}
+
 /// Export `directory` as ONE file that carries its history: the checkpoint's
 /// index, the indexes of up to `limit` retained generations, and every object
 /// any of them references, packed as a `Chunked` checkpoint. Restoring such a
@@ -976,6 +986,7 @@ pub fn export_with_history(
     let objects = directory.join("objects");
     for hash in &hashes {
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -2915,6 +2926,7 @@ pub fn export_chunked(
             continue;
         }
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -4486,6 +4498,40 @@ mod tests {
             )
             .unwrap();
         retained
+    }
+
+    /// The history export moves objects into its staging tree by name and
+    /// the packer dereferences links, so an object that is a symlink would put
+    /// the target's bytes into the file: it is refused like any other object
+    /// that is not a regular file.
+    #[test]
+    #[cfg(unix)]
+    fn a_history_export_refuses_an_object_that_is_not_a_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        capture_generation(&cache, &first, &[1u8; 64], G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &[2u8; 64],
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"host secret").unwrap();
+        let hash = read_index(&second).unwrap().files[0].chunks[0]
+            .clone()
+            .unwrap();
+        let object = second.join("objects").join(&hash);
+        fs::remove_file(&object).unwrap();
+        std::os::unix::fs::symlink(&outside, &object).unwrap();
+        let file = root.path().join("history.checkpoint");
+        let error = export_with_history(&second, 32, &file, |_| {}).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(!file.exists());
     }
 
     const G1: &str = "11111111111111111111111111111111";
