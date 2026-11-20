@@ -2161,6 +2161,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         // The guest must mount these manually (or via the agent)
         for (i, mount) in mounts.iter().enumerate() {
             let mount_tag = HostMount::mount_tag(i);
+            // The guest only reads a staged share, to seed its working copy;
+            // its changes come back through the agent. A writable share would
+            // let it change the host tree while a sync applies to it.
+            let share_read_only = mount.read_only || mount.staged;
             let tag = try_or_free_ctx!(
                 CString::new(mount_tag.clone()),
                 "configure mount",
@@ -2176,7 +2180,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 tag = %mount_tag,
                 host = %mount.source.display(),
                 guest = %mount.target.display(),
-                read_only = mount.read_only,
+                read_only = share_read_only,
                 "adding virtiofs mount"
             );
 
@@ -2206,7 +2210,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
                 ) < 0
                 {
@@ -2244,7 +2248,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
                 );
                 if ret >= 0 {
@@ -2269,9 +2273,9 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                 // EINVAL: a libkrun that does not know the flag; attach as before.
             }
             if attached {
-            } else if mount.read_only || dax_window > 0 {
+            } else if share_read_only || dax_window > 0 {
                 let Some(add_virtiofs3) = krun_add_virtiofs3 else {
-                    if mount.read_only {
+                    if share_read_only {
                         krun_free_ctx(ctx);
                         return Err(Error::agent(
                             "add virtiofs mount",
@@ -2289,7 +2293,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                 ) < 0
                 {
                     krun_free_ctx(ctx);
