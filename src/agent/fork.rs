@@ -1698,7 +1698,9 @@ fn qcow2_backing_name(path: &Path) -> Result<Option<PathBuf>> {
 /// The format a qcow2 layer declares for its backing file (header extension
 /// `0xE2792ACA`), or `None` when it declares none. A backing's own first
 /// bytes cannot say: a raw backing is a guest's disk, which may start with any
-/// header the guest wrote.
+/// header the guest wrote. A header too short or malformed to carry
+/// extensions declares nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
 fn qcow2_backing_format(path: &Path) -> Result<Option<crate::data::disk::DiskFormat>> {
     use crate::data::disk::DiskFormat;
     use std::io::{Read, Seek, SeekFrom};
@@ -1711,24 +1713,30 @@ fn qcow2_backing_format(path: &Path) -> Result<Option<crate::data::disk::DiskFor
         )
     };
     let mut file = File::open(path).map_err(|error| fail(error.to_string()))?;
-    let mut header = [0_u8; 104];
-    file.read_exact(&mut header[..72])
+    let mut header = Vec::with_capacity(104);
+    (&mut file)
+        .take(104)
+        .read_to_end(&mut header)
         .map_err(|error| fail(error.to_string()))?;
-    if header[..4] != *b"QFI\xfb" {
+    if header.len() < 72 || header[..4] != *b"QFI\xfb" {
         return Ok(None);
     }
     let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
     let header_length = if version >= 3 {
-        file.read_exact(&mut header[72..104])
-            .map_err(|error| fail(error.to_string()))?;
+        if header.len() < 104 {
+            return Ok(None);
+        }
         u32::from_be_bytes(header[100..104].try_into().unwrap()) as u64
     } else {
         72
     };
     let cluster_bits = u32::from_be_bytes(header[20..24].try_into().unwrap());
-    let cluster_size = 1_u64.checked_shl(cluster_bits).unwrap_or(0);
-    if header_length < 72 || cluster_size == 0 || header_length >= cluster_size {
-        return Err(fail("invalid qcow2 header length".to_string()));
+    if !(9..=21).contains(&cluster_bits) {
+        return Ok(None);
+    }
+    let cluster_size = 1_u64 << cluster_bits;
+    if header_length < 72 || header_length >= cluster_size {
+        return Ok(None);
     }
     // Extensions follow the header, within its first cluster.
     let mut offset = header_length;
@@ -1736,8 +1744,9 @@ fn qcow2_backing_format(path: &Path) -> Result<Option<crate::data::disk::DiskFor
         .map_err(|error| fail(error.to_string()))?;
     while offset + 8 <= cluster_size {
         let mut extension = [0_u8; 8];
-        file.read_exact(&mut extension)
-            .map_err(|error| fail(error.to_string()))?;
+        if file.read_exact(&mut extension).is_err() {
+            return Ok(None);
+        }
         let kind = u32::from_be_bytes(extension[..4].try_into().unwrap());
         let length = u32::from_be_bytes(extension[4..].try_into().unwrap()) as u64;
         if kind == 0 {
@@ -1745,9 +1754,7 @@ fn qcow2_backing_format(path: &Path) -> Result<Option<crate::data::disk::DiskFor
         }
         let padded = length.div_ceil(8) * 8;
         if offset + 8 + padded > cluster_size {
-            return Err(fail(
-                "qcow2 header extension overruns its cluster".to_string(),
-            ));
+            return Ok(None);
         }
         if kind == BACKING_FORMAT {
             let mut name = vec![0_u8; length as usize];
