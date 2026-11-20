@@ -87,7 +87,7 @@ pub mod udp_publish;
 pub mod udp_relay;
 pub mod watchlist;
 
-pub use egress::EgressPolicy;
+pub use egress::{record_request_denial, EgressPolicy};
 
 use socket2::Socket;
 use std::fmt;
@@ -230,6 +230,10 @@ pub struct GuestNetworkConfig {
     /// Host interceptor and the outbound streams routed through it. Each stream
     /// carries an authenticated preamble naming its original destination.
     pub intercept: Option<StreamInterception>,
+    /// The machine has HTTPS request rules, matched by TLS server name: drop
+    /// guest QUIC unless `--allow-udp` admits it, and answer DNS HTTPS records
+    /// empty so clients skip Encrypted Client Hello, which hides the name.
+    pub request_rules: bool,
 }
 
 /// Exact guest gateway port mapped to one smolvm-owned host loopback port.
@@ -261,6 +265,7 @@ impl GuestNetworkConfig {
             upstream_resolvers: [None; MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
+            request_rules: false,
         }
     }
 }
@@ -729,6 +734,7 @@ pub fn start_virtio_network_on(
             upstream_resolvers: guest_network.upstream_resolvers,
             host_service: guest_network.host_service,
             intercept: guest_network.intercept,
+            request_rules: guest_network.request_rules,
             mtu: usize::from(smolvm_protocol::guest_env::GATEWAY_LINK_MTU),
         },
         Some(tcp_receiver),
