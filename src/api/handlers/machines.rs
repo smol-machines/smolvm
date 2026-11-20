@@ -7494,6 +7494,11 @@ pub(crate) async fn pull_smolmachine(
     };
 
     let mut client = smolvm_registry::RegistryClient::new(base_url);
+    // Only a registry the operator configured may vouch that a repository
+    // holds a blob, letting a copy cached here or on a peer serve the pull.
+    if registry_is_configured(&settings.machines, &parsed.registry) {
+        client = client.vouching_for_blobs();
+    }
 
     // A request-supplied identity token (the control plane's short-lived,
     // tenant-scoped pull token) takes precedence over any persisted credential.
