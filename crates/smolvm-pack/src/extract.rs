@@ -6552,6 +6552,7 @@ mod tests {
 
     /// A failed entry names the OS error the tar crate keeps as its source:
     /// a checkpoint restore on a full disk said only "failed to unpack".
+    #[cfg(unix)]
     #[test]
     fn unpack_errors_name_the_os_error() {
         let dir = tempfile::tempdir().unwrap();
