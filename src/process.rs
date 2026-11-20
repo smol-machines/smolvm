@@ -1541,6 +1541,18 @@ pub fn data_root_is_explicit() -> bool {
     EXPLICIT_DATA_ROOT.get().copied().unwrap_or(false)
 }
 
+/// Relocate all smolvm state under `root`, without consulting the environment.
+/// Embedded callers use this to select a data directory through their own API.
+/// Must be called before the embedded runtime and other worker threads start.
+#[cfg(unix)]
+pub fn apply_data_root(root: &std::path::Path) {
+    EXPLICIT_DATA_ROOT.get_or_init(|| true);
+    // Boot helpers must inherit the HOME selected here, not an unrelated root.
+    std::env::remove_var("SMOLVM_DATA_DIR");
+    apply_data_root_inner(root);
+}
+
+#[cfg(unix)]
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
 /// at it before any path is computed — every `smolvm_paths::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
@@ -1550,7 +1562,6 @@ pub fn data_root_is_explicit() -> bool {
 /// privileged with the uid drop active and no XDG override (serve only — a
 /// one-off root CLI invocation shouldn't silently switch roots). Must be called
 /// single-threaded, before the tokio runtime, so `set_var` is safe.
-#[cfg(unix)]
 pub fn apply_system_data_root(allow_auto: bool) {
     // Only the first pass sees what the user asked for: a later one (serve
     // runs its own) finds the variable this function set itself.
@@ -1576,15 +1587,20 @@ pub fn apply_system_data_root(allow_auto: bool) {
     } else {
         return;
     };
+    apply_data_root_inner(&root);
+}
+
+#[cfg(unix)]
+fn apply_data_root_inner(root: &std::path::Path) {
     // Relocating HOME also relocates the fallback agent rootfs path. Preserve
     // the installed rootfs for explicit SMOLVM_DATA_DIR and serve's /var/lib
     // default, just as we do for the overlayfs workspace default.
     let carry_rootfs_from = installed_agent_rootfs();
-    match std::fs::create_dir_all(&root) {
+    match std::fs::create_dir_all(root) {
         Ok(()) => {
             use std::os::unix::fs::PermissionsExt;
             // 0755 so dropped VMM uids can traverse to their data.
-            let _ = std::fs::set_permissions(&root, std::fs::Permissions::from_mode(0o755));
+            let _ = std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o755));
         }
         Err(e) => {
             tracing::warn!(root = %root.display(), error = %e, "failed to create smolvm data root")
@@ -1602,7 +1618,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
             std::env::set_var("DOCKER_CONFIG", dir);
         }
     }
-    std::env::set_var("HOME", &root);
+    std::env::set_var("HOME", root);
     std::env::remove_var("XDG_CACHE_HOME");
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
@@ -1724,6 +1740,14 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     }
     let _ = std::fs::remove_dir_all(dst);
     std::fs::rename(&staging, dst)
+}
+
+/// Select an explicit data root for an embedded caller without reading its
+/// environment. Windows shares the choice with children through the paths library.
+#[cfg(not(unix))]
+pub fn apply_data_root(root: &std::path::Path) {
+    std::env::set_var("SMOLVM_DATA_DIR", root);
+    apply_system_data_root(false);
 }
 
 /// Windows state directories are resolved by the shared paths library; make
