@@ -444,6 +444,14 @@ impl State {
     /// the IP the guest resolved — which the backend already admitted under the
     /// machine's egress policy — while the certificate is verified for `host`.
     fn client_for(&self, host: &str, destination: SocketAddr) -> Result<reqwest::Client> {
+        // A host the URL parser rewrites (`127.0.0.0x1` is 127.0.0.1) would
+        // be dialled directly, skipping the pin to the admitted destination.
+        let url = reqwest::Url::parse(&format!("https://{host}/")).context("upstream host")?;
+        anyhow::ensure!(
+            url.domain()
+                .is_some_and(|name| name.eq_ignore_ascii_case(host)),
+            "upstream host is not a DNS name"
+        );
         let key = (host.to_string(), destination);
         let mut clients = self.clients.lock().expect("client cache");
         if let Some(client) = clients.get(&key) {
