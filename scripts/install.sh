@@ -243,13 +243,14 @@ verify_checksum() {
     local filename
     filename=$(basename "$file")
 
-    # Extract expected checksum for this file
+    # Exactly one line must name the file, as "HASH  NAME" or "HASH *NAME".
+    # Compare strings: grep let "." match any character and longer names match.
     local expected
-    expected=$(grep "$filename" "$checksums_file" 2>/dev/null | awk '{print $1}')
+    expected=$(awk -v f="$filename" '$2 == f || $2 == "*"f {print $1}' "$checksums_file")
 
-    if [[ -z "$expected" ]]; then
-        warn "Checksum not found for $filename, skipping verification"
-        return 0
+    if [[ -z "$expected" || "$expected" == *$'\n'* ]]; then
+        error "checksums.sha256 needs exactly one entry for $filename"
+        return 1
     fi
 
     # Calculate actual checksum
@@ -384,7 +385,7 @@ install_smolvm() {
         exit 1
     }
 
-    # Download and verify checksums (optional - don't fail if checksums unavailable)
+    # Download and verify checksums. Releases before v0.5.1 publish none, so they fail here.
     if download "$checksums_url" "$checksums" 2>/dev/null; then
         verify_checksum "$archive" "$checksums" || {
             error "Archive failed checksum verification - aborting for security"
@@ -392,7 +393,9 @@ install_smolvm() {
             exit 1
         }
     else
-        warn "Checksums not available for this release, skipping verification"
+        error "Could not download $checksums_url - aborting for security"
+        rm -rf "$tmp_dir"
+        exit 1
     fi
 
     # Extract
