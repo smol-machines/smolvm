@@ -279,6 +279,37 @@ struct HttpRequest {
     /// Present only on a well-formed upgrade request.
     websocket_key: Option<String>,
     wants_binary_subprotocol: bool,
+    /// The page origin a browser names on its requests.
+    origin: Option<String>,
+    /// The `Host` the request was addressed to.
+    host: Option<String>,
+}
+
+/// Whether a WebSocket upgrade may proceed. Browsers do not hold WebSocket
+/// handshakes to the same-origin policy, so a page on any site could open the
+/// display: a request that names a page origin must name this port's own, and
+/// one that arrived over loopback must address it as `localhost` or an IP, or
+/// a page whose own name re-resolves to 127.0.0.1 would pass. A request
+/// without an origin is a native client, not a page.
+fn upgrade_allowed(request: &HttpRequest, from_loopback: bool) -> bool {
+    let Some(origin) = request.origin.as_deref() else {
+        return true;
+    };
+    let Some(host) = request.host.as_deref() else {
+        return false;
+    };
+    let authority = origin.split_once("://").map(|(_, authority)| authority);
+    if !authority.is_some_and(|authority| authority.eq_ignore_ascii_case(host)) {
+        return false;
+    }
+    if from_loopback {
+        let name = match host.strip_prefix('[') {
+            Some(rest) => rest.split(']').next().unwrap_or(rest),
+            None => host.rsplit_once(':').map_or(host, |(name, _)| name),
+        };
+        return name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok();
+    }
+    true
 }
 
 fn serve_http(
@@ -299,6 +330,15 @@ fn serve_http(
         let route = request.path.as_str();
         if route != "/websockify" && route != "/video" {
             return respond(&mut s, "404 Not Found", "text/plain", b"not found");
+        }
+        let from_loopback = s.peer_addr().is_ok_and(|peer| peer.ip().is_loopback());
+        if !upgrade_allowed(&request, from_loopback) {
+            return respond(
+                &mut s,
+                "403 Forbidden",
+                "text/plain",
+                b"the display only accepts its own page",
+            );
         }
         if route == "/video" && !super::video::is_available() {
             return respond(
@@ -371,6 +411,8 @@ fn read_request<R: Read>(s: &mut R) -> std::io::Result<Option<HttpRequest>> {
     let mut websocket_key = None;
     let mut upgrading = false;
     let mut wants_binary_subprotocol = false;
+    let mut origin = None;
+    let mut host = None;
     for line in lines {
         let Some((name, value)) = line.split_once(':') else {
             continue;
@@ -379,6 +421,8 @@ fn read_request<R: Read>(s: &mut R) -> std::io::Result<Option<HttpRequest>> {
         match name.trim().to_ascii_lowercase().as_str() {
             "upgrade" => upgrading = value.eq_ignore_ascii_case("websocket"),
             "sec-websocket-key" => websocket_key = Some(value.to_string()),
+            "origin" => origin = Some(value.to_string()),
+            "host" => host = Some(value.to_string()),
             "sec-websocket-protocol" => {
                 wants_binary_subprotocol = value
                     .split(',')
@@ -392,6 +436,8 @@ fn read_request<R: Read>(s: &mut R) -> std::io::Result<Option<HttpRequest>> {
         path: path.split('?').next().unwrap_or("/").to_string(),
         websocket_key: upgrading.then_some(websocket_key).flatten(),
         wants_binary_subprotocol,
+        origin,
+        host,
     }))
 }
 
@@ -1126,6 +1172,50 @@ pub fn parse_bind_addr(raw: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_the_displays_own_page_may_open_its_websocket() {
+        let request = |origin: Option<&str>, host: Option<&str>| HttpRequest {
+            path: "/websockify".into(),
+            websocket_key: Some("k".into()),
+            wants_binary_subprotocol: false,
+            origin: origin.map(Into::into),
+            host: host.map(Into::into),
+        };
+        // A native viewer sends no origin.
+        assert!(upgrade_allowed(
+            &request(None, Some("127.0.0.1:5900")),
+            true
+        ));
+        // The display's own page.
+        assert!(upgrade_allowed(
+            &request(Some("http://127.0.0.1:5900"), Some("127.0.0.1:5900")),
+            true
+        ));
+        assert!(upgrade_allowed(
+            &request(Some("http://localhost:5900"), Some("localhost:5900")),
+            true
+        ));
+        // Another site's page.
+        assert!(!upgrade_allowed(
+            &request(Some("https://evil.example"), Some("127.0.0.1:5900")),
+            true
+        ));
+        assert!(!upgrade_allowed(
+            &request(Some("null"), Some("127.0.0.1:5900")),
+            true
+        ));
+        // A page whose name was re-pointed at 127.0.0.1.
+        assert!(!upgrade_allowed(
+            &request(Some("http://evil.example:5900"), Some("evil.example:5900")),
+            true
+        ));
+        // Reached over the network by name, its own page is fine.
+        assert!(upgrade_allowed(
+            &request(Some("https://desk.example:5900"), Some("desk.example:5900")),
+            false
+        ));
+    }
 
     #[test]
     fn bare_port_binds_loopback_only() {
