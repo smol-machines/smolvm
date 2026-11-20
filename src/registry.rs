@@ -462,6 +462,26 @@ pub struct Reference {
     pub digest: Option<String>,
 }
 
+/// An OCI distribution tag: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+fn is_valid_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// A registry host as it may appear in a reference: a name or address, an
+/// optional port, and the brackets of an IPv6 literal.
+fn is_valid_registry_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+}
+
 impl Reference {
     /// Parse a reference string.
     ///
@@ -508,6 +528,11 @@ impl Reference {
                 let tag = &input[abs_colon + 1..];
                 if tag.is_empty() {
                     return Err(err("empty tag"));
+                }
+                // The tag is formatted into the manifest URL, where `..` and
+                // `\` would steer the request to another repository.
+                if !is_valid_tag(tag) {
+                    return Err(err("invalid tag (disallowed characters)"));
                 }
                 (path, Some(tag.to_string()), None)
             } else {
@@ -585,6 +610,11 @@ impl Reference {
 
         if name.is_empty() {
             return Err(err("empty name"));
+        }
+        // The registry becomes the URL's authority; nothing in it may end the
+        // authority and start a path or query of its own.
+        if !is_valid_registry_host(&registry) {
+            return Err(err("invalid registry host (disallowed characters)"));
         }
 
         // Reject empty path components (e.g. ghcr.io/org//machine from a double slash).
@@ -1237,6 +1267,35 @@ mirror = "ghcr-mirror.example.com"
             "unexpected reason: {}",
             err.reason
         );
+    }
+
+    #[test]
+    fn a_tag_or_registry_that_could_reshape_the_url_is_refused() {
+        for reference in [
+            r"registry.example/victim/private:..\..\attacker\x",
+            "registry.example/app:..",
+            "registry.example/app:.",
+            "registry.example/app:latest?x=1",
+            "registry.example/app:latest#",
+            "registry.example/app:%2e%2e",
+            "registry.example/app:-v1",
+            r"127.0.0.1:8080\admin\x?q=/repo:tag",
+        ] {
+            assert!(Reference::parse(reference).is_err(), "{reference} accepted");
+        }
+        let long = format!("registry.example/app:{}", "a".repeat(129));
+        assert!(Reference::parse(&long).is_err());
+        for reference in [
+            "python:3.12-slim_x",
+            "localhost:5000/app:dev",
+            "[::1]:5000/app:v1",
+            "my_registry.internal:8443/team/app:v1",
+            "ghcr.io/org/team/machine:latest",
+        ] {
+            assert!(Reference::parse(reference).is_ok(), "{reference} refused");
+        }
+        let longest = format!("registry.example/app:{}", "a".repeat(128));
+        assert!(Reference::parse(&longest).is_ok());
     }
 
     #[test]
