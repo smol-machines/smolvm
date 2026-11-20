@@ -563,8 +563,8 @@ can create and run machines. Machines that ask for nested virtualization
 
 - Machine name defaults to `$SMOLVM_MACHINE_NAME` when set, else `"default"`, when `--name` is omitted. An explicit `--name` always wins. Meant for per-workspace tooling (direnv); `machine run`, `machine checkpoint`, and `machine branch` deliberately ignore the variable. Without the variable, `machine create` generates a `vm-<id>` name instead of `"default"`
 - Network is **off** by default (security-first)
-- CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 10 GiB
-- Packed binaries use the same defaults (CPUs: 4, Memory: 8192 MiB)
+- CPUs: 4, Memory: half the host's RAM up to 8192 MiB, Storage: 20 GiB, Overlay: 10 GiB
+- Packed binaries default to CPUs: 4, Memory: 8192 MiB
 - Memory and CPU are elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest
 
 ## Important Behaviors
