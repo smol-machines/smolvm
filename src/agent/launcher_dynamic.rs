@@ -967,6 +967,8 @@ pub fn launch_agent_vm_dynamic(
         // A watched share keeps missing names for a second (see the mount
         // loop in `launcher.rs`); needs krun_add_virtiofs4.
         let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
+        // A staged share is only read by the guest (see `launcher.rs`).
+        let share_read_only = mount.read_only || mount.staged;
         // SAFETY: ctx is valid, tag and host_path are valid C strings
         let mut added = -libc::EINVAL;
         if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
@@ -976,7 +978,7 @@ pub fn launch_agent_vm_dynamic(
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
                 )
             };
@@ -989,7 +991,7 @@ pub fn launch_agent_vm_dynamic(
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                 )
             };
         }
