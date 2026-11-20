@@ -690,7 +690,13 @@ async fn already_removed_vm_needs_no_signal_to_adopt_its_unowned_exit_record() {
 #[tokio::test]
 async fn recovery_of_remaining_container_survives_removed_sibling() {
     let root = tempfile::tempdir().unwrap();
-    let (engine, mut first, mut preparation) = fixture(root.path());
+    // macOS TMPDIR commonly resolves through /var -> /private/var. Exercise
+    // the same lookup alias on every platform while preserving it for recovery.
+    let actual = root.path().join("actual");
+    let lookup = root.path().join("lookup");
+    std::fs::create_dir(&actual).unwrap();
+    std::os::unix::fs::symlink(&actual, &lookup).unwrap();
+    let (engine, mut first, mut preparation) = fixture(&lookup);
     let mut second = first.clone();
     second.id = "b".repeat(64);
     second.name = "remaining-legacy".into();
@@ -742,7 +748,10 @@ async fn recovery_of_remaining_container_survives_removed_sibling() {
         &preparation.operation,
         &preparation.fingerprint,
         &[first.id.clone(), second.id.clone()],
-        &[first_volume.clone(), second_volume.clone()],
+        &[
+            std::fs::canonicalize(&first_volume).unwrap(),
+            std::fs::canonicalize(&second_volume).unwrap(),
+        ],
     )
     .unwrap()
     .unwrap();
@@ -768,7 +777,7 @@ async fn recovery_of_remaining_container_survives_removed_sibling() {
     std::fs::write(second_volume.join("proof"), "remaining data").unwrap();
     legacy_exit(&engine, &second);
     drop(engine);
-    let engine = crate::engine::test_engine(root.path());
+    let engine = crate::engine::test_engine(&lookup);
     let (wake, live) = adoption::pass(&engine, &preparation.operation)
         .await
         .unwrap();
@@ -783,7 +792,7 @@ async fn recovery_of_remaining_container_survives_removed_sibling() {
     assert!(exit_cleanup::pending(
         &engine.store.load_container(&second.id).unwrap().unwrap()
     ));
-    assert_eq!(counts(root.path()), (1, 0, 0));
+    assert_eq!(counts(&lookup), (1, 0, 0));
 }
 
 #[tokio::test]
@@ -797,18 +806,20 @@ async fn recovery_requires_original_identity_for_every_remaining_volume() {
             "kind":"volume", "source":"retained-volume", "destination":"/data", "read_only":false
         })).unwrap());
         engine.store.save_container(&record).unwrap();
+        // Production review passes the canonical managed volume path.
+        let reviewed_volume = std::fs::canonicalize(&volume).unwrap();
         let bytes = capture(
             &engine,
             &preparation.operation,
             &preparation.fingerprint,
             std::slice::from_ref(&record.id),
-            std::slice::from_ref(&volume),
+            std::slice::from_ref(&reviewed_volume),
         )
         .unwrap()
         .unwrap();
         let mut journal: Journal = serde_json::from_slice(&bytes).unwrap();
         if missing_identity {
-            journal.roots.retain(|entry| entry.path != volume);
+            journal.roots.retain(|entry| entry.path != reviewed_volume);
         }
         reserve(
             &engine,
@@ -826,9 +837,18 @@ async fn recovery_requires_original_identity_for_every_remaining_volume() {
         legacy_exit(&engine, &record);
         let config = engine.store.container_dir(&record.id).join("config.json");
         let before = std::fs::read(&config).unwrap();
-        assert!(adoption::pass(&engine, &preparation.operation)
+        let error = adoption::pass(&engine, &preparation.operation)
             .await
-            .is_err());
+            .unwrap_err();
+        assert!(
+            error.message.contains(if missing_identity {
+                "missing an execution's data root"
+            } else {
+                "data directory was replaced"
+            }),
+            "{}",
+            error.message
+        );
         assert_eq!(std::fs::read(&config).unwrap(), before);
         assert_eq!(
             std::fs::read_to_string(volume.join("proof")).unwrap(),
