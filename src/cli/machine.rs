@@ -1190,6 +1190,22 @@ fn image_bakeable(image: Option<&str>) -> bool {
     )
 }
 
+/// Whether a run's registry image must be fetched on the host because the
+/// run's egress policy keeps the guest from pulling it, by the rule
+/// `machine start` applies: a hostname list must name every registry host
+/// the pull talks to, and a CIDR-only list cannot be checked against
+/// hostnames. Without any policy the guest pulls.
+fn run_needs_host_fetch(reference: &str, params: &vm_common::CreateVmParams) -> bool {
+    let has_policy = params.dns_filter_hosts.is_some()
+        || params.allowed_cidrs.is_some()
+        || !params.egress_rules.is_empty();
+    has_policy
+        && !smolvm::registry::hosts_cover_pull(
+            reference,
+            params.dns_filter_hosts.as_deref().unwrap_or(&[]),
+        )
+}
+
 /// Build the bake's `machine start` argv, forwarding the run's `--proxy` /
 /// `--no-proxy` so the one-time init pull reaches the registry through the same
 /// proxy the outer run uses. Without this, a Smolfile with `init` steps pulls
@@ -2078,10 +2094,37 @@ impl RunCmd {
         // virtiofs (the `.smolmachine` packed-layers path), so no pull happens.
         let raw_image = self.image.clone().or(params.image.clone());
         let mut packed_layers_dir = None;
+        let mut host_fetched = None;
         let image = match raw_image.as_deref() {
             Some(img) => {
                 use smolvm::data::image_source::{classify, resolve, ResolvedImage};
                 match resolve(classify(img))? {
+                    // The guest pulls under the run's own egress policy. When
+                    // that policy does not let it reach the registry, fetch
+                    // the image on the host, as `machine start` does, instead
+                    // of opening the registry's domain to the workload.
+                    ResolvedImage::Registry(reference)
+                        if run_needs_host_fetch(&reference, &params) =>
+                    {
+                        let platform = smolvm::vm::rosetta::image_platform(
+                            params.oci_platform.as_deref(),
+                            params.rosetta,
+                        );
+                        let rt = tokio::runtime::Builder::new_current_thread()
+                            .enable_all()
+                            .build()
+                            .map_err(|e| Error::agent("fetch image", e.to_string()))?;
+                        let fetched =
+                            rt.block_on(smolvm::image_store::fetch_image_archive_for_platform(
+                                &reference,
+                                &smolvm::registry::PullAuth::FromConfig,
+                                platform,
+                            ))?;
+                        packed_layers_dir =
+                            smolvm::data::image_source::packed_layers_dir_for_ref(&fetched.local);
+                        host_fetched = Some((reference, fetched.digest));
+                        Some(fetched.local)
+                    }
                     ResolvedImage::Registry(reference) => Some(reference),
                     ResolvedImage::Local {
                         reference,
@@ -2161,7 +2204,7 @@ impl RunCmd {
 
         let uses_packed_layers = packed_layers_dir.is_some();
 
-        let mut features = smolvm::agent::LaunchFeatures {
+        let features = smolvm::agent::LaunchFeatures {
             ssh_agent_socket,
             cuda: self.cuda || params.cuda,
             expose_docker: self.docker_socket || params.docker_socket,
@@ -2212,11 +2255,6 @@ impl RunCmd {
                 .collect(),
             ..Default::default()
         };
-
-        // This launch pulls a registry image in-guest, subject to the egress
-        // filter — fold its registry into the enforced policy so a hostname
-        // scope doesn't block its own pull.
-        features.allow_image_pull_egress(image.as_deref(), uses_packed_layers);
 
         let freshly_started = manager
             .ensure_running_with_full_config(mounts.clone(), ports, resources, features)
@@ -2455,6 +2493,12 @@ impl RunCmd {
                                 r.workdir = defaults.workdir.clone();
                                 r.user = defaults.user.clone();
                                 r.image = Some(img.clone());
+                                // A host-fetched image keeps the reference the
+                                // user named, pinned to the digest fetched.
+                                if let Some((origin, digest)) = &host_fetched {
+                                    r.image = Some(origin.clone());
+                                    r.pin_host_fetched_image(img.clone(), digest.clone());
+                                }
                                 r.entrypoint = Vec::new();
                                 r.cmd = command.clone();
                                 r.ssh_agent |= self.ssh_agent;
