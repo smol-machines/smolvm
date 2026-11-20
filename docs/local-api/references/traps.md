@@ -79,6 +79,14 @@ auth. Loopback TCP is reachable by other local users. A Unix socket is the safer
 binds it in a private temporary directory, sets mode `0600`, then publishes it at the requested
 path before accepting connections. Run the server and its API clients as the same user.
 
+**Web pages are refused unless their origin is allowed.** A request a browser sends for a page
+is served only when its `Origin` is a `--cors-origin` (default `http://localhost` and
+`http://127.0.0.1` on ports 8080 and 3000) or the server's own docs page; others get 403. On a
+loopback `--listen`, a `Host` other than `localhost`, an IP address or a `--cors-origin` host is
+refused as well, so a client that reaches it by a DNS name (`host.docker.internal`, a proxy that
+forwards `Host`) needs `--cors-origin http://NAME:PORT`. curl and the SDKs send neither header and
+are unaffected.
+
 **Mutual TLS is configured from the environment, not by a flag.** With `SMOLVM_SERVE_TLS_CERT`,
 `SMOLVM_SERVE_TLS_KEY` and `SMOLVM_SERVE_TLS_CLIENT_CA` set, measured on macOS arm64 on v1.22.2: a
 client with no certificate was refused during the handshake, one signed by the client CA got
