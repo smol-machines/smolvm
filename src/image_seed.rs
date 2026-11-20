@@ -259,7 +259,7 @@ mod imp {
 
     /// Bumped when the guest's storage layout changes in a way an old seed would not
     /// satisfy.
-    const SEED_FORMAT: &str = "image-seed-v2";
+    const SEED_FORMAT: &str = "image-seed-v3";
 
     /// Name prefix of the throwaway machines that build seeds.
     pub const SEED_MACHINE_PREFIX: &str = "image-seed-";
