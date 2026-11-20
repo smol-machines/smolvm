@@ -241,7 +241,7 @@ install_crane "$CRANE_BINARY"
 echo "Installing additional packages..."
 # GNU tar replaces busybox tar, which never sets a symlink's owner when it
 # unpacks image layers.
-APK_PACKAGES="jq e2fsprogs e2fsprogs-extra crun util-linux libcap seatd tar"
+APK_PACKAGES="jq e2fsprogs e2fsprogs-extra json-c libseccomp util-linux libcap seatd tar"
 
 # Determine if this is a cross-arch build
 HOST_ARCH="$(uname -m)"
@@ -361,7 +361,8 @@ normalize_owner_only_modes() {
     # a public release page and byte-identical for every user: `shadow` carries no
     # hashes (root:*, every other account !), /etc/crontabs/root is the stock
     # run-parts schedule, /root is empty, and lib/apk/db/lock is zero bytes.
-    # Ownership and write bits are left alone.
+    # These paths keep their ownership and write bits; shared temporary
+    # directories are normalized separately below.
     echo "Normalizing owner-only permissions..."
     local owner_only_dirs=(
         # The tree root itself: created by this script under the builder's umask,
@@ -383,6 +384,16 @@ normalize_owner_only_modes() {
     for path in "${owner_only_files[@]}"; do
         if [[ -f "$path" ]]; then
             chmod 0644 "$path"
+        fi
+    done
+
+    # /tmp is mounted as tmpfs during early init, but pivot_root leaves that
+    # mount under /oldroot. The workload uses this directory on its writable
+    # overlay, so it needs the usual sticky, shared permissions in the base.
+    # The non-root apk build can leave these directories at 0755.
+    for path in "$rootfs_dir/tmp" "$rootfs_dir/var/tmp"; do
+        if [[ -d "$path" && ! -L "$path" ]]; then
+            chmod 1777 "$path"
         fi
     done
 
@@ -432,6 +443,10 @@ else
     echo "Install smolvm first: https://github.com/smolvm/smolvm"
     exit 1
 fi
+
+# Use the same pinned runtime and cleanup patch for native and cross builds.
+# A failed build must stop packaging rather than fall back to a different crun.
+python3 "$SCRIPT_DIR/build-crun.py" "$ALPINE_ARCH" "$OUTPUT_DIR"
 
 repair_executable_modes "$OUTPUT_DIR"
 

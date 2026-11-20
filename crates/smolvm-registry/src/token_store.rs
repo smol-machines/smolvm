@@ -52,7 +52,11 @@ impl PersistedToken {
 }
 
 fn store_dir() -> Option<PathBuf> {
-    Some(dirs::cache_dir()?.join("smolvm").join("registry-tokens"))
+    Some(
+        smolvm_paths::cache_dir()?
+            .join("smolvm")
+            .join("registry-tokens"),
+    )
 }
 
 /// The file holding the token for this registry, challenge, scope, and

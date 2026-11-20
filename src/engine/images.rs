@@ -265,6 +265,7 @@ impl ImageRecord {
 
 /// The engine's images.
 pub(crate) struct Images {
+    db: crate::db::SmolvmDb,
     records: parking_lot::RwLock<HashMap<String, ImageRecord>>,
     /// One pull per image at a time; concurrent pulls of it wait and share.
     pulls: parking_lot::Mutex<HashMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
@@ -280,13 +281,14 @@ impl Images {
         Ok(())
     }
 
-    pub(crate) fn load(store: &Store) -> crate::Result<Self> {
+    pub(crate) fn load(store: &Store, db: crate::db::SmolvmDb) -> crate::Result<Self> {
         let records = store
             .load_objects::<ImageRecord>("images")?
             .into_iter()
             .map(|r| (r.id.clone(), r))
             .collect();
         Ok(Self {
+            db,
             records: parking_lot::RwLock::new(records),
             pulls: parking_lot::Mutex::new(HashMap::new()),
         })
@@ -324,17 +326,45 @@ impl Images {
         self.records.read().values().cloned().collect()
     }
 
-    /// Store `record`, moving each of its tags off any other image.
+    /// Store `record`, moving its tags and digest aliases off other images.
+    /// An index alias names the most recently selected platform.
     pub(crate) fn insert(&self, store: &Store, record: ImageRecord) -> crate::Result<()> {
         let mut records = self.records.write();
+        let mut affected = vec![record.id.as_str()];
+        affected.extend(
+            records
+                .values()
+                .filter(|other| {
+                    other.id != record.id
+                        && (other
+                            .repo_tags
+                            .iter()
+                            .any(|tag| record.repo_tags.contains(tag))
+                            || other
+                                .repo_digests
+                                .iter()
+                                .any(|digest| record.repo_digests.contains(digest)))
+                })
+                .map(|other| other.id.as_str()),
+        );
+        let paths = affected
+            .iter()
+            .map(|id| store.object_path("images", id.trim_start_matches("sha256:")))
+            .collect::<Vec<_>>();
+        let _admission = store.admit_dependency_mutation(&self.db, &paths, |container| {
+            affected.contains(&container.image_id.as_str())
+        })?;
         let mut retagged = Vec::new();
         for other in records.values_mut() {
             if other.id == record.id {
                 continue;
             }
-            let before = other.repo_tags.len();
+            let before = (other.repo_tags.len(), other.repo_digests.len());
             other.repo_tags.retain(|t| !record.repo_tags.contains(t));
-            if other.repo_tags.len() != before {
+            other
+                .repo_digests
+                .retain(|d| !record.repo_digests.contains(d));
+            if (other.repo_tags.len(), other.repo_digests.len()) != before {
                 retagged.push(other.clone());
             }
         }
@@ -361,14 +391,22 @@ impl Images {
         };
         store.save_object("images", merged.id.trim_start_matches("sha256:"), &merged)?;
         records.insert(merged.id.clone(), merged);
+        drop(records);
+        crate::image_feed::changed(store.root())?;
         Ok(())
     }
 
     fn save(&self, store: &Store, record: &ImageRecord) -> crate::Result<()> {
+        let _admission = store.admit_dependency_mutation(
+            &self.db,
+            &[store.object_path("images", record.id.trim_start_matches("sha256:"))],
+            |container| container.image_id == record.id,
+        )?;
         store.save_object("images", record.id.trim_start_matches("sha256:"), record)?;
         self.records
             .write()
             .insert(record.id.clone(), record.clone());
+        crate::image_feed::changed(store.root())?;
         Ok(())
     }
 
@@ -391,7 +429,7 @@ impl Images {
             record.repo_tags.push(familiar);
         }
         record.last_tag_time = super::util::now_rfc3339();
-        self.insert(store, record).map_err(ApiError::from)
+        self.insert(store, record).map_err(ApiError::mutation)
     }
 
     /// `DELETE /images/{name}`: untag, then delete when no tag is left.
@@ -405,6 +443,13 @@ impl Images {
         let image = self
             .resolve(name)
             .ok_or_else(|| ApiError::not_found(format!("No such image: {name}")))?;
+        let _admission = store
+            .admit_dependency_mutation(
+                &self.db,
+                &[store.object_path("images", image.id.trim_start_matches("sha256:"))],
+                |container| container.image_id == image.id,
+            )
+            .map_err(ApiError::mutation)?;
         let mut out = Vec::new();
         let by_tag = ImageRef::parse(name)
             .ok()
@@ -437,8 +482,11 @@ impl Images {
             out.push(serde_json::json!({ "Untagged": digest }));
         }
         out.push(serde_json::json!({ "Deleted": image.id }));
-        store.remove_object("images", image.id.trim_start_matches("sha256:"));
+        store
+            .remove_object("images", image.id.trim_start_matches("sha256:"))
+            .map_err(ApiError::from)?;
         self.records.write().remove(&image.id);
+        crate::image_feed::changed(store.root())?;
         Ok(out)
     }
 
@@ -700,20 +748,8 @@ pub(crate) async fn finish_pull(
                 .await;
         }
     }
-    let record = ImageRecord {
-        id: meta.config_digest.clone(),
-        repo_tags: reference.familiar_tag().into_iter().collect(),
-        repo_digests: vec![format!(
-            "{}@{}",
-            reference.familiar_repo(),
-            meta.manifest_digest
-        )],
-        pull_ref,
-        config: meta.config,
-        size: meta.compressed_size as i64,
-        pulled: super::util::now_rfc3339(),
-        last_tag_time: String::new(),
-    };
+    let reference_digest = meta.reference_digest.clone();
+    let record = pulled_image_record(&reference, meta, pull_ref);
     if let Err(e) = engine.images.insert(&engine.store, record) {
         let message = e.to_string();
         let _ = tx
@@ -722,7 +758,7 @@ pub(crate) async fn finish_pull(
         return;
     }
     let _ = tx
-        .send(serde_json::json!({"status": format!("Digest: {}", meta.manifest_digest)}))
+        .send(serde_json::json!({"status": format!("Digest: {}", reference_digest)}))
         .await;
     let status = if present {
         format!("Status: Image is up to date for {shown}")
@@ -738,9 +774,292 @@ pub(crate) async fn finish_pull(
     );
 }
 
+fn pulled_image_record(
+    reference: &ImageRef,
+    meta: crate::image_store::ImageMetadata,
+    pull_ref: String,
+) -> ImageRecord {
+    let mut repo_digests = vec![format!(
+        "{}@{}",
+        reference.familiar_repo(),
+        meta.reference_digest
+    )];
+    if meta.reference_digest != meta.manifest_digest {
+        repo_digests.push(format!(
+            "{}@{}",
+            reference.familiar_repo(),
+            meta.manifest_digest
+        ));
+    }
+    ImageRecord {
+        id: meta.config_digest,
+        repo_tags: reference.familiar_tag().into_iter().collect(),
+        repo_digests,
+        pull_ref,
+        config: meta.config,
+        size: meta.compressed_size as i64,
+        pulled: super::util::now_rfc3339(),
+        last_tag_time: String::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn transfer_owned_dependency_image_cannot_be_deleted_or_retagged() {
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(dir.path());
+        let image = pulled_record("moving:latest", 'a', 'b', 'c');
+        engine.images.insert(&engine.store, image.clone()).unwrap();
+        let name = format!("image-transfer-{:032x}", rand::random::<u128>());
+        engine
+            .db
+            .insert_vm(
+                &name,
+                &crate::config::VmRecord::new(name.clone(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        let mut container: super::super::containers::ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id":"a".repeat(64),"name":"moving","created":"","image":"moving:latest","image_id":image.id,
+            "pull_ref":"","machine":name,"config":{},"host_config":{},"host_config_raw":{},"networks":{},
+            "path":"sh","args":[],"state":super::super::containers::StateRecord::default(),
+            "restart_count":0,"ports":[],"mounts":[]
+        })).unwrap();
+        let mut guest = container.clone();
+        guest.id = "b".repeat(64);
+        guest.name = "guest".into();
+        guest.machine.clear();
+        guest.host_config.network_mode = format!("container:{}", container.id);
+        // Only the guest uses this image; its machine belongs to the host.
+        container.image_id.clear();
+        engine.store.save_container(&guest).unwrap();
+        engine.store.save_container(&container).unwrap();
+        engine
+            .db
+            .claim_workload_transfer(
+                "image-move",
+                vec![engine.db.review_workload_member(&name).unwrap()],
+                &[],
+            )
+            .unwrap();
+        let guest = super::super::containers::Container::from_record(guest);
+        assert_eq!(
+            super::super::containers::rename(&engine, &guest, "changed")
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            super::super::containers::remove(&engine, &guest, true, true)
+                .await
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(guest.name(), "guest");
+        let before = serde_json::to_value(&image).unwrap();
+        assert_eq!(
+            engine
+                .images
+                .remove(&engine.store, &image.id, true, |_| None)
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            engine
+                .images
+                .tag(&engine.store, &image.id, "changed", "latest")
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(
+            serde_json::to_value(engine.images.resolve(&image.id).unwrap()).unwrap(),
+            before
+        );
+        let other = pulled_record("other:latest", 'd', 'e', 'f');
+        engine.images.insert(&engine.store, other.clone()).unwrap();
+        assert_eq!(
+            engine
+                .images
+                .tag(&engine.store, &other.id, "moving", "latest")
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert_eq!(engine.images.resolve("moving:latest").unwrap().id, image.id);
+        assert_eq!(engine.images.resolve("other:latest").unwrap().id, other.id);
+        let reloaded = Images::load(&engine.store, engine.db.clone()).unwrap();
+        assert_eq!(
+            serde_json::to_value(reloaded.resolve(&image.id).unwrap()).unwrap(),
+            before
+        );
+        assert_eq!(
+            serde_json::to_value(reloaded.resolve(&other.id).unwrap()).unwrap(),
+            serde_json::to_value(&other).unwrap()
+        );
+        engine
+            .images
+            .remove(&engine.store, &other.id, true, |_| None)
+            .unwrap();
+        engine.db.retire_workload_transfer("image-move").unwrap();
+        engine
+            .images
+            .remove(&engine.store, &image.id, true, |_| None)
+            .unwrap();
+        assert!(engine.images.resolve(&image.id).is_none());
+    }
+
+    fn pulled_record(name: &str, index: char, child: char, config: char) -> ImageRecord {
+        let reference = ImageRef::parse(name).unwrap();
+        let meta = crate::image_store::ImageMetadata {
+            reference_digest: format!("sha256:{}", index.to_string().repeat(64)),
+            manifest_digest: format!("sha256:{}", child.to_string().repeat(64)),
+            config_digest: format!("sha256:{}", config.to_string().repeat(64)),
+            config: serde_json::json!({"architecture":"arm64", "os":"linux"}),
+            compressed_size: 123,
+        };
+        let pull_ref = reference.pinned(&meta.manifest_digest);
+        pulled_image_record(&reference, meta, pull_ref)
+    }
+
+    #[test]
+    fn pulled_index_and_child_resolve_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let images = Images::load(
+            &store,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
+        let index = format!("sha256:{}", "a".repeat(64));
+        let child = format!("sha256:{}", "b".repeat(64));
+        let name = format!("alpine@{index}");
+        images
+            .insert(&store, pulled_record(&name, 'a', 'b', 'c'))
+            .unwrap();
+        for images in [
+            images,
+            Images::load(
+                &store,
+                crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+            )
+            .unwrap(),
+        ] {
+            for reference in [
+                &name,
+                &format!("docker.io/library/alpine@{index}"),
+                &format!("alpine@{child}"),
+            ] {
+                let image = images
+                    .resolve(reference)
+                    .expect("a pulled digest must resolve");
+                assert_eq!(image.pull_ref, format!("docker.io/library/alpine@{child}"));
+                assert_eq!(image.repo_digests.len(), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn repulling_index_for_another_platform_moves_only_its_alias() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let images = Images::load(
+            &store,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
+        images
+            .insert(&store, pulled_record("alpine:latest", 'a', 'b', 'c'))
+            .unwrap();
+        let mut other = pulled_record("alpine:latest", 'a', 'd', 'e');
+        other.config["architecture"] = "amd64".into();
+        images.insert(&store, other).unwrap();
+        for images in [
+            images,
+            Images::load(
+                &store,
+                crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+            )
+            .unwrap(),
+        ] {
+            let index = images
+                .resolve(&format!("alpine@sha256:{}", "a".repeat(64)))
+                .unwrap();
+            assert_eq!(index.architecture(), "amd64");
+            assert_eq!(images.resolve("alpine").unwrap().id, index.id);
+            let previous = images
+                .resolve(&format!("alpine@sha256:{}", "b".repeat(64)))
+                .unwrap();
+            assert_eq!(previous.architecture(), "arm64");
+            assert!(previous.repo_tags.is_empty());
+            assert_eq!(previous.repo_digests.len(), 1);
+        }
+    }
+
+    #[test]
+    fn direct_manifest_has_one_digest_alias() {
+        let image = pulled_record("alpine:latest", 'a', 'a', 'b');
+        assert_eq!(
+            image.repo_digests,
+            vec![format!("alpine@sha256:{}", "a".repeat(64))]
+        );
+        assert_eq!(image.repo_tags, vec!["alpine:latest"]);
+    }
+
+    #[test]
+    fn failed_record_removal_preserves_image_for_retry() {
+        use std::os::unix::fs::PermissionsExt;
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let images = Images::load(
+            &store,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
+        let image = ImageRecord {
+            id: format!("sha256:{}", "a".repeat(64)),
+            repo_tags: vec!["retained:latest".into()],
+            repo_digests: Vec::new(),
+            pull_ref: "retained:latest".into(),
+            config: serde_json::json!({}),
+            size: 0,
+            pulled: super::super::util::now_rfc3339(),
+            last_tag_time: String::new(),
+        };
+        images.insert(&store, image).unwrap();
+        let records = dir.path().join("images");
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let result = images.remove(&store, "retained:latest", false, |_| None);
+        std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o700)).unwrap();
+        assert!(result.is_err());
+        assert!(images.resolve("retained:latest").is_some());
+        assert!(Images::load(
+            &store,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap()
+        )
+        .unwrap()
+        .resolve("retained:latest")
+        .is_some());
+        images
+            .remove(&store, "retained:latest", false, |_| None)
+            .unwrap();
+        assert!(images.resolve("retained:latest").is_none());
+        assert!(Images::load(
+            &store,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap()
+        )
+        .unwrap()
+        .resolve("retained:latest")
+        .is_none());
+    }
 
     #[test]
     fn references_normalize_like_the_docker_cli() {

@@ -15,7 +15,7 @@ path = "src/lib.rs"
 # musl — see crates/smolvm-agent/Cargo.toml). Decompression is pure-Rust:
 # gzip via flate2's miniz_oxide backend, zstd via ruzstd.
 [dependencies]
-tar = "0.4"
+tar = { workspace = true }
 flate2 = "1"
 ruzstd = "0.9.1"
 tracing = { workspace = true }

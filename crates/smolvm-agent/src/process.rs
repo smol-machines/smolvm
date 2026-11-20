@@ -598,6 +598,24 @@ impl ExitSignal {
         }
     }
 
+    /// Wait for I/O, child exit, or the command deadline without periodic
+    /// wakeups when a pidfd can report exit. Older kernels still need a
+    /// bounded wait so callers can reap a child whose pipes stay open.
+    pub(crate) fn poll_timeout_ms(&self, deadline: Option<Instant>) -> i32 {
+        let remaining_ms = deadline.map(|deadline| {
+            deadline
+                .saturating_duration_since(Instant::now())
+                .as_nanos()
+                .div_ceil(1_000_000)
+                .min(i32::MAX as u128) as i32
+        });
+        if self.raw_fd().is_some() {
+            remaining_ms.unwrap_or(-1)
+        } else {
+            remaining_ms.unwrap_or(100).min(100)
+        }
+    }
+
     /// Return after `timeout`, or sooner if the child exits.
     pub(crate) fn wait(&self, timeout: Duration) {
         #[cfg(target_os = "linux")]

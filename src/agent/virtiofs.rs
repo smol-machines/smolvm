@@ -1,4 +1,4 @@
-//! Shared virtiofs DAX policy for every libkrun launch path.
+//! Shared virtiofs ownership and DAX policy for every libkrun launch path.
 
 use std::path::Path;
 
@@ -26,6 +26,56 @@ pub(crate) fn rootfs_dax_window() -> u64 {
     } else {
         ROOTFS_DAX_WINDOW
     }
+}
+
+/// Configure the root share with guest ownership independent of the account
+/// that extracted it. Explicit image ownership records still take precedence;
+/// unrecorded base-system files belong to root, including after a host move.
+/// The caller owns `ctx` and must free it if configuration fails.
+pub(crate) fn configure_rootfs(
+    krun: &super::krun::KrunFunctions,
+    ctx: u32,
+    root: &std::ffi::CStr,
+    read_only: bool,
+) -> crate::Result<()> {
+    let add = krun.add_virtiofs4.ok_or_else(|| {
+        crate::Error::agent(
+            "set rootfs",
+            "root ownership requires libkrun with krun_add_virtiofs4",
+        )
+    })?;
+    let owner = krun.set_virtiofs_owner.ok_or_else(|| {
+        crate::Error::agent(
+            "set rootfs",
+            "root ownership requires libkrun with krun_set_virtiofs_owner",
+        )
+    })?;
+    let tag = c"/dev/root";
+    // SAFETY: the caller owns the live context; both C strings live through
+    // each call. The share is added before setting its default owner.
+    unsafe {
+        if add(
+            ctx,
+            tag.as_ptr(),
+            root.as_ptr(),
+            rootfs_dax_window(),
+            read_only,
+            super::krun::KRUN_VIRTIOFS_FLAG_OVERRIDE_STAT,
+        ) < 0
+        {
+            return Err(crate::Error::agent(
+                "set rootfs",
+                "could not add the root filesystem",
+            ));
+        }
+        if owner(ctx, tag.as_ptr(), 0, 0) < 0 {
+            return Err(crate::Error::agent(
+                "set rootfs",
+                "could not set guest root ownership",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Packed-layer DAX window for a fresh boot. The guest kernel spends 64 bytes

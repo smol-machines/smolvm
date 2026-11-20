@@ -88,6 +88,7 @@ pub mod cuda_host;
 /// Canonical shared data models and constants used across adapters.
 pub mod data;
 pub mod db;
+pub mod deletion;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;
@@ -97,6 +98,9 @@ pub mod embedded;
 /// The Docker Engine API, answered by smolvm: every container is a machine.
 #[cfg(unix)]
 pub mod engine;
+pub mod engine_cli;
+/// Local image archives shared with managed Kubernetes clusters.
+pub mod image_feed;
 pub mod image_seed;
 pub mod image_store;
 /// Boots a VM from a written boot-config: the `_boot-vm` subprocess entry point.
@@ -178,3 +182,6 @@ pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 /// executable's path or inode, when another engine asks to branch it: the
 /// same release installed as two files is one build.
 pub const ENGINE_BUILD: &str = concat!(env!("CARGO_PKG_VERSION"), "+", env!("SMOLVM_GIT_COMMIT"));
+
+/// On-demand standard SSH access to local machine environments.
+pub mod ssh;

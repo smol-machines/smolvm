@@ -170,7 +170,7 @@ fn select_dns(
         EffectiveNetworkBackend::None => None,
         // The gateway forwards guest queries from a host UDP socket, so a host
         // loopback stub is reachable and is taken as-is.
-        EffectiveNetworkBackend::VirtioNet => v4(host)
+        EffectiveNetworkBackend::VirtioNet | EffectiveNetworkBackend::Host => v4(host)
             .next()
             .map(|addr| (addr, DnsSource::HostResolvConf)),
         // TSI does not translate a guest loopback destination to the host's

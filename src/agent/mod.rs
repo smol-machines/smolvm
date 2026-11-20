@@ -12,14 +12,19 @@ pub mod fork;
 mod fsnotify_watch;
 pub mod host_gpu;
 pub mod input;
+mod interactive_start;
+pub use smolvm_protocol::interactive_control;
 mod krun;
 mod launcher;
 pub mod launcher_dynamic;
 pub mod live_ports;
 pub mod live_resize;
 mod manager;
+pub(crate) use manager::{ensure_vm_dir_at, ControlOperation};
 pub mod pod_net;
 pub mod rootfs_store;
+#[cfg(unix)]
+pub(crate) mod startup_transaction;
 pub mod state_probe;
 pub mod terminal;
 #[cfg(all(test, unix))]
@@ -103,7 +108,7 @@ pub use launcher::{
     create_disk_overlays, find_lib_dir, launch_agent_vm, validate_external_interceptor,
     DiskOverlaySpec, LaunchConfig, LaunchFeatures, VmDisks,
 };
-pub(crate) use manager::{allocate_live_port, cleanup_dead_vm_runtime_in_db};
+pub(crate) use manager::{allocate_live_port, cleanup_dead_vm_runtime_at};
 pub use manager::{
     apply_live_credential_values, apply_live_egress_policy, apply_live_published_ports,
     cleanup_dead_vm_runtime, lock_live_egress,

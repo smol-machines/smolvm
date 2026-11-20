@@ -59,6 +59,52 @@ pub fn vm_label(name: &Option<String>) -> String {
     name.as_deref().unwrap_or("default").to_string()
 }
 
+/// The error for reaching a paused machine: it has no agent to connect to, and
+/// `machine start` refuses it rather than discard its saved execution, so the
+/// command to name is resume.
+fn paused_machine_error(label: &str, record: &VmRecord) -> Option<smolvm::Error> {
+    record.paused_checkpoint.as_ref()?;
+    Some(smolvm::Error::agent(
+        "connect",
+        format!(
+            "machine '{label}' is paused. Resume it with 'smolvm machine resume --name {label}'; if a resume is already in progress, retry once it finishes."
+        ),
+    ))
+}
+
+#[cfg(test)]
+mod paused_machine_error_tests {
+    use super::paused_machine_error;
+    use smolvm::config::VmRecord;
+
+    #[test]
+    fn a_paused_machine_is_pointed_at_resume_not_start() {
+        let mut record = VmRecord::new("worker".to_string(), 1, 256, vec![], vec![], false);
+        assert!(paused_machine_error("worker", &record).is_none());
+
+        record.paused_checkpoint = Some("saved.smolcheckpoint".into());
+        let message = paused_machine_error("worker", &record)
+            .expect("a paused machine gets its own error")
+            .to_string();
+        assert!(
+            message.contains("smolvm machine resume --name worker"),
+            "{message}"
+        );
+        assert!(!message.contains("machine start"), "{message}");
+    }
+}
+
+/// Connect after the current startup or fork transaction has completed.
+/// A listening agent precedes saved init commands and fork rejuvenation;
+/// workload commands and file access must not observe that intermediate state.
+/// Diagnostics may use `ensure_running_and_connect` during initialization.
+pub fn connect_after_startup(
+    name: &Option<String>,
+) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
+    let _startup_lock = smolvm::agent::fork::lock_fork_source(&vm_label(name))?;
+    ensure_running_and_connect(name)
+}
+
 /// Ensure a VM is running and return a connected client.
 ///
 /// This is the common pattern used by exec commands in the machine subcommand.
@@ -67,6 +113,9 @@ pub fn ensure_running_and_connect(
     name: &Option<String>,
 ) -> smolvm::Result<(AgentManager, smolvm::agent::AgentClient)> {
     let manager = get_vm_manager(name)?;
+    // This path observes an existing process. Failed connection setup must not
+    // stop it when the manager drops before the caller receives the handle.
+    manager.detach();
     let label = vm_label(name);
     let start_hint = match name {
         Some(name) => format!("smolvm machine start --name {}", name),
@@ -74,6 +123,16 @@ pub fn ensure_running_and_connect(
     };
 
     if manager.try_connect_existing().is_none() {
+        // A paused machine would otherwise get the start hint below, and
+        // `machine start` refuses it.
+        let paused = SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(&label).ok().flatten())
+            .and_then(|record| paused_machine_error(&label, &record));
+        if let Some(error) = paused {
+            return Err(error);
+        }
+
         // Distinguish "machine not found" from "machine stopped"
         // so a typo in the name gives a clear error rather than the
         // generic "not running / use start" message.
@@ -266,10 +325,31 @@ pub(crate) fn run_init_commands(
     init: &[String],
     context: InitRunContext<'_>,
 ) -> smolvm::Result<()> {
+    run_init_commands_with_output(client, init, context, true)
+}
+
+/// Run the same initialization without writing to the embedding application's
+/// terminal or enabling a PTY; retain command output for failure diagnostics.
+pub(crate) fn run_init_commands_captured(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    context: InitRunContext<'_>,
+) -> smolvm::Result<()> {
+    run_init_commands_with_output(client, init, context, false)
+}
+
+fn run_init_commands_with_output(
+    client: &mut smolvm::agent::AgentClient,
+    init: &[String],
+    context: InitRunContext<'_>,
+    stream_output: bool,
+) -> smolvm::Result<()> {
     if init.is_empty() {
         return Ok(());
     }
-    println!("Running {} init command(s)...", init.len());
+    if stream_output {
+        println!("Running {} init command(s)...", init.len());
+    }
     for (i, cmd) in init.iter().enumerate() {
         if let Some(image) = context.image {
             let defaults = resolve_image_runtime_defaults(
@@ -284,18 +364,30 @@ pub(crate) fn run_init_commands(
                 &defaults,
                 context.record_mounts,
                 context.overlay_id,
-            )
-            .with_tty(true);
+            );
             // Interactive run streams the command's output live so the user sees
             // progress (a slow compile, apt-get, etc.). The output isn't buffered
             // here, so on a non-zero exit we report just the code — the detail was
             // already printed above. Not checking the exit code would silently
             // ignore a failed init command (e.g. a broken `apt install`).
-            let exit_code = client.run_interactive(config)?;
+            let (exit_code, stdout, stderr) = if stream_output {
+                (
+                    client.run_interactive(config.with_tty(true))?,
+                    Vec::new(),
+                    Vec::new(),
+                )
+            } else {
+                client.run_non_interactive(config)?
+            };
             if exit_code != 0 {
                 return Err(smolvm::Error::agent(
                     "init",
-                    format_init_failure(i, exit_code, "", ""),
+                    format_init_failure(
+                        i,
+                        exit_code,
+                        &String::from_utf8_lossy(&stdout),
+                        &String::from_utf8_lossy(&stderr),
+                    ),
                 ));
             }
         } else {
@@ -575,23 +667,7 @@ pub fn resolve_secret_refs_for_env(
 /// create time. The resolved plaintext stays in the returned vector and never
 /// touches the record or the DB.
 pub fn record_env_with_secrets(record: &VmRecord) -> smolvm::Result<Vec<(String, String)>> {
-    let mut env = record.env.clone();
-    // A variable bound to a credential never carries plaintext into the guest:
-    // its secret reference feeds the host interceptor and the guest gets the
-    // placeholder instead.
-    let (refs, credential_env) = smolvm::credentials::workload_env(
-        record.credential_policy.as_ref(),
-        &record.credential_placeholders,
-        &record.secret_refs,
-    );
-    env.extend(smolvm::secrets::expose_into_env(
-        smolvm::secrets::resolve_refs_to_env(
-            &refs,
-            smolvm::secrets::ResolutionScope::RecordReplay,
-        )?,
-    ));
-    env.extend(credential_env);
-    Ok(env)
+    smolvm::secrets::record_env_with_secrets(record)
 }
 
 /// The `run` counterpart of [`record_env_with_secrets`]: resolve the create
@@ -625,62 +701,18 @@ pub fn prepare_params_credentials(params: &mut CreateVmParams) -> smolvm::Result
 /// name-derived on-disk state. Dropping it releases the DB reservation unless
 /// it was committed.
 pub(crate) struct CreateVmReservation {
-    db: SmolvmDb,
-    name: String,
-    token: String,
-    completed: bool,
+    pub(crate) lease: smolvm::db::VmCreationLease,
 }
 
 impl CreateVmReservation {
     pub(crate) fn reserve(name: &str) -> smolvm::Result<Self> {
-        let db = SmolvmDb::open()?;
-        let token = SmolvmDb::create_reservation_token();
-        if !db.reserve_vm_create(name, &token)? {
-            return Err(smolvm::Error::config(
-                "create machine",
-                format!("machine '{}' already exists or is being created", name),
-            ));
-        }
         Ok(Self {
-            db,
-            name: name.to_string(),
-            token,
-            completed: false,
+            lease: smolvm::db::VmCreationLease::reserve(SmolvmDb::open()?, name)?,
         })
     }
 
-    pub(crate) fn commit(mut self, record: &VmRecord) -> smolvm::Result<()> {
-        if !self
-            .db
-            .commit_reserved_vm(&self.name, &self.token, record)?
-        {
-            return Err(smolvm::Error::config(
-                "create machine",
-                format!(
-                    "machine '{}' already exists or is no longer reserved",
-                    self.name
-                ),
-            ));
-        }
-        self.completed = true;
-        Ok(())
-    }
-}
-
-impl Drop for CreateVmReservation {
-    fn drop(&mut self) {
-        if !self.completed {
-            if let Err(e) = self
-                .db
-                .release_vm_create_reservation(&self.name, &self.token)
-            {
-                tracing::warn!(
-                    machine = %self.name,
-                    error = %e,
-                    "failed to release DB create reservation"
-                );
-            }
-        }
+    pub(crate) fn commit(&self, record: &VmRecord) -> smolvm::Result<()> {
+        self.lease.commit(record)
     }
 }
 
@@ -840,6 +872,7 @@ impl CreateVmParams {
             remote_volumes,
             disk_volumes,
             net,
+            egress: None,
             network_backend,
             dns,
             dns_options,
@@ -1079,6 +1112,7 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
 
     let prep_source_continues = prep.source_continues;
     let snapshot_dir = prep.snapshot_dir.clone();
+    let _startup_lock = prep.startup_lock.clone();
     if let Err(error) = boot_prepared_fork(
         &db,
         clone,
@@ -1088,6 +1122,10 @@ pub fn fork_vm(golden: &str, clone: &str, options: ForkVmOptions<'_>) -> smolvm:
         None,
         options.external_interceptor,
     ) {
+        return retain_failed_fork(golden, &snapshot_dir, error);
+    }
+    if let Err(error) = persist_batch_clones_running(&db, &[clone.to_owned()]) {
+        teardown_fork_clone(&db, clone);
         return retain_failed_fork(golden, &snapshot_dir, error);
     }
     if options.wait_ready.is_some() && !options.hold {
@@ -1205,6 +1243,10 @@ pub fn fork_vm_batch(
         clones.len()
     );
     let prepared = smolvm::agent::fork::prepare_forks(&db, golden, &specs, source_policy)?;
+    let _startup_locks: Vec<_> = prepared
+        .iter()
+        .map(|prep| prep.startup_lock.clone())
+        .collect();
     let source_continues = prepared[0].source_continues;
     let snapshot_dir = prepared[0].snapshot_dir.clone();
     let all_names: Vec<String> = clones.iter().map(|(name, _)| name.clone()).collect();
@@ -1453,7 +1495,7 @@ fn boot_prepared_fork(
     let clone_forkable = prep.clone_record.forkable;
     eprintln!("Booting child '{clone}' from the checkpoint...");
     let mut start = || {
-        start_vm_named_with_db(
+        start_vm_named_locked(
             db,
             clone,
             None,
@@ -1464,7 +1506,7 @@ fn boot_prepared_fork(
                 snapshot_dir: Some(prep.snapshot_dir.clone()),
                 share_weights,
                 preload_modules,
-                defer_running_persistence: retry_gate.is_some(),
+                defer_running_persistence: true,
                 ..Default::default()
             },
             // A clone inherits the golden's running workload from the snapshot
@@ -1474,7 +1516,9 @@ fn boot_prepared_fork(
                 mediated_egress: prep.clone_record.mediated_egress_required,
                 ..Default::default()
             },
+            &prep.startup_lock,
         )
+        .map(|stop_after_workload| debug_assert!(!stop_after_workload))
     };
     let started = match retry_gate {
         Some(gate) => retry_once_serialized(gate, &mut start, |error| {
@@ -1710,9 +1754,45 @@ fn start_vm_named_with_db(
     proxy: Option<&str>,
     no_proxy: Option<&str>,
     from_snapshot: bool,
-    mut fork: ForkLaunch,
+    fork: ForkLaunch,
     options: StartOptions,
 ) -> smolvm::Result<()> {
+    let _admission = db.admit_workload_mutation(Some(name), &[])?;
+    let startup_lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let stop_after_workload = start_vm_named_locked(
+        db,
+        name,
+        proxy,
+        no_proxy,
+        from_snapshot,
+        fork,
+        options,
+        &startup_lock,
+    )?;
+    drop(startup_lock);
+    if stop_after_workload {
+        println!(
+            "Workload exited; stopping machine '{}' (stop_on_exit)",
+            name
+        );
+        return stop_vm_named(name);
+    }
+    Ok(())
+}
+
+/// The caller retains its guard through any fork finalization. A bare workload
+/// requests stop separately so stop can acquire the same lock after release.
+#[allow(clippy::too_many_arguments)]
+fn start_vm_named_locked(
+    db: &SmolvmDb,
+    name: &str,
+    proxy: Option<&str>,
+    no_proxy: Option<&str>,
+    from_snapshot: bool,
+    mut fork: ForkLaunch,
+    options: StartOptions,
+    _startup_lock: &smolvm::agent::fork::ForkSourceLock,
+) -> smolvm::Result<bool> {
     use smolvm::Error;
     let StartOptions {
         no_workload,
@@ -1772,7 +1852,7 @@ fn start_vm_named_with_db(
             }
             let pid_suffix = format_pid_suffix(record.pid);
             println!("Machine '{}' already running{}", name, pid_suffix);
-            return Ok(());
+            return Ok(false);
         }
         RecordState::Unreachable => {
             // Zombie VMM: kill it, clear the record, fall through to
@@ -1820,11 +1900,17 @@ fn start_vm_named_with_db(
             ));
         }
         record.cuda_fork_pool_size = Some(pool_size);
-        db.update_vm(name, |r| r.cuda_fork_pool_size = Some(pool_size))?;
+        db.update_vm_for_record(&record, |r| {
+            r.cuda_fork_pool_size = Some(pool_size);
+            Ok(())
+        })?;
     }
     if let Some(limit_mib) = fork.vram_limit_mib {
         record.cuda_vram_limit_mib = Some(limit_mib);
-        db.update_vm(name, |r| r.cuda_vram_limit_mib = Some(limit_mib))?;
+        db.update_vm_for_record(&record, |r| {
+            r.cuda_vram_limit_mib = Some(limit_mib);
+            Ok(())
+        })?;
     }
 
     // A machine with no network cannot pull its registry image in-guest; the
@@ -1896,7 +1982,7 @@ fn start_vm_named_with_db(
     }
 
     // Start agent VM
-    let manager = AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)
+    let manager = AgentManager::for_vm_record(&record)
         .map_err(|e| Error::agent("create agent manager", e.to_string()))?;
 
     let mount_info = if !mounts.is_empty() {
@@ -1940,6 +2026,9 @@ fn start_vm_named_with_db(
     // the pre-extracted layers instead of pulling, with no dependency on the
     // original bundle file. Shared with the API and embedded start paths.
     let mut features = smolvm::agent::LaunchFeatures {
+        // `machine start` leaves the VM running after this CLI exits, even
+        // when a wrapper selects its boot executable with SMOLVM_BOOT_BINARY.
+        watch_parent: Some(false),
         ssh_agent_socket,
         cuda: record.cuda,
         expose_docker: record.docker_socket,
@@ -1977,17 +2066,6 @@ fn start_vm_named_with_db(
         if let Some(dir) = record.local_image_layers_dir() {
             features.packed_layers_dir = Some(dir);
         }
-    }
-
-    // First boot pulls the base image in-guest, subject to the egress filter —
-    // fold the image's registry into the enforced policy so a hostname scope
-    // doesn't block its own pull. Subsequent starts skip the pull, so they keep
-    // the user's scope unwidened.
-    if !record.init_completed {
-        features.allow_image_pull_egress(
-            record.image.as_deref(),
-            features.packed_layers_dir.is_some() || record.packed_image_on_storage,
-        );
     }
 
     if restoring_checkpoint {
@@ -2209,14 +2287,7 @@ fn start_vm_named_with_db(
 
     // Keep VM running (persistent)
     manager.detach();
-    if stop_after_workload {
-        println!(
-            "Workload exited; stopping machine '{}' (stop_on_exit)",
-            name
-        );
-        return stop_vm_named(name);
-    }
-    Ok(())
+    Ok(stop_after_workload)
 }
 
 /// Persist a named VM as running in the database.
@@ -2231,8 +2302,10 @@ fn start_vm_named_with_db(
 /// test in this module.
 pub(crate) fn apply_overrides(r: &mut VmRecord, o: &DefaultVmOverrides) {
     let name = std::mem::take(&mut r.name);
+    let created_at = r.created_at;
     *r = o.record.clone();
     r.name = name;
+    r.created_at = created_at;
 }
 
 pub fn persist_named_running(
@@ -2387,7 +2460,7 @@ fn check_port_conflicts(
 /// at the default sizes. A recorded default machine starts through
 /// [`start_vm_named`] with its own sizes.
 pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::Result<()> {
-    let manager = AgentManager::new_default_with_sizes(None, None)?;
+    let manager = AgentManager::new_default()?;
 
     if manager.try_connect_existing().is_some() {
         let pid_suffix = format_pid_suffix(manager.child_pid());
@@ -2403,8 +2476,18 @@ pub fn start_vm_default(proxy: Option<&str>, no_proxy: Option<&str>) -> smolvm::
     // zombie would collide on its sockets and pid files.
     cli_recover_if_unreachable("default")?;
 
+    manager.detach();
+    let manager = AgentManager::new_default_with_sizes(None, None)?;
     eprintln!("Starting machine 'default'...");
-    manager.ensure_running()?;
+    manager.ensure_running_with_full_config(
+        Vec::new(),
+        Vec::new(),
+        smolvm::agent::VmResources::default(),
+        smolvm::agent::LaunchFeatures {
+            watch_parent: Some(false),
+            ..Default::default()
+        },
+    )?;
 
     let mut config = SmolvmConfig::load()?;
     persist_named_running(&mut config, "default", manager.child_pid(), None)?;
@@ -2485,11 +2568,12 @@ pub fn stop_vm_named_with_timeout(
     name: &str,
     stop_timeout: Option<std::time::Duration>,
 ) -> smolvm::Result<()> {
+    let _admission = SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     // Serialize against fork capture in this or another process. Stopping the
     // VMM between snapshot preparation and clone registration can otherwise
     // strand an ambiguous generation.
     let _fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
-    let mut config = SmolvmConfig::load()?;
+    let config = SmolvmConfig::load()?;
 
     // Check config for the named VM
     let record = match config.get_vm(name) {
@@ -2588,35 +2672,9 @@ pub fn stop_vm_named_with_timeout(
 
     println!("Stopping machine '{}'...", name);
 
-    // A frozen fork base is snapshot-paused: its agent cannot answer, so both
-    // the staged-mount sync and the shutdown handshake would block until their
-    // deadlines and then fail. The checkpoint that froze it already quiesced
-    // its filesystems, which is what the handshake exists to confirm.
-    let frozen = resolved == RecordState::Frozen;
-    let manager = AgentManager::for_vm(name)
-        .map_err(|e| smolvm::Error::agent("create agent manager", e.to_string()))?;
-    if !frozen && !record.staged_mounts.is_empty() {
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
-    }
-    if frozen {
-        manager.stop_paused()?;
-    } else if let Some(stop_timeout) = stop_timeout {
-        manager.stop_with_timeout(stop_timeout)?;
-    } else {
-        manager.stop()?;
-    }
-
-    // Detach the machine's case-sensitive layers volume now that its process is
-    // gone (macOS hdiutil mount; no-op on Linux). A continuing source's volume
-    // stays mounted while child pack symlinks still reference it.
-    if record.source_smolmachine.is_some() {
-        smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
-            name,
-        ));
-    }
-
-    config.update_vm(name, VmRecord::mark_process_stopped);
+    let manager = AgentManager::for_existing_vm_record(&record)?;
+    manager.detach();
+    manager.stop_persisted(&record, stop_timeout)?;
 
     println!("Stopped machine: {}", name);
     Ok(())
@@ -2676,48 +2734,17 @@ fn kill_orphaned_boot_process(name: &str) {
 
 /// Stop the default machine.
 pub fn stop_vm_default(stop_timeout: Option<std::time::Duration>) -> smolvm::Result<()> {
+    if SmolvmDb::open()?.get_vm("default")?.is_some() {
+        return stop_vm_named_with_timeout("default", stop_timeout);
+    }
     let manager = AgentManager::new_default()?;
-
-    let record = SmolvmConfig::load()
-        .ok()
-        .and_then(|config| config.get_vm("default").cloned());
-
-    // try_connect_existing sets internal state if agent is reachable;
-    // stop() handles both responsive agents and orphans via PID file.
     manager.try_connect_existing();
     println!("Stopping machine 'default'...");
-    if let Some(record) = record
-        .as_ref()
-        .filter(|record| !record.staged_mounts.is_empty())
-    {
-        let mut client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-        smolvm::staged_mount::sync_staged_mounts(record, &mut client)?;
-    }
     match stop_timeout {
         Some(stop_timeout) => manager.stop_with_timeout(stop_timeout)?,
         None => manager.stop()?,
     }
-
-    // Update database record if it exists
-    if let Ok(mut config) = SmolvmConfig::load() {
-        // Detach the per-machine layers volume now that the process is gone,
-        // unless fork children still reference it (macOS hdiutil; no-op on Linux).
-        // Gated on the record so non-bundle machines are untouched; the volume
-        // belongs to "default" and its linked children.
-        let is_bundle = config
-            .get_vm("default")
-            .map(|r| r.source_smolmachine.is_some())
-            .unwrap_or(false);
-        if is_bundle {
-            smolvm_pack::extract::force_detach_layers_volume(
-                &smolvm::agent::machine_layers_cache_dir("default"),
-            );
-        }
-        config.update_vm("default", VmRecord::mark_process_stopped);
-    }
-
     println!("Machine 'default' stopped");
-
     Ok(())
 }
 
@@ -2840,23 +2867,6 @@ pub struct DeleteVmOptions {
     pub cascade: bool,
 }
 
-fn remove_vm_data_and_record(
-    db: &SmolvmDb,
-    name: &str,
-    data_dir: &std::path::Path,
-) -> smolvm::Result<()> {
-    if data_dir.exists() {
-        std::fs::remove_dir_all(data_dir).map_err(|e| {
-            smolvm::Error::storage(
-                "delete machine data",
-                format!("{}: {e}", data_dir.display()),
-            )
-        })?;
-    }
-    db.remove_vm(name)?;
-    Ok(())
-}
-
 fn ensure_fork_base_delete_is_safe(
     name: &str,
     dependent_clones: &[String],
@@ -2876,39 +2886,9 @@ fn ensure_fork_base_delete_is_safe(
     ))
 }
 
-/// Decide whether a delete may go ahead around a process the kernel is
-/// holding after SIGKILL.
-///
-/// Such a process cannot be made to exit, by this or any later delete.
-/// Removing the machine around it leaves that process behind with the
-/// machine's files open, so it needs `--force`: with it the held process is
-/// returned for the caller to name, and without it the machine is recorded
-/// stopped and the delete is refused with the reason.
-fn held_process_delete_gate(
-    db: &SmolvmDb,
-    name: &str,
-    record: &VmRecord,
-    force: bool,
-) -> smolvm::Result<Option<smolvm::process::HeldProcess>> {
-    let Some(held) = record.held_process() else {
-        return Ok(None);
-    };
-    if force {
-        return Ok(Some(held));
-    }
-    db.update_vm(name, VmRecord::mark_process_stopped)?;
-    Err(smolvm::Error::agent(
-        "delete machine",
-        format!(
-            "machine '{name}' is stopped, but {}; pass --force to delete the \
-             machine and leave that process behind",
-            held.explain()
-        ),
-    ))
-}
-
 /// Delete a named machine configuration.
 pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::Result<()> {
+    let _admission = SmolvmDb::open()?.admit_machine_deletion(name)?;
     let fork_source_lock = smolvm::agent::fork::lock_fork_source(name)?;
     let config = SmolvmConfig::load()?;
 
@@ -2975,104 +2955,11 @@ pub fn delete_vm(name: &str, force: bool, options: DeleteVmOptions) -> smolvm::R
         }
     }
 
-    // Stop if running (machine run does this). Use the shared
-    // resolver so an `Unreachable` VM (live PID, dead agent) is also
-    // torn down — otherwise the record gets deleted while the zombie
-    // libkrun process keeps running, orphaned forever.
-    if options.stop_if_running {
-        match smolvm::agent::state_probe::resolve_state(name, &record) {
-            RecordState::Running => {
-                let manager = AgentManager::for_vm(name)?;
-                println!("Stopping machine '{}'...", name);
-                if !record.staged_mounts.is_empty() {
-                    let mut client =
-                        smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
-                    smolvm::staged_mount::sync_staged_mounts(&record, &mut client)?;
-                }
-                // The machine is being deleted, so its workload has nothing
-                // to save: kill it at once rather than wait out its timeout.
-                manager.stop_with_timeout(std::time::Duration::ZERO)?;
-                if record.pid.is_some_and(smolvm::process::can_still_run) {
-                    return Err(smolvm::Error::agent(
-                        "delete machine",
-                        format!("machine '{name}' process is still alive after stop"),
-                    ));
-                }
-            }
-            RecordState::Unreachable => {
-                // Reap unconditionally: we're past the dependent-clones
-                // guard above, so this machine has no live child dependency.
-                // The guarded `cli_recover_if_unreachable` would skip a frozen
-                // fork base, orphaning its VMM after we remove the record below.
-                smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
-            }
-            RecordState::Frozen => {
-                // All descendants are gone (or a cascade removed them above),
-                // so reap the paused VMM before removing its record.
-                smolvm::agent::state_probe::recover_unreachable_machine(&record)?;
-            }
-            _ => {}
-        }
-    }
-
-    if let Some(held) = held_process_delete_gate(&db, name, &record, force)? {
-        eprintln!(
-            "Deleting machine '{name}' and leaving PID {} behind: {}.",
-            held.pid,
-            held.explain()
-        );
-    }
-
-    // If the machine was created from a .smolmachine, detach its case-sensitive
-    // layers volume (macOS hdiutil mount; no-op on Linux) before removing the
-    // data dir below — otherwise the `rm -rf` fails with "Resource busy". The
-    // lease was intentionally leaked with `std::mem::forget` at start time so the
-    // volume stayed mounted while the VM ran. The volume lives under this
-    // machine's own data dir. Dependent children block source deletion above;
-    // the detach helper also preserves any remaining child pack references.
-    if record.source_smolmachine.is_some() {
-        smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
-            name,
-        ));
-    }
-
-    // Drop mount-socket placeholder files this machine left in shared --volume
-    // dirs. Runs after the VM is confirmed stopped (or was never running), so
-    // no live bind mount can reference the host-side node; a machine that still
-    // declares the same socket recreates its placeholder at its next boot.
+    smolvm::deletion::delete_machine_locked(&db, &record, None, options.stop_if_running, force)?;
     remove_mount_socket_placeholders(&record);
-
-    let data_dir = vm_data_dir(name);
-    if data_dir.exists() {
-        println!("Cleaning up data directory for vm: {}", name);
-        // A stopped/crashed live-fork source can still own raw-forked RAM
-        // guardians under its snapshot tree. Stop and authenticate those
-        // processes before removing their manifests; deleting the directory
-        // first loses the only safe PID/token identity and leaks the RAM.
-        smolvm::agent::cleanup_dead_vm_runtime(name)?;
-        // Release this VM's per-VM uid (if any) before the dir holding its
-        // `.vm-uid` record is removed. See process::free_vm_uid.
-        smolvm::process::free_vm_uid(&smolvm::agent::vm_uid_registry_dir(), &data_dir);
-    }
-
-    // Keep the record until process death and storage removal are both confirmed,
-    // so a failed delete remains visible and can be retried safely.
-    remove_vm_data_and_record(&SmolvmDb::open()?, name, &data_dir)?;
     // The machine may have held the last lease on a shared extraction.
     #[cfg(target_os = "linux")]
     smolvm::artifact_cache::log_trim(smolvm::artifact_cache::trim_unleased_shared_packs());
-
-    // Once a child record and its VMM are both gone, its parent may have an old
-    // RAM generation that no remaining clone references. Reap that generation
-    // now instead of retaining its charged pages until the parent's next fork.
-    if let Some(parent) = record.golden.as_deref() {
-        let db = SmolvmDb::open()?;
-        if let Err(error) =
-            smolvm::agent::fork::collect_parent_generations_after_child_delete(&db, parent)
-        {
-            tracing::warn!(%parent, %error, "could not collect unreferenced fork generation");
-        }
-    }
 
     // The VM's readiness marker lives in the *shared* agent rootfs, not its data
     // dir, so the removal above doesn't take it. Sweep it (and any other markers
@@ -3680,6 +3567,24 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
     });
     let fields = obj.as_object_mut().unwrap();
     fields.insert("network".into(), serde_json::json!(record.network));
+    fields.insert(
+        "shared_folders".into(),
+        serde_json::Value::Array(
+            record
+                .host_mounts()
+                .iter()
+                .map(|mount| {
+                    serde_json::json!({ "host": mount.source, "guest": mount.target,
+            "mode": if mount.staged { "staged" } else if mount.read_only { "ro" } else { "rw" } })
+                })
+                .collect(),
+        ),
+    );
+    fields.insert("port_mappings".into(), serde_json::Value::Array(record.ports.iter().map(|(host, guest)| {
+        serde_json::json!({ "host": host, "guest": guest, "protocol": "tcp" })
+    }).chain(record.udp_ports.iter().map(|(host, guest)| {
+        serde_json::json!({ "host": host, "guest": guest, "protocol": "udp" })
+    })).collect()));
     // The egress allow list, present only when one is set, in the stored form
     // `machine update` accepts back: `=host` exact, `*.domain` wildcard, bare
     // `host` for a name and its subdomains, plus CIDRs. Lets a client read the
@@ -3923,6 +3828,39 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
 // Resize
 // ============================================================================
 
+/// A fresh machine has no disk until launch. A missing disk on an existing
+/// machine, or a broken symlink to either disk format, is still an error.
+fn disk_resize_is_physical(
+    path: &std::path::Path,
+    can_be_unallocated: bool,
+) -> smolvm::Result<bool> {
+    match std::fs::symlink_metadata(path) {
+        Ok(_) => Ok(true),
+        Err(error) => {
+            if error.kind() == std::io::ErrorKind::NotFound && can_be_unallocated {
+                // resolve_disk_image follows links when choosing a format. Do
+                // not mistake a dangling qcow2 link for a not-yet-created raw disk.
+                match std::fs::symlink_metadata(path.with_extension("qcow2")) {
+                    Err(alternate) if alternate.kind() == std::io::ErrorKind::NotFound => {
+                        return Ok(false);
+                    }
+                    Err(alternate) => {
+                        return Err(smolvm::Error::storage(
+                            "inspect resize disk",
+                            alternate.to_string(),
+                        ));
+                    }
+                    Ok(_) => {}
+                }
+            }
+            Err(smolvm::Error::storage(
+                "inspect resize disk",
+                format!("{}: {error}", path.display()),
+            ))
+        }
+    }
+}
+
 /// Resize a microVM's disk resources.
 ///
 /// The VM must be stopped before resizing. Only expansion is supported
@@ -3931,7 +3869,8 @@ pub fn list_vms(verbose: bool, json: bool, quiet: bool) -> smolvm::Result<()> {
 /// the caller is responsible for persisting the new sizes.
 ///
 /// Returns a list of human-readable change descriptions for display.
-/// Validates no-shrink and performs the physical I/O.
+/// Validates no-shrink and performs the physical I/O. Unallocated disks of a
+/// newly created machine take their updated sizes from the record at first boot.
 pub fn expand_disks(
     name: &str,
     record: &smolvm::config::VmRecord,
@@ -3989,13 +3928,35 @@ pub fn expand_disks(
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
 
+    let fresh = record.state == RecordState::Created
+        && record.engine_build.is_none()
+        && record.golden.is_none()
+        && record.checkpoint_head.is_none();
+    // Preflight both targets before growing either disk. In particular, a
+    // missing overlay on a stopped machine must not leave its storage grown.
+    let storage_physical = if new_storage_gb.is_some_and(|size| size > current_storage_gb) {
+        disk_resize_is_physical(
+            manager.storage_path(),
+            fresh && !record.packed_image_on_storage,
+        )?
+    } else {
+        false
+    };
+    let overlay_physical = if new_overlay_gb.is_some_and(|size| size > current_overlay_gb) {
+        disk_resize_is_physical(manager.overlay_path(), fresh)?
+    } else {
+        false
+    };
+
     let mut changes = Vec::new();
 
     if let Some(storage_gb) = new_storage_gb {
         if storage_gb > current_storage_gb {
             let storage_path = manager.storage_path();
-            expand_disk::<Storage>(storage_path, storage_gb)
-                .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            if storage_physical {
+                expand_disk::<Storage>(storage_path, storage_gb)
+                    .map_err(|e| smolvm::Error::storage("expand storage disk", e.to_string()))?;
+            }
             changes.push(format!(
                 "  storage: {} GiB → {} GiB",
                 current_storage_gb, storage_gb
@@ -4006,8 +3967,10 @@ pub fn expand_disks(
     if let Some(overlay_gb) = new_overlay_gb {
         if overlay_gb > current_overlay_gb {
             let overlay_path = manager.overlay_path();
-            expand_disk::<Overlay>(overlay_path, overlay_gb)
-                .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            if overlay_physical {
+                expand_disk::<Overlay>(overlay_path, overlay_gb)
+                    .map_err(|e| smolvm::Error::storage("expand overlay disk", e.to_string()))?;
+            }
             changes.push(format!(
                 "  overlay: {} GiB → {} GiB",
                 current_overlay_gb, overlay_gb
@@ -4258,14 +4221,28 @@ pub fn register_ephemeral_vm(
     let (live_mounts, staged_mounts) = HostMount::split_storage_tuples(mounts);
     let mut record = VmRecord::new(name.to_string(), cpus, mem, live_mounts, vec![], network);
     record.staged_mounts = staged_mounts;
+    record.mount_owners = HostMount::stored_owners(mounts);
     record.ephemeral = true;
     record.state = RecordState::Running;
     record.pid = pid;
+    record.pid_start_time = pid.and_then(smolvm::process::process_start_time);
     record.engine_build = Some(smolvm::ENGINE_BUILD.to_string());
     record.image = image;
 
     if let Ok(db) = SmolvmDb::open() {
-        if let Err(e) = db.insert_vm(name, &record) {
+        let result = db
+            .update_vm(name, |existing| {
+                record.created_at = existing.created_at;
+                *existing = record.clone();
+            })
+            .and_then(|updated| {
+                if updated.is_some() {
+                    Ok(())
+                } else {
+                    db.insert_vm_if_not_exists(name, &record).map(|_| ())
+                }
+            });
+        if let Err(e) = result {
             tracing::debug!(error = %e, name, "failed to register ephemeral VM");
         }
     }
@@ -4526,20 +4503,6 @@ mod init_runner_tests {
             ),
             vec!["starting"]
         );
-    }
-
-    #[test]
-    fn failed_data_removal_preserves_machine_record() {
-        let dir = tempfile::TempDir::new().unwrap();
-        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
-        let name = "delete-failure";
-        let record = VmRecord::new(name.to_string(), 1, 256, vec![], vec![], false);
-        db.insert_vm(name, &record).unwrap();
-
-        let data_path = dir.path().join("not-a-directory");
-        std::fs::write(&data_path, b"occupied").unwrap();
-        assert!(remove_vm_data_and_record(&db, name, &data_path).is_err());
-        assert!(db.get_vm(name).unwrap().is_some());
     }
 
     fn sample_image_info(env: Vec<&str>, workdir: Option<&str>, user: Option<&str>) -> ImageInfo {
@@ -5169,6 +5132,37 @@ mod status_dns_tests {
     use super::machine_status_json;
     use smolvm::config::VmRecord;
 
+    #[test]
+    fn status_preserves_folder_modes_order_and_port_protocols() {
+        let mut record = VmRecord::new(
+            "studio-settings".into(),
+            1,
+            512,
+            vec![("/host/read only".into(), "/data".into(), true)],
+            vec![(8080, 80)],
+            true,
+        );
+        record.staged_mounts = vec![(0, "/host/project".into(), "/project".into())];
+        record.udp_ports = vec![(8080, 53)];
+        let status = machine_status_json("studio-settings", &record);
+        assert_eq!(status["mounts"], 2);
+        assert_eq!(
+            status["shared_folders"],
+            serde_json::json!([
+                {"host":"/host/project", "guest":"/project", "mode":"staged"},
+                {"host":"/host/read only", "guest":"/data", "mode":"ro"},
+            ])
+        );
+        assert_eq!(status["ports"], 2);
+        assert_eq!(
+            status["port_mappings"],
+            serde_json::json!([
+                {"host":8080, "guest":80, "protocol":"tcp"},
+                {"host":8080, "guest":53, "protocol":"udp"},
+            ])
+        );
+    }
+
     // `--dns` and `--dns-option` show up in status JSON only when set, so the
     // object other machines produce is unchanged.
     #[test]
@@ -5210,6 +5204,7 @@ mod held_process_tests {
         record.pid = Some(pid);
         record.pid_start_time = Some(fake_held::START_TIME);
         db.insert_vm(name, &record).unwrap();
+        let record = db.get_vm(name).unwrap().unwrap();
         smolvm::agent::state_probe::recover_unreachable_machine_in_db(&record, db).unwrap();
         db.get_vm(name).unwrap().unwrap()
     }
@@ -5262,7 +5257,7 @@ mod held_process_tests {
         let name = "cli-held-delete";
         let record = stopped_with_held_process(&db, name, held.pid);
 
-        let error = held_process_delete_gate(&db, name, &record, false)
+        let error = smolvm::deletion::held_process_delete_gate(&record, false)
             .unwrap_err()
             .to_string();
         assert!(
@@ -5279,7 +5274,7 @@ mod held_process_tests {
         assert_eq!(stored.pid, Some(held.pid));
 
         // With --force the delete goes ahead and names what it leaves.
-        let left = held_process_delete_gate(&db, name, &record, true).unwrap();
+        let left = smolvm::deletion::held_process_delete_gate(&record, true).unwrap();
         assert_eq!(left.map(|held| held.pid), Some(held.pid));
     }
 
@@ -5289,12 +5284,12 @@ mod held_process_tests {
         let held = fake_held::hold();
         let name = "cli-held-then-gone";
         let record = stopped_with_held_process(&db, name, held.pid);
-        assert!(held_process_delete_gate(&db, name, &record, false).is_err());
+        assert!(smolvm::deletion::held_process_delete_gate(&record, false).is_err());
 
         held.disappear();
 
         assert_eq!(
-            held_process_delete_gate(&db, name, &record, false).unwrap(),
+            smolvm::deletion::held_process_delete_gate(&record, false).unwrap(),
             None
         );
         smolvm::agent::state_probe::refuse_start_while_held(&db, name).unwrap();

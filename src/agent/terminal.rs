@@ -265,6 +265,51 @@ pub use unix_impl::{
     stdin_is_tty, write_all_retry, NonBlockingStdin, PollResult, RawModeGuard,
 };
 
+/// Whether a Windows console key event gives the interactive loop's stdin read
+/// something to return. Key releases, and a modifier or lock key pressed alone,
+/// produce no input: a read promised on one of them blocks until a real key
+/// arrives, and the guest's output (a shell prompt) waits with it. The release
+/// of the Enter that launched the command is in the queue that way in a
+/// console window. Other key presses count, arrows and function keys included:
+/// VT input mode turns them into escape sequences when read.
+#[cfg_attr(unix, allow(dead_code))]
+pub(crate) fn console_key_gives_input(key_down: bool, virtual_key: u16) -> bool {
+    // VK_SHIFT, VK_CONTROL, VK_MENU, VK_CAPITAL, VK_LWIN, VK_RWIN, VK_NUMLOCK,
+    // VK_SCROLL, and the left/right Shift, Ctrl and Alt codes
+    const NO_INPUT: &[u16] = &[
+        0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0x90, 0x91, 0xA0, 0xA1, 0xA2, 0xA3, 0xA4, 0xA5,
+    ];
+    key_down && !NO_INPUT.contains(&virtual_key)
+}
+
+#[cfg(test)]
+mod console_key_tests {
+    use super::console_key_gives_input;
+
+    #[test]
+    fn a_key_release_is_not_input() {
+        // VK_RETURN released: the console's queue holds this after Enter
+        // launches a command, and reading it would block until the next key.
+        assert!(!console_key_gives_input(false, 0x0D));
+        assert!(!console_key_gives_input(false, 0x41));
+    }
+
+    #[test]
+    fn a_modifier_or_lock_key_alone_is_not_input() {
+        for vk in [0x10, 0x11, 0x12, 0x14, 0x5B, 0x5C, 0x90, 0x91, 0xA0, 0xA5] {
+            assert!(!console_key_gives_input(true, vk), "{vk:#x}");
+        }
+    }
+
+    #[test]
+    fn a_key_press_is_input_including_arrows_and_function_keys() {
+        // 'A', Enter, Escape, Up arrow, F5
+        for vk in [0x41, 0x0D, 0x1B, 0x26, 0x74] {
+            assert!(console_key_gives_input(true, vk), "{vk:#x}");
+        }
+    }
+}
+
 /// Windows implementation of the interactive-terminal API.
 ///
 /// Mirrors the POSIX `unix_impl` module using Win32 console + WinSock APIs so
@@ -557,13 +602,19 @@ mod windows_impl {
             }
 
             if record.EventType as u32 == KEY_EVENT {
-                // Real input — leave it queued for the loop's stdin read.
-                return true;
+                // SAFETY: `EventType` is KEY_EVENT, so `KeyEvent` is the union's
+                // initialized member.
+                let key = unsafe { record.Event.KeyEvent };
+                if super::console_key_gives_input(key.bKeyDown != 0, key.wVirtualKeyCode) {
+                    // Real input — leave it queued for the loop's stdin read.
+                    return true;
+                }
             }
 
-            // Non-key event: remove just this record so the wait doesn't keep
-            // re-signaling on it, then look again for a real key event.
-            // SAFETY: removes exactly one (the peeked non-key) record.
+            // A record the stdin read would return nothing for: a non-key event,
+            // a key release, or a modifier pressed alone. Remove just this record
+            // so the wait doesn't keep re-signaling on it, then look again.
+            // SAFETY: removes exactly one (the peeked) record.
             if unsafe { ReadConsoleInputW(console, &mut record, 1, &mut read) } == 0 || read == 0 {
                 return false;
             }

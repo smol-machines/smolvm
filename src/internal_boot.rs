@@ -76,7 +76,37 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> crate::Result<VmDis
 /// Reads the boot config from the given path, sets up libkrun, and calls
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> crate::Result<()> {
+    run_inner(config_path, None)
+}
+
+/// Boot only after durably claiming the controller's exact startup ticket.
+/// Old helpers reject this separate entry point instead of ignoring ownership.
+pub fn run_owned(config_path: PathBuf, token: String) -> crate::Result<()> {
+    run_inner(config_path, Some(token))
+}
+
+fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
     let t_proc = std::time::Instant::now();
+    // Map the anonymous commit file before redirecting stdin or closing inherited
+    // descriptors. The mapping also survives the later credential/sandbox setup.
+    #[cfg(unix)]
+    if let Some(parent) = std::env::var_os(crate::agent::startup_transaction::PARENT_ENV) {
+        std::env::remove_var(crate::agent::startup_transaction::PARENT_ENV);
+        let parent = parent
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| crate::Error::agent("watch startup transaction", "invalid owner PID"))?;
+        crate::agent::startup_transaction::watch_stdin(parent, || {
+            if let Some(socket) = AGENT_SOCKET.get() {
+                flush_guest_before_exit(socket);
+            }
+        })
+        .map_err(|error| crate::Error::agent("watch startup transaction", error.to_string()))?;
+    }
+    #[cfg(unix)]
+    crate::ssh::ownership::register_boot().map_err(|error| {
+        crate::Error::agent("register SSH startup ownership", error.to_string())
+    })?;
 
     // --- Parent-death watchdog ---------------------------------------------
     // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:
@@ -118,10 +148,38 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     }
 
     // Read boot config
-    let config_data = std::fs::read(&config_path)
+    let config_data = crate::agent::boot_config::read_boot_config_file(&config_path)
         .map_err(|e| crate::Error::agent("read boot config", e.to_string()))?;
+    // The launcher names the config it wrote by digest: the file's directory
+    // belongs to the VM's uid, which could have put another file in its place.
+    if let Some(expected) = std::env::var_os(crate::agent::boot_config::BOOT_CONFIG_SHA256_ENV) {
+        if crate::agent::boot_config::boot_config_digest(&config_data).as_str() != expected {
+            return Err(crate::Error::agent(
+                "read boot config",
+                "boot config is not the one the launcher wrote",
+            ));
+        }
+    }
     let config: BootConfig = serde_json::from_slice(&config_data)
         .map_err(|e| crate::Error::agent("parse boot config", e.to_string()))?;
+
+    if let Some(token) = token {
+        let ticket = config.startup_ticket.as_ref().ok_or_else(|| {
+            crate::Error::agent_conflict("admit VM startup", "owned boot requires a startup ticket")
+        })?;
+        if ticket.token != token || !ticket.database.is_absolute() {
+            return Err(crate::Error::agent_conflict(
+                "admit VM startup",
+                "boot config does not belong to this startup",
+            ));
+        }
+        crate::db::SmolvmDb::open_at(&ticket.database)?.admit_vm_boot(&token)?;
+    } else if config.startup_ticket.is_some() {
+        return Err(crate::Error::agent_conflict(
+            "admit VM startup",
+            "managed startup requires the owned boot entry point",
+        ));
+    }
 
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
@@ -453,7 +511,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         // be able to open that backing file. Grant the template directory
         // read-only — it is the install dir (same trust level as SMOLVM_LIB_DIR,
         // which lives under it) and holds no secrets. A no-op for the copy path.
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = smolvm_paths::home_dir() {
             read_exec.push(home.join(".smolvm"));
         }
 

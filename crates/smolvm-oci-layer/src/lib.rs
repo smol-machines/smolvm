@@ -39,6 +39,9 @@ pub enum LayerEntry<'a> {
     Whiteout(&'a str),
     /// An ordinary entry to extract as-is.
     Normal,
+    /// A whiteout marker naming its own directory or its parent (`.wh..`,
+    /// `.wh...`): skipped, never applied.
+    Invalid,
 }
 
 /// Classify an entry by its file name. The opaque marker must be checked before
@@ -48,14 +51,22 @@ pub fn classify_layer_entry(file_name: &str) -> LayerEntry<'_> {
         return LayerEntry::OpaqueDir;
     }
     match file_name.strip_prefix(WHITEOUT_PREFIX) {
+        // A whiteout names one entry of its own directory: `.wh..` and
+        // `.wh...` would name the directory itself and its parent.
+        Some("." | "..") => LayerEntry::Invalid,
         Some(name) if !name.is_empty() => LayerEntry::Whiteout(name),
         _ => LayerEntry::Normal,
     }
 }
 
 /// Join `rel` under `base`, returning `None` if any component would escape the
-/// base — lexically (`..`, an absolute path, a Windows-style prefix) **or**
-/// through a symlink already on disk.
+/// base — lexically (`..`, a Windows-style prefix) **or** through a symlink
+/// already on disk.
+///
+/// A leading `/` names the layer root, as Docker, containerd and
+/// `tar::Entry::unpack_in` read it: some image builders (Nix's among them)
+/// write every entry as `/nix/store/...`, and refusing those left whole layers
+/// empty.
 ///
 /// The symlink check is the load-bearing half. This path feeds the whiteout
 /// branch, which performs *destructive* operations (`remove_file`,
@@ -84,8 +95,8 @@ pub fn jailed_join(base: &Path, rel: &Path) -> Option<PathBuf> {
                     }
                 }
             }
-            Component::CurDir => {}
-            Component::ParentDir | Component::RootDir | Component::Prefix(_) => return None,
+            Component::CurDir | Component::RootDir => {}
+            Component::ParentDir | Component::Prefix(_) => return None,
         }
     }
     Some(out)
@@ -306,10 +317,22 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
                     continue;
                 }
                 LayerEntry::Whiteout(removed) => {
-                    if let Some(parent) = full_path.parent() {
+                    // The deleted name goes through the same jail as the marker:
+                    // it is destroyed as root, so it must name an entry of the
+                    // marker's own directory and nothing a link leads to.
+                    let parent_rel = path.parent().unwrap_or(Path::new(""));
+                    let Some(target) = jailed_join(dest, &parent_rel.join(removed)) else {
+                        warn!(path = %path.display(), "skipping a whiteout that escapes the layer dir");
+                        continue;
+                    };
+                    if let Some(parent) = target.parent() {
                         std::fs::create_dir_all(parent)?;
-                        create_overlay_whiteout(&parent.join(removed))?;
                     }
+                    create_overlay_whiteout(&target)?;
+                    continue;
+                }
+                LayerEntry::Invalid => {
+                    warn!(path = %path.display(), "skipping a whiteout that names no entry");
                     continue;
                 }
                 LayerEntry::Normal => {}
@@ -397,6 +420,62 @@ pub fn extract_oci_layer_with_size<R: Read>(reader: R, dest: &Path) -> std::io::
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
+    #[test]
+    fn extraction_preserves_pax_paths_and_link_targets_with_newlines() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(tmp.path()).unwrap();
+        let name = "測試\nname.txt";
+        let payload = b"preserved";
+        let mut builder = tar::Builder::new(Vec::new());
+        builder
+            .append_pax_extensions([("path", name.as_bytes())])
+            .unwrap();
+        let mut header = tar::Header::new_ustar();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o640);
+        header.set_uid(owner.uid() as u64);
+        header.set_gid(owner.gid() as u64);
+        builder
+            .append_data(&mut header, "fallback.txt", &payload[..])
+            .unwrap();
+        for (path, kind) in [
+            ("symlink", tar::EntryType::Symlink),
+            ("hardlink", tar::EntryType::Link),
+        ] {
+            builder
+                .append_pax_extensions([("linkpath", name.as_bytes())])
+                .unwrap();
+            let mut link = header.clone();
+            link.set_size(0);
+            link.set_entry_type(kind);
+            link.set_link_name("fallback.txt").unwrap();
+            builder
+                .append_data(&mut link, path, std::io::empty())
+                .unwrap();
+        }
+        let destination = tmp.path().join("layer");
+        std::fs::create_dir(&destination).unwrap();
+        let bytes =
+            extract_oci_layer_with_size(&builder.into_inner().unwrap()[..], &destination).unwrap();
+        assert_eq!(bytes, payload.len() as u64);
+        assert_eq!(std::fs::read(destination.join(name)).unwrap(), payload);
+        assert!(!destination.join("fallback.txt").exists());
+        assert_eq!(
+            std::fs::read_link(destination.join("symlink")).unwrap(),
+            Path::new(name)
+        );
+        assert_eq!(std::fs::read(destination.join("symlink")).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(destination.join("hardlink"))
+                .unwrap()
+                .ino(),
+            std::fs::metadata(destination.join(name)).unwrap().ino()
+        );
+    }
+
     #[test]
     fn classify_recognizes_markers_and_normals() {
         assert_eq!(classify_layer_entry(".wh..wh..opq"), LayerEntry::OpaqueDir);
@@ -408,6 +487,32 @@ mod tests {
         assert_eq!(classify_layer_entry(".wh."), LayerEntry::Normal);
         assert_eq!(classify_layer_entry("CERN.repo"), LayerEntry::Normal);
         assert_eq!(classify_layer_entry(".wherever"), LayerEntry::Normal);
+        assert_eq!(classify_layer_entry(".wh.."), LayerEntry::Invalid);
+        assert_eq!(classify_layer_entry(".wh..."), LayerEntry::Invalid);
+    }
+
+    /// `.wh...` named the layer dir's parent and `.wh..` the layer dir: their
+    /// whiteouts deleted them, as root when the host fills the image cache.
+    #[test]
+    fn a_whiteout_naming_its_own_directory_or_parent_deletes_nothing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache = tmp.path();
+        let dest = cache.join("layerdir");
+        std::fs::create_dir_all(&dest).unwrap();
+        let victim = cache.join("victim");
+        std::fs::write(&victim, b"outside the layer").unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for marker in [".wh...", ".wh..", "sub/.wh..."] {
+            let mut header = tar::Header::new_gnu();
+            header.set_size(1);
+            header.set_mode(0o644);
+            header.set_cksum();
+            builder.append_data(&mut header, marker, &b"x"[..]).unwrap();
+        }
+        let tar_bytes = builder.into_inner().unwrap();
+        extract_oci_layer(&tar_bytes[..], &dest).unwrap();
+        assert_eq!(std::fs::read(&victim).unwrap(), b"outside the layer");
+        assert!(dest.is_dir(), "the layer dir itself survives");
     }
 
     #[test]
@@ -419,7 +524,85 @@ mod tests {
             Some(base.join("etc/hosts"))
         );
         assert_eq!(jailed_join(base, Path::new("../escape")), None);
-        assert_eq!(jailed_join(base, Path::new("/abs")), None);
+        assert_eq!(jailed_join(base, Path::new("/../escape")), None);
+        assert_eq!(jailed_join(base, Path::new("/abs")), Some(base.join("abs")));
+    }
+
+    // Nix-built images write every entry with a leading `/`. Each one lands in
+    // the layer, as Docker places it, instead of being dropped.
+    #[cfg(unix)]
+    #[test]
+    fn absolute_entry_paths_land_in_the_layer() {
+        use std::os::unix::fs::MetadataExt;
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("layer");
+        std::fs::create_dir_all(&dest).unwrap();
+        // Owned by whoever runs the test: extraction keeps owners.
+        let me = std::fs::metadata(&dest).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for dir in [
+            "/nix/",
+            "/nix/store/",
+            "/nix/store/abc-bash/",
+            "/nix/store/abc-bash/bin/",
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Directory);
+            header.set_mode(0o755);
+            header.set_size(0);
+            header.set_uid(me.uid().into());
+            header.set_gid(me.gid().into());
+            builder
+                .append_data(&mut header, dir.trim_start_matches('/'), &[][..])
+                .unwrap();
+        }
+        let mut header = tar::Header::new_gnu();
+        header.set_mode(0o755);
+        header.set_size(4);
+        header.set_uid(me.uid().into());
+        header.set_gid(me.gid().into());
+        builder
+            .append_data(&mut header, "nix/store/abc-bash/bin/bash", &b"bash"[..])
+            .unwrap();
+        let mut tar_bytes = builder.into_inner().unwrap();
+        // tar::Builder refuses to write absolute names, so prefix them in the
+        // raw headers, as the image builders do.
+        absolutize_names(&mut tar_bytes);
+        let names: Vec<String> = tar::Archive::new(&tar_bytes[..])
+            .entries()
+            .unwrap()
+            .map(|e| e.unwrap().path().unwrap().display().to_string())
+            .collect();
+        assert!(names.iter().all(|n| n.starts_with('/')), "{names:?}");
+
+        extract_oci_layer(&tar_bytes[..], &dest).unwrap();
+        assert_eq!(
+            std::fs::read(dest.join("nix/store/abc-bash/bin/bash")).unwrap(),
+            b"bash"
+        );
+    }
+
+    /// Rewrite each ustar/GNU header's name to start with `/`, fixing up the
+    /// checksum. Names here are short, so they fit the 100-byte field.
+    fn absolutize_names(bytes: &mut [u8]) {
+        let mut offset = 0;
+        while offset + 512 <= bytes.len() {
+            let header = &mut bytes[offset..offset + 512];
+            if header.iter().all(|b| *b == 0) {
+                break;
+            }
+            let len = header[..100].iter().position(|b| *b == 0).unwrap_or(100);
+            header.copy_within(0..len, 1);
+            header[0] = b'/';
+            header[148..156].copy_from_slice(b"        ");
+            let sum: u32 = header.iter().map(|b| *b as u32).sum();
+            header[148..156].copy_from_slice(format!("{sum:06o}\0 ").as_bytes());
+            let size = std::str::from_utf8(&header[124..135])
+                .ok()
+                .and_then(|s| u64::from_str_radix(s.trim_matches(char::from(0)).trim(), 8).ok())
+                .unwrap_or(0);
+            offset += 512 + size.div_ceil(512) as usize * 512;
+        }
     }
 
     /// A hostile layer must not be able to reach outside the layer dir through a

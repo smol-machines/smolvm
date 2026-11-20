@@ -218,6 +218,7 @@ impl CredentialLaunch {
             read_only: true,
             staged: false,
             recorded_ownership: false,
+            owner: None,
         }
     }
 

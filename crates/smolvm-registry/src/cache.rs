@@ -22,6 +22,9 @@ const LOCK_DIR: &str = "locks";
 /// (see [`BlobCache::record_pull`]); a directory, so the blob walks skip it.
 const REFS_DIR: &str = "refs";
 
+/// Records of which registry and repository delivered each cached blob.
+const ORIGIN_DIR: &str = "origins";
+
 /// What one pull of a reference left in the cache.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct PulledRef {
@@ -141,7 +144,7 @@ pub struct BlobCache {
 impl BlobCache {
     /// Open or create a cache at the default location.
     pub fn open_default() -> std::io::Result<Self> {
-        let cache_dir = dirs::cache_dir()
+        let cache_dir = smolvm_paths::cache_dir()
             .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::NotFound, "no cache dir"))?
             .join("smolvm-registry")
             .join("blobs");
@@ -258,6 +261,7 @@ impl BlobCache {
             }
             let _ = fs::remove_dir_all(self.root.join(MANIFEST_DIR));
             let _ = fs::remove_dir_all(self.root.join(REFS_DIR));
+            let _ = fs::remove_dir_all(self.root.join(ORIGIN_DIR));
         }
         Ok(freed)
     }
@@ -515,8 +519,30 @@ impl BlobCache {
         Ok(true)
     }
 
+    /// Record that `registry`/`repo` delivered the blob `digest` here. A
+    /// cached blob serves a later pull only from a repository it came from,
+    /// so naming its digest in another repository's manifest gets nothing.
+    pub fn record_origin(&self, registry: &str, repo: &str, digest: &str) -> io::Result<()> {
+        let Some(path) = self.scoped_path(ORIGIN_DIR, registry, repo, digest) else {
+            return Ok(());
+        };
+        fs::create_dir_all(self.root.join(ORIGIN_DIR))?;
+        fs::write(path, b"")
+    }
+
+    /// Whether [`Self::record_origin`] recorded `registry`/`repo` for `digest`.
+    pub fn has_origin(&self, registry: &str, repo: &str, digest: &str) -> bool {
+        self.scoped_path(ORIGIN_DIR, registry, repo, digest)
+            .is_some_and(|path| path.is_file())
+    }
+
     /// Where a digest-addressed manifest lives, or `None` for a malformed digest.
     fn manifest_path(&self, registry: &str, repo: &str, digest: &str) -> Option<PathBuf> {
+        self.scoped_path(MANIFEST_DIR, registry, repo, digest)
+    }
+
+    /// A per-registry-and-repository record of `digest` under `dir`.
+    fn scoped_path(&self, dir: &str, registry: &str, repo: &str, digest: &str) -> Option<PathBuf> {
         let hex = digest.strip_prefix("sha256:")?;
         if hex.len() != 64 || !hex.chars().all(|c| c.is_ascii_hexdigit()) {
             return None;
@@ -525,7 +551,7 @@ impl BlobCache {
         scope.update(registry.as_bytes());
         scope.update([0]);
         scope.update(repo.as_bytes());
-        Some(self.root.join(MANIFEST_DIR).join(format!(
+        Some(self.root.join(dir).join(format!(
             "{:x}-{}",
             scope.finalize(),
             hex.to_ascii_lowercase()
