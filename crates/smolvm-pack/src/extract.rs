@@ -4098,6 +4098,7 @@ mod resume_extract_tests {
     }
 
     /// A checkpoint sidecar holding `checkpoint/memory.bin` = `memory`.
+    #[cfg(unix)]
     fn sidecar_with_memory(artifact: &Path, memory: &[u8]) -> PackFooter {
         let encoder = zstd::stream::Encoder::new(File::create(artifact).unwrap(), 1).unwrap();
         let mut tar = tar::Builder::new(encoder);
@@ -6761,6 +6762,7 @@ mod tests {
         assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), first_digest);
     }
 
+    #[cfg(unix)]
     fn digest_of(bytes: &[u8]) -> String {
         use sha2::{Digest, Sha256};
         format!("{:x}", Sha256::digest(bytes))
@@ -7527,8 +7529,8 @@ mod tests {
     }
 
     /// Build a tar archive carrying a single symlink entry whose link target
-    /// is `link_target`, plus (optionally) a trailing regular-file entry.
-    #[cfg(unix)]
+    /// is `link_target`, plus (optionally) a trailing regular-file entry. The
+    /// archive is built in memory, so every platform's tests can use it.
     fn make_symlink_tar(name: &str, link_target: &str) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
         let mut header = tar::Header::new_gnu();
