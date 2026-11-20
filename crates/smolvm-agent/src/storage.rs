@@ -6616,6 +6616,7 @@ impl DockerAuthDir {
 
 impl Drop for DockerAuthDir {
     fn drop(&mut self) {
+        #[cfg(target_os = "linux")]
         if self.mounted {
             use std::os::unix::ffi::OsStrExt;
             if let Ok(target) = std::ffi::CString::new(self.dir.path().as_os_str().as_bytes()) {
@@ -6628,6 +6629,7 @@ impl Drop for DockerAuthDir {
 
 /// Mount a small private tmpfs on `dir`, so what is written there stays in
 /// memory.
+#[cfg(target_os = "linux")]
 fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let target = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
@@ -6646,6 +6648,12 @@ fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
     } else {
         Err(std::io::Error::last_os_error())
     }
+}
+
+/// The agent only runs in a Linux guest; elsewhere it is built for tests.
+#[cfg(not(target_os = "linux"))]
+fn mount_private_tmpfs(_dir: &Path) -> std::io::Result<()> {
+    Err(std::io::ErrorKind::Unsupported.into())
 }
 
 fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<DockerAuthDir> {
