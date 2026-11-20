@@ -5,15 +5,16 @@ description: Runs CUDA compute workloads inside a smolvm microVM against a real 
 
 # CUDA inside a machine
 
-Verified on **smolvm v1.22.2** against an **NVIDIA GeForce RTX 4050** (driver 32.0.15.6626,
-Windows x86_64), 2026-10-03, and on **v1.14.6** against an **NVIDIA A10** (driver 580.105.08,
-Linux x86_64, kernel 6.8.0-1046-nvidia). Done means a program in the VM opens the device, creates a context, and moves
+Verified on **smolvm v1.34.0** against an **NVIDIA A10** (driver 580.105.08, Linux x86_64, kernel
+6.8.0-1064-nvidia), 2026-11-09, and on **v1.22.2** against an **NVIDIA GeForce RTX 4050** (driver
+32.0.15.6626, Windows x86_64), 2026-10-03. Done means a program in the VM opens the device, creates a context, and moves
 data to and from it.
 The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
-> **The GPU path was last run end to end on Linux x86_64 on v1.14.6**, on an A10: the
-> preflight, the probe against two glibc images, all three eval prompts and the cleanup. **Windows
+> **The GPU path was last run end to end on Linux x86_64 on v1.34.0**, on an A10: the
+> preflight, the probe against two glibc images and the cleanup, twice; the three eval prompts last
+> ran on v1.14.6. **Windows
 > was re-run on v1.22.2** against an RTX 4050: the probe, the two absences, the shim in a plain
 > `alpine` guest, and a vector add over 16777216 elements; see `references/windows.md`. The macOS
 > arm64 and Linux aarch64 hosts have no NVIDIA hardware, so what runs there is the no-GPU answer,
@@ -143,8 +144,8 @@ Full detail in `references/traps.md`.
 
 ## Platform arms
 
-- **Linux x86_64 with an NVIDIA GPU**: **verified on an A10 on v1.14.6** (driver 580.105.08,
-  kernel 6.8.0-1046-nvidia), preflight through cleanup, with the probe run against two glibc
+- **Linux x86_64 with an NVIDIA GPU**: **verified on an A10 on v1.34.0** (driver 580.105.08,
+  kernel 6.8.0-1064-nvidia) and on v1.14.6, preflight through cleanup, with the probe run against two glibc
   images.
 - **Windows x86_64 with an NVIDIA GPU**: **verified on an RTX 4050 on v1.22.2**, on 2026-10-03,
   and on v1.14.6 on 2026-09-11 (driver 32.0.15.6626), including the device name and a 1 MiB device round trip.
@@ -228,6 +229,18 @@ host_libcuda=0
 note=libcuda.so.1 is not in this host's loader cache; --cuda loads it on the host, and without it the guest reaches the CPU emulation device
 result=blocked
 ```
+
+## Re-verified on v1.34.0, the GPU path
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under fresh
+isolated `HOME`s on an **NVIDIA A10** cloud instance (Ubuntu 22.04 x86_64, 30 vCPU Intel Xeon
+Platinum 8358, 222 GiB, kernel 6.8.0-1064-nvidia, driver 580.105.08), twice, the second time from a
+fresh `HOME`. The preflight said `gpu_present=yes`, `host_libcuda=1` and `result=ready`. The probe
+on `python:3.12-slim` in both passes, and once on `python:3.12-bookworm`, printed `name = NVIDIA
+A10`, `total MiB = 22587` and `roundtrip first 16 bytes match: True`, and reported
+`device_named=ok`, `data_roundtrip=ok`, `device_kind=gpu` and `result=cuda_ok`. The cleanup left
+`machines=clean` and `vm_processes=none`, and afterwards `nvidia-smi` reported 0 MiB used. The
+eval prompts were not re-run.
 
 ## Re-verified on v1.22.2, the no-GPU path
 

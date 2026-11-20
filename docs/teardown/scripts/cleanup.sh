@@ -9,7 +9,7 @@
 # usage: cleanup.sh [--record <name>] [--reap] [--purge]
 #   --record <name>  add a machine name to the state file and exit
 #   --reap           kill every VM process under this HOME; run without it first
-#   --purge          also remove the state file once the list is empty
+#   --purge          also remove the state file once none of its machines is listed
 
 set -uo pipefail
 
@@ -119,26 +119,38 @@ if [ -s "$STATE_FILE" ]; then
     done < "$STATE_FILE"
 fi
 
-# 2. An ephemeral machine's entry retires after its run returns: poll, 20 s at most.
+# 2. An ephemeral machine's entry retires after its run returns: poll, 20 s at
+# most, until no recorded name is listed. A list that fails counts as remaining.
 printf 'waiting=up to 20s for ephemeral entries to retire before asserting\n'
+ours_listed() {
+    listing="$("$SMOLVM" machine list </dev/null 2>&1)" || { printf 'machine list failed: %s\n' "$listing"; return; }
+    [ -s "$STATE_FILE" ] || return
+    awk 'NR>2{print $1}' <<<"$listing" | grep -xF -f <(grep "^$PREFIX" "$STATE_FILE")
+}
 waited=0
-listing="$("$SMOLVM" machine list 2>&1)"
-while ! grep -q 'No machines found' <<<"$listing" && [ "$waited" -lt 20 ]; do
+ours="$(ours_listed)"
+while [ -n "$ours" ] && [ "$waited" -lt 20 ]; do
     sleep 1; waited=$((waited + 1))
-    listing="$("$SMOLVM" machine list 2>&1)"
+    ours="$(ours_listed)"
 done
 printf 'waited=%ss\n' "$waited"
 
-# 3. Assert the value, not the exit code.
-if grep -q 'No machines found' <<<"$listing"; then
+# 3. Assert the value, not the exit code. Other machines are not this packet's
+# to delete, and do not keep its state file.
+if [ -n "$ours" ]; then
+    printf 'machines=remaining\n'
+    printf '%s\n' "$ours" | sed 's/^/  /'
+else
     printf 'machines=clean\n'
     [ "$purge" -eq 1 ] && rm -f "$STATE_FILE"
-else
-    printf 'machines=remaining\n'
-    printf '%s\n' "$listing" | sed 's/^/  /'
-    printf 'note=this packet did not create these, so it will not delete them. By name:\n'
-    printf '  smolvm machine stop --name <NAME> && smolvm machine delete --name <NAME> --force\n'
-    printf '  add --cascade for a machine that was branched from another\n'
+    others="$("$SMOLVM" machine list </dev/null 2>&1 | awk 'NR>2')"
+    if [ -n "$others" ]; then
+        printf 'other_machines=left as they are\n'
+        printf '%s\n' "$others" | sed 's/^/  /'
+        printf 'note=this packet did not create these, so it will not delete them. By name:\n'
+        printf '  smolvm machine stop --name <NAME> && smolvm machine delete --name <NAME> --force\n'
+        printf '  add --cascade for a machine that was branched from another\n'
+    fi
 fi
 
 # 4. Report VM processes under this HOME's state, such as a killed wrapper's.

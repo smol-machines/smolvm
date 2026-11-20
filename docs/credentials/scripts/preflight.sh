@@ -11,7 +11,7 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.29.0"
+VERIFIED_VERSION="1.34.0"
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 

@@ -5,13 +5,13 @@ description: Gives a workload in a smolvm machine an API key or token it can use
 
 # A credential the machine can use and never hold
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24, for everything that
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24, for everything that
 is decided on the host; on v1.29.0 on macOS arm64 **the substituted value also arrived at a real API**
 that echoes the headers it received, a dummy value. Done means the guest's variable is a placeholder, the value
 is nowhere in the guest, the machine's record or smolvm's database, TLS to the bound host goes
 through the machine's own CA, and a placeholder anywhere but a request header is refused before it
 leaves the host (from v1.27.0 a binding with `:body` also substitutes into a form body).
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 `docs/credential-substitution.md` in the smolvm repository is how the feature works: bindings,
@@ -30,9 +30,13 @@ where the value comes from, what the guest sees, what happens to each request, a
 
 **1. Preflight.** Read-only, and it never prints the value or its length.
 
+The examples bind `httpbin.org`, which echoes the headers it receives, so a first run with a test
+value shows the substitution end to end. For a real key, bind your API's host instead; step 4 says
+why.
+
 ```bash
 export API_TOKEN=...          # however your secrets manager hands it over
-scripts/preflight.sh --var API_TOKEN --host api.example.com
+scripts/preflight.sh --var API_TOKEN --host httpbin.org
 ```
 
 Every script here reads the value from its own environment, so keep it exported in the shell that
@@ -58,17 +62,17 @@ would refuse it anyway, with a clearer message.
 start`, and that is the value the machine uses until its next start.
 
 ```bash
-scripts/create-credentialed.sh --var API_TOKEN --host api.example.com
+scripts/create-credentialed.sh --var API_TOKEN --host httpbin.org
 ```
 
 ```
 workload_ready_after_s=1
 guest_sees=placeholder
-binding=api-token host=api.example.com
+binding=api-token host=httpbin.org
 result=up
 ```
 
-The command it runs is `smolvm machine create ... --credential api-token=API_TOKEN@api.example.com`
+The command it runs is `smolvm machine create ... --credential api-token=API_TOKEN@httpbin.org`
 and then `machine start`. `--credential` implies `--net`. In a Smolfile the same binding is a
 `[[network.credentials]]` table, in `docs/credential-substitution.md`.
 
@@ -79,7 +83,7 @@ any workload of yours runs in it: the guest search hands the value to a `grep` i
 length of the search, so a workload that can replace `grep` could read it.
 
 ```bash
-scripts/verify-containment.sh --var API_TOKEN --host api.example.com --other-host example.org
+scripts/verify-containment.sh --var API_TOKEN --host httpbin.org --other-host postman-echo.com
 ```
 
 ```
@@ -95,7 +99,8 @@ result=contained
 
 `value_in_guest` hands the value to a `grep` inside the guest on standard input for the length of
 the search, and looks in every process environment and the writable trees inside the guest;
-`value_in_record` searches the machine's directory and smolvm's database on the host;
+`value_in_record` searches the machine's directory without its disk images, smolvm's database and
+its usage journal on the host, and fails if any file there cannot be read;
 `interception` reads the issuer of the bound host's certificate as the guest sees it, which is
 `smolvm <machine> credential CA`, while `--other-host` keeps its real issuer.
 
@@ -104,11 +109,14 @@ the search, and looks in every process environment and the writable trees inside
 
 ```bash
 smolvm machine exec --name smolskill-cred -- sh -c \
-  'curl -sS -H "Authorization: Bearer $API_TOKEN" https://api.example.com/v1/me'
+  'curl -sS -H "Authorization: Bearer $API_TOKEN" https://httpbin.org/headers'
 ```
 
-That is the first request that carries the value, and it goes only to the host you bound. Judge it
-by the API's answer, the way you would without smolvm.
+That is the first request that carries the value, and it goes only to the host you bound: the
+echoed `Authorization` header holds `Bearer` and the value, while the same request to
+`postman-echo.com` echoes the placeholder. An echo endpoint hands the key back into the guest in its
+response body, so send it only a test value. With a real key, call your own API and judge it by the
+API's answer, the way you would without smolvm.
 
 **5. Clean up.**
 
@@ -118,6 +126,21 @@ scripts/cleanup.sh --purge
 
 `cleanup.sh` waits up to 20 seconds, polling the machine list, and prints `waiting=up to 20s`
 first: an ephemeral machine's entry retires after its run returns.
+
+## The binding in other forms
+
+- **A whole header, from v1.31.0.** With `--credential api-auth=API_AUTH@httpbin.org:set-header=authorization`
+  the host sets `Authorization` to the complete value of `API_AUTH`, `Bearer <key>` included, on
+  every request to the bound hosts, replacing whatever the guest sent. It is for a client that
+  cannot send a placeholder, such as a `git clone`; the guest variable still holds an unused
+  placeholder.
+
+- **The SDKs, from `smolmachines` 1.25.1** for Python, TypeScript and Rust: a credential in the
+  machine's config binds as `--credential` does, with a name, the guest variable, exact host names,
+  an optional value and optional methods; there is no body or set-header form, and the Go SDK has
+  none. In Python, `MachineConfig(credentials=[CredentialSpec(name="api-token", env_var="API_TOKEN",
+  hosts=["httpbin.org"], value=os.environ["API_TOKEN"])])`; without `value`, the process's own
+  `env_var` is read at each start.
 
 ## When the workload has to read the value
 
@@ -178,8 +201,9 @@ Full detail in `references/traps.md`.
 ## Platform arms
 
 `references/platforms.md`. macOS arm64 ran every script on v1.29.0 and v1.22.2, and both hosts gave the same
-results on v1.18.2, on the default virtio-net backend and on `--net-backend tsi`. Linux x86_64 and
-Windows were not run.
+results on v1.18.2, on the default virtio-net backend and on `--net-backend tsi`. Windows ran by
+hand on v1.34.0 with the same answers, except that its guest search needs another route, because
+`machine exec -i` passes no piped input there. Linux x86_64 ran every script on v1.34.0 with the same results.
 
 ## Eval prompts, and what they produced
 
@@ -230,6 +254,36 @@ with `is not reachable under the machine's network allow_hosts`. From v1.26.0 `*
 accepted, and an IP address is refused with `must be a lowercase DNS name, optionally` followed by
 the wildcard form.
 
+## Re-verified on v1.34.1
+
+Run 2026-11-11 PT against v1.34.1 from the published release, checksum checked, with a test value
+bound to `httpbin.org`, on macOS 27.2 arm64 in a `HOME` in daily use, with four other machines and
+89 pack template disks and memory images over 1 GiB in smolvm's data directory, and on Lima
+`linux-kvm` (Ubuntu 24.04 aarch64) under a fresh `HOME`. Both hosts, every step: `result=contained`,
+the guest's `GET /headers` to `httpbin.org` came back carrying the test value and the one to
+`postman-echo.com` the placeholder, and `cleanup.sh --purge` deleted only its own machines and
+removed its state file. On macOS a `:set-header=authorization` binding sent the test value to
+`httpbin.org` on a request with no header and on one with a forged `Authorization`. On 2026-11-10 on
+macOS, the Python SDK (`smolmachines` 1.32.4) with a `CredentialSpec` carrying `value=` gave the
+guest a placeholder and sent the test value to `httpbin.org` and the placeholder elsewhere.
+
+On the used Mac the record search as the packet had it on v1.34.0 ran 5 minutes on one 8 GiB checkpoint memory image
+before it was stopped, and printed `value_in_record=ok (0)`; the search now reads 24 files and
+`verify-containment.sh` takes 2 s. A copy of the test value planted in the machine's directory made
+it fail with `actual=1`, and a file there it could not read failed it with exit 2, on both hosts.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts, bound to `httpbin.org`
+with a dummy value: `result=contained`, `query_refused=ok (403)`, and a `GET /headers` from the
+guest came back carrying the dummy value, not the placeholder.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: `result=contained`, `query_refused=ok (403)`,
+and the guest's `GET /headers` to `httpbin.org` came back carrying the dummy value.
+
 ## Re-verified on v1.29.0
 
 Run 2026-10-15 PT against v1.29.0 from the published release, checksum checked, under a fresh
@@ -254,7 +308,8 @@ macOS, bound to a local HTTPS server with a throwaway value: `result=contained` 
 checks, the `Cookie` and forged placeholders refused with `403`, and the request carrying the
 placeholder answered `502 smolvm credentials: upstream request failed`, because the server's
 certificate was self-signed; the server received nothing. With the disk images left out of the
-record search, `verify-containment.sh` and the rest of the procedure took 25 s.
+record search, `verify-containment.sh` and the rest of the procedure took 25 s, in a `HOME` that held
+no other machine's disks; "Re-verified on v1.34.1" has a host that did.
 
 ## What was not run
 
@@ -270,7 +325,7 @@ record search, `verify-containment.sh` and the rest of the procedure took 25 s.
   nothing here changed a value under a running machine except by the variable.
 - **Credentials over the HTTP API**, branches and checkpoints carrying bindings, and portable
   restores on another host.
-- **Linux x86_64 and Windows.**
+- **These scripts on Windows**, which are bash.
 
 ## Related packets
 

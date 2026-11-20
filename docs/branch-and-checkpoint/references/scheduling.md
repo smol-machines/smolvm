@@ -115,7 +115,7 @@ without it. `OnFailure=` on the service is where an alert goes.
 launchctl load ~/Library/LaunchAgents/com.example.smolvm-checkpoint.plist
 ```
 
-On macOS the machine must have been started `--branchable`, or every scheduled capture fails with
+On macOS before v1.24.0 the machine must have been started `--branchable`, or every scheduled capture fails with
 `deferred durable save requires file-backed guest RAM` on v1.22.2, `guest RAM has no file-backed
 regions` before v1.20.0; `checkpoint.sh` names the cause when it sees either text.
 

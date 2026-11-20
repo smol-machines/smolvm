@@ -114,3 +114,7 @@ credentialed machine from an image, which is what `scripts/create-credentialed.s
 **On v1.22.2 it binds.** The same `create --from` of an image pack with `--credential`, then
 `machine start`, measured on macOS arm64 on 2026-10-03: one `SMOL_PLACEHOLDER` variable in the
 guest's environment and `/run/smol/credentials/ca.pem` present.
+
+**From v1.35.0 a CLI restore can re-authorize the bindings** (#2182): a restore whose `--credential`
+flags match every captured binding exactly reads their values on this host instead of erroring, and
+a CLI start or branch of a machine whose values only an API caller could supply now fails.
