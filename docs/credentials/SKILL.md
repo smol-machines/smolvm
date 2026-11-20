@@ -224,6 +224,10 @@ From v1.27.0 the body case reads `403 smolvm credentials: body substitution is d
 binding`, and a binding created with `:body` substitutes into an `application/x-www-form-urlencoded`
 body instead; that is read from the source, not run here.
 
+gpu-branch fork: a body is scanned for placeholders only when some binding for the host has
+`:body` and the body is `application/x-www-form-urlencoded`. Any other body (a JSON request that
+quotes a placeholder, say) is forwarded unchanged with the placeholder as literal text.
+
 Create-time rules, both hosts, on v1.22.2: `*.example.com` and an IP address are refused with
 `must be an exact lowercase DNS name`, and a credential host outside the machine's `--allow-host`
 with `is not reachable under the machine's network allow_hosts`. From v1.26.0 `*.example.com` is
