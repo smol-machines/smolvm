@@ -7370,6 +7370,22 @@ fn is_ssrf_prone_registry_host(host: &str) -> bool {
 /// The `.smolmachine` a checkpoint's image layers came from: this host's copy
 /// when it has one, otherwise pulled from the registry reference the checkpoint
 /// recorded and checked to be the very same artifact.
+/// Whether `registry` is one this server pulls packs from by its own
+/// configuration: the smolmachines registry, the `[machines]` default, or a
+/// registry listed under `[machines.registries]`.
+fn registry_is_configured(machines: &crate::registry::RegistryConfig, registry: &str) -> bool {
+    registry.eq_ignore_ascii_case(crate::registry::SMOLMACHINES_REGISTRY)
+        || machines
+            .defaults
+            .registry
+            .as_deref()
+            .is_some_and(|default| default.eq_ignore_ascii_case(registry))
+        || machines
+            .registries
+            .keys()
+            .any(|listed| listed.eq_ignore_ascii_case(registry))
+}
+
 async fn checkpoint_pack_sidecar(
     packed: &smolvm_pack::format::CheckpointPackedLayers,
     identity_token: Option<&str>,
@@ -7385,6 +7401,30 @@ async fn checkpoint_pack_sidecar(
             packed.artifact_sha256
         ))
     })?;
+    // The reference comes from the checkpoint file, not from the caller, so
+    // the file's author picks where this pull goes. Only a registry this
+    // server is configured for may see the caller's token, and a file may not
+    // point the pull at this host's loopback or private network.
+    let registry = crate::registry::Reference::parse(reference)
+        .map_err(|e| ApiError::BadRequest(format!("invalid registry reference: {}", e)))?
+        .registry;
+    let settings = crate::settings::SmolSettings::load()
+        .map_err(|e| ApiError::internal(format!("load settings: {}", e)))?;
+    let configured = registry_is_configured(&settings.machines, &registry);
+    if identity_token.is_some() && !configured {
+        return Err(ApiError::BadRequest(format!(
+            "this checkpoint's pack comes from registry '{registry}', which this server is not \
+             configured for; the registry token is only presented to {} or a registry listed \
+             under [machines]",
+            crate::registry::SMOLMACHINES_REGISTRY
+        )));
+    }
+    if !configured && is_ssrf_prone_registry_host(&registry) {
+        return Err(ApiError::BadRequest(format!(
+            "this checkpoint's pack comes from '{registry}', a private or loopback address; \
+             list it under [machines] to restore from it"
+        )));
+    }
     let pulled = pull_smolmachine(reference, identity_token, blob_peers).await?;
     let expected = format!("sha256:{}", packed.artifact_sha256);
     if pulled.digest != expected {
@@ -7642,6 +7682,50 @@ mod tests {
     use crate::db::SmolvmDb;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
+
+    #[test]
+    fn only_configured_registries_count_as_configured() {
+        let mut machines = crate::registry::RegistryConfig::default();
+        assert!(registry_is_configured(
+            &machines,
+            "registry.smolmachines.com"
+        ));
+        assert!(!registry_is_configured(
+            &machines,
+            "registry.attacker.example:8442"
+        ));
+        machines.defaults.registry = Some("reg.example.com".into());
+        machines
+            .registries
+            .insert("other.example.com".into(), Default::default());
+        assert!(registry_is_configured(&machines, "reg.example.com"));
+        assert!(registry_is_configured(&machines, "other.example.com"));
+        assert!(!registry_is_configured(&machines, "127.0.0.1:5000"));
+    }
+
+    /// A checkpoint names where its pack is pulled from; the caller's token
+    /// must not follow it to a registry the server is not configured for,
+    /// and the file must not aim the pull at the host's loopback.
+    #[tokio::test]
+    async fn a_checkpoint_cannot_choose_where_the_restore_token_goes() {
+        let packed = |reference: &str| smolvm_pack::format::CheckpointPackedLayers {
+            artifact_sha256: "ab".repeat(32),
+            footer_checksum: 1,
+            registry_ref: Some(reference.into()),
+            dax_window_bytes: None,
+        };
+        let foreign = packed("registry.attacker.example:8442/team/app:v1");
+        let error = checkpoint_pack_sidecar(&foreign, Some("tenant-pull-token"), &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest(_)), "{error:?}");
+
+        let loopback = packed("127.0.0.1:5000/team/app:v1");
+        let error = checkpoint_pack_sidecar(&loopback, None, &[])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ApiError::BadRequest(_)), "{error:?}");
+    }
 
     /// A restore's egress fields reach the create request it runs, so the
     /// restored guest follows the caller's policy, not the one it was captured
