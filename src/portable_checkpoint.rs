@@ -4511,6 +4511,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         allowed_cidrs: vm.allowed_cidrs.clone(),
         egress_rules: vm.egress_rules.clone(),
         mediated_egress_required: vm.mediated_egress_required,
+        external_interceptor_required: vm.external_interceptor_required,
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
         // The block is enforced on the host, outside the guest, so a restore
         // without it would quietly open the private ranges to the workload.
@@ -10573,6 +10574,28 @@ mod tests {
             ..CheckpointNetwork::default()
         });
         assert!(restored_record("cred-restored", &manifest, &checkpoint).is_err());
+    }
+
+    #[test]
+    fn an_interceptor_requirement_survives_checkpoint_restore() {
+        let mut record = VmRecord::new("intercepted".into(), 2, 1024, Vec::new(), Vec::new(), true);
+        record.external_interceptor_required = true;
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.network = Some(checkpoint_network(&record));
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://intercepted".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let restored = restored_record("intercepted-restored", &manifest, &checkpoint).unwrap();
+        assert!(restored.external_interceptor_required);
+        assert!(!restored.mediated_egress_required);
+
+        record.external_interceptor_required = false;
+        checkpoint.network = Some(checkpoint_network(&record));
+        let restored = restored_record("plain-restored", &manifest, &checkpoint).unwrap();
+        assert!(!restored.external_interceptor_required);
     }
 
     #[test]

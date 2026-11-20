@@ -451,6 +451,8 @@ pub struct RestoredState {
     pub checkpoint_head: Option<String>,
     /// The captured machine routed egress through a host mediator.
     pub mediated_egress_required: bool,
+    /// The captured machine ran behind an external egress interceptor.
+    pub external_interceptor_required: bool,
     /// The bindings came with the artifact and the host user did not
     /// re-authorize them, so their values must be supplied by the caller,
     /// never read from this host's environment.
@@ -1582,6 +1584,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                         .as_ref()
                         .map(|lineage| lineage.id.clone()),
                     mediated_egress_required: captured_net.mediated_egress_required,
+                    external_interceptor_required: captured_net.external_interceptor_required,
                     credentials_from_artifact: !host_values
                         && captured_net
                             .credential_policy
@@ -1908,7 +1911,8 @@ impl ResolvedSpec {
             auto_ports,
             dns_filter_hosts: allowed_hosts,
             credential_policy: credentials,
-            external_interceptor_required: restored.mediated_egress_required,
+            external_interceptor_required: restored.external_interceptor_required
+                || restored.mediated_egress_required,
             mediated_egress_required: restored.mediated_egress_required,
             credential_placeholders,
             credentials_supplied_by_api,
