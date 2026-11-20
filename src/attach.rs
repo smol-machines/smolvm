@@ -21,6 +21,11 @@ use crate::{Error, Result};
 
 pub use smolvm_protocol::AttachedMount;
 
+#[cfg(unix)]
+mod owned_shares;
+#[cfg(unix)]
+pub(crate) use owned_shares::OwnedShares;
+
 fn tag(read_only: bool) -> &'static str {
     if read_only {
         smolvm_protocol::ATTACH_TAG_RO
@@ -76,6 +81,10 @@ const RESTART_HINT: &str =
 
 fn control(name: &str, command: &str) -> Result<String> {
     let reply = control_socket_cmd(&control_socket_path(name), command)?;
+    control_reply(reply)
+}
+
+fn control_reply(reply: String) -> Result<String> {
     let reply = reply.trim().to_string();
     if reply.starts_with("OK") {
         Ok(reply)

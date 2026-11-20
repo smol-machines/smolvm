@@ -248,7 +248,10 @@ impl SmolvmDb {
             refuse_conflicts(&tx, Some(&record.name), std::slice::from_ref(&runtime))?;
             review.validate_conn(self, &tx)?;
             let (member, current) = Member::read(&tx, &record.name)?;
-            if (current.pid, current.pid_start_time) != (record.pid, record.pid_start_time) {
+            if record.execution_identity.is_none()
+                || current.execution_identity != record.execution_identity
+                || (current.pid, current.pid_start_time) != (record.pid, record.pid_start_time)
+            {
                 return Err(conflict("machine execution changed before recovery"));
             }
             super::launch_admission::reconcile_transfer(
@@ -318,6 +321,9 @@ impl VmRecoveryGuard {
             ));
         }
         if current.database_identity != self.record.database_identity
+            || current.execution_identity.is_none()
+            || current.execution_identity != self.record.execution_identity
+            || current.execution_identity != record.execution_identity
             || (current.pid, current.pid_start_time)
                 != (self.record.pid, self.record.pid_start_time)
             || record.database_identity != current.database_identity
@@ -371,7 +377,9 @@ impl VmRecoveryGuard {
             }
             LaunchReview::from_record(&self.record)?.validate_conn(&self.db, &tx)?;
             let (_, before) = Member::read(&tx, &self.record.name)?;
-            if (before.pid, before.pid_start_time) != (self.record.pid, self.record.pid_start_time)
+            if before.execution_identity != self.record.execution_identity
+                || (before.pid, before.pid_start_time)
+                    != (self.record.pid, self.record.pid_start_time)
             {
                 return Err(conflict("machine execution changed during recovery"));
             }
@@ -455,8 +463,9 @@ impl VmRecoveryGuard {
             }
             LaunchReview::from_record(&self.record)?.validate_conn(&self.db, &tx)?;
             let (_, current) = Member::read(&tx, &self.record.name)?;
-            if (current.pid, current.pid_start_time)
-                != (self.record.pid, self.record.pid_start_time)
+            if current.execution_identity != self.record.execution_identity
+                || (current.pid, current.pid_start_time)
+                    != (self.record.pid, self.record.pid_start_time)
             {
                 return Err(conflict("machine execution changed during deletion"));
             }

@@ -39,22 +39,25 @@ pub struct Member {
 impl Member {
     /// Read the row identity and execution state in one SQLite snapshot.
     pub(super) fn read(conn: &Connection, name: &str) -> Result<(Self, VmRecord)> {
-        let row: Option<(Vec<u8>, Option<String>)> = conn
+        let row: Option<(Vec<u8>, Option<String>, Option<String>)> = conn
             .query_row(
-                "SELECT v.data, g.generation FROM vms v
-                 LEFT JOIN vm_incarnations g ON g.name = v.name WHERE v.name = ?1",
+                "SELECT v.data, g.generation, e.generation FROM vms v
+                 LEFT JOIN vm_incarnations g ON g.name = v.name
+                 LEFT JOIN vm_execution_epochs e ON e.name = v.name WHERE v.name = ?1",
                 [name],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
             )
             .optional()
             .db_err("read reviewed machine identity")?;
-        let (data, generation) = row.ok_or_else(|| Error::vm_not_found(name))?;
+        let (data, generation, execution) = row.ok_or_else(|| Error::vm_not_found(name))?;
         let generation = generation
             .filter(|value| super::incarnation::valid(value))
             .ok_or_else(|| {
                 conflict("machine identity is missing or corrupt; recover it before moving")
             })?;
-        let record: VmRecord = serde_json::from_slice(&data).db_err("decode reviewed machine")?;
+        let mut record: VmRecord =
+            serde_json::from_slice(&data).db_err("decode reviewed machine")?;
+        record.execution_identity = execution.filter(|value| super::incarnation::valid(value));
         Ok((
             Self {
                 name: name.to_owned(),
@@ -165,6 +168,7 @@ fn decode(data: &[u8]) -> Result<Claim> {
 
 #[cfg(all(test, unix))]
 mod live_tests;
+pub(crate) mod preparation;
 #[cfg(test)]
 mod tests;
 
@@ -351,8 +355,19 @@ impl SmolvmDb {
     pub fn claim_workload_transfer(
         &self,
         operation: &str,
+        members: Vec<Member>,
+        roots: &[PathBuf],
+    ) -> Result<()> {
+        self.claim_workload_transfer_with_preparation(operation, members, roots, None, None)
+    }
+
+    fn claim_workload_transfer_with_preparation(
+        &self,
+        operation: &str,
         mut members: Vec<Member>,
         roots: &[PathBuf],
+        preparation: Option<&[u8]>,
+        recovery: Option<&[u8]>,
     ) -> Result<()> {
         if !operation_valid(operation)
             || members.is_empty()
@@ -412,6 +427,14 @@ impl SmolvmDb {
                             "this transfer operation was completed or has different members",
                         ));
                     }
+                    preparation::match_existing(&tx, operation, preparation)?;
+                    let saved_recovery: Option<Vec<u8>> = tx.query_row(
+                        "SELECT data FROM workload_preparation_recovery WHERE operation = ?1",
+                        [operation], |row| row.get(0),
+                    ).optional().db_err("read preparation recovery")?;
+                    if saved_recovery.as_deref() != recovery {
+                        return Err(conflict("preparation recovery ownership changed"));
+                    }
                     // A retry must not authorize a replacement created by a
                     // writer that did not participate in transfer admission.
                     for member in &claim.members {
@@ -457,6 +480,22 @@ impl SmolvmDb {
                     params![operation, data],
                 )
                 .map_err(|e| Error::database_unavailable(e.to_string()))?;
+                if let Some(data) = preparation {
+                    tx.execute(
+                        "INSERT INTO workload_transfer_preparations(operation, data) VALUES (?1, ?2)",
+                        params![operation, data],
+                    )
+                    .db_err("persist workload preparation")?;
+                }
+                if let Some(data) = recovery {
+                    if preparation.is_none() || data.is_empty() || data.len() > 16 * 1024 * 1024 {
+                        return Err(conflict("invalid preparation recovery record"));
+                    }
+                    tx.execute(
+                        "INSERT INTO workload_preparation_recovery(operation, data) VALUES (?1, ?2)",
+                        params![operation, data],
+                    ).db_err("persist preparation recovery")?;
+                }
                 tx.commit()
                     .map_err(|e| Error::database_unavailable(e.to_string()))
             })();
@@ -476,6 +515,12 @@ impl SmolvmDb {
         }
         let _gate = self.transfer_gate(true)?;
         self.with_conn(|conn| {
+            if conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM workload_transfer_preparations WHERE operation = ?1)",
+                [operation], |row| row.get::<_, bool>(0),
+            ).db_err("inspect workload preparation ownership")? {
+                return Err(conflict("cancel this workload through its transfer coordinator"));
+            }
             conn.execute_batch("PRAGMA synchronous=FULL;")
                 .map_err(|e| Error::database_unavailable(e.to_string()))?;
             let result = conn

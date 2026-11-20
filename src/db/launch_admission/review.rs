@@ -187,12 +187,20 @@ pub(in crate::db) fn read_record(
     database: &Path,
     name: &str,
 ) -> Result<Option<VmRecord>> {
-    let row: Option<(Vec<u8>, Option<String>)> = conn.query_row(
-        "SELECT v.data, i.generation FROM vms v LEFT JOIN vm_incarnations i ON i.name = v.name WHERE v.name = ?1",
-        [name], |row| Ok((row.get(0)?, row.get(1)?)),
-    ).optional().db_err("read machine settings and identity")?;
-    row.map(|(data, generation)| decode_record(database, name, &data, generation))
-        .transpose()
+    let row: Option<(Vec<u8>, Option<String>, Option<String>)> = conn
+        .query_row(
+            "SELECT v.data, i.generation, e.generation FROM vms v
+         LEFT JOIN vm_incarnations i ON i.name = v.name
+         LEFT JOIN vm_execution_epochs e ON e.name = v.name WHERE v.name = ?1",
+            [name],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()
+        .db_err("read machine settings and identity")?;
+    row.map(|(data, generation, execution)| {
+        decode_record(database, name, &data, generation, execution)
+    })
+    .transpose()
 }
 
 pub(in crate::db) fn decode_record(
@@ -200,9 +208,11 @@ pub(in crate::db) fn decode_record(
     name: &str,
     data: &[u8],
     generation: Option<String>,
+    execution: Option<String>,
 ) -> Result<VmRecord> {
     let mut record: VmRecord =
         serde_json::from_slice(data).db_err("decode reviewed machine settings")?;
+    record.execution_identity = execution.filter(|value| crate::db::incarnation::valid(value));
     // Observation remains possible for diagnosis; launching a record without
     // a valid identity fails closed in capture/from_record/validate_conn.
     record.database_identity = generation

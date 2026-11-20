@@ -71,6 +71,12 @@ pub(crate) struct SavedSession {
     stdin_closed: bool,
 }
 
+impl SavedSession {
+    pub(super) fn origin(&self) -> &Origin {
+        &self.origin
+    }
+}
+
 pub(super) struct Session {
     socket: PathBuf,
     overlay: String,

@@ -439,6 +439,10 @@ pub struct VmRecord {
     #[serde(skip)]
     pub(crate) database_identity: Option<crate::db::launch_admission::RecordIdentity>,
 
+    /// Host-only execution identity, retained after stop and replaced on a new boot.
+    #[serde(skip)]
+    pub(crate) execution_identity: Option<String>,
+
     /// VM name/ID.
     pub name: String,
 
@@ -1032,6 +1036,7 @@ impl VmRecord {
     ) -> Self {
         Self {
             database_identity: None,
+            execution_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1145,6 +1150,7 @@ impl VmRecord {
     ) -> Self {
         Self {
             database_identity: None,
+            execution_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
