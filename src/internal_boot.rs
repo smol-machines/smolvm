@@ -148,8 +148,18 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
     }
 
     // Read boot config
-    let config_data = std::fs::read(&config_path)
+    let config_data = crate::agent::boot_config::read_boot_config_file(&config_path)
         .map_err(|e| crate::Error::agent("read boot config", e.to_string()))?;
+    // The launcher names the config it wrote by digest: the file's directory
+    // belongs to the VM's uid, which could have put another file in its place.
+    if let Some(expected) = std::env::var_os(crate::agent::boot_config::BOOT_CONFIG_SHA256_ENV) {
+        if crate::agent::boot_config::boot_config_digest(&config_data).as_str() != expected {
+            return Err(crate::Error::agent(
+                "read boot config",
+                "boot config is not the one the launcher wrote",
+            ));
+        }
+    }
     let config: BootConfig = serde_json::from_slice(&config_data)
         .map_err(|e| crate::Error::agent("parse boot config", e.to_string()))?;
 
