@@ -11,6 +11,40 @@ pub(crate) struct Store {
 }
 
 impl Store {
+    /// Keep metadata used by a moving workload stable, including containers
+    /// that execute inside another container's machine. Ordinary metadata
+    /// changes need no container inventory scan when no transfer is active.
+    pub(crate) fn admit_dependency_mutation(
+        &self,
+        db: &crate::db::SmolvmDb,
+        paths: &[PathBuf],
+        used_by: impl Fn(&ContainerRecord) -> bool,
+    ) -> crate::Result<Vec<crate::db::transfer_admission::MutationGuard>> {
+        let storage = db.admit_storage_mutation(paths)?;
+        if !storage.has_active_transfers() {
+            return Ok(vec![storage]);
+        }
+        let records: std::collections::BTreeMap<_, _> = self
+            .transfer_containers()?
+            .into_iter()
+            .map(|record| (record.id.clone(), record))
+            .collect();
+        let mut machines = std::collections::BTreeSet::new();
+        for (id, record) in &records {
+            if used_by(record) {
+                let owner = super::transfer::machine_owner(&records, id).map_err(|error| {
+                    crate::Error::agent_conflict("change workload metadata", error.message)
+                })?;
+                machines.insert(records[owner].machine.clone());
+            }
+        }
+        let mut guards = vec![storage];
+        for machine in machines {
+            guards.push(db.admit_machine_mutation(&machine)?);
+        }
+        Ok(guards)
+    }
+
     pub(crate) fn open(root: &Path) -> crate::Result<Self> {
         use std::os::unix::fs::PermissionsExt;
         std::fs::create_dir_all(root)?;
@@ -49,6 +83,21 @@ impl Store {
         write_json(&dir.join("config.json"), record)
     }
 
+    pub(crate) fn save_container_durable(&self, record: &ContainerRecord) -> crate::Result<()> {
+        let dir = self.container_dir(&record.id);
+        // Do not recreate a removed container or engine while relinquishing its execution.
+        let path = dir.join("config.json");
+        let bytes = serde_json::to_vec_pretty(record)
+            .map_err(|error| crate::Error::config("engine execution", error.to_string()))?;
+        let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
+        use std::io::Write;
+        staged.write_all(&bytes)?;
+        staged.as_file().sync_all()?;
+        staged.persist(&path).map_err(|error| error.error)?;
+        std::fs::File::open(&dir)?.sync_all()?;
+        Ok(())
+    }
+
     pub(crate) fn remove_container(&self, id: &str) {
         let _ = std::fs::remove_dir_all(self.container_dir(id));
     }
@@ -72,6 +121,62 @@ impl Store {
         Ok(records)
     }
 
+    /// Transfer preflight must see every possible volume user. Ordinary listing
+    /// tolerates damaged records; a transfer must refuse to proceed if one could
+    /// conceal a writer or a machine-sharing dependency.
+    pub(crate) fn transfer_containers(&self) -> crate::Result<Vec<ContainerRecord>> {
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(self.root.join("containers"))? {
+            let entry = entry?;
+            if !entry.file_type()?.is_dir() {
+                return Err(crate::Error::config(
+                    "plan transfer",
+                    "invalid container record directory",
+                ));
+            }
+            let path = entry.path().join("config.json");
+            let record: ContainerRecord = required_record(&path)?;
+            if !valid_id(&record.id) || entry.file_name() != record.id.as_str() {
+                return Err(crate::Error::config(
+                    "plan transfer",
+                    "container record identity does not match its directory",
+                ));
+            }
+            records.push(record);
+        }
+        records.sort_by(|a, b| a.id.cmp(&b.id));
+        Ok(records)
+    }
+
+    /// Strict flat-object reader, returning the on-disk key for identity checks.
+    pub(crate) fn transfer_objects<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+    ) -> crate::Result<Vec<(String, T)>> {
+        let mut records = Vec::new();
+        for entry in std::fs::read_dir(self.root.join(kind))? {
+            let path = entry?.path();
+            if path.extension().is_some_and(|e| e == "json") {
+                let key = path.file_stem().and_then(|s| s.to_str()).ok_or_else(|| {
+                    crate::Error::config("plan transfer", "invalid object record name")
+                })?;
+                records.push((key.to_owned(), required_record(&path)?));
+            }
+        }
+        records.sort_by(|a, b| a.0.cmp(&b.0));
+        Ok(records)
+    }
+
+    /// Read one reviewed dependency without accepting symlinks or special files.
+    /// The caller validates its key and embedded identity before using it.
+    pub(crate) fn transfer_object<T: DeserializeOwned>(
+        &self,
+        kind: &str,
+        key: &str,
+    ) -> crate::Result<T> {
+        required_record(&self.object_path(kind, key))
+    }
+
     /// `<root>/<kind>/<name>.json` for the flat object kinds.
     pub(crate) fn object_path(&self, kind: &str, name: &str) -> PathBuf {
         self.root.join(kind).join(format!("{name}.json"))
@@ -86,8 +191,15 @@ impl Store {
         write_json(&self.object_path(kind, name), value)
     }
 
-    pub(crate) fn remove_object(&self, kind: &str, name: &str) {
-        let _ = std::fs::remove_file(self.object_path(kind, name));
+    pub(crate) fn remove_object(&self, kind: &str, name: &str) -> crate::Result<()> {
+        match std::fs::remove_file(self.object_path(kind, name)) {
+            Ok(()) => Ok(()),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(e) => Err(crate::Error::config(
+                "engine record",
+                format!("remove {kind}/{name}: {e}"),
+            )),
+        }
     }
 
     pub(crate) fn load_objects<T: DeserializeOwned>(&self, kind: &str) -> crate::Result<Vec<T>> {
@@ -112,7 +224,34 @@ impl Store {
     }
 }
 
-fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
+pub(super) fn valid_id(id: &str) -> bool {
+    id.len() == 64
+        && id
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+}
+
+fn required_record<T: DeserializeOwned>(path: &Path) -> crate::Result<T> {
+    use std::os::unix::fs::OpenOptionsExt;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    if !file.metadata()?.is_file() {
+        return Err(crate::Error::config(
+            "plan transfer",
+            "object record is not a regular file",
+        ));
+    }
+    serde_json::from_reader(file).map_err(|error| {
+        crate::Error::config(
+            "plan transfer",
+            format!("unreadable record {}: {error}", path.display()),
+        )
+    })
+}
+
+pub(super) fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     let bytes = serde_json::to_vec_pretty(value)
         .map_err(|e| crate::Error::config("engine record", e.to_string()))?;
     let tmp = path.with_extension(format!("{}.tmp", super::util::new_id()));
@@ -121,7 +260,7 @@ fn write_json<T: Serialize>(path: &Path, value: &T) -> crate::Result<()> {
     Ok(())
 }
 
-fn read_json<T: DeserializeOwned>(path: &Path) -> crate::Result<Option<T>> {
+pub(super) fn read_json<T: DeserializeOwned>(path: &Path) -> crate::Result<Option<T>> {
     match std::fs::read(path) {
         Ok(bytes) => serde_json::from_slice(&bytes)
             .map(Some)

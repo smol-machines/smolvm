@@ -6,3 +6,5 @@ lib/libepoxy.0.dylib filter=lfs diff=lfs merge=lfs -text
 lib/linux-x86_64/*.so* filter=lfs diff=lfs merge=lfs -text
 lib/linux-aarch64/*.so* filter=lfs diff=lfs merge=lfs -text
 lib/windows-x86_64/*.dll filter=lfs diff=lfs merge=lfs -text
+# Unified diff context represents an empty line with one space.
+patches/crun/*.patch whitespace=-blank-at-eol

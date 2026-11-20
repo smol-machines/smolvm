@@ -21,6 +21,8 @@ pub const COMPAT_NET_FEATURES: u32 =
     NET_FEATURE_GUEST_CSUM | NET_FEATURE_GUEST_TSO4 | NET_FEATURE_GUEST_TSO6;
 /// TSI feature bit that enables INET socket hijacking.
 pub const TSI_FEATURE_HIJACK_INET: u32 = 1 << 0;
+/// TSI host socket ownership; requires the matching runtime and guest ABI.
+pub const TSI_FEATURE_HOST_BIND: u32 = 1 << 2;
 
 /// Network backend override for machine launch.
 #[derive(
@@ -42,6 +44,9 @@ pub enum NetworkBackend {
     /// Use virtio-net with the host-side smolvm network stack.
     #[value(name = "virtio-net")]
     VirtioNet,
+    /// Share host TCP/UDP addresses and ports through libkrun host sockets.
+    #[value(name = "host")]
+    Host,
 }
 
 impl NetworkBackend {
@@ -50,6 +55,7 @@ impl NetworkBackend {
         match self {
             Self::Tsi => "tsi",
             Self::VirtioNet => "virtio-net",
+            Self::Host => "host",
         }
     }
 
@@ -58,6 +64,7 @@ impl NetworkBackend {
         match self {
             Self::Tsi => "tsi",
             Self::VirtioNet => "virtio-net",
+            Self::Host => "host",
         }
     }
 }

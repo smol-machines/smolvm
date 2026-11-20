@@ -89,24 +89,14 @@ pub struct PackedLaunchConfig<'a> {
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
-/// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
-/// begins with the qcow2 magic (`QFI\xfb`), else `0` (raw). Matches
-/// `DiskFormat::to_krun_u32`. Reading the bytes keeps the format in sync with
-/// what libkrun will parse, regardless of the file's extension.
-fn krun_disk_format(path: &Path) -> u32 {
-    use std::io::Read;
-    const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
-    let mut magic = [0u8; 4];
-    let is_qcow2 = std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && magic == QCOW2_MAGIC;
-    if is_qcow2 {
-        1
-    } else {
-        0
-    }
-}
+/// The `krun_add_disk2` image-format code for every disk this launcher
+/// attaches: raw. A packed run's disks are raw by construction (the packer
+/// flattens qcow2 disks, and runtime disks are created as sparse raw files),
+/// and their bytes are not the host's to trust: a pack's storage template is
+/// its author's, and a daemon's disks are its guest's. Reading the format
+/// from those bytes would let either one present a qcow2 header that names a
+/// host file as its backing or data file, and libkrun follows both.
+const PACKED_DISK_FORMAT: u32 = 0;
 
 /// Launch VM using dynamically loaded libkrun (for packed/sidecar mode).
 ///
@@ -368,32 +358,12 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // Set root filesystem via the root virtiofs tag (upstream removed
-    // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
     let root = try_or_free_ctx!(
         path_to_cstring(config.rootfs_path),
         "rootfs path contains null byte"
     );
-    let root_tag = cstr("/dev/root");
-    // Default root with a 512 MB DAX window (matches the removed krun_set_root).
-    // Plain krun_add_virtiofs passes shm_size=0 (no DAX), dropping virtiofs to
-    // writeback caching so the guest's ready-marker write isn't visible to the
-    // host until the socket-probe grace — a multi-second boot-time regression.
-    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
-        free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
-    };
-    // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe {
-        add_virtiofs3(
-            ctx,
-            root_tag.as_ptr(),
-            root.as_ptr(),
-            super::virtiofs::rootfs_dax_window(),
-            true,
-        )
-    } < 0
-    {
-        free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
+    if let Err(error) = super::virtiofs::configure_rootfs(krun, ctx, &root, true) {
+        free_ctx_on_err!(error.to_string());
     }
 
     let network_plan = plan_launch_network(
@@ -439,6 +409,27 @@ pub fn launch_agent_vm_dynamic(
             );
 
             tracing::info!("network backend: tsi");
+            None
+        }
+        EffectiveNetworkBackend::Host => {
+            if let Err(reason) = krun.ensure_host_network() {
+                free_ctx_on_err!(reason);
+            }
+            if unsafe {
+                (krun.add_vsock)(
+                    ctx,
+                    TSI_FEATURE_HIJACK_INET | crate::network::backend::TSI_FEATURE_HOST_BIND,
+                )
+            } < 0
+            {
+                free_ctx_on_err!("krun_add_vsock rejected host networking");
+            }
+            crate::agent::launcher::start_tsi_dns_forwarder(
+                ctx,
+                krun.set_dns_forwarder,
+                config.resources.dns,
+            );
+            tracing::info!("network backend: host");
             None
         }
         EffectiveNetworkBackend::VirtioNet => {
@@ -617,7 +608,7 @@ pub fn launch_agent_vm_dynamic(
         path_to_cstring(config.storage_path),
         "storage path contains null byte"
     );
-    let storage_format = krun_disk_format(config.storage_path);
+    let storage_format = PACKED_DISK_FORMAT;
     let storage_result = add_dynamic_block_disk(
         krun,
         ctx,
@@ -640,7 +631,7 @@ pub fn launch_agent_vm_dynamic(
         let overlay_id = cstr("overlay");
         let overlay_disk =
             try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
-        let overlay_format = krun_disk_format(overlay);
+        let overlay_format = PACKED_DISK_FORMAT;
         let overlay_result = add_dynamic_block_disk(
             krun,
             ctx,
@@ -913,6 +904,10 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
+    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
+        free_ctx_on_err!("mounts require libkrun with krun_add_virtiofs3");
+    };
+
     // Packed image layers use DAX where the guest architecture supports it.
     // User mounts follow the same explicit policy as every other launch path.
     // Add virtiofs mount for packed layers (AFTER set_exec)
@@ -972,6 +967,8 @@ pub fn launch_agent_vm_dynamic(
         // A watched share keeps missing names for a second (see the mount
         // loop in `launcher.rs`); needs krun_add_virtiofs4.
         let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
+        // A staged share is only read by the guest (see `launcher.rs`).
+        let share_read_only = mount.read_only || mount.staged;
         // SAFETY: ctx is valid, tag and host_path are valid C strings
         let mut added = -libc::EINVAL;
         if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
@@ -981,7 +978,7 @@ pub fn launch_agent_vm_dynamic(
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
                 )
             };
@@ -994,7 +991,7 @@ pub fn launch_agent_vm_dynamic(
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                 )
             };
         }
@@ -1171,7 +1168,66 @@ pub(crate) fn describe_krun_start_error(ret: i32) -> String {
         );
     }
 
+    // Confirm unsupported virtualization before replacing the generic EINVAL
+    // hint: permission and resource errors do not establish host incapacity.
+    #[cfg(target_os = "macos")]
+    if -ret == 22 && hypervisor_vm_create_probe() == Some(false) {
+        return format!(
+            "krun_start_enter returned: {ret} (Hypervisor.framework reports \
+             virtualization is unsupported on this host; if this is a virtual \
+             machine, use a host with nested virtualization support)"
+        );
+    }
+
     describe_start_error_with_probe(ret, kvm_error.as_deref())
+}
+
+/// Whether Hypervisor.framework confirms virtualization support.
+/// `Some(false)` means explicitly unsupported; missing APIs, permissions and
+/// resource failures are inconclusive. A VM already in this process is retained.
+#[cfg(target_os = "macos")]
+fn hypervisor_vm_create_probe() -> Option<bool> {
+    type VmCreate = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+    type VmDestroy = unsafe extern "C" fn() -> u32;
+    let lib = unsafe {
+        libloading::Library::new(
+            "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+        )
+    }
+    .ok()?;
+    let vm_create: libloading::Symbol<VmCreate> = unsafe { lib.get(b"hv_vm_create") }.ok()?;
+    // Resolve cleanup before creating anything. A NULL configuration is the
+    // documented default and needs no retained configuration object to release.
+    let vm_destroy: libloading::Symbol<VmDestroy> = unsafe { lib.get(b"hv_vm_destroy") }.ok()?;
+    probe_hypervisor_vm(
+        || unsafe { vm_create(std::ptr::null_mut()) },
+        || unsafe { vm_destroy() },
+    )
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn probe_hypervisor_vm(
+    create: impl FnOnce() -> u32,
+    destroy: impl FnOnce() -> u32,
+) -> Option<bool> {
+    let result = create();
+    // Only destroy the VM this probe created, never an existing caller's VM.
+    if result == 0 && destroy() != 0 {
+        return None;
+    }
+    hv_probe_verdict(result)
+}
+
+#[cfg(any(target_os = "macos", test))]
+fn hv_probe_verdict(ret: u32) -> Option<bool> {
+    const HV_SUCCESS: u32 = 0;
+    const HV_BUSY: u32 = 0xfae9_4002;
+    const HV_UNSUPPORTED: u32 = 0xfae9_400f;
+    match ret {
+        HV_SUCCESS | HV_BUSY => Some(true),
+        HV_UNSUPPORTED => Some(false),
+        _ => None,
+    }
 }
 
 pub(crate) fn describe_krun_start_error_with_detail(ret: i32, detail: Option<&str>) -> String {
@@ -1296,25 +1352,12 @@ pub(crate) fn truncate_console_log(path: &Path) {
     }
 }
 
-/// Longest Unix socket path the host accepts: `sockaddr_un.sun_path` holds 104
-/// bytes on macOS and 108 elsewhere, including the terminating NUL.
-const MAX_UNIX_SOCKET_PATH: usize = if cfg!(target_os = "macos") { 103 } else { 107 };
-
-/// libkrun binds the sockets it listens on inside `krun_start_enter` and
-/// reports a path that does not fit only as a bare EINVAL, which reads like a
-/// bad disk. Check the length before handing a socket to libkrun so the error
-/// names the path and the way out.
+/// Check addressability before libkrun starts; the shared socket library uses
+/// a private alias for deep paths while keeping the socket in its original directory.
 pub(crate) fn check_socket_path_len(path: &Path) -> Result<(), String> {
-    let len = path.as_os_str().len();
-    if len <= MAX_UNIX_SOCKET_PATH {
-        return Ok(());
-    }
-    Err(format!(
-        "socket path is {len} bytes, over the {MAX_UNIX_SOCKET_PATH}-byte limit for Unix \
-         sockets on this host: {}. smolvm keeps machine sockets under your cache \
-         directory, so run it with a shorter HOME (or XDG_CACHE_HOME on Linux)",
-        path.display()
-    ))
+    krun_socket::SocketPath::new(path)
+        .map(|_| ())
+        .map_err(|error| format!("cannot address Unix socket {}: {error}", path.display()))
 }
 
 /// Convert a Path to a CString.
@@ -1360,14 +1403,14 @@ mod tests {
     }
 
     #[test]
-    fn socket_path_over_the_host_limit_is_named() {
-        let fits = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH - 1)));
-        assert!(check_socket_path_len(&fits).is_ok());
-        let long = PathBuf::from(format!("/{}", "a".repeat(MAX_UNIX_SOCKET_PATH)));
-        let err = check_socket_path_len(&long).unwrap_err();
-        assert!(err.contains(&format!("{} bytes", MAX_UNIX_SOCKET_PATH + 1)));
-        assert!(err.contains(&long.display().to_string()));
-        assert!(err.contains("HOME"));
+    fn deep_socket_paths_are_addressable_and_missing_parents_are_named() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("long-state-root".repeat(10));
+        std::fs::create_dir(&parent).unwrap();
+        assert!(check_socket_path_len(&parent.join("agent.sock")).is_ok());
+        let missing = parent.join("absent").join("agent.sock");
+        let error = check_socket_path_len(&missing).unwrap_err();
+        assert!(error.contains(&missing.display().to_string()));
     }
 
     #[test]
@@ -1457,6 +1500,85 @@ mod tests {
         assert!(!entitlement_enabled(
             "<key>com.apple.security.cs.allow-jit</key><true/>"
         ));
+    }
+
+    #[test]
+    fn hv_probe_does_not_misdiagnose_resource_or_permission_failures() {
+        for code in [
+            0xfae9_4001,
+            0xfae9_4003,
+            0xfae9_4005,
+            0xfae9_4007,
+            0xfae9_4008,
+        ] {
+            assert_eq!(hv_probe_verdict(code), None, "error {code:#x}");
+        }
+    }
+
+    #[test]
+    fn hv_probe_cleans_up_only_a_vm_it_created() {
+        for (code, expected) in [
+            (0, Some(true)),
+            (0xfae9_4002, Some(true)),
+            (0xfae9_400f, Some(false)),
+            (0xfae9_4005, None),
+        ] {
+            let mut destroyed = false;
+            assert_eq!(
+                probe_hypervisor_vm(
+                    || code,
+                    || {
+                        destroyed = true;
+                        0
+                    }
+                ),
+                expected
+            );
+            assert_eq!(destroyed, code == 0);
+        }
+        assert_eq!(probe_hypervisor_vm(|| 0, || 0xfae9_4001), None);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_verdict_is_stable() {
+        let first = hypervisor_vm_create_probe();
+        let second = hypervisor_vm_create_probe();
+        eprintln!("HVF probe verdicts: {first:?}, {second:?}");
+        assert_eq!(first, second);
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn hypervisor_probe_preserves_an_existing_vm() {
+        type Create = unsafe extern "C" fn(*mut std::ffi::c_void) -> u32;
+        type Destroy = unsafe extern "C" fn() -> u32;
+        struct OwnedVm(Destroy);
+        impl Drop for OwnedVm {
+            fn drop(&mut self) {
+                unsafe {
+                    (self.0)();
+                }
+            }
+        }
+        let lib = unsafe {
+            libloading::Library::new(
+                "/System/Library/Frameworks/Hypervisor.framework/Versions/A/Hypervisor",
+            )
+        }
+        .unwrap();
+        let create: libloading::Symbol<Create> = unsafe { lib.get(b"hv_vm_create") }.unwrap();
+        let destroy: libloading::Symbol<Destroy> = unsafe { lib.get(b"hv_vm_destroy") }.unwrap();
+        let result = unsafe { create(std::ptr::null_mut()) };
+        if result != 0 {
+            eprintln!("SKIP: test binary cannot create a VM: {result:#x}");
+            return;
+        }
+        let owned = OwnedVm(*destroy);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
+        assert_eq!(unsafe { create(std::ptr::null_mut()) }, 0xfae9_4002);
+        drop(owned);
+        assert_eq!(hypervisor_vm_create_probe(), Some(true));
     }
 
     #[test]

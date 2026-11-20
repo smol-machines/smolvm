@@ -50,8 +50,12 @@ pub struct S3Volume {
     pub session_token: Option<String>,
 }
 
+/// Guest support for owned container TCP listener discovery and raw app connections.
+pub const CONTAINER_APP_PORTS_CAPABILITY: &str = "container-app-ports-v1";
+
 pub mod auto_ports;
 pub mod binary_stream;
+pub mod container_session;
 pub mod credentials;
 pub mod disk_volume;
 pub mod egress_rule;
@@ -59,6 +63,7 @@ pub mod forkpoint;
 pub mod guest_env;
 pub mod host_pattern;
 pub mod image_ref;
+pub mod interactive_control;
 pub mod intercept;
 pub mod mediated_egress;
 pub mod publish_socket;
@@ -66,6 +71,7 @@ pub mod resolv;
 pub mod retry;
 pub mod secrets;
 pub mod sni;
+pub mod tcp_forward;
 pub mod workload_target;
 
 pub use credentials::{CredentialBinding, CredentialPolicy};
@@ -600,6 +606,37 @@ pub enum ManagedDisk {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum AgentRequest {
+    /// Execute a connection-owned command with independently addressable controls.
+    VmExecControlled {
+        /// Command and its caller-generated lifetime identifier.
+        session: interactive_control::Session,
+    },
+    /// Signal or resize an active command over a separate connection.
+    InteractiveControl {
+        /// Lifetime identifier and operation; never a raw PID.
+        request: interactive_control::Request,
+    },
+    /// Control a container execution whose lifetime is independent of this connection.
+    ContainerSession {
+        /// Start, attach, or exchange sequenced container I/O.
+        control: container_session::Control,
+    },
+    /// Watch guest TCP listener changes; after protocol confirmation, receive
+    /// coalesced little-endian u64 generations until this connection closes.
+    WatchListeners,
+    /// Discover TCP listeners owned by one running Docker workload's cgroup.
+    ContainerPorts {
+        /// Persistent workload overlay identity.
+        overlay_id: String,
+    },
+    /// Connect to an owned TCP listener; after a successful `Ok` with
+    /// `protocol: smol-app-tcp-v1`, this connection carries raw TCP bytes.
+    ContainerPortConnect {
+        /// Persistent workload overlay identity.
+        overlay_id: String,
+        /// A currently listening TCP port belonging to that workload.
+        port: u16,
+    },
     /// Offline trailing CPUs after the host verifies runtime shrink support.
     OfflineCpus {
         /// Retained online CPU count, starting at CPU0; must be nonzero.
@@ -1041,16 +1078,29 @@ pub enum AgentRequest {
         target: Option<WorkloadTarget>,
     },
 
-    /// Append a chunk to the currently open streaming upload.
-    /// If `done` is true, the agent fsyncs and atomically renames the
-    /// staging file onto the target path.
+    /// Begin a streamed directory upload using tar data in [`Self::FileWriteChunk`].
+    /// The archive is bounded by [`FILE_TRANSFER_MAX_TOTAL`] and staged until
+    /// the final chunk, then merged into exactly `path`. Aborting before the
+    /// final chunk leaves the destination untouched; interrupted extraction
+    /// can leave a partial merge. Symbolic links are preserved, not followed.
+    DirectoryWriteBegin {
+        /// Absolute destination directory; its parent must already exist.
+        path: String,
+        /// Filesystem to modify; absent means the agent infers the workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
+    },
+
+    /// Append a chunk to the currently open file or directory upload.
+    /// If `done` is true, a file upload fsyncs and atomically renames its
+    /// staging file; a directory upload validates and merges its archive.
     FileWriteChunk {
         /// Chunk bytes. Typically [`FILE_WRITE_CHUNK_SIZE`] except
         /// for the last chunk.
         #[serde(with = "base64_bytes")]
         data: Vec<u8>,
-        /// True on the final chunk; closes and renames the staging
-        /// file. False on intermediate chunks.
+        /// True on the final chunk, committing the file or extracting the
+        /// directory. False on intermediate chunks.
         done: bool,
     },
 
@@ -1224,6 +1274,13 @@ pub enum AgentRequest {
         overlay_id: String,
     },
 
+    /// Sample the running container's cgroup and network namespace.
+    /// Replies `Ok` with a [`ContainerResourceUsage`].
+    ContainerStats {
+        /// Overlay the container runs on.
+        overlay_id: String,
+    },
+
     /// Stream what the container on `overlay_id` changed against its image,
     /// as one image layer: a tar of the overlay's upper directory with
     /// overlayfs whiteouts turned into OCI `.wh.` markers, and the files the
@@ -1308,6 +1365,73 @@ pub struct ContainerStartSpec {
     pub image_source: Option<ContainerImageSource>,
 }
 
+/// Kernel accounting for one running container, including exited children.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerResourceUsage {
+    /// Cumulative CPU time, including exited descendants, in nanoseconds.
+    pub cpu_usage_ns: u64,
+    /// Cumulative user CPU time in nanoseconds.
+    pub cpu_user_ns: u64,
+    /// Cumulative kernel CPU time in nanoseconds.
+    pub cpu_system_ns: u64,
+    /// CPU bandwidth enforcement periods.
+    pub cpu_periods: u64,
+    /// Periods during which the container was throttled.
+    pub cpu_throttled_periods: u64,
+    /// Cumulative CPU throttling duration in nanoseconds.
+    pub cpu_throttled_ns: u64,
+    /// Current cgroup memory charge, including file cache, in bytes.
+    pub memory_bytes: u64,
+    /// Effective memory ceiling, capped by guest RAM, in bytes.
+    pub memory_limit_bytes: u64,
+    /// Inactive file cache subtracted by Docker when displaying memory.
+    pub inactive_file_bytes: u64,
+    /// Anonymous memory charged to the cgroup, in bytes.
+    pub anonymous_bytes: u64,
+    /// File-backed memory charged to the cgroup, in bytes.
+    pub file_bytes: u64,
+    /// Kernel tasks (threads), as Docker's PIDs column reports them.
+    pub pids: u64,
+    /// Cumulative device I/O, including exited descendants.
+    pub block_io: Vec<ContainerBlockIo>,
+    /// Network-namespace counters; containers sharing a namespace share these.
+    pub networks: std::collections::BTreeMap<String, ContainerNetworkUsage>,
+}
+
+/// Block-device accounting for one container cgroup.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerBlockIo {
+    /// Kernel block device major number.
+    pub major: u32,
+    /// Kernel block device minor number.
+    pub minor: u32,
+    /// Bytes read from this block device.
+    pub read_bytes: u64,
+    /// Bytes written to this block device.
+    pub write_bytes: u64,
+}
+
+/// Counters for one interface in the container's network namespace.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ContainerNetworkUsage {
+    /// Received bytes.
+    pub rx_bytes: u64,
+    /// Received packets.
+    pub rx_packets: u64,
+    /// Receive errors.
+    pub rx_errors: u64,
+    /// Dropped received packets.
+    pub rx_dropped: u64,
+    /// Transmitted bytes.
+    pub tx_bytes: u64,
+    /// Transmitted packets.
+    pub tx_packets: u64,
+    /// Transmit errors.
+    pub tx_errors: u64,
+    /// Dropped transmitted packets.
+    pub tx_dropped: u64,
+}
+
 /// Where a container's image layers come from when the machine it runs in
 /// was booted for another image.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -1389,6 +1513,7 @@ impl AgentRequest {
     /// decision rather than an accidental leak in some future request type.
     pub fn log_summary(&self) -> String {
         match self {
+            AgentRequest::ContainerSession { .. } => "ContainerSession".into(),
             AgentRequest::OnlineMemory {
                 start_address,
                 length_bytes,
@@ -1431,12 +1556,19 @@ impl AgentRequest {
             AgentRequest::MemoryStatus => "MemoryStatus".into(),
             AgentRequest::PressureStatus => "PressureStatus".into(),
             AgentRequest::NetworkTest { .. } => "NetworkTest".into(),
+            AgentRequest::WatchListeners => "WatchListeners".into(),
+            AgentRequest::ContainerPorts { .. } => "ContainerPorts".into(),
+            AgentRequest::ContainerPortConnect { port, .. } => {
+                format!("ContainerPortConnect {{ port: {port} }}")
+            }
             AgentRequest::Shutdown { .. } => "Shutdown".into(),
             AgentRequest::ExportLayer { .. } => "ExportLayer".into(),
             AgentRequest::FlattenLayers { lowerdirs, .. } => {
                 format!("FlattenLayers {{ count: {} }}", lowerdirs.len())
             }
             AgentRequest::VmExec { .. } => "VmExec".into(),
+            AgentRequest::VmExecControlled { .. } => "VmExecControlled".into(),
+            AgentRequest::InteractiveControl { .. } => "InteractiveControl".into(),
             AgentRequest::BranchpointWait { .. } => "BranchpointWait".into(),
             AgentRequest::BranchpointArm => "BranchpointArm".into(),
             AgentRequest::BranchpointPark => "BranchpointPark".into(),
@@ -1448,6 +1580,7 @@ impl AgentRequest {
             AgentRequest::Resize { .. } => "Resize".into(),
             AgentRequest::FileWrite { .. } => "FileWrite".into(),
             AgentRequest::FileWriteBegin { .. } => "FileWriteBegin".into(),
+            AgentRequest::DirectoryWriteBegin { .. } => "DirectoryWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
             AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
@@ -1494,6 +1627,9 @@ impl AgentRequest {
             AgentRequest::ContainerTop { overlay_id } => {
                 format!("ContainerTop {{ overlay: {overlay_id} }}")
             }
+            AgentRequest::ContainerStats { overlay_id } => {
+                format!("ContainerStats {{ overlay: {overlay_id} }}")
+            }
             AgentRequest::ContainerDiff { overlay_id } => {
                 format!("ContainerDiff {{ overlay: {overlay_id} }}")
             }
@@ -1528,6 +1664,11 @@ pub struct DirectoryEntry {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "status", rename_all = "snake_case")]
 pub enum AgentResponse {
+    /// Acknowledgement or sequenced I/O from a durable container execution.
+    ContainerSession {
+        /// Session event, scoped to the execution confirmed by attachment.
+        event: container_session::Event,
+    },
     /// Operation completed successfully.
     Ok {
         /// Response data (varies by request type).

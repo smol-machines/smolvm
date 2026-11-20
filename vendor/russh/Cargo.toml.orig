@@ -1,0 +1,144 @@
+[package]
+name = "russh"
+version = "0.65.2"
+description = "A client and server SSH library."
+authors = ["Pierre-Étienne Meunier <pe@pijul.org>"]
+edition = "2024"
+rust-version = "1.89"
+license = "Apache-2.0"
+readme = "../README.md"
+documentation = "https://docs.rs/russh"
+homepage = "https://github.com/warp-tech/russh"
+repository = "https://github.com/warp-tech/russh"
+keywords = ["ssh"]
+
+[package.metadata.docs.rs]
+all-features = true
+
+[[bench]]
+name = "ciphers"
+harness = false
+
+[dependencies]
+aes.workspace = true
+aws-lc-rs = { version = "1.16.2", optional = true, default-features = false, features = [
+    "alloc",
+    "aws-lc-sys",
+] }
+bitflags = "2.0"
+block-padding = { version = "0.4" }
+byteorder.workspace = true
+bytes.workspace = true
+cbc = { version = "0.2" }
+cipher = "0.5.1" # only pinned due to a cargo-minimal-versions failure in 0.5.0
+criterion = { version = "0.7", optional = true, features = ["html_reports"] }
+crypto-bigint = { version = "0.7.3", features = ["alloc"] }
+ctr = "0.10"
+curve25519-dalek = "5"
+data-encoding = "2.3"
+delegate.workspace = true
+der = "0.8"
+des = { version = "0.9", optional = true }
+digest.workspace = true
+ecdsa = "0.17"
+ed25519-dalek = { version = "3", features = ["alloc", "rand_core", "pkcs8"] }
+elliptic-curve = { version = "0.14", features = ["ecdh"] }
+enum_dispatch = "0.3.13"
+flate2 = { version = "1.0.15", optional = true }
+futures.workspace = true
+generic-array = "1.3.3"
+getrandom = { version = "0.4", features = ["wasm_js"] }
+ghash = "0.6.0" # only pinned due to a cargo-minimal-versions failure in 0.6.0-rc.3
+hex-literal = "1"
+hmac.workspace = true
+inout = { version = "0.2" }
+keccak = "0.2.0"
+log.workspace = true
+md5 = "0.8"
+ml-kem = "0.3"
+module-lattice = "0.2"
+num-bigint = { version = "0.5", features = ["rand_0_10"] }
+p256 = { version = "0.14", features = ["ecdh"] }
+p384 = { version = "0.14", features = ["ecdh"] }
+p521 = { version = "0.14", features = ["ecdh"] }
+pbkdf2 = "0.13"
+pkcs1 = { version = "0.8", optional = true }
+pkcs5 = "0.8"
+pkcs8 = { version = "0.11", features = ["encryption", "std"] }
+polyval = "0.7.1" # only pinned due to a cargo-minimal-versions failure in 0.7.0
+rand.workspace = true
+rand_core = { version = "0.10.0" }
+ring = { version = "0.17.14", optional = true }
+rsa = { version = "0.10", optional = true }
+russh-cryptovec = { version = "0.62.0", path = "../cryptovec", features = [
+    "ssh-encoding",
+] }
+russh-util = { version = "0.52.0", path = "../russh-util" }
+salsa20 = "0.11.0"
+scrypt = "0.12.0"
+sec1 = { version = "0.8", features = ["der"] }
+sha1.workspace = true
+sha2.workspace = true
+sha3 = "0.12.0"
+signature.workspace = true
+spki = "0.8"
+ssh-encoding.workspace = true
+ssh-key.workspace = true
+subtle = "2.4"
+thiserror.workspace = true
+tokio = { workspace = true, features = ["io-util", "sync", "time"] }
+typenum = "1.17"
+universal-hash = "0.6.1" # only pinned due to a cargo-minimal-versions failure in 0.6.0
+zeroize = "1.7"
+
+[dev-dependencies]
+anyhow = "1.0.4"
+clap = { version = "4", features = ["derive"] }
+env_logger.workspace = true
+rand.workspace = true
+ratatui = "0.30"
+shell-escape = "0.1"
+tempfile = "3.14.0"
+tokio = { workspace = true, features = [
+    "io-std",
+    "io-util",
+    "rt-multi-thread",
+    "time",
+    "net",
+    "sync",
+    "macros",
+    "process",
+] }
+
+[features]
+default = ["flate2", "aws-lc-rs", "rsa"]
+# Crypto backends: enable at least one of `aws-lc-rs` or `ring`.
+aws-lc-rs = ["dep:aws-lc-rs"] # Default crypto backend.
+# Danger: 3DES cipher is insecure.
+des = ["dep:des"]
+# Danger: DSA algorithm is insecure.
+dsa = ["ssh-key/dsa"]
+ring = ["dep:ring"]                           # Alternative crypto backend.
+rsa = ["dep:rsa", "dep:pkcs1", "ssh-key/rsa"]
+serde = ["ssh-key/serde"]
+_bench = ["dep:criterion"]
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+tokio = { workspace = true, features = [
+    "io-util",
+    "rt-multi-thread",
+    "time",
+    "net",
+] }
+
+[target.'cfg(windows)'.dependencies]
+pageant = { version = "0.2", path = "../pageant" }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+russh-sftp = "2.3.0"
+tokio.workspace = true
+tokio-stream.workspace = true
+
+[target.'cfg(not(target_os = "windows"))'.dev-dependencies]
+tokio-fd = "0.3"
+termion = "4"

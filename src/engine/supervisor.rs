@@ -99,6 +99,159 @@ fn worker_socket(config: &EngineConfig, id: &str) -> PathBuf {
         .join(format!("w-{}.sock", &id[..24]))
 }
 
+pub(super) struct TerminalOwner {
+    _spawn: std::fs::File,
+    _owner: std::fs::File,
+}
+
+pub(super) async fn available_terminal_owner(
+    engine: &Engine,
+    id: &str,
+) -> ApiResult<Option<TerminalOwner>> {
+    if !super::store::valid_id(id) {
+        return Err(ApiError::bad_request("invalid container ID"));
+    }
+    let spawn = tokio::time::timeout(
+        Duration::from_secs(5),
+        lock(engine.config.root.join(format!("spawn-{id}.lock"))),
+    )
+    .await
+    .map_err(|_| ApiError::conflict("supervisor handoff is busy; retry cancellation"))?
+    .map_err(internal)?;
+    Ok(
+        try_owner_lock(&engine.config.root.join(format!("{id}.lock")))
+            .map_err(internal)?
+            .map(|owner| TerminalOwner {
+                _spawn: spawn,
+                _owner: owner,
+            }),
+    )
+}
+
+fn try_owner_lock(path: &Path) -> std::io::Result<Option<std::fs::File>> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .read(true)
+        .write(true)
+        .open(path)?;
+    // SAFETY: flock borrows this live descriptor and retains no pointers.
+    if unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) } == 0 {
+        return Ok(Some(file));
+    }
+    let error = std::io::Error::last_os_error();
+    if error.kind() == std::io::ErrorKind::WouldBlock {
+        Ok(None)
+    } else {
+        Err(error)
+    }
+}
+
+/// Retire only a terminal private supervisor, never its VM or a live command.
+/// The caller retains scoped VM ownership and rechecks the exact execution
+/// before signaling. Spawn and owner locks prevent concurrent replacements.
+pub(super) async fn terminal_owner(
+    engine: &Engine,
+    id: &str,
+    vm_pid: Option<i32>,
+    _ownership: &crate::db::VmRecoveryGuard,
+    check: impl Fn() -> ApiResult<()> + Sync,
+) -> ApiResult<TerminalOwner> {
+    if !super::store::valid_id(id) {
+        return Err(ApiError::bad_request("invalid container ID"));
+    }
+    let spawn = tokio::time::timeout(
+        Duration::from_secs(5),
+        lock(engine.config.root.join(format!("spawn-{id}.lock"))),
+    )
+    .await
+    .map_err(|_| ApiError::conflict("supervisor handoff is busy; retry cancellation"))?
+    .map_err(internal)?;
+    check()?;
+    let owner_path = engine.config.root.join(format!("{id}.lock"));
+    if let Some(owner) = try_owner_lock(&owner_path).map_err(internal)? {
+        return Ok(TerminalOwner {
+            _spawn: spawn,
+            _owner: owner,
+        });
+    }
+    let stream = tokio::time::timeout(
+        Duration::from_secs(1),
+        tokio::net::UnixStream::connect(worker_socket(&engine.config, id)),
+    )
+    .await
+    .map_err(|_| ApiError::conflict("terminal supervisor connection timed out"))?
+    .map_err(internal)?;
+    let peer = stream.peer_cred().map_err(internal)?;
+    let pid = peer
+        .pid()
+        .filter(|pid| *pid > 1 && *pid != std::process::id() as i32 && Some(*pid) != vm_pid)
+        .ok_or_else(|| ApiError::conflict("terminal supervisor has no usable process identity"))?;
+    // SAFETY: getuid has no arguments or retained pointers.
+    if peer.uid() != unsafe { libc::getuid() } {
+        return Err(ApiError::conflict("terminal supervisor owner changed"));
+    }
+    let started = crate::process::process_start_time(pid)
+        .ok_or_else(|| ApiError::conflict("terminal supervisor process cannot be verified"))?;
+    #[cfg(target_os = "linux")]
+    let process_fd = {
+        // SAFETY: pidfd_open returns a fresh process descriptor without pointers.
+        let fd = unsafe { libc::syscall(libc::SYS_pidfd_open, pid, 0u32) };
+        if fd < 0 {
+            return Err(internal(std::io::Error::last_os_error()));
+        }
+        // SAFETY: a nonnegative result is a fresh descriptor owned here.
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fd as i32) };
+        if crate::process::process_start_time(pid) != Some(started) {
+            return Err(ApiError::conflict("terminal supervisor process changed"));
+        }
+        fd
+    };
+    check()?;
+    // It may have exited while we connected. Prefer its released lock to a signal.
+    if let Some(owner) = try_owner_lock(&owner_path).map_err(internal)? {
+        return Ok(TerminalOwner {
+            _spawn: spawn,
+            _owner: owner,
+        });
+    }
+    #[cfg(target_os = "linux")]
+    let signalled = {
+        // SAFETY: this live pidfd pins the verified process; a null siginfo
+        // requests normal SIGTERM without targeting a recycled numeric PID.
+        unsafe {
+            libc::syscall(
+                libc::SYS_pidfd_send_signal,
+                process_fd.as_raw_fd(),
+                libc::SIGTERM,
+                std::ptr::null::<libc::siginfo_t>(),
+                0u32,
+            ) == 0
+        }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let signalled = crate::process::terminate_verified(pid, Some(started));
+    if !signalled {
+        return Err(ApiError::conflict(
+            "terminal supervisor could not be retired; retry cancellation",
+        ));
+    }
+    drop(stream);
+    let owner = tokio::time::timeout(Duration::from_secs(10), lock(owner_path))
+        .await
+        .map_err(|_| {
+            ApiError::conflict(
+                "terminal supervisor has not relinquished ownership; retry cancellation",
+            )
+        })?
+        .map_err(internal)?;
+    check()?;
+    Ok(TerminalOwner {
+        _spawn: spawn,
+        _owner: owner,
+    })
+}
+
 async fn worker(engine: &Engine, id: &str) -> ApiResult<(tokio::net::UnixStream, std::fs::File)> {
     if id.len() != 64 || !id.bytes().all(|b| b.is_ascii_hexdigit()) {
         return Err(ApiError::bad_request("invalid container ID"));
@@ -273,10 +426,16 @@ fn owner_only_request(owner: &str, method: &axum::http::Method, path: &str) -> b
         return false;
     };
     id == owner
-        && matches!(
-            (method.as_str(), action),
-            ("GET", "json" | "logs" | "top" | "stats") | ("POST", "wait" | "attach" | "resize")
-        )
+        && ((method == axum::http::Method::POST
+            && action
+                .strip_prefix("smol/ports/")
+                .and_then(|s| s.strip_suffix("/connect"))
+                .is_some_and(|p| p.parse::<u16>().is_ok_and(|p| p != 0)))
+            || matches!(
+                (method.as_str(), action),
+                ("GET", "json" | "logs" | "top" | "stats" | "smol/ports")
+                    | ("POST", "wait" | "attach" | "resize")
+            ))
 }
 
 fn resolve_container(engine: &Engine, name: &str) -> ApiResult<String> {
@@ -306,6 +465,7 @@ async fn dispatch_inner(
         return Ok(next.run(req).await);
     }
     if engine.owner.is_some() {
+        super::containers::reconcile_owner(engine).await?;
         if !owner_only_request(engine.owner.as_deref().unwrap(), req.method(), &path) {
             engine.refresh().map_err(internal)?;
         }
@@ -332,6 +492,12 @@ async fn dispatch_inner(
             *req.uri_mut() = format!("/containers/{id}{suffix}{query}")
                 .parse()
                 .map_err(internal)?;
+            // A workload may still be owned by a pre-upgrade supervisor.
+            // Sample its guest through the current adapter instead of letting
+            // an old supervisor return VM-wide or placeholder counters.
+            if req.method() == axum::http::Method::GET && suffix == "/stats" {
+                return Ok(next.run(req).await);
+            }
             target = Some(id);
         }
     } else {
@@ -482,6 +648,8 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
             engine.config.root.join("engine.pid"),
             std::process::id().to_string(),
         )?;
+        super::containers::spawn_pending_recovery(&engine);
+        super::containers::preparation_recovery::spawn_recovery(&engine);
     }
     let app = super::api::router(engine.clone());
     if engine.owner.is_some() {
@@ -514,7 +682,7 @@ pub(super) async fn serve(config: EngineConfig, owner: Option<String>) -> crate:
                     .owner
                     .as_deref()
                     .and_then(|id| e.find_container(id))
-                    .is_some_and(|c| c.is_running() || c.record().state.status == "restarting");
+                    .is_some_and(|c| c.owns_live_execution());
                 if !running && !super::warm::has_live_dependents(&e) && e.activity.idle() {
                     if let Some(id) = &e.owner {
                         match lock(e.config.root.join(format!("spawn-{id}.lock"))).await {
@@ -696,6 +864,42 @@ impl axum::extract::connect_info::Connected<axum::serve::IncomingStream<'_, Conn
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn private_app_requests_stay_on_the_live_container_owner() {
+        use axum::http::Method;
+        let owner = "a".repeat(64);
+        assert!(owner_only_request(
+            &owner,
+            &Method::GET,
+            &format!("/containers/{owner}/smol/ports")
+        ));
+        assert!(owner_only_request(
+            &owner,
+            &Method::POST,
+            &format!("/containers/{owner}/smol/ports/8080/connect")
+        ));
+        for action in [
+            "smol/ports/0/connect",
+            "smol/ports/65536/connect",
+            "smol/ports/8080/connect/extra",
+        ] {
+            assert!(!owner_only_request(
+                &owner,
+                &Method::POST,
+                &format!("/containers/{owner}/{action}")
+            ));
+        }
+        assert!(!owner_only_request(
+            &owner,
+            &Method::GET,
+            "/containers/other/smol/ports"
+        ));
+        assert!(!owner_only_request(
+            &owner,
+            &Method::DELETE,
+            &format!("/containers/{owner}/smol/ports")
+        ));
+    }
     #[tokio::test]
     async fn supervisor_readiness_is_signalled_and_socket_is_removed() {
         let dir = tempfile::tempdir().unwrap();

@@ -85,17 +85,30 @@ fn boot_log(level: &str, msg: &str) {
         }
     }
 }
+mod app_ports;
 mod attach;
 mod auto_ports;
 mod branchpoint;
+#[cfg(target_os = "linux")]
+mod builtin_exec;
 mod container;
+#[cfg(target_os = "linux")]
+mod container_session;
+mod container_stats;
+#[cfg(target_os = "linux")]
+mod controlled_exec;
 mod credentials;
 mod cuda;
+mod directory_write;
 mod dirwatch;
 mod disk_trim;
 mod docker_bridge;
 mod forkpoint;
+mod interactive_control;
+#[cfg(all(test, target_os = "linux"))]
+mod interactive_control_tests;
 mod io_target;
+mod listener_watch;
 #[cfg(target_os = "linux")]
 mod memory_trim;
 mod mount_owner;
@@ -114,8 +127,13 @@ mod retry;
 mod rosetta;
 mod rosetta_tracer;
 mod s3mount;
+#[cfg(target_os = "linux")]
+mod sftp;
 mod ssh_agent;
 mod storage;
+#[cfg(target_os = "linux")]
+mod tcp_forward;
+mod terminal_modes;
 #[cfg(target_os = "linux")]
 mod timesync;
 mod vsock;
@@ -137,9 +155,6 @@ const MAX_MESSAGE_SIZE: usize = 16 * 1024 * 1024; // 16MB
 /// Read larger ready chunks to amortize framing and socket writes; a short
 /// read is sent immediately, without waiting for the buffer to fill.
 const IO_BUFFER_SIZE: usize = 64 * 1024;
-
-/// Default poll timeout in milliseconds for interactive I/O loop.
-const INTERACTIVE_POLL_TIMEOUT_MS: i32 = 100;
 
 /// Timeout for network connectivity test operations.
 /// Used in diagnostics/troubleshooting functions.
@@ -347,6 +362,14 @@ fn maybe_set_clock_from_host() {
 }
 
 fn main() {
+    #[cfg(target_os = "linux")]
+    if builtin_exec::requested() {
+        std::process::exit(builtin_exec::run_helper());
+    }
+    #[cfg(target_os = "linux")]
+    if controlled_exec::helper_requested() {
+        std::process::exit(controlled_exec::run_helper());
+    }
     if live_resources::filesystem_helper_requested() {
         std::process::exit(live_resources::run_filesystem_helper());
     }
@@ -2200,7 +2223,13 @@ fn needs_work_slot(request: &AgentRequest) -> bool {
     // like a daemon, not like a unit of work.
     !matches!(
         request,
-        AgentRequest::Ping | AgentRequest::Shutdown { .. } | AgentRequest::ContainerStart(_)
+        AgentRequest::Ping
+            | AgentRequest::InteractiveControl { .. }
+            | AgentRequest::Shutdown { .. }
+            | AgentRequest::ContainerStart(_)
+            | AgentRequest::ContainerSession { .. }
+            | AgentRequest::ContainerPortConnect { .. }
+            | AgentRequest::WatchListeners
     )
 }
 
@@ -2377,6 +2406,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut directory_session: Option<directory_write::Session> = None;
 
     loop {
         // Read length header
@@ -2452,6 +2482,13 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
 
         debug!(method = %request.log_summary(), "received request");
 
+        // A new operation aborts staged uploads, including requests handled by
+        // early streaming branches below. Only upload chunks retain a session.
+        if !matches!(request, AgentRequest::FileWriteChunk { .. }) {
+            write_session = None;
+            directory_session = None;
+        }
+
         // A fork clone resumes this already-initialized agent with fresh
         // virtiofs devices. Repair hidden/stale boot mounts before replying to
         // even a Ping, so fork readiness cannot race the inherited workload's
@@ -2518,6 +2555,11 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         }
         | AgentRequest::Run { tty: true, .. } = &request
         {
+            // Admission may have waited behind other commands. Interactive
+            // work belongs to this connection and must not start after cancel.
+            if process::is_peer_closed(stream.as_raw_fd()) {
+                return Ok(());
+            }
             // Handle interactive session
             handle_interactive_run(stream, request)?;
             continue;
@@ -2533,11 +2575,42 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         if let AgentRequest::VmExec {
             interactive: true, ..
         }
-        | AgentRequest::VmExec { tty: true, .. } = &request
+        | AgentRequest::VmExec { tty: true, .. }
+        | AgentRequest::VmExecControlled { .. } = &request
         {
+            if process::is_peer_closed(stream.as_raw_fd()) {
+                return Ok(());
+            }
             // Handle interactive VM exec session
             handle_interactive_vm_exec(stream, request)?;
             continue;
+        }
+
+        if matches!(request, AgentRequest::WatchListeners) {
+            listener_watch::serve(stream)?;
+            return Ok(());
+        }
+
+        if let AgentRequest::ContainerPortConnect { overlay_id, port } = request {
+            app_ports::connect(stream, &overlay_id, port)?;
+            return Ok(());
+        }
+
+        if let AgentRequest::ContainerSession { control } = request {
+            #[cfg(target_os = "linux")]
+            container_session::serve(stream, control)?;
+            #[cfg(not(target_os = "linux"))]
+            {
+                let _ = control;
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        "container sessions require Linux",
+                        error_codes::INVALID_REQUEST,
+                    ),
+                )?;
+            }
+            return Ok(());
         }
 
         // ContainerStart runs a container's command as its init and streams
@@ -2633,15 +2706,46 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             target,
         } = request
         {
-            // Drop any leftover session now (Drop cleans its tmp file) before
-            // starting a new one. `take()` makes the drop explicit and keeps the
-            // value from looking like a dead store.
-            let _ = write_session.take();
             let (new_session, response) =
                 handle_file_write_begin(path, mode, uid, gid, total_size, target.as_ref());
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
+        }
+        if let AgentRequest::DirectoryWriteBegin { path, target } = request {
+            let response = match directory_write::Session::begin(&path, target.as_ref()) {
+                Ok(session) => {
+                    directory_session = Some(session);
+                    AgentResponse::Ok { data: None }
+                }
+                Err(error) => error,
+            };
+            send_response(stream, &response)?;
+            continue;
+        }
+        if let AgentRequest::FileWriteChunk { ref data, done } = request {
+            if let Some(mut session) = directory_session.take() {
+                let result = session.write(data);
+                let response = match result {
+                    Err(error) => AgentResponse::error(error, error_codes::FILE_IO_FAILED),
+                    Ok(()) if done => {
+                        let client = stream.as_raw_fd();
+                        let result = with_keepalive(stream, FILE_FINALIZE_KEEPALIVE, || {
+                            session.finish(Some(client))
+                        });
+                        match result {
+                            Ok(()) => AgentResponse::Ok { data: None },
+                            Err(error) => AgentResponse::error(error, error_codes::FILE_IO_FAILED),
+                        }
+                    }
+                    Ok(()) => {
+                        directory_session = Some(session);
+                        AgentResponse::Ok { data: None }
+                    }
+                };
+                send_response(stream, &response)?;
+                continue;
+            }
         }
         if let AgentRequest::FileWriteChunk { data, done } = request {
             // The last chunk syncs the staged file and, for a running
@@ -2658,19 +2762,6 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
             write_session = new_session;
             send_response(stream, &response)?;
             continue;
-        }
-
-        // Any other request mid-session is a protocol error. Drop the
-        // session (Drop cleans the staging file) and proceed — the
-        // operator's new request is honored rather than failed; the
-        // alternative (error out) buys no safety since the drop
-        // already handled cleanup.
-        if write_session.is_some() {
-            debug!(
-                method = %request.log_summary(),
-                "dropping in-flight FileWrite session: non-chunk request arrived"
-            );
-            write_session = None;
         }
 
         // Handle regular request. Pass the stream's fd so long-running
@@ -2721,6 +2812,7 @@ fn handle_request(
         AgentRequest::Ping
         | AgentRequest::NetworkTest { .. }
         | AgentRequest::VmExec { .. }
+        | AgentRequest::InteractiveControl { .. }
         // Live growth only accepts an already-mounted disk. Never enter the
         // boot-time mount/format fallback as a side effect of this request.
         | AgentRequest::GrowFilesystem { .. }
@@ -2738,6 +2830,8 @@ fn handle_request(
             let mut capabilities = vec![
                 smolvm_protocol::forkpoint::TYPED_BRANCHPOINT_CAPABILITY.to_string(),
                 smolvm_protocol::WORKLOAD_TARGET_CAPABILITY.to_string(),
+                smolvm_protocol::CONTAINER_APP_PORTS_CAPABILITY.to_string(),
+                smolvm_protocol::container_session::CAPABILITY.to_string(),
                 smolvm_protocol::QUIESCED_SHUTDOWN_CAPABILITY.to_string(),
                 smolvm_protocol::PREPARE_FILE_ACCESS_CAPABILITY.to_string(),
                 smolvm_protocol::ONLINE_FILESYSTEM_GROWTH_CAPABILITY.to_string(),
@@ -2750,6 +2844,12 @@ fn handle_request(
             if workload::logs_enabled() {
                 capabilities.push(smolvm_protocol::WORKLOAD_LOGS_CAPABILITY.to_string());
             }
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::CAPABILITY.to_string());
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::TCP_CAPABILITY.to_string());
+            #[cfg(target_os = "linux")]
+            capabilities.push(smolvm_protocol::interactive_control::SFTP_CAPABILITY.to_string());
             if attach::available() {
                 capabilities.push(smolvm_protocol::ATTACH_MOUNT_CAPABILITY.to_string());
             }
@@ -2766,6 +2866,11 @@ fn handle_request(
             }
         }
 
+        AgentRequest::InteractiveControl { request } => interactive_control::handle(&request),
+        AgentRequest::VmExecControlled { .. } => AgentResponse::error(
+            "controlled VM exec requires an interactive connection",
+            error_codes::INVALID_REQUEST,
+        ),
         AgentRequest::FsNotify { events } => handle_fsnotify(&events),
 
         // Pull is handled separately in handle_streaming_pull for progress streaming
@@ -3068,12 +3173,12 @@ fn handle_request(
 
         // Streaming uploads go through `handle_connection`'s
         // per-connection session state so they can't land here.
-        AgentRequest::FileWriteBegin { .. } | AgentRequest::FileWriteChunk { .. } => {
-            AgentResponse::error(
-                "streaming file write must be handled at connection level",
-                error_codes::INTERNAL_ERROR,
-            )
-        }
+        AgentRequest::FileWriteBegin { .. }
+        | AgentRequest::DirectoryWriteBegin { .. }
+        | AgentRequest::FileWriteChunk { .. } => AgentResponse::error(
+            "streaming file write must be handled at connection level",
+            error_codes::INTERNAL_ERROR,
+        ),
 
         // Streaming read goes through `handle_connection`'s explicit
         // dispatch so it can emit multiple responses per request.
@@ -3118,10 +3223,12 @@ fn handle_request(
 
         AgentRequest::PodDelete { id, exec_id } => pod::handle_pod_delete(&id, exec_id.as_deref()),
 
-        AgentRequest::ContainerStart(_) => AgentResponse::error(
-            "ContainerStart is a streaming request",
-            error_codes::INVALID_REQUEST,
-        ),
+        AgentRequest::ContainerStart(_) | AgentRequest::ContainerSession { .. } => {
+            AgentResponse::error(
+                "ContainerStart is a streaming request",
+                error_codes::INVALID_REQUEST,
+            )
+        }
 
         AgentRequest::ContainerSignal {
             overlay_id,
@@ -3130,6 +3237,16 @@ fn handle_request(
         } => container::handle_container_signal(&overlay_id, &signal, all),
 
         AgentRequest::ContainerTop { overlay_id } => container::handle_container_top(&overlay_id),
+        AgentRequest::ContainerStats { overlay_id } => container_stats::handle(&overlay_id),
+        AgentRequest::WatchListeners => AgentResponse::error(
+            "listener watches require streaming dispatch",
+            error_codes::INVALID_REQUEST,
+        ),
+        AgentRequest::ContainerPorts { overlay_id } => app_ports::list(&overlay_id),
+        AgentRequest::ContainerPortConnect { .. } => AgentResponse::error(
+            "app connections require streaming dispatch",
+            error_codes::INVALID_REQUEST,
+        ),
 
         AgentRequest::ContainerArchive {
             image,
@@ -4128,9 +4245,9 @@ fn handle_streaming_file_read(
 
 /// Stream a tar archive of a directory directly over vsock.
 ///
-/// This deliberately runs in the agent namespace: boot-time staged mounts are
-/// visible there even when an image workload is active, and no temporary
-/// archive needs to traverse virtiofs or occupy the guest disk.
+/// Use the selected workload namespace so its mounted folders are visible;
+/// bare machines retain the agent namespace and its boot-time staged mounts.
+/// Neither path writes a temporary archive to the guest disk.
 fn handle_streaming_archive_directory(
     stream: &mut WireStream<impl ReadWrite>,
     path: &str,
@@ -4143,6 +4260,33 @@ fn handle_streaming_archive_directory(
             return Ok(());
         }
     };
+    if let nsfile::GuestNs::Container(namespace) = root.namespace() {
+        let mut archive = match namespace.archive(path) {
+            Ok(archive) => archive,
+            Err(message) => {
+                send_response(
+                    stream,
+                    &AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+                )?;
+                return Ok(());
+            }
+        };
+        send_data_chunks_body(
+            stream,
+            &mut archive,
+            smolvm_protocol::LAYER_CHUNK_SIZE,
+            "failed to read container archive",
+            error_codes::FILE_IO_FAILED,
+        )?;
+        let response = match archive.finish() {
+            Ok(()) => AgentResponse::DataChunk {
+                data: Vec::new(),
+                done: true,
+            },
+            Err(message) => AgentResponse::error(message, error_codes::FILE_IO_FAILED),
+        };
+        return send_response(stream, &response);
+    }
     // Resolve through the same containment check single-file reads use, rather
     // than trusting the requested path. `normalize_guest_path` alone is lexical:
     // it rejects `..` but happily accepts a path whose final component is a
@@ -6389,8 +6533,21 @@ fn spawn_interactive_command(
 /// The client went away: kill the command and everything it started. For an
 /// image container the command is a grandchild (under `crun exec`), so killing
 /// only the direct child would leave it running.
-fn kill_child_on_disconnect(child: &mut Child) -> i32 {
+fn terminate_interactive_child(
+    child: &mut Child,
+    control: Option<&interactive_control::Registration>,
+) {
+    if let Some(control) = control {
+        control.terminate();
+    }
     process::kill_child_tree(child);
+}
+
+fn kill_child_on_disconnect(
+    child: &mut Child,
+    control: Option<&interactive_control::Registration>,
+) -> i32 {
+    terminate_interactive_child(child, control);
     124
 }
 
@@ -6461,10 +6618,27 @@ impl InteractiveFrame {
     }
 }
 
+// A half-close cancels interactive execution while leaving the response
+// channel open for Exited. Linux requires POLLRDHUP to observe it while
+// backpressure temporarily disables POLLIN.
+#[cfg(target_os = "linux")]
+const INTERACTIVE_READ_HANGUP: libc::c_short = libc::POLLRDHUP;
+#[cfg(not(target_os = "linux"))]
+const INTERACTIVE_READ_HANGUP: libc::c_short = 0;
+
 fn run_interactive_loop(
     stream: &mut WireStream<impl ReadWrite>,
     child: &mut Child,
     timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    run_interactive_loop_controlled(stream, child, timeout_ms, None)
+}
+
+fn run_interactive_loop_controlled(
+    stream: &mut WireStream<impl ReadWrite>,
+    child: &mut Child,
+    timeout_ms: Option<u64>,
+    control: Option<&interactive_control::Registration>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     let mut child_stdout = child.stdout.take();
     let mut child_stderr = child.stderr.take();
@@ -6474,6 +6648,7 @@ fn run_interactive_loop(
         timeout_ms,
         &mut child_stdout,
         &mut child_stderr,
+        control,
     );
     // A pipe still open after the session is held by a process the command
     // left running in the background: keep it drained, so that process is not
@@ -6489,6 +6664,7 @@ fn run_interactive_loop_io(
     timeout_ms: Option<u64>,
     child_stdout: &mut Option<std::process::ChildStdout>,
     child_stderr: &mut Option<std::process::ChildStderr>,
+    control: Option<&interactive_control::Registration>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::time::{Duration, Instant};
@@ -6547,7 +6723,7 @@ fn run_interactive_loop_io(
                 warn!("interactive command timed out, killing process");
                 // The whole tree: in an image container the command is a
                 // grandchild. Also reaps the child, avoiding a zombie.
-                process::kill_child_tree(child);
+                terminate_interactive_child(child, control);
                 send_response(
                     stream,
                     &AgentResponse::Stderr {
@@ -6558,17 +6734,7 @@ fn run_interactive_loop_io(
             }
         }
 
-        // Calculate poll timeout: either remaining time until deadline, or 100ms default
-        let poll_timeout_ms = match deadline {
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                // Cap at 100ms to periodically check child exit status
-                remaining
-                    .as_millis()
-                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
-            }
-            None => INTERACTIVE_POLL_TIMEOUT_MS,
-        };
+        let poll_timeout_ms = exit_signal.poll_timeout_ms(deadline);
 
         // Build poll fds array for stdout, stderr, and vsock stream
         let stdout_fd = child_stdout.as_ref().map(|s| s.as_raw_fd()).unwrap_or(-1);
@@ -6590,11 +6756,12 @@ fn run_interactive_loop_io(
                 fd: stream_fd,
                 // Finish writing a pending frame before reading another one.
                 // This keeps guest memory bounded to a single stdin frame.
-                events: if pending_stdin.is_empty() {
-                    libc::POLLIN
-                } else {
-                    0
-                },
+                events: INTERACTIVE_READ_HANGUP
+                    | if pending_stdin.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -6628,11 +6795,12 @@ fn run_interactive_loop_io(
         // stdin frame waits for the child pipe. Without this check a client
         // disconnect can leave a child that never reads stdin running until
         // its timeout (or forever if there is no timeout).
-        if !pending_stdin.is_empty()
-            && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if poll_fds[2].revents & INTERACTIVE_READ_HANGUP != 0
+            || (!pending_stdin.is_empty()
+                && poll_fds[2].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
-            debug!("host disconnected with pending stdin");
-            return Ok(kill_child_on_disconnect(child));
+            debug!("host disconnected during interactive execution");
+            return Ok(kill_child_on_disconnect(child, control));
         }
 
         // Read available stdout. If send_response fails (host disconnected),
@@ -6660,7 +6828,7 @@ fn run_interactive_loop_io(
                             .is_err()
                             {
                                 debug!("host disconnected while sending stdout");
-                                return Ok(kill_child_on_disconnect(child));
+                                return Ok(kill_child_on_disconnect(child, control));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6701,7 +6869,7 @@ fn run_interactive_loop_io(
                             .is_err()
                             {
                                 debug!("host disconnected while sending stderr");
-                                return Ok(kill_child_on_disconnect(child));
+                                return Ok(kill_child_on_disconnect(child, control));
                             }
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6726,12 +6894,12 @@ fn run_interactive_loop_io(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     // Keep the existing protocol-error behavior while also
                     // reaping the workload before returning the error.
-                    process::kill_child_tree(child);
+                    terminate_interactive_child(child, control);
                     return Err(error.into());
                 }
                 Err(error) => {
                     debug!(%error, "host disconnected during interactive exec");
-                    return Ok(kill_child_on_disconnect(child));
+                    return Ok(kill_child_on_disconnect(child, control));
                 }
             };
             match request {
@@ -6794,6 +6962,17 @@ fn run_interactive_loop_pty(
     pty_master: pty::PtyMaster,
     timeout_ms: Option<u64>,
 ) -> Result<i32, Box<dyn std::error::Error>> {
+    run_interactive_loop_pty_controlled(stream, child, pty_master, timeout_ms, None)
+}
+
+#[cfg(unix)]
+fn run_interactive_loop_pty_controlled(
+    stream: &mut WireStream<impl ReadWrite>,
+    child: &mut Child,
+    pty_master: pty::PtyMaster,
+    timeout_ms: Option<u64>,
+    control: Option<&interactive_control::Registration>,
+) -> Result<i32, Box<dyn std::error::Error>> {
     use std::time::{Duration, Instant};
 
     let start = Instant::now();
@@ -6845,7 +7024,7 @@ fn run_interactive_loop_pty(
         if let (Some(deadline), Some(timeout_ms)) = (deadline, timeout_ms) {
             if Instant::now() >= deadline {
                 warn!("interactive PTY command timed out, killing process");
-                process::kill_child_tree(child);
+                terminate_interactive_child(child, control);
                 send_response(
                     stream,
                     &AgentResponse::Stdout {
@@ -6857,15 +7036,7 @@ fn run_interactive_loop_pty(
         }
 
         // Poll the PTY master fd for readable data.
-        let poll_timeout_ms = match deadline {
-            Some(dl) => {
-                let remaining = dl.saturating_duration_since(Instant::now());
-                remaining
-                    .as_millis()
-                    .min(INTERACTIVE_POLL_TIMEOUT_MS as u128) as i32
-            }
-            None => INTERACTIVE_POLL_TIMEOUT_MS,
-        };
+        let poll_timeout_ms = exit_signal.poll_timeout_ms(deadline);
 
         // Poll PTY master, vsock stream, and child exit signal.
         let stream_fd = stream.as_raw_fd();
@@ -6885,11 +7056,12 @@ fn run_interactive_loop_pty(
                 fd: stream_fd,
                 // Finish writing a pending frame before reading another one.
                 // This keeps guest memory bounded to a single stdin frame.
-                events: if pending_stdin.is_empty() {
-                    libc::POLLIN
-                } else {
-                    0
-                },
+                events: INTERACTIVE_READ_HANGUP
+                    | if pending_stdin.is_empty() {
+                        libc::POLLIN
+                    } else {
+                        0
+                    },
                 revents: 0,
             },
             libc::pollfd {
@@ -6912,11 +7084,12 @@ fn run_interactive_loop_pty(
         // POLLHUP/POLLERR are reported even when POLLIN is disabled while a
         // stdin frame waits for the PTY buffer. Without this check a client
         // disconnect can leave a child running until its timeout.
-        if !pending_stdin.is_empty()
-            && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0
+        if poll_fds[1].revents & INTERACTIVE_READ_HANGUP != 0
+            || (!pending_stdin.is_empty()
+                && poll_fds[1].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0)
         {
-            debug!("host disconnected with pending PTY stdin");
-            return Ok(kill_child_on_disconnect(child));
+            debug!("host disconnected during interactive execution");
+            return Ok(kill_child_on_disconnect(child, control));
         }
 
         // Read available data from PTY master. If send_response fails
@@ -6936,7 +7109,7 @@ fn run_interactive_loop_pty(
                         .is_err()
                         {
                             debug!("host disconnected while sending PTY stdout");
-                            return Ok(kill_child_on_disconnect(child));
+                            return Ok(kill_child_on_disconnect(child, control));
                         }
                     }
                     Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => break,
@@ -6969,36 +7142,21 @@ fn run_interactive_loop_pty(
                 Err(error) if error.kind() == std::io::ErrorKind::InvalidData => {
                     // Keep the existing protocol-error behavior while also
                     // reaping the workload before returning the error.
-                    process::kill_child_tree(child);
+                    terminate_interactive_child(child, control);
                     return Err(error.into());
                 }
                 Err(error) => {
                     debug!(%error, "host disconnected during PTY interactive exec");
-                    return Ok(kill_child_on_disconnect(child));
+                    return Ok(kill_child_on_disconnect(child, control));
                 }
             };
 
             match request {
                 Some(AgentRequest::Stdin { data }) => {
                     if data.is_empty() {
-                        // Host stdin reached EOF. A PTY cannot have one
-                        // direction closed, so signal end-of-input to the
-                        // child by writing the EOF control character (VEOF,
-                        // Ctrl-D / 0x04). In canonical mode VEOF makes the
-                        // pending line available to the child's read()
-                        // immediately; a read() that finds an empty line
-                        // buffer returns 0, which is the EOF the child waits
-                        // for. Without it a stdin-reading child (cat, sh,
-                        // read) never terminates and the exec session hangs.
-                        //
-                        // Send it twice: if the host's final stdin chunk was
-                        // not newline-terminated, the first VEOF only flushes
-                        // that partial line (delivered as data, not EOF), so a
-                        // second VEOF — now at an empty line buffer — is what
-                        // produces the zero-length read. When the buffer is
-                        // already empty the first VEOF yields EOF and the
-                        // second is harmlessly consumed after the child exits.
-                        pending_stdin = vec![0x04, 0x04];
+                        // Honor the current VEOF (including application changes).
+                        // Raw or disabled-EOF terminals have no half-close byte.
+                        pending_stdin = pty_master.eof_input()?;
                         stdin_offset = 0;
                     } else {
                         pending_stdin = data;
@@ -8902,7 +9060,7 @@ fn handle_interactive_vm_exec(
     stream: &mut WireStream<impl ReadWrite>,
     request: AgentRequest,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let (command, env, workdir, timeout_ms, tty) = match request {
+    let (command, env, workdir, timeout_ms, tty, control, terminal) = match request {
         AgentRequest::VmExec {
             command,
             env,
@@ -8910,17 +9068,81 @@ fn handle_interactive_vm_exec(
             timeout_ms,
             tty,
             ..
-        } => (command, env, workdir, timeout_ms, tty),
+        } => (command, env, workdir, timeout_ms, tty, None, None),
+        AgentRequest::VmExecControlled { session } => {
+            if let Err(error) = session.validate_operation() {
+                send_response(
+                    stream,
+                    &AgentResponse::error(error, error_codes::INVALID_REQUEST),
+                )?;
+                return Ok(());
+            }
+            #[cfg(target_os = "linux")]
+            if matches!(session.target, Some(WorkloadTarget::Container { .. })) {
+                return controlled_exec::serve(stream, session);
+            }
+            if session.user.is_some()
+                || matches!(session.target, Some(WorkloadTarget::Container { .. }))
+            {
+                send_response(
+                    stream,
+                    &AgentResponse::error(
+                        "controlled target or user is unsupported on this guest",
+                        error_codes::INVALID_REQUEST,
+                    ),
+                )?;
+                return Ok(());
+            }
+            let registration = match interactive_control::Registration::reserve(&session.id) {
+                Ok(registration) => registration,
+                Err(error) => {
+                    send_response(
+                        stream,
+                        &AgentResponse::from_err(error, error_codes::INVALID_REQUEST),
+                    )?;
+                    return Ok(());
+                }
+            };
+            let command = match &session.builtin {
+                Some(builtin) => {
+                    #[cfg(target_os = "linux")]
+                    {
+                        std::iter::once("/proc/self/exe".to_string())
+                            .chain(builtin_exec::command(builtin))
+                            .collect()
+                    }
+                    #[cfg(not(target_os = "linux"))]
+                    {
+                        let _ = builtin;
+                        return Err("builtin operations require a Linux guest".into());
+                    }
+                }
+                None => session.command,
+            };
+            (
+                command,
+                session.env,
+                session.workdir,
+                session.timeout_ms,
+                session.terminal.is_some(),
+                Some(registration),
+                session.terminal,
+            )
+        }
         _ => {
             send_response(
                 stream,
-                &AgentResponse::error("expected VmExec request", error_codes::INVALID_REQUEST),
+                &AgentResponse::error("expected VM exec request", error_codes::INVALID_REQUEST),
             )?;
             return Ok(());
         }
     };
 
-    info!(command = ?command, tty = tty, "starting interactive VM exec");
+    info!(
+        tty,
+        controlled = control.is_some(),
+        "starting interactive VM exec"
+    );
 
     if command.is_empty() {
         send_response(
@@ -8930,42 +9152,68 @@ fn handle_interactive_vm_exec(
         return Ok(());
     }
 
-    // Spawn the command directly
-    let (mut child, pty_master) =
-        match spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty) {
-            Ok(result) => result,
-            Err(e) => {
-                send_response(
-                    stream,
-                    &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
-                )?;
-                return Ok(());
-            }
-        };
-
-    // Send Started response
-    send_response(stream, &AgentResponse::Started)?;
-
-    // Run the appropriate interactive I/O loop. Every Ok path inside the loops
-    // already reaps the child (try_wait auto-reaps on exit; timeout and host
-    // disconnect both kill+wait). The Err paths — a malformed/oversized inbound
-    // frame, a Stdin parse failure, a try_wait/drain error — do NOT, so reap
-    // here before propagating. The agent is PID 1 with no global waitpid(-1)
-    // reaper, so an unreaped interactive child would linger as a zombie holding
-    // its stdio/PTY fds. Mirrors the loop's own kill_child_on_disconnect.
-    let loop_result = match pty_master {
-        #[cfg(unix)]
-        Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
-        _ => run_interactive_loop(stream, &mut child, timeout_ms),
+    let spawned = if control.is_some() {
+        spawn_direct_interactive_command_controlled(
+            &command,
+            &env,
+            workdir.as_deref(),
+            tty,
+            true,
+            terminal.as_ref(),
+        )
+    } else {
+        spawn_direct_interactive_command(&command, &env, workdir.as_deref(), tty)
     };
-    let exit_code = match loop_result {
-        Ok(code) => code,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
+    let (mut child, pty_master) = match spawned {
+        Ok(result) => result,
+        Err(error) => {
+            send_response(
+                stream,
+                &AgentResponse::from_err(error, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
         }
     };
+    if let Some(control) = &control {
+        #[cfg(unix)]
+        let terminal = pty_master.as_ref().map(|pty| pty.as_raw_fd());
+        #[cfg(not(unix))]
+        let terminal = None;
+        if let Err(error) = control.activate(&child, terminal) {
+            process::kill_child_tree(&mut child);
+            let _ = child.wait();
+            send_response(
+                stream,
+                &AgentResponse::from_err(error, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    }
+
+    // Started delivery is part of the owned session: a failed first write must
+    // reap the command just like a later data-stream failure.
+    let loop_result = (|| {
+        send_response(stream, &AgentResponse::Started)?;
+        match pty_master {
+            #[cfg(unix)]
+            Some(pty) => run_interactive_loop_pty(stream, &mut child, pty, timeout_ms),
+            _ => run_interactive_loop(stream, &mut child, timeout_ms),
+        }
+    })();
+    let exit_code = match loop_result {
+        Ok(code) => code,
+        Err(error) => {
+            // A loop may already have reaped the command before a final output
+            // write failed. Never use that released PID to scan descendants.
+            if matches!(child.try_wait(), Ok(None)) {
+                process::kill_child_tree(&mut child);
+            }
+            let _ = child.wait();
+            return Err(error);
+        }
+    };
+    // Revoke before writing Exited, which may block on an unread connection.
+    drop(control);
 
     // Send Exited response
     send_response(
@@ -8990,7 +9238,19 @@ fn spawn_direct_interactive_command(
     workdir: Option<&str>,
     tty: bool,
 ) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
-    use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
+    spawn_direct_interactive_command_controlled(command, env, workdir, tty, false, None)
+}
+
+#[cfg(unix)]
+fn spawn_direct_interactive_command_controlled(
+    command: &[String],
+    env: &[(String, String)],
+    workdir: Option<&str>,
+    tty: bool,
+    controlled: bool,
+    terminal: Option<&smolvm_protocol::interactive_control::Terminal>,
+) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+    use std::os::unix::io::AsRawFd as _;
     use std::os::unix::process::CommandExt;
 
     let mut cmd = Command::new(&command[0]);
@@ -9004,18 +9264,26 @@ fn spawn_direct_interactive_command(
     }
 
     if tty {
-        // Allocate a PTY pair with default 80x24 size (host will send Resize).
-        let (pty_master, slave_fd) = pty::open_pty(80, 24)?;
-        let slave_raw = slave_fd.as_raw_fd();
-
-        // Set up stdio from the slave fd. We dup because Stdio::from_raw_fd
-        // takes ownership and we need the fd for all three handles + pre_exec.
-        // SAFETY: slave_fd is a valid open fd from openpty.
-        unsafe {
-            cmd.stdin(Stdio::from_raw_fd(libc::dup(slave_raw)));
-            cmd.stdout(Stdio::from_raw_fd(libc::dup(slave_raw)));
-            cmd.stderr(Stdio::from_raw_fd(libc::dup(slave_raw)));
+        // Apply the initial dimensions and modes before the child can read them.
+        let (cols, rows) = terminal.map_or((80, 24), |t| (t.cols, t.rows));
+        if cols == 0 || rows == 0 {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "terminal dimensions must be nonzero",
+            )
+            .into());
         }
+        let (pty_master, slave_fd) = pty::open_pty(cols, rows)?;
+        let slave_raw = slave_fd.as_raw_fd();
+        if let Some(terminal) = terminal {
+            terminal_modes::apply(slave_raw, &terminal.modes)?;
+        }
+
+        // Owned clones report fd exhaustion instead of constructing Stdio
+        // from a failed dup() result. Keep the original for pre_exec.
+        cmd.stdin(Stdio::from(slave_fd.try_clone()?));
+        cmd.stdout(Stdio::from(slave_fd.try_clone()?));
+        cmd.stderr(Stdio::from(slave_fd.try_clone()?));
 
         // SAFETY: pre_exec closure calls only async-signal-safe functions.
         unsafe {
@@ -9029,6 +9297,9 @@ fn spawn_direct_interactive_command(
 
         Ok((child, Some(pty_master)))
     } else {
+        if controlled {
+            cmd.process_group(0);
+        }
         cmd.stdin(Stdio::piped());
         cmd.stdout(Stdio::piped());
         cmd.stderr(Stdio::piped());
@@ -9040,11 +9311,13 @@ fn spawn_direct_interactive_command(
 
 /// Stub for non-Unix platforms.
 #[cfg(not(unix))]
-fn spawn_direct_interactive_command(
+fn spawn_direct_interactive_command_controlled(
     command: &[String],
     env: &[(String, String)],
     workdir: Option<&str>,
     _tty: bool,
+    _controlled: bool,
+    _terminal: Option<&smolvm_protocol::interactive_control::Terminal>,
 ) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
     let mut cmd = Command::new(&command[0]);
     cmd.args(&command[1..]);
@@ -9168,11 +9441,24 @@ mod work_slot_tests {
     use std::time::Duration;
 
     #[test]
-    fn only_pings_and_shutdown_skip_the_work_slots() {
+    fn control_and_long_lived_streams_do_not_consume_work_slots() {
         assert!(!needs_work_slot(&AgentRequest::Ping));
+        assert!(!needs_work_slot(&AgentRequest::InteractiveControl {
+            request: smolvm_protocol::interactive_control::Request {
+                id: "0123456789abcdef0123456789abcdef".into(),
+                action: smolvm_protocol::interactive_control::Action::Signal { signal: 15 },
+            },
+        }));
         assert!(!needs_work_slot(&AgentRequest::Shutdown {
             progress: false,
             stop_timeout_secs: None,
+        }));
+        assert!(!needs_work_slot(&AgentRequest::ContainerPortConnect {
+            overlay_id: "test-overlay".into(),
+            port: 8080,
+        }));
+        assert!(needs_work_slot(&AgentRequest::ContainerPorts {
+            overlay_id: "test-overlay".into(),
         }));
         assert!(needs_work_slot(&AgentRequest::ListImages));
     }
@@ -9214,7 +9500,7 @@ mod work_slot_tests {
     }
 
     #[test]
-    fn a_ping_is_answered_while_every_work_slot_is_taken() {
+    fn liveness_and_session_controls_answer_while_every_work_slot_is_taken() {
         let held: Vec<_> = (0..MAX_CONCURRENT_WORK)
             .map(|_| WORK_SLOTS.acquire())
             .collect();
@@ -9223,13 +9509,29 @@ mod work_slot_tests {
             let mut guest = guest;
             let _ = handle_connection(&mut guest);
         });
-        let frame = serde_json::to_vec(&AgentRequest::Ping).unwrap();
-        host.write_all(&(frame.len() as u32).to_be_bytes()).unwrap();
-        host.write_all(&frame).unwrap();
-        host.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
-        let mut header = [0u8; 4];
-        host.read_exact(&mut header)
-            .expect("a ping must be answered even with every work slot taken");
+        host.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        for request in [
+            AgentRequest::Ping,
+            AgentRequest::InteractiveControl {
+                request: smolvm_protocol::interactive_control::Request {
+                    id: "ffffffffffffffffffffffffffffffff".into(),
+                    action: smolvm_protocol::interactive_control::Action::Signal { signal: 15 },
+                },
+            },
+        ] {
+            let frame = smolvm_protocol::encode_message(&request).unwrap();
+            host.write_all(&frame).unwrap();
+            let mut header = [0u8; 4];
+            host.read_exact(&mut header)
+                .expect("liveness and control requests must bypass occupied work slots");
+            let mut bytes = vec![0; u32::from_be_bytes(header) as usize];
+            host.read_exact(&mut bytes).unwrap();
+            let response: AgentResponse = serde_json::from_slice(&bytes).unwrap();
+            assert!(matches!(
+                response,
+                AgentResponse::Pong { .. } | AgentResponse::Error { .. }
+            ));
+        }
         drop(held);
     }
 }
@@ -10500,6 +10802,17 @@ mod tests {
     #[test]
     #[cfg(target_os = "linux")]
     fn streamed_exec_reaps_child_on_disconnect_with_pending_stdin() {
+        check_disconnect_with_pending_stdin(false);
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn streamed_exec_reaps_child_on_half_close_with_pending_stdin() {
+        check_disconnect_with_pending_stdin(true);
+    }
+
+    #[cfg(target_os = "linux")]
+    fn check_disconnect_with_pending_stdin(half_close: bool) {
         use std::io::{Read, Write};
         use std::os::unix::net::UnixStream;
 
@@ -10540,7 +10853,12 @@ mod tests {
                 .unwrap(),
             )
             .unwrap();
-        drop(client);
+        if half_close {
+            // Keep the response channel open so the host can confirm exit.
+            client.shutdown(std::net::Shutdown::Write).unwrap();
+        } else {
+            client.shutdown(std::net::Shutdown::Both).unwrap();
+        }
 
         let (code, elapsed) = guest.join().unwrap();
         assert_eq!(code, 124);

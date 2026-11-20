@@ -7,6 +7,7 @@ use std::collections::{BTreeMap, HashMap};
 #[derive(Debug, Default, Clone)]
 pub(crate) struct Filters {
     map: HashMap<String, Vec<String>>,
+    name_patterns: Vec<regex::Regex>,
 }
 
 impl Filters {
@@ -39,7 +40,16 @@ impl Filters {
                 _ => {}
             }
         }
-        Ok(Self { map })
+        // Compile once per request rather than once for every listed container.
+        // Docker ignores malformed name expressions instead of rejecting the
+        // request or treating the expression as a substring.
+        let name_patterns = map
+            .get("name")
+            .into_iter()
+            .flatten()
+            .filter_map(|pattern| regex::Regex::new(pattern).ok())
+            .collect();
+        Ok(Self { map, name_patterns })
     }
 
     /// Values given for `key` (empty when the key is absent).
@@ -59,6 +69,21 @@ impl Filters {
             Some(values) if values.is_empty() => true,
             Some(values) => values.iter().any(|v| f(v)),
         }
+    }
+
+    /// Docker matches both the bare name and its canonical `/name` form.
+    pub(crate) fn container_name_matches(&self, name: &str) -> bool {
+        if !self.has("name") {
+            return true;
+        }
+        let canonical = format!("/{name}");
+        self.get("name")
+            .iter()
+            .any(|value| value == name || value == &canonical)
+            || self
+                .name_patterns
+                .iter()
+                .any(|pattern| pattern.is_match(name) || pattern.is_match(&canonical))
     }
 
     /// Every `label` filter (`key` or `key=value`, or `key!=value` for the
@@ -104,5 +129,51 @@ mod tests {
         labels.insert("com.docker.compose.oneoff".into(), "False".into());
         assert!(f.labels_match("label", &labels));
         assert!(label_matches("x!=1", &labels));
+    }
+
+    #[test]
+    fn container_name_filters_match_canonical_names_and_regular_expressions() {
+        for (pattern, matches, misses) in [
+            ("^/app$", vec!["app"], vec!["app-worker", "my-app"]),
+            ("^app$", vec!["app"], vec!["app-worker", "my-app"]),
+            ("app", vec!["app", "app-worker", "my-app"], vec!["worker"]),
+            ("^/app", vec!["app", "app-worker"], vec!["my-app"]),
+            ("app$", vec!["app", "my-app"], vec!["app-worker"]),
+            (
+                "^/(web|worker)-[0-9]+$",
+                vec!["web-1", "worker-12"],
+                vec!["web-a", "api-1"],
+            ),
+            (r"^/app\.v1$", vec!["app.v1"], vec!["appXv1"]),
+            ("//app", vec![], vec!["app"]),
+            ("[", vec![], vec!["app"]),
+        ] {
+            for raw in [
+                serde_json::json!({"name": [pattern]}),
+                serde_json::json!({"name": {pattern: true}}),
+            ] {
+                let filters = Filters::parse(Some(&raw.to_string())).unwrap();
+                for name in &matches {
+                    assert!(filters.container_name_matches(name), "{pattern}: {name}");
+                }
+                for name in &misses {
+                    assert!(!filters.container_name_matches(name), "{pattern}: {name}");
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn container_name_filters_preserve_empty_and_multiple_value_semantics() {
+        for raw in [r#"{}"#, r#"{"name": []}"#, r#"{"name": {"app": false}}"#] {
+            assert!(Filters::parse(Some(raw))
+                .unwrap()
+                .container_name_matches("anything"));
+        }
+        let filters = Filters::parse(Some(r#"{"name": ["[", "^/app$", "^/worker$"]}"#)).unwrap();
+        assert!(filters.container_name_matches("app"));
+        assert!(filters.container_name_matches("worker"));
+        assert!(!filters.container_name_matches("app-worker"));
+        assert!(!filters.container_name_matches("other"));
     }
 }

@@ -77,24 +77,49 @@ mod linux {
             }
         }
 
-        /// Accept a new connection.
+        /// Accept the next connection from the host.
+        ///
+        /// The listener is bound on every CID, so code inside the guest (an
+        /// unprivileged workload included) can reach it too, through the
+        /// loopback CID or the guest's own: the agent serves only the host, so
+        /// any other peer is closed here and the next connection awaited.
         pub fn accept(&self) -> std::io::Result<VsockStream> {
-            unsafe {
-                let fd = libc::accept(
-                    self.fd.as_raw_fd(),
-                    std::ptr::null_mut(),
-                    std::ptr::null_mut(),
-                );
+            loop {
+                let mut peer: sockaddr_vm = unsafe { mem::zeroed() };
+                let mut len = mem::size_of::<sockaddr_vm>() as libc::socklen_t;
+                let fd = unsafe {
+                    libc::accept(
+                        self.fd.as_raw_fd(),
+                        &mut peer as *mut sockaddr_vm as *mut libc::sockaddr,
+                        &mut len,
+                    )
+                };
                 if fd < 0 {
                     return Err(std::io::Error::last_os_error());
                 }
-
-                Ok(VsockStream {
-                    fd: OwnedFd::from_raw_fd(fd),
-                })
+                let stream = VsockStream {
+                    fd: unsafe { OwnedFd::from_raw_fd(fd) },
+                };
+                if peer_is_host(peer.svm_cid) {
+                    return Ok(stream);
+                }
+                tracing::warn!(
+                    cid = peer.svm_cid,
+                    "refused a vsock connection from inside the guest"
+                );
             }
         }
     }
+}
+
+/// The host's CID: the only peer the agent's listeners serve.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const HOST_CID: u32 = 2;
+
+/// Whether a connection's peer CID is the host's.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn peer_is_host(cid: u32) -> bool {
+    cid == HOST_CID
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -237,4 +262,20 @@ pub fn connect(_port: u32) -> std::io::Result<VsockStream> {
         std::io::ErrorKind::Unsupported,
         "vsock only supported on Linux",
     ))
+}
+
+#[cfg(test)]
+mod peer_tests {
+    use super::*;
+
+    /// Only the host is served: the loopback CID (1) and the guest's own CID
+    /// (3 and up) are how code inside the VM reaches a listener bound on every
+    /// CID, and the hypervisor's (0) is never a client.
+    #[test]
+    fn only_the_host_is_a_peer() {
+        assert!(peer_is_host(2));
+        for cid in [0, 1, 3, 4, u32::MAX] {
+            assert!(!peer_is_host(cid), "cid {cid}");
+        }
+    }
 }

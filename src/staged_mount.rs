@@ -13,6 +13,56 @@ use std::collections::HashSet;
 use std::path::Component;
 use std::path::{Path, PathBuf};
 
+/// Synchronize an existing registered guest without starting or stopping it.
+/// The reviewed record and runtime stay owned until host writeback finishes.
+/// Callers that require an explicit branch-sync error use `refuse_detached_sync`.
+pub fn sync_running_machine(record: &VmRecord) -> Result<()> {
+    if record.staged_mounts.is_empty() || !record.staged_mounts_sync_to_host() {
+        return Ok(());
+    }
+    let manager = crate::agent::AgentManager::for_existing_vm_record(record)?;
+    // This temporary manager only observes the persistent guest. In particular,
+    // errors must leave its running state and recoverable working copy intact.
+    manager.detach();
+    sync_with_manager(record, &manager)
+}
+
+pub(crate) fn sync_with_manager(
+    record: &VmRecord,
+    manager: &crate::agent::AgentManager,
+) -> Result<()> {
+    let operation = manager.reserve_control_operation()?;
+    sync_with_operation(record, manager, &operation)
+}
+
+pub(crate) fn sync_with_operation(
+    record: &VmRecord,
+    manager: &crate::agent::AgentManager,
+    operation: &crate::agent::ControlOperation,
+) -> Result<()> {
+    operation.validate_manager(manager)?;
+    operation.validate_staged_record(record)?;
+    if record.staged_mounts.is_empty() || !record.staged_mounts_sync_to_host() {
+        return Ok(());
+    }
+    let verify_process = || {
+        if !record
+            .pid
+            .is_some_and(|pid| crate::process::is_our_process_strict(pid, record.pid_start_time))
+        {
+            return Err(Error::agent_conflict(
+                "sync staged mounts",
+                "the reviewed machine must be running before synchronization",
+            ));
+        }
+        Ok(())
+    };
+    verify_process()?;
+    let mut client = manager.connect()?;
+    verify_process()?;
+    sync_staged_mounts(record, &mut client)
+}
+
 /// Synchronize every staged mount in `record` back to its host source.
 ///
 /// Live `rw` and `ro` mounts are ignored. The caller must hold the machine's
@@ -150,6 +200,7 @@ fn apply_archive(archive_path: &Path, destination: &Path) -> Result<()> {
                 "archive changed between validation and extraction",
             ));
         }
+        refuse_parent_outside(destination, &relative)?;
         prepare_entry_destination(destination, &relative, entry_type)?;
         if !entry
             .unpack_in(destination)
@@ -175,6 +226,43 @@ fn apply_archive(archive_path: &Path, destination: &Path) -> Result<()> {
     std::fs::remove_file(archive_path)
         .map_err(|error| Error::agent("remove staged archive", error.to_string()))?;
     prune_stale_paths(destination, Path::new(""), &wanted)
+}
+
+/// Refuse an entry whose parent, as it exists on the host now, resolves outside
+/// `root`. A guest can make an earlier entry (or leave a file) a symlink to any
+/// host directory; the checks below then look at, and may delete, the path
+/// under that link, which is outside the mount even though the entry's own path
+/// is not. A symlink that stays inside `root` is fine, as it is for the
+/// extraction that follows.
+fn refuse_parent_outside(root: &Path, relative: &Path) -> Result<()> {
+    let Some(parent) = relative.parent() else {
+        return Ok(());
+    };
+    // The deepest part of the parent that exists decides where the rest lands.
+    let mut existing = root.join(parent);
+    while std::fs::symlink_metadata(&existing).is_err() {
+        if !existing.pop() || !existing.starts_with(root) {
+            return Ok(());
+        }
+    }
+    let canonical_root = std::fs::canonicalize(root)
+        .map_err(|error| Error::agent("resolve sync destination", error.to_string()))?;
+    let resolved = std::fs::canonicalize(&existing).map_err(|error| {
+        Error::agent(
+            "sync staged mount",
+            format!("cannot resolve '{}': {error}", existing.display()),
+        )
+    })?;
+    if !resolved.starts_with(&canonical_root) {
+        return Err(Error::agent(
+            "sync staged mount",
+            format!(
+                "archive path '{}' would reach outside the mount through a symlink",
+                relative.display()
+            ),
+        ));
+    }
+    Ok(())
 }
 
 fn prepare_entry_destination(root: &Path, relative: &Path, desired: tar::EntryType) -> Result<()> {
@@ -257,6 +345,106 @@ mod tests {
         let message = refuse_detached_sync(&record, "b1").unwrap().to_string();
         assert!(message.contains("'b1' is a branch"), "{message}");
         assert!(message.contains("'src'"), "{message}");
+    }
+
+    /// An archive entry under a symlink to a host directory must neither write
+    /// nor delete there: an entry of another type used to make the sync remove
+    /// the host file under the link before the extraction refused it.
+    #[cfg(unix)]
+    #[test]
+    fn an_entry_under_a_symlink_out_of_the_mount_touches_nothing_outside() {
+        for kind in [
+            tar::EntryType::Symlink,
+            tar::EntryType::Directory,
+            tar::EntryType::Regular,
+        ] {
+            let outside = tempfile::tempdir().unwrap();
+            let destination = tempfile::tempdir().unwrap();
+            std::fs::write(outside.path().join("victim"), b"keep me").unwrap();
+            let archive_path = destination.path().join(".escape.tar");
+            let mut builder = tar::Builder::new(std::fs::File::create(&archive_path).unwrap());
+            let mut link = tar::Header::new_gnu();
+            link.set_entry_type(tar::EntryType::Symlink);
+            link.set_size(0);
+            link.set_mode(0o777);
+            builder.append_link(&mut link, "a", outside.path()).unwrap();
+            let mut entry = tar::Header::new_gnu();
+            entry.set_entry_type(kind);
+            entry.set_mode(0o755);
+            match kind {
+                tar::EntryType::Symlink => {
+                    entry.set_size(0);
+                    builder
+                        .append_link(&mut entry, "a/victim", "anything")
+                        .unwrap();
+                }
+                tar::EntryType::Directory => {
+                    entry.set_size(0);
+                    builder
+                        .append_data(&mut entry, "a/victim", &b""[..])
+                        .unwrap();
+                }
+                _ => {
+                    entry.set_size(5);
+                    builder
+                        .append_data(&mut entry, "a/victim", &b"pwned"[..])
+                        .unwrap();
+                }
+            }
+            builder.finish().unwrap();
+            drop(builder);
+
+            let error = apply_archive(&archive_path, destination.path())
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("outside"), "{kind:?}: {error}");
+            assert_eq!(
+                std::fs::read(outside.path().join("victim")).unwrap(),
+                b"keep me",
+                "{kind:?}: a host file outside the mount changed"
+            );
+        }
+    }
+
+    /// A symlink that stays inside the mount still works as a parent, as the
+    /// extraction itself allows it (`current -> releases/v2`).
+    #[cfg(unix)]
+    #[test]
+    fn a_symlink_inside_the_mount_still_works_as_a_parent() {
+        let destination = tempfile::tempdir().unwrap();
+        let archive_path = destination.path().join(".inside.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive_path).unwrap());
+        let mut dir = tar::Header::new_gnu();
+        dir.set_entry_type(tar::EntryType::Directory);
+        dir.set_size(0);
+        dir.set_mode(0o755);
+        builder
+            .append_data(&mut dir, "releases/v2", &b""[..])
+            .unwrap();
+        let mut link = tar::Header::new_gnu();
+        link.set_entry_type(tar::EntryType::Symlink);
+        link.set_size(0);
+        link.set_mode(0o777);
+        builder
+            .append_link(&mut link, "current", "releases/v2")
+            .unwrap();
+        let mut file = tar::Header::new_gnu();
+        file.set_entry_type(tar::EntryType::Regular);
+        file.set_size(2);
+        file.set_mode(0o644);
+        builder
+            .append_data(&mut file, "current/app", &b"ok"[..])
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        // Accepted: the link resolves inside the mount. (The sync then prunes
+        // what the archive does not name at its own path, as a mirror does.)
+        apply_archive(&archive_path, destination.path()).unwrap();
+        assert_eq!(
+            std::fs::read_link(destination.path().join("current")).unwrap(),
+            PathBuf::from("releases/v2")
+        );
     }
 
     #[test]

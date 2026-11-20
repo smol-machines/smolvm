@@ -1,0 +1,115 @@
+{
+  "version": "1.31",
+  "source": {
+    "url": "https://github.com/containers/crun/releases/download/1.31/crun-1.31.tar.gz",
+    "sha256": "17d04ba159fada1f1300a36b8afe869afb38bf1bbda28da052e83bb4bee20108"
+  },
+  "source_date_epoch": 1794475823,
+  "toolchain": {
+    "version": "0.14.1",
+    "hosts": {
+      "x86_64-linux": {
+        "url": "https://ziglang.org/download/0.14.1/zig-x86_64-linux-0.14.1.tar.xz",
+        "sha256": "24aeeec8af16c381934a6cd7d95c807a8cb2cf7df9fa40d359aa884195c4716c"
+      },
+      "aarch64-linux": {
+        "url": "https://ziglang.org/download/0.14.1/zig-aarch64-linux-0.14.1.tar.xz",
+        "sha256": "f7a654acc967864f7a050ddacfaa778c7504a0eca8d2b678839c21eea47c992b"
+      },
+      "x86_64-macos": {
+        "url": "https://ziglang.org/download/0.14.1/zig-x86_64-macos-0.14.1.tar.xz",
+        "sha256": "b0f8bdfb9035783db58dd6c19d7dea89892acc3814421853e5752fe4573e5f43"
+      },
+      "aarch64-macos": {
+        "url": "https://ziglang.org/download/0.14.1/zig-aarch64-macos-0.14.1.tar.xz",
+        "sha256": "39f3dc5e79c22088ce878edc821dedb4ca5a1cd9f5ef915e9b3cc3053e8faefa"
+      }
+    }
+  },
+  "sysroots": {
+    "aarch64": {
+      "argp-standalone": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/argp-standalone-1.5.0-r1.apk",
+        "sha256": "72674a71e087edefd93959aee078f89f9da5f749a04d4941727d688a1cb084d0"
+      },
+      "json-c": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/json-c-0.18-r1.apk",
+        "sha256": "2b9ac9f748f4c7b8a19edd51f3ae4cdf4275541763058381627f55a8bbf71ae6"
+      },
+      "json-c-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/json-c-dev-0.18-r1.apk",
+        "sha256": "6e9209ae0762ed3974c0cad9ed08184f73b3285972a20d2a2ede235f586d656d"
+      },
+      "libcap-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcap-dev-2.78-r0.apk",
+        "sha256": "a24ffea3a4ae6145d29cb24492633a4777018de183aad8bb101f8b94d7923fac"
+      },
+      "libseccomp": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libseccomp-2.6.1-r0.apk",
+        "sha256": "9a2a2a5ff3b17ca394a484a5905bceaa57c7d4d392079f07d68a03e44cdcdcd6"
+      },
+      "libseccomp-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libseccomp-dev-2.6.1-r0.apk",
+        "sha256": "72e899fe57fe563a5ad821b6bf5974a6a0dda8006a43f4e225a13d249d60c123"
+      },
+      "linux-headers": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/linux-headers-7.0.0-r1.apk",
+        "sha256": "d61656e81116040ebac0bc8d9046a3ba97f01a00ee085809103576e8a437468f"
+      },
+      "libcap2": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/libcap2-2.78-r0.apk",
+        "sha256": "e13be383f18b1fcfe895361d816ff7cfd2b3c265e442bb371c4a234b29b0e4a9"
+      },
+      "musl": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/musl-1.2.6-r3.apk",
+        "sha256": "2e17864102278d9049c3a56f1bceed9e8cf287065617e579325123443daed8a5"
+      },
+      "musl-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/aarch64/musl-dev-1.2.6-r3.apk",
+        "sha256": "45afe0a9f78de3402b6b5d11f5153ed955bf59d59b45344d9c3fed9f4bbf2f66"
+      }
+    },
+    "x86_64": {
+      "argp-standalone": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/argp-standalone-1.5.0-r1.apk",
+        "sha256": "78cbd31d4f4e217baaf63f263b777f6eb403a03fbce4a69ad5b837234a0a366b"
+      },
+      "json-c": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/json-c-0.18-r1.apk",
+        "sha256": "22dc7a8fe3eda0d22635615cca682b2a575ef25e8c2f401445e12be4cbf77302"
+      },
+      "json-c-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/json-c-dev-0.18-r1.apk",
+        "sha256": "8f718fdb1c2006b18afbe4860b194c4dc829425cf827813e04b4c2f19e5e7f30"
+      },
+      "libcap-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcap-dev-2.78-r0.apk",
+        "sha256": "b9dd5ca2a572aa94fed4d3678101ea78a1d915fa9de045d7cc74dffb7bdcb6e5"
+      },
+      "libseccomp": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libseccomp-2.6.1-r0.apk",
+        "sha256": "b22ccfe8cb072e4c8d3bc17222eeda132e270ce6258c27622acb193bf27b48e1"
+      },
+      "libseccomp-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libseccomp-dev-2.6.1-r0.apk",
+        "sha256": "487f4f1754b0921ce13ff706b4754cacafa0d1b66c0b28ef2a806dde1735c10e"
+      },
+      "linux-headers": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/linux-headers-7.0.0-r1.apk",
+        "sha256": "c4535f3f0dc6fd4d80efa7ff2a7a72a2d3f8dae31e2587c0785cc3243889cdf2"
+      },
+      "libcap2": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/libcap2-2.78-r0.apk",
+        "sha256": "42886a7b4bcde26347c712925c8dc7db202b6029ef9b8c7ee81577ab7bdd8fad"
+      },
+      "musl": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-1.2.6-r3.apk",
+        "sha256": "e142255d0fa397f14318996bc10378093dcc069dc3dd1b6818c8f28a789c21da"
+      },
+      "musl-dev": {
+        "url": "https://dl-cdn.alpinelinux.org/alpine/v3.24/main/x86_64/musl-dev-1.2.6-r3.apk",
+        "sha256": "310b51cff12e1d5ce5f135c558a82e2550427da5465bbd16c9ff9b05e63ee3d9"
+      }
+    }
+  }
+}

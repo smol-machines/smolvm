@@ -27,11 +27,22 @@ pub(crate) fn router(engine: Arc<Engine>) -> Router {
         .route("/info", get(info))
         .route("/events", get(events))
         .route("/system/df", get(system_df))
+        .route("/smol/transfers/plan", post(super::transfer::plan))
+        .route("/smol/transfers/prepare", post(super::transfer::prepare))
+        .route(
+            "/smol/transfers/{operation}",
+            get(super::transfer::status).delete(super::transfer::cancel),
+        )
         .route("/auth", post(auth))
         .route("/containers/create", post(container_create))
         .route("/containers/json", get(container_list))
         .route("/containers/prune", post(container_prune))
         .route("/containers/{id}/json", get(container_inspect))
+        .route("/containers/{id}/smol/ports", get(super::app_ports::list))
+        .route(
+            "/containers/{id}/smol/ports/{port}/connect",
+            post(super::app_ports::connect),
+        )
         .route("/containers/{id}/start", post(container_start))
         .route("/containers/{id}/stop", post(container_stop))
         .route("/containers/{id}/restart", post(container_restart))
@@ -487,34 +498,47 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
             .unwrap_or(0)
     };
     let until_nanos = until.map(nanos);
+    let now = std::time::SystemTime::now();
+    let start = since.map(nanos).unwrap_or_else(|| nanos(now));
+    // Register before the first history snapshot, including events published by
+    // independent workload supervisors while the response is being prepared.
+    let mut subscription =
+        if until.is_some_and(|u| u <= now) {
+            None
+        } else {
+            Some(engine.events.subscribe().map_err(|error| {
+                ApiError::internal(format!("Cannot watch engine events: {error}"))
+            })?)
+        };
     let (tx, body) = super::stream::json_lines();
+    let mut app_updates = if q.get("smol_apps").is_some_and(|value| value == "true")
+        && until.is_none_or(|until| until > now)
+    {
+        Some(super::app_ports::subscribe(&engine).map_err(|error| {
+            ApiError::internal(format!("Cannot observe app listeners: {error}"))
+        })?)
+    } else {
+        None
+    };
     tokio::spawn(async move {
-        let mut last = since
-            .map(nanos)
-            .unwrap_or_else(|| nanos(std::time::SystemTime::now()));
-        let mut seen = std::collections::HashSet::new();
+        let mut seen = std::collections::BTreeSet::new();
+        // Ephemeral listener changes do not modify persisted Docker history.
+        let mut history_changed = true;
         loop {
-            for e in engine.events.since(last) {
-                if e.time_nano < last {
-                    continue;
-                }
-                if until_nanos.is_some_and(|u| e.time_nano > u) {
-                    return;
-                }
-                if e.time_nano > last {
-                    seen.clear();
-                    last = e.time_nano;
-                }
-                if !seen.insert(e.cursor.clone()) {
-                    continue;
-                }
-                if super::events::matches(&e, &f)
-                    && tx
-                        .send(serde_json::to_value(&e).unwrap_or_default())
-                        .await
-                        .is_err()
-                {
-                    return;
+            if history_changed {
+                history_changed = false;
+                for e in engine.events.pending(start, &mut seen) {
+                    if until_nanos.is_some_and(|u| e.time_nano > u) {
+                        return;
+                    }
+                    if super::events::matches(&e, &f)
+                        && tx
+                            .send(serde_json::to_value(&e).unwrap_or_default())
+                            .await
+                            .is_err()
+                    {
+                        return;
+                    }
                 }
             }
             if until.is_some_and(|u| std::time::SystemTime::now() >= u) {
@@ -522,7 +546,42 @@ async fn events(State(engine): S, Query(q): Q) -> ApiResult<Response> {
             }
             tokio::select! {
                 _ = tx.closed() => return,
-                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {}
+                result = async {
+                    match &mut app_updates {
+                        Some(updates) => updates.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if result.is_err() || tx.send(serde_json::json!({
+                        "Type":"smol", "Action":"app_ports", "Actor":{"ID":""}
+                    })).await.is_err() {
+                        return;
+                    }
+                },
+                result = async {
+                    match &mut subscription {
+                        Some(subscription) => subscription.changed().await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    if let Err(error) = result {
+                        tracing::warn!(%error, "Engine event watch failed; closing stream");
+                        return;
+                    }
+                    history_changed = true;
+                }
+                _ = async {
+                    match until {
+                        Some(until) => tokio::time::sleep(
+                            until.duration_since(std::time::SystemTime::now()).unwrap_or_default()
+                        ).await,
+                        None => std::future::pending().await,
+                    }
+                } => {
+                    // Preserve the final inclusive history read at `until`,
+                    // even if its filesystem notification is still queued.
+                    history_changed = true;
+                }
             }
         }
     });
@@ -779,6 +838,9 @@ async fn container_attach(
     let logs = q_bool(&q, "logs");
     // Subscribe before anything else so no output after this point is lost.
     let mut live = c.output.subscribe();
+    // Capture the execution before awaiting the HTTP upgrade, so a delayed
+    // old attachment cannot acquire the next run's input queue.
+    let stdin = c.input.sender();
     let content_type = if tty {
         super::stream::RAW
     } else {
@@ -786,7 +848,6 @@ async fn container_attach(
     };
     let (response, session) = super::stream::hijack(req, content_type);
     let eng = engine.clone();
-    let c2 = c.clone();
     tokio::spawn(async move {
         let Some(session) = session.await else { return };
         let super::stream::Session {
@@ -798,19 +859,15 @@ async fn container_attach(
         attrs.remove("__");
         eng.events
             .emit("container", "attach", &record.id, record.event_attributes());
-        if let (true, Some(input)) = (want_stdin, input) {
-            let c3 = c2.clone();
-            let stdin_once = record.config.stdin_once;
-            tokio::spawn(async move {
-                super::stream::read_input(input, |data| {
-                    super::containers::send_input(&c3, super::runtime::Input::Data(data))
-                })
-                .await;
-                if stdin_once {
-                    super::containers::send_input(&c3, super::runtime::Input::Eof);
-                }
-            });
-        }
+        let _stdin = if let (true, Some(input)) = (want_stdin, input) {
+            Some(super::stream::forward_input(
+                input,
+                stdin,
+                record.config.stdin_once,
+            ))
+        } else {
+            None
+        };
         let query = super::logs::LogQuery {
             stdout: want_stdout,
             stderr: want_stderr,
@@ -874,7 +931,7 @@ async fn container_resize(
             c.id()
         )));
     }
-    super::containers::send_input(&c, super::runtime::Input::Resize { cols: w, rows: h });
+    c.input.resize(w, h);
     Ok(StatusCode::OK.into_response())
 }
 
@@ -1002,95 +1059,51 @@ async fn container_stats(
     let c = container(&engine, &id)?;
     let one_shot = q_bool(&q, "one-shot");
     let stream = !q.get("stream").is_some_and(|v| v == "0" || v == "false") && !one_shot;
+    // Validate the first sample before committing HTTP 200: an old guest or
+    // unavailable cgroup must not masquerade as an idle container.
+    let first = super::stats::sample(&engine, &c).await?;
+    if !stream {
+        let mut sample = first;
+        if !one_shot && c.is_running() {
+            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            let previous = sample;
+            sample = super::stats::sample(&engine, &c).await?;
+            sample["precpu_stats"] = previous["cpu_stats"].clone();
+            sample["preread"] = previous["read"].clone();
+        }
+        return Ok(Json(sample).into_response());
+    }
     let (tx, body) = super::stream::json_lines();
     tokio::spawn(async move {
-        let mut prev: Option<serde_json::Value> = None;
-        // A single answer carries a second-old sample as its `precpu_stats`,
-        // so clients can show a CPU rate from it, unless the client asked for
-        // one sample only.
-        if !stream && !one_shot && c.is_running() {
-            prev = Some(stats_sample(&engine, &c).await);
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let mut previous = first;
+        if tx.send(previous.clone()).await.is_err() {
+            return;
         }
         loop {
-            let sample = stats_sample(&engine, &c).await;
-            let mut out = sample.clone();
-            if let Some(p) = prev.take() {
-                out["precpu_stats"] = p["cpu_stats"].clone();
-                out["preread"] = p["read"].clone();
+            tokio::select! {
+                _ = tx.closed() => return,
+                _ = tokio::time::sleep(std::time::Duration::from_secs(1)) => {},
             }
-            if tx.send(out).await.is_err() || !stream {
+            let next = tokio::select! {
+                _ = tx.closed() => return,
+                sample = super::stats::sample(&engine, &c) => sample,
+            };
+            let mut sample = match next {
+                Ok(sample) => sample,
+                Err(error) => {
+                    tracing::warn!(container = %c.id(), error = %error.message, "container stats stream ended");
+                    return;
+                }
+            };
+            sample["precpu_stats"] = previous["cpu_stats"].clone();
+            sample["preread"] = previous["read"].clone();
+            if tx.send(sample.clone()).await.is_err() {
                 return;
             }
-            prev = Some(sample);
-            tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+            previous = sample;
         }
     });
     Ok(Response::new(body))
-}
-
-async fn stats_sample(
-    engine: &Arc<Engine>,
-    c: &Arc<super::containers::Container>,
-) -> serde_json::Value {
-    let record = c.record();
-    let ncpu = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(1) as u64;
-    let (cpu_ns, rss) = if c.is_running() && record.state.pid > 0 {
-        crate::process::process_stats(record.state.pid as crate::process::Pid)
-            .map(|s| (s.cpu_time_ns, s.rss_bytes))
-            .unwrap_or((0, 0))
-    } else {
-        (0, 0)
-    };
-    let mut usage = rss;
-    let mut limit = crate::process::host_memory_stats()
-        .map(|m| m.total_bytes)
-        .or_else(|| crate::data::resources::host_physical_memory_mib().map(|mib| mib << 20))
-        .unwrap_or(0);
-    if let Some(socket) = c.socket() {
-        if let Ok(smolvm_protocol::AgentResponse::Ok { data: Some(d) }) =
-            super::runtime::request(&socket, &smolvm_protocol::AgentRequest::MemoryStatus).await
-        {
-            if let Ok(m) = serde_json::from_value::<smolvm_protocol::MemoryStatus>(d) {
-                usage = m.used_bytes();
-                limit = m.total_bytes;
-            }
-        }
-    }
-    if record.host_config.memory > 0 {
-        limit = record.host_config.memory as u64;
-    }
-    let system = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as u64)
-        .unwrap_or(0)
-        * ncpu;
-    let _ = engine;
-    serde_json::json!({
-        "read": super::util::now_rfc3339(),
-        "preread": super::util::ZERO_TIME,
-        "id": record.id,
-        "name": format!("/{}", record.name),
-        "num_procs": 0,
-        "pids_stats": {"current": 0},
-        "cpu_stats": {
-            "cpu_usage": {"total_usage": cpu_ns, "usage_in_kernelmode": 0, "usage_in_usermode": cpu_ns},
-            "system_cpu_usage": system,
-            "online_cpus": ncpu,
-            "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
-        },
-        "precpu_stats": {
-            "cpu_usage": {"total_usage": 0, "usage_in_kernelmode": 0, "usage_in_usermode": 0},
-            "system_cpu_usage": 0,
-            "online_cpus": ncpu,
-            "throttling_data": {"periods": 0, "throttled_periods": 0, "throttled_time": 0},
-        },
-        "memory_stats": {"usage": usage, "limit": limit, "stats": {"rss": rss}},
-        "blkio_stats": {"io_service_bytes_recursive": null},
-        "networks": {"eth0": {"rx_bytes": 0, "rx_packets": 0, "rx_errors": 0, "rx_dropped": 0, "tx_bytes": 0, "tx_packets": 0, "tx_errors": 0, "tx_dropped": 0}},
-    })
 }
 
 async fn container_update(
@@ -1107,6 +1120,8 @@ async fn container_update(
     let update: Update = json_body(&body)?;
     let mut warnings = Vec::new();
     if let Some(policy) = update.restart_policy {
+        let _op = c.op_lock().await;
+        let _admission = c.admit_mutation(&engine, false)?;
         c.update(&engine, |r| {
             r.host_config.restart_policy = policy.clone();
             if let Some(obj) = r.host_config_raw.as_object_mut() {
@@ -1553,14 +1568,319 @@ async fn volume_prune(State(engine): S, Query(q): Q) -> ApiResult<Json<serde_jso
         if !f.labels_match("label", &v.labels) {
             continue;
         }
-        if engine.volumes.remove(&engine.store, &v.name).is_ok() {
-            engine
-                .events
-                .emit("volume", "destroy", &v.name, BTreeMap::new());
-            deleted.push(v.name);
-        }
+        engine.volumes.remove(&engine.store, &v.name)?;
+        engine
+            .events
+            .emit("volume", "destroy", &v.name, BTreeMap::new());
+        deleted.push(v.name);
     }
     Ok(Json(
         serde_json::json!({"VolumesDeleted": deleted, "SpaceReclaimed": 0}),
     ))
+}
+
+#[cfg(test)]
+mod event_tests {
+    use super::*;
+    use std::time::{Duration, SystemTime, UNIX_EPOCH};
+    use tokio_stream::StreamExt;
+
+    #[tokio::test]
+    async fn listener_changes_do_not_rescan_history_but_lifecycle_events_still_arrive() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let socket = root.path().join("guest.sock");
+        let record = serde_json::from_value(serde_json::json!({
+            "id":"a".repeat(64),"name":"web","created":"2026-11-18T00:00:00Z","image":"fixture","image_id":"fixture","pull_ref":"","machine":"fixture","agent_socket":socket,
+            "config":{},"host_config":{},"host_config_raw":{},"networks":{},"path":"/web","args":[],"restart_count":0,"ports":[],"mounts":[],
+            "state":{"status":"running","pid":123,"exit_code":0,"error":"","started_at":"2026-11-18T00:00:01Z","finished_at":"","oom_killed":false}
+        })).unwrap();
+        engine.store.save_container(&record).unwrap();
+        let listener = tokio::net::UnixListener::bind(socket).unwrap();
+        let response = request(engine.clone(), &[("smol_apps", "true".into())]).await;
+        let mut stream = response.into_body().into_data_stream();
+        let (mut guest, _) = tokio::time::timeout(Duration::from_secs(2), listener.accept())
+            .await
+            .unwrap()
+            .unwrap();
+        let length = guest.read_u32().await.unwrap();
+        let mut bytes = vec![0; length as usize];
+        guest.read_exact(&mut bytes).await.unwrap();
+        assert!(matches!(
+            smolvm_protocol::binary_stream::decode_request(&bytes)
+                .unwrap()
+                .body,
+            smolvm_protocol::AgentRequest::WatchListeners
+        ));
+        guest
+            .write_all(
+                &smolvm_protocol::encode_message(&smolvm_protocol::AgentResponse::ok_with_data(
+                    serde_json::json!({"protocol":"smol-listener-watch-v1"}),
+                ))
+                .unwrap(),
+            )
+            .await
+            .unwrap();
+        // The initial scan is complete before the watch handshake arrives.
+        let scans = engine.events.history_reads();
+        assert!(scans > 0);
+        for generation in 1u64..=10 {
+            guest.write_all(&generation.to_le_bytes()).await.unwrap();
+            let line = tokio::time::timeout(Duration::from_secs(2), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(event["Type"], "smol");
+            assert_eq!(event["Action"], "app_ports");
+        }
+        assert_eq!(
+            engine.events.history_reads(),
+            scans,
+            "ephemeral listener events reread persistent history"
+        );
+        let writer = super::super::events::Events::persistent(&engine.config.root).unwrap();
+        writer.emit("container", "start", "external-supervisor", BTreeMap::new());
+        let line = tokio::time::timeout(Duration::from_secs(2), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(event["Actor"]["ID"], "external-supervisor");
+        assert!(engine.events.history_reads() > scans);
+        drop(stream);
+        assert_eq!(
+            tokio::time::timeout(Duration::from_secs(2), guest.read(&mut [0]))
+                .await
+                .unwrap()
+                .unwrap(),
+            0
+        );
+    }
+
+    async fn request(engine: Arc<Engine>, query: &[(&str, String)]) -> Response {
+        events(
+            State(engine),
+            Query(
+                query
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.clone()))
+                    .collect(),
+            ),
+        )
+        .await
+        .unwrap()
+    }
+
+    #[tokio::test]
+    async fn events_published_before_the_stream_task_runs_are_delivered_once() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let response = request(engine.clone(), &[]).await;
+        let writer = super::super::events::Events::persistent(&engine.config.root).unwrap();
+        for id in ["one", "two", "three"] {
+            writer.emit("container", "start", id, BTreeMap::new());
+        }
+        let mut stream = response.into_body().into_data_stream();
+        for id in ["one", "two", "three"] {
+            let line = tokio::time::timeout(Duration::from_secs(5), stream.next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+            assert_eq!(event["Actor"]["ID"], id);
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(150), stream.next())
+                .await
+                .is_err()
+        );
+        drop(stream);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while Arc::strong_count(&engine) > 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("disconnected stream kept its engine and watcher alive");
+    }
+
+    #[tokio::test]
+    async fn delayed_publication_is_not_discarded_by_a_newer_timestamp() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let response = request(engine.clone(), &[("since", "0".into())]).await;
+        let mut stream = response.into_body().into_data_stream();
+        engine
+            .events
+            .emit("container", "start", "newer", BTreeMap::new());
+        let line = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let mut delayed: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        let stamp = delayed["timeNano"].as_i64().unwrap() - 1;
+        delayed["timeNano"] = stamp.into();
+        delayed["Actor"]["ID"] = "delayed".into();
+        let dir = engine.config.root.join("events");
+        let temp = dir.join("delayed.tmp");
+        std::fs::write(&temp, delayed.to_string()).unwrap();
+        std::fs::rename(temp, dir.join(format!("{stamp}-delayed.json"))).unwrap();
+        let line = tokio::time::timeout(Duration::from_secs(5), stream.next())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        let delivered: serde_json::Value = serde_json::from_slice(&line).unwrap();
+        assert_eq!(delivered["Actor"]["ID"], "delayed");
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_subscribers_receive_a_burst_while_history_is_pruned() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        for n in 0..2048 {
+            engine
+                .events
+                .emit("container", "seed", &n.to_string(), BTreeMap::new());
+        }
+        let mut readers = Vec::new();
+        for _ in 0..4 {
+            let response = request(engine.clone(), &[]).await;
+            readers.push(tokio::spawn(async move {
+                let mut stream = response.into_body().into_data_stream();
+                let mut ids = std::collections::BTreeSet::new();
+                for _ in 0..30 {
+                    let line = tokio::time::timeout(Duration::from_secs(10), stream.next())
+                        .await
+                        .unwrap()
+                        .unwrap()
+                        .unwrap();
+                    let event: serde_json::Value = serde_json::from_slice(&line).unwrap();
+                    assert!(
+                        ids.insert(event["Actor"]["ID"].as_str().unwrap().to_string()),
+                        "duplicate event"
+                    );
+                }
+                assert_eq!(ids, (0..30).map(|n| format!("burst-{n}")).collect());
+                assert!(
+                    tokio::time::timeout(Duration::from_millis(200), stream.next())
+                        .await
+                        .is_err()
+                );
+            }));
+        }
+        let writer = super::super::events::Events::persistent(&engine.config.root).unwrap();
+        for n in 0..30 {
+            writer.emit("container", "start", &format!("burst-{n}"), BTreeMap::new());
+            tokio::task::yield_now().await;
+        }
+        for reader in readers {
+            reader.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn until_deadline_ends_an_idle_filtered_stream() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let until = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 1;
+        let response = request(
+            engine.clone(),
+            &[
+                ("until", until.to_string()),
+                ("filters", r#"{"event":["die"]}"#.into()),
+            ],
+        )
+        .await;
+        engine
+            .events
+            .emit("container", "start", "one", BTreeMap::new());
+        let bytes = tokio::time::timeout(
+            Duration::from_secs(3),
+            axum::body::to_bytes(response.into_body(), 1024),
+        )
+        .await
+        .unwrap()
+        .unwrap();
+        assert!(bytes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn historical_events_work_without_registering_a_live_watch() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        // A historical request must finish even if no live watch can be made.
+        std::fs::remove_dir(engine.config.root.join("events")).unwrap();
+        let response = request(
+            engine.clone(),
+            &[("since", "1".into()), ("until", "2".into())],
+        )
+        .await;
+        assert!(axum::body::to_bytes(response.into_body(), 1024)
+            .await
+            .unwrap()
+            .is_empty());
+        let error = events(State(engine), Query(HashMap::new()))
+            .await
+            .unwrap_err();
+        assert_eq!(error.status, StatusCode::INTERNAL_SERVER_ERROR);
+        assert!(error.message.contains("Cannot watch engine events"));
+    }
+
+    #[tokio::test]
+    async fn reconnect_replays_history_with_filters_and_inclusive_time_bounds() {
+        let root = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(root.path());
+        let dir = engine.config.root.join("events");
+        for (stamp, id, action) in [
+            (1, "before", "start"),
+            (2, "first", "start"),
+            (2, "second", "start"),
+            (2, "filtered", "die"),
+            (3, "last", "start"),
+            (4, "after", "start"),
+        ] {
+            let event = serde_json::json!({"Type":"container","Action":action,
+                "Actor":{"ID":id,"Attributes":{}},"scope":"local","time":stamp,"timeNano":stamp*1_000_000_000_i64});
+            std::fs::write(
+                dir.join(format!("{}-{id}.json", stamp * 1_000_000_000_i64)),
+                event.to_string(),
+            )
+            .unwrap();
+        }
+        for _ in 0..2 {
+            let response = request(
+                engine.clone(),
+                &[
+                    ("since", "2".into()),
+                    ("until", "3".into()),
+                    ("filters", r#"{"event":["start"]}"#.into()),
+                ],
+            )
+            .await;
+            let bytes = axum::body::to_bytes(response.into_body(), 4096)
+                .await
+                .unwrap();
+            let events: Vec<serde_json::Value> = bytes
+                .split(|b| *b == b'\n')
+                .filter(|line| !line.is_empty())
+                .map(|line| serde_json::from_slice(line).unwrap())
+                .collect();
+            let ids: Vec<_> = events
+                .iter()
+                .map(|event| event["Actor"]["ID"].as_str().unwrap())
+                .collect();
+            assert_eq!(ids, ["first", "second", "last"]);
+        }
+    }
 }

@@ -922,6 +922,16 @@ pub fn generations_from_history(
         .collect()
 }
 
+/// An export forwards objects unopened and the packer follows links, so a
+/// store entry that is not a regular file is refused here the way
+/// [`decode_object`] refuses it on read.
+fn require_object_file(path: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid("checkpoint object is not a regular file"));
+    }
+    Ok(())
+}
+
 /// Export `directory` as ONE file that carries its history: the checkpoint's
 /// index, the indexes of up to `limit` retained generations, and every object
 /// any of them references, packed as a `Chunked` checkpoint. Restoring such a
@@ -976,6 +986,7 @@ pub fn export_with_history(
     let objects = directory.join("objects");
     for hash in &hashes {
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -2923,6 +2934,7 @@ pub fn export_chunked(
             continue;
         }
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -3168,6 +3180,140 @@ pub fn materialize_over(
         "checkpoint materialized over base"
     );
     Ok(stats)
+}
+
+/// How many of a checkpoint's smallest chunk digests stand for all of them
+/// when two checkpoints are compared.
+const SKETCH_SIZE: usize = 256;
+const BASE_SKETCH: &str = "sketch";
+const BASE_TREE: &str = "tree";
+
+/// The `SKETCH_SIZE` smallest distinct chunk digests of `index`, sorted.
+fn sketch_of(index: &Index) -> Vec<String> {
+    let mut digests: Vec<&str> = index
+        .files
+        .iter()
+        .flat_map(|file| file.chunks.iter().flatten())
+        .map(String::as_str)
+        .collect();
+    digests.sort_unstable();
+    digests.dedup();
+    digests.truncate(SKETCH_SIZE);
+    digests.into_iter().map(str::to_owned).collect()
+}
+
+/// Estimated share of chunks two checkpoints have in common (their Jaccard
+/// similarity), from their sketches: of the smallest digests across both,
+/// the fraction both hold.
+fn sketch_similarity(a: &[String], b: &[String]) -> f64 {
+    let mut union: Vec<&String> = a.iter().chain(b).collect();
+    union.sort_unstable();
+    union.dedup();
+    union.truncate(SKETCH_SIZE);
+    if union.is_empty() {
+        return 0.0;
+    }
+    let shared = union
+        .iter()
+        .filter(|digest| a.binary_search(digest).is_ok() && b.binary_search(digest).is_ok())
+        .count();
+    shared as f64 / union.len() as f64
+}
+
+/// Record the materialized `tree` of the stored checkpoint at `directory` in
+/// `library`, so a later restore can build over it: the entry keeps its own
+/// copy of the index, so the tree stays usable after the stored checkpoint is
+/// forgotten, and a sketch of its chunks, so a checkpoint with no recorded
+/// ancestor (a sibling branched from the same machine) can still find it.
+/// Keeps the `keep` most recently used entries; the trees themselves are not
+/// touched.
+pub fn remember_base(library: &Path, directory: &Path, tree: &Path, keep: usize) -> io::Result<()> {
+    let index = read_index(directory)?;
+    fs::create_dir_all(library)?;
+    let name = digest(tree.as_os_str().as_encoded_bytes());
+    let entry = library.join(&name[..32]);
+    let staging = tempfile::Builder::new()
+        .prefix(".base-")
+        .tempdir_in(library)?;
+    fs::copy(directory.join(INDEX), staging.path().join(INDEX))?;
+    fs::write(
+        staging.path().join(BASE_SKETCH),
+        sketch_of(&index).join("\n"),
+    )?;
+    fs::write(
+        staging.path().join(BASE_TREE),
+        tree.as_os_str().as_encoded_bytes(),
+    )?;
+    let _ = fs::remove_dir_all(&entry);
+    fs::rename(staging.keep(), &entry)?;
+    let mut entries: Vec<(std::time::SystemTime, std::path::PathBuf)> = fs::read_dir(library)?
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
+        .filter_map(|entry| {
+            let used = fs::metadata(entry.path().join(BASE_SKETCH))
+                .and_then(|meta| meta.modified())
+                .ok()?;
+            Some((used, entry.path()))
+        })
+        .collect();
+    entries.sort_by_key(|entry| std::cmp::Reverse(entry.0));
+    for (_, stale) in entries.into_iter().skip(keep) {
+        let _ = fs::remove_dir_all(stale);
+    }
+    Ok(())
+}
+
+/// The base in `library` sharing the most chunks with the stored checkpoint
+/// at `directory`: the entry to pass to [`materialize_over`] as the stored
+/// side, its tree, and the estimated share of chunks in common. Entries whose
+/// tree `alive` rejects are removed. `None` when no live tree shares any.
+pub fn closest_base(
+    library: &Path,
+    directory: &Path,
+    alive: impl Fn(&Path) -> bool,
+) -> io::Result<Option<(std::path::PathBuf, std::path::PathBuf, f64)>> {
+    let entries = match fs::read_dir(library) {
+        Ok(entries) => entries,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let sketch = sketch_of(&read_index(directory)?);
+    let mut best: Option<(std::path::PathBuf, std::path::PathBuf, f64)> = None;
+    for entry in entries.filter_map(|entry| entry.ok()) {
+        if entry.file_name().to_string_lossy().starts_with('.') {
+            continue;
+        }
+        let path = entry.path();
+        let (Ok(tree), Ok(theirs)) = (
+            fs::read(path.join(BASE_TREE)),
+            fs::read_to_string(path.join(BASE_SKETCH)),
+        ) else {
+            continue;
+        };
+        #[cfg(unix)]
+        let tree = {
+            use std::os::unix::ffi::OsStringExt;
+            std::path::PathBuf::from(std::ffi::OsString::from_vec(tree))
+        };
+        #[cfg(not(unix))]
+        let tree = std::path::PathBuf::from(String::from_utf8_lossy(&tree).into_owned());
+        if !alive(&tree) {
+            let _ = fs::remove_dir_all(&path);
+            continue;
+        }
+        let theirs: Vec<String> = theirs.lines().map(str::to_owned).collect();
+        let score = sketch_similarity(&sketch, &theirs);
+        if score > 0.0 && best.as_ref().is_none_or(|(_, _, top)| score > *top) {
+            best = Some((path, tree, score));
+        }
+    }
+    if let Some((entry, _, _)) = &best {
+        // Recently used bases are the last to make room for new ones.
+        if let Ok(file) = File::options().write(true).open(entry.join(BASE_SKETCH)) {
+            let _ = file.set_modified(std::time::SystemTime::now());
+        }
+    }
+    Ok(best)
 }
 
 /// Copy `count` bytes from `source` at `from` to `destination` at `offset`,
@@ -4238,6 +4384,96 @@ mod tests {
         assert!(complete_from_base(&other, &empty).is_err());
     }
 
+    #[test]
+    fn a_sibling_with_no_recorded_ancestor_builds_over_the_tree_it_shares_most_with() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let store = |directory: &Path, files: &[(&str, &[u8])]| {
+            fs::create_dir(directory).unwrap();
+            let mut writer = Writer::new(&cache, directory).unwrap();
+            let stored = files
+                .iter()
+                .map(|(path, bytes)| {
+                    writer
+                        .ingest(path, bytes.len() as u64, 0o600, &mut &**bytes)
+                        .unwrap()
+                })
+                .collect();
+            writer.finish(directory, manifest(), stored).unwrap();
+        };
+        let pattern = |seed: u8, len: usize| -> Vec<u8> {
+            (0..len)
+                .map(|i| (i / 4096) as u8 ^ seed ^ (i % 251) as u8)
+                .collect()
+        };
+        // Two branches of one machine: the same disk, their own memory.
+        let disk = pattern(7, 6 * CHUNK_SIZE);
+        let mut changed_disk = disk.clone();
+        changed_disk[CHUNK_SIZE + 9] ^= 0xFF;
+        let first = root.path().join("first");
+        store(
+            &first,
+            &[
+                ("disks/0", &disk),
+                ("checkpoint/memory.bin", &pattern(1, 2 * CHUNK_SIZE)),
+            ],
+        );
+        let unrelated = root.path().join("unrelated");
+        store(&unrelated, &[("disks/0", &pattern(99, 3 * CHUNK_SIZE))]);
+        let second = root.path().join("second");
+        let second_memory = pattern(2, 2 * CHUNK_SIZE);
+        store(
+            &second,
+            &[
+                ("disks/1", &changed_disk),
+                ("checkpoint/memory.bin", &second_memory),
+            ],
+        );
+
+        let library = root.path().join("bases");
+        let alive = |tree: &Path| tree.is_dir();
+        assert!(closest_base(&library, &second, alive).unwrap().is_none());
+        let first_tree = root.path().join("first-tree");
+        materialize_over(&first, &first_tree, None).unwrap();
+        remember_base(&library, &first, &first_tree, 8).unwrap();
+        let unrelated_tree = root.path().join("unrelated-tree");
+        materialize_over(&unrelated, &unrelated_tree, None).unwrap();
+        remember_base(&library, &unrelated, &unrelated_tree, 8).unwrap();
+        // The first branch's stored checkpoint is forgotten; its tree stays.
+        fs::remove_dir_all(&first).unwrap();
+
+        let (entry, tree, score) = closest_base(&library, &second, alive).unwrap().unwrap();
+        assert_eq!(tree, first_tree);
+        assert!(
+            score > 0.4,
+            "5 of the 11 distinct chunks are shared, estimated {score}"
+        );
+        let second_tree = root.path().join("second-tree");
+        let stats = materialize_over(&second, &second_tree, Some((&entry, &tree))).unwrap();
+        assert_eq!(
+            stats.copied_chunks, 5,
+            "every unchanged disk chunk comes from the sibling"
+        );
+        assert_eq!(
+            stats.written_chunks,
+            1 + 2,
+            "the changed chunk and the memory"
+        );
+        assert_eq!(fs::read(second_tree.join("disks/1")).unwrap(), changed_disk);
+        assert_eq!(
+            fs::read(second_tree.join("checkpoint/memory.bin")).unwrap(),
+            second_memory
+        );
+
+        // A tree that is gone is never offered and its entry is dropped.
+        fs::remove_dir_all(&first_tree).unwrap();
+        assert!(closest_base(&library, &second, alive).unwrap().is_none());
+        assert_eq!(fs::read_dir(&library).unwrap().count(), 1);
+        // The library keeps only the most recently used entries.
+        remember_base(&library, &second, &second_tree, 1).unwrap();
+        assert_eq!(fs::read_dir(&library).unwrap().count(), 1);
+    }
+
     /// Capture `bytes` as generation `id`, retaining `parent`'s generations.
     fn capture_generation(
         cache: &Path,
@@ -4270,6 +4506,40 @@ mod tests {
             )
             .unwrap();
         retained
+    }
+
+    /// The history export moves objects into its staging tree by name and
+    /// the packer dereferences links, so an object that is a symlink would put
+    /// the target's bytes into the file: it is refused like any other object
+    /// that is not a regular file.
+    #[test]
+    #[cfg(unix)]
+    fn a_history_export_refuses_an_object_that_is_not_a_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        capture_generation(&cache, &first, &[1u8; 64], G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &[2u8; 64],
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"host secret").unwrap();
+        let hash = read_index(&second).unwrap().files[0].chunks[0]
+            .clone()
+            .unwrap();
+        let object = second.join("objects").join(&hash);
+        fs::remove_file(&object).unwrap();
+        std::os::unix::fs::symlink(&outside, &object).unwrap();
+        let file = root.path().join("history.checkpoint");
+        let error = export_with_history(&second, 32, &file, |_| {}).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(!file.exists());
     }
 
     const G1: &str = "11111111111111111111111111111111";

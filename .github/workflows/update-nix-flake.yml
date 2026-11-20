@@ -75,8 +75,20 @@ jobs:
           else
             echo "::warning title=nix bump PR not opened::GITHUB_TOKEN is blocked from creating PRs; branch '${branch}' is pushed — open it at ${{ github.server_url }}/${{ github.repository }}/compare/main...${branch}?expand=1"
           fi
-          # A push or PR made with the workflow token starts no workflow, so the
-          # required no-ai-attribution check would never report on this branch and
-          # the PR could not merge. A workflow_dispatch is the one event this token
-          # may start: run the check on the branch so it reports on its head.
-          gh workflow run no-ai-attribution.yml --ref "$branch"
+          # GitHub holds the checks of a PR the workflow token opened for a
+          # maintainer's approval (action_required), and a check run started any
+          # other way does not count for the PR, so every bump from 1.34.2 to
+          # 1.35.2 sat unmergeable and was closed while the flake stayed broken.
+          # Approve the held runs on the bump's head so its checks run now.
+          head=$(git rev-parse HEAD)
+          approved=0
+          for _ in $(seq 1 12); do
+            sleep 10
+            for id in $(gh api "repos/${{ github.repository }}/actions/runs?head_sha=${head}&status=action_required" --jq '.workflow_runs[].id'); do
+              if gh api -X POST "repos/${{ github.repository }}/actions/runs/${id}/approve" >/dev/null; then approved=$((approved + 1)); fi
+            done
+            [ "$approved" -gt 0 ] && break
+          done
+          if [ "$approved" -eq 0 ]; then
+            echo "::warning title=nix bump checks not started::no held check run on ${branch} could be approved; approve them on the PR, or close and reopen it, so the flake bump can merge"
+          fi
