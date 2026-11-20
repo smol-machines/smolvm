@@ -34,17 +34,28 @@ pub(crate) const MAX_REQ_SECRETS_PER_REQUEST: usize = 64;
 /// across exec/run handlers.
 pub(crate) fn record_secret_refs_env(
     entry: &std::sync::Arc<parking_lot::Mutex<MachineEntry>>,
+    record: Option<&crate::config::VmRecord>,
 ) -> Result<Vec<(String, String)>, ApiError> {
-    let (refs, credential_env) = {
-        let guard = entry.lock();
-        let credentials = guard.credentials.as_ref();
-        crate::credentials::workload_env(
-            credentials.map(|c| &c.policy),
-            credentials
-                .map(|c| &c.placeholders)
-                .unwrap_or(&Default::default()),
-            &guard.secret_refs,
-        )
+    // The record is the machine's own: the cached entry outlives a CLI delete
+    // and re-create under the same name, and its secrets would reach the
+    // successor, which was granted none of them.
+    let (refs, credential_env) = match record {
+        Some(record) => crate::credentials::workload_env(
+            record.credential_policy.as_ref(),
+            &record.credential_placeholders,
+            &record.secret_refs,
+        ),
+        None => {
+            let guard = entry.lock();
+            let credentials = guard.credentials.as_ref();
+            crate::credentials::workload_env(
+                credentials.map(|c| &c.policy),
+                credentials
+                    .map(|c| &c.placeholders)
+                    .unwrap_or(&Default::default()),
+                &guard.secret_refs,
+            )
+        }
     };
     let mut env = if refs.is_empty() {
         Vec::new()
@@ -134,7 +145,7 @@ pub(crate) fn machine_command_context(
     let mut env = record.map(|record| record.env.clone()).unwrap_or_default();
     use crate::util::layer_env;
     layer_env(&mut env, crate::api::types::EnvVar::to_tuples(request_env));
-    layer_env(&mut env, record_secret_refs_env(entry)?);
+    layer_env(&mut env, record_secret_refs_env(entry, record)?);
     layer_env(
         &mut env,
         crate::secrets::expose_into_env(resolve_request_secrets(request_secrets)?),
@@ -263,6 +274,37 @@ pub(crate) fn resolve_request_secrets(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A machine deleted and re-created under its name by the CLI leaves
+    /// serve's cached entry behind; the successor's commands get the secrets
+    /// its own record grants, not its predecessor's.
+    #[test]
+    fn api_commands_take_secrets_from_the_record_not_a_stale_entry() {
+        let host_var = format!("SMOLVM_TEST_PREDECESSOR_SECRET_{}", std::process::id());
+        std::env::set_var(&host_var, "hunter2");
+        let name = format!("secret-successor-{:032x}", rand::random::<u128>());
+        let mut predecessor =
+            crate::config::VmRecord::new(name.clone(), 1, 128, vec![], vec![], false);
+        predecessor.secret_refs.insert(
+            "DB_PASSWORD".into(),
+            serde_json::from_value(serde_json::json!({ "from_env": host_var })).unwrap(),
+        );
+        let entry = std::sync::Arc::new(parking_lot::Mutex::new(
+            crate::api::handlers::machines::machine_entry_from_record(
+                &predecessor,
+                crate::agent::AgentManager::for_vm(&name).unwrap(),
+            ),
+        ));
+        let successor = crate::config::VmRecord::new(name, 1, 128, vec![], vec![], false);
+
+        let env = record_secret_refs_env(&entry, Some(&successor)).unwrap();
+        assert!(env.iter().all(|(key, _)| key != "DB_PASSWORD"), "{env:?}");
+        let env = record_secret_refs_env(&entry, Some(&predecessor)).unwrap();
+        assert!(env
+            .iter()
+            .any(|(key, value)| key == "DB_PASSWORD" && value == "hunter2"));
+        std::env::remove_var(&host_var);
+    }
     use smolvm_protocol::SecretRef;
     use std::collections::BTreeMap;
 
