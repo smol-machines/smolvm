@@ -1224,6 +1224,53 @@ fn bake_start_args<'a>(
 /// the Smolfile with the workload replaced by a `/bin/true` no-op so only `init`
 /// runs, snapshot it, and delete the temp machine. The real workload command is
 /// supplied at run time against the resulting artifact.
+/// The run's private-range floor and ordered rules as `machine create` flags,
+/// for the init bake: `--block-private` with its exceptions, `--deny-cidr`,
+/// and `--allow-udp`. Rules no flag can express come from the Smolfile, which
+/// the bake is given as well.
+fn bake_policy_args(params: &vm_common::CreateVmParams) -> Vec<String> {
+    let mut args = Vec::new();
+    if let Some(exceptions) = &params.block_private {
+        args.push("--block-private".to_string());
+        for cidr in exceptions {
+            args.push("--allow-private".to_string());
+            args.push(cidr.clone());
+        }
+    }
+    for rule in &params.egress_rules {
+        if let Some((flag, value)) = rule_as_create_flag(rule) {
+            args.push(flag.to_string());
+            args.push(value);
+        }
+    }
+    args
+}
+
+/// The `machine create` flag that adds `rule`, when one exists: a plain
+/// deny is `--deny-cidr`, a UDP allow is `--allow-udp`.
+fn rule_as_create_flag(rule: &smolvm_protocol::EgressRule) -> Option<(&'static str, String)> {
+    use smolvm_protocol::{FlowTransport, RuleAction};
+    let cidr = rule.cidr.as_deref()?;
+    match (rule.action, rule.transport, rule.ports) {
+        (RuleAction::Deny, None, None) => Some(("--deny-cidr", cidr.to_string())),
+        (RuleAction::Allow, Some(FlowTransport::Udp), ports) => {
+            let ports = ports.map(|range| match range.start == range.end {
+                true => range.start.to_string(),
+                false => format!("{}-{}", range.start, range.end),
+            });
+            Some((
+                "--allow-udp",
+                match (ports, cidr.contains(':')) {
+                    (None, _) => cidr.to_string(),
+                    (Some(ports), true) => format!("[{cidr}]:{ports}"),
+                    (Some(ports), false) => format!("{cidr}:{ports}"),
+                },
+            ))
+        }
+        _ => None,
+    }
+}
+
 fn ensure_init_layer(
     params: &vm_common::CreateVmParams,
     smolfile: Option<&Path>,
@@ -1364,6 +1411,9 @@ fn ensure_init_layer(
                 create.push(h.clone());
             }
         }
+        // Init runs the image's own code as root, so it gets the run's
+        // restrictions too, not only its allow lists.
+        create.extend(bake_policy_args(params));
         create.push("--".into());
         create.push("/bin/true".into());
         let create: Vec<&str> = create.iter().map(String::as_str).collect();
@@ -2727,6 +2777,41 @@ impl RunCmd {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn every_udp_allow_and_plain_deny_round_trips_through_its_create_flag() {
+        for spec in [
+            "10.0.0.0/8",
+            "1.1.1.1/32:123",
+            "192.0.2.0/24:3478-3480",
+            "2001:db8::1/128:443",
+        ] {
+            let spec = if spec.contains("::") && spec.matches(':').count() > 2 {
+                let (cidr, port) = spec.rsplit_once(':').unwrap();
+                format!("[{cidr}]:{port}")
+            } else {
+                spec.to_string()
+            };
+            let rule = smolvm::smolfile::parse_allow_udp(&spec).unwrap();
+            let (flag, value) = super::rule_as_create_flag(&rule).unwrap();
+            assert_eq!(flag, "--allow-udp");
+            assert_eq!(
+                smolvm::smolfile::parse_allow_udp(&value).unwrap(),
+                rule,
+                "{spec}"
+            );
+        }
+        let deny = smolvm_protocol::EgressRule {
+            transport: None,
+            cidr: Some("192.168.0.0/16".into()),
+            ports: None,
+            action: smolvm_protocol::RuleAction::Deny,
+        };
+        assert_eq!(
+            super::rule_as_create_flag(&deny),
+            Some(("--deny-cidr", "192.168.0.0/16".to_string()))
+        );
+    }
+
     /// Serialize tests whose asserts depend on SMOLVM_MACHINE_NAME, and shield
     /// them from an ambient value: clap reads real process env at parse time,
     /// so a value set by a concurrently running test (or exported in the
