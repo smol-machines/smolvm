@@ -210,13 +210,18 @@ impl Store {
         result
     }
 
-    /// A free staging path under the store for a tree being installed.
+    /// A free staging path under the store for a tree being installed. Each
+    /// call gets its own: installs run concurrently in one server, and one
+    /// clearing a path another is still unpacking into would let the second
+    /// tree's files land in the first after it was hashed.
     fn staging_dir(&self, label: &str, what: &str) -> Result<PathBuf> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::fs::create_dir_all(&self.root)?;
         let label = hex_of(label).map(|hex| &hex[..16]).unwrap_or(label);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let staging = self
             .root
-            .join(format!(".{label}-{}.{what}", std::process::id()));
+            .join(format!(".{label}-{}-{sequence}.{what}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         Ok(staging)
     }
@@ -297,6 +302,19 @@ mod tests {
         std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
         std::fs::write(dir.join("usr/local/bin/smolvm-agent"), agent).unwrap();
         std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", dir.join("sbin/init")).unwrap();
+    }
+
+    #[test]
+    fn concurrent_installs_never_share_a_staging_tree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let first = store.staging_dir("unknown", "unpack").unwrap();
+        std::fs::create_dir(&first).unwrap();
+        std::fs::write(first.join("busybox"), b"first").unwrap();
+        let second = store.staging_dir("unknown", "unpack").unwrap();
+        assert_ne!(first, second);
+        // The second install leaves the first one's tree alone.
+        assert_eq!(std::fs::read(first.join("busybox")).unwrap(), b"first");
     }
 
     #[test]
