@@ -45,7 +45,7 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialBindingsRequest, CredentialBindingsResponse,
     CredentialValuesRequest, DeleteQuery, DeleteResponse, EgressEventsResponse, ExportRequest,
     ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo,
-    MachineMetricsResponse, MachinePressure, MountInfo, MountSpec, PortSpec, PressureReading,
+    MachineMetricsResponse, MachineNetwork, MachinePressure, MountInfo, MountSpec, PortSpec, PressureReading,
     ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetMachineEnvRequest, SetPortsRequest,
     StartMachineQuery, UpdateEgressRequest, UpdateMachineLabelsRequest,
 };
@@ -7397,32 +7397,7 @@ pub async fn update_machine_egress(
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock_owned().await;
 
-    let record = state
-        .lookup_vm(&name)
-        .await?
-        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
-
-    let actual_state = record.actual_state();
-    let running = match actual_state {
-        RecordState::Stopped | RecordState::Created => false,
-        RecordState::Running => true,
-        _ => {
-            return Err(ApiError::Conflict(format!(
-                "machine '{}' must be stopped or running before its egress changes. Current state: {:?}",
-                name, actual_state
-            )));
-        }
-    };
-    let (record, _egress_lock) = if running {
-        let lock = crate::agent::lock_live_egress(&name)?;
-        let fresh = state
-            .lookup_vm(&name)
-            .await?
-            .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
-        (fresh, Some(lock))
-    } else {
-        (record, None)
-    };
+    let (record, running, _egress_lock) = egress_change_record(&state, &name).await?;
 
     // Normalize CIDRs with the CLI's parser, so a malformed entry is a 400
     // here instead of a silently narrower or wider policy later.
@@ -7459,6 +7434,52 @@ pub async fn update_machine_egress(
             other => ApiError::from(other),
         })?
         .ok_or_else(|| ApiError::BadRequest("request contains no egress changes".into()))?;
+    commit_egress_change(&state, &name, &record, next, running).await
+}
+
+/// A machine's record for an egress change, and whether it runs: a change
+/// needs the machine stopped or running, and a running one's allow list is
+/// locked while it changes. Hold the lifecycle lock across the call.
+async fn egress_change_record(
+    state: &Arc<ApiState>,
+    name: &str,
+) -> Result<(VmRecord, bool, Option<std::fs::File>), ApiError> {
+    let record = state
+        .lookup_vm(name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let actual_state = record.actual_state();
+    let running = match actual_state {
+        RecordState::Stopped | RecordState::Created => false,
+        RecordState::Running => true,
+        _ => {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' must be stopped or running before its egress changes. Current state: {:?}",
+                name, actual_state
+            )));
+        }
+    };
+    if !running {
+        return Ok((record, false, None));
+    }
+    let lock = crate::agent::lock_live_egress(name)?;
+    let fresh = state
+        .lookup_vm(name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    Ok((fresh, true, Some(lock)))
+}
+
+/// Apply an egress change to a running machine, then save it; a failed save
+/// puts the running machine back on the policy its record keeps.
+async fn commit_egress_change(
+    state: &Arc<ApiState>,
+    name: &str,
+    record: &VmRecord,
+    next: VmRecord,
+    running: bool,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let name = name.to_string();
     let rules_change = next.egress_rules != record.egress_rules;
 
     if running {
@@ -7488,13 +7509,90 @@ pub async fn update_machine_egress(
         Err(error) => {
             // The record keeps the old allow list, so the running machine must too.
             if running {
-                let _ = crate::agent::apply_live_egress_policy(&name, &record, rules_change);
+                let _ = crate::agent::apply_live_egress_policy(&name, record, rules_change);
             }
             return Err(error);
         }
     };
 
     Ok(Json(record_to_info(&name, &updated)))
+}
+
+/// Replace a machine's egress policy, in the cloud API's shape: `blocked`,
+/// `open`, or `allowCidrs` with the hosts and CIDRs it may reach. A running
+/// machine takes a policy that keeps an allow list in force, for its next
+/// connection or lookup; opening it fully or blocking it needs it stopped, as
+/// `POST .../egress` does.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/network",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = MachineNetwork,
+    responses(
+        (status = 200, description = "Policy replaced", body = MachineInfo),
+        (status = 400, description = "Invalid policy", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "The change needs the machine stopped", body = ApiErrorResponse),
+        (status = 500, description = "Update failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn set_machine_network(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<MachineNetwork>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock_owned().await;
+    let (record, running, _egress_lock) = egress_change_record(&state, &name).await?;
+    let bad = |error: crate::Error| match error {
+        crate::Error::Config { .. } => ApiError::BadRequest(error.to_string()),
+        other => ApiError::from(other),
+    };
+    let next = match req {
+        MachineNetwork::Blocked => {
+            if running {
+                return Err(ApiError::Conflict(format!(
+                    "machine '{name}' is running; its networking turns off only while it is stopped"
+                )));
+            }
+            let mut next = record.clone();
+            next.replace_egress(false, Vec::new(), Vec::new()).map_err(bad)?;
+            next
+        }
+        MachineNetwork::Open => record
+            .updated_egress(&crate::config::EgressUpdate {
+                reset_allow_list: true,
+                allow_all: true,
+                ..Default::default()
+            })
+            .map_err(bad)?
+            .unwrap_or_else(|| record.clone()),
+        MachineNetwork::AllowCidrs { cidrs, hosts } => {
+            if cidrs.is_empty() && hosts.is_empty() {
+                return Err(ApiError::BadRequest(
+                    "allowCidrs network mode requires at least one CIDR or host".into(),
+                ));
+            }
+            let cidrs = cidrs
+                .iter()
+                .map(|cidr| crate::smolfile::parse_cidr(cidr))
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(ApiError::BadRequest)?;
+            record
+                .updated_egress(&crate::config::EgressUpdate {
+                    reset_allow_list: true,
+                    allow_hosts: hosts,
+                    allow_cidrs: cidrs,
+                    ..Default::default()
+                })
+                .map_err(bad)?
+                .unwrap_or_else(|| record.clone())
+        }
+    };
+    commit_egress_change(&state, &name, &record, next, running).await
 }
 
 /// Replace a machine's environment. A stopped machine takes it at its next
@@ -9203,6 +9301,67 @@ mod tests {
         let req = SetPortsRequest { ports: vec![] };
         let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn network_is_replaced_in_the_cloud_api_shape_on_a_stopped_machine() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "net-vm", Some(20), Some(5));
+        let body = |v: serde_json::Value| -> MachineNetwork { serde_json::from_value(v).unwrap() };
+        let saved = |state: &Arc<ApiState>| state.db().get_vm("net-vm").unwrap().unwrap();
+
+        let _ = set_machine_network(
+            State(state.clone()),
+            Path("net-vm".into()),
+            Json(body(serde_json::json!({"mode": "allowCidrs", "cidrs": ["10.0.0.0/8"], "hosts": ["api.example.com"]}))),
+        )
+        .await
+        .unwrap();
+        let record = saved(&state);
+        assert!(record.network);
+        assert_eq!(record.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
+        assert!(record.dns_filter_hosts.as_ref().is_some_and(|h| h.len() == 1));
+
+        // A replace, not an amend: what the last call named is all there is.
+        let _ = set_machine_network(
+            State(state.clone()),
+            Path("net-vm".into()),
+            Json(body(serde_json::json!({"mode": "allowCidrs", "cidrs": ["192.0.2.0/24"]}))),
+        )
+        .await
+        .unwrap();
+        let record = saved(&state);
+        assert_eq!(record.allowed_cidrs, Some(vec!["192.0.2.0/24".to_string()]));
+        assert!(record.dns_filter_hosts.is_none());
+
+        let _ = set_machine_network(
+            State(state.clone()),
+            Path("net-vm".into()),
+            Json(body(serde_json::json!({"mode": "open"}))),
+        )
+        .await
+        .unwrap();
+        let record = saved(&state);
+        assert!(record.network && record.allowed_cidrs.is_none() && record.dns_filter_hosts.is_none());
+
+        let _ = set_machine_network(
+            State(state.clone()),
+            Path("net-vm".into()),
+            Json(body(serde_json::json!({"mode": "blocked"}))),
+        )
+        .await
+        .unwrap();
+        assert!(!saved(&state).network);
+
+        for bad in [
+            serde_json::json!({"mode": "allowCidrs"}),
+            serde_json::json!({"mode": "allowCidrs", "cidrs": ["not-a-cidr"]}),
+        ] {
+            let refused =
+                set_machine_network(State(state.clone()), Path("net-vm".into()), Json(body(bad.clone()))).await;
+            assert!(matches!(refused.unwrap_err(), ApiError::BadRequest(_)), "{bad}");
+        }
+        assert!(serde_json::from_value::<MachineNetwork>(serde_json::json!({"mode": "everything"})).is_err());
     }
 
     #[tokio::test]

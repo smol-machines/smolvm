@@ -371,6 +371,26 @@ fn env_vars<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<EnvVar>, D::E
     }
 }
 
+/// A machine's egress policy, as the cloud API takes it: the body of
+/// `PUT /api/v1/machines/{name}/network`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MachineNetwork {
+    /// No outbound access for the guest.
+    Blocked,
+    /// Unrestricted outbound access.
+    Open,
+    /// Outbound access only to these CIDRs and hosts.
+    AllowCidrs {
+        /// CIDR ranges the guest may reach.
+        #[serde(default)]
+        cidrs: Vec<String>,
+        /// Hostnames the guest may reach, each with its subdomains.
+        #[serde(default)]
+        hosts: Vec<String>,
+    },
+}
+
 /// Body of `PATCH /api/v1/machines/{name}/labels`: labels to change, leaving
 /// the others as they are, as the cloud API takes them.
 #[derive(Debug, Default, Deserialize, ToSchema)]

@@ -129,6 +129,7 @@ use state::ApiState;
         handlers::machines::update_machine_egress,
         handlers::machines::set_machine_env,
         handlers::machines::update_machine_labels,
+        handlers::machines::set_machine_network,
         handlers::machines::release_held_branch,
         handlers::machines::capture_portable_checkpoint,
         handlers::machines::restore_portable_checkpoint,
@@ -185,6 +186,7 @@ use state::ApiState;
         types::UpdateEgressRequest,
         types::SetMachineEnvRequest,
         types::UpdateMachineLabelsRequest,
+        types::MachineNetwork,
         types::MachineMetricsResponse,
         types::MachinePressure,
         types::PressureReading,
@@ -447,6 +449,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/metrics",
             get(handlers::machines::get_machine_metrics),
         )
+        .route("/{id}/network", put(handlers::machines::set_machine_network))
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
