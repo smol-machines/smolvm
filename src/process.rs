@@ -2134,6 +2134,13 @@ pub(crate) fn mark_checkpoint_backing(file: &std::fs::File) -> std::io::Result<b
     Err(error)
 }
 
+/// Hand `path` and everything under it to `(uid, gid)`, except `excluded`.
+///
+/// The tree may already belong to the VM's uid (every launch after the
+/// first), whose VMM could be swapping entries for links while root walks it.
+/// So each directory is opened once without following links, and every child
+/// is inspected and chowned relative to that open directory, never by a path
+/// a link could redirect; a directory replaced by a link is not entered.
 #[cfg(target_os = "linux")]
 pub(crate) fn chown_tree_except(
     path: &std::path::Path,
@@ -2141,25 +2148,76 @@ pub(crate) fn chown_tree_except(
     gid: u32,
     excluded: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     if excluded == Some(path) {
         return Ok(());
     }
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(path)?;
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+    let parent = path.parent().unwrap_or(std::path::Path::new("/"));
+    let name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let c = std::ffi::CString::new(parent.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: c is a valid C string; the descriptor is owned below.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd was just opened and is owned here.
+    let parent_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if name.is_empty() {
+        return chown_children(&parent_fd, parent, uid, gid, excluded);
+    }
+    chown_entry(parent_fd.as_raw_fd(), &name, path, uid, gid, excluded)
+}
+
+/// Chown one entry of the open directory `dir` (named `name`, at `path`), and
+/// everything under it when it is a real directory.
+#[cfg(target_os = "linux")]
+fn chown_entry(
+    dir: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    excluded: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    if excluded == Some(path) {
+        return Ok(());
+    }
+    let c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: dir is open, c a valid C string, st a valid out-pointer.
+    if unsafe { libc::fstatat(dir, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let kind = st.st_mode & libc::S_IFMT;
     // Service-owned immutable data may be shared by several restored VMs.
     // Transferring its ownership would let one VM chmod a sibling's backing.
     // Do not key this on link count: cache eviction/publication can change it.
-    if meta.is_file() && meta.uid() == 0 && meta.mode() & 0o7777 == 0o444 {
+    if kind == libc::S_IFREG && st.st_uid == 0 && st.st_mode & 0o7777 == 0o444 {
         let mut marker = [0_u8; 1];
-        // lgetxattr does not follow a substituted symlink. Only explicitly
-        // tagged, root-owned immutable files keep shared ownership; unrelated
-        // read-only files still receive the ordinary per-machine owner.
+        // Read through the open directory, without following a link at the
+        // name. Only explicitly tagged, root-owned immutable files keep
+        // shared ownership; other read-only files get the machine's owner.
+        let anchored = std::ffi::CString::new(
+            [format!("/proc/self/fd/{dir}/").as_bytes(), name.as_bytes()].concat(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: valid C strings and buffer.
         let length = unsafe {
             libc::lgetxattr(
-                c.as_ptr(),
+                anchored.as_ptr(),
                 CHECKPOINT_BACKING_XATTR.as_ptr().cast(),
                 marker.as_mut_ptr().cast(),
                 marker.len(),
@@ -2175,14 +2233,55 @@ pub(crate) fn chown_tree_except(
             }
         }
     }
-    if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+    // SAFETY: dir is open and c a valid C string.
+    if unsafe { libc::fchownat(dir, c.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // Recurse into real directories only (not symlinked ones).
-    if meta.file_type().is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            chown_tree_except(&entry?.path(), uid, gid, excluded)?;
+    if kind != libc::S_IFDIR {
+        return Ok(());
+    }
+    // SAFETY: dir is open and c a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        // replaced by a link (or a file) since it was inspected: not entered
+        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+            return Ok(());
         }
+        return Err(error);
+    }
+    // SAFETY: fd was just opened and is owned here.
+    let child = unsafe { OwnedFd::from_raw_fd(fd) };
+    chown_children(&child, path, uid, gid, excluded)
+}
+
+/// Chown every entry of the open directory `dir`, which is at `path`.
+#[cfg(target_os = "linux")]
+fn chown_children(
+    dir: &std::os::fd::OwnedFd,
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    excluded: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Listed through the open directory itself, not its name.
+    for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+        let name = entry?.file_name();
+        chown_entry(
+            dir.as_raw_fd(),
+            &name,
+            &path.join(&name),
+            uid,
+            gid,
+            excluded,
+        )?;
     }
     Ok(())
 }
@@ -5134,6 +5233,37 @@ mod tests {
         // the kernel probe sees this process's own uid and not an unused one
         assert!(uid_has_processes(unsafe { libc::getuid() }).unwrap());
         assert!(!uid_has_processes(VM_UID_BASE + VM_UID_SPAN - 1).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root to change ownership"]
+    fn the_chown_walk_never_reaches_through_a_link() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("vm");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/disk"), b"d").unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"s").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("escape")).unwrap();
+        std::fs::write(tree.join("kept"), b"k").unwrap();
+
+        chown_tree_except(&tree, 2_000_000, 2_000_000, Some(&tree.join("kept"))).unwrap();
+        assert_eq!(
+            std::fs::metadata(tree.join("sub/disk")).unwrap().uid(),
+            2_000_000
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(tree.join("escape"))
+                .unwrap()
+                .uid(),
+            2_000_000
+        );
+        assert_eq!(std::fs::metadata(&outside).unwrap().uid(), 0);
+        assert_eq!(std::fs::metadata(outside.join("secret")).unwrap().uid(), 0);
+        assert_eq!(std::fs::metadata(tree.join("kept")).unwrap().uid(), 0);
     }
 
     #[test]
