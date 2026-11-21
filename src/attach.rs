@@ -21,6 +21,11 @@ use crate::{Error, Result};
 
 pub use smolvm_protocol::AttachedMount;
 
+#[cfg(unix)]
+mod owned_shares;
+#[cfg(unix)]
+pub(crate) use owned_shares::OwnedShares;
+
 fn tag(read_only: bool) -> &'static str {
     if read_only {
         smolvm_protocol::ATTACH_TAG_RO
@@ -75,7 +80,18 @@ const RESTART_HINT: &str =
     "this machine was started before attached mounts were supported; restart it";
 
 fn control(name: &str, command: &str) -> Result<String> {
+    // one command per connection: a newline in a value would add a line of its own
+    if command.contains(['\n', '\r']) {
+        return Err(Error::agent(
+            "attach mount",
+            "control command has a line break",
+        ));
+    }
     let reply = control_socket_cmd(&control_socket_path(name), command)?;
+    control_reply(reply)
+}
+
+fn control_reply(reply: String) -> Result<String> {
     let reply = reply.trim().to_string();
     if reply.starts_with("OK") {
         Ok(reply)
@@ -121,6 +137,8 @@ pub fn attach(
     read_only: bool,
     boot_targets: &[String],
 ) -> Result<AttachedMount> {
+    let _admission = crate::db::SmolvmDb::open()?
+        .admit_workload_mutation(Some(name), &[source.to_path_buf()])?;
     let source = std::fs::canonicalize(source).map_err(|e| {
         Error::config(
             "attach mount",
@@ -133,6 +151,7 @@ pub fn attach(
             format!("host path {} is not a directory", source.display()),
         ));
     }
+    let source_arg = share_source_arg(&source)?;
     let target = normalize_target(target)?;
     let target_str = target.to_string_lossy().into_owned();
     if boot_targets
@@ -176,7 +195,7 @@ pub fn attach(
     let share = share_name(&target);
     let source_str = source.to_string_lossy().into_owned();
     let tag = tag(read_only);
-    control(name, &format!("SHARE_ADD {tag} {share} {source_str}"))?;
+    control(name, &format!("SHARE_ADD {tag} {share} {source_arg}"))?;
     if let Err(error) = client.attach_mount(&share, &source_str, read_only, &target_str) {
         // Never leave a share the guest can reach but did not ask for.
         let _ = control(name, &format!("SHARE_REMOVE {tag} {share}"));
@@ -195,6 +214,8 @@ pub fn attach(
 /// into a container itself (the Docker engine's containers that run in
 /// another container's machine). `share` is ASCII letters and digits.
 pub fn add_share(name: &str, share: &str, source: &Path, read_only: bool) -> Result<()> {
+    let _admission = crate::db::SmolvmDb::open()?
+        .admit_workload_mutation(Some(name), &[source.to_path_buf()])?;
     if share.is_empty() || !share.chars().all(|c| c.is_ascii_alphanumeric()) {
         return Err(Error::config(
             "attach share",
@@ -209,37 +230,92 @@ pub fn add_share(name: &str, share: &str, source: &Path, read_only: bool) -> Res
     })?;
     control(
         name,
-        &format!("SHARE_ADD {} {share} {}", tag(read_only), source.display()),
+        &format!(
+            "SHARE_ADD {} {share} {}",
+            tag(read_only),
+            share_source_arg(&source)?
+        ),
     )
     .map(|_| ())
 }
 
+// The existing VMM control protocol trims its command argument. A final /.
+// retains the exact directory identity when its name ends in whitespace;
+// canonicalization in LiveShares::attach removes it before recording the path.
+fn share_source_arg(source: &Path) -> Result<String> {
+    let source = source
+        .to_str()
+        .filter(|path| !path.chars().any(char::is_control))
+        .ok_or_else(|| {
+            Error::config(
+                "attach share",
+                "host path must be UTF-8 without control characters",
+            )
+        })?;
+    Ok(format!("{source}/."))
+}
+
 /// Remove a share [`add_share`] added, revoking the guest's access to it.
 pub fn remove_share(name: &str, share: &str, read_only: bool) -> Result<()> {
+    let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     control(name, &format!("SHARE_REMOVE {} {share}", tag(read_only))).map(|_| ())
 }
 
 /// Live device exports, including shares bound by the container engine.
 #[cfg(unix)]
 pub(crate) fn shared_directories(name: &str, read_only: bool) -> Result<Vec<(String, PathBuf)>> {
-    let reply = control(name, &format!("SHARE_LIST {}", tag(read_only)))?;
-    let entries = reply.strip_prefix("OK").unwrap_or("").trim();
+    shared_directories_with_timeout(name, read_only, std::time::Duration::from_secs(60))
+}
+
+#[cfg(unix)]
+pub(crate) fn shared_directories_with_timeout(
+    name: &str,
+    read_only: bool,
+    timeout: std::time::Duration,
+) -> Result<Vec<(String, PathBuf)>> {
+    let reply = crate::agent::fork::control_socket_cmd_with_timeout(
+        &control_socket_path(name),
+        &format!("SHARE_LIST {}", tag(read_only)),
+        timeout,
+    )?;
+    parse_shared_directories(&reply)
+}
+
+#[cfg(unix)]
+fn parse_shared_directories(reply: &str) -> Result<Vec<(String, PathBuf)>> {
+    // Do not trim: a host directory may end in spaces. Only the transport
+    // removes the newline delimiting the control reply.
+    let invalid = || Error::config("attach share", "invalid or unsupported live share listing");
+    let entries = reply
+        .strip_prefix("OK ")
+        .or_else(|| (reply == "OK").then_some(""))
+        .ok_or_else(invalid)?;
     if entries.is_empty() {
         return Ok(Vec::new());
     }
-    entries
-        .split('\t')
-        .map(|entry| {
-            let (share, source) = entry
-                .split_once('=')
-                .ok_or_else(|| Error::config("attach share", "invalid live share listing"))?;
-            Ok((share.to_owned(), PathBuf::from(source)))
-        })
-        .collect()
+    let mut seen = std::collections::BTreeSet::new();
+    let mut shares = Vec::new();
+    for entry in entries.split('\t') {
+        let (share, source) = entry.split_once('=').ok_or_else(invalid)?;
+        if share.is_empty() || share.len() > 64 || matches!(share, "." | "..")
+            || !share.bytes().all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            || !seen.insert(share) || seen.len() > 64
+            || !Path::new(source).is_absolute() || source.chars().any(char::is_control)
+            // The legacy wire format renders paths with Display. Refuse a
+            // lossy path instead of mistaking it for a different real path.
+            || source.contains('\u{fffd}')
+        {
+            return Err(invalid());
+        }
+        shares.push((share.to_owned(), PathBuf::from(source)));
+    }
+    shares.sort();
+    Ok(shares)
 }
 
 /// Unmount the attached mount at `target` from the running machine `name`.
 pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
+    let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(Some(name), &[])?;
     let target = normalize_target(target)?;
     let target_str = target.to_string_lossy().into_owned();
     let (mut client, supported) = connect(name)?;
@@ -257,16 +333,39 @@ pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
         ));
     };
     client.detach_mount(&mount.target)?;
-    control(
+    // The share to revoke is the one this host attached for the target, not
+    // the one the guest names: a guest could name another share it holds and
+    // keep this one. Which device holds it is the guest's claim too, so both
+    // are asked, the claimed one first.
+    let share = share_name(&target);
+    let removed = control(
         name,
-        &format!("SHARE_REMOVE {} {}", tag(mount.read_only), mount.share),
-    )?;
-    Ok(mount)
+        &format!("SHARE_REMOVE {} {share}", tag(mount.read_only)),
+    )
+    .or_else(|_| {
+        control(
+            name,
+            &format!("SHARE_REMOVE {} {share}", tag(!mount.read_only)),
+        )
+    });
+    removed?;
+    Ok(AttachedMount { share, ..mount })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_control_command_with_a_line_break_is_never_sent() {
+        let error = control(
+            "no-such-machine",
+            "SHARE_REMOVE smolvm_attach_rw m1\nSHARE_ADD smolvm_attach_rw pwned /",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line break"), "{error}");
+    }
 
     #[test]
     fn a_directory_overlaps_itself_its_parents_and_its_children_only() {
@@ -295,5 +394,68 @@ mod tests {
         assert_ne!(share, share_name(Path::new("/data")));
         assert!(share.len() <= 64);
         assert!(share.bytes().all(|b| b.is_ascii_alphanumeric()));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn live_share_listing_preserves_unicode_equals_and_trailing_spaces() {
+        assert_eq!(
+            parse_shared_directories("OK g._-=/tmp/é a= b ").unwrap(),
+            vec![("g._-".into(), PathBuf::from("/tmp/é a= b "))]
+        );
+        assert!(parse_shared_directories("OK ").unwrap().is_empty());
+        assert!(parse_shared_directories("OK").unwrap().is_empty());
+        assert_eq!(
+            parse_shared_directories("OK b=/tmp/b\ta=/tmp/a").unwrap()[0].0,
+            "a"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn live_share_listing_refuses_partial_ambiguous_or_lossy_inventory() {
+        for reply in [
+            "",
+            "OKevil",
+            "ERR EINVAL unknown command",
+            "OK a",
+            "OK a=relative",
+            "OK =/tmp/a",
+            "OK ../=/tmp/a",
+            "OK ..=/tmp/a",
+            "OK a=/tmp/a\ta=/tmp/b",
+            "OK a=/tmp/a\t",
+            "OK a=/tmp/a\n",
+            "OK a=/tmp/\u{fffd}",
+        ] {
+            assert!(
+                parse_shared_directories(reply).is_err(),
+                "accepted {reply:?}"
+            );
+        }
+        let too_many = format!(
+            "OK {}",
+            (0..65)
+                .map(|n| format!("s{n}=/tmp/{n}"))
+                .collect::<Vec<_>>()
+                .join("\t")
+        );
+        assert!(parse_shared_directories(&too_many).is_err());
+    }
+    #[test]
+    fn share_attachment_keeps_trailing_spaces_and_refuses_unrepresentable_paths() {
+        assert_eq!(
+            share_source_arg(Path::new("/tmp/é= ")).unwrap(),
+            "/tmp/é= /."
+        );
+        for path in ["/tmp/new\nline", "/tmp/tab\tname", "/tmp/nul\0name"] {
+            assert!(share_source_arg(Path::new(path)).is_err());
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::ffi::OsStrExt;
+            assert!(
+                share_source_arg(Path::new(std::ffi::OsStr::from_bytes(b"/tmp/\xff"))).is_err()
+            );
+        }
     }
 }

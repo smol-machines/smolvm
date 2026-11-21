@@ -76,6 +76,13 @@ enum Commands {
         config: std::path::PathBuf,
     },
 
+    /// Internal: boot with durable startup ownership (not for direct use)
+    #[command(name = "_boot-vm-owned", hide = true)]
+    BootVmOwned {
+        config: std::path::PathBuf,
+        token: String,
+    },
+
     /// Internal: run the shared CUDA daemon (not for direct use)
     #[command(name = "_cuda-daemon", hide = true)]
     CudaDaemon {
@@ -189,6 +196,12 @@ fn main() {
 }
 
 fn run_cli() {
+    if let Err(error) =
+        smolvm::ssh::apply_proxy_context(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        eprintln!("SSH startup failed: {error:#}");
+        std::process::exit(2);
+    }
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
     smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
@@ -219,6 +232,7 @@ fn run_cli() {
             .as_deref()
             .and_then(|s| s.to_str()),
         Some("_boot-vm")
+            | Some("_boot-vm-owned")
             | Some("_cuda-daemon")
             | Some("_cuda-clone-worker")
             | Some("_cuda-mps-supervisor")
@@ -264,6 +278,7 @@ fn run_cli() {
             cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)
         }
         Commands::BootVm { config } => smolvm::internal_boot::run(config),
+        Commands::BootVmOwned { config, token } => smolvm::internal_boot::run_owned(config, token),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
             smolvm::cuda_daemon::run(&socket).map_err(smolvm::Error::Io)

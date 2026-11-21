@@ -451,6 +451,8 @@ pub struct RestoredState {
     pub checkpoint_head: Option<String>,
     /// The captured machine routed egress through a host mediator.
     pub mediated_egress_required: bool,
+    /// The captured machine ran behind an external egress interceptor.
+    pub external_interceptor_required: bool,
     /// The bindings came with the artifact and the host user did not
     /// re-authorize them, so their values must be supplied by the caller,
     /// never read from this host's environment.
@@ -467,6 +469,8 @@ pub struct RestoredState {
 pub struct ResolvedSpec {
     /// Who asked for it.
     pub caller: Caller,
+    /// Whether `image` came from a pack or checkpoint rather than the user.
+    pub image_from_artifact: bool,
     /// OCI image the workload runs from; `None` for a bare or VM-mode machine.
     pub image: Option<String>,
     /// Workload entrypoint.
@@ -1032,6 +1036,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             }
             ResolvedSpec {
                 caller,
+                image_from_artifact: false,
                 image: match source {
                     SpecSource::Image(image) => Some(image.to_string()),
                     _ => None,
@@ -1111,6 +1116,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 ));
             }
             let pack = PackDefaults::of(manifest);
+            // A pack's local image is where its author built it. It is only a
+            // label when the pack ships the layers; with none, a start would
+            // share that host path as the guest's root filesystem.
+            if manifest.assets.layers.is_empty() {
+                refuse_artifact_local_dir(pack.image.as_deref())?;
+            }
             let packed_egress = crate::pack_export::validated_manifest_egress(manifest)?;
             let packed_egress = if caller == Caller::Cli {
                 packed_egress.with_cli_overrides(
@@ -1157,6 +1168,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 || !egress_rules.is_empty();
             ResolvedSpec {
                 caller,
+                image_from_artifact: true,
                 image: pack.image,
                 entrypoint,
                 cmd,
@@ -1230,6 +1242,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             let pack = PackDefaults::of(manifest);
             let captured_net = checkpoint.network.clone().unwrap_or_default();
             let workload = checkpoint.workload.as_ref();
+            refuse_artifact_local_dir(workload.map(|workload| workload.image.as_str()))?;
 
             // The workload: already running, so its command, user and init
             // are the checkpoint's.
@@ -1272,9 +1285,6 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
             )?;
             if !disks.is_empty() {
                 return Err(fixed("attached disks", TOPOLOGY));
-            }
-            if !mounts.is_empty() {
-                return Err(fixed("volume mounts", TOPOLOGY));
             }
             if !remote_volumes.is_empty() {
                 return Err(fixed("remote volumes", TOPOLOGY));
@@ -1351,6 +1361,40 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                     "an egress policy",
                     "the checkpoint was captured on the TSI backend, which cannot enforce one",
                 ));
+            }
+            // The local floor lets an allow entry re-open host loopback,
+            // because only the user writes one. A checkpoint's own entries are
+            // its author's, so one that reaches the host is refused; the user
+            // can restore with an egress policy of their own instead.
+            if allowed_cidrs.is_none() {
+                if let Some(cidr) = captured_net
+                    .allowed_cidrs
+                    .iter()
+                    .flatten()
+                    .find(|cidr| reaches_the_host(Some(cidr)))
+                {
+                    return Err(captured_reach(cidr));
+                }
+            }
+            if allowed_hosts.is_none() {
+                if let Some(host) = captured_net
+                    .dns_filter_hosts
+                    .iter()
+                    .flatten()
+                    .find(|host| names_the_host(host))
+                {
+                    return Err(captured_reach(host));
+                }
+            }
+            if egress_rules.is_empty() {
+                if let Some(rule) = captured_net.egress_rules.iter().find(|rule| {
+                    rule.action == smolvm_protocol::RuleAction::Allow
+                        && reaches_the_host(rule.cidr.as_deref())
+                }) {
+                    return Err(captured_reach(
+                        rule.cidr.as_deref().unwrap_or("every address"),
+                    ));
+                }
             }
             let allowed_cidrs = allowed_cidrs.or_else(|| captured_net.allowed_cidrs.clone());
             let allowed_hosts = allowed_hosts.or_else(|| captured_net.dns_filter_hosts.clone());
@@ -1432,20 +1476,12 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                 }
                 ports
             };
-            let mounts = crate::portable_checkpoint::restored_host_mounts(checkpoint)?
-                .into_iter()
-                .map(|(source, target, read_only)| HostMount {
-                    source: source.into(),
-                    target: target.into(),
-                    read_only,
-                    staged: false,
-                    recorded_ownership: false,
-                })
-                .collect();
+            let mounts = crate::portable_checkpoint::restored_host_mounts_at(checkpoint, &mounts)?;
 
             let captured_settings = &checkpoint.settings;
             ResolvedSpec {
                 caller,
+                image_from_artifact: true,
                 image: workload.map(|workload| workload.image.clone()),
                 entrypoint: pack.entrypoint,
                 cmd: pack.cmd,
@@ -1548,6 +1584,7 @@ pub fn resolve(source: SpecSource<'_>, spec: CreateSpec, caller: Caller) -> Resu
                         .as_ref()
                         .map(|lineage| lineage.id.clone()),
                     mediated_egress_required: captured_net.mediated_egress_required,
+                    external_interceptor_required: captured_net.external_interceptor_required,
                     credentials_from_artifact: !host_values
                         && captured_net
                             .credential_policy
@@ -1713,6 +1750,7 @@ impl ResolvedSpec {
         // Destructured without `..`, like `resolve`.
         let ResolvedSpec {
             caller: _,
+            image_from_artifact,
             image,
             entrypoint,
             cmd,
@@ -1780,6 +1818,7 @@ impl ResolvedSpec {
         let restored = restored.unwrap_or_default();
         let is_restore = self.restored.is_some();
         let recorded_ownership_mounts = mounts.iter().any(|m| m.recorded_ownership);
+        let mount_owners = HostMount::stored_owners(&mounts);
         let (mounts, staged_mounts) = HostMount::split_storage_tuples(&mounts);
         let listen_addresses = PortMapping::listen_addresses(&ports);
         let (ports, udp_ports) = PortMapping::split_tuples(&ports);
@@ -1793,6 +1832,8 @@ impl ResolvedSpec {
             credentials.is_some() && self.credentials_supplied_by_api();
         // Every record field, named, so a new one has to be decided here.
         Ok(VmRecord {
+            database_identity: None,
+            execution_identity: None,
             name: name.to_string(),
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1813,6 +1854,7 @@ impl ResolvedSpec {
             staged_mounts,
             recorded_ownership: recorded_ownership_mounts,
             staged_mounts_detached_from: None,
+            mount_owners,
             ports,
             udp_ports,
             allocated_ports: Vec::new(),
@@ -1869,13 +1911,15 @@ impl ResolvedSpec {
             auto_ports,
             dns_filter_hosts: allowed_hosts,
             credential_policy: credentials,
-            external_interceptor_required: restored.mediated_egress_required,
+            external_interceptor_required: restored.external_interceptor_required
+                || restored.mediated_egress_required,
             mediated_egress_required: restored.mediated_egress_required,
             credential_placeholders,
             credentials_supplied_by_api,
             ephemeral,
             source_smolmachine: None,
             packed_image_on_storage: restored.packed_image_on_storage,
+            image_from_artifact,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
@@ -1893,6 +1937,73 @@ impl ResolvedSpec {
             runtime_managed,
         })
     }
+}
+
+/// Refuse an artifact's image that is a `local-dir:` rootfs directory. The
+/// path was written on the artifact author's host; on this one a start would
+/// share whatever directory it names with the guest, `/` included. (A
+/// `local:` archive key resolves only inside this host's archive cache.)
+fn refuse_artifact_local_dir(image: Option<&str>) -> Result<()> {
+    match image {
+        Some(image) if image.starts_with("local-dir:") => Err(Error::config(
+            "create machine",
+            format!(
+                "this artifact's image is a directory on the host that made it ({image}); \
+                 create the machine from that directory with --image instead"
+            ),
+        )),
+        _ => Ok(()),
+    }
+}
+
+/// Addresses that are the host itself, not the network: host loopback and
+/// link-local (where cloud metadata answers), in both families and spelled as
+/// IPv4-mapped IPv6.
+const HOST_RANGES: [&str; 7] = [
+    "127.0.0.0/8",
+    "::1/128",
+    "::ffff:127.0.0.0/104",
+    "169.254.0.0/16",
+    "fe80::/10",
+    "::ffff:169.254.0.0/112",
+    "fd00:ec2::254/128",
+];
+
+/// Whether an allow entry for `cidr` (`None` allows every address) covers any
+/// part of the host. An entry that does not parse is taken to.
+fn reaches_the_host(cidr: Option<&str>) -> bool {
+    let Some(cidr) = cidr else {
+        return true;
+    };
+    let net = match cidr.parse::<ipnet::IpNet>() {
+        Ok(net) => net,
+        Err(_) => match cidr.parse::<std::net::IpAddr>() {
+            Ok(ip) => ipnet::IpNet::from(ip),
+            Err(_) => return true,
+        },
+    };
+    HOST_RANGES.iter().any(|range| {
+        let range: ipnet::IpNet = range.parse().expect("static range");
+        range.contains(&net.network()) || net.contains(&range.network())
+    })
+}
+
+/// Whether an allowed hostname names the host itself.
+fn names_the_host(host: &str) -> bool {
+    let host = host.trim_end_matches('.').to_ascii_lowercase();
+    host == "localhost"
+        || host.ends_with(".localhost")
+        || (host.parse::<std::net::IpAddr>().is_ok() && reaches_the_host(Some(&host)))
+}
+
+fn captured_reach(entry: &str) -> Error {
+    Error::config(
+        "restore checkpoint egress policy",
+        format!(
+            "the checkpoint's egress policy allows {entry}, which reaches this host; \
+             restore it with an egress policy of your own (--allow-cidr, --allow-host, --deny-cidr)"
+        ),
+    )
 }
 
 #[cfg(test)]

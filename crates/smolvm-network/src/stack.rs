@@ -1153,6 +1153,12 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, routing: &DnsRouting)
         return DnsDecision::Forward { learn: false };
     }
     match dns::question_name(query) {
+        // Addresses are learned from the answer, so the question must be a
+        // plain query: a message already carrying records could have them
+        // echoed back by a resolver that answers malformed input in kind.
+        Some(_) if !dns::is_plain_query(query) => {
+            DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL))
+        }
         Some(name) if egress.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
         Some(name) => {
             virtio_net_log!(

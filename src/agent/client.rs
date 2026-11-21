@@ -1086,6 +1086,21 @@ fn is_benign_shutdown_error(error_str: &str) -> bool {
 }
 
 /// Resolve credentials for the registry that will actually receive the pull.
+/// The login a pull sends. One the caller passed explicitly always goes; the
+/// host's saved ones are withheld from a machine whose image an artifact chose.
+fn pull_auth(
+    withhold_saved: bool,
+    config: &RegistryConfig,
+    effective_image: &str,
+    explicit: Option<RegistryAuth>,
+) -> Option<RegistryAuth> {
+    if withhold_saved {
+        explicit
+    } else {
+        registry_pull_credentials(config, effective_image, explicit)
+    }
+}
+
 fn registry_pull_credentials(
     config: &RegistryConfig,
     effective_image: &str,
@@ -1133,6 +1148,9 @@ pub struct AgentClient {
     /// Why command termination could not be confirmed after an output pipe closed.
     /// Staged files must remain in the VM until a caller can recover them.
     session_end_error: Option<String>,
+    /// Set for a machine whose image an artifact chose: its pulls go out
+    /// without this host's registry logins (see `VmRecord::image_from_artifact`).
+    withhold_registry_logins: bool,
 }
 
 fn stalled_read_error(bytes_read: usize, propagate_initial_wouldblock: bool) -> std::io::Error {
@@ -1333,6 +1351,7 @@ impl AgentClient {
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
             session_end_error: None,
+            withhold_registry_logins: false,
         }
     }
 }
@@ -1462,6 +1481,7 @@ impl AgentClient {
             streaming_output_cap: Some(MAX_STREAMING_EXEC_OUTPUT),
             reader_gone: false,
             session_end_error: None,
+            withhold_registry_logins: false,
         })
     }
 
@@ -1695,7 +1715,12 @@ impl AgentClient {
             // Credentials must be scoped to the registry that receives the
             // request. A mirror is a different host and cannot inherit the
             // upstream registry's saved token or Docker login credentials.
-            let auth = registry_pull_credentials(&registry_config, &img, options.auth);
+            let auth = pull_auth(
+                self.withhold_registry_logins,
+                &registry_config,
+                &img,
+                options.auth,
+            );
             (img, auth)
         } else {
             (image.to_string(), options.auth)
@@ -1769,6 +1794,12 @@ impl AgentClient {
     /// Shorthand for `pull(image, PullOptions::new())`.
     pub fn pull_simple(&mut self, image: &str) -> Result<ImageInfo> {
         self.pull(image, PullOptions::new())
+    }
+
+    /// Pull without this host's saved registry logins, for a machine whose
+    /// image a pack or checkpoint chose.
+    pub fn withhold_registry_logins(&mut self) {
+        self.withhold_registry_logins = true;
     }
 
     /// Pull an OCI image with automatic registry credential lookup.
@@ -3119,8 +3150,18 @@ impl AgentClient {
             .set_read_timeout(None)
             .map_err(|e| Error::agent("set read timeout", e.to_string()))?;
 
-        self.send(&request)?;
-        match self.receive()? {
+        let data = self.encode_traced(&request)?;
+        let Some(body) = super::interactive_start::exchange(
+            &mut self.stream,
+            &data,
+            input.wake_fd(),
+            || input.rx.is_closed(),
+            MAX_FRAME_SIZE as usize,
+        )?
+        else {
+            return Ok(DISCONNECT_EXIT_CODE);
+        };
+        match self.decode_response(&body)? {
             AgentResponse::Started => {}
             AgentResponse::Error { message, .. } => return Err(Error::agent(op, message)),
             _ => return Err(Error::agent(op, "expected Started response")),
@@ -3149,7 +3190,11 @@ impl AgentClient {
 
             // The wake-up descriptor stands where a terminal's stdin would: input
             // arriving on the channel interrupts the wait. -1 is ignored by poll().
-            let poll_timeout = if pending.is_empty() {
+            // Startup may have drained input notifications while waiting for
+            // Started. Process already-queued input without needing a new wake.
+            let poll_timeout = if pending.is_empty() && !input.rx.is_empty() {
+                0
+            } else if pending.is_empty() {
                 poll_timeout_ms
             } else {
                 BACKPRESSURE_POLL_TIMEOUT_MS
@@ -3354,6 +3399,48 @@ impl AgentClient {
             "vm exec session",
             POLL_TIMEOUT_MS,
         )
+    }
+
+    /// Execute a VM command with signal/resize controls on a separate client.
+    /// Use a fresh unique session ID; it is revoked when the data session ends.
+    pub fn vm_exec_controlled_io<S, F>(
+        &mut self,
+        mut session: smolvm_protocol::interactive_control::Session,
+        input: InteractiveInputReceiver,
+        on_started: S,
+        on_output: F,
+    ) -> Result<i32>
+    where
+        S: FnOnce(),
+        F: FnMut(InteractiveOutput),
+    {
+        session.env = with_term_default(session.env, session.terminal.is_some());
+        self.interactive_session_io_started(
+            AgentRequest::VmExecControlled { session },
+            input,
+            on_started,
+            on_output,
+            "controlled vm exec",
+            POLL_TIMEOUT_MS,
+        )
+    }
+
+    /// Signal or resize a session. Connect a separate client so blocked session
+    /// stdin or stdout cannot delay this request.
+    pub fn interactive_control(
+        &mut self,
+        request: smolvm_protocol::interactive_control::Request,
+    ) -> Result<()> {
+        match self.request(&AgentRequest::InteractiveControl { request })? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, code } => {
+                Err(agent_error("interactive control", message, code.as_deref()))
+            }
+            other => Err(Error::agent(
+                "interactive control",
+                format!("unexpected response: {other:?}"),
+            )),
+        }
     }
 
     /// [`Self::vm_exec_session_io`] for an image machine: the command runs in
@@ -3904,6 +3991,7 @@ impl AgentClient {
             streaming_output_cap: self.streaming_output_cap,
             reader_gone: self.reader_gone,
             session_end_error: self.session_end_error.clone(),
+            withhold_registry_logins: self.withhold_registry_logins,
         };
         std::thread::scope(|scope| {
             let sender = scope.spawn(move || {
@@ -4156,7 +4244,11 @@ impl AgentClient {
             return Err(e.into());
         }
 
-        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(&buf)
+        self.decode_response(&buf)
+    }
+
+    fn decode_response(&mut self, body: &[u8]) -> Result<AgentResponse> {
+        let (mut resp, binary) = smolvm_protocol::binary_stream::decode_response(body)
             .map_err(|e| Error::agent("deserialize response", e.to_string()))?;
         if binary {
             self.binary_stream.store(true, Ordering::Release);
@@ -4450,15 +4542,23 @@ mod relay_output_tests {
     fn a_partial_exit_frame_cannot_extend_the_command_termination_deadline() {
         use super::AgentClient;
         use crate::platform::uds::UdsStream;
-        use std::io::Read;
         use std::time::Duration;
         let (host, mut guest) = UdsStream::pair().unwrap();
+        let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(0);
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
         let agent = std::thread::spawn(move || {
-            assert_eq!(guest.read(&mut [0; 1]).unwrap(), 0);
+            // Establish the partial frame before starting the 20 ms deadline.
+            // Waiting for request EOF first could leave this thread unscheduled
+            // until after the client timed out and closed both halves: that
+            // exercised an absent response and could strand the fixture's read.
             guest.write_all(&100u32.to_be_bytes()).unwrap();
             guest.write_all(b"{").unwrap();
-            std::thread::sleep(Duration::from_millis(200));
+            ready_tx.send(()).unwrap();
+            // Keep the incomplete response open until the assertion finishes;
+            // no sleep races against scheduling on a loaded test host.
+            let _ = release_rx.recv_timeout(Duration::from_secs(5));
         });
+        ready_rx.recv_timeout(Duration::from_secs(5)).unwrap();
         let mut client = AgentClient::from_stream(host);
         assert_eq!(
             client.end_session_reader_gone_with_timeout(Duration::from_millis(20)),
@@ -4466,6 +4566,7 @@ mod relay_output_tests {
         );
         let error = client.ensure_session_finished().unwrap_err().to_string();
         assert!(error.contains("deadline"), "{error}");
+        release_tx.send(()).unwrap();
         agent.join().unwrap();
     }
 }
@@ -6310,11 +6411,41 @@ mod interactive_input_tests {
 
     #[test]
     fn a_vanished_peer_ends_the_session_without_waiting_for_the_poll_timeout() {
-        let (input, _output, session, guest) = session(&["cat"], 8);
+        let (input, output, session, guest) = session(&["cat"], 8);
+        runtime()
+            .block_on(input.send(InteractiveInput::Stdin(b"started".to_vec())))
+            .unwrap();
+        let mut echoed = Vec::new();
+        while echoed.len() < 7 {
+            match output.recv_timeout(DEADLINE).expect("command started") {
+                InteractiveOutput::Stdout(data) => echoed.extend(data),
+                other => panic!("unexpected output {other:?}"),
+            }
+        }
+        assert_eq!(echoed, b"started");
         drop(input);
         assert_eq!(session.join().unwrap().unwrap(), DISCONNECT_EXIT_CODE);
         // The guest sees its connection close and kills the command.
         guest.finish();
+    }
+
+    #[test]
+    fn an_already_disconnected_input_never_submits_the_command() {
+        let (client, mut peer) = UdsStream::pair().unwrap();
+        peer.set_read_timeout(Some(DEADLINE)).unwrap();
+        let (input, receiver) = interactive_input(8).unwrap();
+        drop(input);
+        let code = AgentClient::from_stream(client)
+            .interactive_session_io(
+                request(&["must-not-run"]),
+                receiver,
+                |_| {},
+                "test",
+                NEVER_MS,
+            )
+            .unwrap();
+        assert_eq!(code, DISCONNECT_EXIT_CODE);
+        assert_eq!(peer.read(&mut [0; 4]).unwrap(), 0);
     }
 
     #[test]
@@ -6575,6 +6706,36 @@ password = "mirror-secret"
             registry_pull_credentials(&config, "origin.example.invalid/app:latest", None).unwrap();
         assert_eq!(original.username, "origin");
         assert_eq!(original.password, "upstream-secret");
+    }
+
+    // An artifact chose this machine's image and its guest says when it is
+    // missing, so a re-pull must not hand the host's saved login to the guest.
+    #[test]
+    fn saved_logins_are_withheld_from_an_artifact_chosen_image() {
+        let config: RegistryConfig = toml::from_str(
+            r#"
+[registries."private.example.invalid"]
+username = "host-user"
+password = "host-secret"
+"#,
+        )
+        .unwrap();
+        let image = "private.example.invalid/app:latest";
+        assert_eq!(
+            pull_auth(false, &config, image, None).unwrap().password,
+            "host-secret"
+        );
+        assert!(pull_auth(true, &config, image, None).is_none());
+        let explicit = RegistryAuth {
+            username: "asked".into(),
+            password: "given".into(),
+        };
+        assert_eq!(
+            pull_auth(true, &config, image, Some(explicit))
+                .unwrap()
+                .password,
+            "given"
+        );
     }
 
     #[test]

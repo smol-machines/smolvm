@@ -826,6 +826,11 @@ pub struct HealthResponse {
     /// Whether this server runs nested-virtualization machines (started with
     /// `--allow-nested-virt`), so a fleet scheduler can place them here.
     pub nested_virt: bool,
+    /// Checkpoint device profiles this engine can read. Capacity, architecture,
+    /// CPU features, and runtime compatibility are checked separately.
+    pub checkpoint_device_profiles: Vec<&'static str>,
+    /// Portable-checkpoint metadata formats understood by the reader.
+    pub checkpoint_format_versions: Vec<u32>,
 }
 
 /// Machine counts for health response.

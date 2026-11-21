@@ -17,23 +17,23 @@
   gnutar,
   coreutils,
 }: let
-  version = "1.35.3";
+  version = "1.35.4";
 
   releases = {
     x86_64-linux = {
       asset = "smolvm-${version}-linux-x86_64.tar.gz";
       root = "smolvm-${version}-linux-x86_64";
-      hash = "sha256-HEYpijYUgfJdEd5J6SQDkO5Dc0A+lbz3a5tkCGCtnH8=";
+      hash = "sha256-EJnycsHe26GwLr5L7Q7imRLpd+ZxXrH4Xb502Z/jPHE=";
     };
     aarch64-linux = {
       asset = "smolvm-${version}-linux-arm64.tar.gz";
       root = "smolvm-${version}-linux-arm64";
-      hash = "sha256-1tOuTag/yxOXo1AJn6A6W7slt/5gNlE0dNYCpUfgVA0=";
+      hash = "sha256-Jf+uS75lrnrs75t4tAdSQuLsx01K9zr3m/3hf4P62YQ=";
     };
     aarch64-darwin = {
       asset = "smolvm-${version}-darwin-arm64.tar.gz";
       root = "smolvm-${version}-darwin-arm64";
-      hash = "sha256-TCcjkiKDUkoqgxc0GVzI8QTgcV2o95pcWLMq9FTvSIA=";
+      hash = "sha256-StKwK+hIIZqdiGMsqebciB1ulzQ2Jqq5wRrEoYSSnZ4=";
     };
   };
 
@@ -86,6 +86,9 @@ in
     dontPatchELF = true;
     dontPatchShebangs = true;
     dontStrip = true;
+    # agent-rootfs is the guest's root filesystem: its links resolve inside the
+    # VM (etc/mtab -> /proc/mounts), never in the store.
+    dontCheckForBrokenSymlinks = true;
 
     installPhase =
       ''

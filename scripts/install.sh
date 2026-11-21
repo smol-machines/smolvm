@@ -1,10 +1,9 @@
 #!/usr/bin/env bash
 # smolvm installer
 #
-# CANONICAL SOURCE: scripts/install.sh in the smolvm repo
-# The website copy at smolmachines/static/install.sh (served at
-# https://smolmachines.com/install.sh) must be kept in sync.
-# After editing this file, copy it verbatim to smolmachines/static/install.sh.
+# https://smolmachines.com/install.sh serves this file from smolvm's main branch,
+# cached for five minutes, and serves the last good copy when GitHub cannot
+# answer. A change here reaches curl users once it merges, before any release.
 #
 # Usage:
 #   curl -sSL https://smolmachines.com/install.sh | bash
@@ -400,7 +399,13 @@ install_smolvm() {
     # --no-same-owner: as root, tar would otherwise give every file the uid/gid
     # stored in the archive (the release builder's), and `cp -a` below carries
     # that owner into the installed agent-rootfs.
-    tar --no-same-owner -xzf "$archive" -C "$tmp_dir" || {
+    # Preserve runtime archive permissions without adopting the build host's owners.
+    # BSD tar otherwise strips setuid/setgid when the archived owner differs.
+    local extract_owner=()
+    if [[ "$platform" == darwin-* ]]; then
+        extract_owner=(--uid "$(id -u)" --gid "$(id -g)")
+    fi
+    tar --no-same-owner "${extract_owner[@]+"${extract_owner[@]}"}" -xpzf "$archive" -C "$tmp_dir" || {
         error "Failed to extract archive"
         rm -rf "$tmp_dir"
         exit 1

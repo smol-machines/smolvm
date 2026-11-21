@@ -104,7 +104,7 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
     }
     crate::ensure_storage_mounted();
     let source = layer_source(spec.image_source.as_ref())?;
-    let prepared = crate::storage::prepare_for_run_persistent_from(
+    let prepared = crate::storage::prepare_for_container_from(
         &spec.image,
         &spec.overlay_id,
         source.as_layer_source(),
@@ -206,6 +206,9 @@ fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Err
     };
     let mut oci = crate::build_oci_spec(rootfs, &launch, &volumes, spec.tty, false, false)?;
     oci.root.readonly = spec.read_only_rootfs;
+    // VM convenience mounts are not Docker defaults: /tmp and /run belong to
+    // the image's writable layer. Explicit caller mounts are applied below.
+    oci.use_container_filesystem();
     if let Some(hostname) = spec.hostname.as_deref().filter(|h| !h.is_empty()) {
         oci.hostname = Some(hostname.to_string());
     }
@@ -562,7 +565,7 @@ pub fn handle_container_archive(
         crate::ensure_storage_mounted();
         let result = layer_source(image_source)
             .and_then(|source| {
-                crate::storage::prepare_for_run_persistent_from(
+                crate::storage::prepare_for_container_from(
                     image,
                     overlay_id,
                     source.as_layer_source(),
@@ -943,6 +946,47 @@ pub fn handle_set_primary_address(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn imported_archives_preserve_pax_filenames_with_newlines() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(root.path()).unwrap();
+        let archive = root.path().join("upload.tar");
+        let name = "測試\nname.txt";
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        builder
+            .append_pax_extensions([("path", name.as_bytes())])
+            .unwrap();
+        let payload = b"keep exact bytes";
+        let mut header = tar::Header::new_ustar();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o640);
+        header.set_uid(owner.uid() as u64);
+        header.set_gid(owner.gid() as u64);
+        builder
+            .append_data(&mut header, "fallback.txt", &payload[..])
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        let guest = root.path().join("container");
+        std::fs::create_dir(&guest).unwrap();
+        unpack_archive(&guest, archive.to_str().unwrap(), "/uploaded").unwrap();
+        let imported = guest.join("uploaded").join(name);
+        assert_eq!(std::fs::read(&imported).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(imported).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!guest.join("uploaded/fallback.txt").exists());
+        assert!(
+            !archive.exists(),
+            "successful import removes its staging archive"
+        );
+    }
 
     #[test]
     fn hosts_file_names_the_container_and_lists_extra_hosts() {

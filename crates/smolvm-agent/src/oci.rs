@@ -868,6 +868,18 @@ impl OciSpec {
         });
     }
 
+    /// Docker's temporary/runtime directories belong to its root filesystem,
+    /// including with a read-only root. Apply before adding requested mounts.
+    pub fn use_container_filesystem(&mut self) {
+        self.annotations
+            .insert(CONTAINER_FILESYSTEM_ANNOTATION.into(), "true".into());
+        self.mounts.retain(|mount| {
+            !(matches!(mount.destination.as_str(), "/tmp" | "/run" | "/run/lock")
+                && mount.mount_type.as_deref() == Some("tmpfs")
+                && mount.source == "tmpfs")
+        });
+    }
+
     /// Record who the workload runs as ([`WORKLOAD_USER_ANNOTATION`]), for a
     /// bundle whose own process may be the keep-alive init instead.
     pub fn set_workload_user(&mut self, identity: &ProcessIdentity) {
@@ -898,7 +910,13 @@ impl OciSpec {
                 && !overlay.join(TMP_KEEP_TMPFS_MARKER).exists()
         });
         let mut spec = std::borrow::Cow::Borrowed(self);
-        if tmp_on_root {
+        if tmp_on_root
+            && self
+                .annotations
+                .get(CONTAINER_FILESYSTEM_ANNOTATION)
+                .map(String::as_str)
+                != Some("true")
+        {
             spec.to_mut().tmp_on_root();
         }
         let json = serde_json::to_string_pretty(&*spec)
@@ -1338,6 +1356,9 @@ fn tun_device_mount(guest_node: &Path) -> Option<OciMount> {
         options: vec!["bind".to_string(), "rprivate".to_string()],
     })
 }
+
+/// Preserve the Docker caller's mount choices when writing or rewriting a bundle.
+const CONTAINER_FILESYSTEM_ANNOTATION: &str = "io.smolvm.container-filesystem";
 
 /// The upper layer beside an overlay's `bundle`: a bundle with one is an overlay workload's.
 pub const OVERLAY_UPPER_DIR: &str = "upper";
@@ -2192,6 +2213,61 @@ mod tests {
             .map(|(k, v)| format!("{k}={v}"))
             .collect();
         assert_eq!(spec.process.env, expected);
+    }
+
+    #[test]
+    fn container_root_preserves_readonly_and_explicit_temporary_mounts() {
+        let root = tempfile::tempdir().unwrap();
+        let bundle = root.path().join("bundle");
+        std::fs::create_dir_all(root.path().join(OVERLAY_UPPER_DIR)).unwrap();
+        std::fs::create_dir(&bundle).unwrap();
+        for readonly in [false, true] {
+            let mut spec = OciSpec::new(
+                &["sh".into()],
+                &[],
+                "/",
+                false,
+                &ProcessIdentity::root(),
+                false,
+            );
+            spec.root.readonly = readonly;
+            spec.use_container_filesystem();
+            spec.write_to(&bundle).unwrap();
+            let written: OciSpec =
+                serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
+                    .unwrap();
+            assert_eq!(written.root.readonly, readonly);
+            assert!(!written
+                .mounts
+                .iter()
+                .any(|m| matches!(m.destination.as_str(), "/tmp" | "/run" | "/run/lock")));
+            assert!(written.mounts.iter().any(|m| m.destination == "/dev/shm"));
+            spec.mounts.push(OciMount {
+                destination: "/tmp".into(),
+                source: "tmpfs".into(),
+                mount_type: Some("tmpfs".into()),
+                options: vec!["size=1048576".into()],
+            });
+            spec.add_bind_mount("/storage/cache", "/run/cache", true);
+            spec.write_to(&bundle).unwrap();
+            let written: OciSpec =
+                serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
+                    .unwrap();
+            assert!(written
+                .mounts
+                .iter()
+                .any(|m| m.destination == "/tmp" && m.options == ["size=1048576"]));
+            assert!(written.mounts.iter().any(|m| m.destination == "/run/cache"));
+            written.write_to(&bundle).unwrap();
+            let json: serde_json::Value =
+                serde_json::from_slice(&std::fs::read(bundle.join("config.json")).unwrap())
+                    .unwrap();
+            assert!(json["mounts"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|m| m["destination"] == "/tmp"));
+        }
     }
 
     /// An overlay workload's /tmp is its root filesystem's (no /tmp mount, so a

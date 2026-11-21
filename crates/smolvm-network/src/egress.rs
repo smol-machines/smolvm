@@ -347,18 +347,27 @@ fn floor_mode() -> FloorMode {
     }
 }
 
-/// The cloud-metadata link-local range (`169.254.0.0/16` / `fe80::/10`) — the
-/// one destination floored in every mode except `Off`, including via an
-/// IPv4-mapped IPv6 address so it can't be smuggled past.
+/// The cloud-metadata link-local range (`169.254.0.0/16` / `fe80::/10`) and
+/// the clouds' IPv6 metadata endpoints — the one destination floored in every
+/// mode except `Off`, including via an IPv4-mapped IPv6 address so it can't be
+/// smuggled past.
 fn is_link_local(ip: IpAddr) -> bool {
     match ip {
         IpAddr::V4(v4) => v4.is_link_local(),
         IpAddr::V6(v6) => {
             (v6.segments()[0] & 0xffc0) == 0xfe80
+                || CLOUD_METADATA_V6.contains(&v6)
                 || v6.to_ipv4_mapped().is_some_and(|v4| v4.is_link_local())
         }
     }
 }
+
+/// IPv6 instance-metadata endpoints outside `fe80::/10`: AWS
+/// (`fd00:ec2::254`) and Google Cloud (`fd20:ce::254`).
+const CLOUD_METADATA_V6: [Ipv6Addr; 2] = [
+    Ipv6Addr::new(0xfd00, 0xec2, 0, 0, 0, 0, 0, 0x254),
+    Ipv6Addr::new(0xfd20, 0xce, 0, 0, 0, 0, 0, 0x254),
+];
 
 /// The host's own loopback / unspecified addresses — what `127.0.0.1` and `::1`
 /// mean to the guest, but which the gateway forwards to the HOST. Floored in
@@ -385,6 +394,10 @@ fn is_reserved_v4(v4: Ipv4Addr) -> bool {
         || v4.is_private()    // 10/8, 172.16/12, 192.168/16 — host/control internal subnet
         || v4.is_unspecified()
         || v4.is_broadcast()
+        // 224.0.0.0/4: a group is delivered on the host's LAN, so a guest's
+        // datagram to 224.0.0.1 reaches every neighbour. 240.0.0.0/4 is reserved.
+        || v4.is_multicast()
+        || v4.octets()[0] >= 240
         // 100.64.0.0/10 (CGNAT) — the gateway's own guest/gateway addresses live here.
         || matches!(v4.octets(), [100, b, ..] if (64..=127).contains(&b))
 }
@@ -403,6 +416,7 @@ fn is_floored(ip: IpAddr, mode: FloorMode) -> bool {
                     || v6.is_unspecified()
                     || (v6.segments()[0] & 0xffc0) == 0xfe80 // fe80::/10 link-local
                     || (v6.segments()[0] & 0xfe00) == 0xfc00 // fc00::/7 unique-local
+                    || v6.is_multicast() // ff00::/8, delivered on the host's LAN
                     || v6.to_ipv4_mapped().is_some_and(is_reserved_v4)
             }
         },
@@ -481,6 +495,19 @@ struct CompiledRule {
 
 impl EgressPolicy {
     /// No allow-list — every destination is allowed EXCEPT the platform hard-floor.
+    /// The local floor `--allow-host-loopback` selects, for tests.
+    #[cfg(test)]
+    pub(crate) fn with_host_loopback_allowed(mut self) -> Self {
+        self.floor = FloorMode::MetadataOnly;
+        self
+    }
+
+    /// The local default floor, whatever the test's environment says.
+    #[cfg(test)]
+    pub(crate) fn floor_for_test_default(&mut self) {
+        self.floor = FloorMode::MetadataAndLoopback;
+    }
+
     pub fn unrestricted() -> Self {
         Self {
             inner: None,
@@ -992,6 +1019,23 @@ mod tests {
     use super::*;
 
     #[test]
+    fn the_clouds_ipv6_metadata_endpoints_are_floored_in_every_mode() {
+        for address in ["fd00:ec2::254", "fd20:ce::254"] {
+            let ip: IpAddr = address.parse().unwrap();
+            for mode in [
+                FloorMode::MetadataOnly,
+                FloorMode::MetadataAndLoopback,
+                FloorMode::Private,
+                FloorMode::Strict,
+            ] {
+                assert!(is_floored(ip, mode), "{address} open under {mode:?}");
+            }
+        }
+        let neighbour: IpAddr = "fd00:ec2::253".parse().unwrap();
+        assert!(!is_floored(neighbour, FloorMode::MetadataOnly));
+    }
+
+    #[test]
     fn a_replaced_allow_list_grants_and_revokes_for_every_clone() {
         let policy = EgressPolicy::new(None, Some(&["api.github.com".into()]));
         let gateway_copy = policy.clone();
@@ -1129,6 +1173,32 @@ mod tests {
         assert!(!policy.allows_flow(FlowTransport::Tcp, target, Some(123)));
         assert!(policy.allows_flow(FlowTransport::Udp, target, Some(123)));
         assert!(!policy.allows_flow(FlowTransport::Icmp, target, None));
+    }
+
+    // A multicast group is delivered on the host's LAN, so it is as private as
+    // the LAN itself under --block-private and the strict floor.
+    #[test]
+    fn the_private_floor_covers_multicast() {
+        use smolvm_protocol::FlowTransport;
+        let ip = |s: &str| -> IpAddr { s.parse().unwrap() };
+        for mode in [FloorMode::Private, FloorMode::Strict] {
+            for group in [
+                "224.0.0.1",
+                "239.255.255.250",
+                "ff02::1",
+                "ff05::c",
+                "::ffff:224.0.0.251",
+                "240.0.0.1",
+            ] {
+                assert!(is_floored(ip(group), mode), "{group} {mode:?}");
+            }
+            assert!(!is_floored(ip("1.1.1.1"), mode));
+        }
+        let mut policy = EgressPolicy::unrestricted();
+        policy.floor = FloorMode::MetadataAndLoopback;
+        let policy = policy.with_private_floor(&[]).unwrap();
+        assert!(!policy.allows_flow(FlowTransport::Udp, ip("224.0.0.1"), Some(9)));
+        assert!(policy.allows_flow(FlowTransport::Udp, ip("1.1.1.1"), Some(53)));
     }
 
     #[test]

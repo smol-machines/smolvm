@@ -1806,6 +1806,39 @@ pub fn allocate_vm_uid(
     key_dir: &std::path::Path,
     vm_key: &str,
 ) -> std::io::Result<u32> {
+    allocate_vm_uid_unless(registry_dir, key_dir, vm_key, uid_has_processes)
+}
+
+/// Whether any process runs as `uid`. A uid freed with its machine is free
+/// only once nothing runs as it: a process a compromised VMM forked can
+/// outlive the machine, and would own the next machine given that uid. Asks
+/// the kernel (`getpriority(PRIO_USER)`, which answers `ESRCH` when no process
+/// has the uid) rather than scanning `/proc`, which a process that keeps
+/// re-forking can slip through.
+#[cfg(target_os = "linux")]
+fn uid_has_processes(uid: u32) -> std::io::Result<bool> {
+    // SAFETY: errno is thread-local; getpriority only reads the task list.
+    unsafe {
+        *libc::__errno_location() = 0;
+        let result = libc::getpriority(libc::PRIO_USER, uid);
+        let errno = *libc::__errno_location();
+        match (result, errno) {
+            (-1, libc::ESRCH) => Ok(false),
+            (-1, 0) | (_, 0) => Ok(true),
+            (_, errno) => Err(std::io::Error::from_raw_os_error(errno)),
+        }
+    }
+}
+
+/// [`allocate_vm_uid`] with the probe that says whether a uid is still in use
+/// by a process.
+#[cfg(target_os = "linux")]
+fn allocate_vm_uid_unless(
+    registry_dir: &std::path::Path,
+    key_dir: &std::path::Path,
+    vm_key: &str,
+    in_use: impl Fn(u32) -> std::io::Result<bool>,
+) -> std::io::Result<u32> {
     std::fs::create_dir_all(registry_dir)?;
     let _registry_lock = lock_uid_registry(registry_dir)?;
     let cache = key_dir.join(".vm-uid");
@@ -1842,6 +1875,10 @@ pub fn allocate_vm_uid(
                 continue; // held by a live VM
             }
             let _ = std::fs::remove_file(&marker); // stale → reclaim below
+        }
+        // a process left running as the uid would own the machine given it
+        if in_use(uid)? {
+            continue;
         }
         match std::fs::OpenOptions::new()
             .write(true)
@@ -4760,9 +4797,15 @@ pub struct ChildProcess {
 impl ChildProcess {
     /// Create a new child process handle, capturing start time immediately.
     pub fn new(pid: Pid) -> Self {
+        Self::from_identity(pid, process_start_time(pid))
+    }
+
+    /// Reattach using the identity already verified by the caller; resampling
+    /// here could silently bind this handle to a recycled PID.
+    pub(crate) fn from_identity(pid: Pid, start_time: Option<u64>) -> Self {
         Self {
             pid,
-            start_time: process_start_time(pid),
+            start_time,
             exit_code: None,
         }
     }
@@ -4855,6 +4898,11 @@ impl SigintGuard {
     /// Install a SIGINT handler that will SIGTERM+SIGKILL the given PID.
     #[cfg(unix)]
     pub fn new(pid: Pid) -> Self {
+        // The SSH proxy owns the boot process from spawn through the durable
+        // Running commit. Killing it here could undo a committed resume.
+        if crate::ssh::ownership::managed() {
+            return Self(());
+        }
         SIGINT_CHILD_PID.store(pid, Ordering::SeqCst);
         unsafe {
             libc::signal(
@@ -5067,6 +5115,26 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_uid_a_process_still_runs_as_is_not_handed_out() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("smolvm").join("uids");
+        let key_dir = root.path().join("smolvm").join("vms").join("aaaa");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let busy = |uid: u32| Ok(uid == VM_UID_BASE);
+        let uid = allocate_vm_uid_unless(&registry, &key_dir, "aaaa", busy).unwrap();
+        assert_eq!(uid, VM_UID_BASE + 1);
+        // a probe that cannot answer refuses the allocation
+        let other = root.path().join("smolvm").join("vms").join("bbbb");
+        std::fs::create_dir_all(&other).unwrap();
+        let unanswered = |_: u32| Err(std::io::Error::other("probe failed"));
+        assert!(allocate_vm_uid_unless(&registry, &other, "bbbb", unanswered).is_err());
+        // the kernel probe sees this process's own uid and not an unused one
+        assert!(uid_has_processes(unsafe { libc::getuid() }).unwrap());
+        assert!(!uid_has_processes(VM_UID_BASE + VM_UID_SPAN - 1).unwrap());
+    }
 
     #[test]
     fn cuda_fork_pool_vcpus_preserve_reliable_guest_topology() {

@@ -69,7 +69,10 @@ pub struct ServeStartCmd {
     #[arg(short, long)]
     verbose: bool,
 
-    /// CORS allowed origins (repeatable). Defaults to localhost:8080 and localhost:3000.
+    /// Origins whose web pages may call the API (repeatable). Defaults to
+    /// localhost:8080 and localhost:3000. Requests from other pages are refused.
+    /// A client that reaches a loopback --listen under a DNS name needs that
+    /// name here too, e.g. --cors-origin http://host.docker.internal:8080.
     #[arg(long = "cors-origin", value_name = "ORIGIN")]
     cors_origins: Vec<String>,
 
@@ -781,6 +784,14 @@ impl ServeStartCmd {
 
         tracing::info!(address = %addr, "starting HTTP API server");
         println!("smolvm API server listening on http://{}", addr);
+
+        // A browser page can reach a loopback listener; refuse names it could
+        // have re-pointed at 127.0.0.1.
+        let app = if addr.ip().is_loopback() {
+            smolvm::api::guard_loopback_listener(app, &self.cors_origins)
+        } else {
+            app
+        };
 
         let (signal, started) = signal_and_notice(shutdown_signal_or_internal(internal_shutdown));
         let serve = axum::serve(listener, app).with_graceful_shutdown(signal);

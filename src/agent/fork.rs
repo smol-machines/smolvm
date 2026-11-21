@@ -34,6 +34,9 @@ pub(crate) use compact::{flatten_standalone, flatten_to_raw};
 /// all stay cheap at this depth.
 const MAX_FORK_LINEAGE_DEPTH: usize = 256;
 
+#[cfg(unix)]
+mod inherited_lock;
+
 type ForkDisk = (&'static str, PathBuf, crate::data::disk::DiskFormat);
 
 #[cfg(target_os = "linux")]
@@ -62,12 +65,20 @@ impl ForkSourceLock {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        #[cfg(unix)]
+        let inherited = inherited_lock::take_matching(path)
+            .map_err(|error| Error::agent("inherited operation lock", error.to_string()))?;
+        #[cfg(not(unix))]
+        let inherited: Option<File> = None;
+        let file = match inherited {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?,
+        };
         lock_file_exclusive(&file)
             .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         Ok(Self { _file: file })
@@ -78,12 +89,20 @@ impl ForkSourceLock {
             std::fs::create_dir_all(parent)
                 .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
         }
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(path)
-            .map_err(|error| Error::agent("fork source lock", error.to_string()))?;
+        #[cfg(unix)]
+        let inherited = inherited_lock::take_matching(path)
+            .map_err(|error| Error::agent("inherited operation lock", error.to_string()))?;
+        #[cfg(not(unix))]
+        let inherited: Option<File> = None;
+        let file = match inherited {
+            Some(file) => file,
+            None => std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(path)
+                .map_err(|error| Error::agent("fork source lock", error.to_string()))?,
+        };
         match try_lock_file_exclusive(&file) {
             Ok(()) => Ok(Some(Self { _file: file })),
             Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => Ok(None),
@@ -112,6 +131,23 @@ pub(crate) fn lock_saved_execution(source: &str) -> Result<ForkSourceLock> {
 pub(crate) fn try_lock_fork_source(source: &str) -> Result<Option<ForkSourceLock>> {
     validate_vm_name(source, "fork source").map_err(|error| Error::config("fork source", error))?;
     ForkSourceLock::try_acquire_at(&fork_source_lock_path(source))
+}
+
+#[cfg(unix)]
+pub(crate) fn try_lock_saved_execution(source: &str) -> Result<Option<ForkSourceLock>> {
+    validate_vm_name(source, "saved execution")
+        .map_err(|error| Error::config("saved execution", error))?;
+    ForkSourceLock::try_acquire_at(&saved_execution_lock_path(source))
+}
+
+/// Preserve the same locked file descriptions through an owned startup child.
+/// The caller must keep both guards alive through spawn and cleanup.
+#[cfg(unix)]
+pub(crate) fn inherit_operation_locks(
+    command: &mut std::process::Command,
+    locks: &[&ForkSourceLock],
+) -> std::io::Result<()> {
+    inherited_lock::configure(command, locks.iter().map(|lock| &lock._file))
 }
 
 fn fork_source_lock_path(source: &str) -> PathBuf {
@@ -283,8 +319,10 @@ fn prune_orphaned_fork_source_locks_in(vms_dir: &Path) {
             }
             continue;
         }
-        // So are the layers its pause pinned.
-        if let Some(dir) = crate::portable_checkpoint::paused_layers_owner(&path) {
+        // So are the layers its pause pinned, and the resume inputs it kept.
+        if let Some(dir) = crate::portable_checkpoint::paused_layers_owner(&path)
+            .or_else(|| crate::portable_checkpoint::paused_resume_owner(&path))
+        {
             if !vms_dir.join(dir).is_dir() {
                 let _ = std::fs::remove_dir_all(&path);
             }
@@ -346,62 +384,140 @@ pub fn control_socket_cmd_with_timeout(
 ) -> Result<String> {
     #[cfg(not(target_os = "windows"))]
     use crate::platform::uds::UdsStream;
-    use std::io::{Read, Write};
+    use std::io::Write;
 
+    let started = std::time::Instant::now();
+    let timed_out = || {
+        Error::agent(
+            "read control socket",
+            format!(
+                "no reply to {} within {} s",
+                verb_of(cmd),
+                timeout.as_secs()
+            ),
+        )
+    };
+    let remaining = || {
+        timeout
+            .checked_sub(started.elapsed())
+            .filter(|duration| !duration.is_zero())
+            .ok_or_else(timed_out)
+    };
     #[cfg(target_os = "windows")]
     let mut stream = {
-        // libkrun's Windows control listener uses loopback TCP and writes its
-        // assigned port to this path; it is not an AF_UNIX socket.
+        // libkrun's Windows control listener uses loopback TCP.
         let port = std::fs::read_to_string(sock)
             .map_err(|e| Error::agent("read control port", e.to_string()))?
             .trim()
             .parse::<u16>()
             .map_err(|e| Error::agent("parse control port", e.to_string()))?;
-        std::net::TcpStream::connect(("127.0.0.1", port))
-            .map_err(|e| Error::agent("connect control socket", e.to_string()))?
+        std::net::TcpStream::connect_timeout(
+            &std::net::SocketAddr::from(([127, 0, 0, 1], port)),
+            remaining()?,
+        )
+        .map_err(|e| Error::agent("connect control socket", e.to_string()))?
     };
     #[cfg(not(target_os = "windows"))]
-    let mut stream = UdsStream::connect(sock)
+    let mut stream = UdsStream::connect_timeout(sock, remaining()?)
         .map_err(|e| Error::agent("connect control socket", e.to_string()))?;
-    stream.set_read_timeout(Some(timeout)).ok();
+    stream
+        .set_write_timeout(Some(remaining()?))
+        .map_err(|e| Error::agent("write control socket", e.to_string()))?;
     stream
         .write_all(format!("{cmd}\n").as_bytes())
         .map_err(|e| Error::agent("write control socket", e.to_string()))?;
-    let mut reply = String::new();
-    let mut byte = [0u8; 1];
+    // SHARE_LIST includes UTF-8 host paths. Turning each byte into a char
+    // corrupts those paths; decode only after the complete frame is received.
+    // The largest supported inventory (64 paths) fits well below this cap.
+    const MAX_REPLY: usize = 1024 * 1024;
+    let mut reply = Vec::new();
+    let mut buffer = [0; 8192];
     loop {
-        match stream.read(&mut byte) {
-            Ok(0) => break,
-            Ok(_) => {
-                if byte[0] == b'\n' {
-                    break;
-                }
-                reply.push(byte[0] as char);
+        match read_control_chunk(&mut stream, &mut buffer, remaining()?) {
+            Ok(0) => {
+                return Err(Error::agent(
+                    "read control socket",
+                    "incomplete control reply",
+                ))
             }
-            // A signal landed during the read (SIGCHLD from a VMM child, say): the
-            // read did nothing, so do it again. `write_all` retries this itself;
-            // a byte-wise `read` does not.
+            Ok(read) => {
+                let end = buffer[..read].iter().position(|byte| *byte == b'\n');
+                let size = end.unwrap_or(read);
+                if size > MAX_REPLY - reply.len() {
+                    return Err(Error::agent(
+                        "read control socket",
+                        "control reply exceeds byte limit",
+                    ));
+                }
+                reply.extend_from_slice(&buffer[..size]);
+                if end.is_some() {
+                    return String::from_utf8(reply).map_err(|_| {
+                        Error::agent("read control socket", "control reply is not UTF-8")
+                    });
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
-            // A read timeout surfaces as EAGAIN, which says nothing about why.
             Err(e)
                 if matches!(
                     e.kind(),
                     std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
                 ) =>
             {
-                return Err(Error::agent(
-                    "read control socket",
-                    format!(
-                        "no reply to {} within {} s",
-                        verb_of(cmd),
-                        timeout.as_secs()
-                    ),
-                ));
+                return Err(timed_out())
             }
             Err(e) => return Err(Error::agent("read control socket", e.to_string())),
         }
     }
-    Ok(reply)
+}
+
+#[cfg(target_os = "windows")]
+type ControlStream = std::net::TcpStream;
+#[cfg(not(target_os = "windows"))]
+type ControlStream = crate::platform::uds::UdsStream;
+
+fn read_control_chunk(
+    stream: &mut ControlStream,
+    buffer: &mut [u8],
+    timeout: Duration,
+) -> std::io::Result<usize> {
+    use std::io::Read;
+    if timeout.is_zero() {
+        return Err(std::io::ErrorKind::TimedOut.into());
+    }
+    // socket2 truncates Unix timeouts to microseconds; a positive remainder
+    // smaller than one microsecond must not become zero (an unlimited wait).
+    let socket_timeout = timeout.max(Duration::from_micros(1));
+    let configured = stream.set_read_timeout(Some(socket_timeout));
+    #[cfg(not(target_os = "macos"))]
+    configured?;
+    #[cfg(target_os = "macos")]
+    if let Err(error) = configured {
+        // Darwin rejects SO_RCVTIMEO after a Unix peer closes, including when
+        // its complete reply is already buffered. Drain only immediately
+        // available bytes; never turn a failed timeout into an unbounded read.
+        if error.raw_os_error() == Some(libc::EINVAL) {
+            use std::os::fd::AsRawFd;
+            // SAFETY: the live stream owns the descriptor and buffer is writable
+            // for its length. MSG_DONTWAIT cannot block on a still-open peer.
+            let read = unsafe {
+                libc::recv(
+                    stream.as_raw_fd(),
+                    buffer.as_mut_ptr().cast(),
+                    buffer.len(),
+                    libc::MSG_DONTWAIT,
+                )
+            };
+            if read >= 0 {
+                return Ok(read as usize);
+            }
+            let read_error = std::io::Error::last_os_error();
+            if read_error.kind() != std::io::ErrorKind::WouldBlock {
+                return Err(read_error);
+            }
+        }
+        return Err(error);
+    }
+    stream.read(buffer)
 }
 
 /// The command word of a control command, without its arguments (paths).
@@ -1452,6 +1568,10 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
         let Some(backing) = qcow2_backing_name(&current)? else {
             return Ok(depth);
         };
+        // A backing declared raw is a guest's disk: it ends the chain, whatever
+        // header its own bytes hold.
+        let backing_is_raw =
+            qcow2_backing_format(&current)? == Some(crate::data::disk::DiskFormat::Raw);
         let next = if backing.is_absolute() {
             backing
         } else {
@@ -1469,6 +1589,9 @@ fn qcow2_backing_depth(path: &Path) -> Result<usize> {
         depth = depth
             .checked_add(1)
             .ok_or_else(|| Error::agent("inspect fork disk chain", "backing depth overflow"))?;
+        if backing_is_raw {
+            return Ok(depth);
+        }
         if depth > 4 * MAX_FORK_DISK_CHAIN_DEPTH {
             return Err(Error::agent(
                 "inspect fork disk chain",
@@ -1574,6 +1697,87 @@ fn qcow2_backing_name(path: &Path) -> Result<Option<PathBuf>> {
     Ok(Some(PathBuf::from(backing)))
 }
 
+/// The format a qcow2 layer declares for its backing file (header extension
+/// `0xE2792ACA`), or `None` when it declares none. A backing's own first
+/// bytes cannot say: a raw backing is a guest's disk, which may start with any
+/// header the guest wrote. A header too short or malformed to carry
+/// extensions declares nothing.
+#[cfg(any(target_os = "linux", target_os = "macos"))]
+fn qcow2_backing_format(path: &Path) -> Result<Option<crate::data::disk::DiskFormat>> {
+    use crate::data::disk::DiskFormat;
+    use std::io::{Read, Seek, SeekFrom};
+
+    const BACKING_FORMAT: u32 = 0xE279_2ACA;
+    let fail = |reason: String| {
+        Error::agent(
+            "inspect fork disk chain",
+            format!("{}: {reason}", path.display()),
+        )
+    };
+    let mut file = File::open(path).map_err(|error| fail(error.to_string()))?;
+    let mut header = Vec::with_capacity(104);
+    (&mut file)
+        .take(104)
+        .read_to_end(&mut header)
+        .map_err(|error| fail(error.to_string()))?;
+    if header.len() < 72 || header[..4] != *b"QFI\xfb" {
+        return Ok(None);
+    }
+    let version = u32::from_be_bytes(header[4..8].try_into().unwrap());
+    let header_length = if version >= 3 {
+        if header.len() < 104 {
+            return Ok(None);
+        }
+        u32::from_be_bytes(header[100..104].try_into().unwrap()) as u64
+    } else {
+        72
+    };
+    let cluster_bits = u32::from_be_bytes(header[20..24].try_into().unwrap());
+    if !(9..=21).contains(&cluster_bits) {
+        return Ok(None);
+    }
+    let cluster_size = 1_u64 << cluster_bits;
+    if header_length < 72 || header_length >= cluster_size {
+        return Ok(None);
+    }
+    // Extensions follow the header, within its first cluster.
+    let mut offset = header_length;
+    file.seek(SeekFrom::Start(offset))
+        .map_err(|error| fail(error.to_string()))?;
+    while offset + 8 <= cluster_size {
+        let mut extension = [0_u8; 8];
+        if file.read_exact(&mut extension).is_err() {
+            return Ok(None);
+        }
+        let kind = u32::from_be_bytes(extension[..4].try_into().unwrap());
+        let length = u32::from_be_bytes(extension[4..].try_into().unwrap()) as u64;
+        if kind == 0 {
+            return Ok(None);
+        }
+        let padded = length.div_ceil(8) * 8;
+        if offset + 8 + padded > cluster_size {
+            return Ok(None);
+        }
+        if kind == BACKING_FORMAT {
+            let mut name = vec![0_u8; length as usize];
+            file.read_exact(&mut name)
+                .map_err(|error| fail(error.to_string()))?;
+            return match name.as_slice() {
+                b"raw" => Ok(Some(DiskFormat::Raw)),
+                b"qcow2" => Ok(Some(DiskFormat::Qcow2)),
+                other => Err(fail(format!(
+                    "unsupported backing format '{}'",
+                    String::from_utf8_lossy(other)
+                ))),
+            };
+        }
+        file.seek(SeekFrom::Current(padded as i64))
+            .map_err(|error| fail(error.to_string()))?;
+        offset += 8 + padded;
+    }
+    Ok(None)
+}
+
 /// Preserve relative backing names when an active qcow2 image is moved into a
 /// fork-generation directory. Portable checkpoint disks deliberately use
 /// compact relative names (`0`, `1`, ...); moving only the top image would make
@@ -1603,6 +1807,8 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
         let Some(backing) = qcow2_backing_name(&source)? else {
             return Ok(());
         };
+        let backing_is_raw =
+            qcow2_backing_format(&source)? == Some(crate::data::disk::DiskFormat::Raw);
         if backing.is_absolute() {
             return Ok(());
         }
@@ -1669,6 +1875,10 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
                     ),
                 ));
             }
+        }
+        // A raw backing is linked like any other, but never read as qcow2.
+        if backing_is_raw {
+            return Ok(());
         }
         source = source_next;
         relocated = relocated_next;
@@ -2594,12 +2804,15 @@ pub fn resume_golden(golden: &str, snapshot_dir: &Path) -> Result<()> {
 /// Remove every retained RAM checkpoint for a golden whose VMM is confirmed
 /// dead and which has no dependent clones. A checkpoint is tied to the exact
 /// golden PID/memfd identity and can never be valid after that process exits.
-pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<()> {
-    let snapshot_root = vm_data_dir(golden).join("s");
-    match std::fs::symlink_metadata(&snapshot_root) {
+pub(crate) fn discard_retained_snapshots_at(
+    db: &SmolvmDb,
+    golden: &str,
+    snapshot_root: &Path,
+) -> Result<()> {
+    match std::fs::symlink_metadata(snapshot_root) {
         Ok(metadata) if metadata.file_type().is_dir() => {
-            stop_snapshot_guardians(&snapshot_root)?;
-            std::fs::remove_dir_all(&snapshot_root).map_err(|error| {
+            stop_snapshot_guardians(snapshot_root)?;
+            std::fs::remove_dir_all(snapshot_root).map_err(|error| {
                 Error::agent("remove retained fork snapshots", error.to_string())
             })?;
         }
@@ -2628,6 +2841,10 @@ pub(crate) fn discard_retained_snapshots(db: &SmolvmDb, golden: &str) -> Result<
 /// record + copy-on-write disks exist on disk. The caller boots the clone from
 /// `snapshot_dir`, then calls [`rejuvenate_clone`].
 pub struct PreparedFork {
+    /// Retain through identity reset, readiness publication, and rollback.
+    /// Shared ownership lets batch callers keep every child locked until the
+    /// whole transaction finishes, including children already booted by workers.
+    pub startup_lock: std::sync::Arc<ForkSourceLock>,
     /// Directory holding the golden's checkpoint + memfd manifest. Pass it as the
     /// clone's `LaunchFeatures::snapshot_dir` to boot from it instead of cold.
     pub snapshot_dir: PathBuf,
@@ -2818,6 +3035,7 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut names = HashSet::with_capacity(specs.len());
+    let mut startup_locks = Vec::with_capacity(specs.len());
     let mut reserved_ports = ReservedPorts::default();
     for spec in specs {
         validate_vm_name(spec.clone, "clone name").map_err(|e| Error::config("clone name", e))?;
@@ -2840,6 +3058,20 @@ pub(crate) fn prepare_forks_reusing(
                 format!("machine '{}' already exists", spec.clone),
             ));
         }
+        // The caller already owns the source lock. Never block while acquiring
+        // targets: overlapping or reciprocal requests must fail instead of
+        // each waiting for a name held by the other. Reserve every target
+        // before changing the source or publishing any clone record.
+        let lock = try_lock_fork_source(spec.clone)?.ok_or_else(|| {
+            Error::agent_conflict(
+                "prepare fork",
+                format!(
+                    "machine '{}' has an active lifecycle operation; retry the fork",
+                    spec.clone
+                ),
+            )
+        })?;
+        startup_locks.push(std::sync::Arc::new(lock));
         for (host, _) in spec.pinned_ports {
             if !reserved_ports.tcp.insert(*host) {
                 return Err(Error::config(
@@ -3251,7 +3483,9 @@ pub(crate) fn prepare_forks_reusing(
     }
 
     let mut prepared = Vec::with_capacity(specs.len());
-    for spec in specs {
+    // Keep the reservations here as well as in each returned clone: a failed
+    // preparation drops its own guard before removing partial files/records.
+    for (spec, startup_lock) in specs.iter().zip(startup_locks.iter().cloned()) {
         match prepare_clone_from_snapshot(
             db,
             golden,
@@ -3260,6 +3494,7 @@ pub(crate) fn prepare_forks_reusing(
             &snapshot_dir,
             spec,
             &mut reserved_ports,
+            startup_lock,
         ) {
             Ok(clone) => prepared.push(clone),
             Err(error) => {
@@ -3427,6 +3662,7 @@ pub(crate) fn retained_snapshot_matches_golden(
         && reusable_snapshot_path(snapshot_root, &snapshot.path)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn prepare_clone_from_snapshot(
     db: &SmolvmDb,
     golden: &str,
@@ -3435,6 +3671,7 @@ fn prepare_clone_from_snapshot(
     snapshot_dir: &Path,
     spec: &ForkSpec<'_>,
     reserved_ports: &mut ReservedPorts,
+    startup_lock: std::sync::Arc<ForkSourceLock>,
 ) -> Result<PreparedFork> {
     let clone = spec.clone;
     let clone_dir = vm_data_dir(clone);
@@ -3553,7 +3790,7 @@ fn prepare_clone_from_snapshot(
         clone_rec.forkable = spec.clone_forkable;
         clone_rec.forkpoint_held = spec.hold;
         clone_rec.fork_env = spec.fork_env.to_vec();
-        db.insert_vm(clone, &clone_rec)?;
+        clone_rec = db.insert_vm_for_launch(clone, &clone_rec)?;
 
         let t_disk = std::time::Instant::now();
         clone_fork_disks(golden_dir, snapshot_dir, &clone_dir)?;
@@ -3563,6 +3800,7 @@ fn prepare_clone_from_snapshot(
             "fork: clone disk overlays created"
         );
         Ok(PreparedFork {
+            startup_lock,
             snapshot_dir: snapshot_dir.to_path_buf(),
             clone_record: clone_rec,
             port_remaps,
@@ -6675,5 +6913,117 @@ tmpfs /tmp tmpfs rw 0 0
             false,
             true
         ));
+    }
+    #[cfg(unix)]
+    #[test]
+    fn control_replies_preserve_utf8_and_refuse_partial_invalid_or_oversized_frames() {
+        use std::io::{BufRead, Write};
+        for (reply, expected) in [
+            (
+                "OK a=/tmp/é a= b \n".as_bytes().to_vec(),
+                Some("OK a=/tmp/é a= b "),
+            ),
+            (b"OK partial".to_vec(), None),
+            (b"OK \xff\n".to_vec(), None),
+            (vec![b'x'; 1024 * 1024 + 1], None),
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let sock = dir.path().join("control.sock");
+            let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut command = String::new();
+                std::io::BufReader::new(&mut stream)
+                    .read_line(&mut command)
+                    .unwrap();
+                assert_eq!(command, "SHARE_LIST mounts\n");
+                for chunk in reply.chunks(137) {
+                    if stream.write_all(chunk).is_err() {
+                        break;
+                    }
+                }
+            });
+            let result =
+                control_socket_cmd_with_timeout(&sock, "SHARE_LIST mounts", Duration::from_secs(5));
+            if let Some(expected) = expected {
+                assert_eq!(result.unwrap(), expected);
+            } else {
+                assert!(result.is_err());
+            }
+            server.join().unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_closed_control_peer_keeps_its_buffered_reply_and_eof() {
+        use std::io::Write;
+        for reply in [b"".as_slice(), "OK /tmp/é= value\n".as_bytes()] {
+            let (mut client, mut server) = crate::platform::uds::UdsStream::pair().unwrap();
+            server.write_all(reply).unwrap();
+            drop(server); // Deterministically close before setting any read timeout.
+            let mut received = Vec::new();
+            let mut buffer = [0; 3];
+            loop {
+                let count =
+                    read_control_chunk(&mut client, &mut buffer, Duration::from_secs(1)).unwrap();
+                if count == 0 {
+                    break;
+                }
+                received.extend_from_slice(&buffer[..count]);
+            }
+            assert_eq!(received, reply);
+            assert!(read_control_chunk(&mut client, &mut buffer, Duration::ZERO).is_err());
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_submicrosecond_control_deadline_never_disables_the_socket_timeout() {
+        use std::io::Write;
+        let (mut client, mut server) = crate::platform::uds::UdsStream::pair().unwrap();
+        server.write_all(b"x").unwrap();
+        let mut buffer = [0; 1];
+        assert_eq!(
+            read_control_chunk(&mut client, &mut buffer, Duration::from_nanos(1)).unwrap(),
+            1
+        );
+        assert_eq!(buffer, *b"x");
+        assert!(client
+            .read_timeout()
+            .unwrap()
+            .is_some_and(|timeout| !timeout.is_zero()));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn control_reply_deadline_does_not_restart_when_bytes_keep_arriving() {
+        use std::io::{BufRead, Write};
+        let dir = tempfile::tempdir().unwrap();
+        let sock = dir.path().join("control.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = listener.accept().unwrap();
+            let mut command = String::new();
+            std::io::BufReader::new(&mut stream)
+                .read_line(&mut command)
+                .unwrap();
+            for _ in 0..100 {
+                if stream.write_all(b"x").is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(30));
+            }
+        });
+        let started = std::time::Instant::now();
+        let error =
+            control_socket_cmd_with_timeout(&sock, "SHARE_LIST mounts", Duration::from_millis(150))
+                .unwrap_err();
+        assert!(
+            error.to_string().contains("no reply to SHARE_LIST"),
+            "{error}"
+        );
+        assert!(started.elapsed() < Duration::from_secs(2));
+        server.join().unwrap();
     }
 }

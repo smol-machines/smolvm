@@ -30,7 +30,7 @@ tempfile = "3"
 # and decompress them in-process too: layers may be gzip- OR zstd-compressed
 # (`skopeo`/`smolvm pack` default to zstd), and the guest rootfs ships no zstd
 # tool — so the old external `gunzip`-only path silently broke every zstd layer.
-tar = "0.4"
+tar = { workspace = true }
 # gzip via `flate2` (defaults to the pure-Rust `miniz_oxide` backend) and zstd
 # via the pure-Rust `ruzstd` decoder. The C-backed `zstd` crate can't link
 # against musl (its zstd-sys references glibc's `__memcpy_chk`) and the agent is
@@ -45,7 +45,7 @@ zstd = "0.14.3"
 
 # Linux-specific dependencies for vsock
 [target.'cfg(target_os = "linux")'.dependencies]
-nix = { version = "0.27", features = ["socket", "fs", "ioctl"] }
+nix = { version = "0.27", features = ["socket", "fs", "ioctl", "uio"] }
 # The new mount API (fsopen/fsconfig/fsmount/move_mount) for overlay mounts — lets
 # us append each lower layer via `lowerdir+` instead of shelling out to `mount(8)`,
 # whose `-o lowerdir=` value is capped at ~255 bytes. Already in the workspace lock.

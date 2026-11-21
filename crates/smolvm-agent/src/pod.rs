@@ -968,8 +968,13 @@ fn write_pod_bundle(
     // CRI mounts (volumes + generated /etc/resolv.conf, /etc/hosts) as bind mounts.
     // Added last so they layer on TOP of the default mounts (e.g. a volume at
     // /tmp/foo mounts over the default tmpfs at /tmp).
+    let read_only = read_only_destinations(&pod.host_spec);
     for (source, destination) in mount_binds {
-        spec.add_bind_mount(&source.to_string_lossy(), destination, false);
+        spec.add_bind_mount(
+            &source.to_string_lossy(),
+            destination,
+            read_only.contains(destination.as_str()),
+        );
     }
 
     // Preserve synthetic CRI mounts the shim did NOT rewrite to the pod share:
@@ -1127,6 +1132,25 @@ fn materialize_pod_mounts(id: &str, mounts: &[PodMount]) -> Vec<(PathBuf, String
         }
     }
     binds
+}
+
+/// The CRI mount destinations a volumeMount asked to be read-only (`ro` in its
+/// options); the copy is bound read-only there too.
+#[cfg(target_os = "linux")]
+fn read_only_destinations(host_spec: &serde_json::Value) -> std::collections::HashSet<&str> {
+    host_spec
+        .get("mounts")
+        .and_then(|mounts| mounts.as_array())
+        .into_iter()
+        .flatten()
+        .filter(|mount| {
+            mount
+                .get("options")
+                .and_then(|options| options.as_array())
+                .is_some_and(|options| options.iter().any(|option| option.as_str() == Some("ro")))
+        })
+        .filter_map(|mount| mount.get("destination").and_then(|d| d.as_str()))
+        .collect()
 }
 
 /// Recursively copy `src` to `dst`, following symlinks (so a symlinked volume
@@ -1717,6 +1741,22 @@ fn start_exec_process(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_only_volume_mount_is_bound_read_only() {
+        let host_spec = serde_json::json!({
+            "mounts": [
+                {"destination": "/etc/config", "type": "bind", "options": ["rbind", "ro"]},
+                {"destination": "/data", "type": "bind", "options": ["rbind", "rw"]},
+                {"destination": "/etc/hosts", "type": "bind"},
+            ],
+        });
+        let read_only = read_only_destinations(&host_spec);
+        assert!(read_only.contains("/etc/config"));
+        assert!(!read_only.contains("/data"));
+        assert!(!read_only.contains("/etc/hosts"));
+    }
 
     #[test]
     fn id_validation() {

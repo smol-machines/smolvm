@@ -42,6 +42,27 @@ pub const DEVICE_PROFILE: &str = "smolvm-basic-v1";
 /// layers. Distinct so a runtime that cannot re-attach the pack refuses the
 /// checkpoint instead of resuming into a device layout it does not reproduce.
 pub const DEVICE_PROFILE_PACKED_LAYERS: &str = "smolvm-packed-layers-v1";
+/// Same image device, with its exact archive carried inside the checkpoint.
+/// Older runtimes must reject this profile instead of trying a registry pull.
+pub const DEVICE_PROFILE_IMAGE_ARCHIVE: &str = "smolvm-image-archive-v1";
+/// Ownership-aware variants make older readers refuse rather than discard
+/// per-mount ownership settings and resume with different file access.
+pub const DEVICE_PROFILE_MOUNT_OWNERSHIP: &str = "smolvm-basic-mount-ownership-v1";
+/// Ownership-aware mounts alongside a packed image layer device.
+pub const DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP: &str = "smolvm-packed-layers-mount-ownership-v1";
+/// Ownership-aware mounts alongside a carried image archive device.
+pub const DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP: &str = "smolvm-image-archive-mount-ownership-v1";
+/// Device profiles understood by this reader; this does not reserve capacity
+/// or waive the CPU, runtime ABI, archive, and device checks during restore.
+pub const SUPPORTED_DEVICE_PROFILES: &[&str] = &[
+    DEVICE_PROFILE,
+    DEVICE_PROFILE_PACKED_LAYERS,
+    DEVICE_PROFILE_IMAGE_ARCHIVE,
+    DEVICE_PROFILE_MOUNT_OWNERSHIP,
+    DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP,
+    DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP,
+];
+const IMAGE_ARCHIVE_ASSET: &str = "checkpoint/image-archive.tar";
 const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Directory inside an extracted artifact containing live state.
@@ -62,6 +83,16 @@ const PAUSED_DISKS_SUFFIX: &str = ".paused-disks";
 /// Suffix of the directory beside a paused machine's data directory that pins
 /// the backing layers its pause artifact references instead of carrying.
 const PAUSED_LAYERS_SUFFIX: &str = ".paused-layers";
+/// Suffix of the directory beside a paused machine's data directory that
+/// keeps its pause's resume inputs unpacked, so a resume on this host need
+/// not decode them from the artifact.
+const PAUSED_RESUME_SUFFIX: &str = ".paused-resume";
+/// The record in that directory naming the artifact its inputs belong to.
+const PAUSED_RESUME_RECORD: &str = "artifact";
+/// Free disk a pause leaves untouched beyond its RAM size when it keeps its
+/// resume inputs: below that, the node's disk matters more than a fast resume.
+#[cfg(target_os = "linux")]
+const KEPT_RESUME_DISK_RESERVE: u64 = 32 << 30;
 
 /// Marks the directory an off-host export of a paused machine builds in,
 /// beside its data directory: `.<data dir>.export-<random>`.
@@ -731,9 +762,9 @@ pub fn log_phase(name: &str, phase: &str, started: &mut std::time::Instant) {
 pub struct CaptureOptions {
     /// Maximum unreferenced prepared-checkpoint bytes to retain on this node.
     pub prepared_cache_budget_bytes: Option<u64>,
-    /// Keep host directory mounts in the capture. The artifact then restores
-    /// only where the same host paths exist; each is re-attached at its guest
-    /// path. Pause uses this (it resumes on the same host); portable
+    /// Record host directory mounts without copying their contents. Restore
+    /// reattaches the original paths unless given new host paths for those
+    /// guest mounts. Pause uses this for same-host resume; portable
     /// checkpoints opt in with `--host-mounts`.
     pub host_mounts: bool,
     /// Reuse content-addressed objects in this directory and publish a
@@ -941,26 +972,14 @@ pub fn restore_from_path_with(
     // Reserve the name before touching its data directory. SDKs and CLIs may
     // run in separate processes, so a process-local lifecycle mutex is not a
     // sufficient creation boundary.
-    let token = crate::db::SmolvmDb::create_reservation_token();
-    if !db.reserve_vm_create(name, &token)? {
-        return Err(Error::agent_conflict(
-            "restore checkpoint",
-            format!("machine '{name}' already exists or is being created"),
-        ));
-    }
-    let mut reservation = RestoreReservation {
-        db: db.clone(),
-        name: name.to_string(),
-        token,
-        committed: false,
-    };
+    let reservation = crate::db::VmCreationLease::reserve(db.clone(), name)?;
 
     let mut record = restored_record_with(name, &manifest, checkpoint, spec)?;
     let vm_data = crate::agent::vm_data_dir(name);
     let cache_dir = crate::agent::machine_layers_cache_dir(name);
     let result = (|| -> Result<()> {
-        let _manager = crate::agent::AgentManager::for_vm_with_sizes(
-            name,
+        let _manager = crate::agent::AgentManager::for_vm_creation(
+            &reservation,
             checkpoint.storage_gib,
             checkpoint.overlay_gib,
         )?;
@@ -1001,35 +1020,17 @@ pub fn restore_from_path_with(
             record.source_smolmachine = Some(sidecar);
             record.source_registry_ref = reference;
         }
-        if let Some(image) = fetch_checkpoint_host_image_blocking(checkpoint)? {
+        if let Some(image) = restore_checkpoint_host_image_blocking(checkpoint, &vm_data)? {
             image.apply(&mut record);
         }
         mark_image_on_storage(checkpoint, &mut record);
-        if !reservation
-            .db
-            .commit_reserved_vm(name, &reservation.token, &record)?
-        {
-            return Err(Error::agent_conflict(
-                "restore checkpoint",
-                format!("machine '{name}' is no longer reserved"),
-            ));
-        }
-        reservation.committed = true;
+        // Detach before publishing: another process may start immediately after
+        // commit, so no cleanup of its mounts may happen after ownership ends.
+        smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
+        reservation.commit(&record)?;
         Ok(())
     })();
-    smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
-    if let Err(error) = result {
-        if let Err(remove_error) = std::fs::remove_dir_all(&vm_data) {
-            if remove_error.kind() != std::io::ErrorKind::NotFound {
-                tracing::warn!(
-                    machine = %name,
-                    error = %remove_error,
-                    "failed to clean checkpoint restore after error"
-                );
-            }
-        }
-        return Err(error);
-    }
+    result?;
     // The restored machine holds its own copies now; keep the shared store
     // within the restore cache's bounds, as a server restore does.
     #[cfg(target_os = "linux")]
@@ -1360,30 +1361,6 @@ impl VerifiedSidecar {
     }
 }
 
-struct RestoreReservation {
-    db: crate::db::SmolvmDb,
-    name: String,
-    token: String,
-    committed: bool,
-}
-
-impl Drop for RestoreReservation {
-    fn drop(&mut self) {
-        if !self.committed {
-            if let Err(error) = self
-                .db
-                .release_vm_create_reservation(&self.name, &self.token)
-            {
-                tracing::warn!(
-                    machine = %self.name,
-                    %error,
-                    "failed to release checkpoint restore reservation"
-                );
-            }
-        }
-    }
-}
-
 /// Guest subnet a checkpoint must be restored on.
 ///
 /// The restored guest keeps its captured address in memory, so the host side
@@ -1449,9 +1426,8 @@ struct SavedVmPause {
 }
 
 impl SavedVmPause {
-    fn stop(&mut self, name: &str, record: &VmRecord) -> Result<()> {
-        crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?
-            .stop_paused()?;
+    fn stop(&mut self, name: &str) -> Result<()> {
+        crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
         self.armed = false;
         Ok(())
     }
@@ -1861,6 +1837,81 @@ fn validated_capture_source(name: &str, host_mounts: bool) -> Result<(SmolvmConf
         crate::agent::fork::validate_checkpoint_agent(name)?;
     }
     Ok((config, frozen))
+}
+
+/// Requirements observed before pausing a source. The identity lets a caller
+/// reject a changed source after destination preflight; capture and restore
+/// still validate their own consistency boundaries.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+pub struct CheckpointRequirements {
+    /// Reviewed machine name.
+    pub name: String,
+    /// Creation identity of that machine.
+    pub created_at: u64,
+    /// Current VMM process identity.
+    pub pid: Option<i32>,
+    /// Host process start time, guarding PID reuse.
+    pub pid_start_time: Option<u64>,
+    /// Guest architecture required by this capture.
+    pub architecture: String,
+    /// Engine release performing the capture.
+    pub engine_version: String,
+    /// Format used by a standalone pause checkpoint.
+    pub format_version: u32,
+    /// Devices and carried assets required by the running guest.
+    pub device_profile: String,
+    /// Configured virtual CPU count.
+    pub cpus: u8,
+    /// Configured guest memory in MiB.
+    pub memory_mib: u32,
+}
+
+fn capture_device_profile(vm: &VmRecord) -> &'static str {
+    checkpoint_device_profile(
+        vm.packed_layer_source().is_some(),
+        vm.packed_layer_source().is_none() && vm.local_image_layers_dir().is_some(),
+        &checkpoint_host_mounts(vm),
+    )
+}
+
+fn checkpoint_device_profile(
+    packed: bool,
+    archive: bool,
+    mounts: &[smolvm_pack::format::CheckpointHostMount],
+) -> &'static str {
+    let owned = mounts
+        .iter()
+        .any(|mount| mount.recorded_ownership || mount.owner.is_some());
+    match (archive, packed, owned) {
+        (true, _, true) => DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP,
+        (true, _, false) => DEVICE_PROFILE_IMAGE_ARCHIVE,
+        (false, true, true) => DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP,
+        (false, true, false) => DEVICE_PROFILE_PACKED_LAYERS,
+        (false, false, true) => DEVICE_PROFILE_MOUNT_OWNERSHIP,
+        (false, false, false) => DEVICE_PROFILE,
+    }
+}
+
+/// Inspect a portable source without capturing memory, stopping execution,
+/// staging image archives, or allocating destination resources.
+pub fn capture_requirements(name: &str) -> Result<CheckpointRequirements> {
+    let (config, _) = validated_capture_source(name, false)?;
+    let vm = config
+        .vms
+        .get(name)
+        .ok_or_else(|| Error::vm_not_found(name))?;
+    Ok(CheckpointRequirements {
+        name: name.to_owned(),
+        created_at: vm.created_at,
+        pid: vm.pid,
+        pid_start_time: vm.pid_start_time,
+        architecture: crate::platform::Arch::current().oci_arch().to_owned(),
+        engine_version: crate::VERSION.to_owned(),
+        format_version: FORMAT_VERSION,
+        device_profile: capture_device_profile(vm).to_owned(),
+        cpus: vm.cpus,
+        memory_mib: vm.mem,
+    })
 }
 
 /// Capture a running checkpointable machine into a self-contained artifact.
@@ -2295,6 +2346,7 @@ fn capture_with_completion(
     }
     if stop_after_capture {
         remove_paused_disks_marker(&crate::agent::vm_data_dir(name))?;
+        remove_paused_resume(&crate::agent::vm_data_dir(name))?;
         publish_resume_point(PauseCaptureStage::Capturing)?;
     }
     let snapshot_dir = staging_dir.join(ASSET_DIR);
@@ -2495,6 +2547,36 @@ fn capture_with_completion(
         }
     }
 
+    // A pause keeps its resume inputs unpacked beside the machine as it packs
+    // them, so a resume on this host installs them without decoding the
+    // artifact. Only a streamed RAM image can be copied as it is packed, and
+    // only while the host keeps a reserve of disk beyond the whole RAM size.
+    #[cfg(target_os = "linux")]
+    let room_to_keep = |stream: &smolvm_pack::checkpoint_stream::CheckpointStream<'_>| {
+        free_bytes(&crate::agent::vm_data_dir(name)).is_some_and(|free| {
+            free >= stream.memory_len().saturating_add(KEPT_RESUME_DISK_RESERVE)
+        })
+    };
+    #[cfg(not(target_os = "linux"))]
+    let room_to_keep = |_: &smolvm_pack::checkpoint_stream::CheckpointStream<'_>| false;
+    let kept_resume = match streamed_memory.as_mut() {
+        Some(stream)
+            if stop_after_capture && stored.is_none() && !retain && room_to_keep(stream) =>
+        {
+            match KeptResume::begin(&crate::agent::vm_data_dir(name)) {
+                Ok((kept, memory)) => {
+                    stream.copy_memory_to(memory);
+                    Some(kept)
+                }
+                Err(error) => {
+                    tracing::warn!(%error, "pause will resume by extracting its artifact");
+                    None
+                }
+            }
+        }
+        _ => None,
+    };
+
     let mut stored = stored;
     let stored_memory = if let Some((_, writer)) = stored.as_mut() {
         if let Some(stream) = streamed_memory.as_mut() {
@@ -2636,8 +2718,13 @@ fn capture_with_completion(
     manifest.cpus = vm.cpus;
     manifest.mem = vm.mem;
     let packed_layers = checkpoint_packed_layers(name, vm)?;
-    let host_image = checkpoint_host_image(vm)?;
+    let host_image = checkpoint_host_image(vm, &snapshot_dir)?;
     let credential_ca = checkpoint_credential_ca(name, vm, &snapshot_dir)?;
+    let host_mounts = if options.host_mounts {
+        checkpoint_host_mounts(vm)
+    } else {
+        Vec::new()
+    };
     manifest.checkpoint = Some(PortableCheckpointManifest {
         version: FORMAT_VERSION,
         runtime_abi: captured_runtime_abi(&host_platform, &snapshot_dir.join("checkpoint.bin"))?
@@ -2664,11 +2751,13 @@ fn capture_with_completion(
             }
             .to_string(),
         ),
-        device_profile: if packed_layers.is_some() || host_image.is_some() {
-            DEVICE_PROFILE_PACKED_LAYERS
-        } else {
-            DEVICE_PROFILE
-        }
+        device_profile: checkpoint_device_profile(
+            packed_layers.is_some() || host_image.is_some(),
+            host_image
+                .as_ref()
+                .is_some_and(|image| image.archive.is_some()),
+            &host_mounts,
+        )
         .to_string(),
         state: describe_asset(
             &snapshot_dir.join("checkpoint.bin"),
@@ -2703,11 +2792,7 @@ fn capture_with_completion(
         disks: checkpoint_disks,
         workload: checkpoint_workload(name, vm),
         network: Some(checkpoint_network(vm)),
-        host_mounts: if options.host_mounts {
-            checkpoint_host_mounts(vm)
-        } else {
-            Vec::new()
-        },
+        host_mounts,
         packed_layers,
         host_image,
         lineage: Some(smolvm_pack::format::CheckpointLineage {
@@ -2823,7 +2908,7 @@ fn capture_with_completion(
         }
         if stop_after_capture {
             publish_resume_point(PauseCaptureStage::Durable)?;
-            pause.stop(name, vm)?;
+            pause.stop(name)?;
             record_paused_disks(
                 &crate::agent::vm_data_dir(name),
                 output,
@@ -2872,6 +2957,12 @@ fn capture_with_completion(
         packer.pack_artifact(output).map(|info| (info, None))
     }
     .map_err(|error| Error::agent("pack checkpoint", error.to_string()))?;
+    if let Some(kept) = kept_resume {
+        let copied = streamed_memory
+            .as_ref()
+            .is_some_and(|stream| stream.memory_copied());
+        kept.finish(copied, &snapshot_dir, output);
+    }
     // A streamed capture is retainable only once its RAM copy is complete.
     #[cfg(target_os = "linux")]
     let retain = retain
@@ -2931,7 +3022,7 @@ fn capture_with_completion(
             pins.commit(output)?;
         }
         publish_resume_point(PauseCaptureStage::Durable)?;
-        pause.stop(name, vm)?;
+        pause.stop(name)?;
         record_paused_disks(
             &crate::agent::vm_data_dir(name),
             output,
@@ -3692,37 +3783,72 @@ pub fn mark_image_on_storage(checkpoint: &PortableCheckpointManifest, record: &m
     }
 }
 
-/// Identify the registry image a machine boots from a host-fetched archive, if
-/// any, so a restore can fetch it again and serve the guest the archive it
-/// read.
-fn checkpoint_host_image(vm: &VmRecord) -> Result<Option<CheckpointHostImage>> {
-    if vm.source_smolmachine.is_some() {
+/// Carry the archive the guest's image device reads, including locally built
+/// images that have never been published to a registry.
+fn checkpoint_host_image(
+    vm: &VmRecord,
+    snapshot_dir: &Path,
+) -> Result<Option<CheckpointHostImage>> {
+    if vm.source_smolmachine.is_some() || vm.local_image_layers_dir().is_none() {
         return Ok(None);
     }
-    let Some(reference) = vm.host_fetched_origin() else {
-        return Ok(None);
-    };
+    let reference = vm
+        .host_fetched_origin()
+        .unwrap_or_else(|| vm.image.clone().unwrap());
     let archive = vm
         .image
         .as_deref()
         .and_then(crate::data::image_source::archive_file_for_ref)
         .ok_or_else(|| Error::agent("checkpoint machine", "image archive has no cache entry"))?;
-    let (archive_size, archive_mtime) = crate::data::image_source::archive_signature(&archive)
-        .map_err(|error| {
-            Error::agent(
-                "checkpoint machine",
-                format!(
-                    "the archive of {reference} is missing from this host's image cache ({}): {error}",
-                    archive.display()
-                ),
-            )
-        })?;
-    Ok(Some(CheckpointHostImage {
-        config_digest: crate::image_store::archive_config_digest(&archive)?,
-        reference,
+    let host = stage_checkpoint_host_image(&archive, &reference, snapshot_dir)?;
+    let key = crate::data::image_source::local_archive_hash(vm.image.as_deref().unwrap())
+        .and_then(|key| key.split('-').next())
+        .unwrap_or_default();
+    if host
+        .archive
+        .as_ref()
+        .is_none_or(|asset| asset.sha256 != key)
+    {
+        return Err(Error::agent(
+            "checkpoint machine",
+            "image archive no longer matches the image the machine booted",
+        ));
+    }
+    Ok(Some(host))
+}
+
+fn stage_checkpoint_host_image(
+    archive: &Path,
+    reference: &str,
+    snapshot_dir: &Path,
+) -> Result<CheckpointHostImage> {
+    let (archive_size, archive_mtime) = crate::data::image_source::archive_signature(archive)?;
+    if archive_size == 0 || archive_size > crate::data::image_source::max_archive_bytes() {
+        return Err(Error::agent(
+            "checkpoint machine",
+            "image archive exceeds the supported size",
+        ));
+    }
+    let staged = snapshot_dir.join("image-archive.tar");
+    // Never link a caller's image into a durable checkpoint: local imports may
+    // share an inode with a file the caller later overwrites.
+    crate::disk_utils::clone_or_copy_file(archive, &staged)?;
+    let asset = describe_asset(&staged, IMAGE_ARCHIVE_ASSET)?;
+    if asset.size != archive_size
+        || crate::data::image_source::archive_signature(archive)? != (archive_size, archive_mtime)
+    {
+        return Err(Error::agent(
+            "checkpoint machine",
+            "image archive changed during capture",
+        ));
+    }
+    Ok(CheckpointHostImage {
+        reference: reference.to_owned(),
+        config_digest: String::new(),
         archive_size,
         archive_mtime,
-    }))
+        archive: Some(asset),
+    })
 }
 
 /// The machine image to boot after restoring a checkpoint whose machine booted
@@ -3742,7 +3868,7 @@ impl RestoredHostImage {
     pub fn apply(self, record: &mut VmRecord) {
         record.image = Some(self.local);
         record.image_origin = Some(self.origin);
-        record.image_origin_digest = Some(self.digest);
+        record.image_origin_digest = (!self.digest.is_empty()).then_some(self.digest);
     }
 }
 
@@ -3759,6 +3885,12 @@ pub async fn fetch_checkpoint_host_image(
     let Some(host) = &checkpoint.host_image else {
         return Ok(None);
     };
+    if host.archive.is_some() {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "embedded image archive requires the installed checkpoint",
+        ));
+    }
     let fetched = crate::image_store::fetch_checkpoint_image(&host.reference, auth)
         .await
         .map_err(|error| {
@@ -3792,6 +3924,114 @@ pub fn fetch_checkpoint_host_image_blocking(
             checkpoint,
             &crate::registry::PullAuth::FromConfig,
         ))
+}
+
+/// Restore a carried archive without registry access, or fetch a legacy image.
+/// `vm_data` is the machine directory populated by [`install`].
+pub async fn restore_checkpoint_host_image(
+    checkpoint: &PortableCheckpointManifest,
+    vm_data: &Path,
+    auth: &crate::registry::PullAuth,
+) -> Result<Option<RestoredHostImage>> {
+    if let Some(host) = checkpoint
+        .host_image
+        .as_ref()
+        .filter(|host| host.archive.is_some())
+    {
+        let host = host.clone();
+        let path = vm_data.join(INSTALLED_DIR).join("image-archive.tar");
+        return tokio::task::spawn_blocking(move || restore_embedded_host_image(&host, &path))
+            .await
+            .map_err(|error| Error::agent("restore checkpoint", error.to_string()))?
+            .map(Some);
+    }
+    fetch_checkpoint_host_image(checkpoint, auth).await
+}
+
+/// Synchronous variant of [`restore_checkpoint_host_image`].
+pub fn restore_checkpoint_host_image_blocking(
+    checkpoint: &PortableCheckpointManifest,
+    vm_data: &Path,
+) -> Result<Option<RestoredHostImage>> {
+    if let Some(host) = checkpoint
+        .host_image
+        .as_ref()
+        .filter(|host| host.archive.is_some())
+    {
+        return restore_embedded_host_image(
+            host,
+            &vm_data.join(INSTALLED_DIR).join("image-archive.tar"),
+        )
+        .map(Some);
+    }
+    fetch_checkpoint_host_image_blocking(checkpoint)
+}
+
+fn restore_embedded_host_image(
+    host: &CheckpointHostImage,
+    path: &Path,
+) -> Result<RestoredHostImage> {
+    validate_embedded_image(host)?;
+    let asset = host.archive.as_ref().expect("validated embedded archive");
+    if !std::fs::symlink_metadata(path)?.file_type().is_file()
+        || describe_asset(path, IMAGE_ARCHIVE_ASSET)? != *asset
+    {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "embedded image archive failed integrity verification",
+        ));
+    }
+    let resolved =
+        crate::data::image_source::resolve(crate::data::image_source::ImageSource::Archive(
+            crate::data::image_source::ArchiveInput::File(path.to_owned()),
+        ))?;
+    let crate::data::image_source::ResolvedImage::Local { reference, .. } = resolved else {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "embedded image did not resolve locally",
+        ));
+    };
+    let restored = RestoredHostImage {
+        local: crate::data::image_source::archive_with_mtime(&reference, host.archive_mtime)?,
+        origin: host.reference.clone(),
+        digest: host
+            .reference
+            .rsplit_once("@sha256:")
+            .map(|(_, hash)| format!("sha256:{hash}"))
+            .unwrap_or_default(),
+    };
+    let final_path = crate::data::image_source::archive_file_for_ref(&restored.local)
+        .ok_or_else(|| Error::agent("restore checkpoint", "restored archive is missing"))?;
+    if describe_asset(&final_path, IMAGE_ARCHIVE_ASSET)? != *asset {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "cached image archive failed integrity verification",
+        ));
+    }
+    Ok(restored)
+}
+
+fn validate_embedded_image(host: &CheckpointHostImage) -> Result<()> {
+    let Some(asset) = &host.archive else {
+        return Ok(());
+    };
+    if asset.path != IMAGE_ARCHIVE_ASSET
+        || asset.size == 0
+        || asset.size != host.archive_size
+        || asset.size > crate::data::image_source::max_archive_bytes()
+        || asset.sha256.len() != 64
+        || !asset.sha256.bytes().all(|b| b.is_ascii_hexdigit())
+        || host.archive_mtime > i64::MAX as u64
+        || std::time::UNIX_EPOCH
+            .checked_add(std::time::Duration::from_secs(host.archive_mtime))
+            .is_none()
+    {
+        return Err(Error::agent(
+            "restore checkpoint",
+            "invalid embedded image archive descriptor",
+        ));
+    }
+    Ok(())
 }
 
 fn serve_checkpoint_host_image(
@@ -3982,8 +4222,8 @@ pub fn attach_cached_checkpoint_pack(
 /// Reject host-bound device state that cannot yet be resumed from an artifact.
 ///
 /// `host_mounts` admits host directory mounts: the capture records them and a
-/// restore re-attaches the same host paths, so the artifact is bound to hosts
-/// where they exist. Staged mounts stay unsupported either way.
+/// restore re-attaches their directories, whose contents must be transferred
+/// separately to move hosts. Staged mounts stay unsupported either way.
 pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> {
     let mut unsupported = Vec::new();
     if vm.network_backend == Some(crate::network::NetworkBackend::Host) {
@@ -4006,7 +4246,11 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
     // with no network. Layers found only under a host path named by the image
     // are not, so they stay unsupported.
     if vm.source_smolmachine.is_none()
-        && vm.host_fetched_origin().is_none()
+        && vm
+            .image
+            .as_deref()
+            .and_then(crate::data::image_source::archive_file_for_ref)
+            .is_none()
         && vm.local_image_layers_dir().is_some()
     {
         unsupported.push("host-backed image layers");
@@ -4055,40 +4299,119 @@ pub fn validate_capture_profile(vm: &VmRecord, host_mounts: bool) -> Result<()> 
 pub fn restored_host_mounts(
     checkpoint: &PortableCheckpointManifest,
 ) -> Result<Vec<(String, String, bool)>> {
+    Ok(restored_host_mounts_at(checkpoint, &[])?
+        .iter()
+        .map(crate::data::storage::HostMount::to_storage_tuple)
+        .collect())
+}
+
+/// Reattach captured devices in their original order, each at the host
+/// directory the restoring user names for it. The caller must transfer the
+/// directory contents; a checkpoint does not include them. Guest paths and
+/// access stay fixed. A checkpoint is its author's, so it never chooses which
+/// host directory a guest gets: a captured mount the user does not name is
+/// refused, with the `-v` that would name it.
+pub(crate) fn restored_host_mounts_at(
+    checkpoint: &PortableCheckpointManifest,
+    destinations: &[crate::data::storage::HostMount],
+) -> Result<Vec<crate::data::storage::HostMount>> {
+    use crate::data::storage::HostMount;
+
+    HostMount::ensure_unique_targets(destinations)?;
+    let mut targets = std::collections::HashSet::new();
+    for mount in &checkpoint.host_mounts {
+        if !targets.insert(Path::new(&mount.guest_path)) {
+            return Err(Error::config(
+                "restore checkpoint volume mounts",
+                format!("duplicate captured mount target: {}", mount.guest_path),
+            ));
+        }
+    }
+    for destination in destinations {
+        let captured = checkpoint
+            .host_mounts
+            .iter()
+            .find(|mount| Path::new(&mount.guest_path) == destination.target)
+            .ok_or_else(|| {
+                Error::config(
+                    "restore checkpoint volume mounts",
+                    format!(
+                        "{} is not a captured guest mount; restore can only relocate existing mounts",
+                        destination.target.display()
+                    ),
+                )
+            })?;
+        if destination.staged
+            || destination.read_only != captured.read_only
+            || (destination.recorded_ownership && !captured.recorded_ownership)
+            || (destination.owner.is_some() && destination.owner != captured.owner)
+        {
+            return Err(Error::config(
+                "restore checkpoint volume mounts",
+                format!(
+                    "{} must keep its captured access and ownership settings; only its host directory can change",
+                    destination.target.display()
+                ),
+            ));
+        }
+    }
     checkpoint
         .host_mounts
         .iter()
         .map(|mount| {
-            if !Path::new(&mount.host_path).is_dir() {
+            let Some(host) = destinations
+                .iter()
+                .find(|destination| destination.target == Path::new(&mount.guest_path))
+                .map(|destination| destination.source.as_path())
+            else {
+                return Err(Error::config(
+                    "restore checkpoint volume mounts",
+                    format!(
+                        "this checkpoint mounts a host directory at {guest}; a checkpoint does not \
+                         choose what this host shares, so name it: -v {host}:{guest}{access}",
+                        guest = mount.guest_path,
+                        host = mount.host_path,
+                        access = if mount.read_only { ":ro" } else { "" },
+                    ),
+                ));
+            };
+            if !host.is_dir() {
                 return Err(Error::config(
                     "restore checkpoint",
                     format!(
                         "this checkpoint mounts host directory {} at {}, which does not exist on \
-                         this host; create it or restore where it exists",
-                        mount.host_path, mount.guest_path
+                         this host; transfer its contents here or map the guest mount to their new host directory",
+                        host.display(), mount.guest_path
                     ),
                 ));
             }
-            Ok((
-                mount.host_path.clone(),
-                mount.guest_path.clone(),
-                mount.read_only,
-            ))
+            Ok(HostMount {
+                source: host.to_path_buf(),
+                target: mount.guest_path.clone().into(),
+                read_only: mount.read_only,
+                staged: false,
+                recorded_ownership: mount.recorded_ownership,
+                owner: mount.owner,
+            })
         })
         .collect()
 }
 
 /// Host directory mounts of `vm` as the checkpoint records them.
 fn checkpoint_host_mounts(vm: &VmRecord) -> Vec<smolvm_pack::format::CheckpointHostMount> {
-    vm.mounts
-        .iter()
-        .map(
-            |(host, guest, read_only)| smolvm_pack::format::CheckpointHostMount {
-                host_path: host.clone(),
-                guest_path: guest.clone(),
-                read_only: *read_only,
-            },
-        )
+    vm.host_mounts()
+        .into_iter()
+        .filter(|mount| !mount.staged)
+        .map(|mount| smolvm_pack::format::CheckpointHostMount {
+            host_path: mount.source.to_string_lossy().into_owned(),
+            guest_path: mount.target.to_string_lossy().into_owned(),
+            read_only: mount.read_only,
+            // Keep the persisted policy, not the host-specific flag that
+            // `host_mounts` derives for an owner on Linux. Restoring that
+            // derived flag as global policy would change unrelated mounts.
+            recorded_ownership: vm.recorded_ownership,
+            owner: mount.owner,
+        })
         .collect()
 }
 
@@ -4235,6 +4558,7 @@ fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
         allowed_cidrs: vm.allowed_cidrs.clone(),
         egress_rules: vm.egress_rules.clone(),
         mediated_egress_required: vm.mediated_egress_required,
+        external_interceptor_required: vm.external_interceptor_required,
         dns_filter_hosts: vm.dns_filter_hosts.clone(),
         // The block is enforced on the host, outside the guest, so a restore
         // without it would quietly open the private ranges to the workload.
@@ -4663,7 +4987,7 @@ fn remove_paused_disks_marker(vm_data: &Path) -> Result<()> {
 /// Where a paused machine pins the backing layers its artifact references:
 /// beside its data directory, like [`paused_disks_marker`], so its VMM cannot
 /// replace them.
-fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
+pub(crate) fn paused_layers_dir(vm_data: &Path) -> Result<PathBuf> {
     match (vm_data.parent(), vm_data.file_name()) {
         (Some(parent), Some(name)) => {
             Ok(parent.join(format!(".{}{PAUSED_LAYERS_SUFFIX}", name.to_string_lossy())))
@@ -4701,6 +5025,200 @@ pub(crate) fn remove_paused_layers(vm_data: &Path) -> Result<()> {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
         Err(error) => Err(error.into()),
     }
+}
+
+/// Where a paused machine keeps its resume inputs unpacked: beside its data
+/// directory, like [`paused_disks_marker`], so its VMM cannot replace them.
+fn paused_resume_dir(vm_data: &Path) -> Result<PathBuf> {
+    match (vm_data.parent(), vm_data.file_name()) {
+        (Some(parent), Some(name)) => {
+            Ok(parent.join(format!(".{}{PAUSED_RESUME_SUFFIX}", name.to_string_lossy())))
+        }
+        _ => Err(Error::agent(
+            "keep paused resume inputs",
+            format!("{} has no parent", vm_data.display()),
+        )),
+    }
+}
+
+/// The data directory name a kept-resume directory belongs to, or `None`
+/// when `path` is not one.
+pub(crate) fn paused_resume_owner(path: &Path) -> Option<&str> {
+    path.file_name()?
+        .to_str()?
+        .strip_prefix('.')?
+        .strip_suffix(PAUSED_RESUME_SUFFIX)
+        .filter(|name| !name.is_empty())
+}
+
+/// Drop a machine's kept resume inputs.
+pub(crate) fn remove_paused_resume(vm_data: &Path) -> Result<()> {
+    match std::fs::remove_dir_all(paused_resume_dir(vm_data)?) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+/// The resume inputs a pause keeps unpacked while it packs them: its RAM
+/// image, copied from the stream, and the small files beside it in staging.
+/// The record naming the artifact is written last, so a directory without it
+/// is never used.
+struct KeptResume {
+    dir: PathBuf,
+}
+
+impl KeptResume {
+    /// Start a fresh directory and open the file the RAM image is copied to.
+    fn begin(vm_data: &Path) -> Result<(Self, std::fs::File)> {
+        let dir = paused_resume_dir(vm_data)?;
+        remove_paused_resume(vm_data)?;
+        let mut builder = std::fs::DirBuilder::new();
+        #[cfg(unix)]
+        std::os::unix::fs::DirBuilderExt::mode(&mut builder, 0o700);
+        builder.recursive(true).create(dir.join(ASSET_DIR))?;
+        let memory = create_private_file(&dir.join(ASSET_DIR).join("memory.bin"))?;
+        Ok((Self { dir }, memory))
+    }
+
+    /// Complete the directory once the artifact is packed, or remove it when
+    /// the RAM copy did not finish. The small inputs are copied before the
+    /// staging tree goes; flushing the RAM image runs on its own thread so the
+    /// pause does not wait on it, and the record follows only once it is
+    /// durable. Best-effort: until then, resume extracts the artifact.
+    fn finish(self, copied: bool, staged: &Path, artifact: &Path) {
+        let inputs = self.dir.join(ASSET_DIR);
+        let copy_small = || -> Result<()> {
+            if !copied {
+                return Err(Error::agent(
+                    "keep paused resume inputs",
+                    "RAM copy incomplete",
+                ));
+            }
+            for file in ["checkpoint.bin", "manifest.bin", "credential-ca.json"] {
+                let source = staged.join(file);
+                if !source.exists() {
+                    continue;
+                }
+                let mut input = std::fs::File::open(&source)?;
+                let mut output = create_private_file(&inputs.join(file))?;
+                std::io::copy(&mut input, &mut output)?;
+                output.sync_all()?;
+            }
+            Ok(())
+        };
+        let identity = copy_small().and_then(|()| paused_artifact_identity(artifact));
+        let artifact = artifact.to_path_buf();
+        let publish = move || {
+            let result = identity.and_then(|identity| -> Result<()> {
+                std::fs::File::open(inputs.join("memory.bin"))?.sync_all()?;
+                std::fs::File::open(&inputs)?.sync_all()?;
+                // Written whole, then renamed into place: a resume that finds
+                // the record must never read it half-written.
+                let staged = self.dir.join(format!("{PAUSED_RESUME_RECORD}.partial"));
+                let mut record = create_private_file(&staged)?;
+                writeln!(record, "{}", artifact.display())?;
+                record.write_all(identity.as_bytes())?;
+                record.sync_all()?;
+                std::fs::rename(&staged, self.dir.join(PAUSED_RESUME_RECORD))?;
+                std::fs::File::open(&self.dir)?.sync_all()?;
+                Ok(())
+            });
+            if let Err(error) = result {
+                tracing::warn!(%error, "pause will resume by extracting its artifact");
+                let _ = std::fs::remove_dir_all(&self.dir);
+            }
+        };
+        if let Err(error) = std::thread::Builder::new()
+            .name("keep-paused-resume".into())
+            .spawn(publish)
+        {
+            tracing::warn!(%error, "pause will resume by extracting its artifact");
+        }
+    }
+}
+
+#[cfg(unix)]
+/// The identity of a pause artifact this service wrote: its inode and size.
+/// Only a regular file this service owns and no one else can write counts,
+/// so the manifest read from it at resume is the one packed.
+fn paused_artifact_identity(artifact: &Path) -> Result<String> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = std::fs::symlink_metadata(artifact)?;
+    if !metadata.is_file()
+        || metadata.uid() != unsafe { libc::geteuid() }
+        || metadata.mode() & 0o022 != 0
+    {
+        return Err(Error::agent(
+            "keep paused resume inputs",
+            "artifact is not a private file of this service",
+        ));
+    }
+    Ok(format!(
+        "{} {} {}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len()
+    ))
+}
+
+#[cfg(unix)]
+/// The directory of resume inputs a pause kept for `artifact`, if they are
+/// complete, service-owned and match the checkpoint they will install.
+fn kept_resume_inputs(
+    vm_data: &Path,
+    artifact: &Path,
+    checkpoint: &PortableCheckpointManifest,
+) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+    let dir = paused_resume_dir(vm_data).ok()?;
+    let owned = |path: &Path, mask: u32| {
+        std::fs::symlink_metadata(path).ok().filter(|metadata| {
+            metadata.uid() == unsafe { libc::geteuid() } && metadata.mode() & mask == 0
+        })
+    };
+    owned(&dir, 0o077).filter(|metadata| metadata.is_dir())?;
+    let record = std::fs::read_to_string(dir.join(PAUSED_RESUME_RECORD)).ok()?;
+    owned(&dir.join(PAUSED_RESUME_RECORD), 0o022)?;
+    let (recorded_artifact, recorded_identity) = record.split_once('\n')?;
+    if Path::new(recorded_artifact) != artifact
+        || paused_artifact_identity(artifact).ok()? != recorded_identity
+    {
+        return None;
+    }
+    let assets = expected_assets(checkpoint)
+        .into_iter()
+        .map(|(asset, path)| (asset, path.to_string()))
+        .chain(
+            checkpoint
+                .credential_ca
+                .iter()
+                .map(|asset| (asset, asset.path.clone())),
+        );
+    for (asset, path) in assets {
+        let metadata = owned(&dir.join(path), 0o022)?;
+        if !metadata.is_file() || metadata.len() != asset.size {
+            return None;
+        }
+    }
+    Some(dir)
+}
+
+#[cfg(not(unix))]
+fn paused_artifact_identity(_artifact: &Path) -> Result<String> {
+    Err(Error::agent(
+        "keep paused resume inputs",
+        "not supported on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn kept_resume_inputs(
+    _vm_data: &Path,
+    _artifact: &Path,
+    _checkpoint: &PortableCheckpointManifest,
+) -> Option<PathBuf> {
+    None
 }
 
 /// A backing layer a pause artifact references rather than carries.
@@ -5557,6 +6075,28 @@ pub fn checkpoint_image_on_storage(checkpoint: &PortableCheckpointManifest) -> b
             .is_some_and(|workload| crate::data::image_source::is_local_ref(&workload.image))
 }
 
+/// Every id a checkpoint file declares is later joined into a path in the
+/// node store, so each must have the form of a checkpoint id before any is
+/// used: an id of `../x` or `/etc/x` would otherwise name a place outside it.
+fn validate_lineage_ids(checkpoint: &PortableCheckpointManifest) -> Result<()> {
+    let lineage = checkpoint
+        .lineage
+        .iter()
+        .chain(checkpoint.history.iter().map(|g| &g.lineage));
+    let ids = lineage
+        .flat_map(|lineage| std::iter::once(&lineage.id).chain(lineage.parent.as_ref()))
+        .chain(checkpoint.base.as_ref().map(|base| &base.id));
+    for id in ids {
+        if !crate::checkpoint_store::is_checkpoint_id(id) {
+            return Err(Error::agent(
+                "restore checkpoint",
+                "invalid checkpoint lineage id: ids are 32 lowercase hex characters",
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate that a checkpoint may be restored by this host and runtime.
 pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result<()> {
     let required = match checkpoint.payload {
@@ -5576,6 +6116,7 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
         ));
     }
     validate_runtime_abi(checkpoint)?;
+    validate_lineage_ids(checkpoint)?;
     let host_platform = crate::platform::Platform::current()
         .host_oci_platform()
         .to_string();
@@ -5595,11 +6136,29 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
             "checkpoint names both a pack and a fetched image as its image layers",
         ));
     }
-    let expected_profile = if mounts_checkpoint_image_layers(checkpoint) {
-        DEVICE_PROFILE_PACKED_LAYERS
-    } else {
-        DEVICE_PROFILE
-    };
+    if let Some(host) = &checkpoint.host_image {
+        validate_embedded_image(host)?;
+    }
+    if let Some(first) = checkpoint.host_mounts.first() {
+        if checkpoint
+            .host_mounts
+            .iter()
+            .any(|mount| mount.recorded_ownership != first.recorded_ownership)
+        {
+            return Err(Error::config(
+                "restore checkpoint mount ownership",
+                "mixed recorded-ownership policies cannot be represented by this runtime",
+            ));
+        }
+    }
+    let expected_profile = checkpoint_device_profile(
+        mounts_checkpoint_image_layers(checkpoint),
+        checkpoint
+            .host_image
+            .as_ref()
+            .is_some_and(|host| host.archive.is_some()),
+        &checkpoint.host_mounts,
+    );
     if checkpoint.device_profile != expected_profile {
         return Err(Error::agent(
             "restore checkpoint",
@@ -5696,12 +6255,20 @@ pub fn validate_compatibility(checkpoint: &PortableCheckpointManifest) -> Result
 
 fn expected_assets(
     checkpoint: &PortableCheckpointManifest,
-) -> [(&CheckpointAsset, &'static str); 3] {
-    [
+) -> Vec<(&CheckpointAsset, &'static str)> {
+    let mut assets = vec![
         (&checkpoint.state, "checkpoint/checkpoint.bin"),
         (&checkpoint.memory, "checkpoint/memory.bin"),
         (&checkpoint.layout, "checkpoint/manifest.bin"),
-    ]
+    ];
+    if let Some(archive) = checkpoint
+        .host_image
+        .as_ref()
+        .and_then(|host| host.archive.as_ref())
+    {
+        assets.push((archive, IMAGE_ARCHIVE_ASSET));
+    }
+    assets
 }
 
 fn validate_disk_manifest(disks: &[CheckpointDisk], cache: bool) -> Result<()> {
@@ -6117,6 +6684,25 @@ fn protect_restore_directory(path: &Path) -> Result<()> {
 #[cfg(target_os = "linux")]
 const MAX_COW_CHAIN_FILES: usize = 4;
 
+/// Refuse a file the manifest lists as raw that is in fact a qcow2 image. Only
+/// files listed as qcow2 have their backing checked, while the layer above can
+/// declare its backing qcow2 (or leave it to a reader that probes), so a qcow2
+/// listed as raw would be parsed as qcow2 anyway, with a backing file of the
+/// checkpoint author's choosing: any host file the restoring user can read.
+fn refuse_qcow2_listed_as_raw(path: &Path, target: &str) -> Result<()> {
+    let mut magic = [0_u8; 4];
+    let read = std::fs::File::open(path)
+        .and_then(|mut file| file.read(&mut magic))
+        .map_err(|error| Error::agent("inspect checkpoint disk", error.to_string()))?;
+    if read == magic.len() && magic == *b"QFI\xfb" {
+        return Err(Error::agent(
+            "install checkpoint",
+            format!("disk '{target}' is listed as raw but is a qcow2 image"),
+        ));
+    }
+    Ok(())
+}
+
 /// Check that the qcow2 `staged` (file `index` of `disk`) is backed by exactly
 /// the next file of the captured chain.
 fn verify_qcow2_backing(staged: &Path, disk: &CheckpointDisk, index: usize) -> Result<()> {
@@ -6374,6 +6960,9 @@ fn install_with(
                     let started = std::time::Instant::now();
                     let staged = staged_disks.join(&file.target);
                     let source = extracted.join(&file.asset.path);
+                    if file.format == "raw" {
+                        refuse_qcow2_listed_as_raw(&source, &file.target)?;
+                    }
                     #[cfg(target_os = "linux")]
                     if index == 0
                         && disk.files.len() == 1
@@ -6579,7 +7168,7 @@ pub fn finalize_live_restore(name: &str, record: &VmRecord) -> Result<()> {
 
 /// Prepare an explicit same-machine resume. The durable artifact stays intact
 /// if extraction, installation, or the subsequent boot fails.
-pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
+pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<Option<RestoredHostImage>> {
     let artifact = record.paused_checkpoint.as_ref().ok_or_else(|| {
         Error::agent_conflict("resume machine", "machine has no saved execution state")
     })?;
@@ -6616,6 +7205,31 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         .collect();
     skip.push(PathBuf::from("lib"));
     let rootfs_available = pinned_rootfs_available(checkpoint);
+    // The pause kept what the installer reads unpacked: install it from there
+    // rather than decoding the artifact, which is only needed elsewhere.
+    if keep_disks && rootfs_available {
+        if let Some(kept) = kept_resume_inputs(&vm_data, artifact, checkpoint) {
+            tracing::info!(machine = %record.name, phase = "extract", kept = true, elapsed_ms = 0, "paused resume phase completed");
+            clear_stale_restore_state(&vm_data)?;
+            install_with(
+                &kept,
+                &vm_data,
+                checkpoint,
+                keep_disks,
+                cache_base.as_deref(),
+                None,
+            )?;
+            return if checkpoint
+                .host_image
+                .as_ref()
+                .is_some_and(|host| host.archive.is_some())
+            {
+                restore_checkpoint_host_image_blocking(checkpoint, &vm_data)
+            } else {
+                Ok(None)
+            };
+        }
+    }
     if rootfs_available {
         skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
     }
@@ -6657,7 +7271,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
                 .map(|file| PathBuf::from(&file.asset.path)),
         );
     }
-    let extract_and_install = |parent: &Path| -> Result<()> {
+    let extract_and_install = |parent: &Path| -> Result<Option<RestoredHostImage>> {
         let staged = tempfile::Builder::new()
             .prefix("resume-")
             .tempdir_in(parent)?;
@@ -6683,7 +7297,16 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
             keep_disks,
             cache_base.as_deref(),
             None,
-        )
+        )?;
+        if checkpoint
+            .host_image
+            .as_ref()
+            .is_some_and(|host| host.archive.is_some())
+        {
+            restore_checkpoint_host_image_blocking(checkpoint, &vm_data)
+        } else {
+            Ok(None)
+        }
     };
     // Stage on tmpfs when there is room, so the RAM image handed to the VMM
     // is never written to disk. Its RAM is freed once the VMM has read it.
@@ -6701,7 +7324,7 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<()> {
         tracing::info!(machine = %record.name, needed_bytes = needed, available_bytes = available, "paused resume tmpfs admission");
         if available.is_some_and(|free| free >= needed) {
             match extract_and_install(&root) {
-                Ok(()) => return Ok(()),
+                Ok(image) => return Ok(image),
                 Err(error) => {
                     tracing::warn!(machine = %record.name, %error, "restore on tmpfs failed; staging on disk");
                     clear_stale_restore_state(&vm_data)?;
@@ -6810,11 +7433,7 @@ fn pin_restore_rootfs_in(
         None if carried_tar.is_file() => {
             // Unpack to learn what it ran on; the tree is kept unless the
             // host's installed rootfs turns out to be the same.
-            let (digest, path) = store.install_tar(&carried_tar)?;
-            if default.as_deref() == Some(digest.as_str()) {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-            digest
+            store.install_tar_unless(&carried_tar, default.as_deref())?
         }
         None => return Ok(None),
     };
@@ -7009,6 +7628,26 @@ mod tests {
     }
 
     use super::*;
+
+    // A checkpoint can list a qcow2 layer as raw: install never inspects a raw
+    // file, so its backing path would reach a host file through the layer
+    // above. Such a file is refused.
+    #[test]
+    fn a_qcow2_listed_as_raw_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let raw = dir.path().join("raw.img");
+        std::fs::write(&raw, vec![0_u8; 4096]).unwrap();
+        assert!(refuse_qcow2_listed_as_raw(&raw, "storage.raw").is_ok());
+        let disguised = dir.path().join("disguised.img");
+        let mut bytes = b"QFI\xfb".to_vec();
+        bytes.resize(4096, 0);
+        std::fs::write(&disguised, bytes).unwrap();
+        let error = refuse_qcow2_listed_as_raw(&disguised, "storage.raw").unwrap_err();
+        assert!(error.to_string().contains("listed as raw"), "{error}");
+        let tiny = dir.path().join("tiny.img");
+        std::fs::write(&tiny, b"QF").unwrap();
+        assert!(refuse_qcow2_listed_as_raw(&tiny, "storage.raw").is_ok());
+    }
 
     /// `/proc/cpuinfo` of an M4 Max guest booted with pointer authentication off.
     const M4_MAX_GUEST_CPUINFO: &str = "processor\t: 0\nFeatures\t: fp asimd evtstrm aes \
@@ -9068,6 +9707,76 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn kept_resume_inputs_serve_only_their_own_artifact() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = &dir.path().join("0123abcd");
+        std::fs::create_dir(vm).unwrap();
+        let artifact = vm.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let staged = dir.path().join("staged");
+        std::fs::create_dir(&staged).unwrap();
+        std::fs::write(staged.join("checkpoint.bin"), b"s").unwrap();
+        std::fs::write(staged.join("manifest.bin"), b"l").unwrap();
+        let checkpoint = test_checkpoint_manifest();
+
+        let (kept, mut memory) = KeptResume::begin(vm).unwrap();
+        memory.write_all(b"m").unwrap();
+        drop(memory);
+        // An unfinished directory has no record and is never used.
+        assert!(kept_resume_inputs(vm, &artifact, &checkpoint).is_none());
+        kept.finish(true, &staged, &artifact);
+        let record = paused_resume_dir(vm).unwrap().join(PAUSED_RESUME_RECORD);
+        for _ in 0..500 {
+            if record.exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert_eq!(
+            kept_resume_inputs(vm, &artifact, &checkpoint),
+            Some(paused_resume_dir(vm).unwrap())
+        );
+        assert!(kept_resume_inputs(vm, &vm.join("other.smolcheckpoint"), &checkpoint).is_none());
+        let mut bigger = test_checkpoint_manifest();
+        bigger.memory.size = 2;
+        assert!(kept_resume_inputs(vm, &artifact, &bigger).is_none());
+
+        // A replaced artifact is a different file, even at the same path.
+        let replacement = vm.join("replacement");
+        std::fs::write(&replacement, b"artifact").unwrap();
+        std::fs::rename(&replacement, &artifact).unwrap();
+        assert!(kept_resume_inputs(vm, &artifact, &checkpoint).is_none());
+
+        assert_eq!(
+            paused_resume_owner(&paused_resume_dir(vm).unwrap()),
+            Some("0123abcd")
+        );
+        remove_paused_resume(vm).unwrap();
+        assert!(!paused_resume_dir(vm).unwrap().exists());
+        remove_paused_resume(vm).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn an_incomplete_ram_copy_keeps_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let vm = &dir.path().join("0123abcd");
+        std::fs::create_dir(vm).unwrap();
+        let artifact = vm.join("pause-1.smolcheckpoint");
+        std::fs::write(&artifact, b"artifact").unwrap();
+        let (kept, _) = KeptResume::begin(vm).unwrap();
+        kept.finish(false, dir.path(), &artifact);
+        for _ in 0..500 {
+            if !paused_resume_dir(vm).unwrap().exists() {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+        assert!(!paused_resume_dir(vm).unwrap().exists());
+    }
+
     fn qcow2_header_fixture() -> Vec<u8> {
         let old = disk_target("storage", 9, "qcow2").unwrap();
         let mut bytes = vec![0_u8; 8192];
@@ -9306,6 +10015,7 @@ mod tests {
                 host_path: "/host".to_string(),
                 guest_path: "/guest".to_string(),
                 read_only: true,
+                ..Default::default()
             }]
         );
         // Staged mounts are copies the restore cannot reproduce, with or without.
@@ -9324,6 +10034,179 @@ mod tests {
     }
 
     #[test]
+    fn checkpoint_mount_ownership_round_trips_and_requires_an_aware_profile() {
+        let host = tempfile::tempdir().unwrap();
+        let mut record = VmRecord::new(
+            "owned".into(),
+            1,
+            512,
+            vec![(host.path().display().to_string(), "/data".into(), false)],
+            Vec::new(),
+            false,
+        );
+        record.recorded_ownership = true;
+        record.mount_owners = vec![(0, 42001, 42002)];
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.host_mounts = checkpoint_host_mounts(&record);
+        assert!(checkpoint.host_mounts[0].recorded_ownership);
+        assert_eq!(checkpoint.host_mounts[0].owner, Some((42001, 42002)));
+        // Ownership cannot be attached to an old profile that old readers accept.
+        assert!(validate_compatibility(&checkpoint).is_err());
+        checkpoint.device_profile = capture_device_profile(&record).into();
+        assert_eq!(checkpoint.device_profile, DEVICE_PROFILE_MOUNT_OWNERSHIP);
+        validate_compatibility(&checkpoint).unwrap();
+        let wire = serde_json::to_vec(&checkpoint).unwrap();
+        let checkpoint: PortableCheckpointManifest = serde_json::from_slice(&wire).unwrap();
+        let manifest = PackManifest::new(
+            "bare".into(),
+            "sha256:0".into(),
+            "linux/amd64".into(),
+            String::new(),
+        );
+        let restored = restored_record_with(
+            "owned-restored",
+            &manifest,
+            &checkpoint,
+            named_mounts(&checkpoint),
+        )
+        .unwrap();
+        assert!(restored.recorded_ownership);
+        assert_eq!(restored.mount_owners, record.mount_owners);
+        assert_eq!(restored.host_mounts()[0].owner, Some((42001, 42002)));
+        let mut stripped = checkpoint;
+        stripped.host_mounts[0].recorded_ownership = false;
+        stripped.host_mounts[0].owner = None;
+        // Removing the settings without changing the profile is also inconsistent.
+        assert!(validate_compatibility(&stripped).is_err());
+    }
+
+    #[test]
+    fn checkpoint_mount_owner_does_not_change_other_mounts_ownership_policy() {
+        let host = tempfile::tempdir().unwrap();
+        let path = host.path().display().to_string();
+        let mut record = VmRecord::new(
+            "mixed-owners".into(),
+            1,
+            512,
+            vec![
+                (path.clone(), "/owned".into(), false),
+                (path, "/plain".into(), false),
+            ],
+            Vec::new(),
+            false,
+        );
+        record.mount_owners = vec![(0, 42001, 42002)];
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.host_mounts = checkpoint_host_mounts(&record);
+        assert!(checkpoint
+            .host_mounts
+            .iter()
+            .all(|mount| !mount.recorded_ownership));
+        checkpoint.device_profile = capture_device_profile(&record).into();
+        let manifest = PackManifest::new(
+            "bare".into(),
+            "sha256:0".into(),
+            "linux/amd64".into(),
+            String::new(),
+        );
+        let restored = restored_record_with(
+            "mixed-restored",
+            &manifest,
+            &checkpoint,
+            named_mounts(&checkpoint),
+        )
+        .unwrap();
+        assert!(!restored.recorded_ownership);
+        assert_eq!(restored.mount_owners, record.mount_owners);
+        assert!(!restored.host_mounts()[1].recorded_ownership);
+        assert_eq!(
+            restored.host_mounts()[0].recorded_ownership,
+            cfg!(target_os = "linux")
+        );
+        // Current records have one global policy: refuse an unrepresentable
+        // artifact instead of enabling virtual ownership on unrelated mounts.
+        checkpoint.host_mounts[0].recorded_ownership = true;
+        assert!(validate_compatibility(&checkpoint)
+            .unwrap_err()
+            .to_string()
+            .contains("mixed recorded-ownership"));
+    }
+
+    #[test]
+    fn checkpoint_mount_ownership_profiles_retain_each_image_topology() {
+        let mut mount = smolvm_pack::format::CheckpointHostMount::default();
+        for (packed, archive, plain, owned) in [
+            (false, false, DEVICE_PROFILE, DEVICE_PROFILE_MOUNT_OWNERSHIP),
+            (
+                true,
+                false,
+                DEVICE_PROFILE_PACKED_LAYERS,
+                DEVICE_PROFILE_PACKED_MOUNT_OWNERSHIP,
+            ),
+            (
+                true,
+                true,
+                DEVICE_PROFILE_IMAGE_ARCHIVE,
+                DEVICE_PROFILE_ARCHIVE_MOUNT_OWNERSHIP,
+            ),
+        ] {
+            for (recorded, owner) in [
+                (false, None),
+                (true, None),
+                (false, Some((42, 43))),
+                (true, Some((42, 43))),
+            ] {
+                mount.recorded_ownership = recorded;
+                mount.owner = owner;
+                let profile =
+                    checkpoint_device_profile(packed, archive, std::slice::from_ref(&mount));
+                assert_eq!(
+                    profile,
+                    if recorded || owner.is_some() {
+                        owned
+                    } else {
+                        plain
+                    }
+                );
+                assert!(SUPPORTED_DEVICE_PROFILES.contains(&profile));
+            }
+        }
+        let old: smolvm_pack::format::CheckpointHostMount =
+            serde_json::from_value(serde_json::json!({
+                "host_path": "/old", "guest_path": "/data", "read_only": false,
+            }))
+            .unwrap();
+        assert!(!old.recorded_ownership);
+        assert_eq!(old.owner, None);
+        assert_eq!(
+            serde_json::to_value(old).unwrap(),
+            serde_json::json!({
+                "host_path": "/old", "guest_path": "/data", "read_only": false,
+            })
+        );
+    }
+
+    /// A restore spec naming every captured mount at its captured directory,
+    /// as the restoring user does.
+    fn named_mounts(checkpoint: &PortableCheckpointManifest) -> crate::machine_spec::CreateSpec {
+        crate::machine_spec::CreateSpec {
+            mounts: checkpoint
+                .host_mounts
+                .iter()
+                .map(|mount| crate::data::storage::HostMount {
+                    source: mount.host_path.clone().into(),
+                    target: mount.guest_path.clone().into(),
+                    read_only: mount.read_only,
+                    staged: false,
+                    recorded_ownership: false,
+                    owner: None,
+                })
+                .collect(),
+            ..Default::default()
+        }
+    }
+
+    #[test]
     fn restored_host_mounts_require_the_directories_to_exist() {
         let present = tempfile::tempdir().unwrap();
         let mut checkpoint = minimal_checkpoint_manifest();
@@ -9331,17 +10214,31 @@ mod tests {
             host_path: present.path().display().to_string(),
             guest_path: "/workspace".to_string(),
             read_only: false,
+            ..Default::default()
         }];
-        assert_eq!(
-            restored_host_mounts(&checkpoint).unwrap(),
-            vec![(
-                present.path().display().to_string(),
-                "/workspace".to_string(),
-                false
-            )]
-        );
-        checkpoint.host_mounts[0].host_path = present.path().join("missing").display().to_string();
+        // The checkpoint alone never attaches a host directory.
         let error = restored_host_mounts(&checkpoint).unwrap_err().to_string();
+        assert!(
+            error.contains(&format!("-v {}:/workspace", present.path().display())),
+            "{error}"
+        );
+        let named = crate::data::storage::HostMount {
+            source: present.path().to_path_buf(),
+            target: "/workspace".into(),
+            read_only: false,
+            staged: false,
+            recorded_ownership: false,
+            owner: None,
+        };
+        let mounts = restored_host_mounts_at(&checkpoint, std::slice::from_ref(&named)).unwrap();
+        assert_eq!(mounts[0].source, present.path());
+        let missing = crate::data::storage::HostMount {
+            source: present.path().join("missing"),
+            ..named
+        };
+        let error = restored_host_mounts_at(&checkpoint, &[missing])
+            .unwrap_err()
+            .to_string();
         assert!(error.contains("does not exist on this host"), "{error}");
         assert!(error.contains("/workspace"), "{error}");
     }
@@ -9385,6 +10282,7 @@ mod tests {
             config_digest: "sha256:c0ffee".to_string(),
             archive_size: 1,
             archive_mtime: 1,
+            archive: None,
         });
         assert!(!carries_no_host_layers(&with_image));
         let mut fetched = no_network_machine("local:caa470fc");
@@ -9445,26 +10343,118 @@ mod tests {
     }
 
     #[test]
-    fn a_users_own_local_image_still_cannot_be_captured() {
-        for image in ["local:abc", "local-dir:/srv/rootfs"] {
-            let record = no_network_machine(image);
-            let error = validate_capture_profile(&record, false)
-                .unwrap_err()
-                .to_string();
-            assert!(
-                error.contains(
-                    "the initial portable checkpoint profile does not support host-backed image layers"
-                ),
-                "{image}: {error}"
-            );
-        }
-        // An origin that is itself a local source is not a registry origin.
-        let mut record = no_network_machine("./saved.tar");
-        record.pin_host_fetched_image("local:abc".to_string(), "sha256:aa".to_string());
-        let error = validate_capture_profile(&record, false)
+    fn local_archives_are_portable_but_mutable_rootfs_directories_are_not() {
+        validate_capture_profile(&no_network_machine("local:abc"), false).unwrap();
+        let record = no_network_machine("local-dir:/srv/rootfs");
+        assert!(validate_capture_profile(&record, false)
             .unwrap_err()
-            .to_string();
-        assert!(error.contains("host-backed image layers"), "{error}");
+            .to_string()
+            .contains("host-backed image layers"));
+        let mut local = no_network_machine("./saved.tar");
+        local.pin_host_fetched_image("local:abc".to_string(), "sha256:aa".to_string());
+        validate_capture_profile(&local, false).unwrap();
+    }
+
+    #[test]
+    fn embedded_image_descriptors_require_their_own_profile_and_safe_assets() {
+        let mut checkpoint = minimal_checkpoint_manifest();
+        let host = CheckpointHostImage {
+            reference: "local:abc".into(),
+            config_digest: "sha256:abc".into(),
+            archive_size: 512,
+            archive_mtime: 42,
+            archive: Some(CheckpointAsset {
+                path: IMAGE_ARCHIVE_ASSET.into(),
+                size: 512,
+                sha256: "ab".repeat(32),
+            }),
+        };
+        checkpoint.host_image = Some(host.clone());
+        checkpoint.device_profile = DEVICE_PROFILE_PACKED_LAYERS.into();
+        assert!(validate_compatibility(&checkpoint).is_err());
+        checkpoint.device_profile = DEVICE_PROFILE_IMAGE_ARCHIVE.into();
+        validate_compatibility(&checkpoint).unwrap();
+        assert!(expected_assets(&checkpoint)
+            .iter()
+            .any(|(_, path)| *path == IMAGE_ARCHIVE_ASSET));
+        let mut old_reader = checkpoint.clone();
+        old_reader.host_image.as_mut().unwrap().archive = None;
+        assert!(validate_compatibility(&old_reader).is_err());
+        for path in ["../image.tar", "/etc/passwd", "checkpoint/other.tar"] {
+            let mut invalid = host.clone();
+            invalid.archive.as_mut().unwrap().path = path.into();
+            assert!(validate_embedded_image(&invalid).is_err());
+        }
+        let mut invalid = host.clone();
+        invalid.archive_size += 1;
+        assert!(validate_embedded_image(&invalid).is_err());
+        invalid = host.clone();
+        invalid.archive.as_mut().unwrap().sha256.clear();
+        assert!(validate_embedded_image(&invalid).is_err());
+        invalid = host;
+        invalid.archive_mtime = u64::MAX;
+        assert!(validate_embedded_image(&invalid).is_err());
+    }
+
+    #[test]
+    fn embedded_image_survives_source_removal_and_refuses_tampering() {
+        const CHILD: &str = "SMOLVM_TEST_EMBEDDED_IMAGE";
+        if std::env::var_os(CHILD).is_none() {
+            let isolated = tempfile::tempdir().unwrap();
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "portable_checkpoint::tests::embedded_image_survives_source_removal_and_refuses_tampering", "--nocapture"])
+                .env(CHILD, "1").env("SMOLVM_DATA_DIR", isolated.path()).env("HOME", isolated.path()).env("XDG_CACHE_HOME", isolated.path().join("cache")).spawn().unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            loop {
+                if let Some(status) = child.try_wait().unwrap() {
+                    assert!(status.success());
+                    break;
+                }
+                if std::time::Instant::now() >= deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("embedded archive regression timed out");
+                }
+                std::thread::sleep(std::time::Duration::from_millis(20));
+            }
+            return;
+        }
+        let source = tempfile::tempdir().unwrap();
+        let staged = tempfile::tempdir().unwrap();
+        let archive = source.path().join("image.tar");
+        let manifest = br#"[{"Config":"abcd.json","Layers":[]}]"#;
+        let mut tar = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        let mut header = tar::Header::new_gnu();
+        header.set_size(manifest.len() as u64);
+        header.set_mode(0o644);
+        header.set_cksum();
+        tar.append_data(&mut header, "manifest.json", &manifest[..])
+            .unwrap();
+        tar.into_inner().unwrap();
+        crate::data::image_source::set_archive_mtime(&archive, 42).unwrap();
+        let host =
+            stage_checkpoint_host_image(&archive, "local:unpublished", staged.path()).unwrap();
+        let expected = std::fs::read(&archive).unwrap();
+        std::fs::write(&archive, b"caller replaced the image").unwrap();
+        source.close().unwrap();
+        let carried = staged.path().join("image-archive.tar");
+        let restored = restore_embedded_host_image(&host, &carried).unwrap();
+        let cached = crate::data::image_source::archive_file_for_ref(&restored.local).unwrap();
+        assert_eq!(std::fs::read(&cached).unwrap(), expected);
+        assert_eq!(
+            crate::data::image_source::archive_signature(&cached).unwrap(),
+            (expected.len() as u64, 42)
+        );
+        let mut vm = no_network_machine("local:unpublished");
+        restored.apply(&mut vm);
+        assert_eq!(vm.image_origin_digest, None);
+        let mut bytes = std::fs::read(&carried).unwrap();
+        bytes[0] ^= 1;
+        std::fs::write(&carried, bytes).unwrap();
+        assert!(restore_embedded_host_image(&host, &carried)
+            .unwrap_err()
+            .to_string()
+            .contains("integrity"));
     }
 
     #[test]
@@ -9482,6 +10472,7 @@ mod tests {
             config_digest: "sha256:c0ffee".to_string(),
             archive_size: 42,
             archive_mtime: 7,
+            archive: None,
         };
         let mut metadata = minimal_checkpoint_manifest();
         metadata.host_image = Some(host_image.clone());
@@ -9918,6 +10909,28 @@ mod tests {
     }
 
     #[test]
+    fn an_interceptor_requirement_survives_checkpoint_restore() {
+        let mut record = VmRecord::new("intercepted".into(), 2, 1024, Vec::new(), Vec::new(), true);
+        record.external_interceptor_required = true;
+        let mut checkpoint = minimal_checkpoint_manifest();
+        checkpoint.network = Some(checkpoint_network(&record));
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://intercepted".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        let restored = restored_record("intercepted-restored", &manifest, &checkpoint).unwrap();
+        assert!(restored.external_interceptor_required);
+        assert!(!restored.mediated_egress_required);
+
+        record.external_interceptor_required = false;
+        checkpoint.network = Some(checkpoint_network(&record));
+        let restored = restored_record("plain-restored", &manifest, &checkpoint).unwrap();
+        assert!(!restored.external_interceptor_required);
+    }
+
+    #[test]
     fn mediated_rules_and_rebind_requirement_survive_checkpoint_restore() {
         let mut record = VmRecord::new("mediated".into(), 2, 1024, Vec::new(), Vec::new(), true);
         record.egress_rules = vec![smolvm_protocol::EgressRule {
@@ -10212,5 +11225,64 @@ mod aarch64_live_host_tests {
         sorted.sort();
         assert_eq!(sorted, features, "contract must be sorted for stability");
         eprintln!("host provides {} guest-visible features", features.len());
+    }
+}
+
+#[cfg(test)]
+mod lineage_id_tests {
+    use super::*;
+    use smolvm_pack::format::{CheckpointBase, CheckpointGeneration, CheckpointLineage};
+
+    const ID: &str = "0123456789abcdef0123456789abcdef";
+
+    fn lineage(id: &str, parent: Option<&str>) -> CheckpointLineage {
+        CheckpointLineage {
+            id: id.into(),
+            parent: parent.map(Into::into),
+            machine: "m".into(),
+            created_at: "2026-01-01T00:00:00Z".into(),
+        }
+    }
+
+    #[test]
+    fn a_lineage_id_that_is_not_a_checkpoint_id_is_rejected() {
+        let mut good = test_checkpoint_manifest();
+        good.lineage = Some(lineage(ID, Some(ID)));
+        good.base = Some(CheckpointBase {
+            id: ID.into(),
+            index_sha256: "x".into(),
+        });
+        good.history = vec![CheckpointGeneration {
+            lineage: lineage(ID, Some(ID)),
+            data_bytes: 0,
+        }];
+        validate_lineage_ids(&good).unwrap();
+
+        for bad in [
+            "/etc/planted",
+            "../escape",
+            "",
+            "0123456789ABCDEF0123456789ABCDEF",
+            "/dev/zero",
+        ] {
+            let mut id = good.clone();
+            id.lineage = Some(lineage(bad, None));
+            let mut parent = good.clone();
+            parent.lineage = Some(lineage(ID, Some(bad)));
+            let mut base = good.clone();
+            base.base = Some(CheckpointBase {
+                id: bad.into(),
+                index_sha256: "x".into(),
+            });
+            let mut history = good.clone();
+            history.history[0].lineage = lineage(ID, Some(bad));
+            for manifest in [id, parent, base, history] {
+                assert!(validate_lineage_ids(&manifest).is_err(), "{bad:?} accepted");
+                assert!(
+                    validate_compatibility(&manifest).is_err(),
+                    "{bad:?} accepted"
+                );
+            }
+        }
     }
 }

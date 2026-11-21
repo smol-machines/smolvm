@@ -21,7 +21,7 @@
 //! | `workdir` | string | No | Working directory inside the VM. |
 //! | `user` | string | No | User the workload runs as, like `docker run --user`: a name or `uid[:gid]`. Overrides the image `USER`. |
 //! | `cpus` | int | No | Number of vCPUs (default: 4). |
-//! | `memory` | int | No | Memory in MiB (default: 8192). |
+//! | `memory` | int | No | Memory in MiB (default: half the host's RAM, at most 8192). |
 //! | `net` | bool | No | Enable outbound networking via NAT. |
 //! | `cuda` | bool | No | Enable CUDA-over-vsock (host NVIDIA GPU). |
 //! | `auto_graph` | bool | No | Best-effort framework CUDA graphs; implies `cuda`. |

@@ -374,6 +374,20 @@ pub fn registry_pull_hosts(image: &str) -> Vec<String> {
     }
 }
 
+/// Whether a hostname allow list lets the guest pull `image` itself: it names
+/// every apex the pull talks to ([`registry_pull_hosts`]), either the apex or
+/// its subdomains, since registries answer from sub-hosts.
+pub fn hosts_cover_pull(image: &str, hosts: &[String]) -> bool {
+    use smolvm_protocol::host_pattern::matches;
+    registry_pull_hosts(image).iter().all(|apex| {
+        let apex = apex.split(':').next().unwrap_or(apex);
+        let sub_host = format!("pull.{apex}");
+        hosts
+            .iter()
+            .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
+    })
+}
+
 /// Rewrite an image reference to use a different registry.
 ///
 /// # Examples
@@ -448,6 +462,26 @@ pub struct Reference {
     pub digest: Option<String>,
 }
 
+/// An OCI distribution tag: `[A-Za-z0-9_][A-Za-z0-9._-]{0,127}`.
+fn is_valid_tag(tag: &str) -> bool {
+    let bytes = tag.as_bytes();
+    !bytes.is_empty()
+        && bytes.len() <= 128
+        && (bytes[0].is_ascii_alphanumeric() || bytes[0] == b'_')
+        && bytes
+            .iter()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'_' | b'.' | b'-'))
+}
+
+/// A registry host as it may appear in a reference: a name or address, an
+/// optional port, and the brackets of an IPv6 literal.
+fn is_valid_registry_host(host: &str) -> bool {
+    !host.is_empty()
+        && host.bytes().all(|b| {
+            b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b':' | b'[' | b']')
+        })
+}
+
 impl Reference {
     /// Parse a reference string.
     ///
@@ -494,6 +528,11 @@ impl Reference {
                 let tag = &input[abs_colon + 1..];
                 if tag.is_empty() {
                     return Err(err("empty tag"));
+                }
+                // The tag is formatted into the manifest URL, where `..` and
+                // `\` would steer the request to another repository.
+                if !is_valid_tag(tag) {
+                    return Err(err("invalid tag (disallowed characters)"));
                 }
                 (path, Some(tag.to_string()), None)
             } else {
@@ -571,6 +610,11 @@ impl Reference {
 
         if name.is_empty() {
             return Err(err("empty name"));
+        }
+        // The registry becomes the URL's authority; nothing in it may end the
+        // authority and start a path or query of its own.
+        if !is_valid_registry_host(&registry) {
+            return Err(err("invalid registry host (disallowed characters)"));
         }
 
         // Reject empty path components (e.g. ghcr.io/org//machine from a double slash).
@@ -678,6 +722,30 @@ fn validate_digest(raw_input: &str, digest: &str) -> std::result::Result<(), Ref
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_hostname_list_covers_a_pull_only_when_it_names_every_registry_host() {
+        let list = |hosts: &[&str]| hosts.iter().map(|h| h.to_string()).collect::<Vec<_>>();
+        assert!(!hosts_cover_pull(
+            "ghcr.io/acme/app:1",
+            &list(&["api.example.com"])
+        ));
+        assert!(!hosts_cover_pull("ghcr.io/acme/app:1", &list(&["ghcr.io"])));
+        assert!(hosts_cover_pull(
+            "ghcr.io/acme/app:1",
+            &list(&["ghcr.io", "githubusercontent.com"])
+        ));
+        assert!(!hosts_cover_pull("alpine", &list(&["docker.io"])));
+        assert!(hosts_cover_pull(
+            "alpine",
+            &list(&["docker.io", "docker.com"])
+        ));
+        assert!(hosts_cover_pull(
+            "registry.vendor.example/tool:1",
+            &list(&["registry.vendor.example"])
+        ));
+        assert!(!hosts_cover_pull("registry.vendor.example/tool:1", &[]));
+    }
 
     #[test]
     fn expired_credential_warning_fires_only_when_past() {
@@ -1199,6 +1267,35 @@ mirror = "ghcr-mirror.example.com"
             "unexpected reason: {}",
             err.reason
         );
+    }
+
+    #[test]
+    fn a_tag_or_registry_that_could_reshape_the_url_is_refused() {
+        for reference in [
+            r"registry.example/victim/private:..\..\attacker\x",
+            "registry.example/app:..",
+            "registry.example/app:.",
+            "registry.example/app:latest?x=1",
+            "registry.example/app:latest#",
+            "registry.example/app:%2e%2e",
+            "registry.example/app:-v1",
+            r"127.0.0.1:8080\admin\x?q=/repo:tag",
+        ] {
+            assert!(Reference::parse(reference).is_err(), "{reference} accepted");
+        }
+        let long = format!("registry.example/app:{}", "a".repeat(129));
+        assert!(Reference::parse(&long).is_err());
+        for reference in [
+            "python:3.12-slim_x",
+            "localhost:5000/app:dev",
+            "[::1]:5000/app:v1",
+            "my_registry.internal:8443/team/app:v1",
+            "ghcr.io/org/team/machine:latest",
+        ] {
+            assert!(Reference::parse(reference).is_ok(), "{reference} refused");
+        }
+        let longest = format!("registry.example/app:{}", "a".repeat(128));
+        assert!(Reference::parse(&longest).is_ok());
     }
 
     #[test]

@@ -922,6 +922,16 @@ pub fn generations_from_history(
         .collect()
 }
 
+/// An export forwards objects unopened and the packer follows links, so a
+/// store entry that is not a regular file is refused here the way
+/// [`decode_object`] refuses it on read.
+fn require_object_file(path: &Path) -> io::Result<()> {
+    if !fs::symlink_metadata(path)?.is_file() {
+        return Err(invalid("checkpoint object is not a regular file"));
+    }
+    Ok(())
+}
+
 /// Export `directory` as ONE file that carries its history: the checkpoint's
 /// index, the indexes of up to `limit` retained generations, and every object
 /// any of them references, packed as a `Chunked` checkpoint. Restoring such a
@@ -976,6 +986,7 @@ pub fn export_with_history(
     let objects = directory.join("objects");
     for hash in &hashes {
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -2252,6 +2263,14 @@ fn materialize_generation(
             fs::remove_file(&destination)?;
             cloned = false;
         }
+        // macOS clonefile preserves read-only modes from the pristine base.
+        // Only our private clone needs write access while applying the diff;
+        // restore the recorded mode below once its contents are complete.
+        #[cfg(unix)]
+        if cloned {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&destination, fs::Permissions::from_mode(0o600))?;
+        }
         let file = File::options()
             .read(true)
             .write(true)
@@ -2915,6 +2934,7 @@ pub fn export_chunked(
             continue;
         }
         let source = objects.join(hash);
+        require_object_file(&source)?;
         let target = staging.join("objects").join(hash);
         if fs::hard_link(&source, &target).is_err() {
             fs::copy(&source, &target)?;
@@ -3017,17 +3037,63 @@ pub fn adopt_objects(store: &Path, directory: &Path) -> io::Result<usize> {
     let _lock = cache_lock(store, false)?;
     let cache = store.join("objects");
     fs::create_dir_all(&cache)?;
-    let mut adopted = 0;
-    for entry in fs::read_dir(directory.join("objects"))? {
-        let entry = entry?;
-        match fs::hard_link(entry.path(), cache.join(entry.file_name())) {
-            Ok(()) => adopted += 1,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+    // Only objects this checkpoint's indexes name, each read the way a
+    // restore reads it: a later capture reuses a cached object by its name
+    // alone, so one whose bytes do not hash to that name would put another
+    // file's contents into that capture.
+    let expected = indexed_object_sizes(directory)?;
+    let adopted = std::sync::atomic::AtomicUsize::new(0);
+    let objects = directory.join("objects");
+    for_each_parallel(worker_threads(), expected.into_iter(), |(hash, size)| {
+        let cached = cache.join(&hash);
+        if fs::symlink_metadata(&cached).is_ok() {
+            return Ok(());
+        }
+        let source = objects.join(&hash);
+        if fs::symlink_metadata(&source).is_err() {
+            return Ok(());
+        }
+        read_object(&source, &hash, size)?;
+        match fs::hard_link(&source, &cached) {
+            Ok(()) => {
+                adopted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    })?;
+    File::open(&cache)?.sync_all()?;
+    Ok(adopted.into_inner())
+}
+
+/// Every object the checkpoint at `directory` names, in its own index or a
+/// retained generation's, with the length its chunk decodes to.
+fn indexed_object_sizes(directory: &Path) -> io::Result<HashMap<String, usize>> {
+    let mut indexes = vec![read_index(directory)?];
+    let generations = directory.join(GENERATIONS);
+    if generations.is_dir() {
+        for entry in fs::read_dir(&generations)? {
+            let entry = entry?;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if valid_generation_id(&id) && entry.file_type()?.is_dir() {
+                indexes.push(read_index_from(&entry.path().join(INDEX))?);
+            }
         }
     }
-    File::open(&cache)?.sync_all()?;
-    Ok(adopted)
+    let mut sizes = HashMap::new();
+    for index in &indexes {
+        let chunk = index.chunk_size as u64;
+        for file in &index.files {
+            for (i, hash) in file.chunks.iter().enumerate() {
+                let Some(hash) = hash else { continue };
+                let start = i as u64 * chunk;
+                let size = chunk.min(file.size.saturating_sub(start)) as usize;
+                sizes.insert(hash.clone(), size);
+            }
+        }
+    }
+    Ok(sizes)
 }
 
 /// What [`materialize_over`] did.
@@ -4488,6 +4554,40 @@ mod tests {
         retained
     }
 
+    /// The history export moves objects into its staging tree by name and
+    /// the packer dereferences links, so an object that is a symlink would put
+    /// the target's bytes into the file: it is refused like any other object
+    /// that is not a regular file.
+    #[test]
+    #[cfg(unix)]
+    fn a_history_export_refuses_an_object_that_is_not_a_regular_file() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let (first, second) = (root.path().join("first"), root.path().join("second"));
+        capture_generation(&cache, &first, &[1u8; 64], G1, None, "2026-01-01T00:00:00Z");
+        capture_generation(
+            &cache,
+            &second,
+            &[2u8; 64],
+            G2,
+            Some(&first),
+            "2026-01-02T00:00:00Z",
+        );
+        let outside = root.path().join("outside");
+        fs::write(&outside, b"host secret").unwrap();
+        let hash = read_index(&second).unwrap().files[0].chunks[0]
+            .clone()
+            .unwrap();
+        let object = second.join("objects").join(&hash);
+        fs::remove_file(&object).unwrap();
+        std::os::unix::fs::symlink(&outside, &object).unwrap();
+        let file = root.path().join("history.checkpoint");
+        let error = export_with_history(&second, 32, &file, |_| {}).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidData);
+        assert!(error.to_string().contains("not a regular file"), "{error}");
+        assert!(!file.exists());
+    }
+
     const G1: &str = "11111111111111111111111111111111";
     const G2: &str = "22222222222222222222222222222222";
     const G3: &str = "33333333333333333333333333333333";
@@ -4581,6 +4681,46 @@ mod tests {
                 .id,
             G1
         );
+    }
+
+    #[test]
+    fn adoption_takes_only_indexed_objects_that_hash_to_their_names() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let saved = root.path().join("saved");
+        capture(&objects, &saved, &vec![0x5A; 2 * CHUNK_SIZE + 17]);
+        let index = read_index(&saved).unwrap();
+        let named = own_objects(&index).len();
+        // a planted object no index names is never adopted
+        fs::write(saved.join("objects").join("f".repeat(64)), b"stray").unwrap();
+        let store = root.path().join("store");
+        assert_eq!(adopt_objects(&store, &saved).unwrap(), named);
+        assert!(!store.join("objects").join("f".repeat(64)).exists());
+
+        // an object whose bytes are another chunk's is refused
+        let forged = root.path().join("forged");
+        capture(&objects, &forged, &vec![0x33; CHUNK_SIZE]);
+        let forged_hash = own_objects(&read_index(&forged).unwrap())
+            .into_iter()
+            .next()
+            .unwrap()
+            .to_string();
+        let other = root.path().join("other");
+        capture(&objects, &other, &vec![0x77; CHUNK_SIZE]);
+        let other_hash = own_objects(&read_index(&other).unwrap())
+            .into_iter()
+            .next()
+            .unwrap()
+            .to_string();
+        fs::remove_file(forged.join("objects").join(&forged_hash)).unwrap();
+        fs::copy(
+            other.join("objects").join(&other_hash),
+            forged.join("objects").join(&forged_hash),
+        )
+        .unwrap();
+        let fresh = root.path().join("fresh-store");
+        assert!(adopt_objects(&fresh, &forged).is_err());
+        assert!(!fresh.join("objects").join(&forged_hash).exists());
     }
 
     #[test]
@@ -4863,6 +5003,66 @@ mod tests {
         let out_a3 = root.path().join("out-a3");
         materialize_with_base(&saved_a, &out_a3, Some(&root.path().join("nope"))).unwrap();
         assert_eq!(fs::read(out_a3.join("checkpoint/memory.bin")).unwrap(), a);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn readonly_base_restores_preserve_permissions_and_cached_bytes() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let base = root.path().join("base");
+        let original = vec![0xAB; 3 * CHUNK_SIZE];
+        let mut changed = original.clone();
+        changed[..CHUNK_SIZE].fill(0xCD);
+        changed[CHUNK_SIZE..2 * CHUNK_SIZE].fill(0);
+        let store = |name: &str, bytes: &[u8]| {
+            let saved = root.path().join(name);
+            capture(&objects, &saved, bytes);
+            let mut index = read_index(&saved).unwrap();
+            for entry in &mut index.files {
+                entry.mode = 0o444;
+            }
+            fs::write(saved.join(INDEX), serde_json::to_vec(&index).unwrap()).unwrap();
+            saved
+        };
+        let saved = store("saved", &original);
+        let updated = store("updated", &changed);
+        let first = root.path().join("first");
+        materialize(&saved, &first).unwrap();
+        if !promote_base(&saved, &first, &base).unwrap() {
+            assert!(std::env::var_os("SMOLVM_TEST_REQUIRE_REFLINK").is_none());
+            return;
+        }
+        let asset = "checkpoint/memory.bin";
+        let cached_identity = file_identity(&base.join(asset));
+        for (i, (checkpoint, expected)) in [
+            (&saved, &original),
+            (&updated, &changed),
+            (&saved, &original),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let output = root.path().join(format!("restored-{i}"));
+            materialize_with_base(checkpoint, &output, Some(&base)).unwrap();
+            assert_eq!(fs::read(output.join(asset)).unwrap(), *expected);
+            assert_eq!(
+                fs::metadata(output.join(asset))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o777,
+                0o444
+            );
+            assert_eq!(fs::read(base.join(asset)).unwrap(), original);
+            assert_eq!(file_identity(&base.join(asset)), cached_identity);
+            assert_eq!(
+                fs::metadata(base.join(asset)).unwrap().permissions().mode() & 0o777,
+                0o444
+            );
+        }
     }
 
     /// A base file whose size disagrees with the base index is not trusted:

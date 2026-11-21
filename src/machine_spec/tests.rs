@@ -349,6 +349,218 @@ fn keeping_an_identity_needs_a_checkpoint() {
 }
 
 #[test]
+fn checkpoint_mount_ownership_is_inherited_when_relocating_a_directory() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manifest = checkpoint_manifest();
+    let checkpoint = manifest.checkpoint.as_mut().unwrap();
+    checkpoint.device_profile = crate::portable_checkpoint::DEVICE_PROFILE_MOUNT_OWNERSHIP.into();
+    checkpoint.host_mounts = vec![smolvm_pack::format::CheckpointHostMount {
+        host_path: directory
+            .path()
+            .join("missing-source")
+            .display()
+            .to_string(),
+        guest_path: "/data".into(),
+        read_only: false,
+        recorded_ownership: true,
+        owner: Some((42001, 42002)),
+    }];
+    let mount = HostMount::parse(&[format!("{}:/data", directory.path().display())])
+        .unwrap()
+        .remove(0);
+    for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+        let resolved = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                mounts: vec![mount.clone()],
+                ..Default::default()
+            },
+            caller,
+        )
+        .unwrap()
+        .to_record("relocated-owned")
+        .unwrap();
+        assert!(resolved.recorded_ownership);
+        assert_eq!(resolved.mount_owners, [(0, 42001, 42002)]);
+        assert_eq!(resolved.mounts, [mount.to_storage_tuple()]);
+    }
+    for owner in [Some((42001, 42002)), Some((1, 2))] {
+        let mut asked = mount.clone();
+        asked.owner = owner;
+        let resolved = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                mounts: vec![asked],
+                ..Default::default()
+            },
+            Caller::Embedded,
+        );
+        assert_eq!(resolved.is_ok(), owner == Some((42001, 42002)));
+    }
+}
+
+#[test]
+fn checkpoint_mount_relocation_keeps_device_order_for_every_caller() {
+    let original = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let mut manifest = checkpoint_manifest();
+    let checkpoint = manifest.checkpoint.as_mut().unwrap();
+    checkpoint.host_mounts = ["/data", "/config"]
+        .into_iter()
+        .enumerate()
+        .map(|(i, target)| smolvm_pack::format::CheckpointHostMount {
+            host_path: original.path().join(i.to_string()).display().to_string(),
+            guest_path: target.into(),
+            read_only: i == 1,
+            ..Default::default()
+        })
+        .collect();
+    // The source machine's paths no longer exist on the destination host.
+    drop(original);
+    let mounts = HostMount::parse(&[
+        format!("{}:/config:ro", destination.path().display()),
+        format!("{}:/data:rw", destination.path().display()),
+    ])
+    .unwrap();
+    let expected = vec![mounts[1].to_storage_tuple(), mounts[0].to_storage_tuple()];
+    let before = serde_json::to_value(&manifest).unwrap();
+    for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+        let record = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                mounts: mounts.clone(),
+                ..Default::default()
+            },
+            caller,
+        )
+        .unwrap()
+        .to_record("relocated")
+        .unwrap();
+        assert_eq!(record.mounts, expected);
+    }
+    assert_eq!(serde_json::to_value(&manifest).unwrap(), before);
+}
+
+#[test]
+fn checkpoint_mounts_attach_only_where_the_user_names_them() {
+    let original = tempfile::tempdir().unwrap();
+    let destination = tempfile::tempdir().unwrap();
+    let mut manifest = checkpoint_manifest();
+    manifest.checkpoint.as_mut().unwrap().host_mounts = ["/data", "/config"]
+        .into_iter()
+        .map(|target| smolvm_pack::format::CheckpointHostMount {
+            host_path: original.path().display().to_string(),
+            guest_path: target.into(),
+            read_only: false,
+            ..Default::default()
+        })
+        .collect();
+    let original_path = original.path().display().to_string();
+    let mounts = HostMount::parse(&[
+        format!("{}:/data", destination.path().display()),
+        format!("{original_path}:/config"),
+    ])
+    .unwrap();
+    let restore = |mounts| {
+        resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                mounts,
+                ..Default::default()
+            },
+            Caller::Embedded,
+        )
+    };
+    // The checkpoint alone attaches nothing, and names what to pass.
+    let unnamed = restore(Vec::new()).unwrap_err().to_string();
+    assert!(
+        unnamed.contains(&format!("-v {original_path}:/data")),
+        "{unnamed}"
+    );
+    let partly = restore(mounts[..1].to_vec()).unwrap_err().to_string();
+    assert!(partly.contains("/config"), "{partly}");
+    let record = restore(mounts.clone())
+        .unwrap()
+        .to_record("relocated")
+        .unwrap();
+    assert_eq!(record.mounts[0], mounts[0].to_storage_tuple());
+    assert_eq!(record.mounts[1], mounts[1].to_storage_tuple());
+    // A file or missing directory cannot substitute for the captured share.
+    let mut invalid = mounts.clone();
+    invalid[0].source = destination.path().join("file");
+    std::fs::write(&invalid[0].source, b"not a directory").unwrap();
+    assert!(restore(invalid)
+        .unwrap_err()
+        .to_string()
+        .contains("does not exist"));
+    drop(destination);
+    assert!(restore(mounts.clone())
+        .unwrap_err()
+        .to_string()
+        .contains("/data"));
+    drop(original);
+    assert!(restore(Vec::new())
+        .unwrap_err()
+        .to_string()
+        .contains("/data"));
+}
+
+#[test]
+fn checkpoint_mount_relocation_refuses_topology_and_permission_changes() {
+    let directory = tempfile::tempdir().unwrap();
+    let mut manifest = checkpoint_manifest();
+    manifest.checkpoint.as_mut().unwrap().host_mounts =
+        vec![smolvm_pack::format::CheckpointHostMount {
+            host_path: directory.path().display().to_string(),
+            guest_path: "/data".into(),
+            read_only: true,
+            ..Default::default()
+        }];
+    let mount = HostMount::parse(&[format!("{}:/data:ro", directory.path().display())])
+        .unwrap()
+        .remove(0);
+    for change in 0..6 {
+        let mut changed = mount.clone();
+        match change {
+            0 => changed.target = "/new-device".into(),
+            1 => changed.read_only = false,
+            2 => changed.staged = true,
+            3 => changed.owner = Some((1000, 1000)),
+            4 => changed.recorded_ownership = true,
+            _ => {}
+        }
+        let mut mounts = vec![changed];
+        if change == 5 {
+            mounts.push(mount.clone());
+        }
+        assert!(
+            resolve(
+                SpecSource::from_manifest(&manifest),
+                CreateSpec {
+                    mounts,
+                    ..Default::default()
+                },
+                Caller::Embedded,
+            )
+            .is_err(),
+            "accepted change {change}"
+        );
+    }
+    let checkpoint = manifest.checkpoint.as_mut().unwrap();
+    checkpoint
+        .host_mounts
+        .push(checkpoint.host_mounts[0].clone());
+    assert!(resolve(
+        SpecSource::from_manifest(&manifest),
+        CreateSpec::default(),
+        Caller::Embedded,
+    )
+    .unwrap_err()
+    .to_string()
+    .contains("duplicate captured mount target"));
+}
+
+#[test]
 fn a_checkpoint_restores_what_it_captured() {
     let record = fresh(CreateSpec::default(), Src::Checkpoint);
     assert_eq!((record.cpus, record.mem), (1, 512));
@@ -391,6 +603,141 @@ fn a_checkpoint_keeps_block_private_udp_ports_and_its_settings() {
     assert_eq!(record.nested_virt, Some(true));
     assert_eq!(record.stop_signal.as_deref(), Some("SIGINT"));
     assert_eq!(record.health_cmd, Some(vec!["true".to_string()]));
+}
+
+// An artifact's `local-dir:` image names a directory on its author's host. A
+// pack that ships no layers, or a checkpoint, would share that directory with
+// the guest here, so either is refused; a pack that ships its layers is not.
+#[test]
+fn an_artifact_cannot_name_a_host_directory_as_its_image() {
+    let mut layerless = pack_manifest();
+    layerless.image = "local-dir:/".into();
+    let mut checkpoint = checkpoint_manifest();
+    checkpoint
+        .checkpoint
+        .as_mut()
+        .unwrap()
+        .workload
+        .as_mut()
+        .unwrap()
+        .image = "local-dir:/etc".into();
+    for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+        for manifest in [&layerless, &checkpoint] {
+            let refused = resolve(
+                SpecSource::from_manifest(manifest),
+                CreateSpec::default(),
+                caller,
+            );
+            assert!(refused.is_err(), "{caller:?}");
+        }
+    }
+    let mut layered = layerless.clone();
+    layered.assets.layers.push(smolvm_pack::format::LayerEntry {
+        digest: "sha256:00".into(),
+        path: "layers/00.tar".into(),
+        size: 1,
+    });
+    assert!(resolve(
+        SpecSource::from_manifest(&layered),
+        CreateSpec::default(),
+        Caller::Cli
+    )
+    .is_ok());
+}
+
+// A checkpoint's own allow entries are its author's: one that reaches the
+// host (loopback, link-local metadata, or every address) is refused, unless the
+// restore brings an egress policy of its own.
+#[test]
+fn a_checkpoint_policy_that_reaches_the_host_is_refused() {
+    let reaching: [fn(&mut CheckpointNetwork); 5] = [
+        |n| n.allowed_cidrs = Some(vec!["127.0.0.0/8".into()]),
+        |n| n.allowed_cidrs = Some(vec!["0.0.0.0/0".into()]),
+        |n| n.dns_filter_hosts = Some(vec!["localhost".into()]),
+        |n| {
+            n.egress_rules = vec![EgressRule {
+                transport: None,
+                cidr: Some("169.254.169.254/32".into()),
+                ports: None,
+                action: smolvm_protocol::RuleAction::Allow,
+            }]
+        },
+        |n| {
+            n.egress_rules = vec![EgressRule {
+                transport: None,
+                cidr: None,
+                ports: None,
+                action: smolvm_protocol::RuleAction::Allow,
+            }]
+        },
+    ];
+    for set in reaching {
+        let mut manifest = checkpoint_manifest();
+        set(manifest
+            .checkpoint
+            .as_mut()
+            .unwrap()
+            .network
+            .as_mut()
+            .unwrap());
+        for caller in [Caller::Cli, Caller::Api, Caller::Embedded] {
+            let refused = resolve(
+                SpecSource::from_manifest(&manifest),
+                CreateSpec::default(),
+                caller,
+            );
+            assert!(refused.is_err(), "{caller:?}");
+        }
+        // The user's own policy replaces the captured one.
+        let replaced = resolve(
+            SpecSource::from_manifest(&manifest),
+            CreateSpec {
+                allowed_cidrs: Some(vec!["10.1.0.0/16".into()]),
+                allowed_hosts: Some(vec!["example.com".into()]),
+                egress_rules: vec![EgressRule {
+                    transport: None,
+                    cidr: Some("10.1.0.0/16".into()),
+                    ports: None,
+                    action: smolvm_protocol::RuleAction::Allow,
+                }],
+                ..Default::default()
+            },
+            Caller::Cli,
+        );
+        assert!(replaced.is_ok(), "{:?}", replaced.err());
+    }
+    // An ordinary captured allow list still restores.
+    let mut manifest = checkpoint_manifest();
+    manifest
+        .checkpoint
+        .as_mut()
+        .unwrap()
+        .network
+        .as_mut()
+        .unwrap()
+        .allowed_cidrs = Some(vec!["10.1.0.0/16".into()]);
+    assert!(resolve(
+        SpecSource::from_manifest(&manifest),
+        CreateSpec::default(),
+        Caller::Cli
+    )
+    .is_ok());
+}
+
+// A pack or checkpoint chose the image of a machine made from it, which is
+// what keeps the host's registry logins out of that machine's pulls.
+#[test]
+fn an_artifact_chosen_image_is_recorded_as_such() {
+    let record = |source| {
+        resolve(source, CreateSpec::default(), Caller::Cli)
+            .unwrap()
+            .to_record("m")
+            .unwrap()
+    };
+    let (pack, checkpoint) = (pack_manifest(), checkpoint_manifest());
+    assert!(!record(SpecSource::Image("alpine")).image_from_artifact);
+    assert!(record(SpecSource::from_manifest(&pack)).image_from_artifact);
+    assert!(record(SpecSource::from_manifest(&checkpoint)).image_from_artifact);
 }
 
 #[test]
@@ -969,6 +1316,7 @@ fn cases() -> Vec<Case> {
                     read_only: true,
                     staged: false,
                     recorded_ownership: false,
+                    owner: None,
                 }]
             },
             |r| r.mounts.len() == 1
@@ -982,6 +1330,7 @@ fn cases() -> Vec<Case> {
                 read_only: true,
                 staged: false,
                 recorded_ownership: false,
+                owner: None,
             }]
         })
         .checkpoint(Refused("volume mounts")),

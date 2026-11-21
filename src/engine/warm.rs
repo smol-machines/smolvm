@@ -412,14 +412,18 @@ fn stop_base(engine: &Arc<Engine>, name: &str, vm: &VmRecord) {
         Some(mut handle) if frozen => handle.stop_paused(),
         Some(mut handle) => handle.stop_with_timeout(Some(Duration::ZERO)),
         None if !vm.is_process_alive() => Ok(()),
-        None if frozen => crate::agent::AgentManager::for_vm(name).and_then(|m| m.stop_paused()),
-        None => {
-            crate::embedded::control::stop_vm_with_timeout(&engine.db, name, Some(Duration::ZERO))
+        None if frozen => {
+            crate::agent::AgentManager::for_existing_vm_record(vm).and_then(|m| m.stop_paused())
         }
+        None => crate::embedded::control::stop_vm_record_with_timeout(
+            &engine.db,
+            vm,
+            Some(Duration::ZERO),
+        ),
     };
     match stopped {
         Ok(()) => {
-            let _ = crate::embedded::control::mark_stopped(&engine.db, name);
+            let _ = crate::embedded::control::mark_stopped_for_record(&engine.db, vm);
         }
         Err(error) => tracing::warn!(base = %name, %error, "could not stop a retired base"),
     }

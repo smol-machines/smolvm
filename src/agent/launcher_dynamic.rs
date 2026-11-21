@@ -89,24 +89,14 @@ pub struct PackedLaunchConfig<'a> {
     pub dns_filter_hosts: Option<Vec<String>>,
 }
 
-/// The `krun_add_disk2` image-format code for a disk file: `1` (qcow2) when it
-/// begins with the qcow2 magic (`QFI\xfb`), else `0` (raw). Matches
-/// `DiskFormat::to_krun_u32`. Reading the bytes keeps the format in sync with
-/// what libkrun will parse, regardless of the file's extension.
-fn krun_disk_format(path: &Path) -> u32 {
-    use std::io::Read;
-    const QCOW2_MAGIC: [u8; 4] = [0x51, 0x46, 0x49, 0xfb];
-    let mut magic = [0u8; 4];
-    let is_qcow2 = std::fs::File::open(path)
-        .and_then(|mut f| f.read_exact(&mut magic))
-        .is_ok()
-        && magic == QCOW2_MAGIC;
-    if is_qcow2 {
-        1
-    } else {
-        0
-    }
-}
+/// The `krun_add_disk2` image-format code for every disk this launcher
+/// attaches: raw. A packed run's disks are raw by construction (the packer
+/// flattens qcow2 disks, and runtime disks are created as sparse raw files),
+/// and their bytes are not the host's to trust: a pack's storage template is
+/// its author's, and a daemon's disks are its guest's. Reading the format
+/// from those bytes would let either one present a qcow2 header that names a
+/// host file as its backing or data file, and libkrun follows both.
+const PACKED_DISK_FORMAT: u32 = 0;
 
 /// Launch VM using dynamically loaded libkrun (for packed/sidecar mode).
 ///
@@ -368,32 +358,12 @@ pub fn launch_agent_vm_dynamic(
         }
     }
 
-    // Set root filesystem via the root virtiofs tag (upstream removed
-    // krun_set_root in favor of krun_add_virtiofs with KRUN_FS_ROOT_TAG).
     let root = try_or_free_ctx!(
         path_to_cstring(config.rootfs_path),
         "rootfs path contains null byte"
     );
-    let root_tag = cstr("/dev/root");
-    // Default root with a 512 MB DAX window (matches the removed krun_set_root).
-    // Plain krun_add_virtiofs passes shm_size=0 (no DAX), dropping virtiofs to
-    // writeback caching so the guest's ready-marker write isn't visible to the
-    // host until the socket-probe grace — a multi-second boot-time regression.
-    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
-        free_ctx_on_err!("root DAX requires libkrun with krun_add_virtiofs3");
-    };
-    // SAFETY: ctx is valid; root_tag/root are valid null-terminated C strings.
-    if unsafe {
-        add_virtiofs3(
-            ctx,
-            root_tag.as_ptr(),
-            root.as_ptr(),
-            super::virtiofs::rootfs_dax_window(),
-            true,
-        )
-    } < 0
-    {
-        free_ctx_on_err!("krun_add_virtiofs3 failed for root filesystem");
+    if let Err(error) = super::virtiofs::configure_rootfs(krun, ctx, &root, true) {
+        free_ctx_on_err!(error.to_string());
     }
 
     let network_plan = plan_launch_network(
@@ -638,7 +608,7 @@ pub fn launch_agent_vm_dynamic(
         path_to_cstring(config.storage_path),
         "storage path contains null byte"
     );
-    let storage_format = krun_disk_format(config.storage_path);
+    let storage_format = PACKED_DISK_FORMAT;
     let storage_result = add_dynamic_block_disk(
         krun,
         ctx,
@@ -661,7 +631,7 @@ pub fn launch_agent_vm_dynamic(
         let overlay_id = cstr("overlay");
         let overlay_disk =
             try_or_free_ctx!(path_to_cstring(overlay), "overlay path contains null byte");
-        let overlay_format = krun_disk_format(overlay);
+        let overlay_format = PACKED_DISK_FORMAT;
         let overlay_result = add_dynamic_block_disk(
             krun,
             ctx,
@@ -934,6 +904,10 @@ pub fn launch_agent_vm_dynamic(
         free_ctx_on_err!("krun_set_exec failed");
     }
 
+    let Some(add_virtiofs3) = krun.add_virtiofs3 else {
+        free_ctx_on_err!("mounts require libkrun with krun_add_virtiofs3");
+    };
+
     // Packed image layers use DAX where the guest architecture supports it.
     // User mounts follow the same explicit policy as every other launch path.
     // Add virtiofs mount for packed layers (AFTER set_exec)
@@ -993,6 +967,8 @@ pub fn launch_agent_vm_dynamic(
         // A watched share keeps missing names for a second (see the mount
         // loop in `launcher.rs`); needs krun_add_virtiofs4.
         let negative_entries = !mount.staged && super::fsnotify_watch::watching_enabled();
+        // A staged share is only read by the guest (see `launcher.rs`).
+        let share_read_only = mount.read_only || mount.staged;
         // SAFETY: ctx is valid, tag and host_path are valid C strings
         let mut added = -libc::EINVAL;
         if let (true, Some(add_virtiofs4)) = (negative_entries, krun.add_virtiofs4) {
@@ -1002,7 +978,7 @@ pub fn launch_agent_vm_dynamic(
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                     super::krun::KRUN_VIRTIOFS_FLAG_NEGATIVE_ENTRIES,
                 )
             };
@@ -1015,7 +991,7 @@ pub fn launch_agent_vm_dynamic(
                     tag.as_ptr(),
                     host_path.as_ptr(),
                     dax_window,
-                    mount.read_only,
+                    share_read_only,
                 )
             };
         }

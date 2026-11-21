@@ -59,6 +59,24 @@ fn transient(error: &io::Error) -> bool {
     )
 }
 
+/// Transport-independent observations of an existing guest execution. This
+/// never contains a start request: restoring it can only attach to that identity.
+#[derive(Clone, Debug, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct SavedSession {
+    origin: Origin,
+    fingerprint: [u8; 32],
+    resume: Resume,
+    pending: Option<u64>,
+    stdin_closed: bool,
+}
+
+impl SavedSession {
+    pub(super) fn origin(&self) -> &Origin {
+        &self.origin
+    }
+}
+
 pub(super) struct Session {
     socket: PathBuf,
     overlay: String,
@@ -73,6 +91,64 @@ pub(super) struct Session {
     connection: Option<(AgentReader, AgentWriter)>,
 }
 impl Session {
+    pub(super) fn origin(&self) -> &Origin {
+        &self.origin
+    }
+    pub(super) fn saved(&self) -> SavedSession {
+        SavedSession {
+            origin: self.origin.clone(),
+            fingerprint: self.fingerprint,
+            resume: self.resume.clone(),
+            pending: self.pending,
+            stdin_closed: self.stdin_closed,
+        }
+    }
+
+    /// Reattach saved execution without ever sending Start, including when the
+    /// restored guest does not have the requested identity.
+    pub(super) async fn from_saved(
+        socket: PathBuf,
+        overlay: String,
+        saved: SavedSession,
+    ) -> io::Result<Self> {
+        if saved.origin.generation == 0
+            || humantime::parse_rfc3339(&saved.origin.started_at).is_err()
+            || saved.resume.output_next == 0
+            || saved.resume.input_next == 0
+            || saved
+                .pending
+                .is_some_and(|pending| pending != saved.resume.input_next)
+        {
+            return Err(invalid("invalid saved container session"));
+        }
+        let mut session = Self {
+            socket,
+            overlay,
+            origin: saved.origin,
+            fingerprint: saved.fingerprint,
+            resume: saved.resume,
+            pending: saved.pending,
+            stdin_closed: saved.stdin_closed,
+            requested: true,
+            startup_notices: Vec::new(),
+            reset_input: false,
+            connection: None,
+        };
+        let deadline = Instant::now() + ATTACH_TIMEOUT;
+        loop {
+            match session.attach().await {
+                Ok(snapshot) => {
+                    session.reconcile_start(snapshot)?;
+                    return Ok(session);
+                }
+                Err(error) if transient(&error) && Instant::now() < deadline => {
+                    sleep(RETRY_MIN).await
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub(super) fn new(socket: PathBuf, overlay: String, origin: Origin) -> Self {
         let identity = super::util::new_id()[..32]
             .to_owned()

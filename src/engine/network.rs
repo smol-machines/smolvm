@@ -121,6 +121,7 @@ fn overlaps(a: (Ipv4Addr, u8), b: (Ipv4Addr, u8)) -> bool {
 
 /// The engine's networks and its end of the switch.
 pub(crate) struct Networks {
+    db: crate::db::SmolvmDb,
     records: parking_lot::RwLock<HashMap<String, NetworkRecord>>,
     /// The switch directory.
     dir: PathBuf,
@@ -136,7 +137,11 @@ impl Networks {
         Ok(())
     }
 
-    pub(crate) fn load(store: &Store, socket: &Path) -> crate::Result<Self> {
+    pub(crate) fn load(
+        store: &Store,
+        socket: &Path,
+        db: crate::db::SmolvmDb,
+    ) -> crate::Result<Self> {
         let mut records: HashMap<String, NetworkRecord> = store
             .load_objects::<NetworkRecord>("networks")?
             .into_iter()
@@ -182,6 +187,7 @@ impl Networks {
         std::fs::create_dir_all(dir.join("ep"))?;
         std::fs::create_dir_all(dir.join("n"))?;
         Ok(Self {
+            db,
             records: parking_lot::RwLock::new(records),
             dir,
         })
@@ -189,6 +195,29 @@ impl Networks {
 
     pub(crate) fn switch_dir(&self) -> &Path {
         &self.dir
+    }
+
+    pub(crate) fn admit_mutation(
+        &self,
+        store: &Store,
+        network: &NetworkRecord,
+    ) -> ApiResult<Vec<crate::db::transfer_admission::MutationGuard>> {
+        store
+            .admit_dependency_mutation(
+                &self.db,
+                &[
+                    store.object_path("networks", &network.id),
+                    self.dir.join("n").join(network.short()),
+                ],
+                |container| {
+                    !network.builtin
+                        && container
+                            .networks
+                            .values()
+                            .any(|endpoint| endpoint.network_id == network.id)
+                },
+            )
+            .map_err(ApiError::mutation)
     }
 
     /// The network `name_or_id` names: a name, a full id or a unique prefix.
@@ -396,6 +425,7 @@ impl Networks {
     fn remove(&self, store: &Store, id: &str) -> ApiResult<()> {
         let mut records = self.records.write();
         if let Some(r) = records.get(id) {
+            let _admission = self.admit_mutation(store, r)?;
             store
                 .remove_object("networks", &r.id)
                 .map_err(ApiError::from)?;
@@ -1331,6 +1361,9 @@ async fn connect(
     let c = engine
         .find_container(&req.container)
         .ok_or_else(|| ApiError::no_such_container(&req.container))?;
+    let _op = c.op_lock().await;
+    let _admission = c.admit_mutation(&engine, false)?;
+    let _network_admission = engine.networks.admit_mutation(&engine.store, &n)?;
     let record = c.record();
     if record.networks.contains_key(&n.name) {
         return Err(ApiError::new(
@@ -1399,6 +1432,9 @@ async fn disconnect(
         None if req.force => return Ok(axum::http::StatusCode::OK),
         None => return Err(ApiError::no_such_container(&req.container)),
     };
+    let _op = c.op_lock().await;
+    let _admission = c.admit_mutation(&engine, false)?;
+    let _network_admission = engine.networks.admit_mutation(&engine.store, &n)?;
     let record = c.record();
     if record.host_config.network_mode == "host" {
         return Err(ApiError::bad_request(
@@ -1448,6 +1484,162 @@ async fn lock_network(engine: &Engine) -> ApiResult<std::fs::File> {
 mod tests {
     use super::*;
 
+    #[tokio::test]
+    async fn transfer_owned_dependency_network_rejects_new_members_and_removal() {
+        use super::super::containers::{Container, ContainerRecord, StateRecord};
+        let dir = tempfile::tempdir().unwrap();
+        let engine = super::super::test_engine(dir.path());
+        let network = engine
+            .networks
+            .create(
+                &engine.store,
+                NetworkCreateRequest {
+                    name: "moving".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        let image: super::super::images::ImageRecord = serde_json::from_value(serde_json::json!({
+            "id":format!("sha256:{}", "c".repeat(64)),"repo_tags":["fixture:latest"],"repo_digests":[],
+            "pull_ref":"fixture:latest","config":{"architecture":"arm64","config":{"Cmd":["true"]}},
+            "size":0,"pulled":"","last_tag_time":""
+        })).unwrap();
+        engine.images.insert(&engine.store, image).unwrap();
+        let name = format!("network-transfer-{:032x}", rand::random::<u128>());
+        engine
+            .db
+            .insert_vm(
+                &name,
+                &crate::config::VmRecord::new(name.clone(), 1, 128, vec![], vec![], false),
+            )
+            .unwrap();
+        let mut moving: ContainerRecord = serde_json::from_value(serde_json::json!({
+            "id":"a".repeat(64),"name":"moving","created":"","image":"fixture:latest","image_id":"",
+            "pull_ref":"","machine":name,"config":{},"host_config":{},"host_config_raw":{},"networks":{},
+            "path":"sh","args":[],"state":StateRecord::default(),"restart_count":0,"ports":[],"mounts":[]
+        })).unwrap();
+        let mut outside = moving.clone();
+        outside.id = "b".repeat(64);
+        outside.name = "outside".into();
+        outside.machine = format!("{name}-outside");
+        moving.networks.insert(
+            network.name.clone(),
+            endpoint_for(&network, &EndpointSettings::default(), &moving.name),
+        );
+        for record in [&moving, &outside] {
+            engine.store.save_container(record).unwrap();
+            engine
+                .containers
+                .write()
+                .insert(record.id.clone(), Container::from_record(record.clone()));
+        }
+        engine
+            .db
+            .claim_workload_transfer(
+                "network-move",
+                vec![engine.db.review_workload_member(&name).unwrap()],
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            engine
+                .networks
+                .remove(&engine.store, &network.id)
+                .unwrap_err()
+                .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert!(engine.networks.find(&network.id).is_some());
+        let body =
+            || axum::body::Bytes::from(serde_json::json!({"Container":outside.id}).to_string());
+        engine.refresh().unwrap();
+        assert_eq!(
+            connect(
+                axum::extract::State(engine.clone()),
+                axum::extract::Path(network.id.clone()),
+                body()
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        let req: CreateRequest = serde_json::from_value(serde_json::json!({
+            "Image":"fixture:latest","Volumes":{"/anonymous":{}},"HostConfig":{"NetworkMode":network.name}
+        })).unwrap();
+        assert_eq!(
+            super::super::containers::create(
+                &engine,
+                Some("new-member".into()),
+                req,
+                serde_json::json!({}),
+                None
+            )
+            .await
+            .unwrap_err()
+            .status,
+            axum::http::StatusCode::CONFLICT
+        );
+        assert!(engine.volumes.all().is_empty());
+        assert_eq!(engine.store.transfer_containers().unwrap().len(), 2);
+        assert_eq!(engine.db.list_vms().unwrap().len(), 1);
+        // The shared default bridge is not a private service dependency.
+        engine.refresh().unwrap();
+        connect(
+            axum::extract::State(engine.clone()),
+            axum::extract::Path("bridge".into()),
+            body(),
+        )
+        .await
+        .unwrap();
+        let other = engine
+            .networks
+            .create(
+                &engine.store,
+                NetworkCreateRequest {
+                    name: "unrelated".into(),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        engine.refresh().unwrap();
+        connect(
+            axum::extract::State(engine.clone()),
+            axum::extract::Path(other.id.clone()),
+            body(),
+        )
+        .await
+        .unwrap();
+        engine.refresh().unwrap();
+        disconnect(
+            axum::extract::State(engine.clone()),
+            axum::extract::Path(other.id.clone()),
+            body(),
+        )
+        .await
+        .unwrap();
+        engine.networks.remove(&engine.store, &other.id).unwrap();
+        engine.db.retire_workload_transfer("network-move").unwrap();
+        engine.refresh().unwrap();
+        connect(
+            axum::extract::State(engine.clone()),
+            axum::extract::Path(network.id.clone()),
+            body(),
+        )
+        .await
+        .unwrap();
+        engine.refresh().unwrap();
+        disconnect(
+            axum::extract::State(engine.clone()),
+            axum::extract::Path(network.id.clone()),
+            body(),
+        )
+        .await
+        .unwrap();
+        engine.networks.remove(&engine.store, &network.id).unwrap();
+        assert!(engine.networks.find(&network.id).is_none());
+    }
+
     #[test]
     fn subnets_overlap_by_the_shorter_prefix() {
         let a = (Ipv4Addr::new(172, 18, 0, 0), 16);
@@ -1459,7 +1651,12 @@ mod tests {
     fn ipv6_networks_get_a_unique_local_or_their_own_subnet() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
-        let nets = Networks::load(&store, &dir.path().join("run/docker.sock")).unwrap();
+        let nets = Networks::load(
+            &store,
+            &dir.path().join("run/docker.sock"),
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
         let auto = nets
             .create(
                 &store,
@@ -1513,7 +1710,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let socket = dir.path().join("run/docker.sock");
-        let nets = Networks::load(&store, &socket).unwrap();
+        let nets = Networks::load(
+            &store,
+            &socket,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
         let network = nets
             .create(
                 &store,
@@ -1529,16 +1731,24 @@ mod tests {
         std::fs::set_permissions(&records, std::fs::Permissions::from_mode(0o700)).unwrap();
         assert!(result.is_err());
         assert!(nets.find("retained").is_some());
-        assert!(Networks::load(&store, &socket)
-            .unwrap()
-            .find("retained")
-            .is_some());
+        assert!(Networks::load(
+            &store,
+            &socket,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap()
+        )
+        .unwrap()
+        .find("retained")
+        .is_some());
         nets.remove(&store, &network.id).unwrap();
         assert!(nets.find("retained").is_none());
-        assert!(Networks::load(&store, &socket)
-            .unwrap()
-            .find("retained")
-            .is_none());
+        assert!(Networks::load(
+            &store,
+            &socket,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap()
+        )
+        .unwrap()
+        .find("retained")
+        .is_none());
     }
 
     #[test]
@@ -1546,7 +1756,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(dir.path()).unwrap();
         let socket = dir.path().join("run/docker.sock");
-        let nets = Networks::load(&store, &socket).unwrap();
+        let nets = Networks::load(
+            &store,
+            &socket,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
         let req = |name: &str| NetworkCreateRequest {
             name: name.into(),
             ..Default::default()
@@ -1567,7 +1782,12 @@ mod tests {
         });
         assert!(nets.create(&store, custom).is_err());
         assert!(nets.find("bridge").unwrap().builtin);
-        let reloaded = Networks::load(&store, &socket).unwrap();
+        let reloaded = Networks::load(
+            &store,
+            &socket,
+            crate::db::SmolvmDb::open_at(&dir.path().join("test.db")).unwrap(),
+        )
+        .unwrap();
         assert!(reloaded.find("a").is_some());
         assert_eq!(
             reloaded.all().iter().filter(|n| n.name == "bridge").count(),

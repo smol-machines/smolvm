@@ -104,7 +104,7 @@ fn macos_sparse_extents(file: &mut File) -> std::io::Result<Option<Vec<SparseExt
 }
 
 #[cfg(target_os = "macos")]
-fn append_macos_sparse_file<W: Write>(
+pub(crate) fn append_macos_sparse_file<W: Write>(
     builder: &mut tar::Builder<W>,
     source: &Path,
     archive_path: &Path,

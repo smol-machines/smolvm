@@ -172,9 +172,12 @@ impl Store {
         if let Some(installed) = self.installed(digest) {
             return Ok(installed);
         }
-        let (actual, path) = self.install_tar(tar)?;
+        // Compared while the tree is still this call's own staging copy: a
+        // published path may be a tree the store already held, which a
+        // mismatch must not remove.
+        let (actual, staged) = self.unpack_tar(tar)?;
         if actual != digest {
-            let _ = std::fs::remove_dir_all(&path);
+            let _ = std::fs::remove_dir_all(&staged);
             return Err(Error::agent(
                 "agent rootfs store",
                 format!(
@@ -183,15 +186,35 @@ impl Store {
                 ),
             ));
         }
-        Ok(path)
+        self.publish_staged(&actual, staged)
     }
 
     /// Keep the tree the `agent-rootfs.tar` at `tar` unpacks to, under the
     /// digest it turns out to have (a checkpoint from before the digest was
     /// recorded). Returns that digest and the installed tree.
     pub fn install_tar(&self, tar: &Path) -> Result<(String, PathBuf)> {
+        let (digest, staged) = self.unpack_tar(tar)?;
+        let path = self.publish_staged(&digest, staged)?;
+        Ok((digest, path))
+    }
+
+    /// The digest of the tree the `agent-rootfs.tar` at `tar` unpacks to,
+    /// installed in the store unless it is `skip` (the host's own rootfs, which
+    /// needs no copy). Nothing already in the store is ever removed.
+    pub fn install_tar_unless(&self, tar: &Path, skip: Option<&str>) -> Result<String> {
+        let (digest, staged) = self.unpack_tar(tar)?;
+        if skip == Some(digest.as_str()) {
+            let _ = std::fs::remove_dir_all(&staged);
+        } else {
+            self.publish_staged(&digest, staged)?;
+        }
+        Ok(digest)
+    }
+
+    /// Unpack `tar` into a staging tree of this call's own and hash it.
+    fn unpack_tar(&self, tar: &Path) -> Result<(String, PathBuf)> {
         let unpacked = self.staging_dir("unknown", "unpack")?;
-        let result = (|| -> Result<(String, PathBuf)> {
+        let result = (|| -> Result<String> {
             std::fs::create_dir(&unpacked)?;
             let mut archive = tar::Archive::new(std::fs::File::open(tar)?);
             archive.set_preserve_permissions(true);
@@ -199,24 +222,39 @@ impl Store {
             archive
                 .unpack(&unpacked)
                 .map_err(|e| Error::agent("unpack agent rootfs", e.to_string()))?;
-            let digest = smolvm_pack::assets::agent_rootfs_digest(&unpacked)
-                .map_err(|e| Error::agent("read agent rootfs", e.to_string()))?;
-            let path = self.publish(&digest, &unpacked)?;
-            Ok((digest, path))
+            smolvm_pack::assets::agent_rootfs_digest(&unpacked)
+                .map_err(|e| Error::agent("read agent rootfs", e.to_string()))
         })();
+        match result {
+            Ok(digest) => Ok((digest, unpacked)),
+            Err(error) => {
+                let _ = std::fs::remove_dir_all(&unpacked);
+                Err(error)
+            }
+        }
+    }
+
+    /// Publish a staging tree, removing it if publishing fails.
+    fn publish_staged(&self, digest: &str, staged: PathBuf) -> Result<PathBuf> {
+        let result = self.publish(digest, &staged);
         if result.is_err() {
-            let _ = std::fs::remove_dir_all(&unpacked);
+            let _ = std::fs::remove_dir_all(&staged);
         }
         result
     }
 
-    /// A free staging path under the store for a tree being installed.
+    /// A free staging path under the store for a tree being installed. Each
+    /// call gets its own: installs run concurrently in one server, and one
+    /// clearing a path another is still unpacking into would let the second
+    /// tree's files land in the first after it was hashed.
     fn staging_dir(&self, label: &str, what: &str) -> Result<PathBuf> {
+        static SEQUENCE: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
         std::fs::create_dir_all(&self.root)?;
         let label = hex_of(label).map(|hex| &hex[..16]).unwrap_or(label);
+        let sequence = SEQUENCE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         let staging = self
             .root
-            .join(format!(".{label}-{}.{what}", std::process::id()));
+            .join(format!(".{label}-{}-{sequence}.{what}", std::process::id()));
         let _ = std::fs::remove_dir_all(&staging);
         Ok(staging)
     }
@@ -297,6 +335,46 @@ mod tests {
         std::fs::create_dir_all(dir.join("usr/local/bin")).unwrap();
         std::fs::write(dir.join("usr/local/bin/smolvm-agent"), agent).unwrap();
         std::os::unix::fs::symlink("/usr/local/bin/smolvm-agent", dir.join("sbin/init")).unwrap();
+    }
+
+    #[test]
+    fn a_carried_rootfs_never_removes_a_tree_the_store_holds() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let source = temp.path().join("rootfs");
+        rootfs(&source, b"agent v1");
+        let digest = smolvm_pack::assets::agent_rootfs_digest(&source).unwrap();
+        let held = store.install_from_dir(&digest, &source).unwrap();
+        let tar_path = temp.path().join("agent-rootfs.tar");
+        let mut builder = tar::Builder::new(std::fs::File::create(&tar_path).unwrap());
+        builder.follow_symlinks(false);
+        builder.append_dir_all(".", &source).unwrap();
+        builder.finish().unwrap();
+
+        // the tar holds the tree the store has, and names another digest
+        let wrong = format!("sha256:{}", "0".repeat(64));
+        assert!(store.install_from_tar(&wrong, &tar_path).is_err());
+        assert_eq!(store.installed(&digest), Some(held.clone()));
+
+        // the host's own rootfs is the same tree: no copy, and the held one stays
+        assert_eq!(
+            store.install_tar_unless(&tar_path, Some(&digest)).unwrap(),
+            digest
+        );
+        assert_eq!(store.installed(&digest), Some(held));
+    }
+
+    #[test]
+    fn concurrent_installs_never_share_a_staging_tree() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let store = Store::at(temp.path().join("store"));
+        let first = store.staging_dir("unknown", "unpack").unwrap();
+        std::fs::create_dir(&first).unwrap();
+        std::fs::write(first.join("busybox"), b"first").unwrap();
+        let second = store.staging_dir("unknown", "unpack").unwrap();
+        assert_ne!(first, second);
+        // The second install leaves the first one's tree alone.
+        assert_eq!(std::fs::read(first.join("busybox")).unwrap(), b"first");
     }
 
     #[test]

@@ -125,7 +125,7 @@ impl std::str::FromStr for RestartPolicy {
 }
 
 /// Restart configuration for a machine.
-#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+#[derive(Debug, Clone, Serialize, Deserialize, Default, PartialEq, Eq)]
 pub struct RestartConfig {
     /// The restart policy.
     #[serde(default)]
@@ -435,6 +435,14 @@ pub struct AllocatedPort {
 /// is managed separately via the container commands.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmRecord {
+    /// Host-only identity attached by a database read; never exported or restored.
+    #[serde(skip)]
+    pub(crate) database_identity: Option<crate::db::launch_admission::RecordIdentity>,
+
+    /// Host-only execution identity, retained after stop and replaced on a new boot.
+    #[serde(skip)]
+    pub(crate) execution_identity: Option<String>,
+
     /// VM name/ID.
     pub name: String,
 
@@ -520,6 +528,12 @@ pub struct VmRecord {
     /// [`crate::data::storage::HostMount::recorded_ownership`]).
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub recorded_ownership: bool,
+
+    /// The owner (`uid`, `gid`) of live mount `index` in `mounts`
+    /// ([`crate::data::storage::HostMount::owner`]). Kept apart from `mounts`
+    /// so existing records keep their tuple encoding.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub mount_owners: Vec<(usize, u32, u32)>,
 
     /// The fork source whose host directories this branch's staged working
     /// copies were seeded from. A branch keeps the copies (they live on its own
@@ -831,6 +845,13 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub packed_image_on_storage: bool,
 
+    /// `image` was chosen by an artifact (a pack or a checkpoint), not by this
+    /// host's user. Its pulls never carry this host's registry logins: the
+    /// artifact names the image and the guest says when it is missing, so a
+    /// login sent along would be handed to whoever wrote the artifact.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub image_from_artifact: bool,
+
     /// Registry reference `source_smolmachine` was pulled from, if any. Carried
     /// into a live checkpoint so another host can fetch the same pack.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -1014,6 +1035,8 @@ impl VmRecord {
         network: bool,
     ) -> Self {
         Self {
+            database_identity: None,
+            execution_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1034,6 +1057,7 @@ impl VmRecord {
             staged_mounts: Vec::new(),
             recorded_ownership: false,
             staged_mounts_detached_from: None,
+            mount_owners: Vec::new(),
             ports,
             udp_ports: Vec::new(),
             allocated_ports: Vec::new(),
@@ -1096,6 +1120,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
+            image_from_artifact: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
@@ -1124,6 +1149,8 @@ impl VmRecord {
         restart: RestartConfig,
     ) -> Self {
         Self {
+            database_identity: None,
+            execution_identity: None,
             name,
             created_at: crate::util::current_timestamp(),
             state: RecordState::Created,
@@ -1144,6 +1171,7 @@ impl VmRecord {
             staged_mounts: Vec::new(),
             recorded_ownership: false,
             staged_mounts_detached_from: None,
+            mount_owners: Vec::new(),
             ports,
             udp_ports: Vec::new(),
             allocated_ports: Vec::new(),
@@ -1206,6 +1234,7 @@ impl VmRecord {
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
+            image_from_artifact: false,
             source_registry_ref: None,
             image_origin: None,
             image_origin_digest: None,
@@ -1285,12 +1314,23 @@ impl VmRecord {
         let mut live = self
             .mounts
             .iter()
-            .map(|(host, guest, ro)| crate::data::storage::HostMount {
-                source: std::path::PathBuf::from(host),
-                target: std::path::PathBuf::from(guest),
-                read_only: *ro,
-                staged: false,
-                recorded_ownership: self.recorded_ownership,
+            .enumerate()
+            .map(|(i, (host, guest, ro))| {
+                let owner = self
+                    .mount_owners
+                    .iter()
+                    .find(|(index, _, _)| *index == i)
+                    .map(|&(_, uid, gid)| (uid, gid));
+                crate::data::storage::HostMount {
+                    source: std::path::PathBuf::from(host),
+                    target: std::path::PathBuf::from(guest),
+                    read_only: *ro,
+                    staged: false,
+                    // Linux serves an owner only where owners are virtualized.
+                    recorded_ownership: self.recorded_ownership
+                        || (cfg!(target_os = "linux") && owner.is_some()),
+                    owner,
+                }
             })
             .collect::<std::collections::VecDeque<_>>();
         let staged = self
@@ -1415,7 +1455,6 @@ impl VmRecord {
     /// cannot be checked against hostnames here, so both send the pull to the
     /// host rather than guess.
     fn guest_can_pull(&self, image: &str) -> bool {
-        use smolvm_protocol::host_pattern::matches;
         if !self.launch_network_plan().outbound {
             return false;
         }
@@ -1425,16 +1464,7 @@ impl VmRecord {
         {
             return true;
         }
-        let hosts = self.dns_filter_hosts.as_deref().unwrap_or(&[]);
-        crate::registry::registry_pull_hosts(image)
-            .iter()
-            .all(|apex| {
-                let apex = apex.split(':').next().unwrap_or(apex);
-                let sub_host = format!("pull.{apex}");
-                hosts
-                    .iter()
-                    .any(|entry| matches(apex, entry) || matches(&sub_host, entry))
-            })
+        crate::registry::hosts_cover_pull(image, self.dns_filter_hosts.as_deref().unwrap_or(&[]))
     }
 
     /// Whether this machine's staged mounts synchronize back to their host

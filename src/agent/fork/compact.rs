@@ -15,7 +15,8 @@
 //! still write. A process that already opened the old file keeps reading it, and
 //! nothing a branch made earlier is deleted while a chain still reaches it.
 
-use super::qcow2_backing_name;
+use super::{qcow2_backing_format, qcow2_backing_name};
+use crate::data::disk::DiskFormat;
 use crate::{Error, Result};
 use imago::file::File as ImagoFile;
 use imago::qcow2::Qcow2;
@@ -147,31 +148,48 @@ fn is_qcow2(path: &Path) -> Result<bool> {
 
 /// The chain from `top` downward, each entry canonical, `top` first.
 fn chain(top: &Path) -> Result<Vec<PathBuf>> {
-    let mut layers = Vec::new();
+    Ok(chain_formats(top, None)?
+        .into_iter()
+        .map(|(layer, _)| layer)
+        .collect())
+}
+
+/// [`chain`] with the format each layer is read as. A backing's format is
+/// the one the layer above declares for it, so a raw layer ends the chain
+/// whatever its own bytes say: it is a guest's disk, and a guest can write a
+/// qcow2 header naming any host file into it. Only a layer whose format
+/// nothing declares (`top` when `top_format` is `None`, or a backing its
+/// parent leaves undeclared) is probed, as imago does.
+fn chain_formats(top: &Path, top_format: Option<DiskFormat>) -> Result<Vec<(PathBuf, DiskFormat)>> {
+    let mut layers: Vec<(PathBuf, DiskFormat)> = Vec::new();
     let mut current = top
         .canonicalize()
         .map_err(|e| compact_err("resolve layer", e))?;
+    let mut format = match top_format {
+        Some(format) => format,
+        None => probed_format(&current)?,
+    };
     loop {
-        if layers.contains(&current) {
+        if layers.iter().any(|(layer, _)| *layer == current) {
             return Err(compact_err(
                 "walk chain",
                 format!("cycle at {}", current.display()),
             ));
         }
-        layers.push(current.clone());
+        layers.push((current.clone(), format));
         if layers.len() > 4 * super::MAX_FORK_DISK_CHAIN_DEPTH {
             return Err(compact_err(
                 "walk chain",
                 "chain is deeper than any branch can make",
             ));
         }
-        let Some(backing) = (if is_qcow2(&current)? {
-            qcow2_backing_name(&current)?
-        } else {
-            None
-        }) else {
+        if format == DiskFormat::Raw {
+            return Ok(layers);
+        }
+        let Some(backing) = qcow2_backing_name(&current)? else {
             return Ok(layers);
         };
+        let declared = qcow2_backing_format(&current)?;
         let next = if backing.is_absolute() {
             backing
         } else {
@@ -183,7 +201,19 @@ fn chain(top: &Path) -> Result<Vec<PathBuf>> {
         current = next
             .canonicalize()
             .map_err(|e| compact_err("resolve backing", e))?;
+        format = match declared {
+            Some(format) => format,
+            None => probed_format(&current)?,
+        };
     }
+}
+
+fn probed_format(path: &Path) -> Result<DiskFormat> {
+    Ok(if is_qcow2(path)? {
+        DiskFormat::Qcow2
+    } else {
+        DiskFormat::Raw
+    })
 }
 
 /// A layer this module or a live branch wrote under the source's `d/`, which may
@@ -310,8 +340,11 @@ fn open_readonly(path: &Path, with_backing: bool) -> Result<SyncFormatAccess<Ima
 }
 
 /// Create `out` as an empty qcow2 of `size` bytes backed by `backing`.
-fn create_overlay(out: &Path, size: u64, backing: &Path) -> Result<()> {
-    let format = if is_qcow2(backing)? { "qcow2" } else { "raw" };
+fn create_overlay(out: &Path, size: u64, backing: &Path, format: DiskFormat) -> Result<()> {
+    let format = match format {
+        DiskFormat::Qcow2 => "qcow2",
+        DiskFormat::Raw => "raw",
+    };
     let backing = backing
         .to_str()
         .ok_or_else(|| compact_err("backing path", "not UTF-8"))?;
@@ -524,15 +557,14 @@ struct ChainData {
 }
 
 fn chain_data(top: &Path) -> Result<ChainData> {
-    let layers = chain(top)?;
+    let layers = chain_formats(top, None)?;
     let view = open_readonly(top, true)?;
     let size = view.size();
     let mut ranges = Vec::new();
-    for layer in &layers {
-        if is_qcow2(layer)? {
-            defined_ranges(layer, size, &mut ranges)?;
-        } else {
-            raw_data_ranges(layer, size, &mut ranges)?;
+    for (layer, format) in &layers {
+        match format {
+            DiskFormat::Qcow2 => defined_ranges(layer, size, &mut ranges)?,
+            DiskFormat::Raw => raw_data_ranges(layer, size, &mut ranges)?,
         }
     }
     Ok(ChainData { view, size, ranges })
@@ -593,7 +625,18 @@ fn coalesce(mut ranges: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
 /// given that `new_backing` reads exactly as `stop` (a layer in `top`'s chain).
 /// Only the ranges the layers above `stop` define are copied.
 pub(super) fn merge_onto(top: &Path, stop: &Path, new_backing: &Path, out: &Path) -> Result<()> {
-    let layers = chain(top)?;
+    let formats = chain_formats(top, None)?;
+    let layers: Vec<PathBuf> = formats.iter().map(|(layer, _)| layer.clone()).collect();
+    // The new backing's format is the one the chain declares for it; only a
+    // layer outside the chain, which this module wrote, is probed.
+    let backing_format = match new_backing
+        .canonicalize()
+        .ok()
+        .and_then(|backing| formats.iter().find(|(layer, _)| *layer == backing))
+    {
+        Some((_, format)) => *format,
+        None => probed_format(new_backing)?,
+    };
     let stop = stop
         .canonicalize()
         .map_err(|e| compact_err("resolve stop", e))?;
@@ -607,7 +650,7 @@ pub(super) fn merge_onto(top: &Path, stop: &Path, new_backing: &Path, out: &Path
     for layer in &layers[..above] {
         defined_ranges(layer, size, &mut ranges)?;
     }
-    create_overlay(out, size, new_backing)?;
+    create_overlay(out, size, new_backing, backing_format)?;
     let result = (|| {
         let qcow = Qcow2::<ImagoFile>::builder_path(out)
             .data_file(None)
@@ -742,8 +785,9 @@ pub(super) fn compact_if_deeper_than(
     threshold: usize,
 ) -> Result<()> {
     for (id, raw) in super::FORK_DISK_ROLES {
-        let (active, _) = crate::agent::resolve_disk_image(gdir, raw);
-        if !active.is_file() {
+        let (active, format) = crate::agent::resolve_disk_image(gdir, raw);
+        // A raw active disk is the guest's own and has no chain to fold.
+        if format != DiskFormat::Qcow2 || !active.is_file() {
             continue;
         }
         compact_disk(gdir, id, &active, vm_ids, threshold)?;
@@ -1030,20 +1074,25 @@ const STALE_PARTIAL: std::time::Duration = std::time::Duration::from_secs(3600);
 /// a chain cannot be read, which keeps everything.
 fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
     let mut reachable = HashSet::new();
-    let mut walk = |top: &Path| -> Option<()> {
-        reachable.extend(chain(top).ok()?);
+    let mut walk = |top: &Path, format: Option<DiskFormat>| -> Option<()> {
+        reachable.extend(
+            chain_formats(top, format)
+                .ok()?
+                .into_iter()
+                .map(|(layer, _)| layer),
+        );
         Some(())
     };
     for dir in machine_dirs {
         for (id, raw) in super::FORK_DISK_ROLES {
-            let (active, _) = crate::agent::resolve_disk_image(dir, raw);
+            let (active, format) = crate::agent::resolve_disk_image(dir, raw);
             if active.exists() {
-                walk(&active)?;
+                walk(&active, Some(format))?;
                 // A frozen source's short copy for its branches stays while the
                 // disk it copies does, so the next branch need not copy again.
                 if let Ok(copy) = clone_base_copy_path(dir, id, &active) {
                     if copy.is_file() {
-                        walk(&copy)?;
+                        walk(&copy, Some(DiskFormat::Qcow2))?;
                     }
                 }
             }
@@ -1057,8 +1106,13 @@ fn reachable_layers(machine_dirs: &[PathBuf]) -> Option<HashSet<PathBuf>> {
                 continue;
             };
             for line in listing.lines() {
-                if let Some(base) = line.split('\t').nth(1) {
-                    walk(Path::new(base))?;
+                let mut fields = line.split('\t').skip(1);
+                if let Some(base) = fields.next() {
+                    let format = match fields.next() {
+                        Some("raw") => DiskFormat::Raw,
+                        _ => DiskFormat::Qcow2,
+                    };
+                    walk(Path::new(base), Some(format))?;
                 }
             }
         }
@@ -1208,6 +1262,63 @@ fn remove_unreachable_files(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tests build their chains from host-written layers, whose format the
+    /// probe reads correctly.
+    fn create_overlay(out: &Path, size: u64, backing: &Path) -> Result<()> {
+        super::create_overlay(out, size, backing, probed_format(backing)?)
+    }
+
+    /// A guest owns its raw disk's bytes and can make them a qcow2 header
+    /// naming any host file. The chain must end at the raw layer the host
+    /// declared, never follow that header.
+    #[test]
+    fn a_raw_disk_that_looks_like_qcow2_ends_its_chain() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let secret = temp.path().join("host-secret");
+        std::fs::write(&secret, b"host-only").unwrap();
+        let machine = temp.path().join("machine");
+        std::fs::create_dir_all(&machine).unwrap();
+        // The guest's raw disk, holding a real qcow2 header backed by the secret.
+        let raw = machine.join(crate::data::storage::STORAGE_DISK_FILENAME);
+        create_overlay(&raw, SIZE, &secret).unwrap();
+        let secret = secret.canonicalize().unwrap();
+
+        let reachable = reachable_layers(std::slice::from_ref(&machine)).unwrap();
+        assert!(!reachable.contains(&secret), "{reachable:?}");
+
+        // A branch overlay declares its base raw, and the walk stops there.
+        let overlay = temp.path().join("overlay.qcow2");
+        super::create_overlay(&overlay, SIZE, &raw, DiskFormat::Raw).unwrap();
+        assert_eq!(
+            super::super::qcow2_backing_format(&overlay).unwrap(),
+            Some(DiskFormat::Raw)
+        );
+        let layers = chain(&overlay).unwrap();
+        assert_eq!(layers.len(), 2);
+        assert!(!layers.contains(&secret));
+        let formats = chain_formats(&overlay, None).unwrap();
+        assert_eq!(formats[1].1, DiskFormat::Raw);
+    }
+
+    #[test]
+    fn a_qcow2_backing_declares_its_format() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let base = temp.path().join("base.qcow2");
+        std::fs::write(temp.path().join("bottom"), vec![0_u8; 4096]).unwrap();
+        super::create_overlay(&base, SIZE, &temp.path().join("bottom"), DiskFormat::Raw).unwrap();
+        let top = temp.path().join("top.qcow2");
+        super::create_overlay(&top, SIZE, &base, DiskFormat::Qcow2).unwrap();
+        assert_eq!(
+            super::super::qcow2_backing_format(&top).unwrap(),
+            Some(DiskFormat::Qcow2)
+        );
+        assert_eq!(
+            super::super::qcow2_backing_format(&temp.path().join("bottom")).unwrap(),
+            None
+        );
+        assert_eq!(chain(&top).unwrap().len(), 3);
+    }
 
     struct TestProcess(std::process::Child);
 
