@@ -44,10 +44,11 @@ use crate::api::state::{
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialBindingsRequest, CredentialBindingsResponse,
     CredentialValuesRequest, DeleteQuery, DeleteResponse, EgressEventsResponse, ExportRequest,
-    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo,
-    MachineMetricsResponse, MachineNetwork, MachinePressure, MountInfo, MountSpec, PortSpec,
-    PressureReading, ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetMachineEnvRequest,
-    SetPortsRequest, StartMachineQuery, UpdateEgressRequest, UpdateMachineLabelsRequest,
+    ExportResponse, ForkBatchRequest, ForkBatchResponse, ForkReleaseRequest, ForkRequest,
+    ListMachinesResponse, MachineInfo, MachineMetricsResponse, MachineNetwork, MachinePressure,
+    MountInfo, MountSpec, PortSpec, PressureReading, ResizeMachineRequest, ResourceSpec,
+    SetCpuLimitRequest, SetMachineEnvRequest, SetPortsRequest, StartMachineQuery,
+    UpdateEgressRequest, UpdateMachineLabelsRequest,
 };
 use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -4753,6 +4754,144 @@ pub async fn branch_machine(
     Json(req): Json<ForkRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     fork_machine_inner(state, source, req).await.map(Json)
+}
+
+/// Child names for a batch branch: the caller's `names`, or `count` names
+/// `<prefix>-<n>` that skip the ones in `taken`, as the cloud API names them.
+fn batch_child_names(
+    req: &ForkBatchRequest,
+    source: &str,
+    taken: &std::collections::HashSet<String>,
+) -> Result<Vec<String>, ApiError> {
+    let names: Vec<String> = if !req.names.is_empty() {
+        req.names.clone()
+    } else {
+        if req.count == 0 {
+            return Err(ApiError::Unprocessable(
+                "batch branch requires `count` >= 1 or a non-empty `names`".into(),
+            ));
+        }
+        let prefix = req.name_prefix.as_deref().unwrap_or(source);
+        (1..)
+            .map(|i| format!("{prefix}-{i}"))
+            .filter(|name| !taken.contains(name))
+            .take(req.count as usize)
+            .collect()
+    };
+    if names.len() as u32 > crate::api::types::MAX_BRANCH_BATCH {
+        return Err(ApiError::Unprocessable(format!(
+            "batch branch size {} exceeds the maximum of {}",
+            names.len(),
+            crate::api::types::MAX_BRANCH_BATCH
+        )));
+    }
+    let mut seen = std::collections::HashSet::new();
+    for name in &names {
+        if !seen.insert(name.as_str()) {
+            return Err(ApiError::Unprocessable(format!(
+                "duplicate child name '{name}' in batch"
+            )));
+        }
+    }
+    Ok(names)
+}
+
+/// Branch a running source into many children, in the cloud API's shape. All
+/// or nothing: a child that fails deletes every child made before it.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/branches/batch",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Branch source name")),
+    request_body = ForkBatchRequest,
+    responses(
+        (status = 201, description = "Children created, in request order", body = ForkBatchResponse),
+        (status = 404, description = "Source not found", body = ApiErrorResponse),
+        (status = 409, description = "A child could not be branched; none were kept", body = ApiErrorResponse),
+        (status = 422, description = "Invalid batch", body = ApiErrorResponse)
+    )
+)]
+pub async fn branch_machines_batch(
+    State(state): State<Arc<ApiState>>,
+    Path(source): Path<String>,
+    Json(req): Json<ForkBatchRequest>,
+) -> Result<(axum::http::StatusCode, Json<ForkBatchResponse>), ApiError> {
+    batch_branch(state, source, req).await
+}
+
+/// The older name of `POST .../branches/batch`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/fork-batch",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Branch source name")),
+    request_body = ForkBatchRequest,
+    responses(
+        (status = 201, description = "Children created, in request order", body = ForkBatchResponse),
+        (status = 404, description = "Source not found", body = ApiErrorResponse),
+        (status = 409, description = "A child could not be branched; none were kept", body = ApiErrorResponse),
+        (status = 422, description = "Invalid batch", body = ApiErrorResponse)
+    )
+)]
+pub async fn fork_machines_batch(
+    State(state): State<Arc<ApiState>>,
+    Path(source): Path<String>,
+    Json(req): Json<ForkBatchRequest>,
+) -> Result<(axum::http::StatusCode, Json<ForkBatchResponse>), ApiError> {
+    batch_branch(state, source, req).await
+}
+
+async fn batch_branch(
+    state: Arc<ApiState>,
+    source: String,
+    req: ForkBatchRequest,
+) -> Result<(axum::http::StatusCode, Json<ForkBatchResponse>), ApiError> {
+    let record = state
+        .lookup_vm(&source)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", source)))?;
+    let taken: std::collections::HashSet<String> = state
+        .db()
+        .list_vms()
+        .map_err(ApiError::database)?
+        .into_iter()
+        .map(|(name, _)| name)
+        .collect();
+    let names = batch_child_names(&req, &source, &taken)?;
+    let labels = req.labels.clone().unwrap_or_else(|| record.labels.clone());
+    let mut clones = Vec::with_capacity(names.len());
+    for name in names {
+        let child: ForkRequest = serde_json::from_value(serde_json::json!({
+            "name": name,
+            "branchable": req.branchable,
+            "freezeSource": req.freeze_source,
+            "keepMachineId": req.keep_machine_id,
+            "labels": labels,
+            "ports": req.ports,
+        }))
+        .map_err(|error| ApiError::internal(format!("build branch request: {error}")))?;
+        match fork_machine_inner(state.clone(), source.clone(), child).await {
+            Ok(info) => clones.push(info),
+            Err(error) => {
+                for made in &clones {
+                    let _ = delete_machine_transaction(
+                        state.clone(),
+                        made.name.clone(),
+                        DeleteQuery {
+                            force: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await;
+                }
+                return Err(error);
+            }
+        }
+    }
+    Ok((
+        axum::http::StatusCode::CREATED,
+        Json(ForkBatchResponse { clones }),
+    ))
 }
 
 /// Internal fork entry point shared by the HTTP handler and pool reconciler.
@@ -9491,6 +9630,49 @@ mod tests {
         assert!(metrics.at.ends_with('Z'));
         let missing = get_machine_metrics(State(state), Path("nope".into())).await;
         assert!(matches!(missing.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[test]
+    fn batch_children_are_named_as_the_cloud_api_names_them() {
+        let req = |v: serde_json::Value| -> ForkBatchRequest { serde_json::from_value(v).unwrap() };
+        let taken: std::collections::HashSet<String> = ["web-2".to_string()].into();
+        assert_eq!(
+            batch_child_names(&req(serde_json::json!({"count": 3})), "web", &taken).unwrap(),
+            ["web-1", "web-3", "web-4"],
+            "a taken name is skipped, so a second batch continues the numbering"
+        );
+        assert_eq!(
+            batch_child_names(
+                &req(serde_json::json!({"count": 1, "namePrefix": "job"})),
+                "web",
+                &taken
+            )
+            .unwrap(),
+            ["job-1"]
+        );
+        assert_eq!(
+            batch_child_names(
+                &req(serde_json::json!({"names": ["a", "b"], "count": 9})),
+                "web",
+                &taken
+            )
+            .unwrap(),
+            ["a", "b"],
+            "names win over count"
+        );
+        for bad in [
+            serde_json::json!({}),
+            serde_json::json!({"count": 65}),
+            serde_json::json!({"names": ["a", "a"]}),
+        ] {
+            assert!(
+                matches!(
+                    batch_child_names(&req(bad.clone()), "web", &taken),
+                    Err(ApiError::Unprocessable(_))
+                ),
+                "{bad}"
+            );
+        }
     }
 
     #[tokio::test]

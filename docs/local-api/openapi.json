@@ -1514,6 +1514,78 @@
         }
       }
     },
+    "/api/v1/machines/{name}/branches/batch": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Branch a running source into many children, in the cloud API's shape. All\nor nothing: a child that fails deletes every child made before it.",
+        "operationId": "branch_machines_batch",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Branch source name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Children created, in request order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkBatchResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Source not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A child could not be branched; none were kept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid batch",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/machines/{name}/cache-disk/publish": {
       "post": {
         "tags": [
@@ -2272,6 +2344,78 @@
           },
           "500": {
             "description": "Fork failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/machines/{name}/fork-batch": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "The older name of `POST .../branches/batch`.",
+        "operationId": "fork_machines_batch",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Branch source name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkBatchRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "201": {
+            "description": "Children created, in request order",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ForkBatchResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Source not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A child could not be branched; none were kept",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Invalid batch",
             "content": {
               "application/json": {
                 "schema": {
@@ -5938,6 +6082,98 @@
             "format": "int64",
             "description": "Size of the file in bytes.",
             "minimum": 0
+          }
+        }
+      },
+      "ForkBatchRequest": {
+        "type": "object",
+        "description": "Request to branch a running source into many children in one call, as the\ncloud API takes it. All or nothing: if any child fails, every child made is\ndeleted.",
+        "properties": {
+          "branchable": {
+            "type": "boolean",
+            "description": "Let every child become another branch source."
+          },
+          "count": {
+            "type": "integer",
+            "format": "int32",
+            "description": "Number of children to branch (1 to 64). Ignored when `names` is given.",
+            "minimum": 0
+          },
+          "expectedBusyCpus": {
+            "type": [
+              "number",
+              "null"
+            ],
+            "format": "double",
+            "description": "Taken for the cloud API's sake: a node places nothing, so it is unused."
+          },
+          "freezeSource": {
+            "type": "boolean",
+            "description": "Keep the source paused as a reusable branch base, as for one branch."
+          },
+          "keepMachineId": {
+            "type": "boolean",
+            "description": "Keep the source's machine-id in every child, as for one branch."
+          },
+          "labels": {
+            "type": [
+              "object",
+              "null"
+            ],
+            "description": "Labels for every child; the source's labels when omitted.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
+          "namePrefix": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Prefix for children named by `count`; the source's name by default."
+          },
+          "names": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Explicit child names. When non-empty, its length is the batch size and\n`count` is ignored; otherwise children are named `{namePrefix}-{n}`,\nskipping names already taken."
+          },
+          "ports": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/PortSpec"
+            },
+            "description": "Inbound port forwards for every child; fresh host ports when empty, so\nsiblings do not collide."
+          },
+          "waitForCapacitySeconds": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Taken for the cloud API's sake: a node places nothing, so it is unused.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "ForkBatchResponse": {
+        "type": "object",
+        "description": "The children of a batch branch, in request order.",
+        "required": [
+          "clones"
+        ],
+        "properties": {
+          "clones": {
+            "type": "array",
+            "items": {
+              "$ref": "#/components/schemas/MachineInfo"
+            },
+            "description": "The children made."
           }
         }
       },
