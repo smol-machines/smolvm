@@ -444,69 +444,74 @@ test_cp_matches_exec_on_image_machine() {
 # each background exec its pid file in the agent's /tmp, which is on the overlay
 # disk once the persistent rootfs is pivoted in: about 120 to 136 sectors (a
 # journal commit) on that disk per exec.
-test_exec_does_not_write_disks() {
+test_exec_does_not_write_disks() (
     local vm_name="exec-disk-quiet-$$"
     cleanup_exec_disk_quiet() {
-        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
-        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+        $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
     }
 
-    $SMOLVM machine create --name "$vm_name" --image alpine:3.20 --net 2>&1 || { cleanup_exec_disk_quiet; return 1; }
-    run_with_timeout 120 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || { cleanup_exec_disk_quiet; return 1; }
+    $SMOLVM machine create --name "$vm_name" --image alpine:3.20 --net || return 1
+    trap cleanup_exec_disk_quiet EXIT
+    run_with_timeout 120 $SMOLVM machine start --name "$vm_name" || return 1
 
-    # Sectors written to each of the machine's virtio disks, after a sync, as
-    # "vda=N vdb=M": every disk is measured, whichever holds /storage or /.
-    local read_disks='sync; for d in /sys/block/vd*; do printf "%s=%s " "${d##*/}" "$(awk "{print \$7}" "$d/stat")"; done'
-    # Per-disk sectors written between two readings, then the largest of them.
-    disk_deltas() {
-        awk -v a="$1" -v b="$2" 'BEGIN {
-            n = split(a, x, " "); for (i = 1; i <= n; i++) { split(x[i], kv, "="); s[kv[1]] = kv[2] }
-            m = split(b, y, " "); for (i = 1; i <= m; i++) { split(y[i], kv, "="); printf "%s=%d ", kv[1], kv[2] - s[kv[1]] }
-        }'
+    read_disks_now() {
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+            sync
+            for d in /sys/block/vd*; do
+                read -r reads merged_read sectors_read read_ms writes merged_write sectors_written rest < "$d/stat"
+                printf "%s=%s\n" "${d##*/}" "$sectors_written"
+            done'
     }
-    max_delta() { echo "$1" | tr ' ' '\n' | awk -F= 'NF == 2 && $2 > m { m = $2 } END { print m + 0 }'; }
-    read_disks_now() { run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- sh -c "$read_disks" 2>&1; }
 
-    # The storage disk is grown at boot and ext4lazyinit then zeroes its new
-    # inode tables in the background. Wait for a 10 s window in which no disk
-    # wrote more than the two readings' execs would on an agent without the
-    # fix (136 sectors each, the most an exec wrote in measurements), so the
-    # wait ends with and without the fix and the measurement below tells the
-    # two apart.
-    local a b deltas quiet="" i
-    for i in $(seq 1 40); do
-        a=$(read_disks_now)
+    # Compare the same set of devices in both samples. Missing, malformed,
+    # duplicated or decreasing counters cannot establish that a disk was idle.
+    max_disk_delta() {
+        awk -v before="$1" -v after="$2" 'BEGIN {
+            n = split(before, rows, "\n")
+            m = split(after, later, "\n")
+            if (!n || n != m) exit 1
+            for (i = 1; i <= n; i++) {
+                if (rows[i] !~ /^vd[a-z]+=[0-9]+$/) exit 1
+                split(rows[i], f, "=")
+                if (f[1] in start) exit 1
+                start[f[1]] = f[2] + 0
+            }
+            for (i = 1; i <= m; i++) {
+                if (later[i] !~ /^vd[a-z]+=[0-9]+$/) exit 1
+                split(later[i], f, "=")
+                if (!(f[1] in start)) exit 1
+                delta = f[2] - start[f[1]]
+                delete start[f[1]]
+                if (delta < 0) exit 1
+                if (delta > max) max = delta
+            }
+            print max + 0
+        }' || { echo "Invalid disk readings: '$1' -> '$2'" >&2; return 1; }
+    }
+
+    # Let boot-time ext4 initialization settle before measuring exec writes.
+    local a b delta i
+    for ((i=0; i<40; i++)); do
+        a=$(read_disks_now) || return 1
         sleep 10
-        b=$(read_disks_now)
-        deltas=$(disk_deltas "$a" "$b")
-        [[ $a == *=* && $b == *=* && $(max_delta "$deltas") -le 272 ]] && { quiet=1; break; }
+        b=$(read_disks_now) || return 1
+        delta=$(max_disk_delta "$a" "$b") || return 1
+        (( delta <= 272 )) && break
     done
-    [[ -n $quiet ]] || {
-        echo "FAIL: disk never went quiet in 400 s (last 10 s window: ${deltas:-no readings: '$a' '$b'})"
-        cleanup_exec_disk_quiet
-        return 1
-    }
+    (( i < 40 )) || { echo "Disk never went quiet: '$a' -> '$b'"; return 1; }
 
-    # Eight foreground and four background execs, then a last reading.
-    a=$(read_disks_now)
-    for i in 1 2 3 4 5 6 7 8; do
-        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- true >/dev/null 2>&1
+    a=$(read_disks_now) || return 1
+    for ((i=0; i<8; i++)); do
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- true >/dev/null || return 1
     done
-    for i in 1 2 3 4; do
-        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" --detach -- true >/dev/null 2>&1
+    for ((i=0; i<4; i++)); do
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" --detach -- true >/dev/null || return 1
     done
-    b=$(read_disks_now)
-    cleanup_exec_disk_quiet
-
-    [[ $a == *=* && $b == *=* ]] || { echo "unexpected readings: '$a' '$b'"; return 1; }
-    deltas=$(disk_deltas "$a" "$b")
-    # Before the fix each of these execs wrote 120 to 136 sectors to one of
-    # the disks; allow less than one exec's worth on any disk.
-    [[ $(max_delta "$deltas") -lt 120 ]] || {
-        echo "FAIL: 8 foreground and 4 background execs wrote sectors to the machine's disks: $deltas"
-        return 1
-    }
-}
+    b=$(read_disks_now) || return 1
+    delta=$(max_disk_delta "$a" "$b") || return 1
+    (( delta < 120 )) || { echo "Execs wrote $delta sectors on one disk: '$a' -> '$b'"; return 1; }
+)
 
 run_test "Create with --image" test_create_with_image || true
 run_test "Mirrored pull keeps original image reference" test_mirrored_image_is_cached_under_original_reference || true

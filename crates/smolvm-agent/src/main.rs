@@ -4658,7 +4658,7 @@ fn handle_interactive_run(
     }
 
     // Spawn the command with crun
-    let (mut child, pty_master) = match spawn_interactive_command(
+    let spawned = match spawn_interactive_command(
         &prepared.rootfs_path,
         &launch,
         &mounts,
@@ -4678,26 +4678,12 @@ fn handle_interactive_run(
         }
     };
 
-    // Send Started response
-    send_response(stream, &AgentResponse::Started)?;
-
-    // Run the appropriate interactive I/O loop
-    let exit_code = match pty_master {
-        #[cfg(target_os = "linux")]
-        Some(pty) => match run_interactive_loop_pty(stream, &mut child, pty, timeout_ms) {
-            Ok(exit_code) => exit_code,
-            Err(e) => {
-                maybe_cleanup(&prepared.workload_id);
-                return Err(e);
-            }
-        },
-        _ => match run_interactive_loop(stream, &mut child, timeout_ms) {
-            Ok(exit_code) => exit_code,
-            Err(e) => {
-                maybe_cleanup(&prepared.workload_id);
-                return Err(e);
-            }
-        },
+    let exit_code = match run_streamed_exec(stream, spawned, timeout_ms) {
+        Ok(code) => code,
+        Err(error) => {
+            maybe_cleanup(&prepared.workload_id);
+            return Err(error);
+        }
     };
 
     // Send Exited response
@@ -5395,17 +5381,32 @@ fn exec_process_spec(
     }))
 }
 
-/// An exec's process spec on the run directory's tmpfs (see
-/// [`write_exec_process_file`]), removed when this is dropped.
-///
-/// crun reads the file when it starts, so the owner keeps this until the crun
-/// it was written for has returned or exited. Each file takes a 4 KiB page of
-/// the capped tmpfs, so one left to the ten-minute sweep for every exec would
-/// fill it at a sustained 14 execs a second.
-#[cfg(target_os = "linux")]
+/// Keeps the process spec readable by crun until the handler finishes with the child.
 pub(crate) struct ExecProcessFile(std::path::PathBuf);
 
 #[cfg(target_os = "linux")]
+type InteractiveExec = (Child, Option<pty::PtyMaster>, Option<ExecProcessFile>);
+#[cfg(not(target_os = "linux"))]
+type InteractiveExec = (Child, Option<()>, Option<ExecProcessFile>);
+
+/// Own the process spec until the streamed child exits, including on disconnect.
+fn run_streamed_exec(
+    stream: &mut WireStream<impl ReadWrite>,
+    spawned: InteractiveExec,
+    timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let (mut child, pty, _process_file) = spawned;
+    let result = send_response(stream, &AgentResponse::Started).and_then(|()| match pty {
+        #[cfg(target_os = "linux")]
+        Some(master) => run_interactive_loop_pty(stream, &mut child, master, timeout_ms),
+        _ => run_interactive_loop(stream, &mut child, timeout_ms),
+    });
+    if result.is_err() && matches!(child.try_wait(), Ok(None)) {
+        terminate_interactive_child(&mut child, None);
+    }
+    result
+}
+
 impl std::ops::Deref for ExecProcessFile {
     type Target = std::path::Path;
 
@@ -5414,27 +5415,14 @@ impl std::ops::Deref for ExecProcessFile {
     }
 }
 
-#[cfg(target_os = "linux")]
-impl ExecProcessFile {
-    /// Leave the file to the sweep in [`write_exec_process_file`], for a crun
-    /// whose exit the caller does not see.
-    fn leave_for_sweep(mut self) {
-        self.0 = std::path::PathBuf::new();
-    }
-}
-
-#[cfg(target_os = "linux")]
 impl Drop for ExecProcessFile {
     fn drop(&mut self) {
-        if !self.0.as_os_str().is_empty() {
-            let _ = std::fs::remove_file(&self.0);
-        }
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
 /// Write an exec's process spec where crun reads it. The returned guard removes
-/// the file; files older than ten minutes are swept on every write, for a crun
-/// whose caller left its file behind.
+/// the file. The sweep also clears stale specs left by interrupted agents.
 #[cfg(target_os = "linux")]
 fn write_exec_process_file(
     container_id: &str,
@@ -5892,7 +5880,7 @@ fn spawn_exec_in_container(
     launch: &ResolvedLaunch,
     tty: bool,
     unprivileged: bool,
-) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveExec, Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
     use std::sync::atomic::Ordering;
@@ -5928,14 +5916,14 @@ fn spawn_exec_in_container(
                 }
                 let child = command.spawn()?;
                 drop(slave_fd);
-                return Ok((child, Some(pty_master)));
+                return Ok((child, Some(pty_master), None));
             }
             let child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            return Ok((child, None));
+            return Ok((child, None, None));
         }
     }
 
@@ -5977,7 +5965,7 @@ fn spawn_exec_in_container(
                             let _ = err.read_to_end(&mut sink);
                         });
                     }
-                    return Ok((child, Some(pty_master)));
+                    return Ok((child, Some(pty_master), None));
                 }
                 Err(e) => {
                     // A transient timeout (crun slow to hand back the console)
@@ -6017,28 +6005,21 @@ fn spawn_exec_in_container(
                 .spawn()?
         };
         drop(slave_fd);
-        Ok((child, Some(pty_master)))
+        Ok((child, Some(pty_master), None))
     } else {
-        let child = match spec_for(false)? {
-            Some(pf) => {
-                let child = crun::CrunCommand::exec_with_process(container_id, &pf)
-                    .stdin_piped()
-                    .capture_output()
-                    .spawn()?;
-                // The caller owns the child from here and this function does
-                // not see it exit, so the file waits for the sweep. That covers
-                // interactive and streaming execs: at a 4 KiB page each for ten
-                // minutes, about 14 a second sustained fill the tmpfs.
-                pf.leave_for_sweep();
-                child
-            }
+        let process_file = spec_for(false)?;
+        let child = match &process_file {
+            Some(pf) => crun::CrunCommand::exec_with_process(container_id, pf)
+                .stdin_piped()
+                .capture_output()
+                .spawn()?,
             None => crun::CrunCommand::exec(container_id, env, command, workdir, false)
                 .user(launch.user.as_deref())
                 .stdin_piped()
                 .capture_output()
                 .spawn()?,
         };
-        Ok((child, None))
+        Ok((child, None, process_file))
     }
 }
 
@@ -6399,7 +6380,7 @@ fn spawn_interactive_command(
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
     s3_volumes: &[smolvm_protocol::S3Volume],
-) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveExec, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     if launch.command.is_empty() {
@@ -6515,7 +6496,8 @@ fn spawn_interactive_command(
 
     // The single-container `Run` path keeps cgroups disabled (its VM is the
     // limit); per-container cgroups are a pod-only concern.
-    spawn_crun_run(&bundle_path, &container_id, tty, false)
+    let (child, pty) = spawn_crun_run(&bundle_path, &container_id, tty, false)?;
+    Ok((child, pty, None))
 }
 
 /// Launch a container with `crun run` and hand back the child plus the PTY
@@ -6629,7 +6611,7 @@ fn spawn_interactive_command(
     _persistent_overlay_id: Option<&str>,
     unprivileged: bool,
     _s3_volumes: &[smolvm_protocol::S3Volume],
-) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveExec, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     let command: &[String] = &launch.command;
@@ -6680,7 +6662,7 @@ fn spawn_interactive_command(
         .capture_output()
         .spawn()?;
 
-    Ok((child, None))
+    Ok((child, None, None))
 }
 
 /// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
@@ -9600,12 +9582,44 @@ mod exec_process_file_tests {
     }
 
     #[test]
-    fn process_file_left_for_the_sweep_stays() {
+    fn streamed_children_release_their_process_files_on_completion() {
         let dir = tempfile::tempdir().unwrap();
-        let process_file = write_exec_process_file_in(dir.path(), "c1", &spec()).unwrap();
-        let path = process_file.to_path_buf();
-        process_file.leave_for_sweep();
-        assert!(path.exists());
+        for _ in 0..8 {
+            let file = write_exec_process_file_in(dir.path(), "c1", &spec()).unwrap();
+            // Read the spec in the child, after spawn, as crun does.
+            let child = std::process::Command::new("test")
+                .arg("-s")
+                .arg(&*file)
+                .spawn()
+                .unwrap();
+            let (mut agent, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let result = run_streamed_exec(
+                &mut WireStream::new(&mut agent),
+                (child, None, Some(file)),
+                Some(2000),
+            )
+            .unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+    #[test]
+    fn disconnected_stream_releases_its_process_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_exec_process_file_in(dir.path(), "c1", &spec()).unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (mut agent, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let result = run_streamed_exec(
+            &mut WireStream::new(&mut agent),
+            (child, None, Some(file)),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
     }
 }
 
