@@ -80,6 +80,13 @@ const RESTART_HINT: &str =
     "this machine was started before attached mounts were supported; restart it";
 
 fn control(name: &str, command: &str) -> Result<String> {
+    // one command per connection: a newline in a value would add a line of its own
+    if command.contains(['\n', '\r']) {
+        return Err(Error::agent(
+            "attach mount",
+            "control command has a line break",
+        ));
+    }
     let reply = control_socket_cmd(&control_socket_path(name), command)?;
     control_reply(reply)
 }
@@ -326,16 +333,39 @@ pub fn detach(name: &str, target: &Path) -> Result<AttachedMount> {
         ));
     };
     client.detach_mount(&mount.target)?;
-    control(
+    // The share to revoke is the one this host attached for the target, not
+    // the one the guest names: a guest could name another share it holds and
+    // keep this one. Which device holds it is the guest's claim too, so both
+    // are asked, the claimed one first.
+    let share = share_name(&target);
+    let removed = control(
         name,
-        &format!("SHARE_REMOVE {} {}", tag(mount.read_only), mount.share),
-    )?;
-    Ok(mount)
+        &format!("SHARE_REMOVE {} {share}", tag(mount.read_only)),
+    )
+    .or_else(|_| {
+        control(
+            name,
+            &format!("SHARE_REMOVE {} {share}", tag(!mount.read_only)),
+        )
+    });
+    removed?;
+    Ok(AttachedMount { share, ..mount })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_control_command_with_a_line_break_is_never_sent() {
+        let error = control(
+            "no-such-machine",
+            "SHARE_REMOVE smolvm_attach_rw m1\nSHARE_ADD smolvm_attach_rw pwned /",
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(error.contains("line break"), "{error}");
+    }
 
     #[test]
     fn a_directory_overlaps_itself_its_parents_and_its_children_only() {
