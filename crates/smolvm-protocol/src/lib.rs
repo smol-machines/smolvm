@@ -590,6 +590,9 @@ pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
 /// Agent rebuilds the workload's credential trust bundle on request ([`AgentRequest::RefreshCredentialTrust`]), so a
 /// CA the host adds for a credential binding's new host is trusted without a restart.
 pub const LIVE_CREDENTIAL_TRUST_CAPABILITY: &str = "live-credential-trust-v1";
+/// Agent takes the machine's credential CA bundle in the request ([`AgentRequest::SetCredentialTrust`]) instead of
+/// re-reading the file the host rewrote, which the guest's file cache can still serve stale.
+pub const PUSHED_CREDENTIAL_TRUST_CAPABILITY: &str = "pushed-credential-trust-v1";
 /// The guest kernel keeps time when its machine resumes on a host whose arm64
 /// system counter runs at another rate, so a checkpoint may move between
 /// such hosts.
@@ -691,6 +694,13 @@ pub enum AgentRequest {
     /// Rebuild the credential trust bundles from the machine's credential CA file, which the host has rewritten (it
     /// added a CA for a binding's new host). Running workloads see the new bundle from their next connection.
     RefreshCredentialTrust,
+    /// [`Self::RefreshCredentialTrust`] from `ca_pem`, the machine's credential CA bundle as the host just wrote it.
+    /// The agent uses it for every trust bundle it builds from then on, so a workload started before the guest sees
+    /// the rewritten file still trusts the new CA.
+    SetCredentialTrust {
+        /// PEM certificates: the machine CA, then each CA added for a new host.
+        ca_pem: String,
+    },
     /// Ping to check if agent is alive.
     Ping,
 
@@ -1549,6 +1559,7 @@ impl AgentRequest {
             AgentRequest::DetachMount { target } => format!("DetachMount {{ target: {target} }}"),
             AgentRequest::ListAttachedMounts => "ListAttachedMounts".into(),
             AgentRequest::RefreshCredentialTrust => "RefreshCredentialTrust".into(),
+            AgentRequest::SetCredentialTrust { .. } => "SetCredentialTrust".into(),
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),

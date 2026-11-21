@@ -125,6 +125,8 @@ pub struct BindingChange {
     pub placeholders: BTreeMap<String, String>,
     /// A CA was added for a new host: a running guest must rebuild its trust before it reaches that host.
     pub trust_changed: bool,
+    /// When the trust changed, the guest's CA bundle as just written, to hand a running guest directly.
+    pub guest_ca: Option<String>,
 }
 
 /// Plan replacing `record`'s bindings with `policy`: validated against the machine's DNS allow-list as at create,
@@ -152,10 +154,19 @@ pub fn plan_binding_change(
     let owner = record.golden.as_deref().unwrap_or(machine);
     let before = record.credential_policy.clone().unwrap_or_default();
     let trust_changed = ensure_cas_for(&ca_dir(owner), owner, &policy, &before)?;
+    let guest_ca = trust_changed
+        .then(|| {
+            std::fs::read_to_string(
+                MachineCa::guest_dir(&ca_dir(owner)).join(smolvm_credentials::ca::GUEST_CA_FILE),
+            )
+        })
+        .transpose()
+        .map_err(|e| Error::config("credentials", format!("read guest CA bundle: {e}")))?;
     Ok(BindingChange {
         policy,
         placeholders,
         trust_changed,
+        guest_ca,
     })
 }
 

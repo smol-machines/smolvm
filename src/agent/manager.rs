@@ -769,7 +769,7 @@ pub fn apply_live_credential_bindings(
     if change.trust_changed {
         AgentManager::for_vm(name)
             .and_then(|manager| crate::agent::AgentClient::connect(manager.vsock_socket()))
-            .and_then(|mut client| client.refresh_credential_trust())
+            .and_then(|mut client| client.refresh_credential_trust(change.guest_ca.as_deref()))
             .map_err(|e| {
                 Error::config(
                     "credentials",
