@@ -1314,6 +1314,13 @@ fn expect_completed(resp: AgentResponse, op: &str) -> Result<(i32, Vec<u8>, Vec<
     }
 }
 
+/// Whether a failed connect met a listener whose accept queue is full: busy,
+/// not gone.
+fn is_full_accept_queue(error_msg: &str) -> bool {
+    error_msg.contains("Resource temporarily unavailable")
+        || error_msg.contains("no error set after POLLHUP")
+}
+
 /// Whether a failed agent connect is worth retrying: the guest or its vsock
 /// muxer is briefly not ready, or turned the connection away.
 fn is_transient_connect_error(error_msg: &str) -> bool {
@@ -1421,7 +1428,27 @@ impl AgentClient {
     /// busy (e.g., processing a Run request's overlayfs setup), but short
     /// enough to not make `ls` feel sluggish when the agent is truly dead.
     pub fn connect_for_state_probe(socket_path: impl AsRef<Path>) -> Result<Self> {
-        Self::connect_with_timeouts_ms(socket_path.as_ref(), 3000, 3000)
+        // The agent socket's listener queues five connections and takes one
+        // per wakeup, so a burst of execs fills it, and a non-blocking connect
+        // to a full queue fails with EAGAIN (socket2 reports "no error set
+        // after POLLHUP"). That is a busy agent, not a dead one: try again,
+        // briefly, before the machine is reported unreachable. A refused
+        // connect or a missing socket still answers at once.
+        let path = socket_path.as_ref();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        let mut delay = std::time::Duration::from_millis(10);
+        loop {
+            match Self::connect_with_timeouts_ms(path, 3000, 3000) {
+                Err(error)
+                    if is_full_accept_queue(&error.to_string())
+                        && std::time::Instant::now() + delay < deadline =>
+                {
+                    std::thread::sleep(delay);
+                    delay = (delay * 2).min(std::time::Duration::from_millis(200));
+                }
+                result => return result,
+            }
+        }
     }
 
     /// Connect with a very short timeout for boot-time probe cycles.
@@ -6840,5 +6867,53 @@ mod binary_negotiation_tests {
             );
             server.join().unwrap();
         }
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod state_probe_tests {
+    use super::AgentClient;
+    use socket2::{Domain, SockAddr, Socket, Type};
+
+    /// A burst of execs fills the agent socket's accept queue; a state probe
+    /// that meets the full queue waits for room instead of calling a busy
+    /// machine unreachable, while a socket nothing listens on is refused at
+    /// once.
+    #[test]
+    fn a_state_probe_waits_out_a_full_accept_queue_but_not_a_refusal() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.sock");
+        let listener = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+        listener.bind(&SockAddr::unix(&path).unwrap()).unwrap();
+        listener.listen(1).unwrap();
+        // Fill the queue without accepting.
+        let mut queued = Vec::new();
+        loop {
+            let s = Socket::new(Domain::UNIX, Type::STREAM, None).unwrap();
+            s.set_nonblocking(true).unwrap();
+            match s.connect(&SockAddr::unix(&path).unwrap()) {
+                Ok(()) => queued.push(s),
+                Err(_) => break,
+            }
+            assert!(queued.len() < 64, "the queue never filled");
+        }
+        let accepting = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            // Room again: take the queued connections, then the probe's.
+            for _ in 0..queued.len() + 1 {
+                let _ = listener.accept();
+            }
+            drop(queued);
+        });
+        let started = std::time::Instant::now();
+        assert!(AgentClient::connect_for_state_probe(&path).is_ok());
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        accepting.join().unwrap();
+
+        let gone = dir.path().join("gone.sock");
+        drop(std::os::unix::net::UnixListener::bind(&gone).unwrap());
+        let started = std::time::Instant::now();
+        assert!(AgentClient::connect_for_state_probe(&gone).is_err());
+        assert!(started.elapsed() < std::time::Duration::from_millis(500));
     }
 }
