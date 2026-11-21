@@ -7306,7 +7306,12 @@ pub async fn set_machine_env(
     Path(name): Path<String>,
     Json(req): Json<SetMachineEnvRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
-    crate::api::handlers::validate_request_env(&req.env)?;
+    let vars: Vec<crate::api::types::EnvVar> = req
+        .env
+        .into_iter()
+        .map(|(name, value)| crate::api::types::EnvVar { name, value })
+        .collect();
+    crate::api::handlers::validate_request_env(&vars)?;
     // Serialize against start/stop/delete, so the state check holds while the
     // record changes.
     let lifecycle = state.lifecycle_lock(&name);
@@ -7324,7 +7329,7 @@ pub async fn set_machine_env(
             )));
         }
     }
-    let env = machine_env_from_request(&req.env);
+    let env = crate::api::types::EnvVar::to_tuples(&vars);
     let updated = state
         .update_vm(&name, move |r| r.env = env)
         .await?
@@ -7332,19 +7337,6 @@ pub async fn set_machine_env(
             ApiError::NotFound(format!("machine '{}' disappeared during update", name))
         })?;
     Ok(Json(record_to_info(&name, &updated)))
-}
-
-/// A request's variables as the record keeps them: one entry per name, at the
-/// position of its first appearance, holding its last value.
-fn machine_env_from_request(env: &[crate::api::types::EnvVar]) -> Vec<(String, String)> {
-    let mut out: Vec<(String, String)> = Vec::with_capacity(env.len());
-    for var in env {
-        match out.iter_mut().find(|(name, _)| *name == var.name) {
-            Some(entry) => entry.1 = var.value.clone(),
-            None => out.push((var.name.clone(), var.value.clone())),
-        }
-    }
-    out
 }
 
 /// Where the export subprocess writes its executable stub. `pack create -o X` derives the
@@ -9012,16 +9004,12 @@ mod tests {
         let info = set_machine_env(
             State(state.clone()),
             Path("env-vm".into()),
-            Json(request(serde_json::json!({"env": [
-                {"name": "A", "value": "1"},
-                {"name": "B", "value": "x=y"},
-                {"name": "A", "value": "2"}
-            ]}))),
+            Json(request(serde_json::json!({"env": {"B": "x=y", "A": "2"}}))),
         )
         .await
         .unwrap();
         assert_eq!(info.name, "env-vm");
-        // Replaced, not merged; a repeated name keeps its first place and last value.
+        // Replaced, not merged, and kept in name order.
         let saved = state.db().get_vm("env-vm").unwrap().unwrap();
         assert_eq!(
             saved.env,
@@ -9034,9 +9022,7 @@ mod tests {
         let bad = set_machine_env(
             State(state.clone()),
             Path("env-vm".into()),
-            Json(request(
-                serde_json::json!({"env": [{"name": "A=B", "value": "1"}]}),
-            )),
+            Json(request(serde_json::json!({"env": {"A=B": "1"}}))),
         )
         .await;
         assert!(matches!(bad.unwrap_err(), ApiError::BadRequest(_)));
@@ -9049,7 +9035,7 @@ mod tests {
         let paused = set_machine_env(
             State(state.clone()),
             Path("env-vm".into()),
-            Json(request(serde_json::json!({"env": []}))),
+            Json(request(serde_json::json!({"env": {}}))),
         )
         .await;
         assert!(matches!(paused.unwrap_err(), ApiError::Conflict(_)));
@@ -9057,7 +9043,7 @@ mod tests {
         let missing = set_machine_env(
             State(state),
             Path("nope".into()),
-            Json(request(serde_json::json!({"env": []}))),
+            Json(request(serde_json::json!({"env": {}}))),
         )
         .await;
         assert!(matches!(missing.unwrap_err(), ApiError::NotFound(_)));

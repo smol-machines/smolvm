@@ -299,9 +299,10 @@ fn auto_start_default() -> bool {
 #[derive(Debug, Default, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct SetMachineEnvRequest {
-    /// Every variable the machine's commands start with, in order; a later
-    /// entry with the same name wins.
-    pub env: Vec<EnvVar>,
+    /// Every variable the machine's commands start with, by name, as the
+    /// cloud API takes environment variables.
+    #[schema(value_type = std::collections::HashMap<String, String>)]
+    pub env: std::collections::BTreeMap<String, String>,
 }
 
 /// Request to amend a machine's egress allow list: add or remove hosts,
