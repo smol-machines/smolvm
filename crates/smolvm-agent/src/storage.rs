@@ -1211,6 +1211,21 @@ const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
 /// wrong fails silently (stale lower content shows through), so the producer
 /// declares it rather than the consumer guessing.
 /// `,userxattr` when the packed layers need it, for the mount(8) fallback.
+/// How a container overlay treats a renamed image directory, as a mount
+/// option suffix. With redirects on, renaming a directory that comes from the
+/// image records only a redirect in the upper directory, and a commit, which
+/// tars that directory, loses every file in it. `redirect_dir=follow` makes
+/// such a rename fail with EXDEV, so `mv` copies, as under Docker, while still
+/// honoring redirects an earlier mount recorded. Linux refuses any redirect
+/// mode but `nofollow` beside `userxattr`, so those mounts keep `userxattr`.
+fn redirect_mount_suffix() -> &'static str {
+    if packed_layers_use_userxattr() {
+        userxattr_mount_suffix()
+    } else {
+        ",redirect_dir=follow"
+    }
+}
+
 fn userxattr_mount_suffix() -> &'static str {
     if packed_layers_use_userxattr() {
         ",userxattr"
@@ -6190,6 +6205,10 @@ fn mount_overlay_fsconfig(
     if packed_layers_use_userxattr() {
         rustix::mount::fsconfig_set_flag(fs.as_fd(), "userxattr")
             .map_err(|e| StorageError::new(format!("fsconfig userxattr failed: {e}")))?;
+    } else if let Err(e) = fsconfig_set_string(fs.as_fd(), "redirect_dir", "follow") {
+        // See `redirect_mount_suffix`: without it a renamed image directory
+        // is lost on commit, but the overlay still works.
+        tracing::warn!(error = %e, "fsconfig redirect_dir=follow failed");
     }
 
     fsconfig_create(fs.as_fd())
@@ -6477,7 +6496,7 @@ fn mount_overlay_sequential(
             lowerdirs[0],
             upper_path.display(),
             work_path.display(),
-            userxattr_mount_suffix()
+            redirect_mount_suffix()
         );
 
         let output = Command::new("mount")
@@ -6555,7 +6574,7 @@ fn mount_overlay_sequential(
         merged_layers_dir.display(),
         upper_path.display(),
         work_path.display(),
-        userxattr_mount_suffix()
+        redirect_mount_suffix()
     );
 
     let output = Command::new("mount")
