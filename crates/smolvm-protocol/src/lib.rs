@@ -587,6 +587,9 @@ pub const OFFLINE_CPU_SHRINK_CAPABILITY: &str = "offline-cpu-shrink-v1";
 
 /// Agent can online and verify a RAM range already added by the VMM.
 pub const ONLINE_MEMORY_GROWTH_CAPABILITY: &str = "online-memory-growth-v1";
+/// Agent rebuilds the workload's credential trust bundle on request ([`AgentRequest::RefreshCredentialTrust`]), so a
+/// CA the host adds for a credential binding's new host is trusted without a restart.
+pub const LIVE_CREDENTIAL_TRUST_CAPABILITY: &str = "live-credential-trust-v1";
 /// The guest kernel keeps time when its machine resumes on a host whose arm64
 /// system counter runs at another rate, so a checkpoint may move between
 /// such hosts.
@@ -685,6 +688,9 @@ pub enum AgentRequest {
     /// List the attached mounts, as `Ok` data holding a JSON array of
     /// [`AttachedMount`].
     ListAttachedMounts,
+    /// Rebuild the credential trust bundles from the machine's credential CA file, which the host has rewritten (it
+    /// added a CA for a binding's new host). Running workloads see the new bundle from their next connection.
+    RefreshCredentialTrust,
     /// Ping to check if agent is alive.
     Ping,
 
@@ -1542,6 +1548,7 @@ impl AgentRequest {
             ),
             AgentRequest::DetachMount { target } => format!("DetachMount {{ target: {target} }}"),
             AgentRequest::ListAttachedMounts => "ListAttachedMounts".into(),
+            AgentRequest::RefreshCredentialTrust => "RefreshCredentialTrust".into(),
             AgentRequest::Ping => "Ping".into(),
             AgentRequest::FsNotify { events } => format!("FsNotify {{ count: {} }}", events.len()),
             AgentRequest::Pull { image, .. } => format!("Pull {{ image: {image} }}"),

@@ -11,7 +11,45 @@
 
 use crate::oci::OciSpec;
 use smolvm_protocol::credentials::{GUEST_CA_BUNDLE, GUEST_CA_DIR, GUEST_CA_FILE};
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+/// Every bundle this boot assembled: (the machine CA file it read, the root whose trust roots it started from, where
+/// it was written), so [`refresh`] rebuilds each in place when the host adds a CA.
+static BUILT: std::sync::Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> =
+    std::sync::Mutex::new(Vec::new());
+
+fn remember(ca_path: &Path, roots: &Path, bundle: &Path) {
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    built.retain(|(_, _, b)| b != bundle);
+    built.push((
+        ca_path.to_path_buf(),
+        roots.to_path_buf(),
+        bundle.to_path_buf(),
+    ));
+}
+
+/// Rebuild every bundle this boot assembled from the CA file as it is now. Written in place, so a bundle bind-mounted
+/// into a running container shows the new roots to its next connection. Returns how many it rebuilt.
+pub fn refresh() -> std::io::Result<usize> {
+    let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
+    // a bundle whose CA file or root is gone (its container exited) has nothing left to trust: dropped, not an error
+    built.retain(|(ca_path, roots, bundle)| {
+        ca_path.exists() && roots.exists() && bundle.parent().is_some_and(Path::exists)
+    });
+    // one bundle that cannot be rewritten does not keep the others on the old roots
+    let mut rebuilt = 0;
+    for (ca_path, roots, bundle) in built.iter() {
+        let written = std::fs::read(ca_path)
+            .and_then(|ca| std::fs::write(bundle, assemble_bundle(roots, Path::new("/"), &ca)));
+        match written {
+            Ok(()) => rebuilt += 1,
+            Err(e) => {
+                tracing::warn!(bundle = %bundle.display(), error = %e, "could not rebuild credential trust bundle")
+            }
+        }
+    }
+    Ok(rebuilt)
+}
 
 /// Agent-side location of the assembled bundle (tmpfs; rebuilt every boot).
 const AGENT_BUNDLE: &str = "/run/smolvm-credentials/ca-bundle.pem";
@@ -44,6 +82,7 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
         tracing::warn!(error = %e, "could not write credential trust bundle");
         return;
     }
+    remember(&ca_path, rootfs, Path::new(AGENT_BUNDLE));
     if let Err(e) = crate::storage::ensure_file_mount_target_under_root(rootfs, GUEST_CA_BUNDLE) {
         tracing::warn!(error = %e, "could not prepare credential trust bundle mountpoint");
         return;
@@ -79,8 +118,11 @@ fn install_bundle_at(mounts: &[(String, String, bool)], root: &Path, bundle_path
         .parent()
         .map_or(Ok(()), std::fs::create_dir_all)
         .and_then(|()| std::fs::write(bundle_path, bundle));
-    if let Err(e) = written {
-        tracing::warn!(path = %bundle_path.display(), error = %e, "could not write credential trust bundle");
+    match written {
+        Ok(()) => remember(&ca_path, root, bundle_path),
+        Err(e) => {
+            tracing::warn!(path = %bundle_path.display(), error = %e, "could not write credential trust bundle")
+        }
     }
 }
 
@@ -121,6 +163,48 @@ fn write_bundle(bundle: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A CA the host adds while the machine runs reaches the bundle it built at boot, rewritten in place.
+    #[test]
+    fn refresh_rebuilds_the_boot_bundle_from_the_ca_file_as_it_is_now() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join("etc/ssl/certs")).unwrap();
+        std::fs::write(
+            root.path().join("etc/ssl/certs/ca-certificates.crt"),
+            b"-----BEGIN CERTIFICATE-----\npublic\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let ca_dir = root.path().join(GUEST_CA_DIR.trim_start_matches('/'));
+        std::fs::create_dir_all(&ca_dir).unwrap();
+        let ca_file = ca_dir.join(GUEST_CA_FILE);
+        std::fs::write(
+            &ca_file,
+            b"-----BEGIN CERTIFICATE-----\nmachine\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        let bundle = root.path().join("bundle.pem");
+        let mounts = vec![("tag".to_string(), GUEST_CA_DIR.to_string(), true)];
+        install_bundle_at(&mounts, root.path(), &bundle);
+        let inode = |p: &Path| std::os::unix::fs::MetadataExt::ino(&std::fs::metadata(p).unwrap());
+        let before = inode(&bundle);
+        assert!(!String::from_utf8_lossy(&std::fs::read(&bundle).unwrap()).contains("added"));
+        std::fs::write(
+            &ca_file,
+            b"-----BEGIN CERTIFICATE-----\nmachine\n-----END CERTIFICATE-----\n-----BEGIN CERTIFICATE-----\nadded\n-----END CERTIFICATE-----\n",
+        )
+        .unwrap();
+        assert!(refresh().unwrap() >= 1);
+        let after = String::from_utf8_lossy(&std::fs::read(&bundle).unwrap()).into_owned();
+        assert!(
+            after.contains("public") && after.contains("machine") && after.contains("added"),
+            "{after}"
+        );
+        assert_eq!(
+            inode(&bundle),
+            before,
+            "rewritten in place, so a bind mount of it sees the new roots"
+        );
+    }
 
     #[test]
     fn a_machine_without_an_image_gets_the_bundle_its_environment_names() {

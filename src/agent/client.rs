@@ -2225,6 +2225,26 @@ impl AgentClient {
         }
     }
 
+    /// Have the guest rebuild its credential trust bundles from the machine's CA file, which the host rewrote after
+    /// adding a CA for a binding's new host. Err when the running agent predates this, so the caller can say the
+    /// machine needs a restart for that host.
+    pub fn refresh_credential_trust(&mut self) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::LIVE_CREDENTIAL_TRUST_CAPABILITY)? {
+            return Err(Error::agent(
+                "credential trust",
+                "this machine's guest agent predates live credential hosts; restart the machine to bind a new host",
+            ));
+        }
+        match self.request(&AgentRequest::RefreshCredentialTrust)? {
+            AgentResponse::Ok { .. } => Ok(()),
+            AgentResponse::Error { message, .. } => Err(Error::agent("credential trust", message)),
+            other => Err(Error::agent(
+                "credential trust",
+                format!("unexpected response: {other:?}"),
+            )),
+        }
+    }
+
     /// Online only an existing block-aligned RAM range after runtime hot-add.
     pub fn online_memory(&mut self, start_address: u64, length_bytes: u64) -> Result<()> {
         if !self.supports_capability(smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY)? {

@@ -42,10 +42,11 @@ use crate::api::state::{
     ReservationGuard,
 };
 use crate::api::types::{
-    ApiErrorResponse, CreateMachineRequest, CredentialValuesRequest, DeleteQuery, DeleteResponse,
-    EgressEventsResponse, ExportRequest, ExportResponse, ForkReleaseRequest, ForkRequest,
-    ListMachinesResponse, MachineInfo, MountInfo, MountSpec, PortSpec, ResizeMachineRequest,
-    ResourceSpec, SetCpuLimitRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
+    ApiErrorResponse, CreateMachineRequest, CredentialBindingsRequest, CredentialBindingsResponse,
+    CredentialValuesRequest, DeleteQuery, DeleteResponse, EgressEventsResponse, ExportRequest,
+    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetPortsRequest,
+    StartMachineQuery, UpdateEgressRequest,
 };
 use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -6253,6 +6254,72 @@ async fn delete_one_transaction(
 
     crate::credentials::forget_values(&name);
     Ok(DeleteResponse { deleted: name })
+}
+
+/// Replace a machine's credential bindings.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/credential-bindings",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = CredentialBindingsRequest,
+    responses(
+        (status = 200, description = "Bindings saved; a running machine that booted with bindings uses them from its next request (`live`), one that booted without them from its next start", body = CredentialBindingsResponse),
+        (status = 400, description = "A binding is invalid or names a host outside the machine's allow-list", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Saved, but the running machine could not take them; they apply from its next start", body = ApiErrorResponse)
+    )
+)]
+pub async fn put_credential_bindings(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<CredentialBindingsRequest>,
+) -> Result<Json<CredentialBindingsResponse>, ApiError> {
+    // Under the lifecycle lock so a start or stop cannot land between saving the bindings and handing them over.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock_owned().await;
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let policy = smolvm_protocol::CredentialPolicy {
+        credentials: req.credentials,
+    };
+    let machine = name.clone();
+    let set =
+        tokio::task::spawn_blocking(move || crate::credentials::set_bindings(&machine, policy))
+            .await
+            .map_err(|error| {
+                ApiError::internal(format!("credential bindings task failed: {error}"))
+            })?;
+    let set = match set {
+        Ok(set) => set,
+        Err(error)
+            if error.to_string().contains("could not hand machine")
+                || error.to_string().contains("could not trust the new host") =>
+        {
+            return Err(ApiError::Conflict(error.to_string()))
+        }
+        Err(error) => return Err(ApiError::BadRequest(error.to_string())),
+    };
+    // new exec sessions take the placeholders of the bindings as they are now
+    if let Ok(entry) = state.get_machine(&name) {
+        entry.lock().credentials =
+            crate::credentials::CredentialLaunch::for_record(&name, &set.record);
+    }
+    let bindings = set
+        .record
+        .credential_policy
+        .iter()
+        .flat_map(|p| p.credentials.iter().map(|b| b.name.clone()))
+        .collect();
+    Ok(Json(CredentialBindingsResponse {
+        bindings,
+        live: set.live,
+        at_next_start: set.at_next_start,
+    }))
 }
 
 /// Supply the values for a machine's credential bindings.

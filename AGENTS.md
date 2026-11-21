@@ -388,6 +388,12 @@ smolvm machine exec --name web --secret-env TOKEN=CI_TOKEN -- ./deploy
 # Rotate a running machine's --credential values without a restart: each binding's
 # ENV_VAR is read again from this shell and used from the machine's next request.
 smolvm machine credentials refresh --name web [BINDING...]
+# Add or remove bindings on a running machine: from its next request an added binding is
+# substituted (its value read now from this shell) and a removed one is not. A binding for a
+# host no CA of the machine permits gets a CA of its own, trusted by the guest at once
+# (machines booted on v1.36.0+; older ones trust it from their next start).
+smolvm machine credentials add    --name web --credential gh=GH_TOKEN@api.github.com
+smolvm machine credentials remove --name web gh
 
 # From a host file (GUEST_VAR=/absolute/path)
 smolvm machine run --secret-file GCP_CREDS=/abs/creds.json -- ./app
