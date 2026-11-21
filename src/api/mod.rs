@@ -125,6 +125,7 @@ use state::ApiState;
         handlers::machines::publish_cache_disk,
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
+        handlers::machines::set_machine_env,
         handlers::machines::put_credential_values,
         handlers::machines::put_credential_bindings,
         handlers::machines::export_machine,
@@ -174,6 +175,7 @@ use state::ApiState;
         types::PublishCacheDiskRequest,
         types::PublishCacheDiskResponse,
         types::UpdateEgressRequest,
+        types::SetMachineEnvRequest,
         types::CredentialValuesRequest,
         types::CredentialBindingsRequest,
         types::CredentialBindingsResponse,
@@ -424,6 +426,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/egress",
             post(handlers::machines::update_machine_egress),
         )
+        .route("/{id}/env", put(handlers::machines::set_machine_env))
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
