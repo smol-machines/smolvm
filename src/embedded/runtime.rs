@@ -1468,6 +1468,44 @@ impl EmbeddedRuntime {
         })
     }
 
+    /// Replace `name`'s credential bindings with `policy`, saved for its next
+    /// boots, and hold `values` for them by binding name. Values already held
+    /// for a binding that stays are kept unless `values` replaces them; those
+    /// of a removed binding are dropped. A value naming no binding of `policy`
+    /// fails the call before anything changes.
+    ///
+    /// A running machine that booted with bindings takes the change at once:
+    /// a new host is trusted, a removed one is no longer substituted, and its
+    /// next request carries the new values. One that booted without any takes
+    /// them from its next start (`at_next_start`).
+    pub fn set_credential_bindings(
+        &self,
+        name: &str,
+        policy: crate::credentials::CredentialPolicy,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> Result<crate::credentials::BindingsSet> {
+        self.with_name_lock(name, || {
+            let bindings: Vec<String> = policy.credentials.iter().map(|b| b.name.clone()).collect();
+            if let Some(unknown) = values.keys().find(|k| !bindings.contains(k)) {
+                return Err(Error::config(
+                    "credentials",
+                    format!("the new bindings of machine '{name}' have no binding '{unknown}'"),
+                ));
+            }
+            let set = crate::credentials::set_bindings_in(&self.db, name, policy)?;
+            let keep: Vec<&str> = bindings.iter().map(String::as_str).collect();
+            let values = values
+                .into_iter()
+                .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
+                .collect();
+            let held = crate::credentials::retain_and_supply_values(name, &keep, values);
+            if set.live && !held.is_empty() {
+                crate::agent::apply_live_credential_values(name, &held)?;
+            }
+            Ok(set)
+        })
+    }
+
     fn mount_bindings_for(&self, name: &str) -> Result<Vec<(String, String, bool)>> {
         let record = control::get_record(&self.db, name)?;
         Ok(crate::workload::record_mounts_to_bindings(&record))
@@ -2124,6 +2162,91 @@ mod tests {
             .supply_credential_values("bound", one("github"))
             .unwrap();
         crate::credentials::forget_values("bound");
+    }
+
+    #[test]
+    fn credential_bindings_change_on_a_stopped_machine_and_keep_held_values() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let policy = |flags: &[&str]| crate::credentials::CredentialPolicy {
+            credentials: flags
+                .iter()
+                .map(|f| crate::credentials::parse_credential_flag(f).unwrap())
+                .collect(),
+        };
+        let one = |binding: &str, value: &str| {
+            std::collections::BTreeMap::from([(binding.to_string(), value.to_string())])
+        };
+        let mut spec = test_spec("rebind", true);
+        spec.allowed_hosts = vec!["github.com".into(), "api.notion.com".into()];
+        runtime
+            .create_machine_with_credentials(
+                spec,
+                Vec::new(),
+                None,
+                None,
+                policy(&["github=GH_TOKEN@github.com"]),
+            )
+            .unwrap();
+        runtime
+            .supply_credential_values("rebind", one("github", "gh"))
+            .unwrap();
+
+        let refused = runtime
+            .set_credential_bindings(
+                "rebind",
+                policy(&["notion=NOTION_TOKEN@api.notion.com"]),
+                one("github", "gh2"),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(refused.contains("no binding 'github'"), "{refused}");
+        let unchanged = control::get_record(&runtime.db, "rebind").unwrap();
+        assert_eq!(unchanged.credential_policy.unwrap().credentials.len(), 1);
+
+        let set = runtime
+            .set_credential_bindings(
+                "rebind",
+                policy(&[
+                    "github=GH_TOKEN@github.com",
+                    "notion=NOTION_TOKEN@api.notion.com",
+                ]),
+                one("notion", "nt"),
+            )
+            .unwrap();
+        assert!(!set.live && !set.at_next_start);
+        let names: Vec<_> = set
+            .record
+            .credential_policy
+            .unwrap()
+            .credentials
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["github", "notion"]);
+        let held = crate::credentials::retain_and_supply_values(
+            "rebind",
+            &["github", "notion"],
+            Default::default(),
+        );
+        assert_eq!(held.get("github").map(|v| v.as_str()), Some("gh"));
+        assert_eq!(held.get("notion").map(|v| v.as_str()), Some("nt"));
+
+        // Removing a binding drops its held value.
+        runtime
+            .set_credential_bindings(
+                "rebind",
+                policy(&["notion=NOTION_TOKEN@api.notion.com"]),
+                Default::default(),
+            )
+            .unwrap();
+        let held = crate::credentials::retain_and_supply_values(
+            "rebind",
+            &["github", "notion"],
+            Default::default(),
+        );
+        assert!(!held.contains_key("github"));
+        crate::credentials::forget_values("rebind");
     }
 
     #[test]

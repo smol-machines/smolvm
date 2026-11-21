@@ -2226,16 +2226,29 @@ impl AgentClient {
     }
 
     /// Have the guest rebuild its credential trust bundles from the machine's CA file, which the host rewrote after
-    /// adding a CA for a binding's new host. Err when the running agent predates this, so the caller can say the
+    /// adding a CA for a binding's new host, or from `ca_pem`, that file's new contents, when the agent takes them
+    /// (its view of the file can lag the host's write). Err when the running agent predates this, so the caller can say the
     /// machine needs a restart for that host.
-    pub fn refresh_credential_trust(&mut self) -> Result<()> {
+    pub fn refresh_credential_trust(&mut self, ca_pem: Option<&str>) -> Result<()> {
         if !self.supports_capability(smolvm_protocol::LIVE_CREDENTIAL_TRUST_CAPABILITY)? {
             return Err(Error::agent(
                 "credential trust",
                 "this machine's guest agent predates live credential hosts; restart the machine to bind a new host",
             ));
         }
-        match self.request(&AgentRequest::RefreshCredentialTrust)? {
+        // A pushed copy spares the agent re-reading the file it may still see stale.
+        let request = match ca_pem {
+            Some(ca_pem)
+                if self
+                    .supports_capability(smolvm_protocol::PUSHED_CREDENTIAL_TRUST_CAPABILITY)? =>
+            {
+                AgentRequest::SetCredentialTrust {
+                    ca_pem: ca_pem.to_string(),
+                }
+            }
+            _ => AgentRequest::RefreshCredentialTrust,
+        };
+        match self.request(&request)? {
             AgentResponse::Ok { .. } => Ok(()),
             AgentResponse::Error { message, .. } => Err(Error::agent("credential trust", message)),
             other => Err(Error::agent(

@@ -18,6 +18,24 @@ use std::path::{Path, PathBuf};
 static BUILT: std::sync::Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
 
+/// The machine's credential CA bundle as the host last pushed it ([`push_ca`]). The host rewrites the CA file in
+/// place when it adds a CA, and the guest's file cache can serve the old contents for a while after, so a pushed copy
+/// is preferred to the file. The host only ever appends CAs, so the pushed copy is never older than the file.
+static PUSHED: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
+
+/// Use `ca` as the machine's credential CA bundle from now on, in place of its file.
+pub fn push_ca(ca: Vec<u8>) {
+    *PUSHED.lock().unwrap_or_else(|e| e.into_inner()) = Some(ca);
+}
+
+/// The machine's credential CA bundle: the pushed copy, else the file at `ca_path`.
+fn read_ca(ca_path: &Path) -> std::io::Result<Vec<u8>> {
+    match PUSHED.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+        Some(ca) => Ok(ca),
+        None => std::fs::read(ca_path),
+    }
+}
+
 fn remember(ca_path: &Path, roots: &Path, bundle: &Path) {
     let mut built = BUILT.lock().unwrap_or_else(|e| e.into_inner());
     built.retain(|(_, _, b)| b != bundle);
@@ -39,7 +57,7 @@ pub fn refresh() -> std::io::Result<usize> {
     // one bundle that cannot be rewritten does not keep the others on the old roots
     let mut rebuilt = 0;
     for (ca_path, roots, bundle) in built.iter() {
-        let written = std::fs::read(ca_path)
+        let written = read_ca(ca_path)
             .and_then(|ca| std::fs::write(bundle, assemble_bundle(roots, Path::new("/"), &ca)));
         match written {
             Ok(()) => rebuilt += 1,
@@ -70,7 +88,7 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
         return;
     };
     let ca_path = crate::storage::volume_bind_source(tag).join(GUEST_CA_FILE);
-    let ca = match std::fs::read(&ca_path) {
+    let ca = match read_ca(&ca_path) {
         Ok(ca) => ca,
         Err(e) => {
             tracing::warn!(path = %ca_path.display(), error = %e, "credential CA not readable; workload will not trust the interceptor");
@@ -106,7 +124,7 @@ fn install_bundle_at(mounts: &[(String, String, bool)], root: &Path, bundle_path
     let ca_path = root
         .join(GUEST_CA_DIR.trim_start_matches('/'))
         .join(GUEST_CA_FILE);
-    let ca = match std::fs::read(&ca_path) {
+    let ca = match read_ca(&ca_path) {
         Ok(ca) => ca,
         Err(e) => {
             tracing::warn!(path = %ca_path.display(), error = %e, "credential CA not readable; workload will not trust the interceptor");

@@ -2840,6 +2840,7 @@ fn handle_request(
                 smolvm_protocol::ONLINE_MEMORY_GROWTH_CAPABILITY.to_string(),
                 smolvm_protocol::GRACEFUL_WORKLOAD_STOP_CAPABILITY.to_string(),
                 smolvm_protocol::LIVE_CREDENTIAL_TRUST_CAPABILITY.to_string(),
+                smolvm_protocol::PUSHED_CREDENTIAL_TRUST_CAPABILITY.to_string(),
             ];
             #[cfg(target_os = "linux")]
             if workload::logs_enabled() {
@@ -2915,15 +2916,11 @@ fn handle_request(
             expected_bytes,
         } => live_resources::grow_filesystem(disk, expected_bytes, client_fd),
         AgentRequest::MemoryStatus => handle_memory_status(),
-        AgentRequest::RefreshCredentialTrust => match credentials::refresh() {
-            Ok(rebuilt) => AgentResponse::Ok {
-                data: Some(serde_json::json!({ "rebuilt": rebuilt })),
-            },
-            Err(e) => AgentResponse::error(
-                format!("rebuild credential trust: {e}"),
-                smolvm_protocol::error_codes::INTERNAL_ERROR,
-            ),
-        },
+        AgentRequest::SetCredentialTrust { ca_pem } => {
+            credentials::push_ca(ca_pem.into_bytes());
+            refreshed_trust()
+        }
+        AgentRequest::RefreshCredentialTrust => refreshed_trust(),
         AgentRequest::PressureStatus => handle_pressure_status(),
         AgentRequest::AttachMount {
             share,
@@ -8587,6 +8584,19 @@ fn handle_storage_status() -> AgentResponse {
 /// bytes. A field the running kernel does not publish stays zero rather than
 /// failing the request: `SwapTotal` is absent on a guest with no swap, and
 /// `MemAvailable` predates some very old kernels.
+/// Rebuild the credential trust bundles ([`credentials::refresh`]).
+fn refreshed_trust() -> AgentResponse {
+    match credentials::refresh() {
+        Ok(rebuilt) => AgentResponse::Ok {
+            data: Some(serde_json::json!({ "rebuilt": rebuilt })),
+        },
+        Err(e) => AgentResponse::error(
+            format!("rebuild credential trust: {e}"),
+            smolvm_protocol::error_codes::INTERNAL_ERROR,
+        ),
+    }
+}
+
 fn handle_memory_status() -> AgentResponse {
     AgentResponse::from_result(read_meminfo("/proc/meminfo"), error_codes::STATUS_FAILED)
 }

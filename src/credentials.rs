@@ -125,6 +125,8 @@ pub struct BindingChange {
     pub placeholders: BTreeMap<String, String>,
     /// A CA was added for a new host: a running guest must rebuild its trust before it reaches that host.
     pub trust_changed: bool,
+    /// When the trust changed, the guest's CA bundle as just written, to hand a running guest directly.
+    pub guest_ca: Option<String>,
 }
 
 /// Plan replacing `record`'s bindings with `policy`: validated against the machine's DNS allow-list as at create,
@@ -152,10 +154,19 @@ pub fn plan_binding_change(
     let owner = record.golden.as_deref().unwrap_or(machine);
     let before = record.credential_policy.clone().unwrap_or_default();
     let trust_changed = ensure_cas_for(&ca_dir(owner), owner, &policy, &before)?;
+    let guest_ca = trust_changed
+        .then(|| {
+            std::fs::read_to_string(
+                MachineCa::guest_dir(&ca_dir(owner)).join(smolvm_credentials::ca::GUEST_CA_FILE),
+            )
+        })
+        .transpose()
+        .map_err(|e| Error::config("credentials", format!("read guest CA bundle: {e}")))?;
     Ok(BindingChange {
         policy,
         placeholders,
         trust_changed,
+        guest_ca,
     })
 }
 
@@ -174,7 +185,15 @@ pub struct BindingsSet {
 /// from its next start. An added binding resolves from its variable, or from a value handed over after it
 /// (`machine credentials refresh`, `PUT …/credential-values`).
 pub fn set_bindings(name: &str, policy: CredentialPolicy) -> Result<BindingsSet> {
-    let db = crate::db::SmolvmDb::open()?;
+    set_bindings_in(&crate::db::SmolvmDb::open()?, name, policy)
+}
+
+/// [`set_bindings`] against `db`, for a runtime that keeps its own database.
+pub fn set_bindings_in(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    policy: CredentialPolicy,
+) -> Result<BindingsSet> {
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     let change = plan_binding_change(name, &record, policy)?;
     let saved = db
@@ -446,6 +465,23 @@ pub fn supply_values(machine: &str, values: SuppliedValues) {
     } else {
         held.insert(machine.to_string(), values);
     }
+}
+
+/// Keep the values held for `machine` whose binding is in `keep`, then hold
+/// `values` over them; returns what is now held.
+pub fn retain_and_supply_values(
+    machine: &str,
+    keep: &[&str],
+    values: SuppliedValues,
+) -> SuppliedValues {
+    let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut merged = held.remove(machine).unwrap_or_default();
+    merged.retain(|binding, _| keep.contains(&binding.as_str()));
+    merged.extend(values);
+    if !merged.is_empty() {
+        held.insert(machine.to_string(), merged.clone());
+    }
+    merged
 }
 
 /// Drop whatever was supplied for `machine`.
