@@ -174,7 +174,15 @@ pub struct BindingsSet {
 /// from its next start. An added binding resolves from its variable, or from a value handed over after it
 /// (`machine credentials refresh`, `PUT …/credential-values`).
 pub fn set_bindings(name: &str, policy: CredentialPolicy) -> Result<BindingsSet> {
-    let db = crate::db::SmolvmDb::open()?;
+    set_bindings_in(&crate::db::SmolvmDb::open()?, name, policy)
+}
+
+/// [`set_bindings`] against `db`, for a runtime that keeps its own database.
+pub fn set_bindings_in(
+    db: &crate::db::SmolvmDb,
+    name: &str,
+    policy: CredentialPolicy,
+) -> Result<BindingsSet> {
     let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
     let change = plan_binding_change(name, &record, policy)?;
     let saved = db
@@ -446,6 +454,23 @@ pub fn supply_values(machine: &str, values: SuppliedValues) {
     } else {
         held.insert(machine.to_string(), values);
     }
+}
+
+/// Keep the values held for `machine` whose binding is in `keep`, then hold
+/// `values` over them; returns what is now held.
+pub fn retain_and_supply_values(
+    machine: &str,
+    keep: &[&str],
+    values: SuppliedValues,
+) -> SuppliedValues {
+    let mut held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
+    let mut merged = held.remove(machine).unwrap_or_default();
+    merged.retain(|binding, _| keep.contains(&binding.as_str()));
+    merged.extend(values);
+    if !merged.is_empty() {
+        held.insert(machine.to_string(), merged.clone());
+    }
+    merged
 }
 
 /// Drop whatever was supplied for `machine`.
