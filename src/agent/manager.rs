@@ -470,7 +470,19 @@ pub(crate) fn cleanup_dead_vm_runtime_at(
 /// prefix cannot collide with a 16-hex [`vm_dir_hash`], so it sits safely beside
 /// the per-machine data dirs on the same filesystem.
 pub fn shared_pack_cache_root() -> PathBuf {
+    #[cfg(test)]
+    if let Some(root) = TEST_SHARED_PACK_ROOT.with(|root| root.borrow().clone()) {
+        return root;
+    }
     vm_cache_root().join("_shared")
+}
+
+#[cfg(test)]
+thread_local! {
+    /// A test's own shared pack root, so pointer fixtures need not live in the
+    /// real cache.
+    pub(crate) static TEST_SHARED_PACK_ROOT: std::cell::RefCell<Option<PathBuf>> =
+        const { std::cell::RefCell::new(None) };
 }
 
 /// Actual host disk consumed by a machine's data dir, in MiB. Sums *real blocks*
@@ -565,10 +577,48 @@ pub fn shared_pack_pointer_path(layers_cache_dir: &std::path::Path) -> PathBuf {
 /// iff the pointer exists and names an existing directory. A stale pointer (the
 /// shared copy was evicted) reads as `None`, so callers fall back to the
 /// per-machine extraction path.
+///
+/// The pointer sits in the machine's directory, which its VMM's uid owns, and
+/// root mounts what it names into the machine. So only a regular file naming a
+/// real shared extraction (an 8-hex checksum directory directly under the
+/// shared pack root) is followed; anything else reads as no pointer.
 pub fn read_shared_pack_pointer(layers_cache_dir: &std::path::Path) -> Option<PathBuf> {
-    let raw = std::fs::read_to_string(shared_pack_pointer_path(layers_cache_dir)).ok()?;
-    let shared = PathBuf::from(raw.trim());
-    shared.is_dir().then_some(shared)
+    read_shared_pack_pointer_in(layers_cache_dir, &shared_pack_cache_root())
+}
+
+fn read_shared_pack_pointer_in(
+    layers_cache_dir: &std::path::Path,
+    shared_root: &std::path::Path,
+) -> Option<PathBuf> {
+    let pointer = shared_pack_pointer_path(layers_cache_dir);
+    let metadata = std::fs::symlink_metadata(&pointer).ok()?;
+    if !metadata.file_type().is_file() || metadata.len() > 4096 {
+        tracing::warn!(pointer = %pointer.display(), "shared pack pointer is not a small regular file; ignoring it");
+        return None;
+    }
+    let raw = std::fs::read_to_string(&pointer).ok()?;
+    let named = PathBuf::from(raw.trim());
+    let target = std::fs::symlink_metadata(&named).ok()?;
+    let shared = named.canonicalize().ok()?;
+    let root = shared_root.canonicalize().ok()?;
+    let valid_name = shared
+        .file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| {
+            name.len() == 8
+                && name
+                    .bytes()
+                    .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
+        });
+    if !named.is_absolute()
+        || !target.file_type().is_dir()
+        || shared.parent() != Some(root.as_path())
+        || !valid_name
+    {
+        tracing::warn!(pointer = %pointer.display(), named = %named.display(), "shared pack pointer names no shared extraction; ignoring it");
+        return None;
+    }
+    Some(shared)
 }
 
 /// Per-VM egress telemetry file: `<vm_data_dir>/egress`. The launcher (running
@@ -6820,3 +6870,49 @@ mod egress_signal_tests {
 #[cfg(all(test, unix))]
 #[path = "manager_reviewed_control_tests.rs"]
 mod reviewed_control_tests;
+
+#[cfg(test)]
+mod shared_pack_pointer_tests {
+    use super::*;
+
+    #[test]
+    fn a_shared_pack_pointer_names_only_a_shared_extraction() {
+        let temp = tempfile::TempDir::new().unwrap();
+        let root = temp.path().join("smolvm-pack");
+        let shared = root.join("0badf00d");
+        std::fs::create_dir_all(&shared).unwrap();
+        let elsewhere = temp.path().join("secrets");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let machine = temp.path().join("machine");
+        let layers = machine.join("pack");
+        std::fs::create_dir_all(&layers).unwrap();
+        let point = |target: &std::path::Path| {
+            std::fs::write(
+                shared_pack_pointer_path(&layers),
+                target.to_string_lossy().as_bytes(),
+            )
+            .unwrap()
+        };
+
+        point(&shared);
+        assert_eq!(
+            read_shared_pack_pointer_in(&layers, &root),
+            Some(shared.canonicalize().unwrap())
+        );
+        point(&elsewhere);
+        assert_eq!(read_shared_pack_pointer_in(&layers, &root), None);
+        point(&root);
+        assert_eq!(read_shared_pack_pointer_in(&layers, &root), None);
+        let badname = root.join("not-hex!");
+        std::fs::create_dir_all(&badname).unwrap();
+        point(&badname);
+        assert_eq!(read_shared_pack_pointer_in(&layers, &root), None);
+        #[cfg(unix)]
+        {
+            let link = root.join("deadbeef");
+            std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+            point(&link);
+            assert_eq!(read_shared_pack_pointer_in(&layers, &root), None);
+        }
+    }
+}
