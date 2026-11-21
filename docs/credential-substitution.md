@@ -185,22 +185,17 @@ path, and expects the raw value back. See `crates/smolvm-credentials`.
   pointing at the bundle; `NODE_EXTRA_CA_CERTS` and `DENO_CERT` at `ca.pem`.
   curl, Python, Node, Deno, Git and anything using OpenSSL defaults work
   unmodified.
-- For clients that ignore those variables, in an image container:
-  - the image's system bundle (for example `/etc/ssl/certs/ca-certificates.crt`,
-    followed through the image's own links) shows the same bundle, so a
-    program reading the system store directly trusts the machine CA;
-  - on images with p11-kit anchor directories (Fedora, RHEL, Arch),
-    `smolvm-credentials.pem` there makes Chrome, Chromium and Firefox trust it;
-  - a `CACertificates` policy in `/etc/chromium/policies/managed` and
-    `/etc/opt/chrome/policies/managed` makes Chrome and Chromium trust it on
-    every distribution, Debian and Ubuntu included.
+- Chrome and Chromium, which ignore those variables, get the CA through a
+  `CACertificates` policy at `/etc/chromium/policies/managed` and
+  `/etc/opt/chrome/policies/managed` (`smolvm-credentials.json`), in an image
+  container on any distribution. A CA added while the machine runs reaches a
+  browser at its next launch.
 
-  Each is a read-only bind; the image's own files are never written, so a
-  start without credentials trusts exactly what the image does. An image with
-  no system bundle at start (a bare `debian` before `ca-certificates` is
-  installed) gets none, and a CA added while the machine runs reaches a
-  browser at its next launch. A client with its own trust store (Java
-  keystores, some Go binaries with pinned roots) needs `ca.pem` added to it.
+  The image's system bundle and trust anchors are left alone, so `apt` and
+  `dnf` updates of `ca-certificates` keep working and nothing of the machine
+  CA is baked into the image. A program that reads only the system store, or
+  has its own trust store (Java keystores, some Go binaries with pinned
+  roots), needs `ca.pem` added to it.
 
 ## What happens to a request
 
