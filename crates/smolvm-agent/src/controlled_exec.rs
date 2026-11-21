@@ -121,12 +121,6 @@ struct OwnedCommand {
     terminate_on_drop: bool,
 }
 
-struct ProcessFile(std::path::PathBuf);
-impl Drop for ProcessFile {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_file(&self.0);
-    }
-}
 impl Drop for OwnedCommand {
     fn drop(&mut self) {
         if self.terminate_on_drop {
@@ -237,7 +231,7 @@ fn execute(
         .into(),
     ];
     process.args.extend(launch.command);
-    let spec = ProcessFile(crate::write_exec_process_file(&container, &process)?);
+    let spec = crate::write_exec_process_file(&container, &process)?;
     let console = if process.terminal {
         Some(crate::pty::ConsoleSocket::bind(&container)?)
     } else {
@@ -245,9 +239,9 @@ fn execute(
     };
     let builder = match &console {
         Some(console) => {
-            crate::crun::CrunCommand::exec_with_process_console(&container, &spec.0, console.path())
+            crate::crun::CrunCommand::exec_with_process_console(&container, &spec, console.path())
         }
-        None => crate::crun::CrunCommand::exec_with_process(&container, &spec.0)
+        None => crate::crun::CrunCommand::exec_with_process(&container, &spec)
             .stdin_piped()
             .capture_output(),
     };

@@ -60,7 +60,7 @@ pub struct CrunCommand {
     pending_positionals: Vec<String>,
 }
 
-/// Unique pid file for one foreground `crun exec` invocation.
+/// Unique pid file for one `crun exec` invocation, foreground or background.
 ///
 /// The PID of the `crun` client is not the PID of the workload in the
 /// container. Keeping the pid file alive until the wait completes lets timeout
@@ -199,6 +199,12 @@ pub fn take_create_log(container_id: &str) -> String {
     take_log(&create_log_path(container_id))
 }
 
+/// Remove the log a successful create left, so that every create does not keep
+/// an inode on the run directory's tmpfs.
+pub fn remove_create_log(container_id: &str) {
+    let _ = std::fs::remove_file(create_log_path(container_id));
+}
+
 /// Read back and remove the diagnostics crun recorded at `path`.
 pub fn take_log(path: &Path) -> String {
     let text = std::fs::read_to_string(path).unwrap_or_default();
@@ -262,7 +268,8 @@ impl CrunCommand {
     /// Stdio is null because the created container inherits it: capturing the
     /// pipes would make `output()` block until the container itself exits.
     /// crun's own diagnostics therefore go to [`create_log_path`], which a
-    /// failed create reads back with [`take_create_log`].
+    /// failed create reads back with [`take_create_log`] and a successful one
+    /// removes with [`remove_create_log`].
     pub fn create(bundle_dir: &Path, container_id: &str) -> Self {
         let log_path = create_log_path(container_id);
         // A stale log from an earlier attempt would be misreported as this
@@ -745,6 +752,56 @@ impl CrunCommand {
         self.cmd.status()
     }
 }
+
+/// Mount a tmpfs over [`paths::CONTAINERS_RUN_DIR`] once the storage disk is
+/// up, so the files kept there stay off the disk.
+///
+/// The directory holds only files that live while one crun call runs: the pid
+/// file of every exec ([`ExecPidFile`]), the process file of an exec whose user
+/// has supplementary groups (`exec-process/`), and the `--log` of a create or
+/// a workload launch (with the launch's pid file). On the storage disk,
+/// every exec created and removed a file there, about 120 sectors with the
+/// journal commits, so a machine that was only polled kept writing its
+/// persistent disk and growing its branch and checkpoint deltas (smolvm#2357).
+/// Nothing there has to survive a reboot.
+///
+/// What an earlier agent left in the directory on the disk is removed first,
+/// since the mount would hide it for good: one write at the first boot after
+/// an upgrade and none after.
+///
+/// Mounted in the agent's own mount namespace, where crun writes `--pid-file`
+/// and `--log`. Does nothing when a filesystem is already mounted there. On an
+/// error the caller carries on: the files land on the disk as before.
+#[cfg(target_os = "linux")]
+pub fn mount_run_dir_tmpfs() -> std::io::Result<()> {
+    let dir = Path::new(paths::CONTAINERS_RUN_DIR);
+    if paths::is_mount_point(dir) {
+        return Ok(());
+    }
+    if dir
+        .read_dir()
+        .is_ok_and(|mut entries| entries.next().is_some())
+    {
+        let _ = std::fs::remove_dir_all(dir);
+    }
+    std::fs::create_dir_all(dir)?;
+    crate::storage::mount_private_tmpfs(dir, RUN_DIR_TMPFS_OPTIONS)
+}
+
+/// Options for the [`mount_run_dir_tmpfs`] tmpfs (mounted `nosuid,nodev,
+/// noexec`: crun only reads and writes files there).
+///
+/// Each file with any data takes at least one 4 KiB page, whatever its size, so
+/// the 32 MiB cap holds 8192 such files. A foreground exec holds two while its
+/// crun runs (its pid file and, for a user with supplementary groups, its
+/// process file), so about 4096 execs can run at once; both are removed when
+/// the exec ends. `nr_inodes` bounds the files that hold no data, such as an
+/// empty `--log`, which `size` does not count: 16384 inodes, twice the files
+/// the pages allow, at about 1 KiB of kernel memory each (inode and dentry),
+/// so at most 16 MiB more. The caps keep a runaway log or a leak from using
+/// unbounded guest memory; a tmpfs only takes memory for what it stores.
+#[cfg(target_os = "linux")]
+const RUN_DIR_TMPFS_OPTIONS: &std::ffi::CStr = c"mode=0755,size=32m,nr_inodes=16k";
 
 /// Bind crun's binary read-only onto itself, once at boot.
 ///

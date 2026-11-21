@@ -5910,6 +5910,7 @@ fn establish_keepalive_container(
             crate::crun::create_failure_reason(&container_id, &create)
         )));
     }
+    crate::crun::remove_create_log(&container_id);
 
     let start = CrunCommand::start(&container_id)
         .output()
@@ -5968,8 +5969,12 @@ fn run_exec_in_container(
     .stdin_null()
     .capture_output()
     .spawn()
+    .map(|child| (child, None::<()>))
     .map_err(|e| e.to_string());
-    let mut child = spawned.map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
+    // `_process_file` removes the exec's process file (when it has one) once the
+    // wait below has seen crun exit.
+    let (mut child, _process_file) =
+        spawned.map_err(|e| StorageError::new(format!("crun exec failed: {}", e)))?;
 
     // On timeout/disconnect, kill only the exec'd process — NOT the main
     // container. The main container hosts the shared namespace for all execs;
@@ -6694,10 +6699,11 @@ impl Drop for DockerAuthDir {
     }
 }
 
-/// Mount a small private tmpfs on `dir`, so what is written there stays in
-/// memory.
+/// Mount a private tmpfs on `dir` with the tmpfs `options` (its size cap and
+/// mode), so what is written there stays in memory. Nothing on it can be run
+/// or act as a device or a setuid binary.
 #[cfg(target_os = "linux")]
-fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
+pub(crate) fn mount_private_tmpfs(dir: &Path, options: &std::ffi::CStr) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt;
     let target = std::ffi::CString::new(dir.as_os_str().as_bytes())?;
     // SAFETY: every pointer is a valid NUL-terminated string.
@@ -6707,7 +6713,7 @@ fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
             target.as_ptr(),
             c"tmpfs".as_ptr(),
             libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
-            c"size=64k,mode=0700".as_ptr().cast(),
+            options.as_ptr().cast(),
         )
     };
     if rc == 0 {
@@ -6719,7 +6725,7 @@ fn mount_private_tmpfs(dir: &Path) -> std::io::Result<()> {
 
 /// The agent only runs in a Linux guest; elsewhere it is built for tests.
 #[cfg(not(target_os = "linux"))]
-fn mount_private_tmpfs(_dir: &Path) -> std::io::Result<()> {
+pub(crate) fn mount_private_tmpfs(_dir: &Path, _options: &std::ffi::CStr) -> std::io::Result<()> {
     Err(std::io::ErrorKind::Unsupported.into())
 }
 
@@ -6739,7 +6745,7 @@ fn setup_docker_auth(image: &str, auth: Option<&RegistryAuth>) -> Result<DockerA
 
     let config_json = match auth {
         Some(a) => {
-            mount_private_tmpfs(auth_dir.path()).map_err(|e| {
+            mount_private_tmpfs(auth_dir.path(), c"size=64k,mode=0700").map_err(|e| {
                 StorageError::new(format!(
                     "failed to mount tmpfs for registry credentials: {}",
                     e

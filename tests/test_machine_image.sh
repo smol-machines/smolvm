@@ -437,6 +437,77 @@ test_cp_matches_exec_on_image_machine() {
     cleanup_cp_image
 }
 
+# Execs leave the machine's disks alone: crun's per-exec files live on a tmpfs
+# over /storage/containers/run (smolvm#2357). Each foreground exec used to
+# create and remove its pid file (and, for a user with supplementary groups such
+# as alpine's root, its process file) in that directory on the storage disk, and
+# each background exec its pid file in the agent's /tmp, which is on the overlay
+# disk once the persistent rootfs is pivoted in: about 120 to 136 sectors (a
+# journal commit) on that disk per exec.
+test_exec_does_not_write_disks() {
+    local vm_name="exec-disk-quiet-$$"
+    cleanup_exec_disk_quiet() {
+        $SMOLVM machine stop --name "$vm_name" 2>/dev/null
+        $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
+    }
+
+    $SMOLVM machine create --name "$vm_name" --image alpine:3.20 --net 2>&1 || { cleanup_exec_disk_quiet; return 1; }
+    run_with_timeout 120 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 || { cleanup_exec_disk_quiet; return 1; }
+
+    # Sectors written to each of the machine's virtio disks, after a sync, as
+    # "vda=N vdb=M": every disk is measured, whichever holds /storage or /.
+    local read_disks='sync; for d in /sys/block/vd*; do printf "%s=%s " "${d##*/}" "$(awk "{print \$7}" "$d/stat")"; done'
+    # Per-disk sectors written between two readings, then the largest of them.
+    disk_deltas() {
+        awk -v a="$1" -v b="$2" 'BEGIN {
+            n = split(a, x, " "); for (i = 1; i <= n; i++) { split(x[i], kv, "="); s[kv[1]] = kv[2] }
+            m = split(b, y, " "); for (i = 1; i <= m; i++) { split(y[i], kv, "="); printf "%s=%d ", kv[1], kv[2] - s[kv[1]] }
+        }'
+    }
+    max_delta() { echo "$1" | tr ' ' '\n' | awk -F= 'NF == 2 && $2 > m { m = $2 } END { print m + 0 }'; }
+    read_disks_now() { run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- sh -c "$read_disks" 2>&1; }
+
+    # The storage disk is grown at boot and ext4lazyinit then zeroes its new
+    # inode tables in the background. Wait for a 10 s window in which no disk
+    # wrote more than the two readings' execs would on an agent without the
+    # fix (136 sectors each, the most an exec wrote in measurements), so the
+    # wait ends with and without the fix and the measurement below tells the
+    # two apart.
+    local a b deltas quiet="" i
+    for i in $(seq 1 40); do
+        a=$(read_disks_now)
+        sleep 10
+        b=$(read_disks_now)
+        deltas=$(disk_deltas "$a" "$b")
+        [[ $a == *=* && $b == *=* && $(max_delta "$deltas") -le 272 ]] && { quiet=1; break; }
+    done
+    [[ -n $quiet ]] || {
+        echo "FAIL: disk never went quiet in 400 s (last 10 s window: ${deltas:-no readings: '$a' '$b'})"
+        cleanup_exec_disk_quiet
+        return 1
+    }
+
+    # Eight foreground and four background execs, then a last reading.
+    a=$(read_disks_now)
+    for i in 1 2 3 4 5 6 7 8; do
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- true >/dev/null 2>&1
+    done
+    for i in 1 2 3 4; do
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" --detach -- true >/dev/null 2>&1
+    done
+    b=$(read_disks_now)
+    cleanup_exec_disk_quiet
+
+    [[ $a == *=* && $b == *=* ]] || { echo "unexpected readings: '$a' '$b'"; return 1; }
+    deltas=$(disk_deltas "$a" "$b")
+    # Before the fix each of these execs wrote 120 to 136 sectors to one of
+    # the disks; allow less than one exec's worth on any disk.
+    [[ $(max_delta "$deltas") -lt 120 ]] || {
+        echo "FAIL: 8 foreground and 4 background execs wrote sectors to the machine's disks: $deltas"
+        return 1
+    }
+}
+
 run_test "Create with --image" test_create_with_image || true
 run_test "Mirrored pull keeps original image reference" test_mirrored_image_is_cached_under_original_reference || true
 run_test "cp: reads and writes the container filesystem exec uses" test_cp_matches_exec_on_image_machine || true
@@ -452,5 +523,6 @@ run_test "Exec-join: ephemeral run is namespace-isolated" test_ephemeral_run_is_
 run_test "Exec-join: exec recovers after main container exits" test_exec_recovers_after_main_container_exits || true
 run_test "Exec-join: timeout does not kill main container (orphan documented)" test_exec_join_timeout_does_not_kill_main_container || true
 run_test "Exec-join: joined exec user behavior (crun exec runs as root)" test_exec_join_documents_user_behavior || true
+run_test "Exec: execs do not write the machine's disks" test_exec_does_not_write_disks || true
 
 print_summary "Image-Backed Tests"
