@@ -237,6 +237,7 @@ pub fn create_disk_overlays(specs: &[DiskOverlaySpec]) -> Result<()> {
                 ),
             ));
         }
+        crate::disk_grants::record(overlay, base);
     }
     Ok(())
 }

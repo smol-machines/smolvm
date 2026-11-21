@@ -161,6 +161,9 @@ fn chain(top: &Path) -> Result<Vec<PathBuf>> {
 /// nothing declares (`top` when `top_format` is `None`, or a backing its
 /// parent leaves undeclared) is probed, as imago does.
 fn chain_formats(top: &Path, top_format: Option<DiskFormat>) -> Result<Vec<(PathBuf, DiskFormat)>> {
+    if top_format != Some(DiskFormat::Raw) {
+        crate::disk_grants::report_chain(top, None, "compaction");
+    }
     let mut layers: Vec<(PathBuf, DiskFormat)> = Vec::new();
     let mut current = top
         .canonicalize()
@@ -358,7 +361,9 @@ fn create_overlay(out: &Path, size: u64, backing: &Path, format: DiskFormat) -> 
                 .create()
                 .await
         })
-        .map_err(|e| compact_err(&format!("create {}", out.display()), e))
+        .map_err(|e| compact_err(&format!("create {}", out.display()), e))?;
+    crate::disk_grants::record(out, Path::new(backing));
+    Ok(())
 }
 
 /// The guest ranges a layer itself defines (data, compressed data or an explicit
