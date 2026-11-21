@@ -127,15 +127,24 @@ test_plaintext_not_in_pack() {
     $SMOLVM machine create --name "$vm" --smolfile "$SECRET_TMPDIR/Smolfile.nopack" 2>&1 || return 1
     $SMOLVM machine start --name "$vm" 2>&1 || { cleanup_vm "$vm"; return 1; }
     $SMOLVM machine stop --name "$vm" 2>&1 || true
-    local pack="$SECRET_TMPDIR/out.smolmachine"
+    # `-o` names the executable stub; the sidecar is written beside it as
+    # "$pack.smolmachine". Check both.
+    local pack="$SECRET_TMPDIR/out"
     $SMOLVM pack create --from-vm "$vm" -o "$pack" 2>&1 || { cleanup_vm "$vm"; return 1; }
-    local leaked=0
-    if strings "$pack" 2>/dev/null | grep -qF "$SECRET_VALUE"; then
-        leaked=1
-        log_info "LEAK: plaintext secret found in pack $pack"
-    fi
+    local leaked=0 f
+    for f in "$pack" "$pack.smolmachine"; do
+        # Scan directly: grep -q can close a strings pipeline early, making
+        # pipefail treat a match as a failure after strings receives SIGPIPE.
+        if LC_ALL=C grep -qaF -- "$SECRET_VALUE" "$f"; then
+            leaked=1
+            log_info "LEAK: plaintext secret found in pack $f"
+        elif [[ $? -ne 1 ]]; then
+            leaked=1
+            log_info "Could not scan pack $f"
+        fi
+    done
     cleanup_vm "$vm"
-    [[ -f "$pack" ]] && [[ "$leaked" -eq 0 ]]
+    [[ -f "$pack" ]] && [[ -f "$pack.smolmachine" ]] && [[ "$leaked" -eq 0 ]]
 }
 
 # =============================================================================
