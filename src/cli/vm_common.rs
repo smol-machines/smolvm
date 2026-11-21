@@ -2749,6 +2749,51 @@ pub fn stop_vm_named_with_timeout(
     Ok(())
 }
 
+pub fn power_off_named(name: &str, expected_pid: i32) -> smolvm::Result<()> {
+    let _lock = smolvm::agent::fork::lock_fork_source(name)?;
+    let db = SmolvmDb::open()?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+    if record.pid != Some(expected_pid) || record.paused_checkpoint.is_some() {
+        return Err(smolvm::Error::agent(
+            "power off",
+            "machine execution changed",
+        ));
+    }
+    if !smolvm::agent::fork::stop_blocking_dependent_clones(&db, name)?.is_empty() {
+        return Err(smolvm::Error::agent(
+            "power off",
+            "machine still has running dependent clones",
+        ));
+    }
+    let manager = AgentManager::for_vm(name)?;
+    manager.detach();
+    manager.power_off_verified(expected_pid, record.pid_start_time)?;
+    db.update_vm(name, |r| {
+        if (r.pid, r.pid_start_time) == (record.pid, record.pid_start_time) {
+            r.restart.user_stopped = true;
+            r.mark_process_stopped();
+        }
+    })?;
+    let current = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+    if current.pid.is_some() || current.state != RecordState::Stopped {
+        return Err(smolvm::Error::agent(
+            "power off",
+            "machine state changed before stop publication",
+        ));
+    }
+    if record.source_smolmachine.is_some() {
+        smolvm_pack::extract::force_detach_layers_volume(&smolvm::agent::machine_layers_cache_dir(
+            name,
+        ));
+    }
+    println!("Powered off machine: {}", name);
+    Ok(())
+}
+
 /// Kill an orphaned `_boot-vm` process for a machine that the DB thinks is
 /// not running.
 ///

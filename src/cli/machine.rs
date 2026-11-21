@@ -448,6 +448,9 @@ pub enum MachineCmd {
     /// Stop a running machine
     Stop(StopCmd),
 
+    /// Power off without guest synchronization. Unsaved data may be lost.
+    PowerOff(PowerOffCmd),
+
     /// Save RAM and disk durably, then stop at the saved execution boundary
     Pause(PauseCmd),
 
@@ -560,6 +563,7 @@ impl MachineCmd {
             MachineCmd::CheckpointWarm(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
+            MachineCmd::PowerOff(cmd) => cmd.run(),
             MachineCmd::Pause(cmd) => cmd.run(),
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -6452,6 +6456,23 @@ impl ResumeCmd {
         smolvm::embedded::EmbeddedRuntime::new()?.resume_machine_detached(&self.name)?;
         println!("Machine '{}' resumed", self.name);
         Ok(())
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct PowerOffCmd {
+    /// Registered machine to power off
+    #[arg(long)]
+    pub name: String,
+
+    /// PID of the reviewed VM execution
+    #[arg(long, value_parser = clap::value_parser!(i32).range(2..))]
+    pub expected_pid: i32,
+}
+
+impl PowerOffCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        vm_common::power_off_named(&self.name, self.expected_pid)
     }
 }
 

@@ -4434,6 +4434,27 @@ impl AgentManager {
         }
     }
 
+    /// End only the reviewed VM process, without waiting for a guest flush.
+    pub fn power_off_verified(&self, pid: i32, start: Option<u64>) -> Result<()> {
+        if pid <= 1
+            || start.is_none()
+            || self.pid_and_start_time() != Some((pid, start))
+            || !process::is_our_process_strict(pid, start)
+        {
+            return Err(Error::agent(
+                "power off",
+                "machine process identity changed",
+            ));
+        }
+        if let Some(name) = self.name() {
+            crate::vm_exit::mark_stop_requested(&vm_data_dir(name), pid);
+        }
+        process::stop_vm_process(pid, VM_EXIT_FLUSH_TIMEOUT, process::VM_SIGKILL_TIMEOUT)?;
+        self.cleanup_marker_files();
+        self.cleanup_dead_vm_runtime();
+        Ok(())
+    }
+
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
         self.stop_inner(false, None)
