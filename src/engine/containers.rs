@@ -1569,18 +1569,6 @@ async fn run_container(
     execution_generation: u64,
 ) -> ApiResult<bool> {
     let record = record.clone();
-    // Files uploaded before the first start go in now, before the command.
-    for (file, destination) in &record.pending_archives {
-        let unpacked = match tokio::fs::read(file).await {
-            Ok(bytes) => super::archive::unpack(&socket, &record, &bytes, destination).await,
-            Err(e) => Err(ApiError::internal(format!("read staged archive: {e}"))),
-        };
-        let _ = tokio::fs::remove_file(file).await;
-        if let Err(e) = unpacked {
-            tracing::warn!(container = %record.id, error = %e.message, "could not unpack an uploaded archive");
-        }
-    }
-
     let spec = start_spec(engine, &record);
     let origin = smolvm_protocol::container_session::Origin {
         generation: execution_generation,
@@ -1591,7 +1579,14 @@ async fn run_container(
         spec.overlay_id.clone(),
         origin.clone(),
     );
-    match session.start(spec).await {
+    let started = async {
+        super::archive::apply_pending(engine, c, &socket)
+            .await
+            .map_err(|e| std::io::Error::other(e.message))?;
+        session.start(spec).await
+    }
+    .await;
+    match started {
         Ok(()) => {
             if let Some(lease) = &mut image_lease {
                 lease.prepared();
@@ -2044,7 +2039,10 @@ fn remove_after_failed_start(engine: &Arc<Engine>, c: &Arc<Container>) {
 }
 
 /// The agent request that runs the container's command.
-fn start_spec(engine: &Engine, record: &ContainerRecord) -> smolvm_protocol::ContainerStartSpec {
+pub(super) fn start_spec(
+    engine: &Engine,
+    record: &ContainerRecord,
+) -> smolvm_protocol::ContainerStartSpec {
     use smolvm_protocol::ContainerMount;
     let mut mounts: Vec<&MountRecord> = record.mounts.iter().filter(|m| !m.socket).collect();
     mounts.sort_by_key(|m| std::path::Path::new(&m.destination).components().count());
@@ -2262,7 +2260,7 @@ fn should_restart(record: &ContainerRecord, code: i64) -> bool {
 /// machine: `host` must be running; the container's host directories are
 /// added to the machine, and its image pulled there. Returns the machine's
 /// agent socket.
-async fn guest_machine(
+pub(super) async fn guest_machine(
     engine: &Arc<Engine>,
     record: &ContainerRecord,
     host: &str,
@@ -2333,7 +2331,7 @@ async fn guest_machine(
 }
 
 /// Take a container's host directories back out of the machine it ran in.
-async fn release_guest_shares(engine: &Arc<Engine>, record: &ContainerRecord) {
+pub(super) async fn release_guest_shares(engine: &Arc<Engine>, record: &ContainerRecord) {
     let Some(host) = record.network_host().and_then(|h| engine.find_container(h)) else {
         return;
     };

@@ -103,6 +103,7 @@ mod directory_write;
 mod dirwatch;
 mod disk_trim;
 mod docker_bridge;
+mod file_metadata;
 mod forkpoint;
 mod interactive_control;
 #[cfg(all(test, target_os = "linux"))]
@@ -2406,6 +2407,7 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
     // the session is replaced, or when a protocol violation (e.g.,
     // another request type arriving mid-stream) takes it.
     let mut write_session: Option<WriteSession> = None;
+    let mut files_session: Option<container::FilesSession> = None;
     let mut directory_session: Option<directory_write::Session> = None;
 
     loop {
@@ -2467,6 +2469,23 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
                     continue;
                 }
             };
+
+        if let Some(session) = files_session.take() {
+            let response = match request {
+                AgentRequest::ContainerEndFiles { overlay_id, id }
+                    if overlay_id == session.overlay_id && id == session.id =>
+                {
+                    session.finish()
+                }
+                _ => AgentResponse::error(
+                    "inspection connection requires its matching end request",
+                    error_codes::INVALID_REQUEST,
+                ),
+            };
+            drop(session);
+            send_response(stream, &response)?;
+            return Ok(());
+        }
 
         // Work around serde flatten + internally-tagged enum limitation:
         // fields with #[serde(default)] can be silently dropped during
@@ -2657,6 +2676,20 @@ fn handle_connection(stream: &mut impl ReadWrite) -> Result<(), Box<dyn std::err
         } = request
         {
             handle_streaming_export_layer(stream, image_digest, layer_index)?;
+            continue;
+        }
+
+        if let AgentRequest::ContainerBeginFiles(spec) = request {
+            let response = match container::FilesSession::begin(*spec) {
+                Ok(session) => {
+                    let response =
+                        AgentResponse::ok_with_data(serde_json::json!({"id": session.id}));
+                    files_session = Some(session);
+                    response
+                }
+                Err(error) => error,
+            };
+            send_response(stream, &response)?;
             continue;
         }
 
@@ -3169,6 +3202,8 @@ fn handle_request(
             AgentResponse::error("export layer not handled here", error_codes::INTERNAL_ERROR)
         }
 
+        AgentRequest::StatPath { path, target } => file_metadata::handle(&path, target.as_ref()),
+
         AgentRequest::FileWrite {
             path,
             data,
@@ -3235,6 +3270,19 @@ fn handle_request(
                 "ContainerStart is a streaming request",
                 error_codes::INVALID_REQUEST,
             )
+        }
+
+        AgentRequest::ContainerPrepareFiles {
+            image,
+            overlay_id,
+            image_source,
+        } => container::handle_prepare_files(&image, &overlay_id, image_source.as_ref()),
+        AgentRequest::ContainerBeginFiles(_) => AgentResponse::error(
+            "inspection requires a held connection",
+            error_codes::INVALID_REQUEST,
+        ),
+        AgentRequest::ContainerEndFiles { overlay_id, id } => {
+            container::handle_end_files(&overlay_id, &id)
         }
 
         AgentRequest::ContainerSignal {
@@ -3327,6 +3375,7 @@ fn apply_mode_best_effort(_path: &std::path::Path, _mode: u32) {}
 #[derive(Clone, Copy, Debug)]
 enum FilePathAccess {
     Read,
+    Metadata,
     Write,
 }
 
@@ -3442,6 +3491,31 @@ fn ensure_descendant_after_canonicalize(
                 return Err(invalid_guest_path_error(
                     original_path,
                     "resolved path escapes allowed root",
+                ));
+            }
+        }
+        FilePathAccess::Metadata => {
+            // Describe the final link without following it, including a dangling
+            // link. Its parent must still resolve within the selected root.
+            let parent = if path == root {
+                path
+            } else {
+                path.parent().unwrap_or(path)
+            };
+            let parent = parent.canonicalize().map_err(|e| {
+                AgentResponse::error(
+                    e.to_string(),
+                    if e.kind() == std::io::ErrorKind::NotFound {
+                        error_codes::NOT_FOUND
+                    } else {
+                        error_codes::FILE_IO_FAILED
+                    },
+                )
+            })?;
+            if !parent.starts_with(&root_canon) {
+                return Err(invalid_guest_path_error(
+                    original_path,
+                    "resolved parent escapes allowed root",
                 ));
             }
         }

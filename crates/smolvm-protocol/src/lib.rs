@@ -1142,6 +1142,16 @@ pub enum AgentRequest {
         target: Option<WorkloadTarget>,
     },
 
+    /// Read metadata without following the final symlink, in the selected
+    /// filesystem. Returns a [`PathMetadata`] object as the response data.
+    StatPath {
+        /// Absolute guest path; trailing slash/dot retains directory semantics.
+        path: String,
+        /// Filesystem to inspect; absent means infer the active workload.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        target: Option<WorkloadTarget>,
+    },
+
     /// Stream a tar archive of a guest directory without creating a guest-side
     /// temporary file. Used by staged mounts to batch many small files across
     /// vsock instead of paying one virtiofs round trip per file.
@@ -1250,6 +1260,31 @@ pub enum AgentRequest {
     /// `Run` on the same overlay join this container while it runs. The host
     /// closing the connection kills the container.
     ContainerStart(Box<ContainerStartSpec>),
+
+    /// Prepare a Docker container's persistent filesystem for inspection
+    /// before its first start, without running its command or clearing /tmp.
+    ContainerPrepareFiles {
+        /// Image the container filesystem is built from.
+        image: String,
+        /// Persistent overlay ID.
+        overlay_id: String,
+        /// Explicit layer source, as for ContainerStart.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        image_source: Option<ContainerImageSource>,
+    },
+
+    /// Create the configured mount namespace for file access without starting
+    /// the container command. Replies with an inspection ID. The connection
+    /// owns the namespace until its matching ContainerEndFiles or disconnect.
+    /// Temporary mounts are read-only until the workload is started.
+    ContainerBeginFiles(Box<ContainerStartSpec>),
+    /// Release exactly the inspection namespace returned by ContainerBeginFiles.
+    ContainerEndFiles {
+        /// Persistent overlay ID.
+        overlay_id: String,
+        /// Inspection container ID returned by the guest.
+        id: String,
+    },
 
     /// Send a signal to the init process of the container `ContainerStart`
     /// started on `overlay_id`.
@@ -1601,6 +1636,7 @@ impl AgentRequest {
             AgentRequest::DirectoryWriteBegin { .. } => "DirectoryWriteBegin".into(),
             AgentRequest::FileWriteChunk { .. } => "FileWriteChunk".into(),
             AgentRequest::FileRead { .. } => "FileRead".into(),
+            AgentRequest::StatPath { .. } => "StatPath".into(),
             AgentRequest::ListDirectory { .. } => "ListDirectory".into(),
             AgentRequest::ArchiveDirectory { .. } => "ArchiveDirectory".into(),
             // Pod requests: spec/process JSON may carry env secrets — emit ids only.
@@ -1628,6 +1664,15 @@ impl AgentRequest {
                 spec.tty,
                 spec.mounts.len()
             ),
+            AgentRequest::ContainerPrepareFiles { overlay_id, .. } => {
+                format!("ContainerPrepareFiles {{ overlay: {overlay_id} }}")
+            }
+            AgentRequest::ContainerBeginFiles(spec) => {
+                format!("ContainerBeginFiles {{ overlay: {} }}", spec.overlay_id)
+            }
+            AgentRequest::ContainerEndFiles { overlay_id, .. } => {
+                format!("ContainerEndFiles {{ overlay: {overlay_id} }}")
+            }
             AgentRequest::ContainerSignal {
                 overlay_id,
                 signal,
@@ -1676,6 +1721,29 @@ pub struct DirectoryEntry {
     /// Size in bytes. Zero for anything that is not a regular file.
     #[serde(default)]
     pub size: u64,
+}
+
+/// Guest filesystem metadata; modes use POSIX permission bits, not host modes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PathMetadata {
+    /// `file`, `dir`, `symlink`, or `other` (devices, sockets and FIFOs).
+    pub kind: String,
+    /// Guest lstat size in bytes; a symlink's size describes its target text.
+    pub size: u64,
+    /// POSIX permission and special bits, masked to 07777.
+    pub mode: u32,
+    /// Owner's guest user ID.
+    pub uid: u32,
+    /// Owner's guest group ID.
+    pub gid: u32,
+    /// Modification time in whole seconds since the Unix epoch, rounded down.
+    pub modified_secs: i64,
+    /// Fractional nanoseconds within the modification second, below one billion.
+    pub modified_nanos: u32,
+    /// Literal symlink target; empty for other entry types.
+    pub link_target: String,
+    /// Absolute ultimate target for Docker-style follow-link requests.
+    pub resolved_link_target: String,
 }
 
 /// Agent response types.

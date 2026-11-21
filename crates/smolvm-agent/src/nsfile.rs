@@ -31,11 +31,10 @@
 //! [`crate::forkpoint`] uses. Bytes move over pipes so neither side buffers a
 //! whole file.
 //!
-//! WHEN THE WORKLOAD IS NOT RUNNING the old behavior is correct and is kept:
-//! overlayfs reads `upper` at mount time, so populating it *before* the overlay
-//! is mounted is exactly how a rootfs is pre-seeded. Only writes *beneath a
-//! live* overlay are lost. That is why this routes into the container only when
-//! one is actually running.
+//! Stopped Docker containers use a create-only inspection namespace owned by
+//! an agent connection. It has the same root and mounts without executing the
+//! workload. Older hosts without an inspection session still use the merged
+//! overlay directly; new hosts hold the session for the entire file operation.
 
 use std::io::{BufRead, Read, Write};
 use std::os::unix::fs::OpenOptionsExt as _;
@@ -125,9 +124,21 @@ pub fn run_helper() -> i32 {
     let result = match op {
         "read" => helper_read(&path),
         "list" => helper_list(&path),
+        "stat" => {
+            // JSON escapes literal newlines in filenames and error messages.
+            let mut output = std::io::stdout().lock();
+            serde_json::to_writer(
+                &mut output,
+                &crate::file_metadata::response(Path::new(&path)),
+            )
+            .map_err(|e| e.to_string())
+            .and_then(|_| output.write_all(b"\n").map_err(|e| e.to_string()))
+        }
         "write" => helper_write(&path, mode, uid, gid),
-        "unpack-directory" => crate::directory_write::helper(&path, uid, gid),
+        "unpack" => helper_unpack(&path),
         "archive" => helper_archive(&path),
+        "readonly-tmpfs" => helper_readonly_tmpfs(&path),
+        "unpack-directory" => crate::directory_write::helper(&path, uid, gid),
         "connect" => helper_connect(&path),
         "mount-cache" => helper_mount_cache(&path, &args),
         "remount-shm" => helper_remount_shm(&path, &args),
@@ -473,6 +484,77 @@ fn helper_remount_shm(path: &str, args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// An inspection-only tmpfs disappears when inspection ends. Make it read-only
+/// so an upload cannot report success for data that is immediately discarded.
+#[cfg(target_os = "linux")]
+fn helper_readonly_tmpfs(path: &str) -> Result<(), String> {
+    let target = std::ffi::CString::new(path).map_err(|e| e.to_string())?;
+    // SAFETY: valid NUL-terminated path and initialized output buffers.
+    let mut fs: libc::statfs = unsafe { std::mem::zeroed() };
+    if unsafe { libc::statfs(target.as_ptr(), &mut fs) } != 0 {
+        return Err(format!(
+            "statfs {path}: {}",
+            std::io::Error::last_os_error()
+        ));
+    }
+    if is_tmpfs(&fs) {
+        // Keep the current per-mount restrictions during the bind remount.
+        let mut vfs: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(target.as_ptr(), &mut vfs) } != 0 {
+            return Err(format!(
+                "statvfs {path}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+        let kept = vfs.f_flag
+            & (libc::MS_NOSUID
+                | libc::MS_NODEV
+                | libc::MS_NOEXEC
+                | libc::MS_NOATIME
+                | libc::MS_NODIRATIME
+                | libc::MS_RELATIME);
+        // SAFETY: the target is a mounted tmpfs in this helper's namespace.
+        if unsafe {
+            libc::mount(
+                std::ptr::null(),
+                target.as_ptr(),
+                std::ptr::null(),
+                libc::MS_REMOUNT | libc::MS_BIND | libc::MS_RDONLY | kept,
+                std::ptr::null(),
+            )
+        } != 0
+        {
+            return Err(format!(
+                "protect inspection tmpfs {path}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+    }
+    println!("OK");
+    Ok(())
+}
+
+#[cfg(not(target_os = "linux"))]
+fn helper_readonly_tmpfs(_path: &str) -> Result<(), String> {
+    Err("mount namespaces are Linux-only".to_string())
+}
+
+#[cfg(target_os = "linux")]
+pub(crate) fn protect_inspection_tmpfs(pid: u32, paths: &[String]) -> Result<(), String> {
+    for path in paths {
+        let output = Command::new(AGENT_BINARY)
+            .args([HELPER_ARG, "readonly-tmpfs", &pid.to_string(), path])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| e.to_string())?;
+        if !output.status.success() {
+            return Err(String::from_utf8_lossy(&output.stdout).trim().to_owned());
+        }
+    }
+    Ok(())
+}
+
 /// Whether `fs` describes a tmpfs. The type of `f_type` differs between glibc
 /// and musl, so both sides are widened to one type.
 #[cfg(target_os = "linux")]
@@ -656,6 +738,22 @@ fn helper_archive(path: &str) -> Result<(), String> {
         .append_dir_all(".", path)
         .map_err(|e| e.to_string())?;
     archive.finish().map_err(|e| e.to_string())
+}
+
+fn helper_unpack(destination: &str) -> Result<(), String> {
+    if !Path::new(destination).is_dir() {
+        return Err(format!("not a directory: {destination}"));
+    }
+    let mut archive = tar::Archive::new(std::io::stdin().lock());
+    archive.set_preserve_permissions(true);
+    archive.set_preserve_ownerships(true);
+    archive.set_unpack_xattrs(false);
+    archive.set_overwrite(true);
+    archive
+        .unpack(destination)
+        .map_err(|e| format!("unpack into {destination}: {e}"))?;
+    println!("OK");
+    Ok(())
 }
 
 fn helper_read(path: &str) -> Result<(), String> {
@@ -882,8 +980,8 @@ impl GuestNs {
 
     /// The namespace of a container running on persistent overlay
     /// `workload_id`, whose mounted root is `merged`: its recorded main
-    /// container when that runs there, else any container rooted on it. With
-    /// none running, I/O goes through `merged` directly.
+    /// container when that runs there, then its held inspection namespace,
+    /// else any container rooted on it. Without one, I/O uses `merged` directly.
     pub fn on_overlay(workload_id: &str, merged: &Path) -> Self {
         match overlay_container(workload_id, merged) {
             Some(pid) => Self::Container(ContainerNs { pid }),
@@ -907,7 +1005,14 @@ fn overlay_container(workload_id: &str, merged: &Path) -> Option<u32> {
         .ok()
         .and_then(|cid| crate::crun_container_pid(cid.trim()))
         .filter(|pid| rooted_here(*pid));
-    main.or_else(|| live_containers().into_iter().find(|pid| rooted_here(*pid)))
+    let inspection = || {
+        std::fs::read_to_string(crate::paths::files_container_id_path(workload_id))
+            .ok()
+            .and_then(|cid| crate::crun_created_container_pid(cid.trim()))
+            .filter(|pid| rooted_here(*pid))
+    };
+    main.or_else(inspection)
+        .or_else(|| live_containers().into_iter().find(|pid| rooted_here(*pid)))
 }
 
 #[cfg(not(target_os = "linux"))]
@@ -1054,6 +1159,28 @@ impl ContainerNs {
 // there, so a developer build on macOS sees these as unused by construction.
 #[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 impl ContainerNs {
+    /// The archive is opened in the agent before the helper enters the
+    /// container; destination paths resolve through its actual mounts.
+    pub fn unpack(&self, archive: &str, destination: &str) -> Result<(), String> {
+        let input = std::fs::File::open(archive).map_err(|e| format!("open archive: {e}"))?;
+        let output = Command::new(AGENT_BINARY)
+            .args([HELPER_ARG, "unpack", &self.pid.to_string(), destination])
+            .stdin(input)
+            .stderr(Stdio::null())
+            .output()
+            .map_err(|e| format!("spawn archive helper: {e}"))?;
+        let message = String::from_utf8_lossy(&output.stdout);
+        if output.status.success() && message.trim() == "OK" {
+            Ok(())
+        } else {
+            Err(message
+                .trim()
+                .strip_prefix("ERR ")
+                .unwrap_or(message.trim())
+                .to_owned())
+        }
+    }
+
     /// Merge a validated folder archive and stop extraction if its client leaves.
     pub(crate) fn unpack_directory(
         &self,
@@ -1133,6 +1260,31 @@ impl ContainerNs {
             size,
             reader: reader.take(size),
         })
+    }
+
+    pub(crate) fn stat(&self, path: &str) -> smolvm_protocol::AgentResponse {
+        let result = Command::new(AGENT_BINARY)
+            .args([HELPER_ARG, "stat", &self.pid.to_string(), path])
+            .stdin(Stdio::null())
+            .stderr(Stdio::null())
+            .output();
+        match result {
+            Ok(output) if output.status.success() => serde_json::from_slice(&output.stdout)
+                .unwrap_or_else(|e| {
+                    smolvm_protocol::AgentResponse::error(
+                        format!("invalid stat helper response: {e}"),
+                        smolvm_protocol::error_codes::FILE_IO_FAILED,
+                    )
+                }),
+            Ok(output) => smolvm_protocol::AgentResponse::error(
+                format!("stat helper failed: {}", output.status),
+                smolvm_protocol::error_codes::FILE_IO_FAILED,
+            ),
+            Err(error) => smolvm_protocol::AgentResponse::error(
+                format!("start stat helper: {error}"),
+                smolvm_protocol::error_codes::FILE_IO_FAILED,
+            ),
+        }
     }
 
     /// List a directory inside the container.

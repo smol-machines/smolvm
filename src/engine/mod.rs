@@ -35,6 +35,8 @@ mod container_session;
 mod containers;
 mod events;
 mod exec;
+/// Shell-free container filesystem inspection.
+pub mod files;
 mod filters;
 mod image_ops;
 mod image_share;

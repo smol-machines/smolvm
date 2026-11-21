@@ -222,6 +222,27 @@ test_copy_in_and_out() {
     docker rm -f "$name" >/dev/null
 }
 
+# Exercise the exact native command used by Studio, including a bind mount
+# whose contents are absent from the image. Browsing must preserve lifecycle.
+test_container_file_browser() {
+    local id state path="$WORK/listing"
+    mkdir -p "$path" || return 1
+    touch "$path/.from-host" || return 1
+    id=$(docker create --label "$PREFIX" -v "$path:/view:ro" alpine sleep 120) || return 1
+    for state in created running exited; do
+        case "$state" in
+            running) docker start "$id" >/dev/null || return 1 ;;
+            exited) docker stop -t 1 "$id" >/dev/null || return 1 ;;
+        esac
+        "$SMOLVM" engine files --socket "$SOCKET_PATH" --container "$id" list /view --json |
+            python3 -c 'import json, sys
+r = json.load(sys.stdin)
+assert r["id"] == sys.argv[1] and r["path"] == "/view"
+assert [(e["name"], e["kind"]) for e in r["entries"]] == [(".from-host", "file")]' "$id" || return 1
+        [[ $(docker inspect -f '{{.State.Status}}' "$id") == "$state" ]] || return 1
+    done
+}
+
 test_copy_before_start() {
     local id
     id=$(docker create --label "$PREFIX" alpine cat /etc/staged.txt) || return 1
@@ -671,6 +692,7 @@ run_test "ports listen where asked" test_ports_listen_where_asked || true
 run_test "env, workdir, user" test_env_workdir_user || true
 run_test "restart policy on-failure" test_restart_policy_on_failure || true
 run_test "health check goes healthy" test_healthcheck_goes_healthy || true
+run_test "Studio lists container files before, during and after execution" test_container_file_browser || true
 run_test "copy in and out" test_copy_in_and_out || true
 run_test "copy before the first start" test_copy_before_start || true
 run_test "events stream the lifecycle" test_events_stream_lifecycle || true
