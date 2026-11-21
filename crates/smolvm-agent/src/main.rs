@@ -1959,6 +1959,27 @@ fn create_storage_dirs(mount_point: &str) {
     for dir in dirs {
         let _ = std::fs::create_dir_all(std::path::Path::new(mount_point).join(dir));
     }
+    // Every exec creates and removes files here: crun's pid file, the process
+    // spec, crun's log. On the storage disk each cost a journal commit (about
+    // 60 KiB written) and read as a change to anyone measuring the disk, yet
+    // none outlives the boot. Keep them in memory, at the same path, where no
+    // workload mount can cover them. Once per boot: an agent restart finds it
+    // mounted.
+    if std::path::Path::new(mount_point).join("containers/run")
+        == std::path::Path::new(paths::CONTAINERS_RUN_DIR)
+        && !is_mounted_at(paths::CONTAINERS_RUN_DIR)
+    {
+        let run = MountEntry {
+            source: "tmpfs",
+            target: paths::CONTAINERS_RUN_DIR,
+            fstype: "tmpfs",
+            flags: libc::MS_NOSUID | libc::MS_NODEV | libc::MS_NOEXEC,
+            data: Some("mode=0700,size=64m"),
+        };
+        if let Err(error) = run.mount() {
+            warn!(%error, "per-exec runtime files stay on the storage disk");
+        }
+    }
     if let Err(error) =
         create_shared_workspace(&std::path::Path::new(mount_point).join("workspace"))
     {
