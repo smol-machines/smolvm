@@ -504,6 +504,8 @@ install_smolvm() {
         rm -f "$prefix/overlay-template.ext4.zst"
     fi
 
+    rm -f "$prefix/overlay-default.ext4" "$prefix/overlay-default.ext4.zst"
+
     # Copy files
     cp -r "$extracted_dir/lib" "$prefix/"
     cp "$extracted_dir/smolvm" "$prefix/"
@@ -548,6 +550,10 @@ install_smolvm() {
         cp "$extracted_dir/overlay-template.ext4.zst" "$prefix/"
     elif [[ -f "$extracted_dir/overlay-template.ext4" ]]; then
         cp "$extracted_dir/overlay-template.ext4" "$prefix/"
+    fi
+
+    if [[ -f "$extracted_dir/overlay-default.ext4.zst" ]]; then
+        cp "$extracted_dir/overlay-default.ext4.zst" "$prefix/"
     fi
 
     # Size the disk templates to their default virtual size at install time, so

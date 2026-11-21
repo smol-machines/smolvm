@@ -95,11 +95,8 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
 
     clone_or_copy_file(template_path, disk_path)?;
 
-    // Extend the sparse file to the target size. The ext4 filesystem inside
-    // is still at the template's original size — the guest agent expands it
-    // at boot via resize2fs in a parallel thread (~10ms, non-blocking).
-    // We do NOT run resize2fs on the host: it takes ~880ms to expand the
-    // filesystem metadata synchronously, blocking the entire boot path.
+    // The default overlay may already have a full-size ext4. With a compact
+    // template the guest grows the filesystem to the requested size at boot.
     let current_size = std::fs::metadata(disk_path)
         .map_err(|e| Error::storage("read copied disk metadata", e.to_string()))?
         .len();

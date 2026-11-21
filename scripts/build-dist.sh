@@ -628,6 +628,15 @@ else
     OVERLAY_TEMPLATE_PATH="$DIST_DIR/overlay-template.ext4"
     dd if=/dev/zero of="$OVERLAY_TEMPLATE_PATH" bs=1 count=0 seek=$TEMPLATE_SIZE 2>/dev/null
     "$MKFS_BIN" -F -q -m 0 -L smolvm-overlay "$OVERLAY_TEMPLATE_PATH"
+    # Keep the compact filesystem for custom disk sizes. APFS clones the
+    # pre-grown default cheaply, avoiding an online resize in each new guest.
+    if [[ "$(uname -s)" == "Darwin" ]] && command -v zstd >/dev/null 2>&1; then
+        DEFAULT_OVERLAY="$DIST_DIR/overlay-default.ext4"
+        cp "$OVERLAY_TEMPLATE_PATH" "$DEFAULT_OVERLAY"
+        extend_sparse "$DEFAULT_OVERLAY" $((10 * 1024 * 1024 * 1024))
+        "$(dirname "$(command -v "$MKFS_BIN")")/resize2fs" "$DEFAULT_OVERLAY"
+        zstd -3 -T0 -q --rm -f "$DEFAULT_OVERLAY" -o "${DEFAULT_OVERLAY}.zst"
+    fi
     # Size to the default overlay virtual size (DEFAULT_OVERLAY_SIZE_GIB=10).
     extend_sparse "$OVERLAY_TEMPLATE_PATH" $((10 * 1024 * 1024 * 1024))
     echo "Overlay template created: $(du -h "$OVERLAY_TEMPLATE_PATH" | cut -f1) physical (10 GiB virtual)"
