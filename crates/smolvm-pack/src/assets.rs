@@ -658,6 +658,13 @@ fn materialize_template(src: &Path, dest: &Path) -> std::io::Result<()> {
         .tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?
         .into_temp_path();
     decompress_sparse(src, &tmp)?;
+    // The staging file is created 0600, but a root host's VM process opens the
+    // template after dropping to its own uid.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+    }
     // A completed cache entry is immutable. Keep the first publisher's file
     // instead of replacing it underneath readers or another Windows rename.
     // Close our file handle before publication as well.
@@ -2797,6 +2804,23 @@ mod template_expand_tests {
 
         assert_eq!(fs::read(&dest).unwrap(), b"first template");
         assert_eq!(fs::read_dir(tmp.path()).unwrap().count(), 2);
+    }
+
+    /// A root host's VM process opens the template after dropping to its own
+    /// uid, so a template only its owner can read stops every machine start.
+    #[cfg(unix)]
+    #[test]
+    fn an_expanded_template_is_readable_by_every_uid() {
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let src = tmp.path().join("t.ext4.zst");
+        let dest = tmp.path().join("t.ext4");
+        compress_to(&src, &template_bytes());
+
+        materialize_template(&src, &dest).expect("materialize");
+
+        let mode = fs::metadata(&dest).expect("stat").permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644, "published mode {mode:o}");
     }
 
     /// The point of the exercise: the hole must not be written out.
