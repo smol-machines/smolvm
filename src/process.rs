@@ -4844,7 +4844,7 @@ pub fn exit_when_parent_is_not(parent: Pid) {
 /// writes reach disk. `before_exit` must bound its own time.
 #[cfg(unix)]
 pub fn exit_when_parent_is_not_with(parent: Pid, before_exit: impl FnOnce() + Send + 'static) {
-    let _ = std::thread::Builder::new()
+    let watch = std::thread::Builder::new()
         .name("parent-death-watch".into())
         .spawn(move || {
             while unsafe { libc::getppid() } == parent {
@@ -4853,6 +4853,10 @@ pub fn exit_when_parent_is_not_with(parent: Pid, before_exit: impl FnOnce() + Se
             before_exit();
             exit_child(0);
         });
+    if let Err(e) = watch {
+        // without the watch this process outlives its parent: say so
+        eprintln!("smolvm: could not watch for the parent process to exit: {e}");
+    }
 }
 
 /// Exit the current process immediately without cleanup.
@@ -5182,25 +5186,47 @@ mod tests {
         ));
     }
 
-    /// A forked child that watches for a parent it doesn't have exits at once
-    /// (its parent is gone, as far as it can tell); one watching its real
-    /// parent keeps running (#1193).
+    /// The process [`a_child_exits_when_its_parent_is_gone`] starts: it watches
+    /// the pid in `SMOLVM_TEST_WATCH_PARENT`, then runs to its own end. Only
+    /// meaningful as that test's child.
+    #[cfg(unix)]
+    #[test]
+    #[ignore = "a child process of a_child_exits_when_its_parent_is_gone"]
+    fn parent_watch_child() {
+        let Some(watched) = std::env::var("SMOLVM_TEST_WATCH_PARENT")
+            .ok()
+            .and_then(|pid| pid.parse::<Pid>().ok())
+        else {
+            return;
+        };
+        exit_when_parent_is_not(watched);
+        std::thread::sleep(std::time::Duration::from_millis(1500));
+        exit_child(3);
+    }
+
+    /// A child that watches for a parent it doesn't have exits at once (its
+    /// parent is gone, as far as it can tell); one watching its real parent
+    /// keeps running (#1193). The child is a fresh process, as `_boot-vm` is:
+    /// forked from the test harness, which runs many threads, its watch thread
+    /// can fail to start, and production never forks such a process on macOS.
     #[cfg(unix)]
     #[test]
     fn a_child_exits_when_its_parent_is_gone() {
         let run_child = |watched: Pid| -> (i32, std::time::Duration) {
             let started = std::time::Instant::now();
-            let pid = unsafe { libc::fork() };
-            assert!(pid >= 0);
-            if pid == 0 {
-                exit_when_parent_is_not(watched);
-                std::thread::sleep(std::time::Duration::from_millis(1500));
-                exit_child(3);
-            }
-            let mut status = 0;
-            assert_eq!(unsafe { libc::waitpid(pid, &mut status, 0) }, pid);
-            assert!(libc::WIFEXITED(status));
-            (libc::WEXITSTATUS(status), started.elapsed())
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "process::tests::parent_watch_child",
+                    "--ignored",
+                    "--nocapture",
+                ])
+                .env("SMOLVM_TEST_WATCH_PARENT", watched.to_string())
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .unwrap();
+            (status.code().expect("the child exits"), started.elapsed())
         };
         let me = std::process::id() as Pid;
         let (code, elapsed) = run_child(me.wrapping_add(1_000_000));
