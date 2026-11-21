@@ -221,8 +221,8 @@ mod imp {
     }
 
     pub(super) fn record_in(root: &Path, layer: &Path, backing: &Path) -> std::io::Result<()> {
-        let layer = Identity::of(&open(layer)?.metadata()?);
         let backing_path = resolve(layer, &backing.to_string_lossy()).canonicalize()?;
+        let layer = Identity::of(&open(layer)?.metadata()?);
         let backing = Identity::of(&open(&backing_path)?.metadata()?);
         write_grant(
             root,
@@ -416,7 +416,7 @@ mod imp {
 
         /// As root every file here is one root wrote, which a walk trusts.
         fn running_as_root() -> bool {
-            unsafe { libc::geteuid() } == 0
+            (unsafe { libc::geteuid() }) == 0
         }
 
         #[test]
