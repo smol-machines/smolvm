@@ -2934,6 +2934,21 @@ async fn create_machine_to_end(
     verified: Option<crate::portable_checkpoint::VerifiedSidecar>,
     cached_checkpoint: bool,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    req.fold_cloud_shape().map_err(ApiError::BadRequest)?;
+    for (key, value) in &req.labels {
+        check_label_key(key)?;
+        if value.chars().count() > MAX_LABEL_VALUE_LEN {
+            return Err(ApiError::Unprocessable(format!(
+                "label {key:?} value too long (max {MAX_LABEL_VALUE_LEN} chars)"
+            )));
+        }
+    }
+    if req.labels.len() > MAX_LABELS {
+        return Err(ApiError::Unprocessable(format!(
+            "too many labels ({}, max {MAX_LABELS})",
+            req.labels.len()
+        )));
+    }
     // Refused before any image pull or disk work, so a server that has not opted
     // in never builds a nested machine.
     state.ensure_nested_virt_allowed(req.nested_virt)?;
@@ -6835,7 +6850,7 @@ pub async fn resize_machine(
 
     if req.storage_gb.unwrap_or(current_storage_gb) < current_storage_gb {
         return Err(ApiError::BadRequest(format!(
-            "storageGb cannot be smaller than current size ({} GiB)",
+            "diskGb cannot be smaller than current size ({} GiB)",
             current_storage_gb
         )));
     }
@@ -6848,7 +6863,7 @@ pub async fn resize_machine(
 
     if req.storage_gb.is_none() && req.overlay_gb.is_none() {
         return Err(ApiError::BadRequest(
-            "at least one of storageGb or overlayGb must be specified".into(),
+            "at least one of diskGb or overlayGb must be specified".into(),
         ));
     }
 
@@ -8073,6 +8088,11 @@ pub(crate) fn create_spec_from_request(
         registry_ref: _,
         registry_identity_token: _,
         blob_peers: _,
+        // Folded into the fields above by `fold_cloud_shape` before this runs.
+        source: _,
+        resources: _,
+        command: _,
+        labels,
         secrets,
         env,
         workdir,
@@ -8141,7 +8161,7 @@ pub(crate) fn create_spec_from_request(
         mounts: host_mounts,
         remote_volumes,
         disk_volumes,
-        net: *network,
+        net: network.enabled(),
         network_backend: *network_backend,
         guest_subnet: guest_subnet.clone(),
         ports: ports.iter().map(PortMapping::from).collect(),
@@ -8155,6 +8175,7 @@ pub(crate) fn create_spec_from_request(
         nested_virt: *nested_virt,
         cuda: *cuda || *auto_graph,
         docker_socket: *docker_socket,
+        labels: labels.clone(),
         ..Default::default()
     })
 }

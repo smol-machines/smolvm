@@ -4838,6 +4838,17 @@
             },
             "description": "Workload command run when the machine starts (see `entrypoint`)."
           },
+          "command": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/CommandSpec",
+                "description": "The workload command, overriding the image's entrypoint: a list, or one\nstring run with `sh -lc`. Instead of `entrypoint`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "cpus": {
             "type": [
               "integer",
@@ -4900,11 +4911,14 @@
             "description": "Workload entrypoint. With `cmd`, overrides the image's (or the\n`.smolmachine` artifact's) own entrypoint+cmd, matching the CLI's\n`machine create -- <command>` precedence. Empty = use the image's."
           },
           "env": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/EnvVar"
+            "type": "object",
+            "description": "Environment variables for the machine's workload (init commands and the\nentrypoint), by name. For `from`/`registry_ref` machines these layer on\ntop of the artifact manifest's env; a request variable wins on name\ncollision. A list of `{name, value}` is also accepted.",
+            "additionalProperties": {
+              "type": "string"
             },
-            "description": "Environment variables for the machine's workload (init commands and the\nentrypoint). For `from`/`registry_ref` machines these layer on top of\nthe artifact manifest's env; a request variable wins on name collision."
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "from": {
             "type": [
@@ -4931,6 +4945,16 @@
               "null"
             ],
             "description": "OCI image reference (e.g., \"alpine:latest\"), or a `docker save` / OCI\narchive or rootfs directory under the server's `--local-image-dir`.\nMutually exclusive with `from`."
+          },
+          "labels": {
+            "type": "object",
+            "description": "Labels to find and group machines by: at most 32; keys 1-63 chars of\n`[a-z0-9]([a-z0-9._/-]*[a-z0-9])?`, values up to 255 chars.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "memoryMb": {
             "type": [
@@ -4962,8 +4986,15 @@
             "description": "Expose the host's virtualization extensions so the guest can run its own\nVMs (nested KVM). Refused with 403 unless the server runs with\n`--allow-nested-virt`; it hands the guest the host kernel's nested-KVM\ncode, so enable it only for trusted workloads."
           },
           "network": {
-            "type": "boolean",
-            "description": "Enable outbound network access (TSI).\nNote: Only TCP/UDP supported, not ICMP (ping)."
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MachineNetwork",
+                "description": "Outbound access: the cloud API's policy (`blocked`, `open`, or\n`allowCidrs` with the hosts and CIDRs it may reach), or the older\n`true`/`false`. Only TCP/UDP, not ICMP (ping)."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "networkBackend": {
             "oneOf": [
@@ -5006,6 +5037,17 @@
             ],
             "description": "Registry reference to a .smolmachine artifact (e.g., \"myapp:v1\").\nPulls from the registry before creating the VM.\nMutually exclusive with `image` and `from`."
           },
+          "resources": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MachineResources",
+                "description": "The machine's size, as the cloud API names it. Instead of `cpus`,\n`memoryMb`, `storageGb` and `diskDurability`."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
           "restart": {
             "oneOf": [
               {
@@ -5020,6 +5062,17 @@
           "secrets": {
             "type": "object",
             "description": "Secret refs attached to the machine. Resolved at every\nsubsequent exec against the host's env/files. Rejected unless empty;\naccepted — `from_env`/`from_file` on the API surface would let\nan untrusted caller exfiltrate the server process's env or\nread arbitrary host files; use the CLI `machine create` path\nfor those source kinds."
+          },
+          "source": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MachineSource",
+                "description": "What the machine runs, as the cloud API names it: an OCI image or a\n`.smolmachine` artifact by reference. Instead of `image` or\n`registryRef`."
+              },
+              {
+                "type": "null"
+              }
+            ]
           },
           "stopSignal": {
             "type": [
@@ -7141,6 +7194,137 @@
           }
         }
       },
+      "MachineResources": {
+        "type": "object",
+        "description": "A machine's size, as the cloud API names it.",
+        "properties": {
+          "cpus": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "vCPUs.",
+            "minimum": 0
+          },
+          "diskDurability": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/DiskDurability",
+                "description": "When guest disk writes must reach the host's disk."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "diskGb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Storage disk size in GiB.",
+            "minimum": 0
+          },
+          "memoryMb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "Memory in MiB.",
+            "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "MachineSource": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "An OCI image.",
+            "required": [
+              "reference",
+              "type"
+            ],
+            "properties": {
+              "arch": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "CPU architecture; this node runs its own."
+              },
+              "reference": {
+                "type": "string",
+                "description": "The image reference."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "image"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A `.smolmachine` artifact in a registry.",
+            "required": [
+              "reference",
+              "type"
+            ],
+            "properties": {
+              "arch": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "CPU architecture; this node runs its own."
+              },
+              "reference": {
+                "type": "string",
+                "description": "The artifact reference."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "smolmachine"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "A checkpoint: restored with `PUT .../checkpoint`, never created.",
+            "required": [
+              "reference",
+              "type"
+            ],
+            "properties": {
+              "arch": {
+                "type": [
+                  "string",
+                  "null"
+                ],
+                "description": "CPU architecture."
+              },
+              "reference": {
+                "type": "string",
+                "description": "The checkpoint's id."
+              },
+              "type": {
+                "type": "string",
+                "enum": [
+                  "checkpoint"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "What a machine runs, as the cloud API names it."
+      },
       "MediationDecisionEvent": {
         "type": "object",
         "description": "One host-observed mediated egress decision.",
@@ -7612,6 +7796,16 @@
             "description": "Target online CPU count; shrinking requires a compatible Linux x86_64 runtime and agent.",
             "minimum": 0
           },
+          "diskGb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Storage disk size in GiB (expand only, optional).",
+            "example": 50,
+            "minimum": 0
+          },
           "expectedRuntime": {
             "oneOf": [
               {
@@ -7647,16 +7841,6 @@
             "format": "int64",
             "description": "Overlay disk size in GiB (expand only, optional).",
             "example": 20,
-            "minimum": 0
-          },
-          "storageGb": {
-            "type": [
-              "integer",
-              "null"
-            ],
-            "format": "int64",
-            "description": "Storage disk size in GiB (expand only, optional).",
-            "example": 50,
             "minimum": 0
           }
         },
