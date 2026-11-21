@@ -1108,6 +1108,7 @@ fn lease_batch_error(error: ApiError) -> (&'static str, String) {
             ("CLONE_IDENTITY_REJUVENATION_FAILED", message)
         }
         ApiError::BadRequest(message) => ("BAD_REQUEST", message),
+        ApiError::Unprocessable(message) => ("UNPROCESSABLE", message),
         ApiError::PayloadTooLarge(message) => ("PAYLOAD_TOO_LARGE", message),
         ApiError::Timeout => ("TIMEOUT", "request timed out".into()),
         ApiError::Unavailable(message) => ("UNAVAILABLE", message),

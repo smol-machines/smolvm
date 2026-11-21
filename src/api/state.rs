@@ -2097,6 +2097,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
             .map(|v| v / (1024 * 1024)),
         disk_used_mb,
         created_at: 0,
+        labels: Default::default(),
     }
 }
 

@@ -1360,6 +1360,78 @@
         }
       }
     },
+    "/api/v1/machines/{name}/branch-release": {
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Assign job parameters and release one held branch-pool slot: the newer\nname of `fork-release`.",
+        "operationId": "release_held_branch",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Held branch name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/ForkReleaseRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Held branch assigned and released",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Branch not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Machine is not a held branch slot",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Activation failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/machines/{name}/branches": {
       "post": {
         "tags": [
@@ -1503,6 +1575,120 @@
           },
           "409": {
             "description": "Machine is running, or the base name is taken",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/machines/{name}/checkpoint": {
+      "put": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Import a live checkpoint, optionally rebinding its host-side published ports\nand replacing its egress policy.",
+        "operationId": "restore_portable_checkpoint",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Name of the machine the checkpoint becomes",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "description": "The checkpoint artifact",
+          "content": {
+            "application/octet-stream": {
+              "schema": {
+                "type": "array",
+                "items": {
+                  "type": "integer",
+                  "format": "int32",
+                  "minimum": 0
+                }
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Machine restored from the checkpoint",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid checkpoint or request",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "A machine of that name exists",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      },
+      "post": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Capture a live checkpoint of a running machine and stream it back as a\n`.checkpoint` file, keeping a node-local copy when the caller\nsupplies a cache key.",
+        "operationId": "capture_portable_checkpoint",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The checkpoint artifact, or JSON naming where it was uploaded or held",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "Machine not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Machine is not running",
             "content": {
               "application/json": {
                 "schema": {
@@ -2169,6 +2355,78 @@
         }
       }
     },
+    "/api/v1/machines/{name}/labels": {
+      "patch": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Change some of a machine's labels, leaving the others as they are, as the\ncloud API does. Labels are host-side metadata, so any state takes this.",
+        "operationId": "update_machine_labels",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/UpdateMachineLabelsRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Labels changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineInfo"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Machine not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "A label breaks the label rules",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Update failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/machines/{name}/mediation-events": {
       "get": {
         "tags": [
@@ -2207,6 +2465,48 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MediationEventsResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Machine not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/machines/{name}/metrics": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Read a machine's CPU time, memory, disk, egress and guest pressure now, in\nthe shape the cloud API answers it. Nothing is stored, so poll to draw a\ngraph.",
+        "operationId": "get_machine_metrics",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The machine's resource use now",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineMetricsResponse"
                 }
               }
             }
@@ -2433,6 +2733,44 @@
               "application/json": {
                 "schema": {
                   "$ref": "#/components/schemas/MachineInfo"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/machines/{name}/pause/checkpoint": {
+      "get": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Download a paused machine's saved execution without consuming it.",
+        "operationId": "paused_checkpoint",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "200": {
+            "description": "The paused execution's checkpoint artifact",
+            "content": {
+              "application/octet-stream": {}
+            }
+          },
+          "404": {
+            "description": "Machine not found or not paused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
                 }
               }
             }
@@ -6145,7 +6483,8 @@
           "forkable",
           "branchpointHeld",
           "forkpointHeld",
-          "createdAt"
+          "createdAt",
+          "labels"
         ],
         "properties": {
           "allowedCidrs": {
@@ -6352,6 +6691,16 @@
             "description": "Resolved workload image, used to bind registry credentials to its host.",
             "example": "registry.example.com/team/app:latest"
           },
+          "labels": {
+            "type": "object",
+            "description": "Labels: metadata to find and group machines by, as the cloud API\nanswers them.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
+          },
           "mediationMachineId": {
             "type": [
               "string",
@@ -6509,6 +6858,140 @@
             "description": "Storage disk size in GiB.",
             "example": 20,
             "minimum": 0
+          }
+        }
+      },
+      "MachineMetricsResponse": {
+        "type": "object",
+        "description": "One reading of a machine's resource use (`GET /api/v1/machines/{name}/metrics`),\nin the shape the cloud API answers it.\n\nCPU is a counter: utilization over an interval is the change in\n`cpuMillis` divided by the elapsed milliseconds times `vcpus`. The counter\nstarts again at 0 when the machine's VM restarts. Readings are present only\nwhile the machine runs.",
+        "required": [
+          "machineId",
+          "at",
+          "state",
+          "vcpus",
+          "memoryLimitMb"
+        ],
+        "properties": {
+          "at": {
+            "type": "string",
+            "description": "When the readings were taken, RFC 3339 with milliseconds."
+          },
+          "cpuLimitMillicpus": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int32",
+            "description": "A CPU limit in force right now, in thousandths of a CPU.",
+            "minimum": 0
+          },
+          "cpuMillis": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "CPU time the machine has used since its VM started, in milliseconds.",
+            "minimum": 0
+          },
+          "diskGb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Disk size in GiB.",
+            "minimum": 0
+          },
+          "diskUsedMb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Disk space in use in MiB.",
+            "minimum": 0
+          },
+          "egressBytes": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Bytes the machine has sent out since its VM started.",
+            "minimum": 0
+          },
+          "machineId": {
+            "type": "string",
+            "description": "The machine these readings are for."
+          },
+          "memoryLimitMb": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The machine's memory size in MiB.",
+            "minimum": 0
+          },
+          "memoryMb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Memory in use in MiB, with pages shared with branches split among them.",
+            "minimum": 0
+          },
+          "pressure": {
+            "oneOf": [
+              {
+                "$ref": "#/components/schemas/MachinePressure",
+                "description": "How much of recent time tasks in the guest waited for CPU, memory or IO."
+              },
+              {
+                "type": "null"
+              }
+            ]
+          },
+          "rssMb": {
+            "type": [
+              "integer",
+              "null"
+            ],
+            "format": "int64",
+            "description": "Resident memory in MiB, counting shared pages in full.",
+            "minimum": 0
+          },
+          "state": {
+            "type": "string",
+            "description": "The machine's state when read."
+          },
+          "vcpus": {
+            "type": "integer",
+            "format": "int32",
+            "description": "The machine's vCPUs.",
+            "minimum": 0
+          }
+        }
+      },
+      "MachinePressure": {
+        "type": "object",
+        "description": "Pressure stall readings from inside the guest.",
+        "required": [
+          "cpu",
+          "memory",
+          "io"
+        ],
+        "properties": {
+          "cpu": {
+            "$ref": "#/components/schemas/PressureReading",
+            "description": "Time tasks waited for a CPU."
+          },
+          "io": {
+            "$ref": "#/components/schemas/PressureReading",
+            "description": "Time tasks waited for block IO."
+          },
+          "memory": {
+            "$ref": "#/components/schemas/PressureReading",
+            "description": "Time tasks waited for memory."
           }
         }
       },
@@ -6683,6 +7166,38 @@
           }
         },
         "additionalProperties": false
+      },
+      "PressureReading": {
+        "type": "object",
+        "description": "Percent of recent time at least one task (`some`) or every task (`full`)\nwaited for a resource.",
+        "required": [
+          "someAvg10",
+          "someAvg60",
+          "fullAvg10",
+          "fullAvg60"
+        ],
+        "properties": {
+          "fullAvg10": {
+            "type": "number",
+            "format": "double",
+            "description": "Over the last 10 seconds; always 0 for CPU."
+          },
+          "fullAvg60": {
+            "type": "number",
+            "format": "double",
+            "description": "Over the last 60 seconds; always 0 for CPU."
+          },
+          "someAvg10": {
+            "type": "number",
+            "format": "double",
+            "description": "Over the last 10 seconds."
+          },
+          "someAvg60": {
+            "type": "number",
+            "format": "double",
+            "description": "Over the last 60 seconds."
+          }
+        }
       },
       "PressureStall": {
         "type": "object",
@@ -8150,6 +8665,29 @@
           "resetAllowList": {
             "type": "boolean",
             "description": "Start from an empty allow list before applying this request's\nadditions, so the machine ends up with exactly what the request names.\nA reset that names nothing needs `allowAll` to open egress. Cannot be\ncombined with removals. Mirrors `--reset-allow-list` on `machine update`."
+          }
+        },
+        "additionalProperties": false
+      },
+      "UpdateMachineLabelsRequest": {
+        "type": "object",
+        "description": "Body of `PATCH /api/v1/machines/{name}/labels`: labels to change, leaving\nthe others as they are, as the cloud API takes them.",
+        "required": [
+          "labels"
+        ],
+        "properties": {
+          "labels": {
+            "type": "object",
+            "description": "Labels to change: a string value sets or replaces that key, `null`\nremoves it (a key the machine does not carry is ignored). Keys left out\nare untouched. The resulting set: at most 32; keys 1-63 chars of\n`[a-z0-9]([a-z0-9._/-]*[a-z0-9])?`, values up to 255 chars.",
+            "additionalProperties": {
+              "type": [
+                "string",
+                "null"
+              ]
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         },
         "additionalProperties": false

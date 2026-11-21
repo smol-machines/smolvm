@@ -43,7 +43,7 @@ use axum::{
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
     response::{IntoResponse, Response},
-    routing::{delete, get, post, put},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -128,6 +128,12 @@ use state::ApiState;
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
         handlers::machines::set_machine_env,
+        handlers::machines::update_machine_labels,
+        handlers::machines::release_held_branch,
+        handlers::machines::capture_portable_checkpoint,
+        handlers::machines::restore_portable_checkpoint,
+        handlers::machines::paused_checkpoint,
+        handlers::machines::get_machine_metrics,
         handlers::machines::put_credential_values,
         handlers::machines::put_credential_bindings,
         handlers::machines::export_machine,
@@ -178,6 +184,10 @@ use state::ApiState;
         types::PublishCacheDiskResponse,
         types::UpdateEgressRequest,
         types::SetMachineEnvRequest,
+        types::UpdateMachineLabelsRequest,
+        types::MachineMetricsResponse,
+        types::MachinePressure,
+        types::PressureReading,
         types::CredentialValuesRequest,
         types::CredentialBindingsRequest,
         types::CredentialBindingsResponse,
@@ -398,7 +408,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route(
             "/{id}/branch-release",
-            post(handlers::machines::release_held_fork),
+            post(handlers::machines::release_held_branch),
         )
         .route(
             "/{id}/fork-release",
@@ -429,6 +439,14 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             post(handlers::machines::update_machine_egress),
         )
         .route("/{id}/env", put(handlers::machines::set_machine_env))
+        .route(
+            "/{id}/labels",
+            patch(handlers::machines::update_machine_labels),
+        )
+        .route(
+            "/{id}/metrics",
+            get(handlers::machines::get_machine_metrics),
+        )
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
@@ -978,12 +996,7 @@ mod tests {
 
     /// Machine routes the router serves but the spec does not describe yet.
     /// Describing one removes its entry.
-    const UNDESCRIBED_MACHINE_ROUTES: &[&str] = &[
-        "POST /api/v1/machines/{}/checkpoint",
-        "PUT /api/v1/machines/{}/checkpoint",
-        "POST /api/v1/machines/{}/branch-release",
-        "GET /api/v1/machines/{}/pause/checkpoint",
-    ];
+    const UNDESCRIBED_MACHINE_ROUTES: &[&str] = &[];
 
     /// Each `METHOD path` the machine routers in this file serve, read from
     /// their source: the spec is only worth comparing with the cloud's if it
