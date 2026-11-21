@@ -3037,17 +3037,63 @@ pub fn adopt_objects(store: &Path, directory: &Path) -> io::Result<usize> {
     let _lock = cache_lock(store, false)?;
     let cache = store.join("objects");
     fs::create_dir_all(&cache)?;
-    let mut adopted = 0;
-    for entry in fs::read_dir(directory.join("objects"))? {
-        let entry = entry?;
-        match fs::hard_link(entry.path(), cache.join(entry.file_name())) {
-            Ok(()) => adopted += 1,
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
-            Err(error) => return Err(error),
+    // Only objects this checkpoint's indexes name, each read the way a
+    // restore reads it: a later capture reuses a cached object by its name
+    // alone, so one whose bytes do not hash to that name would put another
+    // file's contents into that capture.
+    let expected = indexed_object_sizes(directory)?;
+    let adopted = std::sync::atomic::AtomicUsize::new(0);
+    let objects = directory.join("objects");
+    for_each_parallel(worker_threads(), expected.into_iter(), |(hash, size)| {
+        let cached = cache.join(&hash);
+        if fs::symlink_metadata(&cached).is_ok() {
+            return Ok(());
+        }
+        let source = objects.join(&hash);
+        if fs::symlink_metadata(&source).is_err() {
+            return Ok(());
+        }
+        read_object(&source, &hash, size)?;
+        match fs::hard_link(&source, &cached) {
+            Ok(()) => {
+                adopted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                Ok(())
+            }
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => Ok(()),
+            Err(error) => Err(error),
+        }
+    })?;
+    File::open(&cache)?.sync_all()?;
+    Ok(adopted.into_inner())
+}
+
+/// Every object the checkpoint at `directory` names, in its own index or a
+/// retained generation's, with the length its chunk decodes to.
+fn indexed_object_sizes(directory: &Path) -> io::Result<HashMap<String, usize>> {
+    let mut indexes = vec![read_index(directory)?];
+    let generations = directory.join(GENERATIONS);
+    if generations.is_dir() {
+        for entry in fs::read_dir(&generations)? {
+            let entry = entry?;
+            let id = entry.file_name().to_string_lossy().into_owned();
+            if valid_generation_id(&id) && entry.file_type()?.is_dir() {
+                indexes.push(read_index_from(&entry.path().join(INDEX))?);
+            }
         }
     }
-    File::open(&cache)?.sync_all()?;
-    Ok(adopted)
+    let mut sizes = HashMap::new();
+    for index in &indexes {
+        let chunk = index.chunk_size as u64;
+        for file in &index.files {
+            for (i, hash) in file.chunks.iter().enumerate() {
+                let Some(hash) = hash else { continue };
+                let start = i as u64 * chunk;
+                let size = chunk.min(file.size.saturating_sub(start)) as usize;
+                sizes.insert(hash.clone(), size);
+            }
+        }
+    }
+    Ok(sizes)
 }
 
 /// What [`materialize_over`] did.
@@ -4635,6 +4681,46 @@ mod tests {
                 .id,
             G1
         );
+    }
+
+    #[test]
+    fn adoption_takes_only_indexed_objects_that_hash_to_their_names() {
+        let root = tempfile::tempdir().unwrap();
+        let objects = root.path().join("objects");
+        let saved = root.path().join("saved");
+        capture(&objects, &saved, &vec![0x5A; 2 * CHUNK_SIZE + 17]);
+        let index = read_index(&saved).unwrap();
+        let named = own_objects(&index).len();
+        // a planted object no index names is never adopted
+        fs::write(saved.join("objects").join("f".repeat(64)), b"stray").unwrap();
+        let store = root.path().join("store");
+        assert_eq!(adopt_objects(&store, &saved).unwrap(), named);
+        assert!(!store.join("objects").join("f".repeat(64)).exists());
+
+        // an object whose bytes are another chunk's is refused
+        let forged = root.path().join("forged");
+        capture(&objects, &forged, &vec![0x33; CHUNK_SIZE]);
+        let forged_hash = own_objects(&read_index(&forged).unwrap())
+            .into_iter()
+            .next()
+            .unwrap()
+            .to_string();
+        let other = root.path().join("other");
+        capture(&objects, &other, &vec![0x77; CHUNK_SIZE]);
+        let other_hash = own_objects(&read_index(&other).unwrap())
+            .into_iter()
+            .next()
+            .unwrap()
+            .to_string();
+        fs::remove_file(forged.join("objects").join(&forged_hash)).unwrap();
+        fs::copy(
+            other.join("objects").join(&other_hash),
+            forged.join("objects").join(&forged_hash),
+        )
+        .unwrap();
+        let fresh = root.path().join("fresh-store");
+        assert!(adopt_objects(&fresh, &forged).is_err());
+        assert!(!fresh.join("objects").join(&forged_hash).exists());
     }
 
     #[test]

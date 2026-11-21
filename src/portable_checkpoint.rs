@@ -5113,10 +5113,14 @@ impl KeptResume {
             let result = identity.and_then(|identity| -> Result<()> {
                 std::fs::File::open(inputs.join("memory.bin"))?.sync_all()?;
                 std::fs::File::open(&inputs)?.sync_all()?;
-                let mut record = create_private_file(&self.dir.join(PAUSED_RESUME_RECORD))?;
+                // Written whole, then renamed into place: a resume that finds
+                // the record must never read it half-written.
+                let staged = self.dir.join(format!("{PAUSED_RESUME_RECORD}.partial"));
+                let mut record = create_private_file(&staged)?;
                 writeln!(record, "{}", artifact.display())?;
                 record.write_all(identity.as_bytes())?;
                 record.sync_all()?;
+                std::fs::rename(&staged, self.dir.join(PAUSED_RESUME_RECORD))?;
                 std::fs::File::open(&self.dir)?.sync_all()?;
                 Ok(())
             });
@@ -7429,11 +7433,7 @@ fn pin_restore_rootfs_in(
         None if carried_tar.is_file() => {
             // Unpack to learn what it ran on; the tree is kept unless the
             // host's installed rootfs turns out to be the same.
-            let (digest, path) = store.install_tar(&carried_tar)?;
-            if default.as_deref() == Some(digest.as_str()) {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-            digest
+            store.install_tar_unless(&carried_tar, default.as_deref())?
         }
         None => return Ok(None),
     };
