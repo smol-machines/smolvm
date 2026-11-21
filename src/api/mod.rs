@@ -87,6 +87,8 @@ use state::ApiState;
         // Execution
         handlers::exec::exec_command,
         handlers::exec::exec_stream,
+        handlers::exec::exec_interactive,
+        handlers::exec_sessions::attach_exec_session,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
         handlers::exec_sessions::create_exec_session,
@@ -973,6 +975,108 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// Machine routes the router serves but the spec does not describe yet.
+    /// Describing one removes its entry.
+    const UNDESCRIBED_MACHINE_ROUTES: &[&str] = &[
+        "POST /api/v1/machines/{}/checkpoint",
+        "PUT /api/v1/machines/{}/checkpoint",
+        "POST /api/v1/machines/{}/branch-release",
+        "GET /api/v1/machines/{}/pause/checkpoint",
+    ];
+
+    /// Each `METHOD path` the machine routers in this file serve, read from
+    /// their source: the spec is only worth comparing with the cloud's if it
+    /// lists everything the router answers.
+    fn served_machine_routes() -> std::collections::BTreeSet<String> {
+        let source = include_str!("mod.rs");
+        let mut served = std::collections::BTreeSet::new();
+        for router in [
+            "let logs_route",
+            "let bounded_machine_routes",
+            "let create_route",
+            "let long_machine_routes",
+        ] {
+            let start = source.find(router).expect("machine router in source");
+            let block = &source[start..];
+            let block = &block[..block[1..]
+                .find("\n    let ")
+                .map_or(block.len(), |end| end + 1)];
+            for route in block.split(".route(").skip(1) {
+                let path = route.split('"').nth(1).expect("route path literal");
+                let path = if path == "/" {
+                    String::new()
+                } else {
+                    path.to_string()
+                };
+                for method in ["get", "post", "put", "patch", "delete"] {
+                    if route.contains(&format!("{method}(handlers::")) {
+                        served.insert(format!(
+                            "{} /api/v1/machines{}",
+                            method.to_uppercase(),
+                            normalize_route(&path)
+                        ));
+                    }
+                }
+            }
+        }
+        served
+    }
+
+    fn normalize_route(path: &str) -> String {
+        let mut out = String::new();
+        let mut in_param = false;
+        for c in path.chars() {
+            match c {
+                '{' => {
+                    in_param = true;
+                    out.push_str("{}");
+                }
+                '}' => in_param = false,
+                _ if in_param => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_machine_route_is_in_the_spec_or_listed() {
+        use utoipa::OpenApi;
+        let spec = serde_json::to_value(super::ApiDoc::openapi()).expect("spec serializes");
+        let mut described = std::collections::BTreeSet::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for method in item.as_object().expect("path item").keys() {
+                described.insert(format!(
+                    "{} {}",
+                    method.to_uppercase(),
+                    normalize_route(path)
+                ));
+            }
+        }
+        let served = served_machine_routes();
+        assert!(
+            served.len() > 30,
+            "the source scan found too few routes: {served:?}"
+        );
+        let missing: Vec<_> = served
+            .iter()
+            .filter(|route| !described.contains(*route))
+            .filter(|route| !UNDESCRIBED_MACHINE_ROUTES.contains(&route.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "served but not in the spec: {missing:#?}"
+        );
+        let stale: Vec<_> = UNDESCRIBED_MACHINE_ROUTES
+            .iter()
+            .filter(|route| described.contains(**route) || !served.contains(**route))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "listed as undescribed but described or not served; remove: {stale:#?}"
+        );
+    }
 
     /// The checked-in spec is what clients and the cloud parity check read, so
     /// a change to the API that does not regenerate it fails here.

@@ -651,6 +651,21 @@ pub struct AttachQuery {
 }
 
 /// Attach to an exec session over a WebSocket (see the module docs).
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{id}/execs/{exec}/attach",
+    tag = "Execution",
+    params(
+        ("id" = String, Path, description = "Machine name"),
+        ("exec" = String, Path, description = "Exec session id"),
+        ("after" = Option<u64>, Query, description = "Resume output from this offset, acknowledging what precedes it")
+    ),
+    responses(
+        (status = 101, description = "Switching to the WebSocket attach protocol"),
+        (status = 404, description = "Machine or session not found", body = ApiErrorResponse),
+        (status = 400, description = "The offset is beyond the session's output", body = ApiErrorResponse)
+    )
+)]
 pub async fn attach_exec_session(
     State(state): State<Arc<ApiState>>,
     Path((id, exec)): Path<(String, String)>,
