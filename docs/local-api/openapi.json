@@ -166,7 +166,7 @@
         },
         "responses": {
           "200": {
-            "description": "Command executed",
+            "description": "Command executed; with `stream`, its output as Server-Sent Events",
             "content": {
               "application/json": {
                 "schema": {
@@ -207,6 +207,92 @@
           },
           "500": {
             "description": "Execution failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/machines/{id}/exec/interactive": {
+      "get": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Interactive session over a WebSocket.",
+        "description": "The client connects a WebSocket; binary frames are forwarded to the\ncommand's stdin and its output is sent back as binary frames. A JSON text\nframe `{\"type\":\"resize\",\"cols\":N,\"rows\":N}` resizes the terminal. When the\ncommand exits, a final text frame `{\"type\":\"exit\",\"code\":N}` is sent before\nthe socket closes. Closing the socket ends the session, and the command is\nkilled.\n\nQuery parameters: `cmd` is the program and each `arg` one argument to it;\n`tty` chooses between a PTY (the default, which merges stderr into stdout)\nand pipes.\n\nWith `tty=false` stdin is written with backpressure and nothing is ever\ndropped: the WebSocket is read only as fast as the command takes its input.\nStandard output is the binary frames, byte for byte. Standard error is\nreported as text frames `{\"type\":\"stderr\",\"data\":\"...\"}` (lossily decoded\nas UTF-8), so it never mixes into the stream.\n\nImage machines run the program in their persistent-overlay container (the\nsame filesystem `exec` uses); plain machines run it directly in the VM.",
+        "operationId": "exec_interactive",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "cmd",
+            "in": "query",
+            "description": "Program to run (the machine's shell when absent)",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "arg",
+            "in": "query",
+            "description": "One argument to the program, repeated in order",
+            "required": false,
+            "schema": {
+              "type": "array",
+              "items": {
+                "type": "string"
+              }
+            }
+          },
+          {
+            "name": "tty",
+            "in": "query",
+            "description": "Run on a pseudo-terminal (the default) or on pipes",
+            "required": false,
+            "schema": {
+              "type": "boolean"
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching to the WebSocket terminal protocol"
+          },
+          "400": {
+            "description": "Invalid command",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Machine not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "The machine could not be started",
             "content": {
               "application/json": {
                 "schema": {
@@ -541,6 +627,71 @@
           },
           "404": {
             "description": "No such exec on this machine",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/api/v1/machines/{id}/execs/{exec}/attach": {
+      "get": {
+        "tags": [
+          "Execution"
+        ],
+        "summary": "Attach to an exec session over a WebSocket (see the module docs).",
+        "operationId": "attach_exec_session",
+        "parameters": [
+          {
+            "name": "id",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "exec",
+            "in": "path",
+            "description": "Exec session id",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "after",
+            "in": "query",
+            "description": "Resume output from this offset, acknowledging what precedes it",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "format": "int64",
+              "minimum": 0
+            }
+          }
+        ],
+        "responses": {
+          "101": {
+            "description": "Switching to the WebSocket attach protocol"
+          },
+          "400": {
+            "description": "The offset is beyond the session's output",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Machine or session not found",
             "content": {
               "application/json": {
                 "schema": {
@@ -4003,6 +4154,22 @@
           }
         }
       },
+      "CommandSpec": {
+        "oneOf": [
+          {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Program and arguments."
+          },
+          {
+            "type": "string",
+            "description": "A shell command line."
+          }
+        ],
+        "description": "A command as the smol cloud API takes it: an argument list, or one string\nrun with `sh -lc`."
+      },
       "CreateExecSessionRequest": {
         "type": "object",
         "description": "Start a command the node owns: it outlives the request that started it,\nkeeps its output for readers to fetch by offset, and keeps its exit code\nuntil read. See `api::exec_sessions`.\n\nSame command fields as [`ExecRequest`], plus the session's id and shape.",
@@ -4025,22 +4192,25 @@
             "minimum": 0
           },
           "command": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Command and arguments.",
-            "example": [
-              "echo",
-              "hello"
-            ]
+            "$ref": "#/components/schemas/CommandSpec",
+            "description": "Command and arguments, or one string run with `sh -lc`."
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Working directory (`workdir` is accepted too)."
           },
           "env": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/EnvVar"
+            "type": "object",
+            "description": "Environment variables by name. A list of `{name, value}` is also\naccepted.",
+            "additionalProperties": {
+              "type": "string"
             },
-            "description": "Environment variables."
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "execId": {
             "type": [
@@ -4081,13 +4251,13 @@
             ],
             "description": "Data written to the command's stdin when it starts. Unless\n`interactive`, stdin is closed after it."
           },
-          "timeoutSecs": {
+          "timeoutSeconds": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "Kill the command after this many seconds (exit code 124).",
+            "description": "Kill the command after this many seconds (exit code 124;\n`timeoutSecs` is accepted too).",
             "minimum": 0
           },
           "tty": {
@@ -4101,21 +4271,14 @@
             ],
             "description": "Run as this user (image machines)."
           },
-          "waitSecs": {
+          "waitSeconds": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "Wait up to this many seconds (at most 60) for output or the exit before\nanswering, and answer with the output from offset 0; a short command\nthen needs this one request.",
+            "description": "Wait up to this many seconds (at most 60) for output or the exit before\nanswering, and answer with the output from offset 0; a short command\nthen needs this one request (`waitSecs` is accepted too).",
             "minimum": 0
-          },
-          "workdir": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Working directory."
           }
         },
         "additionalProperties": false
@@ -4895,7 +5058,7 @@
       },
       "ExecRequest": {
         "type": "object",
-        "description": "Request to execute a command in a machine.\n\n`deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a\nsilent no-op. This matters for the safety fields (`timeoutSecs`, etc.) — a\ncaller who writes `timeout_secs` must be told, not left running an untrusted\ncommand with no timeout because the field was quietly dropped.",
+        "description": "Request to execute a command in a machine.\n\nField names and shapes follow the smol cloud API (`cwd`, `timeoutSeconds`,\n`env` as an object, `command` as a list or one shell string); the older\n`workdir`, `timeoutSecs` and `env` list are still accepted.\n\n`deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a\nsilent no-op. This matters for the safety fields (`timeoutSeconds`, etc.) —\na caller who writes `timeout_seconds` must be told, not left running an\nuntrusted command with no timeout because the field was quietly dropped.",
         "required": [
           "command"
         ],
@@ -4910,22 +5073,26 @@
             "description": "Run the command detached: spawn it in the background and return its PID\nimmediately instead of waiting. The process keeps running (a long-lived\ndaemon — dev server, agent runner) until it exits or the machine stops."
           },
           "command": {
-            "type": "array",
-            "items": {
-              "type": "string"
-            },
-            "description": "Command and arguments.",
-            "example": [
-              "echo",
-              "hello"
-            ]
+            "$ref": "#/components/schemas/CommandSpec",
+            "description": "Command and arguments, or one string run with `sh -lc`."
+          },
+          "cwd": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Working directory (`workdir` is accepted too).",
+            "example": "/workspace"
           },
           "env": {
-            "type": "array",
-            "items": {
-              "$ref": "#/components/schemas/EnvVar"
+            "type": "object",
+            "description": "Environment variables by name. A list of `{name, value}` is also\naccepted.",
+            "additionalProperties": {
+              "type": "string"
             },
-            "description": "Environment variables."
+            "propertyNames": {
+              "type": "string"
+            }
           },
           "secrets": {
             "type": "object",
@@ -4938,13 +5105,17 @@
             ],
             "description": "Data to pipe to the command's stdin."
           },
-          "timeoutSecs": {
+          "stream": {
+            "type": "boolean",
+            "description": "Stream stdout and stderr as Server-Sent Events, as\n`POST .../exec/stream` does, instead of one JSON body."
+          },
+          "timeoutSeconds": {
             "type": [
               "integer",
               "null"
             ],
             "format": "int64",
-            "description": "Timeout in seconds.",
+            "description": "Timeout in seconds (`timeoutSecs` is accepted too).",
             "example": 30,
             "minimum": 0
           },
@@ -4955,14 +5126,6 @@
             ],
             "description": "Run as this user: a name from the image or a numeric `uid[:gid]`,\noverriding the image's USER. Only meaningful for image machines; a bare\nVM has no container user to become.",
             "example": "1000:1000"
-          },
-          "workdir": {
-            "type": [
-              "string",
-              "null"
-            ],
-            "description": "Working directory.",
-            "example": "/workspace"
           }
         },
         "additionalProperties": false

@@ -242,26 +242,33 @@ pub struct ResourceSpec {
 
 /// Request to execute a command in a machine.
 ///
+/// Field names and shapes follow the smol cloud API (`cwd`, `timeoutSeconds`,
+/// `env` as an object, `command` as a list or one shell string); the older
+/// `workdir`, `timeoutSecs` and `env` list are still accepted.
+///
 /// `deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a
-/// silent no-op. This matters for the safety fields (`timeoutSecs`, etc.) — a
-/// caller who writes `timeout_secs` must be told, not left running an untrusted
-/// command with no timeout because the field was quietly dropped.
+/// silent no-op. This matters for the safety fields (`timeoutSeconds`, etc.) —
+/// a caller who writes `timeout_seconds` must be told, not left running an
+/// untrusted command with no timeout because the field was quietly dropped.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecRequest {
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
+    /// Command and arguments, or one string run with `sh -lc`.
+    #[serde(deserialize_with = "command_argv")]
+    #[schema(value_type = CommandSpec, example = json!(["echo", "hello"]))]
     pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
+    /// Environment variables by name. A list of `{name, value}` is also
+    /// accepted.
+    #[serde(default, deserialize_with = "env_vars")]
+    #[schema(value_type = std::collections::HashMap<String, String>)]
     pub env: Vec<EnvVar>,
     /// Ad-hoc secret refs. Rejected unless empty: an untrusted HTTP
     /// caller cannot read this host's env/files. See `RequestSecretRefs`.
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
+    /// Working directory (`workdir` is accepted too).
+    #[serde(default, rename = "cwd", alias = "workdir")]
     #[schema(example = "/workspace")]
     pub workdir: Option<String>,
     /// Run as this user: a name from the image or a numeric `uid[:gid]`,
@@ -270,8 +277,8 @@ pub struct ExecRequest {
     #[serde(default)]
     #[schema(example = "1000:1000")]
     pub user: Option<String>,
-    /// Timeout in seconds.
-    #[serde(default)]
+    /// Timeout in seconds (`timeoutSecs` is accepted too).
+    #[serde(default, rename = "timeoutSeconds", alias = "timeoutSecs")]
     #[schema(example = 30)]
     pub timeout_secs: Option<u64>,
     /// Data to pipe to the command's stdin.
@@ -288,6 +295,10 @@ pub struct ExecRequest {
     #[serde(default = "auto_start_default")]
     #[schema(default = true)]
     pub auto_start: bool,
+    /// Stream stdout and stderr as Server-Sent Events, as
+    /// `POST .../exec/stream` does, instead of one JSON body.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn auto_start_default() -> bool {
@@ -303,6 +314,61 @@ pub struct SetMachineEnvRequest {
     /// cloud API takes environment variables.
     #[schema(value_type = std::collections::HashMap<String, String>)]
     pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// A command as the smol cloud API takes it: an argument list, or one string
+/// run with `sh -lc`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum CommandSpec {
+    /// Program and arguments.
+    Argv(Vec<String>),
+    /// A shell command line.
+    Shell(String),
+}
+
+impl CommandSpec {
+    /// The argument list the command runs as.
+    pub fn into_argv(self) -> Vec<String> {
+        match self {
+            CommandSpec::Argv(argv) => argv,
+            CommandSpec::Shell(line) => vec!["sh".into(), "-lc".into(), line],
+        }
+    }
+}
+
+fn command_argv<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    match CommandSpec::deserialize(de) {
+        Ok(CommandSpec::Shell(line)) if line.trim().is_empty() => {
+            Err(serde::de::Error::custom("command cannot be empty"))
+        }
+        Ok(command) => Ok(command.into_argv()),
+        Err(_) => Err(serde::de::Error::custom(
+            "command must be a list of strings or one string",
+        )),
+    }
+}
+
+/// Environment variables as the smol cloud API takes them, an object by name,
+/// or as the older list of `{name, value}`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EnvSpec {
+    ByName(std::collections::BTreeMap<String, String>),
+    List(Vec<EnvVar>),
+}
+
+fn env_vars<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<EnvVar>, D::Error> {
+    match EnvSpec::deserialize(de) {
+        Ok(EnvSpec::ByName(vars)) => Ok(vars
+            .into_iter()
+            .map(|(name, value)| EnvVar { name, value })
+            .collect()),
+        Ok(EnvSpec::List(vars)) => Ok(vars),
+        Err(_) => Err(serde::de::Error::custom(
+            "env must be an object of names to values, or a list of {name, value}",
+        )),
+    }
 }
 
 /// Request to amend a machine's egress allow list: add or remove hosts,
@@ -413,24 +479,28 @@ pub struct CreateExecSessionRequest {
     /// the command twice. Generated when absent.
     #[serde(default)]
     pub exec_id: Option<String>,
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
+    /// Command and arguments, or one string run with `sh -lc`.
+    #[serde(deserialize_with = "command_argv")]
+    #[schema(value_type = CommandSpec, example = json!(["echo", "hello"]))]
     pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
+    /// Environment variables by name. A list of `{name, value}` is also
+    /// accepted.
+    #[serde(default, deserialize_with = "env_vars")]
+    #[schema(value_type = std::collections::HashMap<String, String>)]
     pub env: Vec<EnvVar>,
     /// Ad-hoc secret refs; rejected unless empty (see [`ExecRequest`]).
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
+    /// Working directory (`workdir` is accepted too).
+    #[serde(default, rename = "cwd", alias = "workdir")]
     pub workdir: Option<String>,
     /// Run as this user (image machines).
     #[serde(default)]
     pub user: Option<String>,
-    /// Kill the command after this many seconds (exit code 124).
-    #[serde(default)]
+    /// Kill the command after this many seconds (exit code 124;
+    /// `timeoutSecs` is accepted too).
+    #[serde(default, rename = "timeoutSeconds", alias = "timeoutSecs")]
     pub timeout_secs: Option<u64>,
     /// Data written to the command's stdin when it starts. Unless
     /// `interactive`, stdin is closed after it.
@@ -456,8 +526,8 @@ pub struct CreateExecSessionRequest {
     pub auto_start: bool,
     /// Wait up to this many seconds (at most 60) for output or the exit before
     /// answering, and answer with the output from offset 0; a short command
-    /// then needs this one request.
-    #[serde(default)]
+    /// then needs this one request (`waitSecs` is accepted too).
+    #[serde(default, rename = "waitSeconds", alias = "waitSecs")]
     pub wait_secs: Option<u64>,
     /// Most output bytes in the answer.
     #[serde(default)]
@@ -2323,5 +2393,87 @@ mod registry_auth_tests {
         let legacy_pool: StartMachineQuery =
             serde_json::from_value(serde_json::json!({"forkPoolSize": 4})).unwrap();
         assert_eq!(legacy_pool.fork_pool_size, Some(4));
+    }
+
+    #[test]
+    fn exec_takes_the_cloud_shape_and_the_older_one_alike() {
+        let cloud: ExecRequest = serde_json::from_value(serde_json::json!({
+            "command": "echo hi",
+            "cwd": "/srv",
+            "timeoutSeconds": 5,
+            "env": {"B": "2", "A": "1"},
+            "stream": true
+        }))
+        .unwrap();
+        assert_eq!(cloud.command, ["sh", "-lc", "echo hi"]);
+        assert_eq!(cloud.workdir.as_deref(), Some("/srv"));
+        assert_eq!(cloud.timeout_secs, Some(5));
+        assert_eq!(
+            EnvVar::to_tuples(&cloud.env),
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ]
+        );
+        assert!(cloud.stream);
+
+        let older: ExecRequest = serde_json::from_value(serde_json::json!({
+            "command": ["echo", "hi"],
+            "workdir": "/srv",
+            "timeoutSecs": 5,
+            "env": [{"name": "A", "value": "1"}]
+        }))
+        .unwrap();
+        assert_eq!(older.command, ["echo", "hi"]);
+        assert_eq!(older.workdir.as_deref(), Some("/srv"));
+        assert_eq!(older.timeout_secs, Some(5));
+        assert_eq!(
+            EnvVar::to_tuples(&older.env),
+            [("A".to_string(), "1".to_string())]
+        );
+        assert!(!older.stream);
+
+        // Still strict: a misspelled safety field, an empty shell line and a
+        // malformed env are refused, not dropped.
+        for body in [
+            serde_json::json!({"command": ["true"], "timeout_seconds": 5}),
+            serde_json::json!({"command": "  "}),
+            serde_json::json!({"command": ["true"], "env": "A=1"}),
+            serde_json::json!({"command": 7}),
+        ] {
+            assert!(
+                serde_json::from_value::<ExecRequest>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_sessions_take_the_cloud_names_and_the_older_ones_alike() {
+        let cloud: CreateExecSessionRequest = serde_json::from_value(serde_json::json!({
+            "command": "make",
+            "cwd": "/src",
+            "timeoutSeconds": 60,
+            "waitSeconds": 10,
+            "env": {"CI": "1"}
+        }))
+        .unwrap();
+        let older: CreateExecSessionRequest = serde_json::from_value(serde_json::json!({
+            "command": ["sh", "-lc", "make"],
+            "workdir": "/src",
+            "timeoutSecs": 60,
+            "waitSecs": 10,
+            "env": [{"name": "CI", "value": "1"}]
+        }))
+        .unwrap();
+        for req in [&cloud, &older] {
+            assert_eq!(req.command, ["sh", "-lc", "make"]);
+            assert_eq!(req.workdir.as_deref(), Some("/src"));
+            assert_eq!((req.timeout_secs, req.wait_secs), (Some(60), Some(10)));
+            assert_eq!(
+                EnvVar::to_tuples(&req.env),
+                [("CI".to_string(), "1".to_string())]
+            );
+        }
     }
 }

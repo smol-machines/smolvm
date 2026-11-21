@@ -53,7 +53,7 @@ pub(crate) async fn require_running(
     ),
     request_body = ExecRequest,
     responses(
-        (status = 200, description = "Command executed", body = ExecResponse),
+        (status = 200, description = "Command executed; with `stream`, its output as Server-Sent Events", body = ExecResponse),
         (status = 400, description = "Invalid request", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 409, description = "Machine not running and autoStart is false", body = ApiErrorResponse),
@@ -61,10 +61,28 @@ pub(crate) async fn require_running(
     )
 )]
 pub async fn exec_command(
+    state: State<Arc<ApiState>>,
+    id: Path<String>,
+    trace_id: Option<axum::Extension<TraceId>>,
+    Json(req): Json<ExecRequest>,
+) -> Result<axum::response::Response, ApiError> {
+    use axum::response::IntoResponse;
+    // `stream` answers as `/exec/stream` does, as the cloud API's exec does.
+    if req.stream {
+        return exec_stream(state, id, trace_id, Json(req))
+            .await
+            .map(IntoResponse::into_response);
+    }
+    exec_buffered(state, id, trace_id, req)
+        .await
+        .map(IntoResponse::into_response)
+}
+
+async fn exec_buffered(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
     trace_id: Option<axum::Extension<TraceId>>,
-    Json(req): Json<ExecRequest>,
+    req: ExecRequest,
 ) -> Result<Json<ExecResponse>, ApiError> {
     let tid = trace_id.map(|t| t.0 .0.clone());
     validate_command(&req.command)?;
@@ -615,6 +633,23 @@ fn interactive_command(
 ///
 /// Image machines run the program in their persistent-overlay container (the
 /// same filesystem `exec` uses); plain machines run it directly in the VM.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{id}/exec/interactive",
+    tag = "Execution",
+    params(
+        ("id" = String, Path, description = "Machine name"),
+        ("cmd" = Option<String>, Query, description = "Program to run (the machine's shell when absent)"),
+        ("arg" = Option<Vec<String>>, Query, description = "One argument to the program, repeated in order"),
+        ("tty" = Option<bool>, Query, description = "Run on a pseudo-terminal (the default) or on pipes")
+    ),
+    responses(
+        (status = 101, description = "Switching to the WebSocket terminal protocol"),
+        (status = 400, description = "Invalid command", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 500, description = "The machine could not be started", body = ApiErrorResponse)
+    )
+)]
 pub async fn exec_interactive(
     State(state): State<Arc<ApiState>>,
     Path(id): Path<String>,
