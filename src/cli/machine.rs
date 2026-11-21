@@ -7650,9 +7650,9 @@ impl UpdateCmd {
         use smolvm::data::storage::HostMount;
 
         let db = smolvm::db::SmolvmDb::open()?;
-        let record = db.get_vm(&self.name)?.ok_or_else(|| {
-            smolvm::Error::config("update", format!("machine '{}' not found", self.name))
-        })?;
+        let record = db
+            .get_vm(&self.name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
 
         let set_labels = smolvm::util::parse_labels(&self.labels)?;
         let state = record.actual_state();
@@ -8099,9 +8099,9 @@ impl ImagesCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // Observe existing disks first; prepare them only if this query starts a VM.
         let db = smolvm::db::SmolvmDb::open()?;
-        let record = db.get_vm(&self.name)?.ok_or_else(|| {
-            smolvm::Error::config("images", format!("machine '{}' not found", self.name))
-        })?;
+        let record = db
+            .get_vm(&self.name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
 
         let mut manager = AgentManager::for_vm(&self.name)?;
 
@@ -8206,9 +8206,9 @@ impl PruneCmd {
     pub fn run(self) -> smolvm::Result<()> {
         // Observe existing disks first; prepare them only if this query starts a VM.
         let db = smolvm::db::SmolvmDb::open()?;
-        let record = db.get_vm(&self.name)?.ok_or_else(|| {
-            smolvm::Error::config("prune", format!("machine '{}' not found", self.name))
-        })?;
+        let record = db
+            .get_vm(&self.name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
 
         let mut manager = AgentManager::for_vm(&self.name)?;
 

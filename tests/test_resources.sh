@@ -187,6 +187,66 @@ test_exec_nonexistent_machine_reports_not_found() {
     [[ "$output" == *"not found"* ]] || { echo "cp: expected 'not found', got: $output"; return 1; }
 }
 
+test_missing_machine_error_code_is_not_found() {
+    # Callers branch on `code`, so every machine command must report a
+    # missing machine as NOT_FOUND, not CONFIG_ERROR or SMOLVM_ERROR.
+    local name="missing-code-test-$$"
+    local args output rc=0
+    # An empty data dir holds no machines, not even "default", which the
+    # unnamed exec below needs.
+    local data_dir
+    data_dir=$(mktemp -d)
+    for args in \
+        "machine exec -- echo hi" \
+        "pack create --from-vm $name -o $data_dir/out" \
+        "machine status --name $name --json" \
+        "machine update --name $name --cpus 2" \
+        "machine images --name $name" \
+        "machine prune --name $name" \
+        "machine credentials add --name $name --credential gh=GH_TOKEN@api.github.com" \
+        "machine credentials remove --name $name gh" \
+        "machine credentials refresh --name $name"; do
+        # shellcheck disable=SC2086 # word-split the argument list on purpose
+        output=$(SMOLVM_DATA_DIR="$data_dir" GH_TOKEN=unused env -u SMOLVM_MACHINE_NAME \
+            $SMOLVM --error-format json $args 2>&1) && {
+            echo "'$args' on a missing machine should fail"
+            rc=1
+            break
+        }
+        [[ "$output" == *'"code":"NOT_FOUND"'* ]] || {
+            echo "'$args': expected NOT_FOUND, got: $output"
+            rc=1
+            break
+        }
+    done
+    rm -rf "$data_dir"
+    return $rc
+}
+
+test_invalid_input_on_existing_machine_is_config_error() {
+    # The NOT_FOUND fix must only cover a missing machine: bad input to an
+    # existing one is still CONFIG_ERROR.
+    local name="config-code-test-$$"
+    local output
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null || true
+    $SMOLVM machine create --name "$name" 2>&1 || { echo "setup: create failed"; return 1; }
+
+    output=$($SMOLVM --error-format json machine update --name "$name" --cpus 0 2>&1)
+    [[ "$output" == *'"code":"CONFIG_ERROR"'* ]] || {
+        echo "update --cpus 0: expected CONFIG_ERROR, got: $output"
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
+        return 1
+    }
+
+    output=$($SMOLVM --error-format json machine credentials remove --name "$name" nosuch 2>&1)
+    [[ "$output" == *'"code":"CONFIG_ERROR"'* ]] || {
+        echo "credentials remove nosuch: expected CONFIG_ERROR, got: $output"
+        $SMOLVM machine delete --name "$name" -f 2>/dev/null
+        return 1
+    }
+    $SMOLVM machine delete --name "$name" -f 2>/dev/null
+}
+
 test_status_json_output() {
     # `machine status` supports `--json`, mirroring `machine list --json`.
     local name="status-json-test-$$"
@@ -223,6 +283,8 @@ run_test "Start --name nonexistent rejected" test_start_nonexistent_name_rejecte
 run_test "Auto-generated names" test_auto_generated_names || true
 run_test "Create: zero-valued storage/overlay rejected, not persisted" test_create_rejects_zero_valued_disks || true
 run_test "Exec/cp: nonexistent machine reports 'not found'" test_exec_nonexistent_machine_reports_not_found || true
+run_test "Missing machine: every command reports NOT_FOUND" test_missing_machine_error_code_is_not_found || true
+run_test "Existing machine: bad input reports CONFIG_ERROR" test_invalid_input_on_existing_machine_is_config_error || true
 run_test "Status: --json outputs a JSON object" test_status_json_output || true
 
 print_summary "Resource Tests"

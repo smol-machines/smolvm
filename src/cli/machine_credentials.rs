@@ -223,10 +223,7 @@ impl RefreshCmd {
         let lock = smolvm::credentials::lock_bindings(&name)?;
         let Some(record) = smolvm::db::SmolvmDb::open()?.get_vm(&name)? else {
             lock.remove_if_machine_gone();
-            return Err(smolvm::Error::config(
-                "credentials",
-                format!("machine '{name}' not found"),
-            ));
+            return Err(smolvm::Error::vm_not_found(&name));
         };
         if record.credentials_supplied_by_api {
             return Err(smolvm::Error::config(

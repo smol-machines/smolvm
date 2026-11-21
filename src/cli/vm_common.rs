@@ -119,10 +119,9 @@ pub fn ensure_running_and_connect(
     let label = vm_label(name);
     if manager.try_connect_existing().is_none() {
         let db = SmolvmDb::open()?;
-        let record = db.get_vm(&label)?.ok_or_else(|| match name {
-            Some(n) => smolvm::Error::vm_not_found(n),
-            None => smolvm::Error::agent("connect", format!("machine '{label}' not found")),
-        })?;
+        let record = db
+            .get_vm(&label)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&label))?;
         if let Some(error) = paused_machine_error(&label, &record) {
             return Err(error);
         }
@@ -3672,12 +3671,7 @@ pub fn status_vm_json(name: &Option<String>) -> smolvm::Result<()> {
     // ends before `config` is dropped.
     let mut obj = match config.list_vms().find(|(n, _)| *n == &label) {
         Some((_, record)) => machine_status_json(&label, record),
-        None => {
-            return Err(smolvm::Error::config(
-                "machine status",
-                format!("machine '{}' not found", label),
-            ))
-        }
+        None => return Err(smolvm::Error::vm_not_found(label)),
     };
     // Per-port guest listening state, only for a machine that is already
     // running (status never starts one). Kept out of the shared object so
