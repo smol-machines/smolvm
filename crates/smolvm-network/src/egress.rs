@@ -274,18 +274,19 @@ enum FloorMode {
     /// Trusted single-tenant/local override (`SMOLVM_EGRESS_ALLOW_PRIVATE=1`):
     /// floor nothing — the guest reaches exactly what the host can.
     Off,
-    /// Loopback-permitted local mode (`SMOLVM_ALLOW_HOST_LOOPBACK=1`, e.g. the
-    /// `--allow-host-loopback` CLI flag): deny ONLY the cloud-metadata link-local
-    /// range, leaving the host's own loopback reachable so a developer can hit a
-    /// service on their host's `127.0.0.1` from the sandbox on purpose.
+    /// Local DEFAULT: deny ONLY the cloud-metadata link-local range, leaving the
+    /// host's own loopback reachable (through the gateway or
+    /// `host.docker.internal`), so a machine on a developer's computer reaches
+    /// the services they run there, as a container under Docker does. A machine
+    /// with an allow-list reaches loopback only through a CIDR it names, and
+    /// `--deny-cidr 127.0.0.0/8` or `--block-private` closes it.
     MetadataOnly,
-    /// Local DEFAULT: deny the cloud-metadata link-local range
-    /// (`169.254.0.0/16`, incl. `169.254.169.254`) AND the host's own loopback
-    /// (`127.0.0.0/8`, `::1`, `0.0.0.0`/`::`). A guest reaching `127.0.0.1`
-    /// means "myself", but the gateway would forward it to the HOST's loopback —
-    /// a confused-deputy path onto host debuggers, Docker, and local databases.
-    /// The host's LAN stays reachable (legitimate local dev), and an explicit
-    /// allow-list entry can also re-open loopback (see [`EgressPolicy::allows`]).
+    /// Loopback-closed local mode (`SMOLVM_ALLOW_HOST_LOOPBACK=0`): deny the
+    /// cloud-metadata link-local range (`169.254.0.0/16`, incl.
+    /// `169.254.169.254`) AND the host's own loopback (`127.0.0.0/8`, `::1`,
+    /// `0.0.0.0`/`::`), the confused-deputy path onto host debuggers, Docker and
+    /// local databases. The host's LAN stays reachable, and an explicit
+    /// allow-list entry can re-open loopback (see [`EgressPolicy::allows`]).
     MetadataAndLoopback,
     /// Multi-tenant/fleet (`SMOLVM_PUBLISH_ADDR` set): the full floor — metadata,
     /// host/control internal subnets, loopback, link/unique-local, and the
@@ -337,9 +338,10 @@ fn floor_mode() -> FloorMode {
     if std::env::var_os("SMOLVM_PUBLISH_ADDR").is_some() {
         return FloorMode::Strict;
     }
+    // A local machine reaches its host's loopback unless that is turned off.
     let allow_host_loopback = std::env::var("SMOLVM_ALLOW_HOST_LOOPBACK")
-        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
-        .unwrap_or(false);
+        .map(|v| !(v == "0" || v.eq_ignore_ascii_case("false")))
+        .unwrap_or(true);
     if allow_host_loopback {
         FloorMode::MetadataOnly
     } else {
@@ -947,6 +949,13 @@ impl EgressPolicy {
             Some(list) => {
                 if list.rules().cidrs.iter().any(|cidr| cidr.contains(ip)) {
                     return true;
+                }
+                // A restricted machine reaches its host's loopback only through
+                // a CIDR it names, never through an answer it learned: a name
+                // that resolves to 127.0.0.1 must not open the host's own
+                // services (DNS rebinding), whichever local floor applies.
+                if is_host_loopback(ip) {
+                    return false;
                 }
                 list.learned
                     .lock()
@@ -1671,15 +1680,14 @@ mod tests {
     }
 
     #[test]
-    fn unrestricted_local_floors_metadata_and_loopback() {
-        // Local default (no fleet mode): the cloud-metadata link-local range AND
-        // the host's own loopback are denied — a guest reaching `127.0.0.1` would
-        // otherwise hit the host's loopback services. The host's LAN and CGNAT
-        // stay reachable, so a local VM still behaves predictably.
+    fn unrestricted_local_floors_metadata_and_reaches_host_loopback() {
+        // Local default (no fleet mode): only the cloud-metadata link-local
+        // range is denied. The host's own loopback is reachable, as it is from a
+        // container under Docker, so a machine reaches the services its
+        // developer runs on their computer. The LAN and CGNAT stay reachable.
         let p = EgressPolicy::unrestricted();
         assert!(!p.allows_v4(Ipv4Addr::new(169, 254, 169, 254))); // metadata: denied
-        assert!(!p.allows_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback: denied
-        assert!(!p.allows_v4(Ipv4Addr::new(0, 0, 0, 0))); // unspecified: denied
+        assert!(p.allows_v4(Ipv4Addr::new(127, 0, 0, 1))); // loopback: reachable
         assert!(p.allows_v4(Ipv4Addr::new(10, 0, 0, 4))); // LAN: reachable
         assert!(p.allows_v4(Ipv4Addr::new(192, 168, 1, 1)));
         assert!(p.allows_v4(Ipv4Addr::new(172, 16, 0, 1)));

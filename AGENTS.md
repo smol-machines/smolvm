@@ -250,6 +250,10 @@ left out; a `-p` mapping keeps its guest port. `machine status` marks them `auto
 `smolvm serve`, the SDKs, or a running branch), on TSI and virtio-net alike; a port in a separate
 network namespace, or Docker with `"userland-proxy": false`, is not seen. Details:
 `docs/throwaway-machine/README.md`.
+A machine with a network on your own computer reaches the services you run on
+it (`127.0.0.1`, through its gateway or `host.docker.internal`), as a container
+under Docker does; `--deny-cidr 127.0.0.0/8` closes just that, and a cloud
+worker never allows it. Cloud metadata stays blocked everywhere.
 `--block-private` keeps the public internet open but blocks the LAN, cloud
 metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 `--allow-private CIDR` re-opens one private range, such as an internal
