@@ -75,11 +75,9 @@ pub fn reconcile() {
     #[cfg(target_os = "linux")]
     if crate::process::vm_uid_drop_active() {
         match imp::reconcile_in(&grants_root(), &crate::agent::vm_cache_root()) {
-            Ok((recorded, dropped)) => tracing::info!(
-                recorded,
-                dropped,
-                "disk backing grants reconciled"
-            ),
+            Ok((recorded, dropped)) => {
+                tracing::info!(recorded, dropped, "disk backing grants reconciled")
+            }
             Err(error) => tracing::warn!(%error, "could not reconcile disk backing grants"),
         }
     }
@@ -536,9 +534,7 @@ mod imp {
             assert!(grants.join(BACKFILLED).exists());
 
             record_in(&grants, &top, &shared).unwrap();
-            let record = grants.join(
-                Identity::of(&std::fs::metadata(&top).unwrap()).file_name(),
-            );
+            let record = grants.join(Identity::of(&std::fs::metadata(&top).unwrap()).file_name());
             assert!(record.exists());
             assert_eq!(reconcile_in(&grants, &vms).unwrap(), (0, 0));
             assert!(record.exists(), "a live layer keeps its record");
