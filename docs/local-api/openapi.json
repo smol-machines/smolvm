@@ -2708,6 +2708,88 @@
         }
       }
     },
+    "/api/v1/machines/{name}/network": {
+      "put": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Replace a machine's egress policy, in the cloud API's shape: `blocked`,\n`open`, or `allowCidrs` with the hosts and CIDRs it may reach. A running\nmachine takes a policy that keeps an allow list in force, for its next\nconnection or lookup; opening it fully or blocking it needs it stopped, as\n`POST .../egress` does.",
+        "operationId": "set_machine_network",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/MachineNetwork"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Policy replaced",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid policy",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Machine not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "The change needs the machine stopped",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Update failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/machines/{name}/pause": {
       "post": {
         "tags": [
@@ -6971,6 +7053,70 @@
             "minimum": 0
           }
         }
+      },
+      "MachineNetwork": {
+        "oneOf": [
+          {
+            "type": "object",
+            "description": "No outbound access for the guest.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "blocked"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Unrestricted outbound access.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "open"
+                ]
+              }
+            }
+          },
+          {
+            "type": "object",
+            "description": "Outbound access only to these CIDRs and hosts.",
+            "required": [
+              "mode"
+            ],
+            "properties": {
+              "cidrs": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "CIDR ranges the guest may reach."
+              },
+              "hosts": {
+                "type": "array",
+                "items": {
+                  "type": "string"
+                },
+                "description": "Hostnames the guest may reach, each with its subdomains."
+              },
+              "mode": {
+                "type": "string",
+                "enum": [
+                  "allowCidrs"
+                ]
+              }
+            }
+          }
+        ],
+        "description": "A machine's egress policy, as the cloud API takes it: the body of\n`PUT /api/v1/machines/{name}/network`."
       },
       "MachinePressure": {
         "type": "object",
