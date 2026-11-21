@@ -44,9 +44,10 @@ use crate::api::state::{
 use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialBindingsRequest, CredentialBindingsResponse,
     CredentialValuesRequest, DeleteQuery, DeleteResponse, EgressEventsResponse, ExportRequest,
-    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo,
-    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest,
-    SetMachineEnvRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
+    ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo,
+    MachineMetricsResponse, MachinePressure, MountInfo, MountSpec, PortSpec, PressureReading,
+    ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetMachineEnvRequest, SetPortsRequest,
+    StartMachineQuery, UpdateEgressRequest, UpdateMachineLabelsRequest,
 };
 use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -175,6 +176,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         // measured from the data dir regardless of whether the VMM is running.
         disk_used_mb: crate::agent::disk_used_mb(name),
         created_at: record.created_at,
+        labels: record.labels.clone(),
     }
 }
 
@@ -1014,6 +1016,17 @@ pub struct CaptureCheckpointQuery {
 /// Capture a live checkpoint of a running machine and stream it back as a
 /// `.checkpoint` file, keeping a node-local copy when the caller
 /// supplies a cache key.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/checkpoint",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "The checkpoint artifact, or JSON naming where it was uploaded or held", content_type = "application/octet-stream"),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not running", body = ApiErrorResponse)
+    )
+)]
 pub async fn capture_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -2311,6 +2324,18 @@ fn restore_create_request(
 
 /// Import a live checkpoint, optionally rebinding its host-side published ports
 /// and replacing its egress policy.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/checkpoint",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Name of the machine the checkpoint becomes")),
+    request_body(content = Vec<u8>, content_type = "application/octet-stream", description = "The checkpoint artifact"),
+    responses(
+        (status = 200, description = "Machine restored from the checkpoint", body = MachineInfo),
+        (status = 400, description = "Invalid checkpoint or request", body = ApiErrorResponse),
+        (status = 409, description = "A machine of that name exists", body = ApiErrorResponse)
+    )
+)]
 pub async fn restore_portable_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -3645,6 +3670,156 @@ pub async fn get_machine(
             .await
             .map_err(|error| ApiError::internal(format!("disk depth task failed: {error}")))?;
     Ok(Json(info))
+}
+
+/// Most labels one machine may carry, as the cloud API allows.
+const MAX_LABELS: usize = 32;
+/// Longest label key: a DNS label, as the cloud API allows.
+const MAX_LABEL_KEY_LEN: usize = 63;
+/// Longest label value, as the cloud API allows.
+const MAX_LABEL_VALUE_LEN: usize = 255;
+
+/// A label key by the cloud API's rule: 1-63 chars of
+/// `[a-z0-9]([a-z0-9._/-]*[a-z0-9])?`.
+fn check_label_key(key: &str) -> Result<(), ApiError> {
+    let bytes = key.as_bytes();
+    let edge = |b: u8| b.is_ascii_lowercase() || b.is_ascii_digit();
+    let inner = |b: u8| edge(b) || matches!(b, b'.' | b'_' | b'/' | b'-');
+    let ok = !bytes.is_empty()
+        && bytes.len() <= MAX_LABEL_KEY_LEN
+        && edge(bytes[0])
+        && edge(bytes[bytes.len() - 1])
+        && bytes.iter().all(|b| inner(*b));
+    if ok {
+        Ok(())
+    } else {
+        Err(ApiError::Unprocessable(format!(
+            "invalid label key {key:?}: must be 1-{MAX_LABEL_KEY_LEN} chars of lowercase \
+             letters, digits, '.', '_', '/' or '-', starting and ending with a letter or digit"
+        )))
+    }
+}
+
+/// Change some of a machine's labels, leaving the others as they are, as the
+/// cloud API does. Labels are host-side metadata, so any state takes this.
+#[utoipa::path(
+    patch,
+    path = "/api/v1/machines/{name}/labels",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = UpdateMachineLabelsRequest,
+    responses(
+        (status = 200, description = "Labels changed", body = MachineInfo),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 422, description = "A label breaks the label rules", body = ApiErrorResponse),
+        (status = 500, description = "Update failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn update_machine_labels(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<UpdateMachineLabelsRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    for (key, value) in &req.labels {
+        check_label_key(key)?;
+        if let Some(value) = value {
+            if value.chars().count() > MAX_LABEL_VALUE_LEN {
+                return Err(ApiError::Unprocessable(format!(
+                    "label {key:?} value too long (max {MAX_LABEL_VALUE_LEN} chars)"
+                )));
+            }
+        }
+    }
+    // The count is checked on the result, inside the same write.
+    let too_many = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let seen = too_many.clone();
+    let updated = state
+        .update_vm(&name, move |r| {
+            let mut after = r.labels.clone();
+            for (key, value) in req.labels {
+                match value {
+                    Some(value) => after.insert(key, value),
+                    None => after.remove(&key),
+                };
+            }
+            if after.len() > MAX_LABELS {
+                seen.store(after.len(), std::sync::atomic::Ordering::SeqCst);
+            } else {
+                r.labels = after;
+            }
+        })
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let count = too_many.load(std::sync::atomic::Ordering::SeqCst);
+    if count > 0 {
+        return Err(ApiError::Unprocessable(format!(
+            "too many labels ({count}, max {MAX_LABELS})"
+        )));
+    }
+    Ok(Json(record_to_info(&name, &updated)))
+}
+
+/// Read a machine's CPU time, memory, disk, egress and guest pressure now, in
+/// the shape the cloud API answers it. Nothing is stored, so poll to draw a
+/// graph.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/metrics",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    responses(
+        (status = 200, description = "The machine's resource use now", body = MachineMetricsResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse)
+    )
+)]
+pub async fn get_machine_metrics(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+) -> Result<Json<MachineMetricsResponse>, ApiError> {
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    let info = record_to_info(&name, &record);
+    Ok(Json(machine_metrics_from_info(
+        &info,
+        std::time::SystemTime::now(),
+    )))
+}
+
+fn machine_metrics_from_info(
+    info: &MachineInfo,
+    at: std::time::SystemTime,
+) -> MachineMetricsResponse {
+    let reading = |stall: &crate::agent::PressureStall| PressureReading {
+        some_avg10: stall.some_avg10,
+        some_avg60: stall.some_avg60,
+        full_avg10: stall.full_avg10,
+        full_avg60: stall.full_avg60,
+    };
+    MachineMetricsResponse {
+        machine_id: info.name.clone(),
+        at: humantime::format_rfc3339_millis(at).to_string(),
+        state: info.state.clone(),
+        vcpus: u32::from(info.cpus),
+        memory_limit_mb: info.mem,
+        cpu_millis: info.cpu_millis,
+        cpu_limit_millicpus: info.cpu_limit_millicpus,
+        memory_mb: info.pss_mb.or(info.rss_mb),
+        rss_mb: info.rss_mb,
+        disk_used_mb: info.disk_used_mb,
+        disk_gb: info.storage_gb,
+        egress_bytes: info.egress_bytes,
+        pressure: info.pressure.as_ref().map(|p| MachinePressure {
+            cpu: reading(&p.cpu),
+            memory: reading(&p.memory),
+            io: reading(&p.io),
+        }),
+    }
 }
 
 /// Query string for `GET /machines/{name}/egress-events`.
@@ -5526,6 +5701,37 @@ pub async fn release_held_fork(
     Path(clone): Path<String>,
     Json(req): Json<ForkReleaseRequest>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    release_held(state, clone, req).await
+}
+
+/// Assign job parameters and release one held branch-pool slot: the newer
+/// name of `fork-release`.
+#[utoipa::path(
+    post,
+    path = "/api/v1/machines/{name}/branch-release",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Held branch name")),
+    request_body = ForkReleaseRequest,
+    responses(
+        (status = 200, description = "Held branch assigned and released", body = MachineInfo),
+        (status = 404, description = "Branch not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is not a held branch slot", body = ApiErrorResponse),
+        (status = 500, description = "Activation failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn release_held_branch(
+    State(state): State<Arc<ApiState>>,
+    Path(clone): Path<String>,
+    Json(req): Json<ForkReleaseRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    release_held(state, clone, req).await
+}
+
+async fn release_held(
+    state: Arc<ApiState>,
+    clone: String,
+    req: ForkReleaseRequest,
+) -> Result<Json<MachineInfo>, ApiError> {
     let lifecycle = state.lifecycle_lock(&clone);
     let _guard = lifecycle.lock().await;
     let db = state.db().clone();
@@ -5689,6 +5895,16 @@ async fn saved_execution_operation(
 }
 
 /// Download a paused machine's saved execution without consuming it.
+#[utoipa::path(
+    get,
+    path = "/api/v1/machines/{name}/pause/checkpoint",
+    tag = "Machines",
+    params(("name" = String, Path, description = "Machine name")),
+    responses(
+        (status = 200, description = "The paused execution's checkpoint artifact", content_type = "application/octet-stream"),
+        (status = 404, description = "Machine not found or not paused", body = ApiErrorResponse)
+    )
+)]
 pub async fn paused_checkpoint(
     State(state): State<Arc<ApiState>>,
     Path(name): Path<String>,
@@ -8987,6 +9203,96 @@ mod tests {
         let req = SetPortsRequest { ports: vec![] };
         let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn labels_change_as_the_cloud_api_changes_them() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "label-vm", Some(20), Some(5));
+        let patch = |body: serde_json::Value| -> UpdateMachineLabelsRequest {
+            serde_json::from_value(body).unwrap()
+        };
+        let labels = |state: &Arc<ApiState>| state.db().get_vm("label-vm").unwrap().unwrap().labels;
+
+        let first = update_machine_labels(
+            State(state.clone()),
+            Path("label-vm".into()),
+            Json(patch(
+                serde_json::json!({"labels": {"team": "a", "tier": "web"}}),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(first.0.labels.len(), 2);
+        // A string replaces, null removes, an unknown null is ignored, and keys
+        // left out stay.
+        let info = update_machine_labels(
+            State(state.clone()),
+            Path("label-vm".into()),
+            Json(patch(
+                serde_json::json!({"labels": {"team": "b", "tier": null, "gone": null}}),
+            )),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.name, "label-vm");
+        assert_eq!(
+            labels(&state),
+            std::collections::BTreeMap::from([("team".to_string(), "b".to_string())])
+        );
+
+        for bad in [
+            serde_json::json!({"labels": {"Team": "x"}}),
+            serde_json::json!({"labels": {"-team": "x"}}),
+            serde_json::json!({"labels": {"team": "x".repeat(256)}}),
+        ] {
+            let refused = update_machine_labels(
+                State(state.clone()),
+                Path("label-vm".into()),
+                Json(patch(bad.clone())),
+            )
+            .await;
+            assert!(
+                matches!(refused.unwrap_err(), ApiError::Unprocessable(_)),
+                "{bad}"
+            );
+        }
+        let many: serde_json::Map<String, serde_json::Value> = (0..32)
+            .map(|i| (format!("k{i}"), serde_json::json!("v")))
+            .collect();
+        let refused = update_machine_labels(
+            State(state.clone()),
+            Path("label-vm".into()),
+            Json(patch(serde_json::json!({"labels": many}))),
+        )
+        .await;
+        assert!(matches!(refused.unwrap_err(), ApiError::Unprocessable(_)));
+        assert_eq!(labels(&state).len(), 1, "a refused change writes nothing");
+
+        let missing = update_machine_labels(
+            State(state),
+            Path("nope".into()),
+            Json(patch(serde_json::json!({"labels": {}}))),
+        )
+        .await;
+        assert!(matches!(missing.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn metrics_report_the_size_and_no_readings_while_stopped() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "metrics-vm", Some(20), Some(5));
+        let metrics = get_machine_metrics(State(state.clone()), Path("metrics-vm".into()))
+            .await
+            .unwrap()
+            .0;
+        assert_eq!(metrics.machine_id, "metrics-vm");
+        assert_eq!((metrics.vcpus, metrics.memory_limit_mb), (1, 512));
+        assert_eq!(metrics.disk_gb, Some(20));
+        assert!(metrics.cpu_millis.is_none() && metrics.memory_mb.is_none());
+        assert!(metrics.at.ends_with('Z'));
+        let missing = get_machine_metrics(State(state), Path("nope".into())).await;
+        assert!(matches!(missing.unwrap_err(), ApiError::NotFound(_)));
     }
 
     #[tokio::test]

@@ -371,6 +371,84 @@ fn env_vars<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<EnvVar>, D::E
     }
 }
 
+/// Body of `PATCH /api/v1/machines/{name}/labels`: labels to change, leaving
+/// the others as they are, as the cloud API takes them.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateMachineLabelsRequest {
+    /// Labels to change: a string value sets or replaces that key, `null`
+    /// removes it (a key the machine does not carry is ignored). Keys left out
+    /// are untouched. The resulting set: at most 32; keys 1-63 chars of
+    /// `[a-z0-9]([a-z0-9._/-]*[a-z0-9])?`, values up to 255 chars.
+    #[schema(value_type = std::collections::HashMap<String, Option<String>>)]
+    pub labels: std::collections::BTreeMap<String, Option<String>>,
+}
+
+/// One reading of a machine's resource use (`GET /api/v1/machines/{name}/metrics`),
+/// in the shape the cloud API answers it.
+///
+/// CPU is a counter: utilization over an interval is the change in
+/// `cpuMillis` divided by the elapsed milliseconds times `vcpus`. The counter
+/// starts again at 0 when the machine's VM restarts. Readings are present only
+/// while the machine runs.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineMetricsResponse {
+    /// The machine these readings are for.
+    pub machine_id: String,
+    /// When the readings were taken, RFC 3339 with milliseconds.
+    pub at: String,
+    /// The machine's state when read.
+    pub state: String,
+    /// The machine's vCPUs.
+    pub vcpus: u32,
+    /// The machine's memory size in MiB.
+    pub memory_limit_mb: u32,
+    /// CPU time the machine has used since its VM started, in milliseconds.
+    pub cpu_millis: Option<u64>,
+    /// A CPU limit in force right now, in thousandths of a CPU.
+    pub cpu_limit_millicpus: Option<u32>,
+    /// Memory in use in MiB, with pages shared with branches split among them.
+    pub memory_mb: Option<u64>,
+    /// Resident memory in MiB, counting shared pages in full.
+    pub rss_mb: Option<u64>,
+    /// Disk space in use in MiB.
+    pub disk_used_mb: Option<u64>,
+    /// Disk size in GiB.
+    pub disk_gb: Option<u64>,
+    /// Bytes the machine has sent out since its VM started.
+    pub egress_bytes: Option<u64>,
+    /// How much of recent time tasks in the guest waited for CPU, memory or IO.
+    pub pressure: Option<MachinePressure>,
+}
+
+/// Pressure stall readings from inside the guest.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MachinePressure {
+    /// Time tasks waited for a CPU.
+    pub cpu: PressureReading,
+    /// Time tasks waited for memory.
+    pub memory: PressureReading,
+    /// Time tasks waited for block IO.
+    pub io: PressureReading,
+}
+
+/// Percent of recent time at least one task (`some`) or every task (`full`)
+/// waited for a resource.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureReading {
+    /// Over the last 10 seconds.
+    pub some_avg10: f64,
+    /// Over the last 60 seconds.
+    pub some_avg60: f64,
+    /// Over the last 10 seconds; always 0 for CPU.
+    pub full_avg10: f64,
+    /// Over the last 60 seconds; always 0 for CPU.
+    pub full_avg60: f64,
+}
+
 /// Request to amend a machine's egress allow list: add or remove hosts,
 /// patterns, and CIDRs without replacing the whole policy. The same merge and
 /// guards as `machine update`, including on a running machine.
@@ -1406,6 +1484,9 @@ pub struct MachineInfo {
     pub disk_used_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
+    /// Labels: metadata to find and group machines by, as the cloud API
+    /// answers them.
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// One egress denial: the machine's egress policy refused an outbound

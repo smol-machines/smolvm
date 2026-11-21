@@ -29,6 +29,9 @@ pub enum ApiError {
     CloneIdentityRejuvenationFailed(String),
     /// Bad request - invalid input (400).
     BadRequest(String),
+    /// A well-formed request whose values break a rule, such as a label key
+    /// outside the allowed characters (422), as the cloud API answers it.
+    Unprocessable(String),
     /// The request body is larger than this route accepts (413).
     PayloadTooLarge(String),
     /// Durable refusal: retries of this operation cannot apply the resize.
@@ -95,6 +98,9 @@ impl IntoResponse for ApiError {
                 msg,
             ),
             ApiError::BadRequest(msg) => (StatusCode::BAD_REQUEST, "BAD_REQUEST", msg),
+            ApiError::Unprocessable(msg) => {
+                (StatusCode::UNPROCESSABLE_ENTITY, "UNPROCESSABLE", msg)
+            }
             ApiError::PayloadTooLarge(msg) => {
                 (StatusCode::PAYLOAD_TOO_LARGE, "PAYLOAD_TOO_LARGE", msg)
             }
@@ -257,6 +263,10 @@ mod tests {
                 StatusCode::INTERNAL_SERVER_ERROR,
             ),
             (ApiError::BadRequest("x".into()), StatusCode::BAD_REQUEST),
+            (
+                ApiError::Unprocessable("x".into()),
+                StatusCode::UNPROCESSABLE_ENTITY,
+            ),
             (
                 ApiError::PayloadTooLarge("x".into()),
                 StatusCode::PAYLOAD_TOO_LARGE,
