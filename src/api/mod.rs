@@ -970,6 +970,23 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// The checked-in spec is what clients and the cloud parity check read, so
+    /// a change to the API that does not regenerate it fails here.
+    #[test]
+    fn checked_in_spec_matches_the_generated_document() {
+        use utoipa::OpenApi;
+        let generated: serde_json::Value =
+            serde_json::to_value(super::ApiDoc::openapi()).expect("spec serializes");
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../../docs/local-api/openapi.json"))
+                .expect("docs/local-api/openapi.json is JSON");
+        assert!(
+            generated == checked_in,
+            "docs/local-api/openapi.json is stale; regenerate it: \
+             cargo run -- serve openapi -o docs/local-api/openapi.json"
+        );
+    }
     use super::{machine_id_from_path, normalize_metrics_path, validate_command};
 
     #[test]
