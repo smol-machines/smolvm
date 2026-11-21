@@ -570,6 +570,7 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
     for root in &roots {
         let plain = root.join(filename);
         if plain.exists() {
+            share_template(&plain);
             return Some(plain);
         }
     }
@@ -605,6 +606,29 @@ pub fn add_template_root(dir: PathBuf) {
     }
 }
 
+/// Make a template this process owns readable by every uid. A VMM opens it
+/// after dropping to its machine's own uid; v1.35.4 to v1.36.1 published
+/// expanded templates 0600, and publication never replaces a finished one, so
+/// those stay unreadable unless widened here. A template holds an empty
+/// filesystem, nothing private. Best effort: one this process does not own is
+/// left to whoever does.
+fn share_template(path: &Path) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let Ok(metadata) = fs::metadata(path) else {
+            return;
+        };
+        // SAFETY: geteuid has no preconditions.
+        let owner = unsafe { libc::geteuid() };
+        if metadata.is_file() && metadata.uid() == owner && metadata.mode() & 0o044 != 0o044 {
+            let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o644));
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = path;
+}
+
 /// Expand `compressed` into a sparse file and return the expanded path.
 ///
 /// Written next to the archive when that directory is writable, otherwise into
@@ -618,6 +642,7 @@ fn expand_template(compressed: &Path, filename: &str) -> std::io::Result<PathBuf
     let mut last_err = None;
     for dest in [beside, cached].into_iter().flatten() {
         if dest.exists() {
+            share_template(&dest);
             return Ok(dest);
         }
         if let Some(parent) = dest.parent() {
@@ -658,6 +683,13 @@ fn materialize_template(src: &Path, dest: &Path) -> std::io::Result<()> {
         .tempfile_in(parent.unwrap_or_else(|| Path::new(".")))?
         .into_temp_path();
     decompress_sparse(src, &tmp)?;
+    // A VMM opens the template after it drops to its machine's own uid, so it
+    // must be readable by every uid; the staging file is created 0600.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&tmp, fs::Permissions::from_mode(0o644))?;
+    }
     // A completed cache entry is immutable. Keep the first publisher's file
     // instead of replacing it underneath readers or another Windows rename.
     // Close our file handle before publication as well.
@@ -1983,6 +2015,30 @@ pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // A VMM opens its template as its machine's own uid, so an expanded
+    // template is readable by every uid, and one an earlier release left 0600
+    // is widened when it is next used.
+    #[cfg(unix)]
+    #[test]
+    fn an_expanded_template_is_readable_by_every_uid() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let compressed = dir.path().join("t.ext4.zst");
+        let mut data = vec![0u8; 1 << 20];
+        data[4096..4100].copy_from_slice(b"data");
+        fs::write(&compressed, zstd::encode_all(&data[..], 3).unwrap()).unwrap();
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+
+        let expanded = expand_template(&compressed, "t.ext4").unwrap();
+        assert_eq!(mode(&expanded), 0o644);
+        assert_eq!(fs::read(&expanded).unwrap(), data);
+
+        fs::set_permissions(&expanded, fs::Permissions::from_mode(0o600)).unwrap();
+        let reused = expand_template(&compressed, "t.ext4").unwrap();
+        assert_eq!(reused, expanded);
+        assert_eq!(mode(&reused), 0o644);
+    }
 
     // An embedder's registered directory is searched first, so an SDK that
     // ships templates beside its assets gets them without touching ~/.smolvm.
