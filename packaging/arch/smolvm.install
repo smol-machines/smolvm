@@ -1,0 +1,5 @@
+post_upgrade() {
+    find /usr/lib/smolvm -maxdepth 1 \
+        \( -name storage-template.ext4 -o -name overlay-template.ext4 \) \
+        -type f -uid 0 -perm 0600 -exec chmod 0644 -- {} +
+}

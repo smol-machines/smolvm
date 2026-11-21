@@ -28,6 +28,11 @@ sudo pacman -Sy smolvm
 
 Upgrades arrive with your normal `pacman -Syu`.
 
+If you started a machine as root with an affected release (starting with
+v1.35.4), upgrading to a package containing the fix also repairs the read
+permissions of the two expanded templates in `/usr/lib/smolvm`. Existing
+machines keep their backing files; you do not need to recreate their disks.
+
 ## Notes
 
 - The repository is served from an atomic GitHub Pages deployment; packages are

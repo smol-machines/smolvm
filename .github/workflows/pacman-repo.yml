@@ -78,6 +78,29 @@ jobs:
           sudo -u builder makepkg -df --noconfirm
           sudo -u builder env CARCH=aarch64 makepkg -df --noconfirm --ignorearch
 
+      - name: Verify upgrade repairs expanded templates without replacing them
+        shell: bash
+        run: |
+          set -euo pipefail
+          package=(/home/builder/build/smolvm-*-x86_64.pkg.tar.zst)
+          pacman -Udd --noconfirm "${package[@]}"
+          cd /usr/lib/smolvm
+          templates=(storage-template.ext4 overlay-template.ext4)
+          vm_user=(setpriv --reuid=2000000 --regid=2000000 --clear-groups)
+          for template in "${templates[@]}"; do
+            (umask 077; printf '%s' "$template" > "$template")
+            if "${vm_user[@]}" cat "$template"; then exit 1; fi
+          done
+          install -m 0600 /dev/null private.ext4
+          before=$(stat -c '%i' "${templates[@]}")
+          pacman -Udd --noconfirm "${package[@]}"
+          test "$(stat -c '%i' "${templates[@]}")" = "$before"
+          test "$(stat -c '%a' private.ext4)" = 600
+          for template in "${templates[@]}"; do
+            test "$(stat -c '%a' "$template")" = 644
+            test "$("${vm_user[@]}" cat "$template")" = "$template"
+          done
+
       - name: Assemble pacman repository
         run: |
           set -euo pipefail
