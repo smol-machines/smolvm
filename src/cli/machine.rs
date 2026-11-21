@@ -827,9 +827,10 @@ pub struct RunCmd {
     #[arg(long = "allow-private", value_name = "CIDR", value_parser = parse_cidr, help_heading = "Network")]
     pub allow_private: Vec<String>,
 
-    /// Let the guest reach services on the HOST's own loopback (127.0.0.1 / ::1);
-    /// off by default so a sandbox can't reach host debuggers, Docker, or local
-    /// databases. Cloud-metadata stays blocked. Implies --net.
+    /// Let the guest reach services on the HOST's own loopback (127.0.0.1 / ::1),
+    /// through its gateway or host.docker.internal. This is the default for a
+    /// machine on your own computer; the flag is kept for scripts that pass it.
+    /// Use --block-private to close it. Cloud-metadata stays blocked. Implies --net.
     #[arg(long = "allow-host-loopback", help_heading = "Network")]
     pub allow_host_loopback: bool,
 
