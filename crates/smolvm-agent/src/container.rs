@@ -345,7 +345,7 @@ pub(crate) fn check_executable(
 /// `path` inside `rootfs`, following symlinks as the container would see
 /// them (an absolute link target is relative to `rootfs`).
 #[cfg(target_os = "linux")]
-fn resolve_in_root(rootfs: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
+pub(crate) fn resolve_in_root(rootfs: &std::path::Path, path: &str) -> Option<std::path::PathBuf> {
     use std::path::{Component, PathBuf};
     let mut parts: Vec<String> = path
         .split('/')
