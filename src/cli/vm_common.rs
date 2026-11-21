@@ -3598,6 +3598,22 @@ pub fn machine_status_json(name: &str, record: &VmRecord) -> serde_json::Value {
         "health_startup_grace_secs": record.health_startup_grace_secs,
     });
     let fields = obj.as_object_mut().unwrap();
+    // Bindings by name, variable and hosts; values are never on the record.
+    fields.insert(
+        "credentials".into(),
+        record
+            .credential_policy
+            .iter()
+            .flat_map(|policy| policy.credentials.iter())
+            .map(|b| {
+                serde_json::json!({
+                    "name": b.name,
+                    "env_var": b.environment_variable,
+                    "hosts": b.allowed_hosts,
+                })
+            })
+            .collect(),
+    );
     fields.insert("network".into(), serde_json::json!(record.network));
     fields.insert(
         "shared_folders".into(),
@@ -5312,6 +5328,27 @@ mod status_dns_tests {
                 {"host":8080, "guest":80, "protocol":"tcp"},
                 {"host":8080, "guest":53, "protocol":"udp"},
             ])
+        );
+    }
+
+    // Credential bindings show by name, variable and hosts, so a client of the
+    // CLI can tell what a machine binds; a record holds no values to show.
+    #[test]
+    fn status_json_lists_credential_bindings() {
+        let mut record = VmRecord::new("c".to_string(), 1, 512, vec![], vec![], true);
+        assert_eq!(
+            machine_status_json("c", &record)["credentials"],
+            serde_json::json!([])
+        );
+        record.credential_policy = Some(smolvm::credentials::CredentialPolicy {
+            credentials: vec![smolvm::credentials::parse_credential_flag(
+                "gh=GH_TOKEN@api.github.com",
+            )
+            .unwrap()],
+        });
+        assert_eq!(
+            machine_status_json("c", &record)["credentials"],
+            serde_json::json!([{"name":"gh", "env_var":"GH_TOKEN", "hosts":["api.github.com"]}])
         );
     }
 
