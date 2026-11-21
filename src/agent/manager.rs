@@ -1799,6 +1799,13 @@ pub struct AgentManager {
     inner: Arc<Mutex<AgentInner>>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ShutdownMode {
+    Graceful,
+    WithoutGuest,
+    PowerOff,
+}
+
 /// Own a registered execution through external control side effects. Helpers
 /// without a database record retain ordinary transfer admission.
 pub(crate) struct ControlOperation {
@@ -4604,7 +4611,7 @@ impl AgentManager {
         &self,
         pid: crate::process::Pid,
         start_time: Option<u64>,
-        guest_is_paused: bool,
+        mode: ShutdownMode,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
         self.validate_control_identity()?;
@@ -4626,16 +4633,7 @@ impl AgentManager {
         if let Some(runtime) = self.vsock_socket.parent() {
             crate::vm_exit::mark_stop_requested(runtime, pid);
         }
-        // A paused guest has no vCPU to service the request and nothing left to
-        // flush, so skip the handshake rather than wait out its deadline and
-        // then refuse the stop. Identity is still verified below, from the PID
-        // start time or this VM's own boot-config path.
-        if guest_is_paused {
-            tracing::debug!(
-                pid,
-                "guest is paused; terminating without a shutdown handshake"
-            );
-        } else {
+        if mode == ShutdownMode::Graceful {
             // Use short timeout — the agent may already be gone (ephemeral run exited).
             // A 100ms connect timeout avoids blocking the exit path.
             let connect_started = Instant::now();
@@ -4716,6 +4714,9 @@ impl AgentManager {
                 process::VM_SIGKILL_TIMEOUT,
             ) {
                 Ok(process::VmStop::Exited(_)) => true,
+                Ok(process::VmStop::Held(held)) if mode == ShutdownMode::PowerOff => {
+                    return Err(Error::agent("power off", held.explain()));
+                }
                 Ok(process::VmStop::Held(held)) => {
                     // The kernel will not let the process exit, and waiting
                     // longer does not change that. It runs no more code, so
@@ -4947,13 +4948,13 @@ impl AgentManager {
 
     /// Stop the agent VM.
     pub fn stop(&self) -> Result<()> {
-        self.stop_inner(false, None)
+        self.stop_inner(ShutdownMode::Graceful, None)
     }
 
     /// [`stop`](Self::stop), giving the workload `stop_timeout` to exit after
     /// its stop signal instead of the timeout it was launched with.
     pub fn stop_with_timeout(&self, stop_timeout: Duration) -> Result<()> {
-        self.stop_inner(false, Some(stop_timeout))
+        self.stop_inner(ShutdownMode::Graceful, Some(stop_timeout))
     }
 
     /// Synchronize and stop the reviewed registered machine, then publish its
@@ -4965,11 +4966,46 @@ impl AgentManager {
         record: &crate::config::VmRecord,
         stop_timeout: Option<Duration>,
     ) -> Result<crate::config::VmRecord> {
+        self.stop_persisted_inner(record, stop_timeout, None)
+    }
+
+    /// Power off a reviewed execution without guest synchronization. Dirty guest
+    /// pages and outstanding staged-folder writes may be lost.
+    pub fn power_off_persisted(
+        &self,
+        record: &crate::config::VmRecord,
+        expected_pid: i32,
+    ) -> Result<crate::config::VmRecord> {
+        self.stop_persisted_inner(record, None, Some(expected_pid))
+    }
+
+    fn stop_persisted_inner(
+        &self,
+        record: &crate::config::VmRecord,
+        stop_timeout: Option<Duration>,
+        power_off_pid: Option<i32>,
+    ) -> Result<crate::config::VmRecord> {
         let operation = self.reserve_control_operation()?;
         operation.validate_staged_record(record)?;
-        let resolved = crate::agent::state_probe::resolve_state(&record.name, record);
-        let frozen = resolved == crate::config::RecordState::Frozen;
-        if frozen {
+        let mode = if let Some(pid) = power_off_pid {
+            if pid <= 1
+                || record.pid != Some(pid)
+                || self.pid_and_start_time().map(|p| p.0) != Some(pid)
+            {
+                return Err(Error::agent_conflict(
+                    "power off",
+                    "machine execution changed; refresh before trying again",
+                ));
+            }
+            ShutdownMode::PowerOff
+        } else if crate::agent::state_probe::resolve_state(&record.name, record)
+            == crate::config::RecordState::Frozen
+        {
+            ShutdownMode::WithoutGuest
+        } else {
+            ShutdownMode::Graceful
+        };
+        if mode != ShutdownMode::Graceful {
             let dependents = super::fork::stop_blocking_dependent_clones(
                 &crate::db::SmolvmDb::open()?,
                 &record.name,
@@ -4977,14 +5013,14 @@ impl AgentManager {
             if !dependents.is_empty() {
                 return Err(Error::agent_conflict(
                     "stop machine",
-                    "frozen machine still has running dependent clones",
+                    "machine still has running dependent clones",
                 ));
             }
         }
-        if !frozen && record.is_process_alive() {
+        if mode == ShutdownMode::Graceful && record.is_process_alive() {
             crate::staged_mount::sync_with_operation(record, self, &operation)?;
         }
-        self.stop_owned(&operation, frozen, stop_timeout)?;
+        self.stop_owned(&operation, mode, stop_timeout)?;
         // Use the manager's captured path, never a fresh home/name resolution.
         let runtime = operation
             ._ownership
@@ -5016,7 +5052,15 @@ impl AgentManager {
             resolved,
             crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
         );
-        if let Err(error) = self.stop_owned(&operation, without_handshake, Some(Duration::ZERO)) {
+        if let Err(error) = self.stop_owned(
+            &operation,
+            if without_handshake {
+                ShutdownMode::WithoutGuest
+            } else {
+                ShutdownMode::Graceful
+            },
+            Some(Duration::ZERO),
+        ) {
             if without_handshake {
                 return Err(error);
             }
@@ -5029,7 +5073,7 @@ impl AgentManager {
                 %error,
                 "guest did not confirm shutdown; ending it without the handshake because it is being deleted"
             );
-            self.stop_owned(&operation, true, Some(Duration::ZERO))?;
+            self.stop_owned(&operation, ShutdownMode::WithoutGuest, Some(Duration::ZERO))?;
         }
         operation._ownership.take().ok_or_else(|| {
             Error::agent_conflict("delete machine", "deletion requires a reviewed machine")
@@ -5046,18 +5090,18 @@ impl AgentManager {
     /// burns the deadline and then refuses to stop a machine that is safe to
     /// terminate — leaving it running, and billing, with no way out but delete.
     pub fn stop_paused(&self) -> Result<()> {
-        self.stop_inner(true, None)
+        self.stop_inner(ShutdownMode::WithoutGuest, None)
     }
 
-    fn stop_inner(&self, guest_is_paused: bool, stop_timeout: Option<Duration>) -> Result<()> {
+    fn stop_inner(&self, mode: ShutdownMode, stop_timeout: Option<Duration>) -> Result<()> {
         let operation = self.reserve_control_operation()?;
-        self.stop_owned(&operation, guest_is_paused, stop_timeout)
+        self.stop_owned(&operation, mode, stop_timeout)
     }
 
     fn stop_owned(
         &self,
         operation: &ControlOperation,
-        guest_is_paused: bool,
+        mode: ShutdownMode,
         stop_timeout: Option<Duration>,
     ) -> Result<()> {
         operation.validate_manager(self)?;
@@ -5070,8 +5114,7 @@ impl AgentManager {
             // Even if internal state is Stopped, check PID file for orphan processes
             // from previous CLI invocations that weren't properly cleaned up.
             if let Some((pid, start_time)) = self.pid_and_start_time() {
-                if let Err(e) = self.stop_vm_process(pid, start_time, guest_is_paused, stop_timeout)
-                {
+                if let Err(e) = self.stop_vm_process(pid, start_time, mode, stop_timeout) {
                     tracing::warn!(
                         pid,
                         "orphan process still alive, preserving PID/socket files"
@@ -5100,8 +5143,7 @@ impl AgentManager {
             .unwrap_or((None, None));
 
         if let Some(pid) = child_pid {
-            if let Err(e) = self.stop_vm_process(pid, pid_start_time, guest_is_paused, stop_timeout)
-            {
+            if let Err(e) = self.stop_vm_process(pid, pid_start_time, mode, stop_timeout) {
                 // Revert to Running — don't lie about state or delete markers
                 {
                     let mut inner = self.inner.lock();
@@ -5889,7 +5931,8 @@ mod tests {
             let before_start = process::process_start_time(pid);
             let identity_verified = process::is_our_process_strict(pid, Some(start_time));
             let started = std::time::Instant::now();
-            let result = manager.stop_vm_process(pid, Some(start_time), true, None);
+            let result =
+                manager.stop_vm_process(pid, Some(start_time), ShutdownMode::WithoutGuest, None);
             let elapsed = started.elapsed();
             let after_start = process::process_start_time(pid);
             // NOTE_EXIT can arrive just before a child becomes waitable on
@@ -5936,7 +5979,12 @@ mod tests {
             .spawn()
             .unwrap();
         let pid = child.id() as crate::process::Pid;
-        let result = manager.stop_vm_process(pid, process::process_start_time(pid), false, None);
+        let result = manager.stop_vm_process(
+            pid,
+            process::process_start_time(pid),
+            ShutdownMode::Graceful,
+            None,
+        );
         let survived = matches!(child.try_wait(), Ok(None));
         let _ = child.kill();
         let _ = child.wait();

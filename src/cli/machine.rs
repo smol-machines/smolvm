@@ -448,6 +448,9 @@ pub enum MachineCmd {
     /// Stop a running machine
     Stop(StopCmd),
 
+    /// Power off a local VM without syncing guest filesystems. Unsaved data may be lost.
+    PowerOff(PowerOffCmd),
+
     /// Save RAM and disk durably, then stop at the saved execution boundary
     Pause(PauseCmd),
 
@@ -560,6 +563,7 @@ impl MachineCmd {
             MachineCmd::CheckpointWarm(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
+            MachineCmd::PowerOff(cmd) => cmd.run(),
             MachineCmd::Pause(cmd) => cmd.run(),
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -6640,6 +6644,33 @@ impl ResumeCmd {
     pub fn run(self) -> smolvm::Result<()> {
         smolvm::embedded::EmbeddedRuntime::new()?.resume_machine_detached(&self.name)?;
         println!("Machine '{}' resumed", self.name);
+        Ok(())
+    }
+}
+
+#[derive(Args, Debug)]
+pub struct PowerOffCmd {
+    /// Registered machine to power off
+    #[arg(long)]
+    pub name: String,
+
+    /// PID of the reviewed VM execution
+    #[arg(long, value_parser = clap::value_parser!(i32).range(2..))]
+    pub expected_pid: i32,
+}
+
+impl PowerOffCmd {
+    pub fn run(self) -> smolvm::Result<()> {
+        let db = smolvm::db::SmolvmDb::open()?;
+        let _admission = db.admit_workload_mutation(Some(&self.name), &[])?;
+        let _fork = smolvm::agent::fork::lock_fork_source(&self.name)?;
+        let record = db
+            .get_vm(&self.name)?
+            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
+        let manager = smolvm::agent::AgentManager::for_existing_vm_record(&record)?;
+        manager.detach();
+        manager.power_off_persisted(&record, self.expected_pid)?;
+        println!("Powered off machine: {}", self.name);
         Ok(())
     }
 }
