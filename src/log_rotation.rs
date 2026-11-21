@@ -24,13 +24,15 @@ pub(crate) const MAX_LOG_FILES: usize = 3;
 ///
 /// Returns `Ok(true)` if rotation occurred, `Ok(false)` if no rotation needed.
 pub fn rotate_if_needed(log_path: &Path) -> io::Result<bool> {
-    let metadata = match fs::metadata(log_path) {
+    let metadata = match fs::symlink_metadata(log_path) {
         Ok(m) => m,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
 
-    if metadata.len() < MAX_LOG_SIZE {
+    // Only a regular file is a log: the directory may belong to the VM's uid,
+    // which can put a link or a FIFO in its place.
+    if !metadata.is_file() || metadata.len() < MAX_LOG_SIZE {
         return Ok(false);
     }
 
@@ -61,41 +63,76 @@ pub fn rotate_if_needed(log_path: &Path) -> io::Result<bool> {
 /// immediately after the copy; under active writing a tiny loss is the accepted
 /// copy-truncate semantics.
 pub fn rotate(log_path: &Path) -> io::Result<()> {
+    // The log's directory may belong to a less privileged uid than the
+    // caller (the VM's, under a root server), so no name in it is followed:
+    // the live log is opened once without following a link and used through
+    // its descriptor, rotated names are only removed or renamed (which act on
+    // a link itself), and `.1` is created fresh, never written through.
+    let mut live = open_live_log(log_path)?;
     let log_str = log_path.display().to_string();
 
     // Delete the oldest rotated file if it exists
     let oldest = format!("{}.{}", log_str, MAX_LOG_FILES);
-    if Path::new(&oldest).exists() {
-        fs::remove_file(&oldest)?;
-    }
+    ignore_missing(fs::remove_file(&oldest))?;
 
     // Rotate existing files: .2 -> .3, .1 -> .2 (plain renames — nothing holds
     // an open fd to these already-rotated files).
     for i in (1..MAX_LOG_FILES).rev() {
         let from = format!("{}.{}", log_str, i);
         let to = format!("{}.{}", log_str, i + 1);
-        if Path::new(&from).exists() {
-            fs::rename(&from, &to)?;
-        }
+        ignore_missing(fs::rename(&from, &to))?;
     }
 
     // Copy-truncate the live log to .1, preserving the leaked writer fd's inode.
     let first_rotated = format!("{}.1", log_str);
-    fs::copy(log_path, &first_rotated)?;
-    truncate_in_place(log_path)?;
+    let mut options = fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut rotated = options.open(&first_rotated)?;
+    io::copy(&mut live, &mut rotated)?;
+    live.set_len(0)?;
 
     Ok(())
 }
 
-/// Truncate a file to zero length in place, keeping its inode (and therefore any
-/// already-open fds) valid. Uses `OpenOptions::write(true).truncate(true)` which
-/// maps to `open(..., O_TRUNC)` — it does not create a new inode.
-fn truncate_in_place(log_path: &Path) -> io::Result<()> {
-    fs::OpenOptions::new()
-        .write(true)
-        .truncate(true)
-        .open(log_path)?;
-    Ok(())
+/// Open the live log for copy-truncate without following a link to it, and
+/// only a regular file with one name, so the caller's privileges never reach a
+/// file the directory's owner chose.
+fn open_live_log(log_path: &Path) -> io::Result<fs::File> {
+    let mut options = fs::OpenOptions::new();
+    options.read(true).write(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(log_path)?;
+    let metadata = file.metadata()?;
+    #[cfg(unix)]
+    let single_name = {
+        use std::os::unix::fs::MetadataExt;
+        metadata.nlink() == 1
+    };
+    #[cfg(not(unix))]
+    let single_name = true;
+    if !metadata.is_file() || !single_name {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("{} is not a regular log file", log_path.display()),
+        ));
+    }
+    Ok(file)
+}
+
+fn ignore_missing(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        other => other,
+    }
 }
 
 /// Get the total size of all log files (current + rotated).
@@ -104,14 +141,14 @@ pub fn total_log_size(log_path: &Path) -> io::Result<u64> {
     let log_str = log_path.display().to_string();
 
     // Current log
-    if let Ok(metadata) = fs::metadata(log_path) {
+    if let Ok(metadata) = fs::symlink_metadata(log_path) {
         total += metadata.len();
     }
 
     // Rotated logs
     for i in 1..=MAX_LOG_FILES {
         let rotated = format!("{}.{}", log_str, i);
-        if let Ok(metadata) = fs::metadata(&rotated) {
+        if let Ok(metadata) = fs::symlink_metadata(&rotated) {
             total += metadata.len();
         }
     }
@@ -123,17 +160,13 @@ pub fn total_log_size(log_path: &Path) -> io::Result<u64> {
 pub fn cleanup_logs(log_path: &Path) -> io::Result<()> {
     let log_str = log_path.display().to_string();
 
-    // Remove current log
-    if log_path.exists() {
-        fs::remove_file(log_path)?;
-    }
+    // Remove current log (a link is removed, never its target)
+    ignore_missing(fs::remove_file(log_path))?;
 
     // Remove rotated logs
     for i in 1..=MAX_LOG_FILES {
         let rotated = format!("{}.{}", log_str, i);
-        if Path::new(&rotated).exists() {
-            fs::remove_file(&rotated)?;
-        }
+        ignore_missing(fs::remove_file(&rotated))?;
     }
 
     Ok(())
@@ -142,6 +175,45 @@ pub fn cleanup_logs(log_path: &Path) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn test_rotation_does_not_follow_symlinks() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::TempDir::new().unwrap();
+        let log = dir.path().join("agent-console.log");
+        let outside = dir.path().join("outside");
+        std::fs::write(&log, b"vmm line\n").unwrap();
+        std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o4755)).unwrap();
+        // A dangling `.1` pointing where the directory's owner may not write.
+        std::os::unix::fs::symlink(&outside, dir.path().join("agent-console.log.1")).unwrap();
+
+        rotate(&log).unwrap();
+        assert!(!outside.exists(), "rotation wrote through a planted link");
+        let rotated = dir.path().join("agent-console.log.1");
+        assert_eq!(std::fs::read(&rotated).unwrap(), b"vmm line\n");
+        let mode = std::fs::metadata(&rotated).unwrap().permissions().mode() & 0o7777;
+        assert_eq!(mode, 0o600);
+        assert_eq!(std::fs::metadata(&log).unwrap().len(), 0);
+
+        // A live log that is a link, or has a second name, is not rotated.
+        let target = dir.path().join("target");
+        std::fs::write(&target, b"other file").unwrap();
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        assert!(rotate(&log).is_err());
+        assert!(!rotate_if_needed(&log).unwrap());
+        std::fs::remove_file(&log).unwrap();
+        std::fs::hard_link(&target, &log).unwrap();
+        assert!(rotate(&log).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"other file");
+
+        // Cleanup removes a link, not what it names.
+        std::fs::remove_file(&log).unwrap();
+        std::os::unix::fs::symlink(&target, &log).unwrap();
+        cleanup_logs(&log).unwrap();
+        assert!(target.exists());
+    }
     use std::io::Write;
     use tempfile::TempDir;
 

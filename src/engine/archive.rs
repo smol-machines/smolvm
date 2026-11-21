@@ -56,6 +56,7 @@ pub(super) struct FilesMachine {
     operation: Option<tokio::sync::OwnedMutexGuard<()>>,
     session: Option<FilesSession>,
     shares: Option<(Arc<Engine>, super::containers::ContainerRecord)>,
+    image_lease: Option<super::image_share::Lease>,
 }
 
 struct Temporary {
@@ -95,10 +96,14 @@ async fn finish_files(
     session: Option<FilesSession>,
     temporary: Option<Temporary>,
     shares: Option<(Arc<Engine>, super::containers::ContainerRecord)>,
+    image_lease: Option<super::image_share::Lease>,
     _operation: Option<tokio::sync::OwnedMutexGuard<()>>,
 ) {
     if let Some(session) = session {
         end_session(session).await;
+    }
+    if let Some(lease) = image_lease {
+        lease.release().await;
     }
     if let Some((engine, record)) = shares {
         super::containers::release_guest_shares(&engine, &record).await;
@@ -115,6 +120,7 @@ impl FilesMachine {
             self.session.take(),
             self.temporary.take(),
             self.shares.take(),
+            self.image_lease.take(),
             self.operation.take(),
         )
         .await;
@@ -128,6 +134,7 @@ impl Drop for FilesMachine {
                 self.session.take(),
                 self.temporary.take(),
                 self.shares.take(),
+                self.image_lease.take(),
                 self.operation.take(),
             ));
         }
@@ -222,6 +229,9 @@ pub(super) async fn files_machine(
     let mut machine = open_files_machine(engine, c).await?;
     if !c.is_running() {
         machine.session = Some(begin_session(engine, &c.record(), &machine.socket).await?);
+        if let Some(lease) = &mut machine.image_lease {
+            lease.prepared();
+        }
     }
     unpack_pending(engine, c, &machine.socket).await?;
     Ok(machine)
@@ -236,6 +246,7 @@ async fn open_files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResu
             operation: Some(guard),
             session: None,
             shares: None,
+            image_lease: None,
         });
     }
     // A container that shares another's network has its files in that
@@ -248,8 +259,10 @@ async fn open_files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResu
             operation: Some(guard),
             session: None,
             shares: Some((engine.clone(), record.clone())),
+            image_lease: None,
         };
-        machine.socket = super::containers::guest_machine(engine, &record, &host).await?;
+        (machine.socket, machine.image_lease) =
+            super::containers::guest_machine(engine, &record, &host).await?;
         return Ok(machine);
     }
     // A machine still shutting down after its command exited must be down
@@ -278,6 +291,7 @@ async fn open_files_machine(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResu
         operation: None,
         session: None,
         shares: None,
+        image_lease: None,
         temporary: Some(Temporary {
             engine: engine.clone(),
             machine: record.machine,

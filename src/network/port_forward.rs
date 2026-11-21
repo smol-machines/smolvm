@@ -16,7 +16,7 @@
 
 use smolvm_network::acceptor::{AcceptedConnection, BoundTcpPorts, TcpAcceptorSet};
 use smolvm_network::{PortMapping, PortProtocol};
-use std::io::{Read, Write};
+use std::io::Write;
 use std::net::{Shutdown, TcpStream};
 use std::path::Path;
 use std::sync::Arc;
@@ -92,17 +92,23 @@ fn relay(client: TcpStream, socket: &Path, guest: u16) -> std::io::Result<()> {
         let _ = std::io::copy(&mut tunnel_read, &mut client_write);
         let _ = client_write.shutdown(Shutdown::Write);
     });
-    let mut buf = [0u8; 65536];
-    loop {
-        let n = client_read.read(&mut buf)?;
-        if n == 0 {
-            break;
-        }
-        tunnel.write_all(&buf[..n])?;
+    // Keep the existing 64 KiB transfer buffer; copy also retries interrupted
+    // reads rather than abandoning the tunnel while its reply reader is alive.
+    let result = std::io::copy(
+        &mut std::io::BufReader::with_capacity(65536, &mut client_read),
+        &mut tunnel,
+    );
+    if result.is_ok() {
+        // A normal half-close still allows the guest's reply to finish.
+        let _ = tunnel.shutdown(Shutdown::Write);
+    } else {
+        // A reset client or failed tunnel write cannot complete a reply.
+        // Wake both readers before joining, including clones of these sockets.
+        let _ = tunnel.shutdown(Shutdown::Both);
+        let _ = client_read.shutdown(Shutdown::Both);
     }
-    let _ = tunnel.shutdown(Shutdown::Write);
     let _ = back.join();
-    Ok(())
+    result.map(|_| ())
 }
 
 /// Serve the ports control socket in `vm_dir` with `ports`, the way the
@@ -127,6 +133,7 @@ pub fn serve_forwarded_ports_control(forwarder: PortForwarder, vm_dir: &Path) {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
+    use std::io::Read;
     use std::net::{Ipv4Addr, TcpListener};
     use std::time::Duration;
 
@@ -151,6 +158,56 @@ mod tests {
                 });
             }
         });
+    }
+
+    #[test]
+    fn a_reset_client_closes_the_guest_request_half() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(PORT_FORWARD_SOCKET);
+        let guest_listener = crate::platform::uds::UdsListener::bind(&socket).unwrap();
+        let listener = TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let mut client = TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (server, _) = listener.accept().unwrap();
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let _ = done_tx.send(relay(server, &socket, 8080));
+        });
+        let mut guest = guest_listener.accept().unwrap();
+        guest
+            .set_read_timeout(Some(Duration::from_secs(2)))
+            .unwrap();
+        client.write_all(b"request").unwrap();
+        socket2::SockRef::from(&client)
+            .set_linger(Some(Duration::ZERO))
+            .unwrap();
+        drop(client);
+        let mut received = String::new();
+        let result = guest.read_to_string(&mut received);
+        let relayed = done_rx.recv_timeout(Duration::from_secs(2));
+        // Release the reply reader even if the assertion below fails.
+        let _ = guest.shutdown(Shutdown::Both);
+        drop(guest);
+        worker.join().unwrap();
+        assert!(
+            result.is_ok(),
+            "the guest must see EOF after a client reset: {result:?}; received {received:?}"
+        );
+        assert!(received.starts_with("8080\n"));
+        assert!(
+            matches!(relayed, Ok(Err(_))),
+            "the relay must finish and report the client error before the guest closes: {relayed:?}"
+        );
+    }
+
+    #[test]
+    fn a_half_closed_large_request_receives_the_entire_reply() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join(PORT_FORWARD_SOCKET);
+        fake_guest(&socket);
+        let forwarder = PortForwarder::new(&socket).unwrap();
+        let port = forwarder.publish_atomic(8080).unwrap().host;
+        let request = "0123456789abcdef".repeat(16384);
+        assert_eq!(ask(port, &request), format!("8080:{request}"));
     }
 
     #[test]

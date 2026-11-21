@@ -42,8 +42,8 @@ use axum::{
     extract::{DefaultBodyLimit, Request},
     http::{HeaderValue, StatusCode},
     middleware::{self, Next},
-    response::Response,
-    routing::{delete, get, post, put},
+    response::{IntoResponse, Response},
+    routing::{delete, get, patch, post, put},
     Router,
 };
 use std::sync::Arc;
@@ -87,6 +87,8 @@ use state::ApiState;
         // Execution
         handlers::exec::exec_command,
         handlers::exec::exec_stream,
+        handlers::exec::exec_interactive,
+        handlers::exec_sessions::attach_exec_session,
         handlers::exec::run_command,
         handlers::exec::stream_logs,
         handlers::exec_sessions::create_exec_session,
@@ -125,7 +127,16 @@ use state::ApiState;
         handlers::machines::publish_cache_disk,
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
+        handlers::machines::set_machine_env,
+        handlers::machines::update_machine_labels,
+        handlers::machines::set_machine_network,
+        handlers::machines::release_held_branch,
+        handlers::machines::capture_portable_checkpoint,
+        handlers::machines::restore_portable_checkpoint,
+        handlers::machines::paused_checkpoint,
+        handlers::machines::get_machine_metrics,
         handlers::machines::put_credential_values,
+        handlers::machines::put_credential_bindings,
         handlers::machines::export_machine,
         // Pools
         handlers::pools::create_pool,
@@ -173,7 +184,15 @@ use state::ApiState;
         types::PublishCacheDiskRequest,
         types::PublishCacheDiskResponse,
         types::UpdateEgressRequest,
+        types::SetMachineEnvRequest,
+        types::UpdateMachineLabelsRequest,
+        types::MachineNetwork,
+        types::MachineMetricsResponse,
+        types::MachinePressure,
+        types::PressureReading,
         types::CredentialValuesRequest,
+        types::CredentialBindingsRequest,
+        types::CredentialBindingsResponse,
         types::ForkRequest,
         types::ForkReleaseRequest,
         types::ExportRequest,
@@ -310,6 +329,7 @@ pub fn validate_command(cmd: &[String]) -> Result<(), ApiError> {
 /// `cors_origins` specifies allowed CORS origins. If empty, defaults to
 /// localhost:8080 and localhost:3000 (both http and 127.0.0.1 variants).
 pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router {
+    let origins = Arc::new(allowed_origins(&cors_origins));
     // Health check route. `/health` is liveness (pure-async, always answers);
     // `/readyz` is a dispatch-path readiness probe that exercises the blocking pool
     // so the control can detect — and cordon — a node whose start/exec are wedged
@@ -390,7 +410,7 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .route("/{id}/fork", post(handlers::machines::fork_machine))
         .route(
             "/{id}/branch-release",
-            post(handlers::machines::release_held_fork),
+            post(handlers::machines::release_held_branch),
         )
         .route(
             "/{id}/fork-release",
@@ -420,9 +440,26 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/egress",
             post(handlers::machines::update_machine_egress),
         )
+        .route("/{id}/env", put(handlers::machines::set_machine_env))
+        .route(
+            "/{id}/labels",
+            patch(handlers::machines::update_machine_labels),
+        )
+        .route(
+            "/{id}/metrics",
+            get(handlers::machines::get_machine_metrics),
+        )
+        .route(
+            "/{id}/network",
+            put(handlers::machines::set_machine_network),
+        )
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
+        )
+        .route(
+            "/{id}/credential-bindings",
+            put(handlers::machines::put_credential_bindings),
         )
         .route("/{id}/export", post(handlers::machines::export_machine))
         .route("/{id}", delete(handlers::machines::delete_machine))
@@ -586,6 +623,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .layer(TraceLayer::new_for_http().make_span_with(|request: &axum::http::Request<axum::body::Body>| {
             tracing::debug_span!("request", method = %request.method(), path = request.uri().path())
         }))
+        // Inside the CORS layer, so preflights are still answered by it.
+        .layer(middleware::from_fn(move |req: Request, next: Next| {
+            refuse_foreign_web_origins(origins.clone(), req, next)
+        }))
         .layer(cors)
         // Outermost, so a request counts from arrival until its body is sent.
         .layer(middleware::from_fn_with_state(
@@ -595,9 +636,9 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .with_state(state)
 }
 
-/// Build the shared CORS layer from the configured origins (falling back to the
-/// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
-fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
+/// The origins a browser page may call the API from: the configured
+/// `--cors-origin`s, or the localhost defaults when none are valid.
+fn allowed_origins(cors_origins: &[String]) -> Vec<HeaderValue> {
     let default_origins = || {
         vec![
             "http://localhost:8080"
@@ -614,11 +655,11 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
                 .expect("hardcoded CORS origin"),
         ]
     };
-    let origins: Vec<axum::http::HeaderValue> = if cors_origins.is_empty() {
+    if cors_origins.is_empty() {
         default_origins()
     } else {
         let mut valid = Vec::new();
-        for origin in &cors_origins {
+        for origin in cors_origins {
             match origin.parse() {
                 Ok(v) => valid.push(v),
                 Err(e) => {
@@ -632,9 +673,14 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
         } else {
             valid
         }
-    };
+    }
+}
+
+/// Build the shared CORS layer from the configured origins (falling back to the
+/// localhost defaults). Shared by [`create_router`] and [`create_local_router`].
+fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
     CorsLayer::new()
-        .allow_origin(AllowOrigin::list(origins))
+        .allow_origin(AllowOrigin::list(allowed_origins(&cors_origins)))
         .allow_methods([
             axum::http::Method::GET,
             axum::http::Method::POST,
@@ -642,6 +688,116 @@ fn build_cors(cors_origins: Vec<String>) -> CorsLayer {
             axum::http::Method::DELETE,
         ])
         .allow_headers([axum::http::header::CONTENT_TYPE])
+}
+
+/// Refuse requests a browser sends on behalf of a page from a foreign site.
+///
+/// The CORS layer only decides which responses a page may read; a body-less
+/// POST or a WebSocket handshake still reaches its handler without a
+/// preflight. So a request that carries an `Origin` is served only when that
+/// origin is allowed, or is the server's own page (the API docs) reached at
+/// `localhost` or an IP address. A request without `Origin` is refused when
+/// `Sec-Fetch-Site` says another site sent it. Clients that are not browsers
+/// send neither header and are unaffected.
+async fn refuse_foreign_web_origins(
+    allowed: Arc<Vec<HeaderValue>>,
+    req: Request,
+    next: Next,
+) -> Response {
+    if is_foreign_web_request(&allowed, req.headers()) {
+        return (
+            StatusCode::FORBIDDEN,
+            "requests from web pages are only served for origins allowed with --cors-origin",
+        )
+            .into_response();
+    }
+    next.run(req).await
+}
+
+fn is_foreign_web_request(allowed: &[HeaderValue], headers: &axum::http::HeaderMap) -> bool {
+    use axum::http::header::{HOST, ORIGIN};
+    if let Some(origin) = headers.get(ORIGIN) {
+        if allowed
+            .iter()
+            .any(|a| a.as_bytes().eq_ignore_ascii_case(origin.as_bytes()))
+        {
+            return false;
+        }
+        let Some(authority) = origin
+            .to_str()
+            .ok()
+            .and_then(|o| o.split_once("://"))
+            .map(|(_, authority)| authority)
+        else {
+            return true;
+        };
+        let own_page = headers
+            .get(HOST)
+            .and_then(|h| h.to_str().ok())
+            .is_some_and(|host| host.eq_ignore_ascii_case(authority) && is_local_host_name(host));
+        return !own_page;
+    }
+    match headers.get("sec-fetch-site").map(|v| v.as_bytes()) {
+        None | Some(b"same-origin") | Some(b"none") => false,
+        Some(_) => true,
+    }
+}
+
+/// Whether a `Host` value names this machine without DNS: `localhost` or an IP
+/// address. A page can re-point any other name at 127.0.0.1 (DNS rebinding).
+fn is_local_host_name(host: &str) -> bool {
+    let name = host_name(host);
+    name.eq_ignore_ascii_case("localhost") || name.parse::<std::net::IpAddr>().is_ok()
+}
+
+/// The host part of a `Host` value or URL authority, without port or brackets.
+fn host_name(authority: &str) -> &str {
+    if let Some(rest) = authority.strip_prefix('[') {
+        return rest.split(']').next().unwrap_or(rest);
+    }
+    match authority.rsplit_once(':') {
+        Some((name, port)) if port.bytes().all(|b| b.is_ascii_digit()) => name,
+        _ => authority,
+    }
+}
+
+/// Wrap the router served on a plain loopback TCP listener so it refuses a
+/// `Host` that is not `localhost`, an IP address or the host of an allowed
+/// origin. A page that re-pointed its own name at 127.0.0.1 is same-origin
+/// with the API for the browser and sends no `Origin` on reads; its `Host`
+/// is what gives it away. Unix-socket, mTLS and network listeners are left
+/// alone, since their clients may address the server by a DNS name.
+pub fn guard_loopback_listener(router: Router, cors_origins: &[String]) -> Router {
+    let allowed_hosts: Arc<Vec<String>> = Arc::new(
+        allowed_origins(cors_origins)
+            .iter()
+            .filter_map(|o| o.to_str().ok()?.split_once("://"))
+            .map(|(_, authority)| host_name(authority).to_ascii_lowercase())
+            .collect(),
+    );
+    router.layer(middleware::from_fn(move |req: Request, next: Next| {
+        let allowed_hosts = allowed_hosts.clone();
+        async move {
+            let host = req
+                .headers()
+                .get(axum::http::header::HOST)
+                .and_then(|h| h.to_str().ok())
+                .map(str::to_owned)
+                .or_else(|| req.uri().authority().map(|a| a.to_string()));
+            if let Some(host) = host {
+                if !is_local_host_name(&host)
+                    && !allowed_hosts.contains(&host_name(&host).to_ascii_lowercase())
+                {
+                    return (
+                        StatusCode::FORBIDDEN,
+                        "this listener only answers to localhost, an IP address or a --cors-origin host",
+                    )
+                        .into_response();
+                }
+            }
+            next.run(req).await
+        }
+    }))
 }
 
 /// The router served on the plain-HTTP LOOPBACK door (fleet mode), as distinct
@@ -843,6 +999,120 @@ async fn trace_id_middleware(mut req: Request, next: Next) -> Response {
 
 #[cfg(test)]
 mod tests {
+
+    /// Machine routes the router serves but the spec does not describe yet.
+    /// Describing one removes its entry.
+    const UNDESCRIBED_MACHINE_ROUTES: &[&str] = &[];
+
+    /// Each `METHOD path` the machine routers in this file serve, read from
+    /// their source: the spec is only worth comparing with the cloud's if it
+    /// lists everything the router answers.
+    fn served_machine_routes() -> std::collections::BTreeSet<String> {
+        let source = include_str!("mod.rs");
+        let mut served = std::collections::BTreeSet::new();
+        for router in [
+            "let logs_route",
+            "let bounded_machine_routes",
+            "let create_route",
+            "let long_machine_routes",
+        ] {
+            let start = source.find(router).expect("machine router in source");
+            let block = &source[start..];
+            let block = &block[..block[1..]
+                .find("\n    let ")
+                .map_or(block.len(), |end| end + 1)];
+            for route in block.split(".route(").skip(1) {
+                let path = route.split('"').nth(1).expect("route path literal");
+                let path = if path == "/" {
+                    String::new()
+                } else {
+                    path.to_string()
+                };
+                for method in ["get", "post", "put", "patch", "delete"] {
+                    if route.contains(&format!("{method}(handlers::")) {
+                        served.insert(format!(
+                            "{} /api/v1/machines{}",
+                            method.to_uppercase(),
+                            normalize_route(&path)
+                        ));
+                    }
+                }
+            }
+        }
+        served
+    }
+
+    fn normalize_route(path: &str) -> String {
+        let mut out = String::new();
+        let mut in_param = false;
+        for c in path.chars() {
+            match c {
+                '{' => {
+                    in_param = true;
+                    out.push_str("{}");
+                }
+                '}' => in_param = false,
+                _ if in_param => {}
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn every_machine_route_is_in_the_spec_or_listed() {
+        use utoipa::OpenApi;
+        let spec = serde_json::to_value(super::ApiDoc::openapi()).expect("spec serializes");
+        let mut described = std::collections::BTreeSet::new();
+        for (path, item) in spec["paths"].as_object().expect("paths") {
+            for method in item.as_object().expect("path item").keys() {
+                described.insert(format!(
+                    "{} {}",
+                    method.to_uppercase(),
+                    normalize_route(path)
+                ));
+            }
+        }
+        let served = served_machine_routes();
+        assert!(
+            served.len() > 30,
+            "the source scan found too few routes: {served:?}"
+        );
+        let missing: Vec<_> = served
+            .iter()
+            .filter(|route| !described.contains(*route))
+            .filter(|route| !UNDESCRIBED_MACHINE_ROUTES.contains(&route.as_str()))
+            .collect();
+        assert!(
+            missing.is_empty(),
+            "served but not in the spec: {missing:#?}"
+        );
+        let stale: Vec<_> = UNDESCRIBED_MACHINE_ROUTES
+            .iter()
+            .filter(|route| described.contains(**route) || !served.contains(**route))
+            .collect();
+        assert!(
+            stale.is_empty(),
+            "listed as undescribed but described or not served; remove: {stale:#?}"
+        );
+    }
+
+    /// The checked-in spec is what clients and the cloud parity check read, so
+    /// a change to the API that does not regenerate it fails here.
+    #[test]
+    fn checked_in_spec_matches_the_generated_document() {
+        use utoipa::OpenApi;
+        let generated: serde_json::Value =
+            serde_json::to_value(super::ApiDoc::openapi()).expect("spec serializes");
+        let checked_in: serde_json::Value =
+            serde_json::from_str(include_str!("../../docs/local-api/openapi.json"))
+                .expect("docs/local-api/openapi.json is JSON");
+        assert!(
+            generated == checked_in,
+            "docs/local-api/openapi.json is stale; regenerate it: \
+             cargo run -- serve openapi -o docs/local-api/openapi.json"
+        );
+    }
     use super::{machine_id_from_path, normalize_metrics_path, validate_command};
 
     #[test]
@@ -1002,5 +1272,110 @@ mod nested_virt_gate_test {
         let spec = crate::api::state::vm_resources_to_spec(res);
         assert_eq!(spec.nested_virt, Some(true));
         assert!(crate::api::state::resource_spec_to_vm_resources(&spec, false).nested_virt);
+    }
+}
+
+#[cfg(test)]
+mod web_origin_test {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{Request, StatusCode};
+    use tower::ServiceExt;
+
+    fn router(dir: &tempfile::TempDir) -> Router {
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("t.db")).unwrap();
+        create_router(Arc::new(ApiState::with_db(db)), vec![])
+    }
+
+    async fn send(
+        router: Router,
+        method: &str,
+        path: &str,
+        headers: &[(&str, &str)],
+    ) -> StatusCode {
+        let mut request = Request::builder().method(method).uri(path);
+        for (name, value) in headers {
+            request = request.header(*name, *value);
+        }
+        router
+            .oneshot(request.body(Body::empty()).unwrap())
+            .await
+            .unwrap()
+            .status()
+    }
+
+    #[tokio::test]
+    async fn a_foreign_page_cannot_drive_the_api() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = router(&dir);
+        let host = ("host", "127.0.0.1:8080");
+        for headers in [
+            vec![
+                host,
+                ("origin", "https://evil.example"),
+                ("sec-fetch-site", "cross-site"),
+            ],
+            vec![host, ("origin", "null")],
+            vec![host, ("sec-fetch-site", "cross-site")],
+            vec![
+                ("host", "evil.example:8080"),
+                ("origin", "http://evil.example:8080"),
+            ],
+        ] {
+            for (method, path) in [
+                ("POST", "/api/v1/machines/dev/stop"),
+                ("POST", "/drain"),
+                ("GET", "/api/v1/machines/dev/exec/interactive?cmd=sh"),
+            ] {
+                assert_eq!(
+                    send(app.clone(), method, path, &headers).await,
+                    StatusCode::FORBIDDEN,
+                    "{method} {path} with {headers:?}"
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn clients_and_allowed_pages_are_served() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = router(&dir);
+        for headers in [
+            vec![("host", "127.0.0.1:8080")],
+            vec![("host", "node.internal:8443")],
+            vec![
+                ("host", "127.0.0.1:8080"),
+                ("origin", "http://localhost:3000"),
+            ],
+            vec![
+                ("host", "127.0.0.1:9000"),
+                ("origin", "http://127.0.0.1:9000"),
+            ],
+            vec![
+                ("host", "127.0.0.1:8080"),
+                ("sec-fetch-site", "same-origin"),
+            ],
+        ] {
+            assert_eq!(
+                send(app.clone(), "GET", "/api/v1/machines", &headers).await,
+                StatusCode::OK,
+                "{headers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn the_loopback_listener_refuses_a_rebound_name() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let app = guard_loopback_listener(router(&dir), &["http://dev.box:8080".into()]);
+        let get = |host: &'static str| {
+            let app = app.clone();
+            async move { send(app, "GET", "/api/v1/machines", &[("host", host)]).await }
+        };
+        assert_eq!(get("evil.example:8080").await, StatusCode::FORBIDDEN);
+        assert_eq!(get("127.0.0.1:8080").await, StatusCode::OK);
+        assert_eq!(get("[::1]:8080").await, StatusCode::OK);
+        assert_eq!(get("localhost:8080").await, StatusCode::OK);
+        assert_eq!(get("dev.box:8080").await, StatusCode::OK);
     }
 }

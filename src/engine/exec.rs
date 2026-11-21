@@ -26,6 +26,7 @@ struct ExecState {
     running: bool,
     started: bool,
     exit_code: Option<i64>,
+    error: Option<String>,
 }
 
 /// `POST /containers/{id}/exec`.
@@ -135,6 +136,9 @@ pub(crate) async fn start(
     let c = engine
         .find_container(&exec.container_id)
         .ok_or_else(|| ApiError::no_such_container(&exec.container_id))?;
+    let socket = c
+        .socket()
+        .ok_or_else(|| ApiError::conflict(format!("container {} is not running", c.id())))?;
     {
         let mut state = exec.state.lock();
         if state.started {
@@ -147,9 +151,6 @@ pub(crate) async fn start(
         state.running = true;
     }
     persist(engine, &exec);
-    let socket = c
-        .socket()
-        .ok_or_else(|| ApiError::conflict(format!("container {} is not running", c.id())))?;
     let tty = exec.config.tty || body.tty;
     let request = run_request(
         &c,
@@ -168,7 +169,7 @@ pub(crate) async fn start(
             .await
             .map_err(|e| format!("start exec: {e}"))?;
         match reader
-            .recv()
+            .recv_limited(super::runtime::STREAM_FRAME_LIMIT)
             .await
             .map_err(|e| format!("start exec: {e}"))?
         {
@@ -193,7 +194,9 @@ pub(crate) async fn start(
                 let mut state = exec.state.lock();
                 state.running = false;
                 state.exit_code = Some(code);
+                state.error = Some(message.clone());
             }
+            exec.input.finish();
             persist(engine, &exec);
             let message = format!("OCI runtime exec failed: exec failed: {message}\r\n");
             if body.detach {
@@ -225,10 +228,10 @@ pub(crate) async fn start(
         .clone()
         .or(exec.config.console_size.clone());
     if let Some([h, w]) = size.as_deref() {
-        exec.input.push(Input::Resize { cols: *w, rows: *h });
+        exec.input.resize(*w, *h);
     }
     if !exec.config.attach_stdin {
-        exec.input.push(Input::Eof);
+        let _ = exec.input.sender().send(Input::Eof).await;
     }
     let record = c.record();
     let mut attrs = record.event_attributes();
@@ -244,15 +247,30 @@ pub(crate) async fn start(
         let engine = engine.clone();
         let exec = exec.clone();
         let container_id = record.id.clone();
-        move |code: i64| {
+        move |result: std::io::Result<super::runtime::Exit>| {
+            let (code, error) = match result {
+                Ok(exit) => (exit.code, None),
+                Err(error) => {
+                    let message = format!(
+                        "Exec connection failed before an exit status was received: {error}"
+                    );
+                    tracing::warn!(exec = %exec.id, container = %container_id, %message);
+                    (255, Some(message))
+                }
+            };
+            exec.input.finish();
             {
                 let mut state = exec.state.lock();
                 state.running = false;
                 state.exit_code = Some(code);
+                state.error = error.clone();
             }
             persist(&engine, &exec);
             let mut attrs = attrs;
             attrs.insert("exitCode".into(), code.to_string());
+            if let Some(error) = error {
+                attrs.insert("error".into(), error);
+            }
             engine
                 .events
                 .emit("container", "exec_die", &container_id, attrs);
@@ -262,8 +280,8 @@ pub(crate) async fn start(
     if body.detach {
         let exec2 = exec.clone();
         tokio::spawn(async move {
-            let exit = super::runtime::pump(reader, writer, &exec2.input, |_, _| {}).await;
-            finish(exit.code);
+            let exit = super::runtime::pump(reader, writer, &exec2.input, |_, _| async {}).await;
+            finish(exit);
         });
         return Ok(Response::new(axum::body::Body::empty()));
     }
@@ -279,7 +297,10 @@ pub(crate) async fn start(
         let Some(session) = session.await else {
             drop(writer);
             drop(reader);
-            finish(130);
+            finish(Err(std::io::Error::new(
+                std::io::ErrorKind::ConnectionAborted,
+                "exec attachment did not open",
+            )));
             return;
         };
         let super::stream::Session {
@@ -287,27 +308,32 @@ pub(crate) async fn start(
             mut output,
             _activity,
         } = session;
-        if let Some(input) = input {
-            if exec2.config.attach_stdin {
-                let exec3 = exec2.clone();
-                tokio::spawn(async move {
-                    super::stream::read_input(input, |data| exec3.input.push(Input::Data(data)))
-                        .await;
-                    exec3.input.push(Input::Eof);
-                });
-            }
-        }
-        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<(u8, Vec<u8>)>();
+        let _stdin = if let (true, Some(input)) = (exec2.config.attach_stdin, input) {
+            Some(super::stream::forward_input(
+                input,
+                exec2.input.sender(),
+                true,
+            ))
+        } else {
+            None
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel::<(u8, Vec<u8>)>(4);
         let pump = tokio::spawn({
             let exec2 = exec2.clone();
             async move {
                 super::runtime::pump(reader, writer, &exec2.input, |stream, data| {
-                    let _ = tx.send((stream, data));
+                    let tx = tx.clone();
+                    async move {
+                        // A closed receiver means the client detached. Keep
+                        // draining the command without retaining its output.
+                        let _ = tx.send((stream, data)).await;
+                    }
                 })
                 .await
             }
         });
         let attach_out = exec2.config.attach_stdout || exec2.config.attach_stderr;
+        let mut disconnected = false;
         while let Some((stream, data)) = rx.recv().await {
             if !attach_out {
                 continue;
@@ -324,15 +350,26 @@ pub(crate) async fn start(
                 super::stream::frame(stream, &data)
             };
             if !output.write(bytes).await {
+                disconnected = true;
                 break;
             }
         }
-        let exit = pump.await.unwrap_or(super::runtime::Exit {
-            code: 137,
-            oom: false,
-        });
-        finish(exit.code);
-        output.close().await;
+        // Release the bounded receiver before waiting: otherwise a sender
+        // already waiting for capacity could never observe the disconnect.
+        drop(rx);
+        let output = if disconnected {
+            drop(output);
+            None
+        } else {
+            Some(output)
+        };
+        let result = pump
+            .await
+            .unwrap_or_else(|error| Err(std::io::Error::other(error.to_string())));
+        finish(result);
+        if let Some(output) = output {
+            output.close().await;
+        }
     });
     Ok(response)
 }
@@ -345,6 +382,7 @@ pub(crate) fn inspect(exec: &Exec) -> serde_json::Value {
         "ID": exec.id,
         "Running": state.running,
         "ExitCode": state.exit_code,
+        "Error": state.error.unwrap_or_default(),
         "ProcessConfig": {
             "tty": exec.config.tty,
             "entrypoint": cmd.first().cloned().unwrap_or_default(),
@@ -364,7 +402,7 @@ pub(crate) fn inspect(exec: &Exec) -> serde_json::Value {
 
 /// `POST /exec/{id}/resize`.
 pub(crate) fn resize(exec: &Exec, rows: u16, cols: u16) {
-    exec.input.push(Input::Resize { cols, rows });
+    exec.input.resize(cols, rows);
 }
 
 /// Run `argv` in the running container and return its exit code and
@@ -387,12 +425,14 @@ pub(crate) async fn run_capture(
             .await?;
         let mut output = Vec::new();
         loop {
-            match reader.recv().await? {
+            match reader
+                .recv_limited(super::runtime::STREAM_FRAME_LIMIT)
+                .await?
+            {
                 smolvm_protocol::AgentResponse::Stdout { data }
                 | smolvm_protocol::AgentResponse::Stderr { data } => {
-                    if output.len() < 64 * 1024 {
-                        output.extend_from_slice(&data);
-                    }
+                    let remaining = (64 * 1024usize).saturating_sub(output.len());
+                    output.extend_from_slice(&data[..data.len().min(remaining)]);
                 }
                 smolvm_protocol::AgentResponse::Exited { exit_code, .. } => {
                     return Ok::<_, std::io::Error>((

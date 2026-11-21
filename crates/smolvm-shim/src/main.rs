@@ -25,12 +25,25 @@ fn main() {
     // by SMOLVM_BOOT_BINARY. Checked before the shim service starts, because a
     // boot subprocess must never register itself with containerd.
     let mut args = std::env::args_os().skip(1);
-    if args.next().as_deref().and_then(|a| a.to_str()) == Some("_boot-vm") {
+    let command = args.next();
+    if matches!(
+        command.as_deref().and_then(|a| a.to_str()),
+        Some("_boot-vm" | "_boot-vm-owned")
+    ) {
         let Some(config) = args.next() else {
-            eprintln!("_boot-vm requires a boot-config path");
+            eprintln!("boot requires a boot-config path");
             std::process::exit(2);
         };
-        if let Err(e) = smolvm::internal_boot::run(std::path::PathBuf::from(config)) {
+        let result = if command.as_deref() == Some(std::ffi::OsStr::new("_boot-vm-owned")) {
+            let Some(token) = args.next().and_then(|token| token.into_string().ok()) else {
+                eprintln!("owned boot requires a startup token");
+                std::process::exit(2);
+            };
+            smolvm::internal_boot::run_owned(config.into(), token)
+        } else {
+            smolvm::internal_boot::run(config.into())
+        };
+        if let Err(e) = result {
             eprintln!("boot failed: {e}");
             std::process::exit(1);
         }

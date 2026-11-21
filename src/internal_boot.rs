@@ -76,7 +76,37 @@ fn open_boot_disk<K: DiskType>(path: &Path, size_gb: u64) -> crate::Result<VmDis
 /// Reads the boot config from the given path, sets up libkrun, and calls
 /// `krun_start_enter` which blocks forever (or until the VM exits).
 pub fn run(config_path: PathBuf) -> crate::Result<()> {
+    run_inner(config_path, None)
+}
+
+/// Boot only after durably claiming the controller's exact startup ticket.
+/// Old helpers reject this separate entry point instead of ignoring ownership.
+pub fn run_owned(config_path: PathBuf, token: String) -> crate::Result<()> {
+    run_inner(config_path, Some(token))
+}
+
+fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
     let t_proc = std::time::Instant::now();
+    // Map the anonymous commit file before redirecting stdin or closing inherited
+    // descriptors. The mapping also survives the later credential/sandbox setup.
+    #[cfg(unix)]
+    if let Some(parent) = std::env::var_os(crate::agent::startup_transaction::PARENT_ENV) {
+        std::env::remove_var(crate::agent::startup_transaction::PARENT_ENV);
+        let parent = parent
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .ok_or_else(|| crate::Error::agent("watch startup transaction", "invalid owner PID"))?;
+        crate::agent::startup_transaction::watch_stdin(parent, || {
+            if let Some(socket) = AGENT_SOCKET.get() {
+                flush_guest_before_exit(socket);
+            }
+        })
+        .map_err(|error| crate::Error::agent("watch startup transaction", error.to_string()))?;
+    }
+    #[cfg(unix)]
+    crate::ssh::ownership::register_boot().map_err(|error| {
+        crate::Error::agent("register SSH startup ownership", error.to_string())
+    })?;
 
     // --- Parent-death watchdog ---------------------------------------------
     // This VMM (`smol-vmm _boot-vm`) is always spawned by an embedding parent:
@@ -118,10 +148,38 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     }
 
     // Read boot config
-    let config_data = std::fs::read(&config_path)
+    let config_data = crate::agent::boot_config::read_boot_config_file(&config_path)
         .map_err(|e| crate::Error::agent("read boot config", e.to_string()))?;
+    // The launcher names the config it wrote by digest: the file's directory
+    // belongs to the VM's uid, which could have put another file in its place.
+    if let Some(expected) = std::env::var_os(crate::agent::boot_config::BOOT_CONFIG_SHA256_ENV) {
+        if crate::agent::boot_config::boot_config_digest(&config_data).as_str() != expected {
+            return Err(crate::Error::agent(
+                "read boot config",
+                "boot config is not the one the launcher wrote",
+            ));
+        }
+    }
     let config: BootConfig = serde_json::from_slice(&config_data)
         .map_err(|e| crate::Error::agent("parse boot config", e.to_string()))?;
+
+    if let Some(token) = token {
+        let ticket = config.startup_ticket.as_ref().ok_or_else(|| {
+            crate::Error::agent_conflict("admit VM startup", "owned boot requires a startup ticket")
+        })?;
+        if ticket.token != token || !ticket.database.is_absolute() {
+            return Err(crate::Error::agent_conflict(
+                "admit VM startup",
+                "boot config does not belong to this startup",
+            ));
+        }
+        crate::db::SmolvmDb::open_at(&ticket.database)?.admit_vm_boot(&token)?;
+    } else if config.startup_ticket.is_some() {
+        return Err(crate::Error::agent_conflict(
+            "admit VM startup",
+            "managed startup requires the owned boot entry point",
+        ));
+    }
 
     // Clean up the config file — it's no longer needed
     let _ = std::fs::remove_file(&config_path);
@@ -283,7 +341,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
     {
         // The seed belongs to the launcher uid. A mount is needed only when
         // this VMM will drop to a different, per-VM uid.
-        let seed_dirs = if std::env::var_os("SMOLVM_VM_UID").is_some() {
+        let seed_dirs = if let Some(uid) = std::env::var("SMOLVM_VM_UID")
+            .ok()
+            .and_then(|uid| uid.parse().ok())
+        {
+            report_boot_chains(&config, uid);
             boot_seed_dirs(&config)
         } else {
             Vec::new()
@@ -453,7 +515,7 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
         // be able to open that backing file. Grant the template directory
         // read-only — it is the install dir (same trust level as SMOLVM_LIB_DIR,
         // which lives under it) and holds no secrets. A no-op for the copy path.
-        if let Some(home) = dirs::home_dir() {
+        if let Some(home) = smolvm_paths::home_dir() {
             read_exec.push(home.join(".smolvm"));
         }
 
@@ -521,23 +583,11 @@ pub fn run(config_path: PathBuf) -> crate::Result<()> {
             }
         }
 
-        // The guest agent signals boot-readiness by writing a marker file into
-        // the virtiofs rootfs, which the host polls. The rootfs is granted
-        // read-exec above, so that FUSE write would be denied here. Carve out
-        // write on JUST that one marker file — never the rootfs dir, which
-        // holds the shared agent binary/init/libs a guest→VMM escape must not
-        // be able to tamper with. Landlock needs an existing path to build the
-        // rule, so pre-create it empty; the guest overwrites it with content
-        // and the host treats non-empty as ready (see manager.rs wait loop).
-        // The marker name is per-VM (the host passes it via SMOLVM_READY_MARKER so
-        // concurrent boots don't share one file); fall back to the shared constant
-        // if unset. Granting/pre-creating the WRONG name would leave the agent's
-        // real (per-VM) write Landlock-denied → readiness limps to the vsock grace.
-        let marker_name = std::env::var(smolvm_protocol::guest_env::READY_MARKER)
-            .unwrap_or_else(|_| smolvm_protocol::AGENT_READY_MARKER.to_string());
-        let ready_marker = config.rootfs_path.join(marker_name);
-        let _ = std::fs::File::create(&ready_marker);
-        read_write.push(ready_marker);
+        // No per-machine file is made in the shared rootfs: every guest mounts
+        // it as its root, so a file named after a machine would tell any guest
+        // which machines run. Readiness comes through the doorbell socket and
+        // the agent ping in the machine's own directory, so the rootfs stays
+        // read-exec only.
 
         if let Err(e) = crate::process::restrict_filesystem(&read_exec, &read_write) {
             eprintln!("[landlock] restriction failed, refusing to boot unconfined: {e}");
@@ -812,20 +862,54 @@ fn boot_disk_backing_paths(
     extra_disks: &[(PathBuf, bool, DiskFormat)],
     cache_layer: Option<&Path>,
 ) -> Vec<PathBuf> {
+    boot_qcow2_disks(storage, overlay, extra_disks)
+        .chain(cache_layer)
+        .flat_map(qcow2_backing_chain)
+        .collect()
+}
+
+/// The disks this boot attaches as qcow2. A disk is opened in the format it is
+/// attached in: only a qcow2 one has a backing chain, and a raw one whose bytes
+/// the guest made look like qcow2 must not widen what the VMM may read or have
+/// a seed mounted for it. Storage and overlay are qcow2 exactly when
+/// [`open_boot_disk`] opens them so.
+#[cfg(target_os = "linux")]
+fn boot_qcow2_disks<'a>(
+    storage: &'a Path,
+    overlay: &'a Path,
+    extra_disks: &'a [(PathBuf, bool, DiskFormat)],
+) -> impl Iterator<Item = &'a Path> {
     [storage, overlay]
         .into_iter()
-        // An attached disk is opened in the format it was attached in: only a
-        // qcow2 one has a backing chain to grant, and a raw one whose bytes the
-        // guest made look like qcow2 must not widen what the VMM may read.
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("qcow2"))
         .chain(
             extra_disks
                 .iter()
                 .filter(|(_, _, format)| *format == DiskFormat::Qcow2)
                 .map(|(path, _, _)| path.as_path()),
         )
-        .chain(cache_layer)
-        .flat_map(qcow2_backing_chain)
-        .collect()
+}
+
+/// Report each backing in this boot's chains that root did not attach for
+/// them, to the machine's log.
+#[cfg(target_os = "linux")]
+fn report_boot_chains(config: &crate::agent::boot_config::BootConfig, uid: u32) {
+    let cache_layer = cache_disk_layer(config);
+    let disks = boot_qcow2_disks(
+        &config.storage_disk_path,
+        &config.overlay_disk_path,
+        &config.extra_disks,
+    )
+    .chain(cache_layer.as_deref());
+    for disk in disks {
+        for backing in crate::disk_grants::report_chain(disk, Some(uid), "boot") {
+            eprintln!(
+                "[disk-grants] {} names backing {} that root did not attach for it",
+                disk.display(),
+                backing.display()
+            );
+        }
+    }
 }
 
 /// The machine's own layer over its cache disk's base, beside its storage disk.
@@ -842,10 +926,12 @@ fn cache_disk_layer(config: &crate::agent::boot_config::BootConfig) -> Option<Pa
 #[cfg(target_os = "linux")]
 fn boot_seed_dirs(config: &crate::agent::boot_config::BootConfig) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let disks = [&config.storage_disk_path, &config.overlay_disk_path]
-        .into_iter()
-        .chain(config.extra_disks.iter().map(|(path, _, _)| path));
-    for dir in disks.filter_map(|disk| seed_dir_for_disk(disk)) {
+    let disks = boot_qcow2_disks(
+        &config.storage_disk_path,
+        &config.overlay_disk_path,
+        &config.extra_disks,
+    );
+    for dir in disks.filter_map(seed_dir_for_disk) {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }

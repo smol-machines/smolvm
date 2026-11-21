@@ -138,6 +138,7 @@ pub fn run_helper() -> i32 {
         "unpack" => helper_unpack(&path),
         "archive" => helper_archive(&path),
         "readonly-tmpfs" => helper_readonly_tmpfs(&path),
+        "unpack-directory" => crate::directory_write::helper(&path, uid, gid),
         "connect" => helper_connect(&path),
         "mount-cache" => helper_mount_cache(&path, &args),
         "remount-shm" => helper_remount_shm(&path, &args),
@@ -1097,9 +1098,6 @@ pub struct ContainerFile {
     pub reader: std::io::Take<std::io::BufReader<std::process::ChildStdout>>,
 }
 
-// Reachable only on Linux: `workload_container` yields a `ContainerNs` only
-// there, so a developer build on macOS sees these as unused by construction.
-#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
 /// A streaming archive helper whose lifetime follows its consumer.
 pub(crate) struct ContainerArchive {
     child: std::process::Child,
@@ -1155,7 +1153,12 @@ impl ContainerNs {
         }
         Ok(archive)
     }
+}
 
+// Reachable only on Linux: `workload_container` yields a `ContainerNs` only
+// there, so a developer build on macOS sees these as unused by construction.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+impl ContainerNs {
     /// The archive is opened in the agent before the helper enters the
     /// container; destination paths resolve through its actual mounts.
     pub fn unpack(&self, archive: &str, destination: &str) -> Result<(), String> {
@@ -1175,6 +1178,58 @@ impl ContainerNs {
                 .strip_prefix("ERR ")
                 .unwrap_or(message.trim())
                 .to_owned())
+        }
+    }
+
+    /// Merge a validated folder archive and stop extraction if its client leaves.
+    pub(crate) fn unpack_directory(
+        &self,
+        archive: std::fs::File,
+        destination: &str,
+        client: Option<std::os::fd::RawFd>,
+        owner: (Option<u32>, Option<u32>),
+    ) -> Result<(), String> {
+        let mut child = Command::new(AGENT_BINARY)
+            .args([
+                HELPER_ARG,
+                "unpack-directory",
+                &self.pid.to_string(),
+                destination,
+                "-",
+                &owner.0.map_or_else(|| "-".into(), |id| id.to_string()),
+                &owner.1.map_or_else(|| "-".into(), |id| id.to_string()),
+            ])
+            .stdin(archive)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .spawn()
+            .map_err(|e| format!("spawn folder helper: {e}"))?;
+        match crate::process::wait_with_timeout_cleanup_and_liveness(
+            &mut child,
+            Some(600_000),
+            client,
+            || {},
+        )
+        .map_err(|e| e.to_string())?
+        {
+            crate::process::WaitResult::Completed { exit_code, output } => {
+                let message = String::from_utf8_lossy(&output.stdout);
+                if exit_code == 0 && message.trim() == "OK" {
+                    Ok(())
+                } else {
+                    Err(message
+                        .trim()
+                        .strip_prefix("ERR ")
+                        .unwrap_or(message.trim())
+                        .into())
+                }
+            }
+            crate::process::WaitResult::ClientDisconnected { .. } => {
+                Err("Folder upload cancelled.".into())
+            }
+            crate::process::WaitResult::TimedOut { .. } => {
+                Err("Folder extraction timed out.".into())
+            }
         }
     }
 

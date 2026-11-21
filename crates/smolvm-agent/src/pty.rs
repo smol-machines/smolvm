@@ -71,6 +71,23 @@ impl PtyMaster {
         }
     }
 
+    /// A PTY has no write-side shutdown. Only canonical mode has a distinct
+    /// EOF character; injecting Ctrl-D into a raw terminal would corrupt data.
+    pub fn eof_input(&self) -> io::Result<Vec<u8>> {
+        let mut state = std::mem::MaybeUninit::<libc::termios>::uninit();
+        // SAFETY: tcgetattr initializes state through our owned terminal fd.
+        if unsafe { libc::tcgetattr(self.fd.as_raw_fd(), state.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let state = unsafe { state.assume_init() };
+        let eof = state.c_cc[libc::VEOF];
+        if state.c_lflag & libc::ICANON == 0 || eof == libc::_POSIX_VDISABLE {
+            return Ok(Vec::new());
+        }
+        // First flush an unterminated line; then produce the empty EOF read.
+        Ok(vec![eof, eof])
+    }
+
     pub fn as_raw_fd(&self) -> RawFd {
         self.fd.as_raw_fd()
     }

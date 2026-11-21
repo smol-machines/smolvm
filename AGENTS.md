@@ -117,7 +117,7 @@ smolvm machine delete --name NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
 smolvm machine stats [--name NAME] [--json]       # CPU %, guest memory and pressure stalls
 smolvm machine ls [--json]                        # list all
-smolvm machine update --name NAME [OPTIONS]              # modify stopped machine settings
+smolvm machine update --name NAME [OPTIONS]              # modify settings (env, ports, labels, allow list live)
 smolvm machine mount add --name NAME -v HOST:GUEST[:ro] # mount into a running machine (until it stops)
 smolvm machine mount rm --name NAME -t GUEST              # unmount it, revoking open files
 smolvm machine mount ls --name NAME [--json]              # list mounts added this boot
@@ -182,7 +182,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--net` | | run, create, update, pack run | Enable outbound networking (off by default) |
 | `--gpu` | | run, create, update, pack create | Enable GPU acceleration (Vulkan via virtio-gpu) |
 | `--gpu-vram` | | run, create | GPU shared-memory region size in MiB (default: 4096). Ignored without `--gpu`. |
-| `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro]`, or `GUEST` alone for a directory on the machine's own disk (`-v /var/lib/docker`), which starts with the image's owner and mode at that path |
+| `--volume` | `-v` | run, create, update, pack run | Mount host dir: `HOST:GUEST[:ro][:uid=N[,gid=N]]` (`uid=`/`gid=`: the guest owner of files that record none, e.g. `~/.pi:/home/ubuntu/.pi:uid=1000`), or `GUEST` alone for a directory on the machine's own disk (`-v /var/lib/docker`), which starts with the image's owner and mode at that path |
 | `--allow-system-mounts` | | run, create, update, pack run | Permit trusted read-only `/etc` and `/var/log` mounts below `/host` |
 | `--port` | `-p` | run, create, update, pack run | Port mapping: `HOST:GUEST`, or `HOST:GUEST/udp` for UDP |
 | `--auto-ports` | | run, create, update | Publish every TCP port the guest listens on at the same port on host loopback while it listens (off by default) |
@@ -250,6 +250,10 @@ left out; a `-p` mapping keeps its guest port. `machine status` marks them `auto
 `smolvm serve`, the SDKs, or a running branch), on TSI and virtio-net alike; a port in a separate
 network namespace, or Docker with `"userland-proxy": false`, is not seen. Details:
 `docs/throwaway-machine/README.md`.
+A machine with a network on your own computer reaches the services you run on
+it (`127.0.0.1`, through its gateway or `host.docker.internal`), as a container
+under Docker does; `--deny-cidr 127.0.0.0/8` closes just that, and a cloud
+worker never allows it. Cloud metadata stays blocked everywhere.
 `--block-private` keeps the public internet open but blocks the LAN, cloud
 metadata, CGNAT (Tailscale), unique-local IPv6 and the host's loopback;
 `--allow-private CIDR` re-opens one private range, such as an internal
@@ -384,6 +388,16 @@ Attach refs on the command line:
 smolvm machine run    --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
 smolvm machine create --name web --secret-env DATABASE_URL=PROD_DB_URL   # persists the ref
 smolvm machine exec --name web --secret-env TOKEN=CI_TOKEN -- ./deploy
+
+# Rotate a running machine's --credential values without a restart: each binding's
+# ENV_VAR is read again from this shell and used from the machine's next request.
+smolvm machine credentials refresh --name web [BINDING...]
+# Add or remove bindings on a running machine: from its next request an added binding is
+# substituted (its value read now from this shell) and a removed one is not. A binding for a
+# host no CA of the machine permits gets a CA of its own, trusted by the guest at once
+# (machines booted on v1.36.0+; older ones trust it from their next start).
+smolvm machine credentials add    --name web --credential gh=GH_TOKEN@api.github.com
+smolvm machine credentials remove --name web gh
 
 # From a host file (GUEST_VAR=/absolute/path)
 smolvm machine run --secret-file GCP_CREDS=/abs/creds.json -- ./app
@@ -559,8 +573,8 @@ can create and run machines. Machines that ask for nested virtualization
 
 - Machine name defaults to `$SMOLVM_MACHINE_NAME` when set, else `"default"`, when `--name` is omitted. An explicit `--name` always wins. Meant for per-workspace tooling (direnv); `machine run`, `machine checkpoint`, and `machine branch` deliberately ignore the variable. Without the variable, `machine create` generates a `vm-<id>` name instead of `"default"`
 - Network is **off** by default (security-first)
-- CPUs: 4, Memory: 8192 MiB, Storage: 20 GiB, Overlay: 10 GiB
-- Packed binaries use the same defaults (CPUs: 4, Memory: 8192 MiB)
+- CPUs: 4, Memory: half the host's RAM up to 8192 MiB, Storage: 20 GiB, Overlay: 10 GiB
+- Packed binaries default to CPUs: 4, Memory: 8192 MiB
 - Memory and CPU are elastic via virtio balloon — the host only commits what the guest actually uses and reclaims the rest
 
 ## Important Behaviors
@@ -573,4 +587,4 @@ can create and run machines. Machines that ask for nested virtualization
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
 - **`machine mount add` mounts into a running machine.** The host directory appears at the guest path at once, in the machine and in every workload container, with no restart; `:ro` is enforced by the host. It lasts until the machine stops (use `machine update -v` to keep a mount), a branch inherits it, and `mount rm` revokes the guest's access, open files included. `POST/GET/DELETE /api/v1/machines/:name/mounts` does the same over the API.
 - **A mounted host directory belongs to the workload user.** When an image-based machine runs as a non-root user (image `USER`, Smolfile `user`, or `-u`), each `-v` directory appears owned by that user inside the machine, so it is writable without `chown`; on the host the files stay owned by the host user. Root workloads, bare machines and host directories owned by root see the host's ownership unchanged.
-- **`machine update` modifies a stopped machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped, except for allow-list changes (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`, `--remove-allow-host`, `--remove-allow-cidr`, `--allow-udp`, `--remove-allow-udp`) on a machine started with an allow list: those apply to its next connection, datagram or DNS lookup and persist across restarts. Lifting the allow list entirely still needs a stop. Labels (`--label KEY=VALUE`, `--remove-label KEY`) are host-side metadata and change in any state.
+- **`machine update` modifies a machine.** Add/remove mounts, ports, env vars, or change CPU/memory without recreating the VM. Changes take effect on next `machine start`. Requires the machine to be stopped, except for allow-list changes (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`, `--remove-allow-host`, `--remove-allow-cidr`, `--allow-udp`, `--remove-allow-udp`) on a machine started with an allow list: those apply to its next connection, datagram or DNS lookup and persist across restarts. Lifting the allow list entirely still needs a stop. Env vars (`-e KEY=VALUE`, `--remove-env KEY`, or `PUT /api/v1/machines/:name/env` to replace them all) also change on a running machine: every command started afterwards gets the new environment, while a process already running keeps the one it started with until it restarts. Published ports change live too. Each live kind is applied in an update of its own. Labels (`--label KEY=VALUE`, `--remove-label KEY`) are host-side metadata and change in any state.

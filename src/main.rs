@@ -24,7 +24,7 @@ struct Cli {
 
     /// Keep all smolvm state (machines, images, caches, the database) under
     /// PATH instead of the user's default directories, for example to run a
-    /// second engine version beside an installed one. Not supported on Windows.
+    /// second engine version beside an installed one.
     #[arg(long, global = true, value_name = "PATH")]
     state_dir: Option<std::path::PathBuf>,
 
@@ -74,6 +74,13 @@ enum Commands {
     BootVm {
         /// Path to boot config JSON file
         config: std::path::PathBuf,
+    },
+
+    /// Internal: boot with durable startup ownership (not for direct use)
+    #[command(name = "_boot-vm-owned", hide = true)]
+    BootVmOwned {
+        config: std::path::PathBuf,
+        token: String,
     },
 
     /// Internal: run the shared CUDA daemon (not for direct use)
@@ -159,7 +166,6 @@ fn stray_stub_note(exe_stem: &str) -> Option<String> {
 /// `SMOLVM_DATA_DIR` root that child processes inherit. Arguments after `--`
 /// belong to the workload and are never read. A relative path is made
 /// absolute so children started in another directory agree on it.
-#[cfg_attr(not(unix), allow(dead_code))]
 fn state_dir_from_args(
     args: impl IntoIterator<Item = std::ffi::OsString>,
 ) -> Option<std::path::PathBuf> {
@@ -190,6 +196,12 @@ fn main() {
 }
 
 fn run_cli() {
+    if let Err(error) =
+        smolvm::ssh::apply_proxy_context(&std::env::args_os().skip(1).collect::<Vec<_>>())
+    {
+        eprintln!("SSH startup failed: {error:#}");
+        std::process::exit(2);
+    }
     // Lets pack extraction pick host-side layers when this host's virtiofs
     // server can present their recorded ownership.
     smolvm_pack::extract::set_host_layers_probe(smolvm::agent::host_layers_supported);
@@ -197,7 +209,6 @@ fn run_cli() {
     // agree on where smolvm state lives) before anything computes a path. The
     // auto /var/lib/smolvm default is serve-only (applied in its run()). Done
     // first, single-threaded, so the set_var is safe.
-    #[cfg(unix)]
     if let Some(dir) = state_dir_from_args(std::env::args_os().skip(1)) {
         std::env::set_var("SMOLVM_DATA_DIR", dir);
     }
@@ -221,6 +232,7 @@ fn run_cli() {
             .as_deref()
             .and_then(|s| s.to_str()),
         Some("_boot-vm")
+            | Some("_boot-vm-owned")
             | Some("_cuda-daemon")
             | Some("_cuda-clone-worker")
             | Some("_cuda-mps-supervisor")
@@ -247,11 +259,6 @@ fn run_cli() {
 
     let cli = Cli::parse();
     let error_format = cli.error_format;
-    if cli.state_dir.is_some() && !cfg!(unix) {
-        eprintln!("Error: --state-dir is not supported on Windows");
-        std::process::exit(2);
-    }
-
     // Initialize logging based on RUST_LOG or default to warn
     init_logging();
 
@@ -271,6 +278,7 @@ fn run_cli() {
             cli::completion::print(shell, &mut cmd).map_err(smolvm::Error::Io)
         }
         Commands::BootVm { config } => smolvm::internal_boot::run(config),
+        Commands::BootVmOwned { config, token } => smolvm::internal_boot::run_owned(config, token),
         #[cfg(unix)]
         Commands::CudaDaemon { socket } => {
             smolvm::cuda_daemon::run(&socket).map_err(smolvm::Error::Io)
@@ -374,13 +382,15 @@ mod tests {
                 .map(std::ffi::OsString::from)
                 .collect::<Vec<_>>()
         };
+        let absolute = std::env::temp_dir().join("smol state");
+        let path = absolute.to_str().unwrap();
         assert_eq!(
-            state_dir_from_args(args(&["--state-dir", "/srv/smol", "machine", "ls"])),
-            Some("/srv/smol".into())
+            state_dir_from_args(args(&["--state-dir", path, "machine", "ls"])),
+            Some(absolute.clone())
         );
         assert_eq!(
-            state_dir_from_args(args(&["machine", "ls", "--state-dir=/srv/smol"])),
-            Some("/srv/smol".into())
+            state_dir_from_args(args(&["machine", "ls", &format!("--state-dir={path}")])),
+            Some(absolute)
         );
         assert_eq!(
             state_dir_from_args(args(&["machine", "run", "--", "app", "--state-dir", "/x"])),

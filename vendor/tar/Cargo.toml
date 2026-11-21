@@ -1,36 +1,49 @@
 [package]
-name = "tar"
-version = "0.4.46"
+name = "smolvm-tar"
+version = "0.4.46-smol.1"
+authors = ["Alex Crichton <alex@alexcrichton.com>"]
+homepage = "https://github.com/composefs/tar-rs"
+repository = "https://github.com/smol-machines/smolvm"
+documentation = "https://docs.rs/smolvm-tar"
+license = "MIT OR Apache-2.0"
+keywords = ["tar", "tarfile", "encoding"]
+readme = false
 edition = "2021"
 rust-version = "1.63"
-authors = ["Alex Crichton <alex@alexcrichton.com>"]
-license = "MIT OR Apache-2.0"
-description = "Rust TAR reader/writer with length-delimited PAX records"
-repository = "https://github.com/composefs/tar-rs"
-readme = false
+include = ["src/**", "tests/**", "examples/**", "LICENSE-*", "Cargo.toml", "Cargo.lock"]
 
-# Keep the upstream implementation; the only source patch is src/pax.rs.
-[package.metadata.smol]
-upstream-version = "0.4.46"
-upstream-revision = "fc459c149f83bf4daceaa52e17d351989002e1a9"
-upstream-issue = "https://github.com/composefs/tar-rs/issues/452"
-
-[features]
-default = ["xattr"]
+description = """
+A Rust implementation of a TAR file reader and writer. This library does not
+currently handle compression, but it is abstract over all I/O readers and
+writers. Additionally, great lengths are taken to ensure that the entire
+contents are never required to be entirely resident in memory all at once.
+"""
 
 [dependencies]
 filetime = "0.2.8"
 
-[target.'cfg(unix)'.dependencies]
-libc = "0.2"
-xattr = { version = "1.1.3", optional = true }
-
 [dev-dependencies]
+astral-tokio-tar = "0.6.2"
+rand = { version = "0.8", features = ["small_rng"] }
 tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt"] }
+tokio-stream = "0.1"
 
-# Preserve upstream source outside pax.rs while accepting its existing lint
-# baseline under the newer compiler used by this workspace.
-[lints.clippy]
-manual_clear = "allow"
-needless_late_init = "allow"
-incompatible_msrv = "allow"
+[target."cfg(unix)".dependencies]
+xattr = { version = "1.1.3", optional = true }
+libc = "0.2"
+
+[features]
+default = ["xattr"]
+
+[lints.rust]
+# Feel free to comment this one out locally during development of a patch.
+dead_code = "deny"
+
+[lib]
+name = "tar"
+
+[package.metadata.smolvm]
+upstream-version = "0.4.46"
+upstream-revision = "38451cc19418dac850e46e9dc6fac0fae1247940"
+upstream-fix = "https://github.com/composefs/tar-rs/pull/476"

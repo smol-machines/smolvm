@@ -1,0 +1,65 @@
+on:
+  pull_request:
+  merge_group:
+
+name: Test
+
+jobs:
+  tests:
+    runs-on: ubuntu-22.04
+    needs: [check-msrv, test-msrv, test-stable, clippy, test-netsim]
+    steps:
+      - name: Done
+        run: exit 0
+
+  check-msrv:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Checks MSRV
+        run: ./ci.sh check msrv
+
+  test-msrv:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Tests MSRV
+        run: ./ci.sh test msrv
+
+  clippy:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Clippy
+        run: ./ci.sh clippy
+
+  test-stable:
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Tests stable
+        run: ./ci.sh test stable
+
+  test-nightly:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run Tests nightly
+        run: ./ci.sh test nightly
+
+  test-netsim:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Run network-simulation tests
+        run: ./ci.sh netsim
+
+  test-build-16bit:
+    runs-on: ubuntu-22.04
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build for target with 16 bit pointer
+        run: ./ci.sh build_16bit

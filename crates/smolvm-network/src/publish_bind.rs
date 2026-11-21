@@ -116,7 +116,9 @@ pub fn bind_udp(port: u16) -> io::Result<BoundSockets<UdpSocket>> {
 /// the default publish address.
 pub fn bind_udp_on(port: u16, listen: Option<IpAddr>) -> io::Result<BoundSockets<UdpSocket>> {
     bind_listen(port, listen, |addr| {
-        Ok(new_socket(addr, Type::DGRAM, Protocol::UDP)?.into())
+        let socket = new_socket(addr, Type::DGRAM, Protocol::UDP)?;
+        crate::host_udp::configure(&socket)?;
+        Ok(socket.into())
     })
 }
 
@@ -329,6 +331,12 @@ mod tests {
         })
         .unwrap();
         assert!(bound.v6.is_none());
+    }
+
+    #[test]
+    fn published_udp_socket_carries_maximum_datagrams() {
+        let bound = bind_udp_on(0, Some(Ipv4Addr::LOCALHOST.into())).unwrap();
+        crate::host_udp::assert_maximum_datagram_round_trip(bound.v4, crate::host_udp::peer());
     }
 
     #[test]

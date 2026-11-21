@@ -225,13 +225,19 @@ pub fn handle_container_start(
             return Ok(());
         }
     };
-    crate::send_response(stream, &AgentResponse::Started)?;
-
     let oom_before = oom_kills();
-    let result = match started.pty.take() {
-        Some(pty) => crate::run_interactive_loop_pty(stream, &mut started.child, pty, None),
-        None => crate::run_interactive_loop(stream, &mut started.child, None),
-    };
+    let result = (|| {
+        crate::send_response(stream, &AgentResponse::Started)?;
+        match started.pty.take() {
+            Some(pty) => crate::run_interactive_loop_pty(stream, &mut started.child, pty, None),
+            None => crate::run_interactive_loop(stream, &mut started.child, None),
+        }
+    })();
+    if result.is_err() {
+        // Also cover a failed Started write: the spawned init must never
+        // survive an owner which could not establish or service its I/O.
+        crate::process::kill_child_tree(&mut started.child);
+    }
     // The container is gone however the loop ended (exit, or the host went
     // away and the loop killed it); clear its runtime state so the overlay's
     // next start or exec does not find a dead main container.
@@ -452,6 +458,8 @@ fn prepare_bundle(
         }
     }
 
+    let container_id = crate::oci::generate_container_id();
+    crate::container_stats::configure(&mut oci, &container_id)?;
     let bundle = rootfs
         .parent()
         .ok_or("invalid rootfs path: no parent")?
@@ -459,7 +467,6 @@ fn prepare_bundle(
     std::fs::create_dir_all(&bundle)?;
     oci.write_to(&bundle)
         .map_err(|e| format!("failed to write OCI spec: {e}"))?;
-    let container_id = crate::oci::generate_container_id();
     Ok((bundle, container_id, workload_id))
 }
 
@@ -467,7 +474,7 @@ fn prepare_bundle(
 fn prepare(spec: &ContainerStartSpec) -> Result<Started, Box<dyn std::error::Error>> {
     let (bundle, container_id, workload_id) = prepare_bundle(spec, false)?;
     tracing::info!(id = %spec.id, container_id = %container_id, command = ?spec.command, tty = spec.tty, "starting container");
-    let (mut child, pty) = crate::spawn_crun_run(&bundle, &container_id, spec.tty, false)?;
+    let (mut child, pty) = crate::spawn_crun_run(&bundle, &container_id, spec.tty, true)?;
     // Only a running container becomes the overlay's main container: a `Run`
     // that looked it up while crun was still creating it would find it not
     // running and delete its state, failing the start.
@@ -1162,6 +1169,47 @@ mod tests {
                 matches!(handle_prepare_files(image, overlay, None), AgentResponse::Error { code: Some(code), .. } if code == error_codes::INVALID_REQUEST)
             );
         }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn imported_archives_preserve_pax_filenames_with_newlines() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+
+        let root = tempfile::tempdir().unwrap();
+        let owner = std::fs::metadata(root.path()).unwrap();
+        let archive = root.path().join("upload.tar");
+        let name = "測試\nname.txt";
+        let mut builder = tar::Builder::new(std::fs::File::create(&archive).unwrap());
+        builder
+            .append_pax_extensions([("path", name.as_bytes())])
+            .unwrap();
+        let payload = b"keep exact bytes";
+        let mut header = tar::Header::new_ustar();
+        header.set_size(payload.len() as u64);
+        header.set_mode(0o640);
+        header.set_uid(owner.uid() as u64);
+        header.set_gid(owner.gid() as u64);
+        builder
+            .append_data(&mut header, "fallback.txt", &payload[..])
+            .unwrap();
+        builder.finish().unwrap();
+        drop(builder);
+
+        let guest = root.path().join("container");
+        std::fs::create_dir(&guest).unwrap();
+        unpack_archive(&guest, archive.to_str().unwrap(), "/uploaded").unwrap();
+        let imported = guest.join("uploaded").join(name);
+        assert_eq!(std::fs::read(&imported).unwrap(), payload);
+        assert_eq!(
+            std::fs::metadata(imported).unwrap().permissions().mode() & 0o777,
+            0o640
+        );
+        assert!(!guest.join("uploaded/fallback.txt").exists());
+        assert!(
+            !archive.exists(),
+            "successful import removes its staging archive"
+        );
     }
 
     #[test]

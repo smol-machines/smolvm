@@ -8,6 +8,7 @@
 //! payloads start with a strictly boolean completion byte. All other bytes
 //! are raw data; the existing outer frame limit remains in force.
 
+use crate::container_session::{Control, Event, Input, OutputStream, MAX_INPUT_BYTES};
 use crate::{AgentRequest, AgentResponse, Envelope, MAX_FRAME_SIZE};
 use std::io::{self, Write};
 
@@ -18,6 +19,28 @@ const FILE_WRITE_CHUNK: u8 = 2;
 const STDOUT: u8 = 3;
 const STDERR: u8 = 4;
 const DATA_CHUNK: u8 = 5;
+const SESSION_STDIN: u8 = 6;
+const SESSION_STDOUT: u8 = 7;
+const SESSION_STDERR: u8 = 8;
+
+fn session_payload(sequence: u64, data: &[u8]) -> io::Result<()> {
+    if sequence == 0 || data.is_empty() || data.len() > MAX_INPUT_BYTES {
+        return Err(invalid(
+            "invalid container session sequence or payload size",
+        ));
+    }
+    Ok(())
+}
+
+fn decode_session(payload: &[u8]) -> io::Result<(u64, &[u8])> {
+    let sequence = payload
+        .get(..8)
+        .ok_or_else(|| invalid("truncated session sequence"))?;
+    let sequence = u64::from_be_bytes(sequence.try_into().unwrap());
+    let data = &payload[8..];
+    session_payload(sequence, data)?;
+    Ok((sequence, data))
+}
 
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -41,13 +64,23 @@ pub fn encode_request(
     request: &AgentRequest,
     trace_id: Option<&str>,
 ) -> io::Result<Option<Vec<u8>>> {
-    let (tag, data, done) = match request {
-        AgentRequest::Stdin { data } => (STDIN, data, None),
-        AgentRequest::FileWriteChunk { data, done } => (FILE_WRITE_CHUNK, data, Some(*done)),
+    let (tag, data, done, sequence) = match request {
+        AgentRequest::Stdin { data } => (STDIN, data, None, None),
+        AgentRequest::FileWriteChunk { data, done } => (FILE_WRITE_CHUNK, data, Some(*done), None),
+        AgentRequest::ContainerSession {
+            control:
+                Control::Input {
+                    sequence,
+                    input: Input::Data { bytes },
+                },
+        } => {
+            session_payload(*sequence, bytes)?;
+            (SESSION_STDIN, bytes, None, Some(*sequence))
+        }
         _ => return Ok(None),
     };
     let trace = trace_id.unwrap_or("").as_bytes();
-    let len = (7 + usize::from(done.is_some()))
+    let len = (7 + usize::from(done.is_some()) + 8 * usize::from(sequence.is_some()))
         .checked_add(trace.len())
         .and_then(|n| n.checked_add(data.len()))
         .filter(|n| *n <= MAX_FRAME_SIZE as usize)
@@ -60,6 +93,9 @@ pub fn encode_request(
     if let Some(done) = done {
         frame.push(u8::from(done));
     }
+    if let Some(sequence) = sequence {
+        frame.extend_from_slice(&sequence.to_be_bytes());
+    }
     frame.extend_from_slice(data);
     Ok(Some(frame))
 }
@@ -69,7 +105,7 @@ pub fn decode_request(body: &[u8]) -> io::Result<Envelope<AgentRequest>> {
     let Some(tag) = kind(body)? else {
         return serde_json::from_slice(body).map_err(|e| invalid(&e.to_string()));
     };
-    if !matches!(tag, STDIN | FILE_WRITE_CHUNK) || body.len() < 7 {
+    if !matches!(tag, STDIN | FILE_WRITE_CHUNK | SESSION_STDIN) || body.len() < 7 {
         return Err(invalid("invalid binary request kind or trace header"));
     }
     let len = u32::from_be_bytes(body[3..7].try_into().unwrap()) as usize;
@@ -81,6 +117,16 @@ pub fn decode_request(body: &[u8]) -> io::Result<Envelope<AgentRequest>> {
     let request = if tag == STDIN {
         AgentRequest::Stdin {
             data: payload.to_vec(),
+        }
+    } else if tag == SESSION_STDIN {
+        let (sequence, bytes) = decode_session(payload)?;
+        AgentRequest::ContainerSession {
+            control: Control::Input {
+                sequence,
+                input: Input::Data {
+                    bytes: bytes.to_vec(),
+                },
+            },
         }
     } else {
         let (&done, data) = payload
@@ -101,20 +147,42 @@ pub fn decode_request(body: &[u8]) -> io::Result<Envelope<AgentRequest>> {
 /// Write a bulk response directly from its payload without JSON/base64 or a
 /// second payload-sized framing buffer. Return false for a control response.
 pub fn write_response(writer: &mut impl Write, response: &AgentResponse) -> io::Result<bool> {
-    let (tag, data, done) = match response {
-        AgentResponse::Stdout { data } => (STDOUT, data, None),
-        AgentResponse::Stderr { data } => (STDERR, data, None),
-        AgentResponse::DataChunk { data, done } => (DATA_CHUNK, data, Some(*done)),
+    let (tag, data, done, sequence) = match response {
+        AgentResponse::Stdout { data } => (STDOUT, data, None, None),
+        AgentResponse::Stderr { data } => (STDERR, data, None, None),
+        AgentResponse::DataChunk { data, done } => (DATA_CHUNK, data, Some(*done), None),
+        AgentResponse::ContainerSession {
+            event:
+                Event::Output {
+                    sequence,
+                    stream,
+                    bytes,
+                },
+        } => {
+            session_payload(*sequence, bytes)?;
+            (
+                match stream {
+                    OutputStream::Stdout => SESSION_STDOUT,
+                    OutputStream::Stderr => SESSION_STDERR,
+                },
+                bytes,
+                None,
+                Some(*sequence),
+            )
+        }
         _ => return Ok(false),
     };
-    let len = 3 + usize::from(done.is_some()) + data.len();
+    let len = 3 + usize::from(done.is_some()) + 8 * usize::from(sequence.is_some()) + data.len();
     if len > MAX_FRAME_SIZE as usize {
         return Err(invalid("binary response exceeds maximum size"));
     }
-    let mut header = [0; 8];
+    let mut header = [0; 15];
     header[..4].copy_from_slice(&(len as u32).to_be_bytes());
     header[4..7].copy_from_slice(&[0, VERSION, tag]);
-    let header_len = if let Some(done) = done {
+    let header_len = if let Some(sequence) = sequence {
+        header[7..15].copy_from_slice(&sequence.to_be_bytes());
+        15
+    } else if let Some(done) = done {
         header[7] = u8::from(done);
         8
     } else {
@@ -139,6 +207,20 @@ pub fn decode_response(body: &[u8]) -> io::Result<(AgentResponse, bool)> {
         return Ok((response, version.binary_stream == Some(VERSION)));
     };
     let response = match tag {
+        SESSION_STDOUT | SESSION_STDERR => {
+            let (sequence, bytes) = decode_session(&body[3..])?;
+            AgentResponse::ContainerSession {
+                event: Event::Output {
+                    sequence,
+                    stream: if tag == SESSION_STDOUT {
+                        OutputStream::Stdout
+                    } else {
+                        OutputStream::Stderr
+                    },
+                    bytes: bytes.to_vec(),
+                },
+            }
+        }
         STDOUT => AgentResponse::Stdout {
             data: body[3..].to_vec(),
         },
@@ -157,6 +239,109 @@ pub fn decode_response(body: &[u8]) -> io::Result<(AgentResponse, bool)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sequenced_container_io_preserves_raw_bytes_with_bounded_overhead() {
+        let bytes: Vec<u8> = (0..=255).cycle().take(MAX_INPUT_BYTES).collect();
+        let request = AgentRequest::ContainerSession {
+            control: Control::Input {
+                sequence: 42,
+                input: Input::Data {
+                    bytes: bytes.clone(),
+                },
+            },
+        };
+        let frame = encode_request(&request, Some("trace")).unwrap().unwrap();
+        assert_eq!(frame.len(), bytes.len() + 24);
+        let decoded = decode_request(&frame[4..]).unwrap();
+        assert_eq!(decoded.trace_id.as_deref(), Some("trace"));
+        assert_eq!(
+            serde_json::to_value(decoded.body).unwrap(),
+            serde_json::to_value(request).unwrap()
+        );
+        for stream in [OutputStream::Stdout, OutputStream::Stderr] {
+            let response = AgentResponse::ContainerSession {
+                event: Event::Output {
+                    sequence: 42,
+                    stream,
+                    bytes: bytes.clone(),
+                },
+            };
+            let mut frame = Vec::new();
+            assert!(write_response(&mut frame, &response).unwrap());
+            assert_eq!(frame.len(), bytes.len() + 15);
+            assert_eq!(
+                serde_json::to_value(decode_response(&frame[4..]).unwrap().0).unwrap(),
+                serde_json::to_value(response).unwrap()
+            );
+            assert!(decode_request(&frame[4..]).is_err());
+        }
+    }
+
+    #[test]
+    fn malformed_session_binary_frames_cannot_allocate_or_imply_eof() {
+        for sequence in [0u64, 1] {
+            for size in [0, MAX_INPUT_BYTES + 1] {
+                let request = AgentRequest::ContainerSession {
+                    control: Control::Input {
+                        sequence,
+                        input: Input::Data {
+                            bytes: vec![0; size],
+                        },
+                    },
+                };
+                assert!(encode_request(&request, None).is_err());
+                let mut body = vec![0, VERSION, SESSION_STDOUT];
+                body.extend_from_slice(&sequence.to_be_bytes());
+                body.resize(body.len() + size, 0);
+                assert!(decode_response(&body).is_err());
+            }
+        }
+        for size in 0..8 {
+            let mut body = vec![0, VERSION, SESSION_STDOUT];
+            body.resize(body.len() + size, 0);
+            assert!(decode_response(&body).is_err());
+        }
+    }
+
+    #[test]
+    fn session_control_roundtrips_without_exposing_spec_or_input_in_logs() {
+        let controls = [
+            Control::Start {
+                origin: crate::container_session::Origin {
+                    generation: 1,
+                    started_at: "2026-11-18T00:00:00Z".into(),
+                },
+                execution: "a".repeat(32).try_into().unwrap(),
+                spec: Box::new(crate::ContainerStartSpec {
+                    env: vec![("SECRET".into(), "private-token".into())],
+                    ..Default::default()
+                }),
+            },
+            Control::Input {
+                sequence: 1,
+                input: Input::Eof {},
+            },
+            Control::Input {
+                sequence: 2,
+                input: Input::Resize { cols: 80, rows: 24 },
+            },
+            Control::OutputAck { next: 3 },
+        ];
+        for control in controls {
+            let request = AgentRequest::ContainerSession { control };
+            assert_eq!(request.log_summary(), "ContainerSession");
+            assert!(encode_request(&request, None).unwrap().is_none());
+            let body = serde_json::to_vec(&request).unwrap();
+            assert_eq!(
+                serde_json::to_value(decode_request(&body).unwrap().body).unwrap(),
+                serde_json::to_value(request).unwrap()
+            );
+        }
+        assert!(crate::container_session::InputCursor::default()
+            .check(1, &Input::Data { bytes: Vec::new() })
+            .is_err());
+    }
 
     #[test]
     fn bulk_requests_roundtrip_bytes_trace_and_eof() {

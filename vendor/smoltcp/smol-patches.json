@@ -1,0 +1,20 @@
+{
+  "upstream": "https://github.com/smoltcp-rs/smoltcp",
+  "version": "0.13.1",
+  "source": "crates.io published source",
+  "vcs": {
+    "git": {
+      "sha1": "e347a1e2d3ac33c5ce2c0c114e24b85ae23c4897"
+    },
+    "path_in_vcs": ""
+  },
+  "changes": [
+    "Keep a queued datagram while the previous IPv4 fragment stream is unfinished; do not overwrite its buffer.",
+    "Omit upstream Markdown files from this vendored dependency and disable readme metadata.",
+    "Publish under a distinct crate identity so packaged SDK consumers select the same tested implementation."
+  ],
+  "crate_checksum": "5f73d40463bba65efc9adc6370b56df76d563cc46e2482bba58351b4afb7535e",
+  "validation": "261 upstream library tests passed with the engine feature set; gateway burst regression fails without the fragment-buffer fix.",
+  "published_name": "smolvm-smoltcp",
+  "published_version": "0.13.1-smol.1"
+}

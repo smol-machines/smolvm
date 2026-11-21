@@ -257,6 +257,8 @@ impl EmbeddedRuntime {
     }
 
     fn pause_machine_inner(&self, name: &str, operation: Option<&str>) -> Result<()> {
+        // Pause recovery may itself resume a partially captured VMM.
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let mut record = control::get_record(&self.db, name)?;
@@ -304,12 +306,7 @@ impl EmbeddedRuntime {
                             "source is still running; refusing to stop newer execution",
                         ));
                     }
-                    crate::agent::AgentManager::for_vm_with_sizes(
-                        name,
-                        record.storage_gb,
-                        record.overlay_gb,
-                    )?
-                    .stop_paused()?;
+                    crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
                     self.remove_cached_handle(name)?;
                 }
             }
@@ -377,6 +374,9 @@ impl EmbeddedRuntime {
                             tracing::warn!(%cleanup, "could not remove failed pause artifact");
                         }
                     }
+                    let _ = crate::portable_checkpoint::remove_paused_resume(
+                        &crate::agent::vm_data_dir(name),
+                    );
                 }
                 return Err(error);
             }
@@ -415,6 +415,9 @@ impl EmbeddedRuntime {
         detached: bool,
         operation: Option<&str>,
     ) -> Result<()> {
+        // Recovery can send RESUME directly to an existing VMM, bypassing
+        // ordinary boot admission. Fence that path before touching its state.
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             let _operation_lock = crate::agent::fork::lock_saved_execution(name)?;
             let _source = crate::agent::fork::lock_fork_source(name)?;
@@ -455,10 +458,15 @@ impl EmbeddedRuntime {
                 if status.trim() != "OK paused" {
                     return Err(Error::agent_conflict("resume machine", "source is still running; refusing to replace its execution"));
                 }
-                crate::agent::AgentManager::for_vm_with_sizes(name, record.storage_gb, record.overlay_gb)?.stop_paused()?;
+                crate::agent::AgentManager::for_vm(name)?.stop_paused()?;
             }
             self.remove_cached_handle(name)?;
-            crate::portable_checkpoint::prepare_paused_restore(&record)?;
+            if let Some(image) = crate::portable_checkpoint::prepare_paused_restore(&record)? {
+                // Keep the pause and its retry key active until the VM actually
+                // resumes; only replace the verified image cache reference here.
+                self.db.update_vm_durable(name, |record| image.apply(record))?
+                    .ok_or_else(|| Error::vm_not_found(name))?;
+            }
             let started = control::resume_vm(&self.db, name, detached)?;
             if detached {
                 started.handle.detach();
@@ -475,6 +483,9 @@ impl EmbeddedRuntime {
             let vm_data = crate::agent::vm_data_dir(name);
             if let Err(error) = crate::portable_checkpoint::remove_paused_layers(&vm_data) {
                 tracing::warn!(%error, "could not remove consumed pause's pinned layers");
+            }
+            if let Err(error) = crate::portable_checkpoint::remove_paused_resume(&vm_data) {
+                tracing::warn!(%error, "could not remove consumed pause's kept inputs");
             }
             Ok(())
         })
@@ -597,6 +608,7 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
@@ -620,7 +632,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -644,7 +656,9 @@ impl EmbeddedRuntime {
         name: &str,
         interceptor: Option<smolvm_protocol::InterceptEndpoint>,
     ) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
+            let startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if control::get_record(&self.db, name)?
                 .paused_checkpoint
                 .is_some()
@@ -677,12 +691,13 @@ impl EmbeddedRuntime {
                 return Ok(());
             }
 
+            drop(startup_lock);
             let started = control::start_vm_with_interceptor(&self.db, name, interceptor)?;
             let mut handle = started.handle;
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -697,6 +712,7 @@ impl EmbeddedRuntime {
     /// Used by the containerd shim for pod sandboxes; requires the machine to use
     /// the virtio-net backend.
     pub fn start_machine_with_netns(&self, name: &str, netns: std::path::PathBuf) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
@@ -716,6 +732,7 @@ impl EmbeddedRuntime {
     /// with [`fork_machine`](Self::fork_machine) — the basis for local RL rollout
     /// branching.
     pub fn start_forkable_machine(&self, name: &str) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         self.with_name_lock(name, || {
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
@@ -729,7 +746,7 @@ impl EmbeddedRuntime {
             if started.freshly_started {
                 if let Err(error) = self.launch_image_workload(name, &mut handle) {
                     let _ = handle.stop();
-                    let _ = control::mark_stopped(&self.db, name);
+                    let _ = control::mark_stopped_for_record(&self.db, &started.record);
                     return Err(error);
                 }
             }
@@ -882,6 +899,7 @@ impl EmbeddedRuntime {
                 parallel,
                 options.source_policy,
                 options.keep_machine_id,
+                if options.detached { Some(false) } else { None },
             )?;
             if options.detached {
                 for (_, handle) in started {
@@ -973,6 +991,9 @@ impl EmbeddedRuntime {
     /// Connect to an already-running machine and cache its handle.
     pub fn connect_machine(&self, name: &str) -> Result<()> {
         self.with_name_lock(name, || {
+            // A live agent (or cached process handle) does not mean another
+            // process has finished initialization or fork rejuvenation.
+            let _startup_lock = crate::agent::fork::lock_fork_source(name)?;
             if let Some(handle) = self.cached_handle(name)? {
                 if lock_handle(&handle)?.is_process_alive() {
                     return Ok(());
@@ -996,6 +1017,7 @@ impl EmbeddedRuntime {
     /// commands and transfers finish first and overriding the workload's stop
     /// timeout. New commands are refused while the stop runs.
     pub fn stop_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _admission = self.db.admit_workload_mutation(Some(name), &[])?;
         let _fence = self.inflight.fence(name, "stopped", options.drain);
         self.with_name_lock(name, || {
             let _source_lock = crate::agent::fork::lock_fork_source(name)?;
@@ -1016,17 +1038,13 @@ impl EmbeddedRuntime {
                     ),
                 ));
             }
-            if let Some(handle) = self.remove_cached_handle(name)? {
-                let mut handle = lock_handle(&handle)?;
-                if !record.staged_mounts.is_empty() {
-                    handle.sync_staged_mounts(&record)?;
-                }
-                handle.stop_with_timeout(options.stop_timeout)?;
-                control::mark_stopped(&self.db, name)?;
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.stop_persisted(&record, options.stop_timeout)?;
+                self.remove_cached_handle(name)?;
                 return Ok(());
             }
 
-            control::stop_vm_with_timeout(&self.db, name, options.stop_timeout)
+            control::stop_vm_record_with_timeout(&self.db, &record, options.stop_timeout)
         })
     }
 
@@ -1040,6 +1058,7 @@ impl EmbeddedRuntime {
     /// [`delete_machine`](Self::delete_machine), optionally letting running
     /// commands and transfers finish first.
     pub fn delete_machine_with(&self, name: &str, options: &StopOptions) -> Result<()> {
+        let _admission = self.db.admit_machine_deletion(name)?;
         let _fence = self.inflight.fence(name, "deleted", options.drain);
         let result = self.delete_machine_inner(name);
         if result.is_ok() {
@@ -1070,43 +1089,12 @@ impl EmbeddedRuntime {
                 ));
             }
 
-            let state = crate::agent::state_probe::resolve_state(name, &record);
-            if matches!(
-                state,
-                crate::config::RecordState::Frozen | crate::config::RecordState::Unreachable
-            ) {
-                // Paused vCPUs cannot acknowledge the normal guest shutdown.
-                // Reap the verified VMM directly instead of waiting for a
-                // response that cannot arrive.
-                self.remove_cached_handle(name)?;
-                crate::agent::state_probe::recover_unreachable_machine_in_db(&record, &self.db)?;
-            } else if matches!(
-                state,
-                crate::config::RecordState::Stopped
-                    | crate::config::RecordState::Created
-                    | crate::config::RecordState::Paused
-            ) {
-                // A graceful stop already synchronized staged mounts. Do not
-                // reconnect to the now-absent agent and fail a subsequent delete.
-                self.remove_cached_handle(name)?;
-            } else if let Some(handle) = self.remove_cached_handle(name)? {
-                let mut handle = lock_handle(&handle)?;
-                if !record.staged_mounts.is_empty() {
-                    handle.sync_staged_mounts(&record)?;
-                }
-                // The machine is going away: its workload has nothing to save.
-                handle.stop_with_timeout(Some(Duration::ZERO))?;
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.delete_persisted(&self.db, &record)?;
             } else {
-                control::stop_vm_with_timeout(&self.db, name, Some(Duration::ZERO))?;
+                crate::deletion::delete_machine_locked(&self.db, &record, None, true, false)?;
             }
-
-            // Idempotent: deleting an already-deleted machine is a no-op success
-            // (the desired end state — gone — already holds). Lets SDK callers
-            // call delete() more than once without an error.
-            match control::delete_vm_locked(&self.db, name) {
-                Ok(()) | Err(crate::Error::VmNotFound { .. }) => {}
-                Err(e) => return Err(e),
-            }
+            self.remove_cached_handle(name)?;
             self.remove_name_lock(name)?;
             Ok(())
         })
@@ -1121,9 +1109,14 @@ impl EmbeddedRuntime {
             if record.staged_mounts.is_empty() {
                 return Ok(());
             }
-            let handle = self.started_handle(name)?;
-            let result = lock_handle(&handle)?.sync_staged_mounts(&record);
-            result
+            if let Some(error) = crate::staged_mount::refuse_detached_sync(&record, name) {
+                return Err(error);
+            }
+            if let Some(handle) = self.cached_handle(name)? {
+                lock_handle(&handle)?.sync_staged_mounts(&record)
+            } else {
+                crate::staged_mount::sync_running_machine(&record)
+            }
         })
     }
 
@@ -1382,7 +1375,14 @@ impl EmbeddedRuntime {
     }
 
     fn launch_image_workload(&self, name: &str, handle: &mut VmHandle) -> Result<()> {
-        let record = control::get_record(&self.db, name)?;
+        let mut record = control::get_record(&self.db, name)?;
+        if !record.init_completed {
+            handle.initialize_machine(name, &record)?;
+            self.db
+                .update_vm(name, |record| record.init_completed = true)?
+                .ok_or_else(|| Error::vm_not_found(name))?;
+            record.init_completed = true;
+        }
         handle.launch_image_workload(name, &record)
     }
 
@@ -1465,6 +1465,44 @@ impl EmbeddedRuntime {
                 Some(values) => crate::agent::apply_live_credential_values(name, &values),
                 None => Ok(()),
             }
+        })
+    }
+
+    /// Replace `name`'s credential bindings with `policy`, saved for its next
+    /// boots, and hold `values` for them by binding name. Values already held
+    /// for a binding that stays are kept unless `values` replaces them; those
+    /// of a removed binding are dropped. A value naming no binding of `policy`
+    /// fails the call before anything changes.
+    ///
+    /// A running machine that booted with bindings takes the change at once:
+    /// a new host is trusted, a removed one is no longer substituted, and its
+    /// next request carries the new values. One that booted without any takes
+    /// them from its next start (`at_next_start`).
+    pub fn set_credential_bindings(
+        &self,
+        name: &str,
+        policy: crate::credentials::CredentialPolicy,
+        values: std::collections::BTreeMap<String, String>,
+    ) -> Result<crate::credentials::BindingsSet> {
+        self.with_name_lock(name, || {
+            let bindings: Vec<String> = policy.credentials.iter().map(|b| b.name.clone()).collect();
+            if let Some(unknown) = values.keys().find(|k| !bindings.contains(k)) {
+                return Err(Error::config(
+                    "credentials",
+                    format!("the new bindings of machine '{name}' have no binding '{unknown}'"),
+                ));
+            }
+            let set = crate::credentials::set_bindings_in(&self.db, name, policy)?;
+            let keep: Vec<&str> = bindings.iter().map(String::as_str).collect();
+            let values = values
+                .into_iter()
+                .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
+                .collect();
+            let held = crate::credentials::retain_and_supply_values(name, &keep, values);
+            if set.live && !held.is_empty() {
+                crate::agent::apply_live_credential_values(name, &held)?;
+            }
+            Ok(set)
         })
     }
 
@@ -1743,6 +1781,26 @@ impl EmbeddedRuntime {
     /// [`Self::start_machine`].
     pub fn create_machine_from_pack(&self, name: &str, pack: &std::path::Path) -> Result<()> {
         self.create_machine_from_pack_with(name, pack, &crate::machine_spec::CreateSpec::default())
+    }
+
+    /// Create the stopped machine `name` from a `.smolmachine` artifact,
+    /// optionally applying an explicit caller outbound network policy before
+    /// the machine is published. Invalid policy fails before creation, so no
+    /// unrestricted intermediate record can be started by another process.
+    pub fn create_machine_from_pack_with_egress(
+        &self,
+        name: &str,
+        pack: &std::path::Path,
+        egress: Option<&crate::data::network::EgressPolicy>,
+    ) -> Result<()> {
+        self.create_machine_from_pack_with(
+            name,
+            pack,
+            &crate::machine_spec::CreateSpec {
+                egress: egress.cloned(),
+                ..Default::default()
+            },
+        )
     }
 
     /// [`Self::create_machine_from_pack`] with options for the machine. The
@@ -2107,6 +2165,91 @@ mod tests {
     }
 
     #[test]
+    fn credential_bindings_change_on_a_stopped_machine_and_keep_held_values() {
+        let runtime = EmbeddedRuntime::with_db(test_db());
+        let policy = |flags: &[&str]| crate::credentials::CredentialPolicy {
+            credentials: flags
+                .iter()
+                .map(|f| crate::credentials::parse_credential_flag(f).unwrap())
+                .collect(),
+        };
+        let one = |binding: &str, value: &str| {
+            std::collections::BTreeMap::from([(binding.to_string(), value.to_string())])
+        };
+        let mut spec = test_spec("rebind", true);
+        spec.allowed_hosts = vec!["github.com".into(), "api.notion.com".into()];
+        runtime
+            .create_machine_with_credentials(
+                spec,
+                Vec::new(),
+                None,
+                None,
+                policy(&["github=GH_TOKEN@github.com"]),
+            )
+            .unwrap();
+        runtime
+            .supply_credential_values("rebind", one("github", "gh"))
+            .unwrap();
+
+        let refused = runtime
+            .set_credential_bindings(
+                "rebind",
+                policy(&["notion=NOTION_TOKEN@api.notion.com"]),
+                one("github", "gh2"),
+            )
+            .err()
+            .unwrap()
+            .to_string();
+        assert!(refused.contains("no binding 'github'"), "{refused}");
+        let unchanged = control::get_record(&runtime.db, "rebind").unwrap();
+        assert_eq!(unchanged.credential_policy.unwrap().credentials.len(), 1);
+
+        let set = runtime
+            .set_credential_bindings(
+                "rebind",
+                policy(&[
+                    "github=GH_TOKEN@github.com",
+                    "notion=NOTION_TOKEN@api.notion.com",
+                ]),
+                one("notion", "nt"),
+            )
+            .unwrap();
+        assert!(!set.live && !set.at_next_start);
+        let names: Vec<_> = set
+            .record
+            .credential_policy
+            .unwrap()
+            .credentials
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(names, ["github", "notion"]);
+        let held = crate::credentials::retain_and_supply_values(
+            "rebind",
+            &["github", "notion"],
+            Default::default(),
+        );
+        assert_eq!(held.get("github").map(|v| v.as_str()), Some("gh"));
+        assert_eq!(held.get("notion").map(|v| v.as_str()), Some("nt"));
+
+        // Removing a binding drops its held value.
+        runtime
+            .set_credential_bindings(
+                "rebind",
+                policy(&["notion=NOTION_TOKEN@api.notion.com"]),
+                Default::default(),
+            )
+            .unwrap();
+        let held = crate::credentials::retain_and_supply_values(
+            "rebind",
+            &["github", "notion"],
+            Default::default(),
+        );
+        assert!(!held.contains_key("github"));
+        crate::credentials::forget_values("rebind");
+    }
+
+    #[test]
     fn saved_execution_cannot_be_started_or_accessed_as_a_fresh_machine() {
         let db = test_db();
         let runtime = EmbeddedRuntime::with_db(db.clone());
@@ -2458,3 +2601,7 @@ mod tests {
         assert!(db.get_vm("delete-frozen").unwrap().is_none());
     }
 }
+
+#[cfg(test)]
+#[path = "runtime_stop_tests.rs"]
+mod stop_tests;

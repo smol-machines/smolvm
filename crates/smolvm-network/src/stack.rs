@@ -208,6 +208,8 @@ enum FrameAction {
         index: u8,
     },
     Passthrough,
+    /// Invalid fragment bounds or headers; do not allocate reassembly state.
+    Drop,
 }
 
 /// Start the dedicated smoltcp poll thread for the virtio-net backend.
@@ -436,6 +438,7 @@ fn run_network_stack(
                 _ => None,
             };
             match action {
+                FrameAction::Drop => device.drop_staged_frame(),
                 FrameAction::Fabric { index } => {
                     if let (Some(handle), Some(packet)) = (fabric.as_ref(), fabric_payload) {
                         // The peer stack re-frames the packet for its own
@@ -1150,6 +1153,12 @@ fn classify_dns_query(query: &[u8], egress: &EgressPolicy, routing: &DnsRouting)
         return DnsDecision::Forward { learn: false };
     }
     match dns::question_name(query) {
+        // Addresses are learned from the answer, so the question must be a
+        // plain query: a message already carrying records could have them
+        // echoed back by a resolver that answers malformed input in kind.
+        Some(_) if !dns::is_plain_query(query) => {
+            DnsDecision::Immediate(dns::error_response(query, dns::DNS_RCODE_SERVFAIL))
+        }
         Some(name) if egress.hostname_allowed(&name) => DnsDecision::Forward { learn: true },
         Some(name) => {
             virtio_net_log!(
@@ -1578,6 +1587,7 @@ fn classify_guest_frame(
         }
     }
 
+    let mut first_fragment = false;
     // Extract (src, dst, transport protocol, transport payload) from either IP
     // family. Anything that isn't plain IPv4/IPv6 — ARP, and IPv6 packets with
     // extension headers (which guest TCP/UDP traffic doesn't use) — passes
@@ -1588,6 +1598,21 @@ fn classify_guest_frame(
                 Ok(packet) => packet,
                 Err(_) => return FrameAction::Passthrough,
             };
+            if ipv4.more_frags() || ipv4.frag_offset() != 0 {
+                let payload_len = ipv4.payload().len();
+                // Bound the alloc-backed reassembler to one legal IPv4 payload.
+                if payload_len == 0
+                    || usize::from(ipv4.frag_offset()) + payload_len > 65_535 - 20
+                    || (ipv4.more_frags() && payload_len % 8 != 0)
+                    || ipv4.dont_frag()
+                {
+                    return FrameAction::Drop;
+                }
+                if ipv4.frag_offset() != 0 {
+                    return FrameAction::Passthrough;
+                }
+                first_fragment = true;
+            }
             (
                 IpAddr::V4(ipv4.src_addr()),
                 IpAddr::V4(ipv4.dst_addr()),
@@ -1647,9 +1672,24 @@ fn classify_guest_frame(
             }
         }
         smoltcp::wire::IpProtocol::Udp => {
-            let udp = match UdpPacket::new_checked(transport) {
-                Ok(packet) => packet,
-                Err(_) => return FrameAction::Passthrough,
+            let udp = if first_fragment {
+                // The length field names the complete datagram, so checked
+                // parsing rejects an ordinary first fragment. Read only the
+                // complete header here; smoltcp checks the reassembled UDP
+                // length and checksum before delivering any payload.
+                if transport.len() < 8 {
+                    return FrameAction::Drop;
+                }
+                let header = UdpPacket::new_unchecked(transport);
+                if header.len() < 8 {
+                    return FrameAction::Drop;
+                }
+                header
+            } else {
+                match UdpPacket::new_checked(transport) {
+                    Ok(packet) => packet,
+                    Err(_) => return FrameAction::Passthrough,
+                }
             };
 
             if udp.dst_port() == DNS_SOCKET_PORT {
@@ -1673,6 +1713,10 @@ fn classify_guest_frame(
 pub fn fuzz_classify_guest_frame(frame: &[u8]) {
     let _ = classify_guest_frame(frame, &[], Some(1));
 }
+
+#[cfg(test)]
+#[path = "stack_fragment_tests.rs"]
+mod fragment_tests;
 
 #[cfg(test)]
 mod tests {
@@ -1769,6 +1813,40 @@ mod tests {
         f.extend_from_slice(&[0, 0, 0, 0, 0, 0, 0, 0]); // seq + ack
         f.extend_from_slice(&[0x50, 0x02, 0xff, 0xff, 0, 0, 0, 0]); // offset/SYN/window/csum/urg
         f
+    }
+
+    #[test]
+    fn first_udp_fragment_retains_its_destination() {
+        let frame = udp_fragment(0, true, &[0x12, 0x34, 0x23, 0x45, 0x10, 0, 0, 0]);
+        assert_eq!(
+            classify_guest_frame(&frame, &[], None),
+            FrameAction::UdpFlow {
+                destination: "1.1.1.1:9029".parse().unwrap(),
+            }
+        );
+    }
+
+    #[test]
+    fn later_udp_fragments_are_never_interpreted_as_transport_headers() {
+        // These payload bytes happen to look like a complete UDP header.
+        let frame = udp_fragment(8, false, &[0x12, 0x34, 0x23, 0x45, 0, 8, 0, 0]);
+        assert_eq!(
+            classify_guest_frame(&frame, &[], None),
+            FrameAction::Passthrough
+        );
+    }
+
+    fn udp_fragment(offset: u16, more: bool, payload: &[u8]) -> Vec<u8> {
+        let mut frame = tcp_syn_frame([1, 1, 1, 1], 0);
+        frame.truncate(14 + 20);
+        frame.extend_from_slice(payload);
+        let mut ip = Ipv4Packet::new_unchecked(&mut frame[14..]);
+        ip.set_total_len((20 + payload.len()) as u16);
+        ip.set_next_header(IpProtocol::Udp);
+        ip.set_frag_offset(offset);
+        ip.set_more_frags(more);
+        ip.fill_checksum();
+        frame
     }
 
     #[test]

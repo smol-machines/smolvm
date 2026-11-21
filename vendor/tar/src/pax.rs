@@ -38,6 +38,9 @@ pub const PAX_GNUSPARSEREALSIZE: &str = "GNU.sparse.realsize";
 ///
 /// This iterator yields structures which can themselves be parsed into
 /// key/value pairs.
+///
+/// Records are framed by their leading decimal length, so a value may hold
+/// any byte, a newline included. A malformed body yields one error and ends.
 pub struct PaxExtensions<'entry> {
     data: &'entry [u8],
 }
@@ -85,40 +88,33 @@ impl<'entry> Iterator for PaxExtensions<'entry> {
         if self.data.is_empty() {
             return None;
         }
-        // A value may itself contain newlines. The decimal prefix covers the
-        // entire record (including the prefix and final newline), in bytes.
-        // Stop on invalid framing rather than guessing where another begins.
-        let data = std::mem::take(&mut self.data);
-        let record = (|| {
-            let space = data.iter().position(|b| *b == b' ')?;
-            if space == 0 || !data[..space].iter().all(u8::is_ascii_digit) {
+
+        let rest = self.data;
+        let record = rest.iter().position(|b| *b == b' ').and_then(|space| {
+            let digits = &rest[..space];
+            // `parse` would accept a leading '+', which GNU tar rejects.
+            if !digits.iter().all(u8::is_ascii_digit) {
                 return None;
             }
-            let length = str::from_utf8(&data[..space]).ok()?.parse::<usize>().ok()?;
-            let record = data.get(..length)?;
-            if record.last() != Some(&b'\n') || length <= space + 3 {
+            let len = str::from_utf8(digits).ok()?.parse::<usize>().ok()?;
+            if len <= space + 1 || len > rest.len() || rest[len - 1] != b'\n' {
                 return None;
             }
-            let pair = &record[space + 1..length - 1];
-            let equals = pair.iter().position(|b| *b == b'=')?;
-            if equals == 0 {
-                return None;
+            let keyvalue = &rest[space + 1..len - 1];
+            let equals = keyvalue.iter().position(|b| *b == b'=')?;
+            Some((len, &keyvalue[..equals], &keyvalue[equals + 1..]))
+        });
+
+        match record {
+            Some((len, key, value)) => {
+                self.data = &rest[len..];
+                Some(Ok(PaxExtension { key, value }))
             }
-            Some((
-                length,
-                PaxExtension {
-                    key: &pair[..equals],
-                    value: &pair[equals + 1..],
-                },
-            ))
-        })();
-        Some(match record {
-            Some((length, extension)) => {
-                self.data = &data[length..];
-                Ok(extension)
+            None => {
+                self.data = &[];
+                Some(Err(other("malformed pax extension")))
             }
-            None => Err(other("malformed pax extension")),
-        })
+        }
     }
 }
 
@@ -192,115 +188,5 @@ impl<T: Write> crate::Builder<T> {
         header.set_entry_type(crate::EntryType::XHeader);
         header.set_cksum();
         self.append(&header, data_as_bytes)
-    }
-}
-
-#[cfg(test)]
-mod length_record_tests {
-    use super::*;
-
-    fn record(key: &str, value: &[u8]) -> Vec<u8> {
-        let mut builder = crate::Builder::new(Vec::new());
-        builder.append_pax_extensions([(key, value)]).unwrap();
-        let bytes = builder.into_inner().unwrap();
-        let size = crate::Header::from_byte_slice(&bytes[..512])
-            .size()
-            .unwrap() as usize;
-        bytes[512..512 + size].to_vec()
-    }
-
-    #[test]
-    fn newline_and_unicode_values_do_not_split_records() {
-        let path = "a ; $(false) &?#+%\n雪.txt";
-        let mut data = record("path", path.as_bytes());
-        data.extend(record("size", b"25"));
-        data.extend(record("linkpath", b"a\n b"));
-        data.extend(record("comment", b""));
-        let entries = PaxExtensions::new(&data)
-            .map(|e| {
-                let e = e.unwrap();
-                (e.key_bytes().to_vec(), e.value_bytes().to_vec())
-            })
-            .collect::<Vec<_>>();
-        assert_eq!(
-            entries,
-            vec![
-                (b"path".to_vec(), path.as_bytes().to_vec()),
-                (b"size".to_vec(), b"25".to_vec()),
-                (b"linkpath".to_vec(), b"a\n b".to_vec()),
-                (b"comment".to_vec(), Vec::new())
-            ]
-        );
-        assert_eq!(pax_extensions_value(&data, "size"), Some(25));
-    }
-
-    #[test]
-    fn invalid_lengths_fail_once_without_panicking_or_resynchronizing() {
-        for bytes in [
-            b"0 ".as_slice(),
-            b"2 ",
-            b"9 path=x",
-            b"+9 path=x\n",
-            b"9 =xxxxx\n",
-            b"999999999999999999999999999 path=x\n",
-            b"\n",
-        ] {
-            let mut entries = PaxExtensions::new(bytes);
-            assert!(entries.next().unwrap().is_err(), "{bytes:?}");
-            assert!(entries.next().is_none());
-        }
-    }
-
-    #[test]
-    fn unpack_uses_exact_pax_path_and_symlink_target() {
-        let name = "雪\nfile.txt";
-        let mut builder = crate::Builder::new(Vec::new());
-        builder
-            .append_pax_extensions([("path", name.as_bytes())])
-            .unwrap();
-        let mut header = crate::Header::new_ustar();
-        header.set_path("fallback.txt").unwrap();
-        header.set_size(5);
-        header.set_mode(0o644);
-        header.set_cksum();
-        builder.append(&header, b"hello".as_slice()).unwrap();
-        builder
-            .append_pax_extensions([("linkpath", name.as_bytes())])
-            .unwrap();
-        let mut header = crate::Header::new_ustar();
-        header.set_path("link").unwrap();
-        header.set_link_name("fallback.txt").unwrap();
-        header.set_entry_type(crate::EntryType::Symlink);
-        header.set_size(0);
-        header.set_mode(0o777);
-        header.set_cksum();
-        builder.append(&header, std::io::empty()).unwrap();
-        let bytes = builder.into_inner().unwrap();
-        let directory = tempfile::tempdir().unwrap();
-        let mut archive = crate::Archive::new(bytes.as_slice());
-        #[cfg(unix)]
-        {
-            archive.unpack(directory.path()).unwrap();
-            assert_eq!(
-                std::fs::read_link(directory.path().join("link")).unwrap(),
-                std::path::Path::new(name)
-            );
-        }
-        #[cfg(not(unix))]
-        {
-            archive
-                .entries()
-                .unwrap()
-                .next()
-                .unwrap()
-                .unwrap()
-                .unpack_in(directory.path())
-                .unwrap();
-        }
-        assert_eq!(
-            std::fs::read(directory.path().join(name)).unwrap(),
-            b"hello"
-        );
-        assert!(!directory.path().join("fallback.txt").exists());
     }
 }

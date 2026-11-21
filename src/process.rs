@@ -242,6 +242,35 @@ pub fn close_inherited_fds_from(min_fd: i32) {
 #[cfg(not(unix))]
 pub fn close_inherited_fds_from(_min_fd: i32) {}
 
+/// Do not pass the launching command's original pipes to a detached Windows VM.
+/// Rust duplicates any explicitly selected child stdio handles, but its spawn
+/// also inherits other handles already marked inheritable by the caller (for
+/// example .NET Process). Redirecting the child's stdio alone leaves those
+/// original pipes open and prevents Studio/SDK readers from observing EOF.
+#[cfg(windows)]
+pub fn prevent_inherited_stdio_leaks() -> std::io::Result<()> {
+    use windows_sys::Win32::Foundation::{
+        SetHandleInformation, HANDLE_FLAG_INHERIT, INVALID_HANDLE_VALUE,
+    };
+    use windows_sys::Win32::System::Console::{
+        GetStdHandle, STD_ERROR_HANDLE, STD_INPUT_HANDLE, STD_OUTPUT_HANDLE,
+    };
+
+    for which in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE] {
+        // SAFETY: each constant selects a standard handle owned by this process.
+        let handle = unsafe { GetStdHandle(which) };
+        if handle.is_null() || handle == INVALID_HANDLE_VALUE {
+            continue;
+        }
+        // SAFETY: clear only inheritance, without closing or replacing the
+        // handle; subsequent Rust spawns duplicate their requested stdio.
+        if unsafe { SetHandleInformation(handle, HANDLE_FLAG_INHERIT, 0) } == 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
 #[cfg(unix)]
 fn close_fds_from_dev_fd(min_fd: i32) -> bool {
     let entries = match std::fs::read_dir("/dev/fd") {
@@ -1513,7 +1542,7 @@ pub fn data_root_is_explicit() -> bool {
 }
 
 /// Relocate all smolvm state under a single system data root by pointing `HOME`
-/// at it before any path is computed — every `dirs::`-derived path (VM dirs,
+/// at it before any path is computed — every `smolvm_paths::`-derived path (VM dirs,
 /// agent rootfs, templates, server DB) follows. This is what lets per-VM uid
 /// isolation's dropped uids traverse to their data (an XDG-under-a-700-home
 /// layout can't). `SMOLVM_DATA_DIR` is honored for **every** command (so the CLI
@@ -1566,7 +1595,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
     // `~/.docker` (if it exists and the operator hasn't set DOCKER_CONFIG) so
     // private image pulls keep finding their credentials after the relocation.
     if std::env::var_os("DOCKER_CONFIG").is_none() {
-        if let Some(dir) = dirs::home_dir()
+        if let Some(dir) = smolvm_paths::home_dir()
             .map(|h| h.join(".docker"))
             .filter(|d| d.is_dir())
         {
@@ -1578,7 +1607,7 @@ pub fn apply_system_data_root(allow_auto: bool) {
     std::env::remove_var("XDG_DATA_HOME");
     std::env::remove_var("XDG_CONFIG_HOME");
     // Resolved after HOME moved, so it is the relocated data dir on every OS.
-    let rootfs_dst = dirs::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
+    let rootfs_dst = smolvm_paths::data_local_dir().map(|d| d.join("smolvm/agent-rootfs"));
     if let (Some(src), Some(dst)) = (carry_rootfs_from, rootfs_dst) {
         if src != dst {
             if let Err(e) = sync_agent_rootfs(&src, &dst) {
@@ -1621,7 +1650,7 @@ fn overlay_workspace_root() -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    let home = dirs::home_dir()?;
+    let home = smolvm_paths::home_dir()?;
     let workspace = std::path::Path::new("/workspace");
     choose_workspace_root(
         fs_magic(&home),
@@ -1644,7 +1673,7 @@ fn installed_agent_rootfs() -> Option<std::path::PathBuf> {
     {
         return None;
     }
-    dirs::data_local_dir()
+    smolvm_paths::data_local_dir()
         .map(|d| d.join("smolvm/agent-rootfs"))
         .filter(|d| d.is_dir())
 }
@@ -1697,9 +1726,25 @@ fn sync_agent_rootfs(src: &std::path::Path, dst: &std::path::Path) -> std::io::R
     std::fs::rename(&staging, dst)
 }
 
-/// No-op where `HOME` does not root smolvm's paths (Windows).
+/// Windows state directories are resolved by the shared paths library; make
+/// the inherited root absolute before a child can start in another directory.
 #[cfg(not(unix))]
-pub fn apply_system_data_root(_allow_auto: bool) {}
+pub fn apply_system_data_root(_allow_auto: bool) {
+    let Some(root) = std::env::var_os("SMOLVM_DATA_DIR") else {
+        return;
+    };
+    if let Ok(root) = std::path::absolute(root) {
+        std::env::set_var("SMOLVM_DATA_DIR", root);
+    }
+    if std::env::var_os("DOCKER_CONFIG").is_none() {
+        if let Some(dir) = smolvm_paths::user_home_dir()
+            .map(|h| h.join(".docker"))
+            .filter(|d| d.is_dir())
+        {
+            std::env::set_var("DOCKER_CONFIG", dir);
+        }
+    }
+}
 
 /// Per-VM uid isolation needs every ancestor of the data root to be traversable
 /// (others-execute) by the drop uid, or the dropped VMM can't reach its own
@@ -1761,6 +1806,39 @@ pub fn allocate_vm_uid(
     key_dir: &std::path::Path,
     vm_key: &str,
 ) -> std::io::Result<u32> {
+    allocate_vm_uid_unless(registry_dir, key_dir, vm_key, uid_has_processes)
+}
+
+/// Whether any process runs as `uid`. A uid freed with its machine is free
+/// only once nothing runs as it: a process a compromised VMM forked can
+/// outlive the machine, and would own the next machine given that uid. Asks
+/// the kernel (`getpriority(PRIO_USER)`, which answers `ESRCH` when no process
+/// has the uid) rather than scanning `/proc`, which a process that keeps
+/// re-forking can slip through.
+#[cfg(target_os = "linux")]
+fn uid_has_processes(uid: u32) -> std::io::Result<bool> {
+    // SAFETY: errno is thread-local; getpriority only reads the task list.
+    unsafe {
+        *libc::__errno_location() = 0;
+        let result = libc::getpriority(libc::PRIO_USER, uid);
+        let errno = *libc::__errno_location();
+        match (result, errno) {
+            (-1, libc::ESRCH) => Ok(false),
+            (-1, 0) | (_, 0) => Ok(true),
+            (_, errno) => Err(std::io::Error::from_raw_os_error(errno)),
+        }
+    }
+}
+
+/// [`allocate_vm_uid`] with the probe that says whether a uid is still in use
+/// by a process.
+#[cfg(target_os = "linux")]
+fn allocate_vm_uid_unless(
+    registry_dir: &std::path::Path,
+    key_dir: &std::path::Path,
+    vm_key: &str,
+    in_use: impl Fn(u32) -> std::io::Result<bool>,
+) -> std::io::Result<u32> {
     std::fs::create_dir_all(registry_dir)?;
     let _registry_lock = lock_uid_registry(registry_dir)?;
     let cache = key_dir.join(".vm-uid");
@@ -1797,6 +1875,10 @@ pub fn allocate_vm_uid(
                 continue; // held by a live VM
             }
             let _ = std::fs::remove_file(&marker); // stale → reclaim below
+        }
+        // a process left running as the uid would own the machine given it
+        if in_use(uid)? {
+            continue;
         }
         match std::fs::OpenOptions::new()
             .write(true)
@@ -2052,6 +2134,13 @@ pub(crate) fn mark_checkpoint_backing(file: &std::fs::File) -> std::io::Result<b
     Err(error)
 }
 
+/// Hand `path` and everything under it to `(uid, gid)`, except `excluded`.
+///
+/// The tree may already belong to the VM's uid (every launch after the
+/// first), whose VMM could be swapping entries for links while root walks it.
+/// So each directory is opened once without following links, and every child
+/// is inspected and chowned relative to that open directory, never by a path
+/// a link could redirect; a directory replaced by a link is not entered.
 #[cfg(target_os = "linux")]
 pub(crate) fn chown_tree_except(
     path: &std::path::Path,
@@ -2059,25 +2148,76 @@ pub(crate) fn chown_tree_except(
     gid: u32,
     excluded: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
     if excluded == Some(path) {
         return Ok(());
     }
-    use std::os::unix::fs::MetadataExt;
-    let meta = std::fs::symlink_metadata(path)?;
-    use std::os::unix::ffi::OsStrExt;
-    let c = std::ffi::CString::new(path.as_os_str().as_bytes())
+    let parent = path.parent().unwrap_or(std::path::Path::new("/"));
+    let name = path
+        .file_name()
+        .map(|n| n.to_os_string())
+        .unwrap_or_default();
+    let c = std::ffi::CString::new(parent.as_os_str().as_bytes())
         .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    // SAFETY: c is a valid C string; the descriptor is owned below.
+    let fd = unsafe {
+        libc::open(
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fd was just opened and is owned here.
+    let parent_fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    if name.is_empty() {
+        return chown_children(&parent_fd, parent, uid, gid, excluded);
+    }
+    chown_entry(parent_fd.as_raw_fd(), &name, path, uid, gid, excluded)
+}
+
+/// Chown one entry of the open directory `dir` (named `name`, at `path`), and
+/// everything under it when it is a real directory.
+#[cfg(target_os = "linux")]
+fn chown_entry(
+    dir: std::os::fd::RawFd,
+    name: &std::ffi::OsStr,
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    excluded: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::os::unix::ffi::OsStrExt;
+    if excluded == Some(path) {
+        return Ok(());
+    }
+    let c = std::ffi::CString::new(name.as_bytes())
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+    let mut st: libc::stat = unsafe { std::mem::zeroed() };
+    // SAFETY: dir is open, c a valid C string, st a valid out-pointer.
+    if unsafe { libc::fstatat(dir, c.as_ptr(), &mut st, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let kind = st.st_mode & libc::S_IFMT;
     // Service-owned immutable data may be shared by several restored VMs.
     // Transferring its ownership would let one VM chmod a sibling's backing.
     // Do not key this on link count: cache eviction/publication can change it.
-    if meta.is_file() && meta.uid() == 0 && meta.mode() & 0o7777 == 0o444 {
+    if kind == libc::S_IFREG && st.st_uid == 0 && st.st_mode & 0o7777 == 0o444 {
         let mut marker = [0_u8; 1];
-        // lgetxattr does not follow a substituted symlink. Only explicitly
-        // tagged, root-owned immutable files keep shared ownership; unrelated
-        // read-only files still receive the ordinary per-machine owner.
+        // Read through the open directory, without following a link at the
+        // name. Only explicitly tagged, root-owned immutable files keep
+        // shared ownership; other read-only files get the machine's owner.
+        let anchored = std::ffi::CString::new(
+            [format!("/proc/self/fd/{dir}/").as_bytes(), name.as_bytes()].concat(),
+        )
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e))?;
+        // SAFETY: valid C strings and buffer.
         let length = unsafe {
             libc::lgetxattr(
-                c.as_ptr(),
+                anchored.as_ptr(),
                 CHECKPOINT_BACKING_XATTR.as_ptr().cast(),
                 marker.as_mut_ptr().cast(),
                 marker.len(),
@@ -2093,14 +2233,55 @@ pub(crate) fn chown_tree_except(
             }
         }
     }
-    if unsafe { libc::lchown(c.as_ptr(), uid, gid) } != 0 {
+    // SAFETY: dir is open and c a valid C string.
+    if unsafe { libc::fchownat(dir, c.as_ptr(), uid, gid, libc::AT_SYMLINK_NOFOLLOW) } != 0 {
         return Err(std::io::Error::last_os_error());
     }
-    // Recurse into real directories only (not symlinked ones).
-    if meta.file_type().is_dir() {
-        for entry in std::fs::read_dir(path)? {
-            chown_tree_except(&entry?.path(), uid, gid, excluded)?;
+    if kind != libc::S_IFDIR {
+        return Ok(());
+    }
+    // SAFETY: dir is open and c a valid C string.
+    let fd = unsafe {
+        libc::openat(
+            dir,
+            c.as_ptr(),
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let error = std::io::Error::last_os_error();
+        // replaced by a link (or a file) since it was inspected: not entered
+        if matches!(error.raw_os_error(), Some(libc::ELOOP | libc::ENOTDIR)) {
+            return Ok(());
         }
+        return Err(error);
+    }
+    // SAFETY: fd was just opened and is owned here.
+    let child = unsafe { OwnedFd::from_raw_fd(fd) };
+    chown_children(&child, path, uid, gid, excluded)
+}
+
+/// Chown every entry of the open directory `dir`, which is at `path`.
+#[cfg(target_os = "linux")]
+fn chown_children(
+    dir: &std::os::fd::OwnedFd,
+    path: &std::path::Path,
+    uid: u32,
+    gid: u32,
+    excluded: Option<&std::path::Path>,
+) -> std::io::Result<()> {
+    use std::os::fd::AsRawFd;
+    // Listed through the open directory itself, not its name.
+    for entry in std::fs::read_dir(format!("/proc/self/fd/{}", dir.as_raw_fd()))? {
+        let name = entry?.file_name();
+        chown_entry(
+            dir.as_raw_fd(),
+            &name,
+            &path.join(&name),
+            uid,
+            gid,
+            excluded,
+        )?;
     }
     Ok(())
 }
@@ -4715,9 +4896,15 @@ pub struct ChildProcess {
 impl ChildProcess {
     /// Create a new child process handle, capturing start time immediately.
     pub fn new(pid: Pid) -> Self {
+        Self::from_identity(pid, process_start_time(pid))
+    }
+
+    /// Reattach using the identity already verified by the caller; resampling
+    /// here could silently bind this handle to a recycled PID.
+    pub(crate) fn from_identity(pid: Pid, start_time: Option<u64>) -> Self {
         Self {
             pid,
-            start_time: process_start_time(pid),
+            start_time,
             exit_code: None,
         }
     }
@@ -4810,6 +4997,11 @@ impl SigintGuard {
     /// Install a SIGINT handler that will SIGTERM+SIGKILL the given PID.
     #[cfg(unix)]
     pub fn new(pid: Pid) -> Self {
+        // The SSH proxy owns the boot process from spawn through the durable
+        // Running commit. Killing it here could undo a committed resume.
+        if crate::ssh::ownership::managed() {
+            return Self(());
+        }
         SIGINT_CHILD_PID.store(pid, Ordering::SeqCst);
         unsafe {
             libc::signal(
@@ -5022,6 +5214,57 @@ mod tests {
     }
 
     use super::*;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_uid_a_process_still_runs_as_is_not_handed_out() {
+        let root = tempfile::tempdir().unwrap();
+        let registry = root.path().join("smolvm").join("uids");
+        let key_dir = root.path().join("smolvm").join("vms").join("aaaa");
+        std::fs::create_dir_all(&key_dir).unwrap();
+        let busy = |uid: u32| Ok(uid == VM_UID_BASE);
+        let uid = allocate_vm_uid_unless(&registry, &key_dir, "aaaa", busy).unwrap();
+        assert_eq!(uid, VM_UID_BASE + 1);
+        // a probe that cannot answer refuses the allocation
+        let other = root.path().join("smolvm").join("vms").join("bbbb");
+        std::fs::create_dir_all(&other).unwrap();
+        let unanswered = |_: u32| Err(std::io::Error::other("probe failed"));
+        assert!(allocate_vm_uid_unless(&registry, &other, "bbbb", unanswered).is_err());
+        // the kernel probe sees this process's own uid and not an unused one
+        assert!(uid_has_processes(unsafe { libc::getuid() }).unwrap());
+        assert!(!uid_has_processes(VM_UID_BASE + VM_UID_SPAN - 1).unwrap());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    #[ignore = "requires root to change ownership"]
+    fn the_chown_walk_never_reaches_through_a_link() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        let tree = root.path().join("vm");
+        std::fs::create_dir_all(tree.join("sub")).unwrap();
+        std::fs::write(tree.join("sub/disk"), b"d").unwrap();
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), b"s").unwrap();
+        std::os::unix::fs::symlink(&outside, tree.join("escape")).unwrap();
+        std::fs::write(tree.join("kept"), b"k").unwrap();
+
+        chown_tree_except(&tree, 2_000_000, 2_000_000, Some(&tree.join("kept"))).unwrap();
+        assert_eq!(
+            std::fs::metadata(tree.join("sub/disk")).unwrap().uid(),
+            2_000_000
+        );
+        assert_eq!(
+            std::fs::symlink_metadata(tree.join("escape"))
+                .unwrap()
+                .uid(),
+            2_000_000
+        );
+        assert_eq!(std::fs::metadata(&outside).unwrap().uid(), 0);
+        assert_eq!(std::fs::metadata(outside.join("secret")).unwrap().uid(), 0);
+        assert_eq!(std::fs::metadata(tree.join("kept")).unwrap().uid(), 0);
+    }
 
     #[test]
     fn cuda_fork_pool_vcpus_preserve_reliable_guest_topology() {

@@ -242,26 +242,33 @@ pub struct ResourceSpec {
 
 /// Request to execute a command in a machine.
 ///
+/// Field names and shapes follow the smol cloud API (`cwd`, `timeoutSeconds`,
+/// `env` as an object, `command` as a list or one shell string); the older
+/// `workdir`, `timeoutSecs` and `env` list are still accepted.
+///
 /// `deny_unknown_fields`: an unknown or mis-cased field is a hard 400, not a
-/// silent no-op. This matters for the safety fields (`timeoutSecs`, etc.) — a
-/// caller who writes `timeout_secs` must be told, not left running an untrusted
-/// command with no timeout because the field was quietly dropped.
+/// silent no-op. This matters for the safety fields (`timeoutSeconds`, etc.) —
+/// a caller who writes `timeout_seconds` must be told, not left running an
+/// untrusted command with no timeout because the field was quietly dropped.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecRequest {
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
+    /// Command and arguments, or one string run with `sh -lc`.
+    #[serde(deserialize_with = "command_argv")]
+    #[schema(value_type = CommandSpec, example = json!(["echo", "hello"]))]
     pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
+    /// Environment variables by name. A list of `{name, value}` is also
+    /// accepted.
+    #[serde(default, deserialize_with = "env_vars")]
+    #[schema(value_type = std::collections::HashMap<String, String>)]
     pub env: Vec<EnvVar>,
     /// Ad-hoc secret refs. Rejected unless empty: an untrusted HTTP
     /// caller cannot read this host's env/files. See `RequestSecretRefs`.
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
+    /// Working directory (`workdir` is accepted too).
+    #[serde(default, rename = "cwd", alias = "workdir")]
     #[schema(example = "/workspace")]
     pub workdir: Option<String>,
     /// Run as this user: a name from the image or a numeric `uid[:gid]`,
@@ -270,8 +277,8 @@ pub struct ExecRequest {
     #[serde(default)]
     #[schema(example = "1000:1000")]
     pub user: Option<String>,
-    /// Timeout in seconds.
-    #[serde(default)]
+    /// Timeout in seconds (`timeoutSecs` is accepted too).
+    #[serde(default, rename = "timeoutSeconds", alias = "timeoutSecs")]
     #[schema(example = 30)]
     pub timeout_secs: Option<u64>,
     /// Data to pipe to the command's stdin.
@@ -288,10 +295,178 @@ pub struct ExecRequest {
     #[serde(default = "auto_start_default")]
     #[schema(default = true)]
     pub auto_start: bool,
+    /// Stream stdout and stderr as Server-Sent Events, as
+    /// `POST .../exec/stream` does, instead of one JSON body.
+    #[serde(default)]
+    pub stream: bool,
 }
 
 fn auto_start_default() -> bool {
     true
+}
+
+/// Body of `PUT /api/v1/machines/{name}/env`: the machine's whole environment,
+/// replacing what it had.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetMachineEnvRequest {
+    /// Every variable the machine's commands start with, by name, as the
+    /// cloud API takes environment variables.
+    #[schema(value_type = std::collections::HashMap<String, String>)]
+    pub env: std::collections::BTreeMap<String, String>,
+}
+
+/// A command as the smol cloud API takes it: an argument list, or one string
+/// run with `sh -lc`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(untagged)]
+pub enum CommandSpec {
+    /// Program and arguments.
+    Argv(Vec<String>),
+    /// A shell command line.
+    Shell(String),
+}
+
+impl CommandSpec {
+    /// The argument list the command runs as.
+    pub fn into_argv(self) -> Vec<String> {
+        match self {
+            CommandSpec::Argv(argv) => argv,
+            CommandSpec::Shell(line) => vec!["sh".into(), "-lc".into(), line],
+        }
+    }
+}
+
+fn command_argv<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<String>, D::Error> {
+    match CommandSpec::deserialize(de) {
+        Ok(CommandSpec::Shell(line)) if line.trim().is_empty() => {
+            Err(serde::de::Error::custom("command cannot be empty"))
+        }
+        Ok(command) => Ok(command.into_argv()),
+        Err(_) => Err(serde::de::Error::custom(
+            "command must be a list of strings or one string",
+        )),
+    }
+}
+
+/// Environment variables as the smol cloud API takes them, an object by name,
+/// or as the older list of `{name, value}`.
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum EnvSpec {
+    ByName(std::collections::BTreeMap<String, String>),
+    List(Vec<EnvVar>),
+}
+
+fn env_vars<'de, D: serde::Deserializer<'de>>(de: D) -> Result<Vec<EnvVar>, D::Error> {
+    match EnvSpec::deserialize(de) {
+        Ok(EnvSpec::ByName(vars)) => Ok(vars
+            .into_iter()
+            .map(|(name, value)| EnvVar { name, value })
+            .collect()),
+        Ok(EnvSpec::List(vars)) => Ok(vars),
+        Err(_) => Err(serde::de::Error::custom(
+            "env must be an object of names to values, or a list of {name, value}",
+        )),
+    }
+}
+
+/// A machine's egress policy, as the cloud API takes it: the body of
+/// `PUT /api/v1/machines/{name}/network`.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(tag = "mode", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MachineNetwork {
+    /// No outbound access for the guest.
+    Blocked,
+    /// Unrestricted outbound access.
+    Open,
+    /// Outbound access only to these CIDRs and hosts.
+    AllowCidrs {
+        /// CIDR ranges the guest may reach.
+        #[serde(default)]
+        cidrs: Vec<String>,
+        /// Hostnames the guest may reach, each with its subdomains.
+        #[serde(default)]
+        hosts: Vec<String>,
+    },
+}
+
+/// Body of `PATCH /api/v1/machines/{name}/labels`: labels to change, leaving
+/// the others as they are, as the cloud API takes them.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct UpdateMachineLabelsRequest {
+    /// Labels to change: a string value sets or replaces that key, `null`
+    /// removes it (a key the machine does not carry is ignored). Keys left out
+    /// are untouched. The resulting set: at most 32; keys 1-63 chars of
+    /// `[a-z0-9]([a-z0-9._/-]*[a-z0-9])?`, values up to 255 chars.
+    #[schema(value_type = std::collections::HashMap<String, Option<String>>)]
+    pub labels: std::collections::BTreeMap<String, Option<String>>,
+}
+
+/// One reading of a machine's resource use (`GET /api/v1/machines/{name}/metrics`),
+/// in the shape the cloud API answers it.
+///
+/// CPU is a counter: utilization over an interval is the change in
+/// `cpuMillis` divided by the elapsed milliseconds times `vcpus`. The counter
+/// starts again at 0 when the machine's VM restarts. Readings are present only
+/// while the machine runs.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MachineMetricsResponse {
+    /// The machine these readings are for.
+    pub machine_id: String,
+    /// When the readings were taken, RFC 3339 with milliseconds.
+    pub at: String,
+    /// The machine's state when read.
+    pub state: String,
+    /// The machine's vCPUs.
+    pub vcpus: u32,
+    /// The machine's memory size in MiB.
+    pub memory_limit_mb: u32,
+    /// CPU time the machine has used since its VM started, in milliseconds.
+    pub cpu_millis: Option<u64>,
+    /// A CPU limit in force right now, in thousandths of a CPU.
+    pub cpu_limit_millicpus: Option<u32>,
+    /// Memory in use in MiB, with pages shared with branches split among them.
+    pub memory_mb: Option<u64>,
+    /// Resident memory in MiB, counting shared pages in full.
+    pub rss_mb: Option<u64>,
+    /// Disk space in use in MiB.
+    pub disk_used_mb: Option<u64>,
+    /// Disk size in GiB.
+    pub disk_gb: Option<u64>,
+    /// Bytes the machine has sent out since its VM started.
+    pub egress_bytes: Option<u64>,
+    /// How much of recent time tasks in the guest waited for CPU, memory or IO.
+    pub pressure: Option<MachinePressure>,
+}
+
+/// Pressure stall readings from inside the guest.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct MachinePressure {
+    /// Time tasks waited for a CPU.
+    pub cpu: PressureReading,
+    /// Time tasks waited for memory.
+    pub memory: PressureReading,
+    /// Time tasks waited for block IO.
+    pub io: PressureReading,
+}
+
+/// Percent of recent time at least one task (`some`) or every task (`full`)
+/// waited for a resource.
+#[derive(Debug, Serialize, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct PressureReading {
+    /// Over the last 10 seconds.
+    pub some_avg10: f64,
+    /// Over the last 60 seconds.
+    pub some_avg60: f64,
+    /// Over the last 10 seconds; always 0 for CPU.
+    pub full_avg10: f64,
+    /// Over the last 60 seconds; always 0 for CPU.
+    pub full_avg60: f64,
 }
 
 /// Request to amend a machine's egress allow list: add or remove hosts,
@@ -402,24 +577,28 @@ pub struct CreateExecSessionRequest {
     /// the command twice. Generated when absent.
     #[serde(default)]
     pub exec_id: Option<String>,
-    /// Command and arguments.
-    #[schema(example = json!(["echo", "hello"]))]
+    /// Command and arguments, or one string run with `sh -lc`.
+    #[serde(deserialize_with = "command_argv")]
+    #[schema(value_type = CommandSpec, example = json!(["echo", "hello"]))]
     pub command: Vec<String>,
-    /// Environment variables.
-    #[serde(default)]
+    /// Environment variables by name. A list of `{name, value}` is also
+    /// accepted.
+    #[serde(default, deserialize_with = "env_vars")]
+    #[schema(value_type = std::collections::HashMap<String, String>)]
     pub env: Vec<EnvVar>,
     /// Ad-hoc secret refs; rejected unless empty (see [`ExecRequest`]).
     #[serde(default)]
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
-    /// Working directory.
-    #[serde(default)]
+    /// Working directory (`workdir` is accepted too).
+    #[serde(default, rename = "cwd", alias = "workdir")]
     pub workdir: Option<String>,
     /// Run as this user (image machines).
     #[serde(default)]
     pub user: Option<String>,
-    /// Kill the command after this many seconds (exit code 124).
-    #[serde(default)]
+    /// Kill the command after this many seconds (exit code 124;
+    /// `timeoutSecs` is accepted too).
+    #[serde(default, rename = "timeoutSeconds", alias = "timeoutSecs")]
     pub timeout_secs: Option<u64>,
     /// Data written to the command's stdin when it starts. Unless
     /// `interactive`, stdin is closed after it.
@@ -445,8 +624,8 @@ pub struct CreateExecSessionRequest {
     pub auto_start: bool,
     /// Wait up to this many seconds (at most 60) for output or the exit before
     /// answering, and answer with the output from offset 0; a short command
-    /// then needs this one request.
-    #[serde(default)]
+    /// then needs this one request (`waitSecs` is accepted too).
+    #[serde(default, rename = "waitSeconds", alias = "waitSecs")]
     pub wait_secs: Option<u64>,
     /// Most output bytes in the answer.
     #[serde(default)]
@@ -826,6 +1005,11 @@ pub struct HealthResponse {
     /// Whether this server runs nested-virtualization machines (started with
     /// `--allow-nested-virt`), so a fleet scheduler can place them here.
     pub nested_virt: bool,
+    /// Checkpoint device profiles this engine can read. Capacity, architecture,
+    /// CPU features, and runtime compatibility are checked separately.
+    pub checkpoint_device_profiles: Vec<&'static str>,
+    /// Portable-checkpoint metadata formats understood by the reader.
+    pub checkpoint_format_versions: Vec<u32>,
 }
 
 /// Machine counts for health response.
@@ -873,7 +1057,8 @@ pub struct CapacityResponse {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub host_memory_available_mb: Option<u64>,
     /// Host memory (MB) a branch must leave free on this node. A branch of N
-    /// children is refused unless `host_memory_available_mb` covers this plus
+    /// children is refused unless `host_memory_available_mb`, less
+    /// `branch_growth_owed_mb`, covers this plus
     /// `N * (branch_child_overhead_mb + branch_child_growth_fraction * the
     /// source's guest RAM)` plus any fresh RAM generation it copies.
     /// Omitted when branch memory admission is off or host memory is unknown.
@@ -886,6 +1071,11 @@ pub struct CapacityResponse {
     /// on top of `branch_child_overhead_mb`, for the pages it dirties later.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub branch_child_growth_fraction: Option<f64>,
+    /// Growth (MB) branch admission has promised running branch children and
+    /// they have not yet taken: each child's charge less its private memory
+    /// now. Branch admission holds it back from `host_memory_available_mb`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub branch_growth_owed_mb: Option<u64>,
     /// Real disk (GB) consumed by VM storage + overlay files.
     pub used_disk_gb: u64,
     /// Disk space (bytes) the node's incremental checkpoint store held at its
@@ -1314,6 +1504,9 @@ pub struct MachineInfo {
     pub disk_used_mb: Option<u64>,
     /// Creation timestamp (seconds since Unix epoch).
     pub created_at: u64,
+    /// Labels: metadata to find and group machines by, as the cloud API
+    /// answers them.
+    pub labels: std::collections::BTreeMap<String, String>,
 }
 
 /// One egress denial: the machine's egress policy refused an outbound
@@ -1618,6 +1811,26 @@ impl ExternalInterceptorSpec {
             token,
         })
     }
+}
+/// Request to replace a machine's credential bindings (`PUT /api/v1/machines/{name}/credential-bindings`).
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+pub struct CredentialBindingsRequest {
+    /// The machine's bindings after the change: kept ones keep their placeholders, added ones get new ones, and any
+    /// left out are removed.
+    #[schema(value_type = Vec<Object>)]
+    pub credentials: Vec<smolvm_protocol::credentials::CredentialBinding>,
+}
+
+/// What a bindings change did.
+#[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct CredentialBindingsResponse {
+    /// The machine's binding names now.
+    pub bindings: Vec<String>,
+    /// The running machine uses them from its next request.
+    pub live: bool,
+    /// The machine runs but booted without bindings: they apply from its next start.
+    pub at_next_start: bool,
 }
 
 /// Values for a machine's credential bindings, by binding name.
@@ -2281,5 +2494,87 @@ mod registry_auth_tests {
         let legacy_pool: StartMachineQuery =
             serde_json::from_value(serde_json::json!({"forkPoolSize": 4})).unwrap();
         assert_eq!(legacy_pool.fork_pool_size, Some(4));
+    }
+
+    #[test]
+    fn exec_takes_the_cloud_shape_and_the_older_one_alike() {
+        let cloud: ExecRequest = serde_json::from_value(serde_json::json!({
+            "command": "echo hi",
+            "cwd": "/srv",
+            "timeoutSeconds": 5,
+            "env": {"B": "2", "A": "1"},
+            "stream": true
+        }))
+        .unwrap();
+        assert_eq!(cloud.command, ["sh", "-lc", "echo hi"]);
+        assert_eq!(cloud.workdir.as_deref(), Some("/srv"));
+        assert_eq!(cloud.timeout_secs, Some(5));
+        assert_eq!(
+            EnvVar::to_tuples(&cloud.env),
+            [
+                ("A".to_string(), "1".to_string()),
+                ("B".to_string(), "2".to_string())
+            ]
+        );
+        assert!(cloud.stream);
+
+        let older: ExecRequest = serde_json::from_value(serde_json::json!({
+            "command": ["echo", "hi"],
+            "workdir": "/srv",
+            "timeoutSecs": 5,
+            "env": [{"name": "A", "value": "1"}]
+        }))
+        .unwrap();
+        assert_eq!(older.command, ["echo", "hi"]);
+        assert_eq!(older.workdir.as_deref(), Some("/srv"));
+        assert_eq!(older.timeout_secs, Some(5));
+        assert_eq!(
+            EnvVar::to_tuples(&older.env),
+            [("A".to_string(), "1".to_string())]
+        );
+        assert!(!older.stream);
+
+        // Still strict: a misspelled safety field, an empty shell line and a
+        // malformed env are refused, not dropped.
+        for body in [
+            serde_json::json!({"command": ["true"], "timeout_seconds": 5}),
+            serde_json::json!({"command": "  "}),
+            serde_json::json!({"command": ["true"], "env": "A=1"}),
+            serde_json::json!({"command": 7}),
+        ] {
+            assert!(
+                serde_json::from_value::<ExecRequest>(body.clone()).is_err(),
+                "{body}"
+            );
+        }
+    }
+
+    #[test]
+    fn exec_sessions_take_the_cloud_names_and_the_older_ones_alike() {
+        let cloud: CreateExecSessionRequest = serde_json::from_value(serde_json::json!({
+            "command": "make",
+            "cwd": "/src",
+            "timeoutSeconds": 60,
+            "waitSeconds": 10,
+            "env": {"CI": "1"}
+        }))
+        .unwrap();
+        let older: CreateExecSessionRequest = serde_json::from_value(serde_json::json!({
+            "command": ["sh", "-lc", "make"],
+            "workdir": "/src",
+            "timeoutSecs": 60,
+            "waitSecs": 10,
+            "env": [{"name": "CI", "value": "1"}]
+        }))
+        .unwrap();
+        for req in [&cloud, &older] {
+            assert_eq!(req.command, ["sh", "-lc", "make"]);
+            assert_eq!(req.workdir.as_deref(), Some("/src"));
+            assert_eq!((req.timeout_secs, req.wait_secs), (Some(60), Some(10)));
+            assert_eq!(
+                EnvVar::to_tuples(&req.env),
+                [("CI".to_string(), "1".to_string())]
+            );
+        }
     }
 }

@@ -677,14 +677,15 @@ impl TcpRelayTable {
         if self.is_host_service_destination(destination) {
             return true;
         }
-        // A gateway destination is dialed as host loopback. A deny on the
-        // dialed address has to hold even though the guest named the gateway.
+        // A gateway destination is dialed as host loopback, so the whole
+        // policy has to admit the loopback address it reaches, not only the
+        // gateway address the guest named: host loopback stays closed unless
+        // the machine was given --allow-host-loopback (or a rule names it).
         let dialed = self.host_connect_addr(destination);
         if dialed.ip() != destination.ip()
-            && self
+            && !self
                 .egress
-                .rule_action(FlowTransport::Tcp, dialed.ip(), Some(dialed.port()))
-                == Some(RuleAction::Deny)
+                .allows_flow(FlowTransport::Tcp, dialed.ip(), Some(dialed.port()))
         {
             return false;
         }
@@ -2600,11 +2601,75 @@ mod tests {
                 action: RuleAction::Deny,
             }])
             .unwrap();
-        let table = TcpRelayTable::new(None, policy, vec![gateway], None);
+        let table = TcpRelayTable::new(
+            None,
+            policy.with_host_loopback_allowed(),
+            vec![gateway],
+            None,
+        );
         assert!(!table.destination_allowed(SocketAddr::new(gateway, 5432)));
         // Without the deny the same flow is not refused by the rule path.
-        let open = TcpRelayTable::new(None, EgressPolicy::unrestricted(), vec![gateway], None);
+        let open = TcpRelayTable::new(
+            None,
+            EgressPolicy::unrestricted().with_host_loopback_allowed(),
+            vec![gateway],
+            None,
+        );
         assert!(open.destination_allowed(SocketAddr::new(gateway, 5432)));
+    }
+
+    #[test]
+    fn a_private_exception_covering_the_gateway_keeps_loopback_closed() {
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let floored = |exceptions: &[&str]| {
+            let policy = EgressPolicy::unrestricted()
+                .with_private_floor(
+                    &exceptions
+                        .iter()
+                        .map(|range| range.to_string())
+                        .collect::<Vec<_>>(),
+                )
+                .unwrap();
+            TcpRelayTable::new(None, policy, vec![gateway], None)
+        };
+
+        let tailnet = floored(&["100.64.0.0/10"]);
+        assert!(!tailnet.destination_allowed(SocketAddr::new(gateway, 18765)));
+        assert!(tailnet.destination_allowed(SocketAddr::new("100.100.1.2".parse().unwrap(), 443)));
+        assert!(floored(&["100.64.0.0/10", "127.0.0.0/8"])
+            .destination_allowed(SocketAddr::new(gateway, 18765)));
+
+        // With --allow-host-loopback the gateway reaches the host.
+        let open = TcpRelayTable::new(
+            None,
+            EgressPolicy::unrestricted().with_host_loopback_allowed(),
+            vec![gateway],
+            None,
+        );
+        assert!(open.destination_allowed(SocketAddr::new(gateway, 18765)));
+    }
+
+    // Host loopback is closed by default; naming the gateway instead of
+    // 127.0.0.1 must not open it, on the default floor or on a moved link.
+    #[test]
+    fn the_gateway_does_not_reach_host_loopback_without_the_grant() {
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let moved: IpAddr = "203.0.113.1".parse().unwrap();
+        let mut local = EgressPolicy::unrestricted();
+        local.floor_for_test_default();
+        for gw in [gateway, moved] {
+            let table = TcpRelayTable::new(None, local.clone(), vec![gw], None);
+            assert!(
+                !table.destination_allowed(SocketAddr::new(gw, 5432)),
+                "{gw}"
+            );
+            assert!(!table.destination_allowed(SocketAddr::new(Ipv4Addr::LOCALHOST.into(), 5432)));
+        }
+        let floored = EgressPolicy::unrestricted()
+            .with_private_floor(&["203.0.113.0/24".to_string()])
+            .unwrap();
+        let table = TcpRelayTable::new(None, floored, vec![moved], None);
+        assert!(!table.destination_allowed(SocketAddr::new(moved, 5432)));
     }
 
     #[test]

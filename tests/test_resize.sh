@@ -64,8 +64,9 @@ test_machine_resize_happy_path() {
     resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 10 --overlay 5 2>&1)
 
     # Verify resize output contains expected messages
-    if [[ "$resize_output" != *"Resizing machine"* ]]; then
-        echo "Resize output should contain 'Resizing machine'"
+    if [[ "$resize_output" != *"Resized machine '$vm_name':"* ]]; then
+        echo "Resize output should contain: Resized machine '$vm_name':"
+        echo "Got: $resize_output"
         $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null
         rm -rf "$(vm_data_dir "$vm_name")"
         return 1
@@ -76,8 +77,8 @@ test_machine_resize_happy_path() {
     rm -rf "$(vm_data_dir "$vm_name")"
     ensure_data_dir_deleted "$vm_name"
 
-    # Verify output mentions success
-    [[ "$resize_output" == *"resized successfully"* ]]
+    # Verify output lists both disks
+    [[ "$resize_output" == *"storage: 5 GiB → 10 GiB"* ]] && [[ "$resize_output" == *"overlay: 2 GiB → 5 GiB"* ]]
 }
 
 test_machine_resize_running_vm() {
@@ -206,8 +207,8 @@ test_machine_resize_default_vm() {
     resize_output=$($SMOLVM machine resize --storage 30 --overlay 15 2>&1)
 
     # Verify resize output contains expected messages
-    if [[ "$resize_output" != *"Resizing machine"* ]]; then
-        echo "Resize output should contain 'Resizing machine'"
+    if [[ "$resize_output" != *"Resized machine 'default':"* ]]; then
+        echo "Resize output should contain: Resized machine 'default':"
         echo "Got: $resize_output"
         $SMOLVM machine stop 2>/dev/null || true
         return 1
@@ -216,8 +217,8 @@ test_machine_resize_default_vm() {
     # Clean up
     $SMOLVM machine stop 2>/dev/null || true
 
-    # Verify output mentions success
-    [[ "$resize_output" == *"resized successfully"* ]]
+    # Verify output lists both disks
+    [[ "$resize_output" == *"storage: 20 GiB → 30 GiB"* ]] && [[ "$resize_output" == *"overlay: 10 GiB → 15 GiB"* ]]
 }
 
 test_machine_resize_no_params_rejected() {
@@ -275,14 +276,15 @@ test_machine_resize_storage_only() {
     # Resize storage only
     local resize_output
     resize_output=$($SMOLVM machine resize --name "$vm_name" --storage 15 2>&1)
+    echo "RESIZE OUTPUT: '$resize_output'"
 
     # Clean up
     $SMOLVM machine delete --name "$vm_name" -f 2>/dev/null || true
     rm -rf "$(vm_data_dir "$vm_name")"
     ensure_data_dir_deleted "$vm_name"
 
-    # Should succeed and mention storage expansion
-    [[ "$resize_output" == *"Storage"* ]] && [[ "$resize_output" == *"resized successfully"* ]]
+    # Should succeed and list the storage disk only
+    [[ "$resize_output" == *"Resized machine '$vm_name':"$'\n'"  storage: 5 GiB → 15 GiB"* ]] && [[ "$resize_output" != *$'\n  overlay:'* ]]
 }
 
 test_machine_resize_overlay_only() {
@@ -330,8 +332,8 @@ test_machine_resize_overlay_only() {
     rm -rf "$(vm_data_dir "$vm_name")"
     ensure_data_dir_deleted "$vm_name"
 
-    # Should succeed and mention overlay expansion
-    [[ "$resize_output" == *"Overlay"* ]] && [[ "$resize_output" == *"resized successfully"* ]]
+    # Should succeed and list the overlay disk only
+    [[ "$resize_output" == *"Resized machine '$vm_name':"$'\n'"  overlay: 2 GiB → 8 GiB"* ]] && [[ "$resize_output" != *$'\n  storage:'* ]]
 }
 
 test_machine_resize_stopped_then_start_bare() {

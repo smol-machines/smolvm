@@ -21,32 +21,74 @@ pub fn workload_log_path(dir: &Path) -> PathBuf {
     dir.join(WORKLOAD_LOG_FILE)
 }
 
+/// Connections served at once. The guest keeps one and opens another when it
+/// reconnects (a restore, a resume), so a handful is plenty; each costs a host
+/// thread, and a guest must not be able to open them without bound.
+const MAX_CONNECTIONS: usize = 8;
+
+/// The connections being served, oldest first, each with a handle to close it.
+type Open = Arc<Mutex<std::collections::VecDeque<(u64, UdsStream)>>>;
+
 /// Listen on `socket_path` and append everything the guest sends to `log`.
 pub fn start(socket_path: &Path, log: &Path) -> io::Result<()> {
+    start_with_limit(socket_path, log, MAX_CONNECTIONS)
+}
+
+fn start_with_limit(socket_path: &Path, log: &Path, limit: usize) -> io::Result<()> {
     let _ = std::fs::remove_file(socket_path);
     let listener = UdsListener::bind(socket_path)?;
     let writer = Arc::new(Mutex::new(LogWriter::open(log)?));
+    let open: Open = Arc::default();
     std::thread::Builder::new()
         .name("workload-log".into())
         .spawn(move || {
+            let mut next_id = 0u64;
             for stream in listener.incoming() {
                 match stream {
                     Ok(stream) => {
-                        let writer = Arc::clone(&writer);
-                        // A connection lasts until the guest drops it; a
-                        // restored or reconnecting guest opens another.
-                        let spawned = std::thread::Builder::new()
-                            .name("workload-log-conn".into())
-                            .spawn(move || copy_into(stream, &writer));
-                        if let Err(e) = spawned {
-                            tracing::warn!(error = %e, "could not serve a workload log connection");
-                        }
+                        next_id += 1;
+                        serve(stream, next_id, &writer, &open, limit);
                     }
                     Err(e) => tracing::debug!(error = %e, "workload log accept failed"),
                 }
             }
         })?;
     Ok(())
+}
+
+/// Serve one connection on its own thread. At the limit the OLDEST connection
+/// is closed rather than this one refused: the newest is the guest's live
+/// one, while an old one may be a connection from before a restore that the
+/// host never saw end.
+fn serve(stream: UdsStream, id: u64, writer: &Arc<Mutex<LogWriter>>, open: &Open, limit: usize) {
+    let Ok(handle) = stream.try_clone() else {
+        tracing::warn!("could not serve a workload log connection");
+        return;
+    };
+    {
+        let mut open = open.lock().unwrap_or_else(|e| e.into_inner());
+        while open.len() >= limit {
+            if let Some((_, oldest)) = open.pop_front() {
+                let _ = oldest.shutdown(std::net::Shutdown::Both);
+                tracing::warn!("workload log: closed the oldest connection to stay within {limit}");
+            }
+        }
+        open.push_back((id, handle));
+    }
+    let (thread_writer, thread_open) = (Arc::clone(writer), Arc::clone(open));
+    let spawned = std::thread::Builder::new()
+        .name("workload-log-conn".into())
+        .spawn(move || {
+            copy_into(stream, &thread_writer);
+            let mut open = thread_open.lock().unwrap_or_else(|e| e.into_inner());
+            open.retain(|(other, _)| *other != id);
+        });
+    if let Err(e) = spawned {
+        tracing::warn!(error = %e, "could not serve a workload log connection");
+        open.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|(other, _)| *other != id);
+    }
 }
 
 fn copy_into(mut stream: UdsStream, writer: &Mutex<LogWriter>) {
@@ -225,6 +267,46 @@ mod tests {
         let mut second = UdsStream::connect(&socket).unwrap();
         second.write_all(b"two\n").unwrap();
         wait_for(&log, "from an earlier start\none\ntwo\n");
+    }
+
+    /// A guest that keeps opening connections cannot take more than `limit`
+    /// host threads: the oldest are closed, and the newest still logs.
+    #[test]
+    fn connections_beyond_the_limit_close_the_oldest_and_the_newest_still_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let socket = dir.path().join("wl.sock");
+        let log = workload_log_path(dir.path());
+        start_with_limit(&socket, &log, 3).unwrap();
+
+        let mut held: Vec<UdsStream> = (0..10)
+            .map(|_| {
+                let s = UdsStream::connect(&socket).unwrap();
+                // let the accept loop register it before the next one
+                std::thread::sleep(Duration::from_millis(20));
+                s
+            })
+            .collect();
+        // The first seven were closed by the host: reading them ends at once.
+        for stream in held.iter_mut().take(7) {
+            // macOS refuses the option on a socket its peer already shut down,
+            // which is the outcome being checked.
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+            let mut byte = [0u8; 1];
+            // Closed by the host: end of file (or a reset), never a timeout.
+            match stream.read(&mut byte) {
+                Ok(n) => assert_eq!(n, 0, "an old connection stayed open"),
+                Err(e) => assert!(
+                    !matches!(
+                        e.kind(),
+                        io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                    ),
+                    "an old connection stayed open: {e}"
+                ),
+            }
+        }
+        // The newest is the guest's live one, and it still logs.
+        held[9].write_all(b"latest\n").unwrap();
+        wait_for(&log, "latest\n");
     }
 
     #[test]

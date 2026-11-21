@@ -15,11 +15,53 @@ use crate::data::storage::HostMount;
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 
+/// Environment variable carrying the SHA-256 of the boot config the launcher
+/// wrote. The config sits in the machine's directory, which the VM's uid
+/// owns, so that uid can rename another file over it before the boot helper,
+/// still root, reads it; the digest lets the helper refuse what it did not
+/// get from the launcher.
+pub const BOOT_CONFIG_SHA256_ENV: &str = "SMOLVM_BOOT_CONFIG_SHA256";
+
+/// Hex SHA-256 of a boot config's bytes, as [`BOOT_CONFIG_SHA256_ENV`] carries it.
+pub fn boot_config_digest(bytes: &[u8]) -> String {
+    use sha2::Digest;
+    hex::encode(sha2::Sha256::digest(bytes))
+}
+
+/// Read the boot config at `path` without following a link to it, and only
+/// a regular file of a sane size, so a name swapped for a FIFO or a device
+/// cannot stall or exhaust the reader.
+pub fn read_boot_config_file(path: &std::path::Path) -> std::io::Result<Vec<u8>> {
+    use std::io::Read;
+    const LIMIT: u64 = 16 * 1024 * 1024;
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK);
+    }
+    let file = options.open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.len() > LIMIT {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "boot config is not a regular file of bounded size",
+        ));
+    }
+    let mut bytes = Vec::new();
+    file.take(LIMIT).read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Configuration for the `_boot-vm` subprocess.
 ///
 /// Written to a temp file by the parent and read by the child.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct BootConfig {
+    /// Durable launch ownership, required by `_boot-vm-owned`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub startup_ticket: Option<crate::db::launch_admission::BootTicket>,
     /// Path to the agent rootfs directory.
     pub rootfs_path: PathBuf,
     /// Path to the storage disk file.
@@ -114,4 +156,32 @@ pub struct BootConfig {
     /// machine runs.
     #[serde(default)]
     pub workload_log: Option<PathBuf>,
+}
+
+#[cfg(test)]
+mod digest_tests {
+    use super::*;
+
+    #[test]
+    fn a_config_swapped_under_its_name_is_refused() {
+        let dir = tempfile::TempDir::new().unwrap();
+        let path = dir.path().join("boot-config.json");
+        std::fs::write(&path, br#"{"written":"by the launcher"}"#).unwrap();
+        let expected = boot_config_digest(&read_boot_config_file(&path).unwrap());
+
+        let forged = dir.path().join("forged");
+        std::fs::write(&forged, br#"{"written":"by the VM uid"}"#).unwrap();
+        std::fs::rename(&forged, &path).unwrap();
+        assert_ne!(
+            boot_config_digest(&read_boot_config_file(&path).unwrap()),
+            expected
+        );
+
+        #[cfg(unix)]
+        {
+            std::fs::remove_file(&path).unwrap();
+            std::os::unix::fs::symlink("/dev/zero", &path).unwrap();
+            assert!(read_boot_config_file(&path).is_err());
+        }
+    }
 }

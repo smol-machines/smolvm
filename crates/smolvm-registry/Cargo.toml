@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-registry"
-version = "1.35.0"
+version = "1.36.1"
 edition = "2021"
 description = "OCI Distribution client for smolmachines registry"
 license = "Apache-2.0"
@@ -20,7 +20,7 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
-dirs = "5"
+smolvm-paths = { path = "../smolvm-paths", version = "1.35.0" }
 filetime = "0.2"
 tempfile = "3"
 tokio-util = { version = "0.7", features = ["io"] }

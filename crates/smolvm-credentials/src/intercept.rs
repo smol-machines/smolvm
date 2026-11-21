@@ -76,6 +76,9 @@ pub struct InterceptorConfig {
     /// Binding name → placeholder the guest was given.
     pub placeholders: BTreeMap<String, String>,
     pub ca: MachineCa,
+    /// CAs added after boot for hosts the machine CA does not permit (each name-constrained to its own hosts); empty
+    /// for a machine whose bindings never changed.
+    pub extra_cas: Vec<MachineCa>,
     /// Extra PEM roots trusted for upstream connections, for private services.
     /// Public roots stay enabled.
     pub upstream_roots_pem: Vec<Vec<u8>>,
@@ -84,21 +87,49 @@ pub struct InterceptorConfig {
 /// A running interceptor. Dropping it stops the listener and every session.
 pub struct Interceptor {
     endpoint: InterceptEndpoint,
+    state: Arc<State>,
     shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     thread: Option<std::thread::JoinHandle<()>>,
 }
 
-struct State {
-    machine: String,
+/// The machine's bindings as they are now, swapped whole by [`Interceptor::update`] so every request reads one
+/// consistent set while sessions in flight keep the one they started with.
+struct Bindings {
     policy: CredentialPolicy,
     /// placeholder → binding name
-    bindings_by_placeholder: HashMap<String, String>,
+    by_placeholder: HashMap<String, String>,
     /// binding name → placeholder
     placeholders: BTreeMap<String, String>,
+    /// The machine CA first, then those added for hosts it does not permit; a host's leaf is minted by the first that
+    /// permits it.
+    cas: Vec<Arc<MachineCa>>,
+}
+
+impl Bindings {
+    fn new(
+        policy: CredentialPolicy,
+        placeholders: BTreeMap<String, String>,
+        cas: Vec<Arc<MachineCa>>,
+    ) -> Self {
+        let by_placeholder = placeholders
+            .iter()
+            .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
+            .collect();
+        Self {
+            policy,
+            by_placeholder,
+            placeholders,
+            cas,
+        }
+    }
+}
+
+struct State {
+    machine: String,
+    bindings: std::sync::RwLock<Arc<Bindings>>,
     /// binding name → values it has resolved to in this process, newest last.
     /// An entry with no values is a binding that could not be resolved.
     resolved: Mutex<HashMap<String, Vec<zeroize::Zeroizing<String>>>>,
-    ca: MachineCa,
     resolver: Arc<dyn CredentialResolver>,
     endpoint: InterceptEndpoint,
     leaves: Mutex<HashMap<String, Arc<rustls::ServerConfig>>>,
@@ -123,17 +154,18 @@ impl Interceptor {
             .iter()
             .map(|pem| reqwest::Certificate::from_pem(pem).context("upstream root"))
             .collect::<Result<Vec<_>>>()?;
+        let cas = std::iter::once(config.ca)
+            .chain(config.extra_cas)
+            .map(Arc::new)
+            .collect();
         let state = Arc::new(State {
             machine: config.machine,
-            bindings_by_placeholder: config
-                .placeholders
-                .iter()
-                .map(|(binding, placeholder)| (placeholder.clone(), binding.clone()))
-                .collect(),
-            placeholders: config.placeholders,
+            bindings: std::sync::RwLock::new(Arc::new(Bindings::new(
+                config.policy,
+                config.placeholders,
+                cas,
+            ))),
             resolved: Mutex::new(HashMap::new()),
-            policy: config.policy,
-            ca: config.ca,
             resolver,
             endpoint,
             leaves: Mutex::new(HashMap::new()),
@@ -148,6 +180,7 @@ impl Interceptor {
             .enable_all()
             .build()
             .context("interceptor runtime")?;
+        let handle_state = state.clone();
         let thread = std::thread::Builder::new()
             .name("smolvm-credentials-listener".into())
             .spawn(move || {
@@ -169,6 +202,7 @@ impl Interceptor {
             .context("interceptor thread")?;
         Ok(Self {
             endpoint,
+            state: handle_state,
             shutdown: Some(shutdown_tx),
             thread: Some(thread),
         })
@@ -177,6 +211,61 @@ impl Interceptor {
     /// Where the network backend should redirect flows, and with which token.
     pub fn endpoint(&self) -> InterceptEndpoint {
         self.endpoint
+    }
+
+    /// Replace the bindings while the machine runs ([`InterceptorControl::update`]).
+    pub fn update(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: BTreeMap<String, String>,
+        extra_cas: Vec<MachineCa>,
+    ) {
+        self.control().update(policy, placeholders, extra_cas)
+    }
+
+    /// A handle that changes this interceptor's bindings, for whoever serves the machine's control socket.
+    pub fn control(&self) -> InterceptorControl {
+        InterceptorControl {
+            state: self.state.clone(),
+        }
+    }
+}
+
+/// Changes a running interceptor's bindings ([`Interceptor::control`]); outliving the interceptor changes nothing.
+#[derive(Clone)]
+pub struct InterceptorControl {
+    state: Arc<State>,
+}
+
+impl InterceptorControl {
+    /// Replace the bindings while the machine runs: a binding added is intercepted and substituted from the next
+    /// request, one removed is not, and the values remembered for it are dropped. `extra_cas` are the CAs added for
+    /// hosts the machine CA does not permit, all of them (the machine CA is kept). Sessions already past their
+    /// policy check finish with the bindings they started with.
+    pub fn update(
+        &self,
+        policy: CredentialPolicy,
+        placeholders: BTreeMap<String, String>,
+        extra_cas: Vec<MachineCa>,
+    ) {
+        let mut current = self
+            .state
+            .bindings
+            .write()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut cas: Vec<Arc<MachineCa>> = current.cas.first().cloned().into_iter().collect();
+        cas.extend(extra_cas.into_iter().map(Arc::new));
+        let names: std::collections::HashSet<String> =
+            policy.credentials.iter().map(|b| b.name.clone()).collect();
+        *current = Arc::new(Bindings::new(policy, placeholders, cas));
+        drop(current);
+        self.state
+            .resolved
+            .lock()
+            .expect("resolved values")
+            .retain(|binding, _| names.contains(binding));
+        // a host whose CA changed mints its leaf again
+        self.state.leaves.lock().expect("leaf cache").clear();
     }
 }
 
@@ -251,7 +340,14 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     .context("client hello timeout")??;
 
     match peek {
-        Peek::ServerName(host) if state.policy.bindings_for_host(&host).next().is_some() => {
+        Peek::ServerName(host)
+            if state
+                .bindings()
+                .policy
+                .bindings_for_host(&host)
+                .next()
+                .is_some() =>
+        {
             // The upstream client opens its own verified connection.
             drop(upstream);
             terminate(state, stream, buffered, host, destination).await
@@ -324,6 +420,14 @@ async fn terminate(
 }
 
 impl State {
+    /// The bindings now: one consistent set for the caller to read.
+    fn bindings(&self) -> Arc<Bindings> {
+        self.bindings
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     /// Ask the resolver for `binding`'s value for this request. The inner
     /// `Err` is the reply to send the guest when it has none.
     async fn resolve(
@@ -381,9 +485,10 @@ impl State {
         method: &str,
         path: &str,
     ) -> Result<Option<Scrubber>> {
+        let live = self.bindings();
         let unseen: Vec<String> = {
             let resolved = self.resolved.lock().expect("resolved values");
-            self.policy
+            live.policy
                 .bindings_for_host(host)
                 .filter(|b| !resolved.contains_key(&b.name))
                 .map(|b| b.name.clone())
@@ -397,7 +502,7 @@ impl State {
                 .await?;
         }
         let resolved = self.resolved.lock().expect("resolved values");
-        let secrets: Vec<Secret<'_>> = self
+        let secrets: Vec<Secret<'_>> = live
             .policy
             .bindings_for_host(host)
             .flat_map(|b| {
@@ -405,7 +510,7 @@ impl State {
                 let placeholder = b
                     .set_header
                     .is_none()
-                    .then(|| self.placeholders.get(&b.name).map(String::as_str))
+                    .then(|| live.placeholders.get(&b.name).map(String::as_str))
                     .flatten();
                 resolved
                     .get(&b.name)
@@ -424,7 +529,14 @@ impl State {
         if let Some(config) = self.leaves.lock().expect("leaf cache").get(host) {
             return Ok(config.clone());
         }
-        let (chain, key) = self.ca.issue_leaf(host)?;
+        let live = self.bindings();
+        let ca = live
+            .cas
+            .iter()
+            .find(|ca| ca.permits(host))
+            .or(live.cas.first())
+            .context("no machine CA")?;
+        let (chain, key) = ca.issue_leaf(host)?;
         let mut config = rustls::ServerConfig::builder_with_provider(Arc::new(
             rustls::crypto::ring::default_provider(),
         ))
@@ -444,6 +556,14 @@ impl State {
     /// the IP the guest resolved — which the backend already admitted under the
     /// machine's egress policy — while the certificate is verified for `host`.
     fn client_for(&self, host: &str, destination: SocketAddr) -> Result<reqwest::Client> {
+        // A host the URL parser rewrites (`127.0.0.0x1` is 127.0.0.1) would
+        // be dialled directly, skipping the pin to the admitted destination.
+        let url = reqwest::Url::parse(&format!("https://{host}/")).context("upstream host")?;
+        anyhow::ensure!(
+            url.domain()
+                .is_some_and(|name| name.eq_ignore_ascii_case(host)),
+            "upstream host is not a DNS name"
+        );
         let key = (host.to_string(), destination);
         let mut clients = self.clients.lock().expect("client cache");
         if let Some(client) = clients.get(&key) {
@@ -473,6 +593,7 @@ impl State {
         destination: SocketAddr,
         request: Request<Incoming>,
     ) -> Result<Reply> {
+        let live = self.bindings();
         let authority = if destination.port() == 443 {
             host.to_string()
         } else {
@@ -571,13 +692,13 @@ impl State {
             .map(|(_, placeholder)| placeholder)
             .or(body_placeholder.as_ref())
         {
-            let Some(binding_name) = self.bindings_by_placeholder.get(placeholder) else {
+            let Some(binding_name) = live.by_placeholder.get(placeholder) else {
                 return Ok(text(
                     StatusCode::FORBIDDEN,
                     "smolvm credentials: unknown placeholder",
                 ));
             };
-            let binding = self
+            let binding = live
                 .policy
                 .binding(binding_name)
                 .context("binding vanished from policy")?;
@@ -665,7 +786,7 @@ impl State {
 
         // Header-setting bindings: the host supplies the whole value and it
         // replaces whatever the guest sent, placeholder or not.
-        for binding in self.policy.header_bindings(host, parts.method.as_str()) {
+        for binding in live.policy.header_bindings(host, parts.method.as_str()) {
             let header_name = binding
                 .set_header
                 .as_deref()
@@ -1324,6 +1445,7 @@ mod tests {
                 policy,
                 placeholders,
                 ca,
+                extra_cas: Vec::new(),
                 upstream_roots_pem: vec![upstream.cert_pem.clone()],
             },
             Arc::new(resolver),
@@ -1390,6 +1512,121 @@ mod tests {
         assert_eq!(
             seen,
             vec![("Bearer real-secret".to_string(), "/v1/me".to_string())]
+        );
+    }
+
+    /// Bindings change while the machine runs (Capy adds and removes variables in place, 2026-11-18): a binding
+    /// added is substituted from the next request, one removed is refused, and a binding for a host the machine CA does
+    /// not permit is served by the CA added for it, which the guest trusts beside the first.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn bindings_added_and_removed_live_take_effect_from_the_next_request() {
+        let binding = |name: &str, var: &str, host: &str| CredentialBinding {
+            name: name.into(),
+            environment_variable: var.into(),
+            allowed_hosts: vec![host.into()],
+            injection_location: InjectionLocation::default(),
+            methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
+            set_header: None,
+        };
+        let policy = CredentialPolicy {
+            credentials: vec![binding("svc", "SVC_TOKEN", CRED_HOST)],
+        };
+        let resolver = StaticResolver::new()
+            .with("svc", "real-secret")
+            .with("other", "other-secret");
+        let f = fixture_with_policy(policy, CRED_HOST, resolver).await;
+        let svc = f.placeholder.clone();
+        let ask = |host: &str, placeholder: &str| {
+            format!("GET /v1/me HTTP/1.1\r\nHost: {host}\r\nAuthorization: Bearer {placeholder}\r\nConnection: close\r\n\r\n")
+        };
+
+        // add `other` for a host the machine CA does not permit, with a CA of its own
+        let grown = CredentialPolicy {
+            credentials: vec![
+                binding("svc", "SVC_TOKEN", CRED_HOST),
+                binding("other", "OTHER_TOKEN", OTHER_HOST),
+            ],
+        };
+        let mut placeholders = crate::policy::generate_placeholders(&grown);
+        placeholders.insert("svc".into(), svc.clone());
+        let other = placeholders["other"].clone();
+        let extra = MachineCa::generate("test-machine", &[OTHER_HOST.to_string()]).unwrap();
+        let trusted = format!("{}{}", f.ca_pem, extra.certificate_pem());
+        f.interceptor
+            .update(grown, placeholders.clone(), vec![extra]);
+        let response = guest_request(&f, trusted.as_bytes(), OTHER_HOST, &ask(OTHER_HOST, &other))
+            .await
+            .unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "added binding: {response}"
+        );
+        let response = guest_request(&f, trusted.as_bytes(), CRED_HOST, &ask(CRED_HOST, &svc))
+            .await
+            .unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "kept binding: {response}"
+        );
+
+        // remove `svc`: its placeholder is refused from the next request
+        let shrunk = CredentialPolicy {
+            credentials: vec![binding("other", "OTHER_TOKEN", OTHER_HOST)],
+        };
+        placeholders.remove("svc");
+        let extra_again = MachineCa::generate("test-machine", &[OTHER_HOST.to_string()]).unwrap();
+        let trusted = format!("{}{}", f.ca_pem, extra_again.certificate_pem());
+        f.interceptor
+            .update(shrunk, placeholders, vec![extra_again]);
+        let response = guest_request(&f, trusted.as_bytes(), OTHER_HOST, &ask(OTHER_HOST, &other))
+            .await
+            .unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 200"),
+            "remaining binding: {response}"
+        );
+        // the removed binding's host is no longer intercepted: it is spliced to the real server, whose certificate
+        // the guest does not trust, so the placeholder never gets a value
+        let removed = guest_request(&f, trusted.as_bytes(), CRED_HOST, &ask(CRED_HOST, &svc)).await;
+        assert!(
+            removed
+                .map(|r| !r.starts_with("HTTP/1.1 200"))
+                .unwrap_or(true),
+            "removed binding still substituted"
+        );
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert!(
+            seen.contains(&("Bearer other-secret".to_string(), "/v1/me".to_string())),
+            "{seen:?}"
+        );
+        assert!(
+            seen.contains(&("Bearer real-secret".to_string(), "/v1/me".to_string())),
+            "{seen:?}"
+        );
+        // a host no binding covers any more is spliced, not intercepted: its placeholder never reaches a credential
+        assert_eq!(
+            seen.iter()
+                .filter(|(auth, _)| auth == "Bearer real-secret")
+                .count(),
+            1,
+            "{seen:?}"
+        );
+    }
+
+    #[test]
+    fn a_ca_permits_its_hosts_and_their_subdomains_only() {
+        let ca =
+            MachineCa::generate("m", &["api.notion.com".into(), "*.example.com".into()]).unwrap();
+        assert!(
+            ca.permits("api.notion.com")
+                && ca.permits("API.Notion.com.")
+                && ca.permits("x.api.notion.com")
+        );
+        assert!(ca.permits("example.com") && ca.permits("a.example.com"));
+        assert!(
+            !ca.permits("notion.com")
+                && !ca.permits("evilapi.notion.com.attacker.test")
+                && !ca.permits("xexample.com")
         );
     }
 
