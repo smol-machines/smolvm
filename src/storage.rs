@@ -655,7 +655,7 @@ impl<K: DiskType> VmDisk<K> {
     /// overlay path is safe without ever mutating the shared template.
     #[cfg(target_os = "linux")]
     fn template_at_least(size_bytes: u64) -> bool {
-        Self::template_path()
+        Self::template_path(size_bytes)
             .and_then(|p| std::fs::metadata(p).ok())
             .map(|m| m.len() >= size_bytes)
             .unwrap_or(false)
@@ -673,7 +673,7 @@ impl<K: DiskType> VmDisk<K> {
     /// template's filesystem). Linux only; called only via [`Self::open_or_overlay_at`].
     #[cfg(target_os = "linux")]
     fn create_overlay_from_template(overlay_path: &Path, size_bytes: u64) -> Result<Self> {
-        let template = Self::template_path()
+        let template = Self::template_path(size_bytes)
             .ok_or_else(|| Error::storage("overlay from template", "no disk template found"))?;
 
         // The template must already present the full virtual size (install-time
@@ -732,7 +732,7 @@ impl<K: DiskType> VmDisk<K> {
             return Ok(());
         }
 
-        if let Some(template_path) = Self::template_path() {
+        if let Some(template_path) = Self::template_path(self.size_bytes) {
             disk_utils::copy_disk_from_template::<K>(&self.path, self.size_bytes, &template_path)?;
         } else {
             disk_utils::format_disk_with_mkfs::<K>(&self.path)?;
@@ -811,8 +811,14 @@ impl<K: DiskType> VmDisk<K> {
     /// the plain file or a `.zst` archive that is expanded to a sparse file on
     /// first use — releases ship the compressed form. Shared with the pack
     /// crate so both paths agree on where templates live and how they expand.
-    fn template_path() -> Option<PathBuf> {
-        let found = smolvm_pack::assets::find_existing_template(K::TEMPLATE_FILENAME);
+    fn template_path(size_bytes: u64) -> Option<PathBuf> {
+        let preferred = if size_bytes == K::DEFAULT_SIZE_GIB * BYTES_PER_GIB {
+            K::DEFAULT_TEMPLATE_FILENAME
+        } else {
+            None
+        };
+        let found =
+            smolvm_pack::assets::find_template_with_sibling(K::TEMPLATE_FILENAME, preferred);
         if let Some(path) = &found {
             tracing::debug!(
                 path = %path.display(),

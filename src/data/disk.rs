@@ -536,6 +536,8 @@ pub trait DiskType {
     const DEFAULT_SIZE_GIB: u64;
     /// Preformatted template filename for this disk type.
     const TEMPLATE_FILENAME: &'static str;
+    /// Optional template whose filesystem already fills the default disk.
+    const DEFAULT_TEMPLATE_FILENAME: Option<&'static str> = None;
     /// ext4 volume label used when formatting this disk type.
     const VOLUME_LABEL: &'static str;
 }
@@ -545,6 +547,7 @@ impl DiskType for Overlay {
     const DEFAULT_FILENAME: &'static str = OVERLAY_DISK_FILENAME;
     const DEFAULT_SIZE_GIB: u64 = DEFAULT_OVERLAY_SIZE_GIB;
     const TEMPLATE_FILENAME: &'static str = "overlay-template.ext4";
+    const DEFAULT_TEMPLATE_FILENAME: Option<&'static str> = Some("overlay-default.ext4");
     const VOLUME_LABEL: &'static str = "smolvm-overlay";
 }
 

@@ -549,11 +549,16 @@ fn publish_agent_rootfs_tar(built: &Path, cached: &Path) {
 /// 2. `~/.smolvm/{filename}` (installed location)
 /// 3. Next to the current executable (development)
 ///
-/// Each location is checked for the plain file first and then for a `.zst`
-/// sibling, which is expanded on demand by [`materialize_template`]. Releases
+/// Plain files are checked across these locations first, then `.zst` archives
+/// are expanded on demand by [`materialize_template`]. Releases
 /// ship only the compressed form; the plain file is still honored so existing
 /// installs and development trees keep working untouched.
 pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
+    find_template_with_sibling(filename, None)
+}
+
+/// Prefer an optional pre-sized sibling in the same distribution as the selected template.
+pub fn find_template_with_sibling(filename: &str, preferred: Option<&str>) -> Option<PathBuf> {
     let mut roots: Vec<PathBuf> = TEMPLATE_ROOTS
         .lock()
         .map(|roots| roots.clone())
@@ -567,23 +572,36 @@ pub fn find_existing_template(filename: &str) -> Option<PathBuf> {
         }
     }
 
-    for root in &roots {
-        let plain = root.join(filename);
-        if plain.exists() {
-            return Some(plain);
-        }
-    }
-    for root in &roots {
-        let compressed = root.join(format!("{filename}.zst"));
-        if compressed.exists() {
-            match expand_template(&compressed, filename) {
-                Ok(path) => return Some(path),
-                Err(e) => {
-                    // Falling through would report the template as simply
-                    // missing, which hides the real cause (usually no space or
-                    // no writable location).
-                    eprintln!("warning: could not expand {}: {e}", compressed.display());
+    resolve_template(&roots, filename, preferred)
+}
+
+fn resolve_template(roots: &[PathBuf], filename: &str, preferred: Option<&str>) -> Option<PathBuf> {
+    // Preserve plain-template overrides, even over an archive in an earlier root.
+    for suffix in ["", ".zst"] {
+        for root in roots {
+            let original = root.join(format!("{filename}{suffix}"));
+            if !original.is_file() {
+                continue;
+            }
+            if let Some(name) = preferred {
+                let plain = root.join(name);
+                if plain.is_file() {
+                    return Some(plain);
                 }
+                let archive = root.join(format!("{name}.zst"));
+                if archive.is_file() {
+                    match expand_template(&archive, name) {
+                        Ok(path) => return Some(path),
+                        Err(e) => eprintln!("warning: could not expand {}: {e}", archive.display()),
+                    }
+                }
+            }
+            if suffix.is_empty() {
+                return Some(original);
+            }
+            match expand_template(&original, filename) {
+                Ok(path) => return Some(path),
+                Err(e) => eprintln!("warning: could not expand {}: {e}", original.display()),
             }
         }
     }
@@ -1990,6 +2008,56 @@ pub fn crc32_reader_range<R: std::io::Read + std::io::Seek>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn preferred_template_respects_original_root_and_custom_size_fallback() {
+        let bundle = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let roots = [bundle.path().to_owned(), other.path().to_owned()];
+        let name = "overlay-template.ext4";
+        let fast = "overlay-default.ext4";
+        fs::write(other.path().join(name), b"custom").unwrap();
+        fs::write(bundle.path().join(format!("{name}.zst")), b"unused").unwrap();
+        fs::write(bundle.path().join(fast), b"full").unwrap();
+        assert_eq!(
+            resolve_template(&roots, name, Some(fast)),
+            Some(other.path().join(name))
+        );
+        fs::remove_file(other.path().join(name)).unwrap();
+        assert_eq!(
+            resolve_template(&roots, name, Some(fast)),
+            Some(bundle.path().join(fast))
+        );
+        fs::write(bundle.path().join(name), b"compact").unwrap();
+        assert_eq!(
+            resolve_template(&roots, name, None),
+            Some(bundle.path().join(name))
+        );
+        fs::remove_file(bundle.path().join(fast)).unwrap();
+        assert_eq!(
+            resolve_template(&roots, name, Some(fast)),
+            Some(bundle.path().join(name))
+        );
+    }
+
+    #[test]
+    fn expands_preferred_archive_and_falls_back_if_unreadable() {
+        let bundle = tempfile::tempdir().unwrap();
+        let roots = [bundle.path().to_owned()];
+        let name = "compact.ext4";
+        let fast = "preferred.ext4";
+        let archive = bundle.path().join(format!("{fast}.zst"));
+        fs::write(bundle.path().join(name), b"compact").unwrap();
+        fs::write(&archive, zstd::encode_all(&b"prepared"[..], 1).unwrap()).unwrap();
+        let path = resolve_template(&roots, name, Some(fast)).unwrap();
+        assert_eq!(fs::read(&path).unwrap(), b"prepared");
+        fs::remove_file(path).unwrap();
+        fs::write(&archive, b"invalid").unwrap();
+        assert_eq!(
+            resolve_template(&roots, name, Some(fast)),
+            Some(bundle.path().join(name))
+        );
+    }
 
     // An embedder's registered directory is searched first, so an SDK that
     // ships templates beside its assets gets them without touching ~/.smolvm.
