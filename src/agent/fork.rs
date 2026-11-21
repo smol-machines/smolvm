@@ -1795,6 +1795,7 @@ fn stage_relocated_qcow2_backings(source_top: &Path, relocated_top: &Path) -> Re
             format!("{}: {error}", source_top.display()),
         )
     })?;
+    crate::disk_grants::report_chain(&source, None, "branch relocation");
     let mut relocated = relocated_top.to_path_buf();
     let mut seen = HashSet::new();
     for _ in 0..4 * MAX_FORK_DISK_CHAIN_DEPTH {

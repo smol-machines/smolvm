@@ -5667,6 +5667,7 @@ fn stage_disk_chains_with_links(
             crate::data::disk::DiskFormat::Raw => "raw",
             crate::data::disk::DiskFormat::Qcow2 => "qcow2",
         };
+        crate::disk_grants::report_chain(&source, None, "checkpoint capture");
         let disk_staging = checkpoint_dir.join("disks").join(role);
         std::fs::create_dir_all(&disk_staging)
             .map_err(|error| Error::agent("stage checkpoint disk", error.to_string()))?;
@@ -7098,6 +7099,11 @@ fn install_with(
         for name in &staged_names {
             std::fs::rename(destination.join("disks").join(name), vm_data_dir.join(name))
                 .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
+        }
+        // Each installed layer's header was checked against the checkpoint's
+        // chain, and no VMM runs on these disks yet.
+        for name in &staged_names {
+            crate::disk_grants::record_named(&vm_data_dir.join(name));
         }
         crate::agent::create_disk_overlays(&cow_tops)?;
         for disk in checkpoint.disks.iter().filter(|disk| disk.role != "cache") {

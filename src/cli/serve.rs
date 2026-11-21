@@ -556,6 +556,12 @@ impl ServeStartCmd {
         // A previous run may have stopped while restored checkpoint RAM was
         // still being written back; finish that in the background.
         smolvm::portable_checkpoint::resume_deferred_restore_syncs();
+        if let Err(error) = std::thread::Builder::new()
+            .name("disk-grants".into())
+            .spawn(smolvm::disk_grants::reconcile)
+        {
+            tracing::warn!(%error, "could not start disk backing grant reconcile");
+        }
 
         // Create shutdown channel for supervisor
         let (shutdown_tx, shutdown_rx) = tokio::sync::watch::channel(false);

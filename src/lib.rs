@@ -89,6 +89,7 @@ pub mod cuda_host;
 pub mod data;
 pub mod db;
 pub mod deletion;
+pub mod disk_grants;
 pub mod disk_utils;
 pub mod dns_filter;
 pub mod dns_filter_listener;

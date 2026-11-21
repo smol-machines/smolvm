@@ -341,7 +341,11 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
     {
         // The seed belongs to the launcher uid. A mount is needed only when
         // this VMM will drop to a different, per-VM uid.
-        let seed_dirs = if std::env::var_os("SMOLVM_VM_UID").is_some() {
+        let seed_dirs = if let Some(uid) = std::env::var("SMOLVM_VM_UID")
+            .ok()
+            .and_then(|uid| uid.parse().ok())
+        {
+            report_boot_chains(&config, uid);
             boot_seed_dirs(&config)
         } else {
             Vec::new()
@@ -858,20 +862,54 @@ fn boot_disk_backing_paths(
     extra_disks: &[(PathBuf, bool, DiskFormat)],
     cache_layer: Option<&Path>,
 ) -> Vec<PathBuf> {
+    boot_qcow2_disks(storage, overlay, extra_disks)
+        .chain(cache_layer)
+        .flat_map(qcow2_backing_chain)
+        .collect()
+}
+
+/// The disks this boot attaches as qcow2. A disk is opened in the format it is
+/// attached in: only a qcow2 one has a backing chain, and a raw one whose bytes
+/// the guest made look like qcow2 must not widen what the VMM may read or have
+/// a seed mounted for it. Storage and overlay are qcow2 exactly when
+/// [`open_boot_disk`] opens them so.
+#[cfg(target_os = "linux")]
+fn boot_qcow2_disks<'a>(
+    storage: &'a Path,
+    overlay: &'a Path,
+    extra_disks: &'a [(PathBuf, bool, DiskFormat)],
+) -> impl Iterator<Item = &'a Path> {
     [storage, overlay]
         .into_iter()
-        // An attached disk is opened in the format it was attached in: only a
-        // qcow2 one has a backing chain to grant, and a raw one whose bytes the
-        // guest made look like qcow2 must not widen what the VMM may read.
+        .filter(|path| path.extension().and_then(|e| e.to_str()) == Some("qcow2"))
         .chain(
             extra_disks
                 .iter()
                 .filter(|(_, _, format)| *format == DiskFormat::Qcow2)
                 .map(|(path, _, _)| path.as_path()),
         )
-        .chain(cache_layer)
-        .flat_map(qcow2_backing_chain)
-        .collect()
+}
+
+/// Report each backing in this boot's chains that root did not attach for
+/// them, to the machine's log.
+#[cfg(target_os = "linux")]
+fn report_boot_chains(config: &crate::agent::boot_config::BootConfig, uid: u32) {
+    let cache_layer = cache_disk_layer(config);
+    let disks = boot_qcow2_disks(
+        &config.storage_disk_path,
+        &config.overlay_disk_path,
+        &config.extra_disks,
+    )
+    .chain(cache_layer.as_deref());
+    for disk in disks {
+        for backing in crate::disk_grants::report_chain(disk, Some(uid), "boot") {
+            eprintln!(
+                "[disk-grants] {} names backing {} that root did not attach for it",
+                disk.display(),
+                backing.display()
+            );
+        }
+    }
 }
 
 /// The machine's own layer over its cache disk's base, beside its storage disk.
@@ -888,10 +926,12 @@ fn cache_disk_layer(config: &crate::agent::boot_config::BootConfig) -> Option<Pa
 #[cfg(target_os = "linux")]
 fn boot_seed_dirs(config: &crate::agent::boot_config::BootConfig) -> Vec<PathBuf> {
     let mut dirs: Vec<PathBuf> = Vec::new();
-    let disks = [&config.storage_disk_path, &config.overlay_disk_path]
-        .into_iter()
-        .chain(config.extra_disks.iter().map(|(path, _, _)| path));
-    for dir in disks.filter_map(|disk| seed_dir_for_disk(disk)) {
+    let disks = boot_qcow2_disks(
+        &config.storage_disk_path,
+        &config.overlay_disk_path,
+        &config.extra_disks,
+    );
+    for dir in disks.filter_map(seed_dir_for_disk) {
         if !dirs.contains(&dir) {
             dirs.push(dir);
         }
