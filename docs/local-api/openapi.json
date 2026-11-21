@@ -1709,6 +1709,88 @@
         }
       }
     },
+    "/api/v1/machines/{name}/env": {
+      "put": {
+        "tags": [
+          "Machines"
+        ],
+        "summary": "Replace a machine's environment. A stopped machine takes it at its next\nstart; a running one gives it to every command started from now on, since\neach command reads the machine's environment from its record. A process\nalready running keeps the environment it started with.",
+        "operationId": "set_machine_env",
+        "parameters": [
+          {
+            "name": "name",
+            "in": "path",
+            "description": "Machine name",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SetMachineEnvRequest"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "description": "Environment replaced",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MachineInfo"
+                }
+              }
+            }
+          },
+          "400": {
+            "description": "Invalid variable name",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "404": {
+            "description": "Machine not found",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "409": {
+            "description": "Machine is starting, stopping or paused",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "500": {
+            "description": "Update failed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
     "/api/v1/machines/{name}/export": {
       "post": {
         "tags": [
@@ -7696,6 +7778,26 @@
             "description": "Host CPU the machine's VMM may use, in milli-CPUs across all its vCPUs\n(200 = a fifth of one CPU), from 1 to vCPUs × 1000. `null` clears the\nlimit back to one CPU per vCPU. Required: an empty body is refused.\nThe guest still sees all its vCPUs, and the limit holds for every later\nlaunch of the machine until cleared.",
             "example": 200,
             "minimum": 0
+          }
+        },
+        "additionalProperties": false
+      },
+      "SetMachineEnvRequest": {
+        "type": "object",
+        "description": "Body of `PUT /api/v1/machines/{name}/env`: the machine's whole environment,\nreplacing what it had.",
+        "required": [
+          "env"
+        ],
+        "properties": {
+          "env": {
+            "type": "object",
+            "description": "Every variable the machine's commands start with, by name, as the\ncloud API takes environment variables.",
+            "additionalProperties": {
+              "type": "string"
+            },
+            "propertyNames": {
+              "type": "string"
+            }
           }
         },
         "additionalProperties": false

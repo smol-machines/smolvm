@@ -3989,6 +3989,50 @@ mod tests {
     }
 
     #[test]
+    fn update_changes_env_alone_on_a_running_machine() {
+        assert!(parse_update(&["-e", "A=1"]).changes_only_env());
+        assert!(parse_update(&["--remove-env", "A"]).changes_only_env());
+        // Anything that needs a stopped machine takes the env with it to the
+        // stopped path, which refuses a running machine as a whole.
+        let mixed = parse_update(&["-e", "A=1", "--cpus", "2"]);
+        assert!(!mixed.changes_only_env());
+        // A running machine applies each live kind alone, so env beside
+        // another one must not ride along unapplied.
+        for other in [
+            &["--allow-host", "pypi.org"][..],
+            &["-p", "3000:3000"],
+            &["--label", "k=v"],
+        ] {
+            let mixed = parse_update(&[&["-e", "A=1"][..], other].concat());
+            assert!(!mixed.changes_only_env(), "{other:?}");
+            assert!(!mixed.changes_only_egress() && !mixed.changes_only_ports());
+            assert!(!mixed.changes_only_labels());
+        }
+    }
+
+    #[test]
+    fn update_sets_replaces_and_removes_env() {
+        let mut env = vec![
+            ("A".to_string(), "1".to_string()),
+            ("B".to_string(), "2".to_string()),
+        ];
+        let cmd = parse_update(&["--remove-env", "B", "-e", "A=3", "-e", "C=x=y"]);
+        let changes = cmd.apply_env(&mut env);
+        assert_eq!(
+            env,
+            vec![
+                ("A".to_string(), "3".to_string()),
+                ("C".to_string(), "x=y".to_string())
+            ]
+        );
+        assert_eq!(changes, ["  removed env: B", "  env: A=3", "  env: C=x=y"]);
+        assert!(parse_update(&["-e", "=v"]).validate_env_specs().is_err());
+        assert!(parse_update(&["-e", "NOVALUE"])
+            .validate_env_specs()
+            .is_err());
+    }
+
+    #[test]
     fn update_sets_and_removes_labels() {
         let apply = |extra: &[&'static str], labels: &mut _| {
             let cmd = parse_update(extra);
@@ -6916,12 +6960,14 @@ impl ResizeCmd {
 // Update Command
 // ============================================================================
 
-/// Modify settings on a stopped machine, or the allow list of a running one.
+/// Modify settings on a stopped machine, or some settings of a running one.
 ///
 /// Changes are applied to the DB record and take effect on the next
-/// `machine start`. The machine must be stopped, except to add or remove
-/// allowed hosts and CIDRs on a machine started with an allow list: those take
-/// effect on its next connection or DNS lookup.
+/// `machine start`. The machine must be stopped, except for: allowed hosts and
+/// CIDRs on a machine started with an allow list (its next connection or DNS
+/// lookup), published ports, labels, and environment variables. A running
+/// machine's new environment reaches every command started after the update;
+/// a process already running keeps the environment it started with.
 ///
 /// Examples:
 ///   smolvm machine update --name myvm -v ./src:/app -p 8080:8080
@@ -6929,6 +6975,7 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --remove-volume ./src:/app
 ///   smolvm machine update --name myvm --net -e DEBUG=1
 ///   smolvm machine update --name myvm --allow-host pypi.org   # while running
+///   smolvm machine update --name myvm -e API_URL=https://api.example.com   # while running
 ///   smolvm machine update --name myvm --auto-ports
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
@@ -7210,13 +7257,86 @@ impl UpdateCmd {
     /// Whether this update changes the allow list and nothing else, one of the
     /// changes a running machine takes.
     fn changes_only_egress(&self) -> bool {
-        let (egress, ports, labels, other) = self.changed_settings();
-        egress && !ports && !labels && !other
+        let (egress, ports, labels, env, other) = self.changed_settings();
+        egress && !ports && !labels && !env && !other
     }
 
     fn changes_only_labels(&self) -> bool {
-        let (egress, ports, labels, other) = self.changed_settings();
-        labels && !egress && !ports && !other
+        let (egress, ports, labels, env, other) = self.changed_settings();
+        labels && !egress && !ports && !env && !other
+    }
+
+    /// Whether this update changes environment variables and nothing else. A
+    /// running machine takes these: every command reads the machine's
+    /// environment from its record when it starts.
+    fn changes_only_env(&self) -> bool {
+        let (egress, ports, labels, env, other) = self.changed_settings();
+        env && !egress && !ports && !labels && !other
+    }
+
+    /// Check each `--env` is `KEY=VALUE` with a non-empty key.
+    fn validate_env_specs(&self) -> smolvm::Result<()> {
+        for spec in &self.env {
+            match spec.split_once('=') {
+                Some((key, _)) if !key.is_empty() => {}
+                _ => {
+                    return Err(smolvm::Error::config(
+                        "update",
+                        format!("invalid env format '{}': expected KEY=VALUE", spec),
+                    ));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Apply `--remove-env` then `--env` to `env`. Returns a line per change.
+    fn apply_env(&self, env: &mut Vec<(String, String)>) -> Vec<String> {
+        let mut changes = Vec::new();
+        for rm_key in &self.remove_env {
+            let before = env.len();
+            env.retain(|(k, _)| k != rm_key);
+            if env.len() < before {
+                changes.push(format!("  removed env: {}", rm_key));
+            }
+        }
+        for spec in &self.env {
+            if let Some((key, val)) = spec.split_once('=') {
+                env.retain(|(k, _)| k != key);
+                env.push((key.to_string(), val.to_string()));
+                changes.push(format!("  env: {}={}", key, val));
+            }
+        }
+        changes
+    }
+
+    /// Change a running machine's environment. Commands started from now on
+    /// get it; processes already running keep the environment they started
+    /// with, as any process does.
+    fn update_running_env(&self, db: &smolvm::db::SmolvmDb) -> smolvm::Result<()> {
+        self.validate_env_specs()?;
+        let mut changes = Vec::new();
+        let saved = db.update_vm(&self.name, |r| {
+            changes = self.apply_env(&mut r.env);
+        })?;
+        if saved.is_none() {
+            return Err(smolvm::Error::config(
+                "update",
+                format!("machine '{}' disappeared during update", self.name),
+            ));
+        }
+        if changes.is_empty() {
+            println!("No changes specified.");
+            return Ok(());
+        }
+        println!(
+            "Updated machine '{}' (running; new commands get it now, processes already running keep theirs until restarted):",
+            self.name
+        );
+        for change in &changes {
+            println!("{change}");
+        }
+        Ok(())
     }
 
     /// Apply this update's label changes to `labels`: `--remove-label` keys
@@ -7269,13 +7389,14 @@ impl UpdateCmd {
     }
 
     fn changes_only_ports(&self) -> bool {
-        let (egress, ports, labels, other) = self.changed_settings();
-        ports && !egress && !labels && !other
+        let (egress, ports, labels, env, other) = self.changed_settings();
+        ports && !egress && !labels && !env && !other
     }
 
     /// Which kinds of setting this update changes: the allow list, published
-    /// ports, labels, and anything else (which needs a stopped machine).
-    fn changed_settings(&self) -> (bool, bool, bool, bool) {
+    /// ports, labels, environment variables, and anything else (which needs a
+    /// stopped machine).
+    fn changed_settings(&self) -> (bool, bool, bool, bool, bool) {
         let Self {
             name: _,
             volume,
@@ -7337,8 +7458,6 @@ impl UpdateCmd {
             || mem.is_some()
             || *no_net
             || *no_egress_interceptor
-            || !env.is_empty()
-            || !remove_env.is_empty()
             || workdir.is_some()
             || *gpu
             || *no_gpu
@@ -7352,7 +7471,8 @@ impl UpdateCmd {
             || *clear_dns_options
             || shm_size.is_some();
         let labels = !labels.is_empty() || !remove_labels.is_empty();
-        (egress, ports, labels, other)
+        let env = !env.is_empty() || !remove_env.is_empty();
+        (egress, ports, labels, env, other)
     }
 
     fn next_ports(&self, record: &smolvm::config::VmRecord) -> smolvm::Result<Vec<PortMapping>> {
@@ -7514,6 +7634,9 @@ impl UpdateCmd {
         if state == RecordState::Running && self.changes_only_ports() {
             return self.update_running_ports(&db, &record);
         }
+        if state == RecordState::Running && self.changes_only_env() {
+            return self.update_running_env(&db);
+        }
 
         // Must be stopped (same check as resize)
         match state {
@@ -7538,18 +7661,7 @@ impl UpdateCmd {
         };
         proposed.validate()?;
 
-        // Validate env specs have KEY=VALUE format with non-empty key
-        for spec in &self.env {
-            match spec.split_once('=') {
-                Some((key, _)) if !key.is_empty() => {}
-                _ => {
-                    return Err(smolvm::Error::config(
-                        "update",
-                        format!("invalid env format '{}': expected KEY=VALUE", spec),
-                    ));
-                }
-            }
-        }
+        self.validate_env_specs()?;
 
         // The egress allow list after this update, validated as a whole before
         // anything is written (#1299).
@@ -7799,21 +7911,7 @@ impl UpdateCmd {
                 }
             }
 
-            // Env vars
-            for rm_key in &self.remove_env {
-                let before = r.env.len();
-                r.env.retain(|(k, _)| k != rm_key);
-                if r.env.len() < before {
-                    changes.push(format!("  removed env: {}", rm_key));
-                }
-            }
-            for spec in &self.env {
-                if let Some((key, val)) = spec.split_once('=') {
-                    r.env.retain(|(k, _)| k != key);
-                    r.env.push((key.to_string(), val.to_string()));
-                    changes.push(format!("  env: {}={}", key, val));
-                }
-            }
+            changes.extend(self.apply_env(&mut r.env));
 
             // Workdir
             if let Some(ref wd) = self.workdir {
