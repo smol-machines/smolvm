@@ -7429,11 +7429,7 @@ fn pin_restore_rootfs_in(
         None if carried_tar.is_file() => {
             // Unpack to learn what it ran on; the tree is kept unless the
             // host's installed rootfs turns out to be the same.
-            let (digest, path) = store.install_tar(&carried_tar)?;
-            if default.as_deref() == Some(digest.as_str()) {
-                let _ = std::fs::remove_dir_all(&path);
-            }
-            digest
+            store.install_tar_unless(&carried_tar, default.as_deref())?
         }
         None => return Ok(None),
     };
