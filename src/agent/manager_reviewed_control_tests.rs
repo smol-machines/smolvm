@@ -174,7 +174,7 @@ fn shutdown_and_cached_kill_refuse_a_recycled_process_identity() {
             manager.inner.lock().child = Some(ChildProcess::from_identity(pid, Some(wrong_start)));
             std::fs::write(&manager.pid_file, b"keep pid file").unwrap();
             assert!(manager
-                .stop_vm_process(pid, Some(wrong_start), false, None)
+                .stop_vm_process(pid, Some(wrong_start), ShutdownMode::Graceful, None)
                 .is_err());
             manager.kill_and_wait(Duration::ZERO);
             assert!(child.0.try_wait().unwrap().is_none());
@@ -437,6 +437,42 @@ fn failed_staged_sync_releases_ownership_and_preserves_the_running_process() {
 }
 
 #[test]
+fn power_off_ends_the_reviewed_execution_without_guest_sync() {
+    isolated(
+        "power_off_ends_the_reviewed_execution_without_guest_sync",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            let child = child();
+            let pid = child.0.id() as i32;
+            let start = process::process_start_time(pid).unwrap();
+            db.update_vm(&record.name, |r| {
+                r.state = crate::config::RecordState::Running;
+                r.pid = Some(pid);
+                r.pid_start_time = Some(start);
+            })
+            .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let manager = make_manager(root);
+            std::fs::write(&manager.pid_file, format!("{pid}\n{start}")).unwrap();
+            assert!(manager.power_off_persisted(&record, pid + 1).is_err());
+            assert!(process::is_our_process_strict(pid, Some(start)));
+            let stopped = manager.power_off_persisted(&record, pid).unwrap();
+            assert!(!process::is_our_process_strict(pid, Some(start)));
+            assert_eq!(stopped.pid, None);
+            assert!(stopped.restart.user_stopped);
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            assert_eq!(
+                std::fs::read(root.join("storage")).unwrap(),
+                b"storage sentinel"
+            );
+        },
+    );
+}
+
+#[test]
 fn persisted_stop_retains_ownership_until_stopped_state_is_published() {
     isolated(
         "persisted_stop_retains_ownership_until_stopped_state_is_published",
@@ -455,7 +491,9 @@ fn persisted_stop_retains_ownership_until_stopped_state_is_published() {
             std::fs::write(&manager.pid_file, format!("{pid}\n{start}")).unwrap();
             let operation = manager.reserve_control_operation().unwrap();
             operation.validate_staged_record(&record).unwrap();
-            manager.stop_owned(&operation, true, None).unwrap();
+            manager
+                .stop_owned(&operation, ShutdownMode::WithoutGuest, None)
+                .unwrap();
             assert!(!process::is_our_process_strict(pid, Some(start)));
             assert_eq!(db.get_vm(&record.name).unwrap().unwrap().pid, Some(pid));
             let raw = rusqlite::Connection::open(SmolvmDb::default_path().unwrap()).unwrap();
@@ -488,7 +526,7 @@ fn a_control_operation_cannot_be_used_by_another_manager() {
             let other = make_manager(root);
             let operation = manager.reserve_control_operation().unwrap();
             assert!(other
-                .stop_owned(&operation, true, None)
+                .stop_owned(&operation, ShutdownMode::WithoutGuest, None)
                 .unwrap_err()
                 .to_string()
                 .contains("another manager"));
