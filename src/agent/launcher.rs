@@ -3536,6 +3536,9 @@ mod tests {
     /// node's content-addressed store. Returns the layers cache dir to pass to
     /// [`LaunchFeatures::with_packed_layers`].
     fn machine_with_pointer(root: &Path, shared: &Path) -> PathBuf {
+        // a pointer is followed only to an extraction under the shared root
+        let shared_root = shared.parent().unwrap().to_path_buf();
+        super::super::manager::TEST_SHARED_PACK_ROOT.with(|r| *r.borrow_mut() = Some(shared_root));
         let layers_cache_dir = root.join("vm").join("pack");
         fs::create_dir_all(&layers_cache_dir).unwrap();
         let pointer = super::super::shared_pack_pointer_path(&layers_cache_dir);
@@ -3562,7 +3565,7 @@ mod tests {
         Packer::new(manifest).pack_artifact(&artifact).unwrap();
         let artifact_path = artifact.to_str().unwrap();
 
-        let shared = tmp.path().join("_shared").join("check");
+        let shared = tmp.path().join("_shared").join("0000c0de");
         fs::create_dir_all(shared.join("layers")).unwrap();
         let cache = machine_with_pointer(tmp.path(), &shared);
         let features = LaunchFeatures::default()
@@ -3621,9 +3624,10 @@ mod tests {
     #[test]
     fn shared_pack_idmap_source_targets_layers_subdir() {
         let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("_shared").join("ea92da8fcheck");
+        let shared = tmp.path().join("_shared").join("ea92da8f");
         fs::create_dir_all(shared.join("layers").join("25f1d6b1951a")).unwrap();
         fs::create_dir_all(shared.join("agent-rootfs")).unwrap();
+        let shared = shared.canonicalize().unwrap();
         let layers_cache_dir = machine_with_pointer(tmp.path(), &shared);
 
         let features = LaunchFeatures::default()
@@ -3649,8 +3653,9 @@ mod tests {
     #[test]
     fn shared_pack_idmap_falls_back_to_root_without_layers_subdir() {
         let tmp = tempfile::tempdir().unwrap();
-        let shared = tmp.path().join("_shared").join("deadbeefcheck");
+        let shared = tmp.path().join("_shared").join("deadbeef");
         fs::create_dir_all(&shared).unwrap();
+        let shared = shared.canonicalize().unwrap();
         let layers_cache_dir = machine_with_pointer(tmp.path(), &shared);
 
         let features = LaunchFeatures::default()
