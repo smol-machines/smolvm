@@ -3583,6 +3583,10 @@ impl AgentManager {
     ) -> Result<()> {
         use super::boot_config::BootConfig;
 
+        for mount in &mounts {
+            mount.ensure_source_still_allowed()?;
+        }
+
         // Retain the gate through boot and PID-file registration. Callers that
         // publish the PID to the database must hold an outer guard until then.
         let _admission = crate::db::SmolvmDb::open()?.admit_workload_mutation(

@@ -328,6 +328,34 @@ impl HostMount {
         Self::validate_with_system_mounts(mount, false)
     }
 
+    /// Refuse a launch whose recorded source now resolves to a protected
+    /// path. A source is checked when the mount is accepted, but launched by
+    /// name: a guest that can write a parent directory of it could have
+    /// replaced that directory with a link since. A source that still
+    /// resolves to itself stands as it was accepted.
+    pub fn ensure_source_still_allowed(&self) -> Result<()> {
+        let Ok(resolved) = self.source.canonicalize() else {
+            return Ok(());
+        };
+        if resolved == self.source {
+            return Ok(());
+        }
+        let moved = Self {
+            source: resolved.clone(),
+            ..self.clone()
+        };
+        Self::validate(&moved).map_err(|_| {
+            Error::mount(
+                "validate host path",
+                format!(
+                    "mount source {} now resolves to {}, a protected path; recreate the machine to mount the directory it now names",
+                    self.source.display(),
+                    resolved.display()
+                ),
+            )
+        })
+    }
+
     fn validate_with_system_mounts(mount: &Self, allow_system_mounts: bool) -> Result<()> {
         for (illegal_path, block_subtree) in Self::ILLEGAL_SOURCE_MOUNT_PATH {
             let illegal_path = Path::new(illegal_path);
@@ -518,6 +546,47 @@ impl HostMount {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_source_redirected_to_a_protected_path_is_refused_at_launch() {
+        let root = tempfile::tempdir().unwrap();
+        let parent = root.path().join("project");
+        std::fs::create_dir_all(parent.join("data")).unwrap();
+        let mount = HostMount::new(parent.join("data"), "/data", false).unwrap();
+        mount.ensure_source_still_allowed().unwrap();
+
+        // the parent becomes a link: `data` now resolves under the protected tree
+        std::fs::remove_dir_all(&parent).unwrap();
+        #[cfg(target_os = "linux")]
+        let protected = Path::new("/etc");
+        #[cfg(target_os = "macos")]
+        let protected = Path::new("/private/etc");
+        std::os::unix::fs::symlink(protected.parent().unwrap(), &parent).unwrap();
+        let redirected = HostMount {
+            source: parent.join(protected.file_name().unwrap()),
+            ..mount.clone()
+        };
+        assert!(redirected.ensure_source_still_allowed().is_err());
+
+        // an unprotected redirect, or a source that is gone, is left alone
+        let elsewhere = root.path().join("elsewhere");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        let link = root.path().join("link");
+        std::os::unix::fs::symlink(&elsewhere, &link).unwrap();
+        HostMount {
+            source: link,
+            ..mount.clone()
+        }
+        .ensure_source_still_allowed()
+        .unwrap();
+        HostMount {
+            source: root.path().join("gone"),
+            ..mount
+        }
+        .ensure_source_still_allowed()
+        .unwrap();
+    }
     use std::path::PathBuf;
 
     #[test]
