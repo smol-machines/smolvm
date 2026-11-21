@@ -27,6 +27,8 @@ const DNS_RR_RDLEN_OFFSET: usize = 8;
 const DNS_CLASS_IN: u16 = 1;
 const DNS_TYPE_A: u16 = 1;
 const DNS_TYPE_AAAA: u16 = 28;
+/// The HTTPS record (RFC 9460), which carries Encrypted Client Hello keys.
+pub const DNS_TYPE_HTTPS: u16 = 65;
 const DNS_A_RDATA_LEN: usize = 4;
 const DNS_AAAA_RDATA_LEN: usize = 16;
 pub const DNS_RCODE_SERVFAIL: u16 = 2;
@@ -95,6 +97,12 @@ pub fn question_name(packet: &[u8]) -> Option<String> {
     }
     let (name, _) = read_name(packet, DNS_HEADER_LEN)?;
     Some(name)
+}
+
+/// The question type in a DNS query (first question only). `None` on malformed input.
+pub fn question_type(packet: &[u8]) -> Option<u16> {
+    let end = question_section_end(packet)?;
+    read_u16(packet, end - DNS_QUESTION_FIXED_LEN)
 }
 
 /// Extract `(IpAddr, ttl)` pairs from the A and AAAA records in a DNS response.

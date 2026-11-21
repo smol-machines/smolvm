@@ -26,6 +26,7 @@ impl Gateway {
             upstream_resolvers: [None; crate::MAX_UPSTREAM_RESOLVERS],
             host_service: None,
             intercept: None,
+            request_rules: false,
             mtu: 1500,
         };
         let queues = NetworkFrameQueues::shared(256);

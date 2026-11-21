@@ -2068,7 +2068,7 @@
         "tags": [
           "Machines"
         ],
-        "summary": "List the machine's egress denials — outbound connects and sendtos its\negress policy refused. Empty for a machine with no policy, no denials, or\none that has never booted.",
+        "summary": "List the machine's egress denials — outbound connects, sendtos and\nlookups its egress policy refused, and HTTPS requests a request rule\nrefused. Empty for a machine with no policy, no denials, or one that has\nnever booted.",
         "operationId": "get_machine_egress_events",
         "parameters": [
           {
@@ -5180,6 +5180,13 @@
               "null"
             ],
             "description": "Registry reference to a .smolmachine artifact (e.g., \"myapp:v1\").\nPulls from the registry before creating the VM.\nMutually exclusive with `image` and `from`."
+          },
+          "requestRules": {
+            "type": "array",
+            "items": {
+              "type": "object"
+            },
+            "description": "HTTPS method and path rules enforced by the host interceptor, each\n`{action: \"allow\"|\"deny\", hosts, methods?, paths?}`. A denied request\ngets 403. Rules never enable the network or make a host reachable."
           },
           "resources": {
             "oneOf": [

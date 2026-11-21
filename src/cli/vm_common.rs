@@ -5345,6 +5345,7 @@ mod status_dns_tests {
                 "gh=GH_TOKEN@api.github.com",
             )
             .unwrap()],
+            ..Default::default()
         });
         assert_eq!(
             machine_status_json("c", &record)["credentials"],

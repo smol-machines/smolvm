@@ -40,6 +40,7 @@ use hyper_util::rt::TokioIo;
 use smolvm_protocol::intercept::{
     connect_verdict, preamble_len, InterceptEndpoint, HEADER_LEN, TOKEN_LEN,
 };
+use smolvm_protocol::request_rules::{decide, rules_name_host, Decision};
 use std::collections::{BTreeMap, HashMap};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -68,6 +69,10 @@ const DECODED_LIMIT: u64 = 256 * 1024 * 1024;
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 type Reply = Response<BoxBody<Bytes, BoxError>>;
 
+/// Told the method, host and request target of each request a request rule
+/// refuses, so the caller can record it.
+pub type RefusalSink = Arc<dyn Fn(&str, &str, &str) + Send + Sync>;
+
 /// Everything an interceptor needs besides the resolver.
 pub struct InterceptorConfig {
     /// Machine identity handed to the resolver with every request.
@@ -82,6 +87,7 @@ pub struct InterceptorConfig {
     /// Extra PEM roots trusted for upstream connections, for private services.
     /// Public roots stay enabled.
     pub upstream_roots_pem: Vec<Vec<u8>>,
+    pub on_refused: Option<RefusalSink>,
 }
 
 /// A running interceptor. Dropping it stops the listener and every session.
@@ -136,6 +142,7 @@ struct State {
     clients: Mutex<HashMap<(String, SocketAddr), reqwest::Client>>,
     upstream_roots: Vec<reqwest::Certificate>,
     sessions: Arc<tokio::sync::Semaphore>,
+    on_refused: Option<RefusalSink>,
 }
 
 impl Interceptor {
@@ -172,6 +179,7 @@ impl Interceptor {
             clients: Mutex::new(HashMap::new()),
             upstream_roots,
             sessions: Arc::new(tokio::sync::Semaphore::new(MAX_SESSIONS)),
+            on_refused: config.on_refused,
         });
         let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -341,16 +349,29 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
 
     match peek {
         Peek::ServerName(host)
-            if state
-                .bindings()
-                .policy
-                .bindings_for_host(&host)
-                .next()
-                .is_some() =>
+            if {
+                let bindings = state.bindings();
+                bindings.policy.bindings_for_host(&host).next().is_some()
+                    || rules_name_host(&bindings.policy.request_rules, &host)
+            } =>
         {
             // The upstream client opens its own verified connection.
             drop(upstream);
             terminate(state, stream, buffered, host, destination).await
+        }
+        // Request rules are keyed by server name, so a flow without one could
+        // reach a ruled host's address unruled. With rules present it is
+        // dropped unforwarded; a name no rule or binding names passes through.
+        Peek::NoServerName | Peek::Incomplete
+            if !state.bindings().policy.request_rules.is_empty() =>
+        {
+            tracing::warn!(
+                machine = %state.machine,
+                destination = %destination,
+                reason = "request rules need a TLS server name",
+                "flow refused"
+            );
+            Ok(())
         }
         Peek::ServerName(_) | Peek::NoServerName | Peek::Incomplete => {
             passthrough(stream, upstream, buffered).await
@@ -650,6 +671,27 @@ impl State {
             .path_and_query()
             .map(|p| p.as_str().to_string())
             .unwrap_or_else(|| "/".to_string());
+        // Rules come before any credential work: a refused request never
+        // resolves a secret.
+        if let Decision::Deny(reason) = decide(
+            &live.policy.request_rules,
+            host,
+            parts.method.as_str(),
+            &target,
+        ) {
+            tracing::warn!(
+                machine = %self.machine,
+                host,
+                method = %parts.method,
+                path = %target,
+                reason,
+                "request refused by request rule"
+            );
+            if let Some(on_refused) = &self.on_refused {
+                on_refused(parts.method.as_str(), host, &target);
+            }
+            return Ok(text(StatusCode::FORBIDDEN, reason));
+        }
         if target.contains(PLACEHOLDER_PREFIX) {
             return Ok(text(
                 StatusCode::FORBIDDEN,
@@ -1256,6 +1298,7 @@ mod tests {
     use crate::policy::{CredentialBinding, InjectionLocation, DEFAULT_METHODS};
     use crate::resolver::StaticResolver;
     use rustls::pki_types::ServerName;
+    use smolvm_protocol::request_rules::{Action, RequestRule};
     use tokio_rustls::TlsConnector;
 
     const CRED_HOST: &str = "api.credential.test";
@@ -1405,6 +1448,8 @@ mod tests {
     }
 
     struct Fixture {
+        /// `METHOD host target` of every request a rule refused.
+        refused: Arc<Mutex<Vec<String>>>,
         upstream: Upstream,
         interceptor: Interceptor,
         placeholder: String,
@@ -1415,8 +1460,9 @@ mod tests {
         fixture_with_secret("real-secret").await
     }
 
-    async fn fixture_with_secret(secret: &str) -> Fixture {
-        let policy = CredentialPolicy {
+    /// The `svc` placeholder binding for [`CRED_HOST`], plus `request_rules`.
+    fn svc_policy(request_rules: Vec<RequestRule>) -> CredentialPolicy {
+        CredentialPolicy {
             credentials: vec![CredentialBinding {
                 name: "svc".into(),
                 environment_variable: "SVC_TOKEN".into(),
@@ -1425,20 +1471,36 @@ mod tests {
                 methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
                 set_header: None,
             }],
+            request_rules,
+        }
+    }
+
+    /// A machine with no bindings, only `GET api.credential.test` allowed.
+    async fn rules_only_fixture() -> Fixture {
+        let policy = CredentialPolicy {
+            request_rules: vec![rule(Action::Allow, "GET api.credential.test")],
+            ..Default::default()
         };
-        fixture_with_policy(policy, CRED_HOST, StaticResolver::new().with("svc", secret)).await
+        fixture_with_policy(policy, CRED_HOST, StaticResolver::new()).await
+    }
+
+    async fn fixture_with_secret(secret: &str) -> Fixture {
+        let resolver = StaticResolver::new().with("svc", secret);
+        fixture_with_policy(svc_policy(Vec::new()), CRED_HOST, resolver).await
     }
 
     async fn fixture_with_policy(
         policy: CredentialPolicy,
         ca_subtree: &str,
-        resolver: StaticResolver,
+        resolver: impl CredentialResolver,
     ) -> Fixture {
         let upstream = start_upstream().await;
         let placeholders = crate::policy::generate_placeholders(&policy);
         let placeholder = placeholders.values().next().cloned().unwrap_or_default();
         let ca = MachineCa::generate("test-machine", &[ca_subtree.to_string()]).unwrap();
         let ca_pem = ca.certificate_pem().to_string();
+        let refused = Arc::new(Mutex::new(Vec::new()));
+        let sink = refused.clone();
         let interceptor = Interceptor::spawn(
             InterceptorConfig {
                 machine: "test-machine".into(),
@@ -1447,11 +1509,17 @@ mod tests {
                 ca,
                 extra_cas: Vec::new(),
                 upstream_roots_pem: vec![upstream.cert_pem.clone()],
+                on_refused: Some(Arc::new(move |method, host, target| {
+                    sink.lock()
+                        .unwrap()
+                        .push(format!("{method} {host} {target}"));
+                })),
             },
             Arc::new(resolver),
         )
         .unwrap();
         Fixture {
+            refused,
             upstream,
             interceptor,
             placeholder,
@@ -1530,6 +1598,7 @@ mod tests {
         };
         let policy = CredentialPolicy {
             credentials: vec![binding("svc", "SVC_TOKEN", CRED_HOST)],
+            ..Default::default()
         };
         let resolver = StaticResolver::new()
             .with("svc", "real-secret")
@@ -1546,6 +1615,7 @@ mod tests {
                 binding("svc", "SVC_TOKEN", CRED_HOST),
                 binding("other", "OTHER_TOKEN", OTHER_HOST),
             ],
+            ..Default::default()
         };
         let mut placeholders = crate::policy::generate_placeholders(&grown);
         placeholders.insert("svc".into(), svc.clone());
@@ -1572,6 +1642,7 @@ mod tests {
         // remove `svc`: its placeholder is refused from the next request
         let shrunk = CredentialPolicy {
             credentials: vec![binding("other", "OTHER_TOKEN", OTHER_HOST)],
+            ..Default::default()
         };
         placeholders.remove("svc");
         let extra_again = MachineCa::generate("test-machine", &[OTHER_HOST.to_string()]).unwrap();
@@ -1641,6 +1712,7 @@ mod tests {
                 methods: vec!["GET".into()],
                 set_header: Some("authorization".into()),
             }],
+            ..Default::default()
         };
         fixture_with_policy(
             policy,
@@ -1703,6 +1775,7 @@ mod tests {
                 methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
                 set_header: Some("authorization".into()),
             }],
+            ..Default::default()
         };
         let f = fixture_with_policy(policy, CRED_HOST, StaticResolver::new()).await;
         let request = format!("GET / HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
@@ -1714,6 +1787,157 @@ mod tests {
             f.upstream.seen.lock().unwrap().is_empty(),
             "nothing reached upstream"
         );
+    }
+
+    /// Dial the interceptor towards a plain TCP sink, send `bytes` that carry
+    /// no TLS server name, and return what the sink received.
+    async fn no_sni_flow(f: &Fixture, bytes: &[u8]) -> Vec<u8> {
+        let sink = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let sink_addr = sink.local_addr().unwrap();
+        let received = tokio::spawn(async move {
+            let (mut conn, _) = sink.accept().await.unwrap();
+            let mut got = Vec::new();
+            let _ = tokio::time::timeout(Duration::from_secs(2), conn.read_to_end(&mut got)).await;
+            got
+        });
+        let mut tcp = TcpStream::connect(f.interceptor.endpoint().addr)
+            .await
+            .unwrap();
+        tcp.write_all(&f.interceptor.endpoint().preamble(sink_addr))
+            .await
+            .unwrap();
+        let mut verdict = [0xffu8; 1];
+        tcp.read_exact(&mut verdict).await.unwrap();
+        let _ = tcp.write_all(bytes).await;
+        let _ = tcp.shutdown().await;
+        let mut sink_out = Vec::new();
+        let _ = tokio::time::timeout(Duration::from_secs(2), tcp.read_to_end(&mut sink_out)).await;
+        received.await.unwrap()
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn request_rules_refuse_flows_without_a_server_name() {
+        let f = rules_only_fixture().await;
+        assert!(no_sni_flow(&f, b"not tls at all").await.is_empty());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn flows_without_a_server_name_pass_through_without_rules() {
+        let f = fixture().await;
+        assert_eq!(no_sni_flow(&f, b"not tls at all").await, b"not tls at all");
+    }
+
+    /// Counts every resolve, to prove a refused request never reaches it.
+    struct CountingResolver {
+        inner: StaticResolver,
+        calls: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    impl CredentialResolver for CountingResolver {
+        fn resolve(
+            &self,
+            request: &CredentialRequest,
+        ) -> Result<zeroize::Zeroizing<String>, crate::resolver::ResolveError> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.resolve(request)
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_denied_request_never_resolves_its_credential() {
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let resolver = CountingResolver {
+            inner: StaticResolver::new().with("svc", "real-secret"),
+            calls: calls.clone(),
+        };
+        let policy = svc_policy(vec![rule(Action::Deny, "api.credential.test/admin/**")]);
+        let f = fixture_with_policy(policy, CRED_HOST, resolver).await;
+        let auth = format!("Authorization: Bearer {}\r\n", f.placeholder);
+        let denied = guest_request(
+            &f,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &get(CRED_HOST, "/admin/users", &auth),
+        )
+        .await
+        .unwrap();
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        assert!(
+            denied.ends_with("smolvm: request denied by request rules"),
+            "{denied}"
+        );
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 0);
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
+        let ok = guest_request(
+            &f,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &get(CRED_HOST, "/v1/me", &auth),
+        )
+        .await
+        .unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        assert_eq!(calls.load(std::sync::atomic::Ordering::SeqCst), 1);
+        let seen = f.upstream.seen.lock().unwrap().clone();
+        assert_eq!(
+            seen,
+            vec![("Bearer real-secret".to_string(), "/v1/me".to_string())]
+        );
+    }
+
+    fn rule(action: Action, spec: &str) -> RequestRule {
+        RequestRule::parse(action, spec).unwrap()
+    }
+
+    fn get(host: &str, path: &str, extra: &str) -> String {
+        format!("GET {path} HTTP/1.1\r\nHost: {host}\r\n{extra}Connection: close\r\n\r\n")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_rules_only_host_is_terminated_and_a_denied_method_gets_403() {
+        let f = rules_only_fixture().await;
+        let ok = guest_request(
+            &f,
+            f.ca_pem.as_bytes(),
+            CRED_HOST,
+            &get(CRED_HOST, "/x", ""),
+        )
+        .await
+        .unwrap();
+        assert!(ok.starts_with("HTTP/1.1 200"), "{ok}");
+        let request = format!(
+            "POST /x HTTP/1.1\r\nHost: {CRED_HOST}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let denied = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(denied.starts_with("HTTP/1.1 403"), "{denied}");
+        assert!(
+            denied.contains("smolvm: request denied by request rules (no allow rule matches)"),
+            "{denied}"
+        );
+        assert_eq!(
+            *f.refused.lock().unwrap(),
+            vec![format!("POST {CRED_HOST} /x")],
+            "only the refusal is reported"
+        );
+        assert_eq!(
+            f.upstream.seen.lock().unwrap().len(),
+            1,
+            "POST never forwarded"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_host_without_rules_or_bindings_is_still_passed_through() {
+        let f = rules_only_fixture().await;
+        let request = format!(
+            "POST /raw HTTP/1.1\r\nHost: {OTHER_HOST}\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+        );
+        let response = guest_request(&f, &f.upstream.cert_pem, OTHER_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -1770,6 +1994,7 @@ mod tests {
                 methods: vec!["POST".into()],
                 set_header: None,
             }],
+            ..Default::default()
         };
         let secret = "token+with&separator=1";
         let f = fixture_with_policy(
@@ -1833,6 +2058,7 @@ mod tests {
                 methods: vec!["POST".into()],
                 set_header: None,
             }],
+            ..Default::default()
         };
         let f = fixture_with_policy(
             policy,
