@@ -117,75 +117,19 @@ pub fn ensure_running_and_connect(
     // stop it when the manager drops before the caller receives the handle.
     manager.detach();
     let label = vm_label(name);
-    let start_hint = match name {
-        Some(name) => format!("smolvm machine start --name {}", name),
-        None => "smolvm machine start".to_string(),
-    };
-
     if manager.try_connect_existing().is_none() {
-        // A paused machine would otherwise get the start hint below, and
-        // `machine start` refuses it.
-        let paused = SmolvmDb::open()
-            .ok()
-            .and_then(|db| db.get_vm(&label).ok().flatten())
-            .and_then(|record| paused_machine_error(&label, &record));
-        if let Some(error) = paused {
+        let db = SmolvmDb::open()?;
+        let record = db.get_vm(&label)?.ok_or_else(|| match name {
+            Some(n) => smolvm::Error::vm_not_found(n),
+            None => smolvm::Error::agent("connect", format!("machine '{label}' not found")),
+        })?;
+        if let Some(error) = paused_machine_error(&label, &record) {
             return Err(error);
         }
-
-        // Distinguish "machine not found" from "machine stopped"
-        // so a typo in the name gives a clear error rather than the
-        // generic "not running / use start" message.
-        if let Some(ref n) = name {
-            let record = SmolvmDb::open()
-                .ok()
-                .and_then(|db| db.get_vm(n).ok().flatten());
-            let Some(record) = record else {
-                return Err(smolvm::Error::vm_not_found(n));
-            };
-            if smolvm::agent::state_probe::resolve_state(n, &record) == RecordState::Frozen {
-                return Err(smolvm::Error::agent(
-                    "connect",
-                    format!(
-                        "machine '{n}' is frozen as a reusable fork base; fork it again, or delete its descendants and stop it before restarting"
-                    ),
-                ));
-            }
-        }
-
-        // Best-effort reconcile: if we can't connect to the agent
-        // but the libkrun PID is alive, we're in the bug 2 zombie
-        // state — record says "running" but agent is dead. Mark
-        // the record `Unreachable` so subsequent `machine list`
-        // calls reflect truth without re-pinging. DB write is
-        // best-effort: we ignore failures so a bad DB doesn't mask
-        // the real "can't connect" error the user is about to see.
-        mark_unreachable_if_zombie(&label);
-
-        // Distinguish "machine does not exist" from "machine exists but is
-        // stopped". Without this a typo in --name reports "is not running"
-        // and points at `start`, which then fails differently (QA BUG-45).
-        let exists = SmolvmDb::open()
-            .ok()
-            .and_then(|db| db.get_vm(&label).ok().flatten())
-            .is_some();
-        if !exists {
-            return Err(smolvm::Error::agent(
-                "connect",
-                format!("machine '{}' not found", label),
-            ));
-        }
-
-        // `machine start` runs in its own process, so a start can be in flight
-        // while this one finds no agent yet. Say so instead of sending the
-        // user to start a machine that is already starting.
-        return Err(smolvm::Error::agent(
-            "connect",
-            format!(
-                "machine '{}' is not running. Start it with '{}'; if a start is already in progress, retry once it finishes.",
-                label, start_hint
-            ),
-        ));
+        let resolved = smolvm::agent::state_probe::resolve_state(&label, &record);
+        check_exec_recovery(&db, &record, name.as_deref(), resolved, || {
+            manager.try_connect_existing()
+        })?;
     }
 
     let client = smolvm::agent::AgentClient::connect_with_retry(manager.vsock_socket())?;
@@ -219,45 +163,90 @@ fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<()> {
     Ok(())
 }
 
-/// If the VM record says `Running` and the libkrun PID is alive but
-/// the agent isn't responding, transition the record to
-/// `Unreachable`. Caller invokes this on `ensure_running_and_connect`
-/// failure so the next `machine list` is honest.
-///
-/// All errors are swallowed (logged at debug level) — this is a
-/// best-effort cleanup, not a critical path.
-fn mark_unreachable_if_zombie(name: &str) {
-    let Ok(mut config) = SmolvmConfig::load() else {
-        return;
+/// Reconcile a missed exec probe against the latest liveness observation.
+fn check_exec_recovery(
+    db: &SmolvmDb,
+    record: &VmRecord,
+    requested_name: Option<&str>,
+    resolved: RecordState,
+    verify_connection: impl FnOnce() -> Option<()>,
+) -> smolvm::Result<()> {
+    let name = &record.name;
+    match resolved {
+        RecordState::Running => {
+            // resolve_state only pings. Exec still needs the original manager
+            // to verify the socket and execution identity before using it.
+            return verify_connection().ok_or_else(|| {
+                smolvm::Error::agent(
+                    "connect",
+                    format!("machine '{name}' responded but its connection could not be verified; retry the command"),
+                )
+            });
+        }
+        RecordState::Frozen => {
+            return Err(smolvm::Error::agent(
+                "connect",
+                format!("machine '{name}' is frozen as a reusable fork base; fork it again, or delete its descendants and stop it before restarting"),
+            ));
+        }
+        RecordState::Unreachable
+            if record.state == RecordState::Running
+                && !smolvm::agent::state_probe::is_frozen_fork_base(name, record) =>
+        {
+            // Only persist this observation for the same, still-active execution.
+            let _ = db.update_vm_for_record(record, |current| {
+                if current.state != RecordState::Running
+                    || current.pid != record.pid
+                    || current.pid_start_time != record.pid_start_time
+                    || current.paused_checkpoint.is_some()
+                    || !current.is_process_alive()
+                {
+                    return Err(smolvm::Error::agent_conflict(
+                        "connect",
+                        "machine state changed during probe",
+                    ));
+                }
+                current.state = RecordState::Unreachable;
+                Ok(())
+            });
+        }
+        _ => {}
+    }
+    let start_hint = match requested_name {
+        Some(n) => format!("smolvm machine start --name {n}"),
+        None => "smolvm machine start".to_owned(),
     };
-    let Some(record) = config.get_vm(name) else {
-        return;
-    };
-    // Only transition Running → Unreachable. Stopped/Created/Failed
-    // are already accurate.
-    if record.state != RecordState::Running {
-        return;
+    Err(smolvm::Error::agent(
+        "connect",
+        format!("machine '{name}' is not running. Start it with '{start_hint}'; if a start is already in progress, retry once it finishes."),
+    ))
+}
+
+#[cfg(test)]
+mod exec_recovery_tests {
+    use super::*;
+
+    #[test]
+    fn a_running_recheck_requires_verified_reconnect_and_preserves_running_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = SmolvmDb::open_at(&dir.path().join("test.db")).unwrap();
+        let mut record = VmRecord::new("worker".to_owned(), 1, 256, vec![], vec![], false);
+        record.state = RecordState::Running;
+        db.insert_vm("worker", &record).unwrap();
+        let record = db.get_vm("worker").unwrap().unwrap();
+        check_exec_recovery(&db, &record, Some("worker"), RecordState::Running, || {
+            Some(())
+        })
+        .unwrap();
+        let error =
+            check_exec_recovery(&db, &record, Some("worker"), RecordState::Running, || None)
+                .unwrap_err();
+        assert!(error.to_string().contains("could not be verified"));
+        assert_eq!(
+            db.get_vm("worker").unwrap().unwrap().state,
+            RecordState::Running
+        );
     }
-    if !record.is_process_alive() {
-        // PID dead → next list will see Stopped without our help.
-        return;
-    }
-    // A fork base is intentionally paused and cannot answer its agent socket.
-    // Treating that expected silence as a zombie corrupts the source record to
-    // Unreachable and makes later retained-checkpoint forks inherit bad state.
-    if smolvm::agent::state_probe::is_frozen_fork_base(name, record) {
-        return;
-    }
-    // PID alive + ensure_running_and_connect failed → zombie. Persist
-    // the new state. Update via the closure-based helper if available;
-    // fall back to nothing on failure (best-effort).
-    let _ = config.update_vm(name, |r| {
-        r.state = RecordState::Unreachable;
-    });
-    tracing::debug!(
-        machine = %name,
-        "marked machine Unreachable: PID alive but agent not responding"
-    );
 }
 
 /// Print command output and exit with the given code.
