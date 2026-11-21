@@ -45,8 +45,8 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialBindingsRequest, CredentialBindingsResponse,
     CredentialValuesRequest, DeleteQuery, DeleteResponse, EgressEventsResponse, ExportRequest,
     ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo, MountInfo,
-    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetPortsRequest,
-    StartMachineQuery, UpdateEgressRequest,
+    MountSpec, PortSpec, ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest,
+    SetMachineEnvRequest, SetPortsRequest, StartMachineQuery, UpdateEgressRequest,
 };
 use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -7281,6 +7281,72 @@ pub async fn update_machine_egress(
     Ok(Json(record_to_info(&name, &updated)))
 }
 
+/// Replace a machine's environment. A stopped machine takes it at its next
+/// start; a running one gives it to every command started from now on, since
+/// each command reads the machine's environment from its record. A process
+/// already running keeps the environment it started with.
+#[utoipa::path(
+    put,
+    path = "/api/v1/machines/{name}/env",
+    tag = "Machines",
+    params(
+        ("name" = String, Path, description = "Machine name")
+    ),
+    request_body = SetMachineEnvRequest,
+    responses(
+        (status = 200, description = "Environment replaced", body = MachineInfo),
+        (status = 400, description = "Invalid variable name", body = ApiErrorResponse),
+        (status = 404, description = "Machine not found", body = ApiErrorResponse),
+        (status = 409, description = "Machine is starting, stopping or paused", body = ApiErrorResponse),
+        (status = 500, description = "Update failed", body = ApiErrorResponse)
+    )
+)]
+pub async fn set_machine_env(
+    State(state): State<Arc<ApiState>>,
+    Path(name): Path<String>,
+    Json(req): Json<SetMachineEnvRequest>,
+) -> Result<Json<MachineInfo>, ApiError> {
+    crate::api::handlers::validate_request_env(&req.env)?;
+    // Serialize against start/stop/delete, so the state check holds while the
+    // record changes.
+    let lifecycle = state.lifecycle_lock(&name);
+    let _guard = lifecycle.lock_owned().await;
+    let record = state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    match record.actual_state() {
+        RecordState::Stopped | RecordState::Created | RecordState::Running => {}
+        other => {
+            return Err(ApiError::Conflict(format!(
+                "machine '{}' must be stopped or running before its environment changes. Current state: {:?}",
+                name, other
+            )));
+        }
+    }
+    let env = machine_env_from_request(&req.env);
+    let updated = state
+        .update_vm(&name, move |r| r.env = env)
+        .await?
+        .ok_or_else(|| {
+            ApiError::NotFound(format!("machine '{}' disappeared during update", name))
+        })?;
+    Ok(Json(record_to_info(&name, &updated)))
+}
+
+/// A request's variables as the record keeps them: one entry per name, at the
+/// position of its first appearance, holding its last value.
+fn machine_env_from_request(env: &[crate::api::types::EnvVar]) -> Vec<(String, String)> {
+    let mut out: Vec<(String, String)> = Vec::with_capacity(env.len());
+    for var in env {
+        match out.iter_mut().find(|(name, _)| *name == var.name) {
+            Some(entry) => entry.1 = var.value.clone(),
+            None => out.push((var.name.clone(), var.value.clone())),
+        }
+    }
+    out
+}
+
 /// Where the export subprocess writes its executable stub. `pack create -o X` derives the
 /// real artifact as `X.smolmachine`, so this must NOT already end in that extension or the
 /// CLI rejects it outright.
@@ -8929,6 +8995,72 @@ mod tests {
         let req = SetPortsRequest { ports: vec![] };
         let result = set_machine_ports(State(state), Path("nope".into()), Json(req)).await;
         assert!(matches!(result.unwrap_err(), ApiError::NotFound(_)));
+    }
+
+    #[tokio::test]
+    async fn set_env_replaces_the_machine_environment() {
+        let (_dir, state) = setup_test_state();
+        create_test_vm(state.db(), "env-vm", Some(20), Some(5));
+        state
+            .db()
+            .update_vm("env-vm", |r| r.env = vec![("OLD".into(), "1".into())])
+            .unwrap();
+        let request = |body: serde_json::Value| -> SetMachineEnvRequest {
+            serde_json::from_value(body).unwrap()
+        };
+
+        let info = set_machine_env(
+            State(state.clone()),
+            Path("env-vm".into()),
+            Json(request(serde_json::json!({"env": [
+                {"name": "A", "value": "1"},
+                {"name": "B", "value": "x=y"},
+                {"name": "A", "value": "2"}
+            ]}))),
+        )
+        .await
+        .unwrap();
+        assert_eq!(info.name, "env-vm");
+        // Replaced, not merged; a repeated name keeps its first place and last value.
+        let saved = state.db().get_vm("env-vm").unwrap().unwrap();
+        assert_eq!(
+            saved.env,
+            vec![
+                ("A".to_string(), "2".to_string()),
+                ("B".to_string(), "x=y".to_string())
+            ]
+        );
+
+        let bad = set_machine_env(
+            State(state.clone()),
+            Path("env-vm".into()),
+            Json(request(
+                serde_json::json!({"env": [{"name": "A=B", "value": "1"}]}),
+            )),
+        )
+        .await;
+        assert!(matches!(bad.unwrap_err(), ApiError::BadRequest(_)));
+        assert_eq!(state.db().get_vm("env-vm").unwrap().unwrap().env, saved.env);
+
+        state
+            .db()
+            .update_vm("env-vm", |r| r.state = RecordState::Paused)
+            .unwrap();
+        let paused = set_machine_env(
+            State(state.clone()),
+            Path("env-vm".into()),
+            Json(request(serde_json::json!({"env": []}))),
+        )
+        .await;
+        assert!(matches!(paused.unwrap_err(), ApiError::Conflict(_)));
+
+        let missing = set_machine_env(
+            State(state),
+            Path("nope".into()),
+            Json(request(serde_json::json!({"env": []}))),
+        )
+        .await;
+        assert!(matches!(missing.unwrap_err(), ApiError::NotFound(_)));
     }
 
     #[tokio::test]

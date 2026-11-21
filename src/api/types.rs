@@ -294,6 +294,16 @@ fn auto_start_default() -> bool {
     true
 }
 
+/// Body of `PUT /api/v1/machines/{name}/env`: the machine's whole environment,
+/// replacing what it had.
+#[derive(Debug, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SetMachineEnvRequest {
+    /// Every variable the machine's commands start with, in order; a later
+    /// entry with the same name wins.
+    pub env: Vec<EnvVar>,
+}
+
 /// Request to amend a machine's egress allow list: add or remove hosts,
 /// patterns, and CIDRs without replacing the whole policy. The same merge and
 /// guards as `machine update`, including on a running machine.
