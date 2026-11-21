@@ -4090,32 +4090,6 @@ impl AgentManager {
                     // non-listable and Landlock grants only this VM's exact chain).
                     crate::process::ensure_traversable(&crate::storage::cow_base_cache_root());
                 }
-                // Pre-create this VM's per-VM readiness marker owned by its uid
-                // (0600): the dropped guest can overwrite it but couldn't create a
-                // file in the shared, host-user-owned rootfs. Per-VM name + 0600 =
-                // no shared-marker race and no world-writable file.
-                #[cfg(target_os = "linux")]
-                {
-                    use std::os::unix::ffi::OsStrExt;
-                    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-                    let marker = self.ready_marker_path();
-                    if std::fs::OpenOptions::new()
-                        .create(true)
-                        .write(true)
-                        .truncate(true)
-                        .mode(0o600)
-                        .open(&marker)
-                        .is_ok()
-                    {
-                        let _ = std::fs::set_permissions(
-                            &marker,
-                            std::fs::Permissions::from_mode(0o600),
-                        );
-                        if let Ok(c) = std::ffi::CString::new(marker.as_os_str().as_bytes()) {
-                            unsafe { libc::lchown(c.as_ptr(), uid, uid) };
-                        }
-                    }
-                }
                 tracing::info!(uid, vm_dir = %d.display(), "per-VM uid isolation enabled");
                 uid_env = vec![
                     ("SMOLVM_VM_UID", uid.to_string()),

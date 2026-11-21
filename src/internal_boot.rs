@@ -579,23 +579,11 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
             }
         }
 
-        // The guest agent signals boot-readiness by writing a marker file into
-        // the virtiofs rootfs, which the host polls. The rootfs is granted
-        // read-exec above, so that FUSE write would be denied here. Carve out
-        // write on JUST that one marker file — never the rootfs dir, which
-        // holds the shared agent binary/init/libs a guest→VMM escape must not
-        // be able to tamper with. Landlock needs an existing path to build the
-        // rule, so pre-create it empty; the guest overwrites it with content
-        // and the host treats non-empty as ready (see manager.rs wait loop).
-        // The marker name is per-VM (the host passes it via SMOLVM_READY_MARKER so
-        // concurrent boots don't share one file); fall back to the shared constant
-        // if unset. Granting/pre-creating the WRONG name would leave the agent's
-        // real (per-VM) write Landlock-denied → readiness limps to the vsock grace.
-        let marker_name = std::env::var(smolvm_protocol::guest_env::READY_MARKER)
-            .unwrap_or_else(|_| smolvm_protocol::AGENT_READY_MARKER.to_string());
-        let ready_marker = config.rootfs_path.join(marker_name);
-        let _ = std::fs::File::create(&ready_marker);
-        read_write.push(ready_marker);
+        // No per-machine file is made in the shared rootfs: every guest mounts
+        // it as its root, so a file named after a machine would tell any guest
+        // which machines run. Readiness comes through the doorbell socket and
+        // the agent ping in the machine's own directory, so the rootfs stays
+        // read-exec only.
 
         if let Err(e) = crate::process::restrict_filesystem(&read_exec, &read_write) {
             eprintln!("[landlock] restriction failed, refusing to boot unconfined: {e}");
