@@ -43,7 +43,9 @@ pub fn parse_image(s: &str) -> Result<String, String> {
 }
 
 // Env parsing delegated to the library.
-pub use smolvm::util::{parse_env_list, parse_env_spec};
+pub use smolvm::util::{
+    load_env_files, parse_env_file, parse_env_file_contents, parse_env_list, parse_env_spec,
+};
 
 /// Assign positional virtiofs tags to a list of (guest_target, read_only)
 /// pairs and return the agent's `(tag, target, read_only)` binding form.
