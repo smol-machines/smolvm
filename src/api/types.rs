@@ -1170,10 +1170,12 @@ pub struct CreateMachineRequest {
     /// Port mappings (host:guest).
     #[serde(default)]
     pub ports: Vec<PortSpec>,
-    /// Enable outbound network access (TSI).
-    /// Note: Only TCP/UDP supported, not ICMP (ping).
+    /// Outbound access: the cloud API's policy (`blocked`, `open`, or
+    /// `allowCidrs` with the hosts and CIDRs it may reach), or the older
+    /// `true`/`false`. Only TCP/UDP, not ICMP (ping).
     #[serde(default)]
-    pub network: bool,
+    #[schema(value_type = Option<MachineNetwork>)]
+    pub network: NetworkSetting,
     /// Enable GPU acceleration (Vulkan via virtio-gpu).
     #[serde(default)]
     pub gpu: bool,
@@ -1307,14 +1309,205 @@ pub struct CreateMachineRequest {
     #[schema(value_type = Object)]
     pub secrets: RequestSecretRefs,
     /// Environment variables for the machine's workload (init commands and the
-    /// entrypoint). For `from`/`registry_ref` machines these layer on top of
-    /// the artifact manifest's env; a request variable wins on name collision.
-    #[serde(default)]
+    /// entrypoint), by name. For `from`/`registry_ref` machines these layer on
+    /// top of the artifact manifest's env; a request variable wins on name
+    /// collision. A list of `{name, value}` is also accepted.
+    #[serde(default, deserialize_with = "env_vars")]
+    #[schema(value_type = std::collections::HashMap<String, String>)]
     pub env: Vec<EnvVar>,
     /// Working directory for the machine's workload. Overrides the artifact
     /// manifest's workdir when set.
     #[serde(default)]
     pub workdir: Option<String>,
+    /// What the machine runs, as the cloud API names it: an OCI image or a
+    /// `.smolmachine` artifact by reference. Instead of `image` or
+    /// `registryRef`.
+    #[serde(default)]
+    pub source: Option<MachineSource>,
+    /// The machine's size, as the cloud API names it. Instead of `cpus`,
+    /// `memoryMb`, `storageGb` and `diskDurability`.
+    #[serde(default)]
+    pub resources: Option<MachineResources>,
+    /// The workload command, overriding the image's entrypoint: a list, or one
+    /// string run with `sh -lc`. Instead of `entrypoint`.
+    #[serde(default, deserialize_with = "optional_command_argv")]
+    #[schema(value_type = Option<CommandSpec>)]
+    pub command: Option<Vec<String>>,
+    /// Labels to find and group machines by: at most 32; keys 1-63 chars of
+    /// `[a-z0-9]([a-z0-9._/-]*[a-z0-9])?`, values up to 255 chars.
+    #[serde(default)]
+    pub labels: std::collections::BTreeMap<String, String>,
+}
+
+/// A create's outbound access: the cloud API's policy, or the older flag.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(untagged)]
+pub enum NetworkSetting {
+    /// The older `true`/`false`.
+    Flag(bool),
+    /// The cloud API's policy.
+    Policy(MachineNetwork),
+}
+
+impl Default for NetworkSetting {
+    fn default() -> Self {
+        NetworkSetting::Flag(false)
+    }
+}
+
+impl NetworkSetting {
+    /// Whether the machine gets outbound access at all.
+    pub fn enabled(&self) -> bool {
+        match self {
+            NetworkSetting::Flag(enabled) => *enabled,
+            NetworkSetting::Policy(MachineNetwork::Blocked) => false,
+            NetworkSetting::Policy(_) => true,
+        }
+    }
+}
+
+/// What a machine runs, as the cloud API names it.
+#[derive(Debug, Clone, Deserialize, ToSchema)]
+#[serde(tag = "type", rename_all = "camelCase", deny_unknown_fields)]
+pub enum MachineSource {
+    /// An OCI image.
+    Image {
+        /// The image reference.
+        reference: String,
+        /// CPU architecture; this node runs its own.
+        #[serde(default)]
+        arch: Option<String>,
+    },
+    /// A `.smolmachine` artifact in a registry.
+    Smolmachine {
+        /// The artifact reference.
+        reference: String,
+        /// CPU architecture; this node runs its own.
+        #[serde(default)]
+        arch: Option<String>,
+    },
+    /// A checkpoint: restored with `PUT .../checkpoint`, never created.
+    Checkpoint {
+        /// The checkpoint's id.
+        reference: String,
+        /// CPU architecture.
+        #[serde(default)]
+        arch: Option<String>,
+    },
+}
+
+/// A machine's size, as the cloud API names it.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct MachineResources {
+    /// vCPUs.
+    #[serde(default)]
+    pub cpus: Option<u32>,
+    /// Memory in MiB.
+    #[serde(default)]
+    pub memory_mb: Option<u32>,
+    /// Storage disk size in GiB.
+    #[serde(default)]
+    pub disk_gb: Option<u64>,
+    /// When guest disk writes must reach the host's disk.
+    #[serde(default)]
+    pub disk_durability: Option<crate::data::resources::DiskDurability>,
+}
+
+fn optional_command_argv<'de, D: serde::Deserializer<'de>>(
+    de: D,
+) -> Result<Option<Vec<String>>, D::Error> {
+    command_argv(de).map(Some)
+}
+
+impl CreateMachineRequest {
+    /// Fold the cloud API's fields (`source`, `resources`, `command`, a
+    /// network policy) into the ones the create path reads, refusing a request
+    /// that says the same thing both ways differently.
+    pub fn fold_cloud_shape(&mut self) -> Result<(), String> {
+        if let Some(source) = self.source.take() {
+            if self.image.is_some() || self.from.is_some() || self.registry_ref.is_some() {
+                return Err("give `source` or `image`/`from`/`registryRef`, not both".into());
+            }
+            match source {
+                MachineSource::Image { reference, .. } => self.image = Some(reference),
+                MachineSource::Smolmachine { reference, .. } => self.registry_ref = Some(reference),
+                MachineSource::Checkpoint { .. } => {
+                    return Err(
+                        "a checkpoint is restored with PUT /api/v1/machines/{name}/checkpoint, \
+                         not created"
+                            .into(),
+                    )
+                }
+            }
+        }
+        if let Some(resources) = self.resources.take() {
+            fn fold<T: PartialEq + Copy + std::fmt::Debug>(
+                slot: &mut Option<T>,
+                value: Option<T>,
+                names: &str,
+            ) -> Result<(), String> {
+                match (*slot, value) {
+                    (Some(a), Some(b)) if a != b => {
+                        Err(format!("{names} disagree ({a:?} and {b:?})"))
+                    }
+                    (None, Some(b)) => {
+                        *slot = Some(b);
+                        Ok(())
+                    }
+                    _ => Ok(()),
+                }
+            }
+            let cpus = resources
+                .cpus
+                .map(|cpus| {
+                    u8::try_from(cpus).map_err(|_| format!("resources.cpus {cpus} is too many"))
+                })
+                .transpose()?;
+            fold(&mut self.cpus, cpus, "cpus and resources.cpus")?;
+            fold(
+                &mut self.mem,
+                resources.memory_mb,
+                "memoryMb and resources.memoryMb",
+            )?;
+            fold(
+                &mut self.storage_gb,
+                resources.disk_gb,
+                "storageGb and resources.diskGb",
+            )?;
+            fold(
+                &mut self.disk_durability,
+                resources.disk_durability,
+                "diskDurability and resources.diskDurability",
+            )?;
+        }
+        if let Some(command) = self.command.take() {
+            if !self.entrypoint.is_empty() {
+                return Err("give `command` or `entrypoint`, not both".into());
+            }
+            self.entrypoint = command;
+        }
+        if let NetworkSetting::Policy(policy) = &self.network {
+            match policy {
+                MachineNetwork::Blocked | MachineNetwork::Open => {}
+                MachineNetwork::AllowCidrs { cidrs, hosts } => {
+                    if cidrs.is_empty() && hosts.is_empty() {
+                        return Err(
+                            "allowCidrs network mode requires at least one CIDR or host".into()
+                        );
+                    }
+                    if self.allowed_cidrs.is_some() || self.allowed_hosts.is_some() {
+                        return Err(
+                            "give an allowCidrs `network` or `allowedCidrs`/`allowedHosts`, not both".into(),
+                        );
+                    }
+                    self.allowed_cidrs = (!cidrs.is_empty()).then(|| cidrs.clone());
+                    self.allowed_hosts = (!hosts.is_empty()).then(|| hosts.clone());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Machine status information.
@@ -1623,7 +1816,7 @@ pub struct ResizeMachineRequest {
     #[serde(default)]
     pub cpus: Option<u8>,
     /// Storage disk size in GiB (expand only, optional).
-    #[serde(default)]
+    #[serde(default, rename = "diskGb", alias = "storageGb")]
     #[schema(example = 50)]
     pub storage_gb: Option<u64>,
     /// Overlay disk size in GiB (expand only, optional).
@@ -2576,5 +2769,88 @@ mod registry_auth_tests {
                 [("CI".to_string(), "1".to_string())]
             );
         }
+    }
+
+    #[test]
+    fn a_create_in_the_cloud_shape_folds_into_the_fields_the_create_path_reads() {
+        let mut cloud: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "web",
+            "source": {"type": "image", "reference": "alpine:3.20", "arch": "arm64"},
+            "resources": {"cpus": 2, "memoryMb": 1024, "diskGb": 30},
+            "command": "python3 -m http.server",
+            "network": {"mode": "allowCidrs", "cidrs": ["10.0.0.0/8"], "hosts": ["pypi.org"]},
+            "env": {"MODE": "prod"},
+            "labels": {"team": "web"}
+        }))
+        .unwrap();
+        cloud.fold_cloud_shape().unwrap();
+        assert_eq!(cloud.image.as_deref(), Some("alpine:3.20"));
+        assert_eq!(
+            (cloud.cpus, cloud.mem, cloud.storage_gb),
+            (Some(2), Some(1024), Some(30))
+        );
+        assert_eq!(cloud.entrypoint, ["sh", "-lc", "python3 -m http.server"]);
+        assert!(cloud.network.enabled());
+        assert_eq!(cloud.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
+        assert_eq!(cloud.allowed_hosts, Some(vec!["pypi.org".to_string()]));
+        assert_eq!(
+            EnvVar::to_tuples(&cloud.env),
+            [("MODE".to_string(), "prod".to_string())]
+        );
+        assert_eq!(cloud.labels.get("team").map(String::as_str), Some("web"));
+
+        let mut older: CreateMachineRequest = serde_json::from_value(serde_json::json!({
+            "name": "web", "image": "alpine:3.20", "cpus": 2, "memoryMb": 1024, "network": true,
+            "registryRef": null, "env": [{"name": "MODE", "value": "prod"}]
+        }))
+        .unwrap();
+        older.fold_cloud_shape().unwrap();
+        assert!(older.network.enabled());
+        assert_eq!((older.cpus, older.mem), (Some(2), Some(1024)));
+
+        let smolmachine = |v: serde_json::Value| {
+            let mut req: CreateMachineRequest = serde_json::from_value(v).unwrap();
+            req.fold_cloud_shape().map(|()| req)
+        };
+        let req = smolmachine(serde_json::json!({"source": {"type": "smolmachine", "reference": "smolmachines.com/app:v1"}, "network": {"mode": "blocked"}})).unwrap();
+        assert_eq!(req.registry_ref.as_deref(), Some("smolmachines.com/app:v1"));
+        assert!(!req.network.enabled());
+
+        for (body, why) in [
+            (
+                serde_json::json!({"source": {"type": "image", "reference": "a"}, "image": "b"}),
+                "both sources",
+            ),
+            (
+                serde_json::json!({"source": {"type": "checkpoint", "reference": "ck"}}),
+                "a checkpoint",
+            ),
+            (
+                serde_json::json!({"command": ["a"], "entrypoint": ["b"]}),
+                "command and entrypoint",
+            ),
+            (
+                serde_json::json!({"cpus": 2, "resources": {"cpus": 4}}),
+                "disagreeing cpus",
+            ),
+            (
+                serde_json::json!({"resources": {"cpus": 300}}),
+                "too many cpus",
+            ),
+            (
+                serde_json::json!({"network": {"mode": "allowCidrs"}}),
+                "an empty allow list",
+            ),
+            (
+                serde_json::json!({"network": {"mode": "allowCidrs", "cidrs": ["1.1.1.1/32"]}, "allowedCidrs": ["2.2.2.2/32"]}),
+                "two allow lists",
+            ),
+        ] {
+            assert!(smolmachine(body).is_err(), "{why} must be refused");
+        }
+        assert!(serde_json::from_value::<CreateMachineRequest>(
+            serde_json::json!({"network": {"mode": "wide"}})
+        )
+        .is_err());
     }
 }
