@@ -2042,6 +2042,58 @@ pub struct CredentialValuesRequest {
     pub values: std::collections::BTreeMap<String, String>,
 }
 
+/// Most children one batch branch makes, as the cloud API allows.
+pub const MAX_BRANCH_BATCH: u32 = 64;
+
+/// Request to branch a running source into many children in one call, as the
+/// cloud API takes it. All or nothing: if any child fails, every child made is
+/// deleted.
+#[derive(Debug, Clone, Default, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct ForkBatchRequest {
+    /// Explicit child names. When non-empty, its length is the batch size and
+    /// `count` is ignored; otherwise children are named `{namePrefix}-{n}`,
+    /// skipping names already taken.
+    #[serde(default)]
+    pub names: Vec<String>,
+    /// Number of children to branch (1 to 64). Ignored when `names` is given.
+    #[serde(default)]
+    pub count: u32,
+    /// Prefix for children named by `count`; the source's name by default.
+    #[serde(default)]
+    pub name_prefix: Option<String>,
+    /// Let every child become another branch source.
+    #[serde(default)]
+    pub branchable: bool,
+    /// Keep the source paused as a reusable branch base, as for one branch.
+    #[serde(default)]
+    pub freeze_source: bool,
+    /// Keep the source's machine-id in every child, as for one branch.
+    #[serde(default)]
+    pub keep_machine_id: bool,
+    /// Labels for every child; the source's labels when omitted.
+    #[serde(default)]
+    pub labels: Option<std::collections::BTreeMap<String, String>>,
+    /// Inbound port forwards for every child; fresh host ports when empty, so
+    /// siblings do not collide.
+    #[serde(default)]
+    pub ports: Vec<PortSpec>,
+    /// Taken for the cloud API's sake: a node places nothing, so it is unused.
+    #[serde(default)]
+    pub expected_busy_cpus: Option<f64>,
+    /// Taken for the cloud API's sake: a node places nothing, so it is unused.
+    #[serde(default)]
+    pub wait_for_capacity_seconds: Option<u64>,
+}
+
+/// The children of a batch branch, in request order.
+#[derive(Debug, Serialize, ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub struct ForkBatchResponse {
+    /// The children made.
+    pub clones: Vec<MachineInfo>,
+}
+
 /// Request to branch a running, branchable source machine into a new child.
 #[derive(Debug, Clone, Deserialize, Serialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]

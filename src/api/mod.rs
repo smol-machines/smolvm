@@ -128,6 +128,8 @@ use state::ApiState;
         handlers::machines::delete_cache_base,
         handlers::machines::update_machine_egress,
         handlers::machines::set_machine_env,
+        handlers::machines::branch_machines_batch,
+        handlers::machines::fork_machines_batch,
         handlers::machines::update_machine_labels,
         handlers::machines::set_machine_network,
         handlers::machines::release_held_branch,
@@ -185,6 +187,8 @@ use state::ApiState;
         types::PublishCacheDiskResponse,
         types::UpdateEgressRequest,
         types::SetMachineEnvRequest,
+        types::ForkBatchRequest,
+        types::ForkBatchResponse,
         types::UpdateMachineLabelsRequest,
         types::MachineNetwork,
         types::MachineMetricsResponse,
@@ -408,6 +412,14 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         )
         .route("/{id}/branches", post(handlers::machines::branch_machine))
         .route("/{id}/fork", post(handlers::machines::fork_machine))
+        .route(
+            "/{id}/branches/batch",
+            post(handlers::machines::branch_machines_batch),
+        )
+        .route(
+            "/{id}/fork-batch",
+            post(handlers::machines::fork_machines_batch),
+        )
         .route(
             "/{id}/branch-release",
             post(handlers::machines::release_held_branch),
