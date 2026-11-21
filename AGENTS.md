@@ -391,7 +391,7 @@ smolvm machine credentials refresh --name web [BINDING...]
 # Add or remove bindings on a running machine: from its next request an added binding is
 # substituted (its value read now from this shell) and a removed one is not. A binding for a
 # host no CA of the machine permits gets a CA of its own, trusted by the guest at once
-# (machines booted on v1.35.5+; older ones trust it from their next start).
+# (machines booted on v1.36.0+; older ones trust it from their next start).
 smolvm machine credentials add    --name web --credential gh=GH_TOKEN@api.github.com
 smolvm machine credentials remove --name web gh
 
