@@ -45,9 +45,9 @@ use crate::api::types::{
     ApiErrorResponse, CreateMachineRequest, CredentialBindingsRequest, CredentialBindingsResponse,
     CredentialValuesRequest, DeleteQuery, DeleteResponse, EgressEventsResponse, ExportRequest,
     ExportResponse, ForkReleaseRequest, ForkRequest, ListMachinesResponse, MachineInfo,
-    MachineMetricsResponse, MachineNetwork, MachinePressure, MountInfo, MountSpec, PortSpec, PressureReading,
-    ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetMachineEnvRequest, SetPortsRequest,
-    StartMachineQuery, UpdateEgressRequest, UpdateMachineLabelsRequest,
+    MachineMetricsResponse, MachineNetwork, MachinePressure, MountInfo, MountSpec, PortSpec,
+    PressureReading, ResizeMachineRequest, ResourceSpec, SetCpuLimitRequest, SetMachineEnvRequest,
+    SetPortsRequest, StartMachineQuery, UpdateEgressRequest, UpdateMachineLabelsRequest,
 };
 use crate::config::{RecordState, VmRecord};
 use crate::data::disk::{Overlay, Storage};
@@ -7559,7 +7559,8 @@ pub async fn set_machine_network(
                 )));
             }
             let mut next = record.clone();
-            next.replace_egress(false, Vec::new(), Vec::new()).map_err(bad)?;
+            next.replace_egress(false, Vec::new(), Vec::new())
+                .map_err(bad)?;
             next
         }
         MachineNetwork::Open => record
@@ -9320,13 +9321,18 @@ mod tests {
         let record = saved(&state);
         assert!(record.network);
         assert_eq!(record.allowed_cidrs, Some(vec!["10.0.0.0/8".to_string()]));
-        assert!(record.dns_filter_hosts.as_ref().is_some_and(|h| h.len() == 1));
+        assert!(record
+            .dns_filter_hosts
+            .as_ref()
+            .is_some_and(|h| h.len() == 1));
 
         // A replace, not an amend: what the last call named is all there is.
         let _ = set_machine_network(
             State(state.clone()),
             Path("net-vm".into()),
-            Json(body(serde_json::json!({"mode": "allowCidrs", "cidrs": ["192.0.2.0/24"]}))),
+            Json(body(
+                serde_json::json!({"mode": "allowCidrs", "cidrs": ["192.0.2.0/24"]}),
+            )),
         )
         .await
         .unwrap();
@@ -9342,7 +9348,9 @@ mod tests {
         .await
         .unwrap();
         let record = saved(&state);
-        assert!(record.network && record.allowed_cidrs.is_none() && record.dns_filter_hosts.is_none());
+        assert!(
+            record.network && record.allowed_cidrs.is_none() && record.dns_filter_hosts.is_none()
+        );
 
         let _ = set_machine_network(
             State(state.clone()),
@@ -9357,11 +9365,21 @@ mod tests {
             serde_json::json!({"mode": "allowCidrs"}),
             serde_json::json!({"mode": "allowCidrs", "cidrs": ["not-a-cidr"]}),
         ] {
-            let refused =
-                set_machine_network(State(state.clone()), Path("net-vm".into()), Json(body(bad.clone()))).await;
-            assert!(matches!(refused.unwrap_err(), ApiError::BadRequest(_)), "{bad}");
+            let refused = set_machine_network(
+                State(state.clone()),
+                Path("net-vm".into()),
+                Json(body(bad.clone())),
+            )
+            .await;
+            assert!(
+                matches!(refused.unwrap_err(), ApiError::BadRequest(_)),
+                "{bad}"
+            );
         }
-        assert!(serde_json::from_value::<MachineNetwork>(serde_json::json!({"mode": "everything"})).is_err());
+        assert!(serde_json::from_value::<MachineNetwork>(
+            serde_json::json!({"mode": "everything"})
+        )
+        .is_err());
     }
 
     #[tokio::test]

@@ -449,7 +449,10 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
             "/{id}/metrics",
             get(handlers::machines::get_machine_metrics),
         )
-        .route("/{id}/network", put(handlers::machines::set_machine_network))
+        .route(
+            "/{id}/network",
+            put(handlers::machines::set_machine_network),
+        )
         .route(
             "/{id}/credential-values",
             put(handlers::machines::put_credential_values),
