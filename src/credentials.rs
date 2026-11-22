@@ -609,6 +609,9 @@ fn serve_live_values(
             if let Some(unknown) = request.values.keys().find(|k| !known.contains(k)) {
                 return Err(format!("no credential binding '{unknown}'"));
             }
+            for (binding, value) in &request.values {
+                smolvm_credentials::check_credential_value(binding, value)?;
+            }
             if request.values.is_empty() {
                 return Ok(());
             }

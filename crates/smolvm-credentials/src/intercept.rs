@@ -31,8 +31,8 @@
 
 use crate::ca::MachineCa;
 use crate::policy::{CredentialPolicy, PLACEHOLDER_PREFIX};
-use crate::resolver::{CredentialRequest, CredentialResolver};
-use crate::scrub::{Scrubber, Secret};
+use crate::resolver::{CredentialRequest, CredentialResolver, ResolveError};
+use crate::scrub::{Scrubber, Secret, MAX_FORM_LEN};
 use crate::sni::{peek_client_hello, Peek, MAX_CLIENT_HELLO};
 use anyhow::{Context, Result};
 use bytes::Bytes;
@@ -734,7 +734,13 @@ impl State {
         };
         let resolved = tokio::task::spawn_blocking(move || resolver.resolve(&request))
             .await
-            .context("resolver task")?;
+            .context("resolver task")?
+            // Never sent, so never scrubbed: a longer value could outrun what a streamed response keeps to check.
+            .and_then(|value| {
+                crate::policy::check_credential_value(binding, &value)
+                    .map(|()| value)
+                    .map_err(ResolveError::Unavailable)
+            });
         self.remember(bindings, binding, resolved.as_ref().ok());
         Ok(resolved.map_err(|e| {
             tracing::warn!(machine = %self.machine, binding, host, error = %e, "credential resolution failed");
@@ -1343,8 +1349,11 @@ struct Rescrub {
 
 /// `body` with every credential form `scrubber` knows replaced. Holds back the
 /// tail of each chunk that could start a form the next chunk finishes. Before
-/// each chunk, a scrubber built before a value was bound or resolved is built
-/// again, so a value bound mid-response is scrubbed from the rest of it.
+/// each chunk is passed on, a scrubber built before a value was bound or
+/// resolved is built again, so a value bound mid-response is scrubbed from the
+/// rest of it, even one that began in bytes already passed on before it was
+/// bound (see [`Scrubber::scan_after`]): the last input bytes passed on are kept
+/// for that, as many as the longest form a value may take.
 fn scrubbed<S>(
     body: S,
     scrubber: Option<Scrubber>,
@@ -1353,11 +1362,15 @@ fn scrubbed<S>(
 where
     S: Stream<Item = reqwest::Result<Bytes>> + Send + Unpin + 'static,
 {
+    /// Input bytes passed on that are kept: a form begun in them can still be finished.
+    const KEPT: usize = MAX_FORM_LEN - 1;
     struct Scan<S> {
         body: S,
         scrubber: Option<Scrubber>,
         rescrub: Rescrub,
         carry: Vec<u8>,
+        /// The last input bytes passed on, at most [`KEPT`] once trimmed.
+        sent: Vec<u8>,
         hits: usize,
         done: bool,
     }
@@ -1377,18 +1390,29 @@ where
             Ok(())
         }
 
-        /// Scrub what is carried, holding back a possible partial form unless `last`.
-        fn scan(&mut self, last: bool) -> Vec<u8> {
-            let mut out = Vec::with_capacity(self.carry.len());
-            match &self.scrubber {
-                Some(scrubber) => {
-                    let (used, hits) = scrubber.scan(&self.carry, last, &mut out);
-                    self.carry.drain(..used);
-                    self.hits += hits;
+        /// What of the carried bytes may be passed on now, scrubbed by a scrubber that knows every value bound
+        /// so far: rebuilt and scanned again if one was bound while scanning.
+        async fn take(&mut self, last: bool) -> Result<Vec<u8>> {
+            loop {
+                self.refresh().await?;
+                let mut out = Vec::with_capacity(self.carry.len());
+                let (used, hits) = match &self.scrubber {
+                    Some(scrubber) => scrubber.scan_after(&self.sent, &self.carry, last, &mut out),
+                    None => {
+                        out.extend_from_slice(&self.carry);
+                        (self.carry.len(), 0)
+                    }
+                };
+                if self.rescrub.state.secrets_epoch() != self.rescrub.epoch {
+                    continue;
                 }
-                None => out.append(&mut self.carry),
+                self.hits += hits;
+                self.sent.extend(self.carry.drain(..used));
+                if self.sent.len() > 2 * KEPT {
+                    self.sent.drain(..self.sent.len() - KEPT);
+                }
+                return Ok(out);
             }
-            out
         }
     }
     futures_util::stream::unfold(
@@ -1397,6 +1421,7 @@ where
             scrubber,
             rescrub,
             carry: Vec::new(),
+            sent: Vec::new(),
             hits: 0,
             done: false,
         },
@@ -1405,35 +1430,37 @@ where
                 return None;
             }
             loop {
-                let next = scan.body.next().await;
-                if let Err(e) = scan.refresh().await {
-                    scan.done = true;
-                    return Some((Err(e.into()), scan));
-                }
-                match next {
+                let last = match scan.body.next().await {
                     Some(Ok(chunk)) => {
                         scan.carry.extend_from_slice(&chunk);
-                        let out = scan.scan(false);
-                        if !out.is_empty() {
-                            return Some((Ok(Bytes::from(out)), scan));
-                        }
+                        false
                     }
                     Some(Err(e)) => {
                         scan.done = true;
                         return Some((Err(Box::new(e) as BoxError), scan));
                     }
-                    None => {
+                    None => true,
+                };
+                let out = match scan.take(last).await {
+                    Ok(out) => out,
+                    Err(e) => {
                         scan.done = true;
-                        let out = scan.scan(true);
-                        scan.carry.clear();
-                        if scan.hits > 0 {
-                            tracing::warn!(machine = %scan.rescrub.state.machine, host = %scan.rescrub.host, count = scan.hits, "credential value removed from a response body");
-                        }
-                        if out.is_empty() {
-                            return None;
-                        }
-                        return Some((Ok(Bytes::from(out)), scan));
+                        return Some((Err(e.into()), scan));
                     }
+                };
+                if last {
+                    scan.done = true;
+                    scan.carry.clear();
+                    if scan.hits > 0 {
+                        tracing::warn!(machine = %scan.rescrub.state.machine, host = %scan.rescrub.host, count = scan.hits, "credential value removed from a response body");
+                    }
+                    if out.is_empty() {
+                        return None;
+                    }
+                    return Some((Ok(Bytes::from(out)), scan));
+                }
+                if !out.is_empty() {
+                    return Some((Ok(Bytes::from(out)), scan));
                 }
             }
         },
@@ -1855,6 +1882,37 @@ mod tests {
                                     ));
                                     reply
                                 }
+                                // `/stream-read` with what is stored split around the gate: its first half before.
+                                "/stream-split" => {
+                                    let held = held.clone();
+                                    let stored = held.stored.lock().unwrap().clone();
+                                    let (head, tail) = stored.split_at(stored.len() / 2);
+                                    let (head, tail) = (head.to_string(), tail.to_string());
+                                    let chunks = futures_util::stream::unfold(0u8, move |step| {
+                                        let held = held.clone();
+                                        let (head, tail) = (head.clone(), tail.clone());
+                                        async move {
+                                            match step {
+                                                0 => {
+                                                    let mut lead = vec![b'.'; STREAM_LEAD];
+                                                    lead.extend_from_slice(head.as_bytes());
+                                                    Some((Bytes::from(lead), 1))
+                                                }
+                                                1 => {
+                                                    held.arrived.notify_one();
+                                                    held.gate.notified().await;
+                                                    Some((Bytes::from(format!("{tail} end")), 2))
+                                                }
+                                                _ => None,
+                                            }
+                                        }
+                                    });
+                                    let mut reply = text(StatusCode::OK, "");
+                                    *reply.body_mut() = BodyExt::boxed(StreamBody::new(
+                                        chunks.map(|chunk| Ok::<_, BoxError>(Frame::data(chunk))),
+                                    ));
+                                    reply
+                                }
                                 _ => text(StatusCode::OK, "upstream ok"),
                             })
                         }
@@ -2174,6 +2232,72 @@ mod tests {
             response_body(&response).starts_with("echo Bearer "),
             "{response}"
         );
+    }
+
+    /// A value bound while a response streams, whose first half the guest already has (the host's binding had no
+    /// value, so nothing was held back): the second half, sent after the binding took effect, is replaced.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_rest_of_a_value_bound_mid_stream_is_scrubbed_though_its_start_was_sent() {
+        const VALUE: &str = "ghp_straddlesecret1234";
+        let (head, tail) = VALUE.split_at(VALUE.len() / 2);
+        let policy = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST)],
+        };
+        // `svc` resolves to nothing: the response starts with no scrubber at all
+        let resolver = StaticResolver::new().with("other", VALUE);
+        let f = fixture_with_policy(policy, CRED_HOST, resolver).await;
+        *f.upstream.held.stored.lock().unwrap() = VALUE.to_string();
+        let mut stream = open_guest(&f, f.ca_pem.as_bytes(), CRED_HOST)
+            .await
+            .unwrap();
+        stream
+            .write_all(
+                format!(
+                    "GET /stream-split HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n"
+                )
+                .as_bytes(),
+            )
+            .await
+            .unwrap();
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        while !response_body(&String::from_utf8_lossy(&received)).ends_with(head) {
+            let n = stream.read(&mut chunk).await.unwrap();
+            assert!(n > 0, "response ended early");
+            received.extend_from_slice(&chunk[..n]);
+        }
+
+        let grown = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST), bound("other", CRED_HOST)],
+        };
+        let placeholders = crate::policy::generate_placeholders(&grown);
+        rebind(&f, grown, placeholders, Vec::new());
+        f.upstream.held.gate.notify_one();
+        let _ = stream.read_to_end(&mut received).await;
+        let body = response_body(&String::from_utf8_lossy(&received));
+        let rest = body
+            .trim_start_matches('.')
+            .strip_prefix(head)
+            .unwrap_or(&body);
+        assert!(rest.ends_with(" end"), "{rest}");
+        assert!(!rest.contains(tail), "{rest}");
+        assert!(!body.contains(VALUE), "{body}");
+    }
+
+    /// A value past the length limit is never sent, so it never needs scrubbing.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_value_past_the_length_limit_is_refused() {
+        let f =
+            fixture_with_secret(&"v".repeat(crate::policy::MAX_CREDENTIAL_VALUE_BYTES + 1)).await;
+        let request = format!(
+            "GET /v1/me HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &request)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 502"), "{response}");
+        assert!(f.upstream.seen.lock().unwrap().is_empty());
     }
 
     /// A value bound to a host while a response from it streams is scrubbed from the rest of that response.
@@ -2712,7 +2836,7 @@ mod tests {
         assert!(f.upstream.seen.lock().unwrap().is_empty());
     }
 
-    /// Body of a raw HTTP/1.1 response, chunked or not.
+    /// Body of a raw HTTP/1.1 response, chunked or not, or what of it has arrived.
     fn response_body(response: &str) -> String {
         let (head, body) = response.split_once("\r\n\r\n").unwrap_or((response, ""));
         if !head
@@ -2726,6 +2850,11 @@ mod tests {
         while let Some((size, after)) = rest.split_once("\r\n") {
             let size = usize::from_str_radix(size.trim(), 16).unwrap_or(0);
             if size == 0 {
+                break;
+            }
+            // a response still arriving ends in part of a chunk
+            if after.len() < size + 2 {
+                out.push_str(&after[..size.min(after.len())]);
                 break;
             }
             out.push_str(&after[..size]);

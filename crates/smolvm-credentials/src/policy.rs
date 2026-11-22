@@ -7,6 +7,22 @@ pub use smolvm_protocol::credentials::{
 };
 use std::collections::BTreeMap;
 
+/// Longest credential value, in bytes. Bounds how much of a streamed response the interceptor keeps to scrub a value
+/// that a response carries across a chunk boundary.
+pub const MAX_CREDENTIAL_VALUE_BYTES: usize = 8 * 1024;
+
+/// Refuse a value for `binding` longer than [`MAX_CREDENTIAL_VALUE_BYTES`], with a reason naming the binding (never
+/// the value).
+pub fn check_credential_value(binding: &str, value: &str) -> Result<(), String> {
+    if value.len() > MAX_CREDENTIAL_VALUE_BYTES {
+        return Err(format!(
+            "credential '{binding}' value is {} bytes; values are limited to {MAX_CREDENTIAL_VALUE_BYTES} bytes",
+            value.len()
+        ));
+    }
+    Ok(())
+}
+
 /// Build a fresh placeholder for a binding.
 ///
 /// Placeholders are opaque and unique per machine; the interceptor matches
@@ -43,6 +59,14 @@ pub fn generate_placeholders(policy: &CredentialPolicy) -> BTreeMap<String, Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_value_past_the_limit_is_refused_naming_its_binding_only() {
+        assert!(check_credential_value("svc", &"x".repeat(MAX_CREDENTIAL_VALUE_BYTES)).is_ok());
+        let long = "y".repeat(MAX_CREDENTIAL_VALUE_BYTES + 1);
+        let why = check_credential_value("svc", &long).unwrap_err();
+        assert!(why.contains("'svc'") && why.contains("8192") && !why.contains("yyyy"));
+    }
 
     #[test]
     fn placeholders_are_prefixed_tagged_and_unique() {

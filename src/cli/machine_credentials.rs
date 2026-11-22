@@ -163,7 +163,9 @@ pub fn refresh_values(
     {
         match env(var).filter(|v| !v.is_empty()) {
             Some(value) => {
-                values.insert(name.clone(), zeroize::Zeroizing::new(value));
+                let value = zeroize::Zeroizing::new(value);
+                smolvm_credentials::check_credential_value(name, &value)?;
+                values.insert(name.clone(), value);
             }
             None => missing.push(format!("{name} (${var})")),
         }

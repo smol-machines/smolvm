@@ -15,6 +15,10 @@ pub(crate) const REDACTED: &[u8] = b"[smolvm-redacted]";
 /// Shortest form worth looking for. Anything shorter matches ordinary text.
 const MIN_FORM_LEN: usize = 8;
 
+/// Longest form of a value of at most [`MAX_CREDENTIAL_VALUE_BYTES`](crate::policy::MAX_CREDENTIAL_VALUE_BYTES)
+/// bytes: JSON escapes a control byte as six.
+pub(crate) const MAX_FORM_LEN: usize = 6 * crate::policy::MAX_CREDENTIAL_VALUE_BYTES;
+
 /// One value the interceptor may have sent the host, and the placeholder the
 /// guest knows it by, if any.
 pub(crate) struct Secret<'a> {
@@ -115,6 +119,53 @@ impl Scrubber {
         }
         out.extend_from_slice(&buf[copied..i]);
         (i, hits)
+    }
+
+    /// [`Self::scan`] for `buf` following `sent`, the input bytes already passed on just before it, perhaps under a
+    /// scrubber that did not know every value this one does. A form that began in `sent` and ends in `buf` is
+    /// matched too: what of it is in `buf` is replaced, so nothing passed on from here completes it. While such a
+    /// form might still end beyond `buf`, none of `buf` is consumed.
+    pub(crate) fn scan_after(
+        &self,
+        sent: &[u8],
+        buf: &[u8],
+        last: bool,
+        out: &mut Vec<u8>,
+    ) -> (usize, usize) {
+        let lead = sent.len().min(self.overlap());
+        if lead == 0 {
+            return self.scan(buf, last, out);
+        }
+        let mut joined = Vec::with_capacity(lead + buf.len());
+        joined.extend_from_slice(&sent[sent.len() - lead..]);
+        joined.extend_from_slice(buf);
+        // A position is checked only with a whole form's worth of bytes after it.
+        let limit = if last {
+            joined.len()
+        } else {
+            joined.len().saturating_sub(self.overlap())
+        };
+        if limit < lead {
+            return (0, 0);
+        }
+        let swallowed = (0..lead)
+            .filter(|&i| self.first_bytes[joined[i] as usize])
+            .filter_map(|i| {
+                self.patterns
+                    .iter()
+                    .filter(|p| joined[i..].starts_with(&p.needle))
+                    .map(|p| i + p.needle.len())
+                    .max()
+            })
+            .filter(|&end| end > lead)
+            .max()
+            .map_or(0, |end| end - lead);
+        if swallowed == 0 {
+            return self.scan(buf, last, out);
+        }
+        out.extend_from_slice(REDACTED);
+        let (used, hits) = self.scan(&buf[swallowed..], last, out);
+        (swallowed + used, hits + 1)
     }
 
     /// Scrub a complete value. `None` when nothing in it matched.
@@ -324,6 +375,34 @@ mod tests {
                 "chunk size {chunk}"
             );
         }
+    }
+
+    #[test]
+    fn the_rest_of_a_value_begun_in_what_was_passed_on_is_replaced() {
+        let s = scrubber("ghp_straddlesecret1234", Some("SMOL_PLACEHOLDER_X_1"));
+        let sent = b"lead ghp_straddl";
+        let mut out = Vec::new();
+        // not enough after the start yet to tell: nothing passes
+        assert_eq!(s.scan_after(sent, b"esecr", false, &mut out), (0, 0));
+        assert!(out.is_empty());
+        let rest = b"esecret1234 and the tail goes on past the overlap";
+        let (used, hits) = s.scan_after(sent, rest, false, &mut out);
+        assert_eq!(hits, 1);
+        let mut carry = rest[used..].to_vec();
+        let (_, _) = s.scan(&carry, true, &mut out);
+        carry.clear();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("[smolvm-redacted] and the tail"), "{out}");
+        assert!(!out.contains("esecret1234"), "{out}");
+        // nothing begun before: the same as `scan`
+        let mut plain = Vec::new();
+        let mut after = Vec::new();
+        let body = b"x ghp_straddlesecret1234 y";
+        assert_eq!(
+            s.scan(body, true, &mut plain),
+            s.scan_after(b"unrelated text before it", body, true, &mut after)
+        );
+        assert_eq!(plain, after);
     }
 
     #[test]
