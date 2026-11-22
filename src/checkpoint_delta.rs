@@ -559,12 +559,10 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     let lazy = crate::lazy_disk::enabled();
     #[cfg(not(unix))]
     let lazy = false;
-    let skip = |path: &str| {
-        #[cfg(unix)]
-        return lazy && crate::lazy_disk::is_lazy_asset(path);
-        #[cfg(not(unix))]
-        return false;
-    };
+    #[cfg(unix)]
+    let skip = |path: &str| lazy && crate::lazy_disk::is_lazy_asset(path);
+    #[cfg(not(unix))]
+    let skip = |_: &str| false;
     let materialized = store::materialize_over_except(
         &imported.directory,
         &partial,
