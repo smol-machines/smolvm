@@ -333,6 +333,13 @@ mod tests {
             crate::process::build_seccomp_program(true, false).expect("build seccomp program");
         seccompiler::apply_filter(&program).expect("apply seccomp filter");
         let mut snapshot = Snapshot::new().expect("open snapshot");
+        // A real workspace outgrows the snapshot's page cache and SQLite spills
+        // it to a temporary file, which is where its VFS reaches stat(3). One
+        // page makes this small tree spill the same way.
+        snapshot
+            .db
+            .execute_batch("PRAGMA cache_size=1;")
+            .expect("shrink cache");
         let stop = AtomicBool::new(false);
         let mut changes = 0_usize;
         snapshot
@@ -355,10 +362,10 @@ mod tests {
     #[test]
     fn reconcile_runs_under_the_vmm_seccomp_filter() {
         let dir = tempfile::tempdir().unwrap();
-        for d in 0..3 {
+        for d in 0..4 {
             let sub = dir.path().join(format!("d{d}"));
             std::fs::create_dir(&sub).unwrap();
-            for f in 0..20 {
+            for f in 0..100 {
                 std::fs::write(sub.join(f.to_string()), b"x").unwrap();
             }
         }
