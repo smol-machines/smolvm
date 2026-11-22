@@ -6703,7 +6703,7 @@ pub async fn put_credential_bindings(
     request_body = CredentialValuesRequest,
     responses(
         (status = 204, description = "Values held for the machine's next boot, and in use at once on a running machine"),
-        (status = 400, description = "A value names no binding of the machine", body = ApiErrorResponse),
+        (status = 400, description = "A value names no binding of the machine, or is longer than 8192 bytes", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
         (status = 409, description = "The machine runs but could not take the values; they still apply from its next boot", body = ApiErrorResponse)
     )
@@ -6726,6 +6726,9 @@ pub async fn put_credential_values(
         return Err(ApiError::BadRequest(format!(
             "machine '{name}' has no credential binding '{unknown}'"
         )));
+    }
+    for (binding, value) in &req.values {
+        smolvm_credentials::check_credential_value(binding, value).map_err(ApiError::BadRequest)?;
     }
     let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = req
         .values

@@ -154,6 +154,16 @@ Full detail in `references/traps.md`.
   binds. `references/traps.md` has both.
 - **Port 80 is not intercepted.** Plaintext HTTP is relayed untouched, so a placeholder there
   travels as the literal string and the API sees garbage.
+- **A value longer than 8 KiB (8192 bytes) is refused.** `machine credentials refresh` and
+  `add`, `PUT …/credential-values` (`400`) and the embedded runtime refuse it with a message
+  naming the binding; read from a variable or file at request time, it fails every request to
+  the bound host with `502 smolvm credentials: credential unavailable`, and the host log says
+  `values are limited to 8192 bytes`.
+- **A host stays on the interceptor until the machine stops, once any binding has covered it.**
+  Removing the binding live stops substitution but not interception, so responses are still
+  scrubbed of values sent there: the host stays HTTP/1.1 only, with WebSocket upgrades and gRPC
+  refused and `br` or `zstd` responses answered `502`. Restart the machine to relay it untouched
+  again.
 - **The machine's CA is the only one the guest trusts for the bound host.** curl, Python, Node,
   Deno and Git pick it up from the variables smolvm sets; a client with its own trust store needs
   `/run/smol/credentials/ca.pem` added.

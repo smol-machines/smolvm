@@ -1949,7 +1949,7 @@
             "description": "Values held for the machine's next boot, and in use at once on a running machine"
           },
           "400": {
-            "description": "A value names no binding of the machine",
+            "description": "A value names no binding of the machine, or is longer than 8192 bytes",
             "content": {
               "application/json": {
                 "schema": {

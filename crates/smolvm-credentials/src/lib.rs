@@ -21,9 +21,10 @@ mod scrub;
 pub use smolvm_protocol::sni;
 
 pub use ca::MachineCa;
-pub use intercept::{Interceptor, InterceptorConfig, InterceptorControl};
+pub use intercept::{Interceptor, InterceptorConfig, InterceptorControl, PreparedBindings};
 pub use policy::{
-    generate_placeholders, CredentialBinding, CredentialPolicy, InjectionLocation, PolicyError,
+    check_credential_value, generate_placeholders, CredentialBinding, CredentialPolicy,
+    InjectionLocation, PolicyError, MAX_CREDENTIAL_VALUE_BYTES,
 };
 pub use resolver::{CredentialRequest, CredentialResolver, ResolveError, StaticResolver};
 pub use smolvm_protocol::InterceptEndpoint;

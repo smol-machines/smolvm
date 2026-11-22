@@ -537,8 +537,10 @@ struct LiveBindings {
 /// `{"values":{"<binding>":"<value>",…}}` or `{"bindings":{"policy":…,"placeholders":…}}` and gets back `ok` or
 /// `error: <reason>`. Values replace those the machine resolves for the bindings named, from its next request on; a
 /// name that is not a binding changes nothing. Bindings replace the machine's bindings: an added one resolves from
-/// its variable (or a value handed over after it), a removed one is no longer intercepted and its values are
-/// dropped, and a CA the caller added for a new host signs that host from the next connection.
+/// its variable (or a value handed over after it), a removed one is no longer substituted (its hosts stay
+/// intercepted, their responses checked for the values sent there), and a CA the caller added for a new host signs
+/// that host from the next connection. A change is refused, the running machine keeping its bindings, if connections
+/// already spliced to a host it covers do not end in time or another change is being applied.
 fn serve_live_values(
     vm_dir: &Path,
     policy: &CredentialPolicy,
@@ -574,6 +576,9 @@ fn serve_live_values(
                 let Some(change) = change.as_ref() else {
                     return Err("this machine cannot change its bindings while it runs".to_string());
                 };
+                // Ends the connections spliced to hosts the new bindings cover first, or refuses with nothing
+                // changed.
+                let prepared = change.control.prepare(&next.policy)?;
                 let names: Vec<String> = next
                     .policy
                     .credentials
@@ -592,7 +597,7 @@ fn serve_live_values(
                 live.lock()
                     .unwrap_or_else(|e| e.into_inner())
                     .retain(|name, _| names.contains(name));
-                change.control.update(
+                prepared.commit(
                     next.policy,
                     next.placeholders,
                     load_extra_cas(&change.ca_dir, &change.ca_owner),
@@ -603,6 +608,9 @@ fn serve_live_values(
             let known = bindings.lock().unwrap_or_else(|e| e.into_inner()).clone();
             if let Some(unknown) = request.values.keys().find(|k| !known.contains(k)) {
                 return Err(format!("no credential binding '{unknown}'"));
+            }
+            for (binding, value) in &request.values {
+                smolvm_credentials::check_credential_value(binding, value)?;
             }
             if request.values.is_empty() {
                 return Ok(());

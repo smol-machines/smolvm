@@ -165,6 +165,14 @@ new value without a restart. A value naming no binding of the machine is
 refused, and a running machine that cannot take values live (one started before
 live values were supported) fails the call while keeping them for its next start.
 
+A value may be at most 8 KiB (8192 bytes). A longer one is refused where it is
+supplied: `machine credentials refresh` and `add`, `PUT …/credential-values`
+(`400`), the embedded runtime, and a value handed to a running machine. Read
+from a variable or file when a request needs it, a longer value fails that
+request with the `502` below and is never sent. The limit bounds how much of a
+streamed response the host keeps to scrub a value that arrives split across
+chunks.
+
 Embedders resolve however they like: the engine asks a `CredentialResolver`
 with the machine name, binding name, destination host and port, method and
 path, and expects the raw value back. See `crates/smolvm-credentials`.
@@ -213,6 +221,21 @@ the destination. The interceptor reads the TLS server name:
 - **Any other host**: the bytes are relayed untouched. The guest sees the real
   server's certificate, and a placeholder in such a request is just a string.
 
+Bindings changed while the machine runs apply from the next request. A host a
+removed binding allowed stays intercepted until the machine stops, with nothing
+substituted and its old placeholder refused, so its responses are still
+scrubbed of values sent there. It keeps the limits of an intercepted host
+(below): HTTP/1.1 only, no WebSocket upgrades or gRPC, and a `br` or `zstd`
+response refused. Connections relayed untouched to a host that a new binding
+allows are closed before the binding takes effect. If one does not close within
+two seconds, or another change is still being applied, the running machine
+keeps its current bindings and the call fails (`409` over the API), but the new
+bindings are already saved: they apply from the machine's next start, and until
+then a new `exec` session gets the new placeholders, which the running machine
+refuses (`403`, unknown placeholder). Retry the change, or restart the machine.
+A value bound while a response streams is scrubbed from the rest of that
+response.
+
 Refused with a `403` and a one-line reason in the body:
 
 - a placeholder in the path or query string, or in a request body when the
@@ -228,7 +251,7 @@ is refused with a `415`.
 
 `502 smolvm credentials: credential unavailable` means the host could not
 resolve the binding — the variable is unset, the file is missing or
-unreadable, or the value has control characters. Details are in the machine's
+unreadable, the value has control characters, or it is longer than 8 KiB. Details are in the machine's
 host log, never in the response.
 
 A request to an allowed host that carries no placeholder is forwarded as is.

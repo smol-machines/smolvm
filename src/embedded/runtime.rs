@@ -1451,6 +1451,10 @@ impl EmbeddedRuntime {
                     format!("machine '{name}' has no credential binding '{unknown}'"),
                 ));
             }
+            for (binding, value) in &values {
+                smolvm_credentials::check_credential_value(binding, value)
+                    .map_err(|why| Error::config("credentials", why))?;
+            }
             let values: std::collections::BTreeMap<String, zeroize::Zeroizing<String>> = values
                 .into_iter()
                 .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
@@ -1491,6 +1495,10 @@ impl EmbeddedRuntime {
                     "credentials",
                     format!("the new bindings of machine '{name}' have no binding '{unknown}'"),
                 ));
+            }
+            for (binding, value) in &values {
+                smolvm_credentials::check_credential_value(binding, value)
+                    .map_err(|why| Error::config("credentials", why))?;
             }
             let set = crate::credentials::set_bindings_in(&self.db, name, policy)?;
             let keep: Vec<&str> = bindings.iter().map(String::as_str).collect();

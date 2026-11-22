@@ -15,6 +15,10 @@ pub(crate) const REDACTED: &[u8] = b"[smolvm-redacted]";
 /// Shortest form worth looking for. Anything shorter matches ordinary text.
 const MIN_FORM_LEN: usize = 8;
 
+/// Longest form of a value of at most [`MAX_CREDENTIAL_VALUE_BYTES`](crate::policy::MAX_CREDENTIAL_VALUE_BYTES)
+/// bytes: JSON escapes a control byte as six.
+pub(crate) const MAX_FORM_LEN: usize = 6 * crate::policy::MAX_CREDENTIAL_VALUE_BYTES;
+
 /// One value the interceptor may have sent the host, and the placeholder the
 /// guest knows it by, if any.
 pub(crate) struct Secret<'a> {
@@ -22,30 +26,33 @@ pub(crate) struct Secret<'a> {
     pub placeholder: Option<&'a str>,
 }
 
-struct Pattern {
-    needle: Zeroizing<Vec<u8>>,
-    replacement: Vec<u8>,
-}
-
-/// Replaces every known form of a set of secrets.
+/// Replaces every known form of a set of secrets, in time linear in what it
+/// scans however many forms it knows.
 pub(crate) struct Scrubber {
-    /// Longest first, so the longest form at a position wins.
-    patterns: Vec<Pattern>,
-    first_bytes: [bool; 256],
+    /// Every form, matched leftmost-longest: the longest form starting at the
+    /// first position where any starts wins, as a scan form by form would pick.
+    matcher: aho_corasick::AhoCorasick,
+    /// What replaces each form, by its pattern id.
+    replacements: Vec<Vec<u8>>,
     longest: usize,
+    /// The values whose forms it knows, sorted.
+    values: Vec<Zeroizing<Vec<u8>>>,
 }
 
 impl Scrubber {
-    /// `None` when no secret has a form long enough to look for.
-    pub(crate) fn new(secrets: &[Secret<'_>]) -> Option<Self> {
-        let mut patterns: Vec<Pattern> = Vec::new();
-        for secret in secrets {
+    /// `None` when no secret has a form long enough to look for. An error means the forms could not be compiled
+    /// into a matcher: the caller must not pass the response on unchecked.
+    pub(crate) fn new(secrets: &[Secret<'_>]) -> Result<Option<Self>, aho_corasick::BuildError> {
+        // (form, replacement, which secret): sorted and deduplicated so the
+        // first secret giving a form decides what replaces it.
+        let mut forms_found: Vec<(Zeroizing<Vec<u8>>, Vec<u8>, usize)> = Vec::new();
+        for (order, secret) in secrets.iter().enumerate() {
             let restored = secret
                 .placeholder
                 .map(|p| p.as_bytes().to_vec())
                 .unwrap_or_else(|| REDACTED.to_vec());
             for (needle, raw) in forms(secret.value) {
-                if needle.len() < MIN_FORM_LEN || patterns.iter().any(|p| *p.needle == *needle) {
+                if needle.len() < MIN_FORM_LEN {
                     continue;
                 }
                 // Only the value exactly as sent maps back to its placeholder;
@@ -55,26 +62,39 @@ impl Scrubber {
                 } else {
                     REDACTED.to_vec()
                 };
-                patterns.push(Pattern {
-                    needle,
-                    replacement,
-                });
+                forms_found.push((needle, replacement, order));
             }
         }
-        if patterns.is_empty() {
-            return None;
+        if forms_found.is_empty() {
+            return Ok(None);
         }
-        patterns.sort_by_key(|p| std::cmp::Reverse(p.needle.len()));
-        let mut first_bytes = [false; 256];
-        for pattern in &patterns {
-            first_bytes[pattern.needle[0] as usize] = true;
-        }
-        let longest = patterns[0].needle.len();
-        Some(Self {
-            patterns,
-            first_bytes,
+        forms_found.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        forms_found.dedup_by(|later, kept| later.0 == kept.0);
+        let longest = forms_found.iter().map(|f| f.0.len()).max().unwrap_or(0);
+        let matcher = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .start_kind(aho_corasick::StartKind::Both)
+            .build(forms_found.iter().map(|f| f.0.as_slice()))?;
+        let replacements = forms_found.into_iter().map(|f| f.1).collect();
+        let mut values: Vec<Zeroizing<Vec<u8>>> = secrets
+            .iter()
+            .map(|s| Zeroizing::new(s.value.to_vec()))
+            .collect();
+        values.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        values.dedup_by(|a, b| a.as_slice() == b.as_slice());
+        Ok(Some(Self {
+            matcher,
+            replacements,
             longest,
-        })
+            values,
+        }))
+    }
+
+    /// Whether this scrubber looks for every form of `value`.
+    pub(crate) fn covers(&self, value: &[u8]) -> bool {
+        self.values
+            .binary_search_by(|known| known.as_slice().cmp(value))
+            .is_ok()
     }
 
     /// Bytes a streaming caller must hold back after each chunk: a form may
@@ -93,28 +113,64 @@ impl Scrubber {
         } else {
             buf.len().saturating_sub(self.overlap())
         };
-        let mut i = 0;
         let mut copied = 0;
         let mut hits = 0;
-        while i < limit {
-            if self.first_bytes[buf[i] as usize] {
-                if let Some(pattern) = self
-                    .patterns
-                    .iter()
-                    .find(|p| buf[i..].starts_with(&p.needle))
-                {
-                    out.extend_from_slice(&buf[copied..i]);
-                    out.extend_from_slice(&pattern.replacement);
-                    i += pattern.needle.len();
-                    copied = i;
-                    hits += 1;
-                    continue;
-                }
+        // A form starting before `limit` has all its bytes in `buf`, so it is
+        // found exactly as it would be with the next chunk joined on.
+        for found in self.matcher.find_iter(buf) {
+            if found.start() >= limit {
+                break;
             }
-            i += 1;
+            out.extend_from_slice(&buf[copied..found.start()]);
+            out.extend_from_slice(&self.replacements[found.pattern().as_usize()]);
+            copied = found.end();
+            hits += 1;
         }
-        out.extend_from_slice(&buf[copied..i]);
-        (i, hits)
+        let used = copied.max(limit);
+        out.extend_from_slice(&buf[copied..used]);
+        (used, hits)
+    }
+
+    /// [`Self::scan`] for `buf` following `sent`, the input bytes already passed on just before it, perhaps under a
+    /// scrubber that did not know every value this one does. A form that began in `sent` and ends in `buf` is
+    /// matched too: what of it is in `buf` is replaced, so nothing passed on from here completes it. While such a
+    /// form might still end beyond `buf`, none of `buf` is consumed.
+    pub(crate) fn scan_after(
+        &self,
+        sent: &[u8],
+        buf: &[u8],
+        last: bool,
+        out: &mut Vec<u8>,
+    ) -> (usize, usize) {
+        let lead = sent.len().min(self.overlap());
+        if lead == 0 {
+            return self.scan(buf, last, out);
+        }
+        // A position in `sent` is checked only with a whole form's worth of bytes after it.
+        if !last && buf.len() < self.overlap() {
+            return (0, 0);
+        }
+        // Only what a form begun in `sent` can reach.
+        let reach = buf.len().min(lead + self.overlap());
+        let mut joined = Vec::with_capacity(lead + reach);
+        joined.extend_from_slice(&sent[sent.len() - lead..]);
+        joined.extend_from_slice(&buf[..reach]);
+        let swallowed = (0..lead)
+            .filter_map(|i| {
+                let input = aho_corasick::Input::new(&joined)
+                    .range(i..)
+                    .anchored(aho_corasick::Anchored::Yes);
+                self.matcher.find(input).map(|found| found.end())
+            })
+            .filter(|&end| end > lead)
+            .max()
+            .map_or(0, |end| end - lead);
+        if swallowed == 0 {
+            return self.scan(buf, last, out);
+        }
+        out.extend_from_slice(REDACTED);
+        let (used, hits) = self.scan(&buf[swallowed..], last, out);
+        (swallowed + used, hits + 1)
     }
 
     /// Scrub a complete value. `None` when nothing in it matched.
@@ -233,6 +289,7 @@ mod tests {
             value: value.as_bytes(),
             placeholder,
         }])
+        .unwrap()
         .expect("patterns")
     }
 
@@ -286,6 +343,7 @@ mod tests {
             value: secret,
             placeholder: None,
         }])
+        .unwrap()
         .unwrap();
         for prefix in ["", "a", "ab", "abc", "Authorization: Basic "] {
             let mut plain = prefix.as_bytes().to_vec();
@@ -327,11 +385,137 @@ mod tests {
     }
 
     #[test]
+    fn the_rest_of_a_value_begun_in_what_was_passed_on_is_replaced() {
+        let s = scrubber("ghp_straddlesecret1234", Some("SMOL_PLACEHOLDER_X_1"));
+        let sent = b"lead ghp_straddl";
+        let mut out = Vec::new();
+        // not enough after the start yet to tell: nothing passes
+        assert_eq!(s.scan_after(sent, b"esecr", false, &mut out), (0, 0));
+        assert!(out.is_empty());
+        let rest = b"esecret1234 and the tail goes on past the overlap";
+        let (used, hits) = s.scan_after(sent, rest, false, &mut out);
+        assert_eq!(hits, 1);
+        let mut carry = rest[used..].to_vec();
+        let (_, _) = s.scan(&carry, true, &mut out);
+        carry.clear();
+        let out = String::from_utf8(out).unwrap();
+        assert!(out.starts_with("[smolvm-redacted] and the tail"), "{out}");
+        assert!(!out.contains("esecret1234"), "{out}");
+        // nothing begun before: the same as `scan`
+        let mut plain = Vec::new();
+        let mut after = Vec::new();
+        let body = b"x ghp_straddlesecret1234 y";
+        assert_eq!(
+            s.scan(body, true, &mut plain),
+            s.scan_after(b"unrelated text before it", body, true, &mut after)
+        );
+        assert_eq!(plain, after);
+    }
+
+    /// Form by form, longest first at each position: what the matcher must agree with.
+    fn naive_scrub(secrets: &[Secret<'_>], body: &[u8]) -> Vec<u8> {
+        let mut patterns: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for secret in secrets {
+            let restored = secret
+                .placeholder
+                .map(|p| p.as_bytes().to_vec())
+                .unwrap_or_else(|| REDACTED.to_vec());
+            for (needle, raw) in forms(secret.value) {
+                if needle.len() >= MIN_FORM_LEN && !patterns.iter().any(|p| *p.0 == *needle) {
+                    let replacement = if raw {
+                        restored.clone()
+                    } else {
+                        REDACTED.to_vec()
+                    };
+                    patterns.push((needle.to_vec(), replacement));
+                }
+            }
+        }
+        patterns.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            match patterns.iter().find(|p| body[i..].starts_with(&p.0)) {
+                Some((needle, replacement)) => {
+                    out.extend_from_slice(replacement);
+                    i += needle.len();
+                }
+                None => {
+                    out.push(body[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn many_values_are_found_as_a_form_by_form_scan_would_in_any_chunking() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        // shared prefixes, one value inside another, a scheme, and characters that encode
+        let mut values: Vec<String> = (0..48)
+            .map(|i| {
+                let mut v = if i % 2 == 0 { "sk-proj-" } else { "ghp_" }.to_string();
+                for _ in 0..(12 + next() % 30) {
+                    v.push(ALNUM[(next() % 62) as usize] as char);
+                }
+                v
+            })
+            .collect();
+        values.push(format!("{}XYZ", values[0]));
+        values.push(format!("Bearer {}", values[1]));
+        values.push("pa\"ss/w\\rd+&=12".to_string());
+        let placeholders: Vec<String> = (0..values.len())
+            .map(|i| format!("SMOL_PLACEHOLDER_V_{i}"))
+            .collect();
+        let secrets: Vec<Secret<'_>> = values
+            .iter()
+            .zip(&placeholders)
+            .enumerate()
+            .map(|(i, (v, p))| Secret {
+                value: v.as_bytes(),
+                placeholder: (i % 3 != 0).then_some(p.as_str()),
+            })
+            .collect();
+        let s = Scrubber::new(&secrets).unwrap().unwrap();
+        let mut body = Vec::new();
+        for i in 0..400 {
+            let v = values[(next() as usize) % values.len()].as_bytes();
+            match i % 5 {
+                0 => body.extend_from_slice(v),
+                1 => body.extend_from_slice(&v[..v.len() / 2]),
+                2 => body.extend_from_slice(standard_b64(v).as_bytes()),
+                _ => body.extend((0..(next() % 20)).map(|_| ALNUM[(next() % 62) as usize])),
+            }
+        }
+        let expected = naive_scrub(&secrets, &body);
+        assert_eq!(s.scrub(&body).unwrap_or_else(|| body.clone()), expected);
+        for chunk in [1, 7, 64, 1000] {
+            let (mut carry, mut out) = (Vec::new(), Vec::new());
+            for piece in body.chunks(chunk) {
+                carry.extend_from_slice(piece);
+                let (used, _) = s.scan(&carry, false, &mut out);
+                carry.drain(..used);
+            }
+            s.scan(&carry, true, &mut out);
+            assert_eq!(out, expected, "chunk size {chunk}");
+        }
+        assert!(values.iter().all(|v| s.covers(v.as_bytes())));
+        assert!(!s.covers(b"not-a-value-at-all"));
+    }
+
+    #[test]
     fn short_values_are_not_looked_for() {
         assert!(Scrubber::new(&[Secret {
             value: b"abc",
             placeholder: None
         }])
+        .unwrap()
         .is_none());
     }
 }

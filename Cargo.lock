@@ -4430,6 +4430,7 @@ dependencies = [
 name = "smolvm-credentials"
 version = "1.36.1"
 dependencies = [
+ "aho-corasick",
  "anyhow",
  "base64 0.22.1",
  "bytes",
