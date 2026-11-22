@@ -137,9 +137,43 @@ pub fn save_ca(ca: &MachineCa, ca_dir: &Path) -> Result<()> {
     ca.save_to(&HostCaFiles::at(ca_dir)).map_err(ca_err)
 }
 
-/// The CAs added to `ca_dir` for hosts its machine CA does not permit, oldest first.
-pub fn load_extra_cas(ca_dir: &Path, owner: &str) -> Vec<MachineCa> {
-    let files = HostCaFiles::at(ca_dir);
+/// File in a CA directory that serializes adding CAs to it: the CLI, an API server, embedders and boot processes may
+/// each add CAs to a directory machines share (a golden and its branches share their golden's).
+const CA_LOCK_FILE: &str = "ca.lock";
+
+/// How long adding a CA waits for another add to the same directory: an add holds the lock for a key generation and
+/// a few small writes, so a holder past this is stuck.
+const CA_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Hold [`CA_LOCK_FILE`] of `files` while CAs are added to it, so two changes never both mint a CA for one host nor
+/// take one index. The lock file is reached without following a link and created for the directory's owner.
+fn lock_ca_dir(files: &HostCaFiles) -> Result<std::fs::File> {
+    let fail = |e: std::io::Error| Error::agent("credential CA lock", e.to_string());
+    let file = crate::nofollow::open_lock_file(&files.base, &files.components(&[CA_LOCK_FILE]))
+        .map_err(fail)?;
+    let deadline = std::time::Instant::now() + CA_LOCK_TIMEOUT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(50))
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                return Err(Error::agent_conflict(
+                    "credential CA lock",
+                    format!(
+                        "another change has held the credential CAs for over {}s; try again once it finishes",
+                        CA_LOCK_TIMEOUT.as_secs()
+                    ),
+                ))
+            }
+            Err(std::fs::TryLockError::Error(e)) => return Err(fail(e)),
+        }
+    }
+}
+
+/// The names of the directories in `ca_dir` holding added CAs, by index, whether or not each holds a readable CA.
+fn extra_dirs(files: &HostCaFiles) -> Vec<(u32, String)> {
     let mut dirs: Vec<(u32, String)> =
         crate::nofollow::list(&files.base, &files.components(&[EXTRA_CA_DIR]))
             .unwrap_or_default()
@@ -147,38 +181,111 @@ pub fn load_extra_cas(ca_dir: &Path, owner: &str) -> Vec<MachineCa> {
             .filter_map(|name| Some((name.parse().ok()?, name)))
             .collect();
     dirs.sort();
-    dirs.into_iter()
+    dirs
+}
+
+/// The CAs added to `ca_dir` for hosts its machine CA does not permit, oldest first.
+pub fn load_extra_cas(ca_dir: &Path, owner: &str) -> Vec<MachineCa> {
+    let files = HostCaFiles::at(ca_dir);
+    extra_dirs(&files)
+        .into_iter()
         .filter_map(|(_, dir)| {
             MachineCa::load_from(&files.below(&[EXTRA_CA_DIR, &dir]), owner).ok()
         })
         .collect()
 }
 
+/// Save `ca` as the newest CA added to `files`, at the first index past every one taken (one whose CA is unreadable
+/// keeps its index too, so no CA is ever overwritten). Called under [`lock_ca_dir`], which keeps two adds from taking
+/// one index.
+fn save_extra_ca(files: &HostCaFiles, ca: &MachineCa) -> Result<()> {
+    let index = extra_dirs(files)
+        .last()
+        .map_or(0, |(index, _)| index.saturating_add(1));
+    ca.save_to(&files.below(&[EXTRA_CA_DIR, &index.to_string()]))
+        .map_err(ca_err)
+}
+
+/// PEM certificates, one after another, as the guest's CA bundle holds them.
+fn pem_bundle<'a>(certificates: impl IntoIterator<Item = &'a str>) -> String {
+    let mut bundle = String::new();
+    for pem in certificates {
+        if !bundle.is_empty() && !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+        bundle.push_str(pem);
+    }
+    bundle
+}
+
+/// The certificates of a PEM bundle, each trimmed, to compare one bundle's with another's.
+fn pem_certificates(bundle: &str) -> Vec<&str> {
+    const END: &str = "-----END CERTIFICATE-----";
+    bundle
+        .split_inclusive(END)
+        .map(str::trim)
+        .filter(|pem| pem.ends_with(END))
+        .collect()
+}
+
+/// The CAs of a lineage's directory as [`add_cas_for`] left them.
+struct CaSet {
+    primary: MachineCa,
+    extras: Vec<MachineCa>,
+    /// A CA was added for a host none permitted.
+    added: bool,
+}
+
+impl CaSet {
+    /// The guest's CA bundle: the machine CA followed by every added one.
+    fn bundle(&self) -> String {
+        pem_bundle(
+            std::iter::once(self.primary.certificate_pem())
+                .chain(self.extras.iter().map(|ca| ca.certificate_pem())),
+        )
+    }
+
+    /// The CAs as a guest's trust needs them, the machine CA first.
+    fn lineage(&self) -> Vec<LineageCa> {
+        std::iter::once(LineageCa {
+            certificate: self.primary.certificate_pem().to_string(),
+            permitted: None,
+        })
+        .chain(self.extras.iter().map(|ca| LineageCa {
+            certificate: ca.certificate_pem().to_string(),
+            permitted: Some(ca.permitted().to_vec()),
+        }))
+        .collect()
+    }
+}
+
 /// Make every host `policy` binds signable by a CA the guest trusts: a host no CA in `ca_dir` permits gets a new CA
 /// of its own, name-constrained to just the uncovered hosts (the machine CA's constraint is never widened), and the
 /// guest's `ca.pem` becomes the machine CA followed by every added one. A machine CA saved before it recorded its
-/// hosts permits the hosts `generated_for` binds. True when a CA was added, so a running guest must rebuild its trust.
+/// hosts permits the hosts `generated_for` binds. True when a CA was added.
 pub fn ensure_cas_for(
     ca_dir: &Path,
     owner: &str,
     policy: &CredentialPolicy,
     generated_for: &CredentialPolicy,
 ) -> Result<bool> {
-    add_cas_for(ca_dir, owner, policy, generated_for).map(|bundle| bundle.is_some())
+    add_cas_for(ca_dir, owner, policy, generated_for).map(|set| set.is_some_and(|set| set.added))
 }
 
-/// [`ensure_cas_for`], returning the guest's CA bundle as written when a CA was added: what a running guest is
-/// handed, never read back from a directory its user could have changed since.
+/// [`ensure_cas_for`], returning the CAs as it loaded and added them, so what a running guest is handed is never read
+/// back from a directory its user could have changed since. `None` when the directory holds no CA yet.
 fn add_cas_for(
     ca_dir: &Path,
     owner: &str,
     policy: &CredentialPolicy,
     generated_for: &CredentialPolicy,
-) -> Result<Option<String>> {
+) -> Result<Option<CaSet>> {
     let files = HostCaFiles::at(ca_dir);
     if !MachineCa::exists_in(&files) {
         return Ok(None);
     }
+    // whoever held it may have just added the CA this change needs
+    let _lock = lock_ca_dir(&files)?;
     MachineCa::record_permitted_if_missing_in(&files, &binding_subtrees(generated_for))
         .map_err(ca_err)?;
     let primary = MachineCa::load_from(&files, owner).map_err(ca_err)?;
@@ -190,36 +297,282 @@ fn add_cas_for(
     let added = !uncovered.is_empty();
     if added {
         let ca = MachineCa::generate(owner, &uncovered).map_err(ca_err)?;
-        ca.save_to(&files.below(&[EXTRA_CA_DIR, &extras.len().to_string()]))
-            .map_err(ca_err)?;
+        save_extra_ca(&files, &ca)?;
         extras.push(ca);
     }
-    if extras.is_empty() {
-        return Ok(None);
+    let set = CaSet {
+        primary,
+        extras,
+        added,
+    };
+    if !set.extras.is_empty() {
+        write_guest_bundle(&files, &set.bundle())?;
     }
-    let mut bundle = primary.certificate_pem().to_string();
-    for ca in &extras {
-        if !bundle.ends_with('\n') {
-            bundle.push('\n');
-        }
-        bundle.push_str(ca.certificate_pem());
-    }
-    write_guest_bundle(&files, &bundle)?;
-    Ok(added.then_some(bundle))
+    Ok(Some(set))
 }
 
-/// Overwrite the guest's CA bundle in `files` in place (the guest reads it through its read-only mount), never
-/// through a link, into a file with another name, or into anything but a regular file.
+/// Replace the guest's CA bundle in `files` with `bundle` whole, so a booting guest never reads part of it: written
+/// beside it and renamed over it, never through a link, and left alone when it already is that.
 fn write_guest_bundle(files: &HostCaFiles, bundle: &str) -> Result<()> {
-    crate::nofollow::write_in_place(
-        &files.base,
-        &files.components(&[
+    let path = [
+        smolvm_credentials::ca::GUEST_SUBDIR,
+        smolvm_credentials::ca::GUEST_CA_FILE,
+    ];
+    if smolvm_credentials::ca::CaFiles::read(files, &path)
+        .is_ok_and(|held| held == bundle.as_bytes())
+    {
+        return Ok(());
+    }
+    smolvm_credentials::ca::CaFiles::write(files, &path, bundle.as_bytes(), 0o644)
+        .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))
+}
+
+/// The guest's CA bundle in `ca_dir` as it is now, read without following a link; `None` when there is none.
+pub fn read_guest_bundle(ca_dir: &Path) -> Option<String> {
+    smolvm_credentials::ca::CaFiles::read(
+        &HostCaFiles::at(ca_dir),
+        &[
             smolvm_credentials::ca::GUEST_SUBDIR,
             smolvm_credentials::ca::GUEST_CA_FILE,
-        ]),
-        bundle.as_bytes(),
+        ],
     )
-    .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))
+    .ok()
+    .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Whether DNS subtrees `a` and `b` share a host: they name one domain or one lies inside the other.
+fn subtrees_overlap(a: &str, b: &str) -> bool {
+    let norm = |s: &str| {
+        s.trim_start_matches("*.")
+            .trim_end_matches('.')
+            .to_ascii_lowercase()
+    };
+    let (a, b) = (norm(a), norm(b));
+    a == b || a.ends_with(&format!(".{b}")) || b.ends_with(&format!(".{a}"))
+}
+
+/// One CA of a machine's lineage as its guest's trust needs it: the certificate, and the hosts it may sign for.
+#[derive(Clone)]
+struct LineageCa {
+    certificate: String,
+    /// The DNS subtrees it permits; `None` for the machine CA, which every guest trusts.
+    permitted: Option<Vec<String>>,
+}
+
+impl LineageCa {
+    /// Whether the interceptor may sign with it for a host inside one of `subtrees`: it is the machine CA, or it permits
+    /// a host overlapping one. A bound host is signed by the first CA permitting it, which is always such a CA.
+    fn may_sign_for(&self, subtrees: &[String]) -> bool {
+        self.permitted.as_ref().is_none_or(|permitted| {
+            permitted
+                .iter()
+                .any(|p| subtrees.iter().any(|s| subtrees_overlap(p, s)))
+        })
+    }
+}
+
+/// The CAs of `ca_dir`, the machine CA first, each read without following a link. Empty when it holds no CA yet.
+fn lineage_cas(ca_dir: &Path, owner: &str) -> Result<Vec<LineageCa>> {
+    if !ca_exists(ca_dir) {
+        return Ok(Vec::new());
+    }
+    Ok(CaSet {
+        primary: load_ca(ca_dir, owner)?,
+        extras: load_extra_cas(ca_dir, owner),
+        added: false,
+    }
+    .lineage())
+}
+
+/// The bundle of those of `cas` that `pick` selects, in order.
+fn bundle_of(cas: &[LineageCa], pick: impl Fn(usize, &LineageCa) -> bool) -> String {
+    pem_bundle(
+        cas.iter()
+            .enumerate()
+            .filter(|(index, ca)| pick(*index, ca))
+            .map(|(_, ca)| ca.certificate.as_str()),
+    )
+}
+
+/// Which of `cas` a guest trusting `trusted` (a PEM bundle; `None` when unknown) trusts: the machine CA always.
+fn trusted_cas(cas: &[LineageCa], trusted: Option<&str>) -> Vec<bool> {
+    let trusted = trusted.map(pem_certificates).unwrap_or_default();
+    cas.iter()
+        .map(|ca| ca.permitted.is_none() || trusted.contains(&ca.certificate.trim()))
+        .collect()
+}
+
+/// The CA bundle the guest of a machine bound by `policy` must trust, from the CAs in `ca_dir`: the machine CA, then
+/// each added CA the interceptor may sign with for a host `policy` binds. `None` when the directory holds no CA yet.
+pub fn guest_trust(
+    ca_dir: &Path,
+    owner: &str,
+    policy: &CredentialPolicy,
+) -> Result<Option<String>> {
+    let cas = lineage_cas(ca_dir, owner)?;
+    let bound = binding_subtrees(policy);
+    Ok((!cas.is_empty()).then(|| bundle_of(&cas, |_, ca| ca.may_sign_for(&bound))))
+}
+
+/// The trust a guest that just booted with `policy` is to have ([`guest_trust_at_boot`]).
+pub struct BootTrust {
+    /// The bundle to hand it: `None` when it already trusts exactly what its bindings need.
+    pub hand: Option<String>,
+    /// What it trusts without that bundle, to record when it is not handed one or cannot take it.
+    pub held: String,
+}
+
+/// What a guest that just booted with `policy` is to trust: exactly the CAs its bindings need ([`guest_trust`]), so a
+/// CA no binding needs leaves its trust here, at boot, where no retired binding can still be signed with it. `known`
+/// is what it is known to trust already: the CA file as it was before the boot, for a guest that read it afresh; what
+/// a paused machine's guest was last known to trust; `None` for other restored guests (a checkpoint, a branch), which
+/// are known to trust only the machine CA. `None` when the directory holds no CA.
+pub fn guest_trust_at_boot(
+    ca_dir: &Path,
+    owner: &str,
+    policy: &CredentialPolicy,
+    known: Option<&str>,
+) -> Result<Option<BootTrust>> {
+    let cas = lineage_cas(ca_dir, owner)?;
+    if cas.is_empty() {
+        return Ok(None);
+    }
+    let bound = binding_subtrees(policy);
+    let held = trusted_cas(&cas, known);
+    let needed: Vec<bool> = cas.iter().map(|ca| ca.may_sign_for(&bound)).collect();
+    Ok(Some(BootTrust {
+        hand: (held != needed).then(|| bundle_of(&cas, |index, _| needed[index])),
+        held: bundle_of(&cas, |index, _| held[index]),
+    }))
+}
+
+/// File in a machine's data directory holding the CA bundle its running guest is known to trust: what it read at boot
+/// or was last handed. A CA the interceptor may sign with is handed to the guest unless it is here.
+const GUEST_TRUST_RECORD: &str = "credential-trust.pem";
+
+/// The CA bundle `machine`'s running guest is recorded to trust, read without following a link; `None` when none is.
+pub fn recorded_guest_trust(machine: &str) -> Option<String> {
+    crate::nofollow::read(
+        &crate::agent::vm_data_dir(machine),
+        &[GUEST_TRUST_RECORD],
+        MAX_CA_FILE_BYTES,
+    )
+    .ok()
+    .and_then(|bytes| String::from_utf8(bytes).ok())
+}
+
+/// Record `bundle` as what `machine`'s running guest trusts, never writing through a link. Without a record the guest
+/// is taken to trust only the machine CA, so a failed write only means a CA is handed to it again.
+pub fn record_guest_trust(machine: &str, bundle: &str) {
+    let dir = crate::agent::vm_data_dir(machine);
+    if let Err(e) =
+        crate::nofollow::write_replacing(&dir, &[GUEST_TRUST_RECORD], bundle.as_bytes(), 0o644)
+    {
+        tracing::warn!(machine, error = %e, "could not record the credential CAs the guest trusts");
+        let _ = crate::nofollow::write_replacing(&dir, &[GUEST_TRUST_RECORD], b"", 0o644);
+    }
+}
+
+/// Every CA of `ca_dir` as one portable document, for a checkpoint whose captured guest trusts them: the machine CA's
+/// [`MachineCa::export`] with each added CA's under `extra`, oldest first, each loaded without following a link. A
+/// machine CA saved before it recorded its hosts is exported permitting those `policy` binds, as its interceptor
+/// treats it. Holds every signing key: write it only where the checkpoint itself is kept.
+pub fn export_cas(
+    ca_dir: &Path,
+    owner: &str,
+    policy: &CredentialPolicy,
+) -> Result<zeroize::Zeroizing<String>> {
+    let primary = load_ca(ca_dir, owner)?
+        .with_permitted(binding_subtrees(policy))
+        .export();
+    let extras: Vec<zeroize::Zeroizing<String>> = load_extra_cas(ca_dir, owner)
+        .iter()
+        .map(MachineCa::export)
+        .collect();
+    if extras.is_empty() {
+        return Ok(primary);
+    }
+    // reopen the one JSON object `export` writes to add the list, sized up front so no key is left in a freed buffer
+    let body = primary
+        .strip_suffix('}')
+        .ok_or_else(|| ca_err("exported CA is not one object"))?;
+    let mut document = zeroize::Zeroizing::new(String::with_capacity(
+        body.len() + extras.iter().map(|e| e.len() + 1).sum::<usize>() + 16,
+    ));
+    document.push_str(body);
+    document.push_str(",\"extra\":[");
+    for (index, extra) in extras.iter().enumerate() {
+        if index > 0 {
+            document.push(',');
+        }
+        document.push_str(extra);
+    }
+    document.push_str("]}");
+    Ok(document)
+}
+
+/// Overwrite every string in `value` (the parsed document holds signing keys).
+fn scrub_json(value: &mut serde_json::Value) {
+    use zeroize::Zeroize;
+    match value {
+        serde_json::Value::String(text) => text.zeroize(),
+        serde_json::Value::Array(items) => items.iter_mut().for_each(scrub_json),
+        serde_json::Value::Object(fields) => fields.values_mut().for_each(scrub_json),
+        _ => {}
+    }
+}
+
+/// Install a document from [`export_cas`] as the CAs of `ca_dir`, writing every file without following a link: the
+/// machine CA, each added CA the directory does not already hold (a paused machine resumed in place still holds them),
+/// and the guest's bundle of them all. A document from before added CAs travelled holds only the machine CA, and one
+/// from before CAs recorded their hosts names none: the machine CA then keeps the hosts the directory recorded for it
+/// (resumed in place), or permits those `generated_for` binds, the bindings its checkpoint was captured with.
+pub fn import_cas(document: &str, ca_dir: &Path, generated_for: &CredentialPolicy) -> Result<()> {
+    let mut primary = MachineCa::import(document).map_err(ca_err)?;
+    let mut parsed: serde_json::Value = serde_json::from_str(document).map_err(ca_err)?;
+    let extras = match parsed.get("extra") {
+        None => Ok(Vec::new()),
+        Some(serde_json::Value::Array(items)) => items
+            .iter()
+            .map(|item| MachineCa::import(&zeroize::Zeroizing::new(item.to_string())))
+            .collect::<anyhow::Result<Vec<_>>>()
+            .map_err(ca_err),
+        Some(_) => Err(ca_err("exported CA's added CAs are not a list")),
+    };
+    scrub_json(&mut parsed);
+    let extras = extras?;
+    let files = HostCaFiles::at(ca_dir);
+    let _lock = lock_ca_dir(&files)?;
+    if primary.permitted().is_empty() {
+        // every CA records the machine it was made for, so no owner is needed to load one
+        let recorded = load_ca(ca_dir, "")
+            .ok()
+            .filter(|held| held.certificate_pem() == primary.certificate_pem())
+            .map(|held| held.permitted().to_vec())
+            .filter(|hosts| !hosts.is_empty());
+        primary =
+            primary.with_permitted(recorded.unwrap_or_else(|| binding_subtrees(generated_for)));
+    }
+    primary.save_to(&files).map_err(ca_err)?;
+    let mut held = load_extra_cas(ca_dir, "");
+    for ca in extras {
+        if !held
+            .iter()
+            .any(|h| h.certificate_pem() == ca.certificate_pem())
+        {
+            save_extra_ca(&files, &ca)?;
+            held.push(ca);
+        }
+    }
+    if !held.is_empty() {
+        let set = CaSet {
+            primary,
+            extras: held,
+            added: false,
+        };
+        write_guest_bundle(&files, &set.bundle())?;
+    }
+    Ok(())
 }
 
 /// A machine's credential bindings after a change ([`plan_binding_change`]).
@@ -228,16 +581,16 @@ pub struct BindingChange {
     pub policy: CredentialPolicy,
     /// Binding name → placeholder: those of kept bindings unchanged, a new one for each added binding.
     pub placeholders: BTreeMap<String, String>,
-    /// A CA was added for a new host: a running guest must rebuild its trust before it reaches that host.
-    pub trust_changed: bool,
-    /// When the trust changed, the guest's CA bundle as just written, to hand a running guest directly.
-    pub guest_ca: Option<String>,
+    /// The bindings before the change.
+    pub before: CredentialPolicy,
+    /// The CAs of the machine's lineage once the change added any it needs, the machine CA first.
+    cas: Vec<LineageCa>,
 }
 
 /// Plan replacing `record`'s bindings with `policy`: validated against the machine's DNS allow-list as at create,
 /// placeholders kept for bindings that stay (the guest already holds them) and minted for added ones, and a CA added
 /// for any host no CA of the machine's lineage permits. Writes CA files only; the caller persists the record and
-/// hands a running machine the change.
+/// hands a running machine the change ([`hand_over_binding_change`]).
 pub fn plan_binding_change(
     machine: &str,
     record: &VmRecord,
@@ -265,12 +618,14 @@ pub fn plan_binding_change(
         .collect();
     let owner = record.golden.as_deref().unwrap_or(machine);
     let before = record.credential_policy.clone().unwrap_or_default();
-    let guest_ca = add_cas_for(&ca_dir(owner), owner, &policy, &before)?;
+    let cas = add_cas_for(&ca_dir(owner), owner, &policy, &before)?
+        .map(|set| set.lineage())
+        .unwrap_or_default();
     Ok(BindingChange {
         policy,
         placeholders,
-        trust_changed: guest_ca.is_some(),
-        guest_ca,
+        before,
+        cas,
     })
 }
 
@@ -299,14 +654,157 @@ fn refuse_bindings_without_network(
     ))
 }
 
+/// What [`hand_over_binding_change`] did.
+#[derive(Debug, Default, PartialEq)]
+pub struct HandedOver {
+    /// The CA bundle the guest was handed, to record as what it trusts now.
+    pub trusted: Option<String>,
+    /// Bindings the running machine did not take, because its guest could not trust a CA they need: they apply from
+    /// its next start.
+    pub deferred: Vec<String>,
+}
+
+/// Hand running machine `name` `change` so that no host is ever intercepted with a CA its guest does not trust. The
+/// guest, known to trust `trusted` (a PEM bundle; `None` when unknown: the machine CA only), is first handed (`trust`)
+/// every CA the new bindings may be signed with that it lacks, together with every CA it trusts or the old bindings
+/// may be signed with (no CA leaves a running guest's trust: a host leaving the bindings can stay intercepted until
+/// the machine stops). The interceptor then takes the bindings (`bind`). A guest that cannot take the CAs (an agent
+/// predating live trust) still has its removed bindings revoked at once and takes each added or changed binding whose
+/// CAs it already trusts; the others are [`HandedOver::deferred`] to its next start.
+pub fn hand_over_binding_change(
+    name: &str,
+    change: &BindingChange,
+    trusted: Option<&str>,
+    trust: impl FnOnce(&str) -> Result<()>,
+    bind: impl FnOnce(&CredentialPolicy, &BTreeMap<String, String>) -> Result<()>,
+) -> Result<HandedOver> {
+    let cas = &change.cas;
+    let held = trusted_cas(cas, trusted);
+    let signs_for = |policy: &CredentialPolicy| -> Vec<bool> {
+        let bound = binding_subtrees(policy);
+        cas.iter().map(|ca| ca.may_sign_for(&bound)).collect()
+    };
+    let after = signs_for(&change.policy);
+    if !after
+        .iter()
+        .zip(&held)
+        .any(|(needed, held)| *needed && !*held)
+    {
+        bind(&change.policy, &change.placeholders)?;
+        return Ok(HandedOver::default());
+    }
+    let before = signs_for(&change.before);
+    let bundle = bundle_of(cas, |index, _| held[index] || after[index] || before[index]);
+    match trust(&bundle) {
+        Ok(()) => {
+            bind(&change.policy, &change.placeholders)?;
+            Ok(HandedOver {
+                trusted: Some(bundle),
+                deferred: Vec::new(),
+            })
+        }
+        Err(e) => {
+            tracing::warn!(machine = name, error = %e, "the guest cannot trust a CA new credential bindings need; they apply from its next start");
+            let (kept, deferred): (Vec<_>, Vec<_>) = change
+                .policy
+                .credentials
+                .iter()
+                .cloned()
+                .partition(|binding| {
+                    change.before.credentials.contains(binding)
+                        || signs_for(&CredentialPolicy {
+                            credentials: vec![binding.clone()],
+                        })
+                        .iter()
+                        .zip(&held)
+                        .all(|(needed, held)| !*needed || *held)
+                });
+            let partial = CredentialPolicy { credentials: kept };
+            let placeholders = change
+                .placeholders
+                .iter()
+                .filter(|(binding, _)| partial.credentials.iter().any(|b| &b.name == *binding))
+                .map(|(binding, placeholder)| (binding.clone(), placeholder.clone()))
+                .collect();
+            bind(&partial, &placeholders)?;
+            Ok(HandedOver {
+                trusted: None,
+                deferred: deferred.into_iter().map(|b| b.name).collect(),
+            })
+        }
+    }
+}
+
+/// Why a machine on a Kubernetes pod network takes no new credential bindings.
+pub const POD_NETWORK_REFUSAL: &str = "credential bindings cannot be enforced on a Kubernetes pod network: its bridge carries guest traffic around the credential interceptor";
+
+/// The interceptor a machine booting with `launch` runs, if any: none on a Kubernetes pod network
+/// ([`POD_NETWORK_REFUSAL`]), whose guest then sends its placeholders unsubstituted and no value is ever resolved.
+pub fn interceptor_on_network(
+    launch: Option<&CredentialLaunch>,
+    pod_network: bool,
+) -> Option<&CredentialLaunch> {
+    match launch {
+        Some(launch) if pod_network => {
+            tracing::warn!(
+                machine = %launch.machine,
+                "credentials are not substituted on a Kubernetes pod network: the guest's placeholders go out as they are"
+            );
+            None
+        }
+        launch => launch,
+    }
+}
+
+/// Largest boot config read to tell whether a machine booted on a pod network.
+const MAX_BOOT_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+
+/// Whether the boot that left `vm_dir`'s boot config attached the machine to a Kubernetes pod network.
+fn booted_on_pod_network(vm_dir: &Path) -> bool {
+    #[derive(Deserialize)]
+    struct Booted {
+        #[serde(default)]
+        pod_netns: Option<PathBuf>,
+    }
+    // the machine's directory is its user's: never follow a link or block on a FIFO there
+    crate::nofollow::read(vm_dir, &["boot-config.json"], MAX_BOOT_CONFIG_BYTES)
+        .ok()
+        .and_then(|config| serde_json::from_slice::<Booted>(&config).ok())
+        .is_some_and(|booted| booted.pod_netns.is_some())
+}
+
+/// Refuse a change that adds or changes a binding of machine `name`, whose data directory is `vm_dir`, when it last
+/// booted on a Kubernetes pod network ([`POD_NETWORK_REFUSAL`]). Removing bindings is allowed.
+fn refuse_change_on_pod_network(
+    name: &str,
+    vm_dir: &Path,
+    before: Option<&CredentialPolicy>,
+    after: &CredentialPolicy,
+) -> Result<()> {
+    let adds = after
+        .credentials
+        .iter()
+        .any(|b| !before.is_some_and(|p| p.credentials.contains(b)));
+    if adds && booted_on_pod_network(vm_dir) {
+        return Err(Error::config(
+            "credentials",
+            format!("machine '{name}' runs on a Kubernetes pod network; {POD_NETWORK_REFUSAL}"),
+        ));
+    }
+    Ok(())
+}
+
 /// What [`set_bindings`] did.
 pub struct BindingsSet {
     /// The record as saved, with the new bindings.
     pub record: VmRecord,
-    /// The running machine took them at once (it booted with bindings, so its interceptor runs).
+    /// The running machine took them at once (it booted with bindings, so its interceptor runs), but for `deferred`.
     pub live: bool,
     /// The machine runs but booted without bindings: they apply from its next start.
     pub at_next_start: bool,
+    /// Bindings a `live` machine did not take, because its guest could not trust a CA they need: they apply from its
+    /// next start.
+    pub deferred: Vec<String>,
 }
 
 /// Who changes a machine's bindings, which decides where their values may come from.
@@ -593,6 +1091,12 @@ pub fn set_bindings_in(
         return Err(Error::vm_not_found(name));
     };
     let policy = build(&record)?;
+    refuse_change_on_pod_network(
+        name,
+        &crate::agent::vm_data_dir(name),
+        record.credential_policy.as_ref(),
+        &policy,
+    )?;
     let change = plan_binding_change(name, &record, policy)?;
     let (supplied, withheld) = provenance_after(&record, &change.policy, changer);
     let saved = db
@@ -614,17 +1118,23 @@ pub fn set_bindings_in(
     let interceptor =
         std::fs::symlink_metadata(crate::agent::vm_data_dir(name).join(CREDENTIALS_SOCKET)).is_ok();
     let live = running && interceptor;
+    let mut deferred = Vec::new();
     if live {
         // the host sources of the bindings this host's operator defined, and none for any other
         let sources = CredentialLaunch::for_record(name, &saved)
             .map(|launch| launch.sources)
             .unwrap_or_default();
-        crate::agent::apply_live_credential_bindings(name, &change, &sources)?;
+        let handed = crate::agent::apply_live_credential_bindings(name, &change, &sources)?;
+        if let Some(bundle) = &handed.trusted {
+            record_guest_trust(name, bundle);
+        }
+        deferred = handed.deferred;
     }
     Ok(BindingsSet {
         record: saved,
         live,
         at_next_start: running && !interceptor,
+        deferred,
     })
 }
 
@@ -804,6 +1314,11 @@ impl CredentialLaunch {
             // a binding changed while the machine was stopped may name a host no CA permits yet
             return ensure_cas_for(&self.ca_dir, &self.ca_owner, &self.policy, &self.policy)
                 .map(|_| ());
+        }
+        let _lock = lock_ca_dir(&HostCaFiles::at(&self.ca_dir))?;
+        if ca_exists(&self.ca_dir) {
+            // another launch of the lineage made it first
+            return Ok(());
         }
         // A wildcard's parent is the subtree the CA may sign in; the name
         // constraint on it already covers every subdomain.
@@ -989,12 +1504,23 @@ fn replace_live_bindings(
 /// binding this host's operator defined in `sources`. `sources` sits beside `bindings`, not inside it: a boot process
 /// that predates it (v1.36) refuses an unknown top-level field as a malformed request and keeps the bindings it has,
 /// where it would quietly drop a nested one and resolve every added binding from its own environment.
+#[cfg(test)]
 pub(crate) fn live_bindings_request(
     change: &BindingChange,
     sources: &BTreeMap<String, SecretRef>,
 ) -> String {
+    live_bindings_request_for(&change.policy, &change.placeholders, sources)
+}
+
+/// [`live_bindings_request`] for `policy` and its `placeholders`: a change's bindings, or those of them its guest can
+/// trust ([`hand_over_binding_change`]).
+pub(crate) fn live_bindings_request_for(
+    policy: &CredentialPolicy,
+    placeholders: &BTreeMap<String, String>,
+    sources: &BTreeMap<String, SecretRef>,
+) -> String {
     serde_json::json!({
-        "bindings": { "policy": change.policy, "placeholders": change.placeholders },
+        "bindings": { "policy": policy, "placeholders": placeholders },
         "sources": sources,
     })
     .to_string()
@@ -1315,7 +1841,7 @@ mod tests {
 
     /// A CA directory the machine's user owns while root changes its bindings: root never writes the guest bundle
     /// through a symbolic or hard link, or into a FIFO, planted at its name, so the file the link names is left as it
-    /// was. The write itself is refused, not only skipped because the CA then looks missing.
+    /// was. The bundle replaces what was planted with a regular file of its own, never blocking on a FIFO.
     #[cfg(unix)]
     #[test]
     fn a_binding_change_never_writes_the_guest_bundle_through_a_link() {
@@ -1337,11 +1863,10 @@ mod tests {
                     assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
                 }
             }
-            let err = write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap_err();
-            assert!(
-                err.to_string().contains("guest CA bundle"),
-                "{planted}: {err}"
-            );
+            write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap();
+            let replaced = std::fs::symlink_metadata(&guest).unwrap();
+            assert!(replaced.is_file(), "{planted}: replaced by a regular file");
+            assert_eq!(std::fs::read(&guest).unwrap(), b"bundle");
             let _ = ensure_cas_for(dir.path(), "m", &grown, &first);
             assert_eq!(
                 std::fs::read(&victim).unwrap(),
@@ -1349,15 +1874,6 @@ mod tests {
                 "written through a {planted} link"
             );
         }
-        // an ordinary bundle is overwritten in place, keeping its inode
-        use std::os::unix::fs::MetadataExt;
-        let dir = tempfile::tempdir().unwrap();
-        saved_ca_and_growth(dir.path());
-        let guest = MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
-        let inode = std::fs::metadata(&guest).unwrap().ino();
-        write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap();
-        assert_eq!(std::fs::read(&guest).unwrap(), b"bundle");
-        assert_eq!(std::fs::metadata(&guest).unwrap().ino(), inode);
     }
 
     /// A FIFO planted among the CA files is refused, never waited on: root's server must not hang there.
@@ -1381,6 +1897,29 @@ mod tests {
                 .recv_timeout(std::time::Duration::from_secs(10))
                 .is_ok(),
             "blocked on a FIFO"
+        );
+    }
+
+    /// The lock serializing CA adds lives in the machine's directory: a FIFO or a link planted at its name is
+    /// refused, never waited on or followed, and the add fails rather than running unlocked.
+    #[cfg(unix)]
+    #[test]
+    fn a_planted_ca_lock_is_refused_not_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, grown) = saved_ca_and_growth(dir.path());
+        let lock = dir.path().join(CA_LOCK_FILE);
+        let fifo = std::ffi::CString::new(lock.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        assert!(ensure_cas_for(dir.path(), "m", &grown, &first).is_err());
+        std::fs::remove_file(&lock).unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(elsewhere.path().join("root-file"), &lock).unwrap();
+        assert!(ensure_cas_for(dir.path(), "m", &grown, &first).is_err());
+        assert!(!elsewhere.path().join("root-file").exists());
+        assert!(
+            load_extra_cas(dir.path(), "m").is_empty(),
+            "nothing added unlocked"
         );
     }
 
@@ -1449,6 +1988,378 @@ mod tests {
                 "a CA was added on top of a {how} linked key"
             );
         }
+    }
+
+    fn certificates(bundle: &str) -> usize {
+        bundle.matches("BEGIN CERTIFICATE").count()
+    }
+
+    fn policy(bindings: &[(&str, &str)]) -> CredentialPolicy {
+        CredentialPolicy {
+            credentials: bindings.iter().map(|(n, h)| binding(n, h)).collect(),
+        }
+    }
+
+    /// A machine CA for `hosts` saved in a new directory.
+    fn ca_dir_for(hosts: &[(&str, &str)]) -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        MachineCa::generate("m", &binding_subtrees(&policy(hosts)))
+            .unwrap()
+            .save(dir.path())
+            .unwrap();
+        dir
+    }
+
+    /// A CA is added under an index no other directory holds, also one whose CA cannot be read: the CA there stays
+    /// as it was, and so does every CA a running machine's guest already trusts.
+    #[test]
+    fn an_added_ca_never_takes_an_index_already_held() {
+        let dir = ca_dir_for(&[("notion", "api.notion.com")]);
+        let first = policy(&[("notion", "api.notion.com")]);
+        let extra = dir.path().join(EXTRA_CA_DIR);
+        std::fs::create_dir_all(extra.join("0")).unwrap();
+        std::fs::write(extra.join("0").join("ca.pem"), "half written").unwrap();
+        let github = MachineCa::generate("m", &["api.github.com".to_string()]).unwrap();
+        github.save(&extra.join("1")).unwrap();
+
+        let grown = policy(&[("notion", "api.notion.com"), ("openai", "api.openai.com")]);
+        assert!(ensure_cas_for(dir.path(), "m", &grown, &first).unwrap());
+        let kept = MachineCa::load(&extra.join("1"), "m").unwrap();
+        assert_eq!(
+            kept.certificate_pem(),
+            github.certificate_pem(),
+            "the CA at index 1 is not overwritten"
+        );
+        let extras = load_extra_cas(dir.path(), "m");
+        assert_eq!(extras.len(), 2);
+        assert!(extras.iter().any(|ca| ca.permits("api.openai.com")));
+        assert!(extras.iter().any(|ca| ca.permits("api.github.com")));
+    }
+
+    /// Changes racing on one CA directory (a golden and its branches share it; the CLI, an API server and embedders
+    /// each change bindings) lose no CA: every host ends up permitted by a CA of its own, and a host bound by several at
+    /// once gets one CA, not several.
+    #[test]
+    fn racing_changes_on_one_ca_directory_lose_no_ca() {
+        let dir = ca_dir_for(&[("notion", "api.notion.com")]);
+        let first = policy(&[("notion", "api.notion.com")]);
+        let hosts: Vec<String> = (0..8).map(|i| format!("api{i}.example.org")).collect();
+        std::thread::scope(|scope| {
+            for host in &hosts {
+                let (dir, first) = (dir.path(), &first);
+                scope.spawn(move || {
+                    let grown = policy(&[("notion", "api.notion.com"), ("b", host.as_str())]);
+                    ensure_cas_for(dir, "m", &grown, first).unwrap();
+                });
+            }
+        });
+        let extras = load_extra_cas(dir.path(), "m");
+        for host in &hosts {
+            assert!(
+                extras.iter().any(|ca| ca.permits(host)),
+                "{host} lost its CA"
+            );
+        }
+        assert_eq!(extras.len(), hosts.len());
+
+        let shared = policy(&[("notion", "api.notion.com"), ("s", "api.shared.org")]);
+        std::thread::scope(|scope| {
+            for _ in 0..8 {
+                let (dir, first, shared) = (dir.path(), &first, &shared);
+                scope.spawn(move || ensure_cas_for(dir, "m", shared, first).unwrap());
+            }
+        });
+        assert_eq!(
+            load_extra_cas(dir.path(), "m")
+                .iter()
+                .filter(|ca| ca.permits("api.shared.org"))
+                .count(),
+            1
+        );
+    }
+
+    /// The change from `before` to `after` on the CAs in `dir`, as [`plan_binding_change`] makes it.
+    fn change_in(dir: &Path, before: &CredentialPolicy, after: &CredentialPolicy) -> BindingChange {
+        ensure_cas_for(dir, "m", after, before).unwrap();
+        BindingChange {
+            policy: after.clone(),
+            placeholders: after
+                .credentials
+                .iter()
+                .map(|b| (b.name.clone(), format!("SMOL_PLACEHOLDER_{}", b.name)))
+                .collect(),
+            before: before.clone(),
+            cas: lineage_cas(dir, "m").unwrap(),
+        }
+    }
+
+    fn primary_pem(dir: &Path) -> String {
+        MachineCa::load(dir, "m")
+            .unwrap()
+            .certificate_pem()
+            .to_string()
+    }
+
+    /// The added CA of `dir` that permits `host`.
+    fn ca_permitting(dir: &Path, host: &str) -> String {
+        load_extra_cas(dir, "m")
+            .into_iter()
+            .find(|ca| ca.permits(host))
+            .unwrap()
+            .certificate_pem()
+            .to_string()
+    }
+
+    /// Hand `change` over, recording the calls made: `trust` succeeds when `trust_ok`.
+    fn hand_over(
+        change: &BindingChange,
+        trusted: Option<&str>,
+        trust_ok: bool,
+    ) -> (Result<HandedOver>, Vec<String>, Option<CredentialPolicy>) {
+        let calls = std::cell::RefCell::new(Vec::new());
+        let bound = std::cell::RefCell::new(None);
+        let result = hand_over_binding_change(
+            "m",
+            change,
+            trusted,
+            |bundle| {
+                calls.borrow_mut().push(format!("trust {bundle}"));
+                if trust_ok {
+                    Ok(())
+                } else {
+                    Err(Error::agent(
+                        "credential trust",
+                        "agent predates live hosts",
+                    ))
+                }
+            },
+            |policy, placeholders| {
+                let mut names: Vec<&String> = policy.credentials.iter().map(|b| &b.name).collect();
+                names.sort();
+                assert_eq!(placeholders.keys().collect::<Vec<_>>(), names);
+                calls.borrow_mut().push("bind".to_string());
+                *bound.borrow_mut() = Some(policy.clone());
+                Ok(())
+            },
+        );
+        (result, calls.into_inner(), bound.into_inner())
+    }
+
+    /// Widening a binding the machine CA signs (api.github.com) to *.github.com mints a CA for github.com that overlaps
+    /// the host already bound; the guest is handed it before the interceptor can sign uploads.github.com with it. So is
+    /// a CA a sibling branch minted in the shared directory, the first time this machine binds its host.
+    #[test]
+    fn a_ca_the_interceptor_may_sign_with_reaches_the_guest_first() {
+        let dir = ca_dir_for(&[("gh", "api.github.com")]);
+        let narrow = policy(&[("gh", "api.github.com")]);
+        let wide = policy(&[("gh", "*.github.com")]);
+        let primary = primary_pem(dir.path());
+        let change = change_in(dir.path(), &narrow, &wide);
+        let (result, calls, bound) = hand_over(&change, Some(&primary), true);
+        let handed = result.unwrap();
+        let signer = ca_permitting(dir.path(), "uploads.github.com");
+        assert_eq!(calls.len(), 2);
+        assert!(calls[0].starts_with("trust ") && calls[0].contains(signer.trim()));
+        assert_eq!(calls[1], "bind", "the interceptor takes the bindings after");
+        assert_eq!(bound, Some(wide.clone()));
+        let trusted = handed.trusted.expect("the new trust is recorded");
+        assert!(trusted.contains(signer.trim()) && trusted.contains(primary.trim()));
+        assert!(handed.deferred.is_empty());
+
+        // a guest already trusting it is not handed it again
+        let (result, calls, _) = hand_over(&change, Some(&trusted), true);
+        assert_eq!(result.unwrap(), HandedOver::default());
+        assert_eq!(calls, ["bind"]);
+
+        // a sibling sharing the directory minted the openai CA; this machine binding openai needs it handed too
+        let sibling = policy(&[("gh", "api.github.com"), ("o", "api.openai.com")]);
+        ensure_cas_for(dir.path(), "m", &sibling, &narrow).unwrap();
+        let change = change_in(dir.path(), &narrow, &sibling);
+        let (result, calls, _) = hand_over(&change, Some(&primary), true);
+        assert!(calls[0].contains(ca_permitting(dir.path(), "api.openai.com").trim()));
+        assert!(result.unwrap().trusted.is_some());
+    }
+
+    /// No CA leaves a running guest's trust (a host leaving the bindings can stay intercepted until the machine stops):
+    /// a removal hands nothing, and a swap hands the CAs of both the old and new hosts.
+    #[test]
+    fn no_ca_leaves_a_running_guests_trust() {
+        let dir = ca_dir_for(&[("notion", "api.notion.com")]);
+        let first = policy(&[("notion", "api.notion.com")]);
+        let github = policy(&[("notion", "api.notion.com"), ("gh", "api.github.com")]);
+        let change = change_in(dir.path(), &first, &github);
+        let (result, _, _) = hand_over(&change, None, true);
+        let trusted = result.unwrap().trusted.unwrap();
+        assert_eq!(certificates(&trusted), 2);
+
+        let removal = change_in(dir.path(), &github, &first);
+        let (result, calls, _) = hand_over(&removal, Some(&trusted), true);
+        assert_eq!(result.unwrap(), HandedOver::default());
+        assert_eq!(calls, ["bind"], "nothing is pruned while it runs");
+
+        // trusted only the machine CA (unknown), swapping github for openai: both added CAs, the machine CA first
+        let swapped = policy(&[("notion", "api.notion.com"), ("o", "api.openai.com")]);
+        let swap = change_in(dir.path(), &github, &swapped);
+        let (result, _, _) = hand_over(&swap, None, true);
+        let trusted = result.unwrap().trusted.unwrap();
+        assert_eq!(certificates(&trusted), 3);
+        assert!(trusted.starts_with(primary_pem(dir.path()).trim()));
+    }
+
+    /// A guest agent that cannot take new CAs (one predating live trust) does not hold the whole change back: removed
+    /// bindings are revoked at once, an added binding whose CA it already trusts is taken, and only those needing a CA
+    /// it lacks are deferred to its next start.
+    #[test]
+    fn an_old_guest_has_removals_revoked_and_trusted_additions_taken() {
+        let dir = ca_dir_for(&[("notion", "api.notion.com")]);
+        let first = policy(&[("notion", "api.notion.com")]);
+        let booted = policy(&[("notion", "api.notion.com"), ("gh", "api.github.com")]);
+        ensure_cas_for(dir.path(), "m", &booted, &first).unwrap();
+        // it booted trusting the CA file: the machine CA and the github one
+        let read_at_boot = guest_trust(dir.path(), "m", &booted).unwrap().unwrap();
+        let next = policy(&[
+            ("gh", "api.github.com"),
+            ("gh2", "api.github.com"),
+            ("oa", "api.openai.com"),
+        ]);
+        let change = change_in(dir.path(), &booted, &next);
+        let (result, calls, bound) = hand_over(&change, Some(&read_at_boot), false);
+        assert_eq!(
+            result.unwrap(),
+            HandedOver {
+                trusted: None,
+                deferred: vec!["oa".to_string()],
+            }
+        );
+        assert!(calls[0].starts_with("trust ") && calls[1] == "bind");
+        let bound: Vec<String> = bound
+            .unwrap()
+            .credentials
+            .into_iter()
+            .map(|b| b.name)
+            .collect();
+        assert_eq!(bound, ["gh", "gh2"], "notion is revoked, gh2 is covered");
+
+        // a pure removal needs no trust at all
+        let removal = change_in(dir.path(), &booted, &first);
+        let (result, calls, bound) = hand_over(&removal, Some(&read_at_boot), false);
+        assert_eq!(result.unwrap(), HandedOver::default());
+        assert_eq!(calls, ["bind"]);
+        assert_eq!(bound, Some(first));
+    }
+
+    /// A guest is handed a bundle at boot only when what it is known to trust differs from what its bindings need: a
+    /// resumed guest whose bindings gained a host while it was paused is; one that read a CA file holding just what it
+    /// needs, or a restored one needing only the machine CA, is not. A CA no binding needs leaves its trust here.
+    #[test]
+    fn a_guest_is_handed_its_trust_at_boot_only_when_it_differs() {
+        let dir = ca_dir_for(&[("notion", "api.notion.com")]);
+        let file = |dir: &Path| {
+            std::fs::read_to_string(
+                MachineCa::guest_dir(dir).join(smolvm_credentials::ca::GUEST_CA_FILE),
+            )
+            .unwrap()
+        };
+        let first = policy(&[("notion", "api.notion.com")]);
+        let boot = guest_trust_at_boot(dir.path(), "m", &first, Some(&file(dir.path())))
+            .unwrap()
+            .unwrap();
+        assert!(boot.hand.is_none(), "the CA file is what it needs");
+        assert_eq!(boot.held, primary_pem(dir.path()));
+        let restored = guest_trust_at_boot(dir.path(), "m", &first, None)
+            .unwrap()
+            .unwrap();
+        assert!(restored.hand.is_none(), "every guest trusts the machine CA");
+
+        // a binding added while the machine was paused, which then resumes trusting what it was recorded to
+        let recorded = file(dir.path());
+        let grown = policy(&[("notion", "api.notion.com"), ("gh", "api.github.com")]);
+        ensure_cas_for(dir.path(), "m", &grown, &first).unwrap();
+        let resumed = guest_trust_at_boot(dir.path(), "m", &grown, Some(&recorded))
+            .unwrap()
+            .unwrap();
+        let hand = resumed
+            .hand
+            .expect("the resumed guest is handed the github CA");
+        assert!(hand.contains(ca_permitting(dir.path(), "api.github.com").trim()));
+        assert_eq!(resumed.held, recorded, "what it holds if it cannot take it");
+
+        // booting afresh after the binding was removed: the file still holds the github CA, which leaves its trust
+        let pruned = guest_trust_at_boot(dir.path(), "m", &first, Some(&file(dir.path())))
+            .unwrap()
+            .unwrap();
+        assert_eq!(pruned.hand.as_deref().map(certificates), Some(1));
+        let none = tempfile::tempdir().unwrap();
+        assert!(guest_trust_at_boot(none.path(), "m", &first, None)
+            .unwrap()
+            .is_none());
+    }
+
+    /// Adding a CA replaces the guest's CA file whole (a booting guest never reads part of it), readable through the
+    /// mount, and leaves it untouched when nothing changed.
+    #[cfg(unix)]
+    #[test]
+    fn the_guest_ca_file_is_replaced_whole_and_only_when_it_changes() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = ca_dir_for(&[("notion", "api.notion.com")]);
+        let first = policy(&[("notion", "api.notion.com")]);
+        let guest = MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
+        let before = std::fs::metadata(&guest).unwrap().ino();
+
+        let grown = policy(&[("notion", "api.notion.com"), ("gh", "api.github.com")]);
+        ensure_cas_for(dir.path(), "m", &grown, &first).unwrap();
+        let replaced = std::fs::metadata(&guest).unwrap();
+        assert_ne!(replaced.ino(), before, "a new file renamed over the old");
+        assert_eq!(replaced.mode() & 0o777, 0o644, "readable through the mount");
+        assert_eq!(certificates(&std::fs::read_to_string(&guest).unwrap()), 2);
+
+        ensure_cas_for(dir.path(), "m", &grown, &first).unwrap();
+        assert_eq!(
+            std::fs::metadata(&guest).unwrap().ino(),
+            replaced.ino(),
+            "unchanged: not rewritten"
+        );
+    }
+
+    /// A machine on a Kubernetes pod network carries guest traffic around the interceptor: one that has bindings still
+    /// boots, with no interceptor (no value is resolved and its placeholders go out as they are), and a change adding
+    /// or changing a binding is refused, while removing one is not.
+    #[test]
+    fn a_pod_network_machine_runs_no_interceptor_and_takes_no_new_binding() {
+        let gh = policy(&[("gh", "api.github.com")]);
+        let launch =
+            CredentialLaunch::from_parts("pod", &gh, &BTreeMap::new(), &BTreeMap::new(), None);
+        assert!(interceptor_on_network(launch.as_ref(), true).is_none());
+        assert!(interceptor_on_network(launch.as_ref(), false).is_some());
+
+        let vm_dir = tempfile::tempdir().unwrap();
+        let widened = policy(&[("gh", "*.github.com")]);
+        refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &widened).unwrap();
+        std::fs::write(
+            vm_dir.path().join("boot-config.json"),
+            r#"{"pod_netns":"/var/run/netns/cni-1","credentials":null}"#,
+        )
+        .unwrap();
+        for (before, after) in [(Some(&gh), &widened), (None, &gh)] {
+            let refused = refuse_change_on_pod_network("pod", vm_dir.path(), before, after)
+                .unwrap_err()
+                .to_string();
+            assert!(refused.contains(POD_NETWORK_REFUSAL), "{refused}");
+        }
+        refuse_change_on_pod_network(
+            "pod",
+            vm_dir.path(),
+            Some(&gh),
+            &CredentialPolicy::default(),
+        )
+        .unwrap();
+        refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &gh).unwrap();
+        std::fs::write(
+            vm_dir.path().join("boot-config.json"),
+            r#"{"pod_netns":null}"#,
+        )
+        .unwrap();
+        refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &widened).unwrap();
     }
 
     #[test]
@@ -1809,8 +2720,8 @@ mod tests {
         BindingChange {
             policy: policy.clone(),
             placeholders: smolvm_credentials::generate_placeholders(policy),
-            trust_changed: false,
-            guest_ca: None,
+            before: CredentialPolicy::default(),
+            cas: Vec::new(),
         }
     }
 

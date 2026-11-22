@@ -1874,7 +1874,7 @@
         },
         "responses": {
           "200": {
-            "description": "Bindings saved; a running machine that booted with bindings uses them from its next request (`live`), one that booted without them from its next start",
+            "description": "Bindings saved; a running machine that booted with bindings uses them from its next request (`live`) but for those its guest cannot trust yet (`deferred`), one that booted without them from its next start",
             "content": {
               "application/json": {
                 "schema": {
@@ -1904,7 +1904,17 @@
             }
           },
           "409": {
-            "description": "Saved, but the running machine could not take them; they apply from its next start. Or another change to the machine's bindings held them too long, and nothing changed",
+            "description": "Saved, but the running machine could not take them; they apply from its next start. Or another change to the machine's bindings or credential CAs held them too long, and nothing changed",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ApiErrorResponse"
+                }
+              }
+            }
+          },
+          "422": {
+            "description": "Nothing saved: the machine runs on a Kubernetes pod network, where bindings cannot be enforced, and the change adds or changes one",
             "content": {
               "application/json": {
                 "schema": {
@@ -5359,6 +5369,13 @@
               "type": "string"
             },
             "description": "The machine's binding names now."
+          },
+          "deferred": {
+            "type": "array",
+            "items": {
+              "type": "string"
+            },
+            "description": "Bindings a `live` machine did not take because its guest agent could not trust the CA they need: they apply\nfrom its next start."
           },
           "live": {
             "type": "boolean",

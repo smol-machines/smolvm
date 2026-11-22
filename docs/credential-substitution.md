@@ -291,7 +291,25 @@ by its branches too, until values are supplied for a branch itself.
 
 Placeholders, the policy and the CA travel with portable checkpoints, so
 processes captured in a checkpoint keep trusting the interceptor after a
-restore. Values never travel: supply them again for the restored machine.
+restore. So does each CA added for a host bound while the machine ran. Values
+never travel: supply them again for the restored machine.
+
+A machine resumed after a pause, restored from a checkpoint, or branched is
+handed the CAs its bindings need when it comes back, as is a running machine
+before its interceptor signs a newly bound host. The agent rebuilds the trust
+bundle files, so new connections from clients that read them per connection
+trust the host; a process that loaded its trust when it started (Node with
+`NODE_EXTRA_CA_CERTS`, for one) needs a restart first. A guest agent too old to
+take new CAs while it runs still has removed bindings revoked at once, and the
+added bindings that need a CA it lacks apply from its next start (`deferred`).
+A CA added for a host no binding names any more stays trusted while the machine
+runs and leaves the guest's trust at its next boot.
+
+A checkpoint whose CAs exceed 64 KiB (dozens of hosts bound while it ran)
+cannot be restored by smolvm 1.36 or earlier, which refuse it as an unexpected
+credential CA asset. Those versions restore only the machine CA from any
+checkpoint, so hosts bound while it ran fail TLS until the restored machine
+restarts.
 
 ## Backends and limits
 
@@ -299,6 +317,11 @@ restore. Values never travel: supply them again for the restored machine.
   `--allow-host` does). `--net-backend tsi` works only with a libkrun that
   provides `krun_set_stream_intercept`; otherwise start fails with a message
   saying so.
+- A machine on a Kubernetes pod network gets no substitution: its bridge
+  carries guest traffic around the interceptor. One that already has bindings
+  still boots, runs no interceptor and logs a warning, and its placeholders go
+  out as they are; no value is resolved for it. Adding or changing a binding on
+  it is refused (`422` over the API).
 - Interception covers port 443. Plaintext HTTP on port 80 and other ports are
   relayed without substitution.
 - The guest side is HTTP/1.1 (the interceptor negotiates `http/1.1` only);

@@ -347,6 +347,11 @@ impl MachineCa {
         })
     }
 
+    /// The DNS subtrees its name constraint permits, as recorded (empty for a CA saved before they were).
+    pub fn permitted(&self) -> &[String] {
+        &self.permitted
+    }
+
     /// PEM of the public certificate — what the guest trusts.
     pub fn certificate_pem(&self) -> &str {
         &self.cert_pem

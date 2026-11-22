@@ -2024,6 +2024,10 @@ pub struct CredentialBindingsResponse {
     pub live: bool,
     /// The machine runs but booted without bindings: they apply from its next start.
     pub at_next_start: bool,
+    /// Bindings a `live` machine did not take because its guest agent could not trust the CA they need: they apply
+    /// from its next start.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub deferred: Vec<String>,
 }
 
 /// Values for a machine's credential bindings, by binding name.

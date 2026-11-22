@@ -28,7 +28,8 @@ static BUILT: std::sync::Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> =
 
 /// The machine's credential CA bundle as the host last pushed it ([`push_ca`]). The host rewrites the CA file in
 /// place when it adds a CA, and the guest's file cache can serve the old contents for a while after, so a pushed copy
-/// is preferred to the file. The host only ever appends CAs, so the pushed copy is never older than the file.
+/// is preferred to the file. The file holds every CA of the machine's lineage; the pushed copy holds those the
+/// machine's own bindings may be signed with, which the host pushes again whenever they need one it lacks.
 static PUSHED: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
 /// Use `ca` as the machine's credential CA bundle from now on, in place of its file.

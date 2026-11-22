@@ -11,7 +11,7 @@
 //! following a link, directories with `O_DIRECTORY`, files only when regular
 //! and never blocking on open. The base itself is the trusted path to the
 //! machine's directory: its ancestors (a linked cache or runtime directory)
-//! are followed as usual. A file read or written in place must have one name
+//! are followed as usual. A file read, or opened to lock, must have one name
 //! only and belong to this process's user, root or the base directory's
 //! owner, and reads are capped. What root creates below the base takes the
 //! owner of the directory it is created in, so the machine's own process can
@@ -156,23 +156,18 @@ pub(crate) fn write_replacing(
     written
 }
 
-/// Overwrite `base/<components…>` with `bytes` in place, keeping its inode,
-/// for a file a running guest reads through a mount of its directory. The
-/// file is created (mode `0o644`, and handed to the base directory's owner
-/// when root creates it) when missing; an existing one must be regular, have
-/// one name only and belong to this user, root or the base directory's owner.
-/// No component is followed if it is a link.
+/// Open `base/<components…>` to hold an advisory lock on, read and write,
+/// creating it (mode `0o600`, handed to the base directory's owner when root
+/// creates it) and any directory on the way when missing. An existing one must
+/// be regular, have one name only and belong to this user, root or the base
+/// directory's owner; a FIFO in its place never blocks the open. No component
+/// is followed if it is a link.
 #[cfg(unix)]
-pub(crate) fn write_in_place(
-    base: &Path,
-    components: &[&str],
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    use std::io::Write;
+pub(crate) fn open_lock_file(base: &Path, components: &[&str]) -> std::io::Result<std::fs::File> {
     let (name, dirs) = split(components)?;
-    let (dir, owner) = unix::open_dirs(base, dirs, false)?;
-    let flags = libc::O_WRONLY | libc::O_NONBLOCK;
-    let mut file = match unix::open_at(&dir, name, flags | libc::O_CREAT | libc::O_EXCL, 0o644) {
+    let (dir, owner) = unix::open_dirs(base, dirs, true)?;
+    let flags = libc::O_RDWR | libc::O_NONBLOCK;
+    let file = match unix::open_at(&dir, name, flags | libc::O_CREAT | libc::O_EXCL, 0o600) {
         Ok(created) => {
             let file = std::fs::File::from(created);
             unix::adopt(owner, &file)?;
@@ -184,17 +179,21 @@ pub(crate) fn write_in_place(
         Err(e) => return Err(e),
     };
     unix::check_file(&file, owner.uid)?;
-    file.set_len(0)?;
-    file.write_all(bytes)
+    Ok(file)
 }
 
 #[cfg(not(unix))]
-pub(crate) fn write_in_place(
-    base: &Path,
-    components: &[&str],
-    bytes: &[u8],
-) -> std::io::Result<()> {
-    std::fs::write(windows::checked_path(base, components, false)?, bytes)
+pub(crate) fn open_lock_file(base: &Path, components: &[&str]) -> std::io::Result<std::fs::File> {
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(windows::checked_path(base, components, true)?)?;
+    if !file.metadata()?.is_file() {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(file)
 }
 
 /// A socket file found in a machine's directory without following a link.
@@ -693,7 +692,6 @@ mod tests {
             read(dir.path(), &["fifo"], 16).is_err(),
             "refused, not blocked"
         );
-        assert!(write_in_place(dir.path(), &["fifo"], b"x").is_err());
         assert!(!is_file(dir.path(), &["fifo"]));
 
         let sub = dir.path().join("sub");
@@ -709,7 +707,8 @@ mod tests {
         std::fs::hard_link(dir.path().join("plain"), sub.join("second")).unwrap();
         let err = read(&sub, &["second"], 64).unwrap_err();
         assert!(err.to_string().contains("more than one name"), "{err}");
-        assert!(write_in_place(&sub, &["second"], b"x").is_err());
+        // replaced by name, never written through to the file it shares
+        write_replacing(&sub, &["second"], b"x", 0o644).unwrap();
         assert_eq!(std::fs::read(dir.path().join("plain")).unwrap(), b"hello");
     }
 
@@ -821,8 +820,7 @@ mod tests {
     }
 
     /// A write never goes through a link: a linked directory on the way is
-    /// refused, a link at the file's own name is replaced, not followed, and
-    /// an in-place write refuses it.
+    /// refused, and a link at the file's own name is replaced, not followed.
     #[test]
     fn writes_never_go_through_links() {
         use std::os::unix::fs::PermissionsExt;
@@ -835,12 +833,11 @@ mod tests {
             std::fs::metadata(&file).unwrap().permissions().mode() & 0o777,
             0o600
         );
-        write_in_place(dir.path(), &["a", "b", "file"], b"two").unwrap();
+        write_replacing(dir.path(), &["a", "b", "file"], b"two", 0o600).unwrap();
         assert_eq!(std::fs::read(&file).unwrap(), b"two");
 
         std::os::unix::fs::symlink(elsewhere.path(), dir.path().join("linked")).unwrap();
         assert!(write_replacing(dir.path(), &["linked", "file"], b"x", 0o644).is_err());
-        assert!(write_in_place(dir.path(), &["linked", "file"], b"x").is_err());
         assert!(std::fs::read_dir(elsewhere.path())
             .unwrap()
             .next()
@@ -849,7 +846,6 @@ mod tests {
         let target = elsewhere.path().join("target");
         std::fs::write(&target, b"root's").unwrap();
         std::os::unix::fs::symlink(&target, dir.path().join("swapped")).unwrap();
-        assert!(write_in_place(dir.path(), &["swapped"], b"new").is_err());
         write_replacing(dir.path(), &["swapped"], b"new", 0o644).unwrap();
         assert_eq!(std::fs::read(&target).unwrap(), b"root's");
         let swapped = dir.path().join("swapped");

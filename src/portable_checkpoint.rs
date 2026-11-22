@@ -4457,15 +4457,20 @@ pub fn restored_network_backend(
 
 /// Artifact path of a captured machine's credential CA.
 const CREDENTIAL_CA_ASSET: &str = "checkpoint/credential-ca.json";
-/// An exported CA is a name, one certificate and one key; anything larger is
-/// not one.
-const MAX_CREDENTIAL_CA_BYTES: u64 = 64 * 1024;
+/// The exported CAs are the machine CA and each added for a host it does not
+/// permit, each a name, one certificate, its hosts and one key; anything larger
+/// is not that.
+const MAX_CREDENTIAL_CA_BYTES: u64 = 1024 * 1024;
+/// The most smolvm 1.36 and earlier read back, which also restore only the
+/// machine CA.
+const LEGACY_CREDENTIAL_CA_BYTES: u64 = 64 * 1024;
 
-/// Stage the machine's credential CA beside the captured state. The guest in
-/// this checkpoint trusts that CA (its trust bundle is in the captured RAM),
-/// so a restore must keep signing with it; a freshly minted CA would make
-/// every intercepted request fail TLS. `None` without a credential policy or
-/// before the CA was first created.
+/// Stage the machine's credential CAs beside the captured state: its CA and
+/// every CA added for a host bound after it. The guest in this checkpoint
+/// trusts them (its trust bundle is in the captured RAM), so a restore must
+/// keep signing with them; a freshly minted CA would make every request to its
+/// hosts fail TLS. `None` without a credential policy or before the CA was
+/// first created.
 fn checkpoint_credential_ca(
     name: &str,
     vm: &VmRecord,
@@ -4474,12 +4479,36 @@ fn checkpoint_credential_ca(
     let Some(launch) = crate::credentials::CredentialLaunch::for_record(name, vm) else {
         return Ok(None);
     };
+    stage_credential_ca(&launch, snapshot_dir)
+}
+
+/// [`checkpoint_credential_ca`] for the machine `launch` describes.
+fn stage_credential_ca(
+    launch: &crate::credentials::CredentialLaunch,
+    snapshot_dir: &Path,
+) -> Result<Option<CheckpointAsset>> {
     // The machine's directory is its user's while it runs: never export a key linked in from elsewhere.
     if !crate::credentials::ca_exists(&launch.ca_dir) {
         return Ok(None);
     }
-    let ca = crate::credentials::load_ca(&launch.ca_dir, &launch.ca_owner)
+    let document = crate::credentials::export_cas(&launch.ca_dir, &launch.ca_owner, &launch.policy)
         .map_err(|e| Error::agent("capture credential CA", e.to_string()))?;
+    let size = document.len() as u64;
+    if size > MAX_CREDENTIAL_CA_BYTES {
+        return Err(Error::agent(
+            "capture credential CA",
+            format!(
+                "the machine's credential CAs take {size} bytes, more than the {MAX_CREDENTIAL_CA_BYTES} a checkpoint carries: too many hosts were bound to it while it ran"
+            ),
+        ));
+    }
+    if size > LEGACY_CREDENTIAL_CA_BYTES {
+        tracing::warn!(
+            machine = %launch.machine,
+            size,
+            "this checkpoint's credential CAs exceed 64 KiB: smolvm 1.36 and earlier refuse to restore it"
+        );
+    }
     let path = snapshot_dir.join("credential-ca.json");
     {
         use std::io::Write;
@@ -4492,25 +4521,37 @@ fn checkpoint_credential_ca(
         }
         options
             .open(&path)
-            .and_then(|mut file| file.write_all(ca.export().as_bytes()))
+            .and_then(|mut file| file.write_all(document.as_bytes()))
             .map_err(|e| Error::agent("stage credential CA", e.to_string()))?;
     }
     describe_asset(&path, CREDENTIAL_CA_ASSET).map(Some)
 }
 
-/// Install a checkpoint's credential CA as the restored machine's own, so its
-/// interceptor signs with the CA the captured guest already trusts. The staged
-/// copy is removed once the CA is in place.
+/// Install a checkpoint's credential CAs as the restored machine's own, so its
+/// interceptor signs with the CAs the captured guest already trusts. The staged
+/// copy is removed once the CAs are in place. `policy` is the bindings the
+/// checkpoint was captured with, which a machine CA from before CAs recorded
+/// their hosts was generated for.
 fn install_credential_ca(
     extracted: &Path,
     vm_data_dir: &Path,
     partial: &Path,
     asset: &CheckpointAsset,
+    policy: &crate::credentials::CredentialPolicy,
 ) -> Result<()> {
-    if asset.path != CREDENTIAL_CA_ASSET || asset.size > MAX_CREDENTIAL_CA_BYTES {
+    if asset.path != CREDENTIAL_CA_ASSET {
         return Err(Error::agent(
             "install checkpoint",
             format!("unexpected credential CA asset '{}'", asset.path),
+        ));
+    }
+    if asset.size > MAX_CREDENTIAL_CA_BYTES {
+        return Err(Error::agent(
+            "install checkpoint",
+            format!(
+                "the checkpoint's credential CAs take {} bytes, more than the {MAX_CREDENTIAL_CA_BYTES} a checkpoint carries",
+                asset.size
+            ),
         ));
     }
     let staged = partial.join("credential-ca.json");
@@ -4520,12 +4561,14 @@ fn install_credential_ca(
             .map_err(|e| Error::agent("read checkpoint credential CA", e.to_string()))?,
     );
     let _ = std::fs::remove_file(&staged);
-    let ca = smolvm_credentials::MachineCa::import(&document)
-        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))?;
-    // The machine's directory may be its user's (a paused machine resumed from this checkpoint): never write the
-    // key, or anything else, through a link left in it.
-    crate::credentials::save_ca(&ca, &vm_data_dir.join(crate::credentials::CA_DIR_NAME))
-        .map_err(|e| Error::agent("install checkpoint credential CA", e.to_string()))
+    // The machine's directory may be its user's (a paused machine resumed from this checkpoint): never write a key,
+    // or anything else, through a link left in it.
+    crate::credentials::import_cas(
+        &document,
+        &vm_data_dir.join(crate::credentials::CA_DIR_NAME),
+        policy,
+    )
+    .map_err(|e| Error::agent("install checkpoint credential CA", e.to_string()))
 }
 
 fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
@@ -6947,7 +6990,12 @@ fn install_with(
             );
         }
         if let Some(asset) = &checkpoint.credential_ca {
-            install_credential_ca(extracted, vm_data_dir, &partial, asset)?;
+            let policy = checkpoint
+                .network
+                .as_ref()
+                .and_then(|network| network.credential_policy.clone())
+                .unwrap_or_default();
+            install_credential_ca(extracted, vm_data_dir, &partial, asset, &policy)?;
         }
         validate_state_origin(checkpoint, &partial.join("checkpoint.bin"))?;
 
@@ -8537,7 +8585,14 @@ mod tests {
 
         let machine = tempfile::tempdir().unwrap();
         let partial = tempfile::tempdir().unwrap();
-        install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset).unwrap();
+        install_credential_ca(
+            extracted.path(),
+            machine.path(),
+            partial.path(),
+            &asset,
+            &Default::default(),
+        )
+        .unwrap();
         let ca_dir = machine.path().join(crate::credentials::CA_DIR_NAME);
         let installed = smolvm_credentials::MachineCa::load(&ca_dir, "cred-restored").unwrap();
         assert_eq!(installed.certificate_pem(), original.certificate_pem());
@@ -8549,17 +8604,26 @@ mod tests {
         // A tampered CA fails its checksum; a CA under another path is refused.
         std::fs::write(&source, b"{}").unwrap();
         let other = tempfile::tempdir().unwrap();
-        assert!(
-            install_credential_ca(extracted.path(), other.path(), partial.path(), &asset).is_err()
-        );
+        assert!(install_credential_ca(
+            extracted.path(),
+            other.path(),
+            partial.path(),
+            &asset,
+            &Default::default()
+        )
+        .is_err());
         let misplaced = CheckpointAsset {
             path: "checkpoint/memory.bin".into(),
             ..asset
         };
-        assert!(
-            install_credential_ca(extracted.path(), other.path(), partial.path(), &misplaced)
-                .is_err()
-        );
+        assert!(install_credential_ca(
+            extracted.path(),
+            other.path(),
+            partial.path(),
+            &misplaced,
+            &Default::default()
+        )
+        .is_err());
     }
 
     /// A restored machine's directory may already be its user's: installing the CA never writes the key, or
@@ -8583,10 +8647,14 @@ mod tests {
             machine.path().join(crate::credentials::CA_DIR_NAME),
         )
         .unwrap();
-        assert!(
-            install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset)
-                .is_err()
-        );
+        assert!(install_credential_ca(
+            extracted.path(),
+            machine.path(),
+            partial.path(),
+            &asset,
+            &Default::default()
+        )
+        .is_err());
         assert!(
             std::fs::read_dir(elsewhere.path())
                 .unwrap()
@@ -8594,6 +8662,170 @@ mod tests {
                 .is_none(),
             "the key was written through a linked directory"
         );
+    }
+
+    /// A checkpoint carries every CA the captured guest trusts, those added for hosts bound after the machine CA
+    /// too, with the hosts each permits: the restored machine signs each host with the CA the guest already trusts,
+    /// and its CA file is the source's. Resumed in place, a machine keeps the CAs it holds without duplicating them.
+    #[test]
+    fn a_checkpoint_carries_every_added_ca_and_its_hosts() {
+        let notion =
+            crate::credentials::parse_credential_flag("notion=NOTION_KEY@api.notion.com").unwrap();
+        let github =
+            crate::credentials::parse_credential_flag("gh=GH_TOKEN@api.github.com").unwrap();
+        let first = crate::credentials::CredentialPolicy {
+            credentials: vec![notion.clone()],
+        };
+        let grown = crate::credentials::CredentialPolicy {
+            credentials: vec![notion, github],
+        };
+        let source = tempfile::tempdir().unwrap();
+        let mut launch = crate::credentials::CredentialLaunch::from_parts(
+            "cred",
+            &grown,
+            &Default::default(),
+            &Default::default(),
+            None,
+        )
+        .unwrap();
+        launch.ca_dir = source.path().join("credentials");
+        smolvm_credentials::MachineCa::generate("cred", &["api.notion.com".to_string()])
+            .unwrap()
+            .save(&launch.ca_dir)
+            .unwrap();
+        // github bound while the machine ran: a CA of its own
+        assert!(
+            crate::credentials::ensure_cas_for(&launch.ca_dir, "cred", &grown, &first).unwrap()
+        );
+        let guest_file = |dir: &Path| {
+            std::fs::read_to_string(
+                smolvm_credentials::MachineCa::guest_dir(dir)
+                    .join(smolvm_credentials::ca::GUEST_CA_FILE),
+            )
+            .unwrap()
+        };
+
+        let snapshot = tempfile::tempdir().unwrap();
+        std::fs::create_dir(snapshot.path().join(ASSET_DIR)).unwrap();
+        let staged = stage_credential_ca(&launch, &snapshot.path().join(ASSET_DIR))
+            .unwrap()
+            .expect("a CA to capture");
+        let machine = tempfile::tempdir().unwrap();
+        let partial = tempfile::tempdir().unwrap();
+        install_credential_ca(
+            snapshot.path(),
+            machine.path(),
+            partial.path(),
+            &staged,
+            &grown,
+        )
+        .unwrap();
+
+        let restored = machine.path().join(crate::credentials::CA_DIR_NAME);
+        let extras = crate::credentials::load_extra_cas(&restored, "cred-restored");
+        let source_extras = crate::credentials::load_extra_cas(&launch.ca_dir, "cred");
+        assert_eq!(extras.len(), 1, "the CA added for api.github.com travels");
+        assert_eq!(
+            extras[0].certificate_pem(),
+            source_extras[0].certificate_pem(),
+            "with the key the captured guest trusts, not a new one"
+        );
+        assert!(extras[0].permits("api.github.com") && !extras[0].permits("api.notion.com"));
+        let primary = smolvm_credentials::MachineCa::load(&restored, "cred-restored").unwrap();
+        assert!(primary.permits("api.notion.com") && !primary.permits("api.github.com"));
+        assert_eq!(guest_file(&restored), guest_file(&launch.ca_dir));
+        // the restored machine's next start finds every host covered: no CA is minted anew
+        assert!(
+            !crate::credentials::ensure_cas_for(&restored, "cred-restored", &grown, &grown)
+                .unwrap()
+        );
+
+        // resumed in place: the same CAs, not a second copy of each
+        install_credential_ca(
+            snapshot.path(),
+            machine.path(),
+            partial.path(),
+            &staged,
+            &grown,
+        )
+        .unwrap();
+        assert_eq!(
+            crate::credentials::load_extra_cas(&restored, "cred-restored").len(),
+            1
+        );
+        assert_eq!(guest_file(&restored), guest_file(&launch.ca_dir));
+    }
+
+    /// A checkpoint from before CAs recorded their hosts names none for its machine CA. Restored afresh, the CA
+    /// permits the hosts of the bindings the checkpoint was captured with, never none (which would mint a CA for every
+    /// host); resumed in place, it keeps the hosts its directory recorded, even when bindings changed while it was
+    /// paused. CAs too large for a checkpoint are refused by size, not as an unknown asset.
+    #[test]
+    fn a_checkpoint_ca_without_its_hosts_keeps_the_hosts_it_was_made_for() {
+        let notion =
+            crate::credentials::parse_credential_flag("notion=NOTION_KEY@api.notion.com").unwrap();
+        let captured = crate::credentials::CredentialPolicy {
+            credentials: vec![notion.clone()],
+        };
+        let original =
+            smolvm_credentials::MachineCa::generate("cred", &["api.notion.com".to_string()])
+                .unwrap();
+        let mut legacy: serde_json::Value = serde_json::from_str(&original.export()).unwrap();
+        legacy.as_object_mut().unwrap().remove("permitted");
+        let extracted = tempfile::tempdir().unwrap();
+        std::fs::create_dir(extracted.path().join(ASSET_DIR)).unwrap();
+        let source = extracted.path().join(CREDENTIAL_CA_ASSET);
+        std::fs::write(&source, legacy.to_string()).unwrap();
+        let asset = describe_asset(&source, CREDENTIAL_CA_ASSET).unwrap();
+        let partial = tempfile::tempdir().unwrap();
+
+        let fresh = tempfile::tempdir().unwrap();
+        install_credential_ca(
+            extracted.path(),
+            fresh.path(),
+            partial.path(),
+            &asset,
+            &captured,
+        )
+        .unwrap();
+        let ca_dir = fresh.path().join(crate::credentials::CA_DIR_NAME);
+        let restored = smolvm_credentials::MachineCa::load(&ca_dir, "cred").unwrap();
+        assert_eq!(restored.permitted(), ["api.notion.com".to_string()]);
+
+        // resumed in place after github was bound while paused: the recorded hosts stay the machine CA's
+        let grown = crate::credentials::CredentialPolicy {
+            credentials: vec![
+                notion,
+                crate::credentials::parse_credential_flag("gh=GH@api.github.com").unwrap(),
+            ],
+        };
+        crate::credentials::ensure_cas_for(&ca_dir, "cred", &grown, &captured).unwrap();
+        install_credential_ca(
+            extracted.path(),
+            fresh.path(),
+            partial.path(),
+            &asset,
+            &grown,
+        )
+        .unwrap();
+        let resumed = smolvm_credentials::MachineCa::load(&ca_dir, "cred").unwrap();
+        assert!(resumed.permits("api.notion.com") && !resumed.permits("api.github.com"));
+        assert_eq!(crate::credentials::load_extra_cas(&ca_dir, "cred").len(), 1);
+
+        let oversized = CheckpointAsset {
+            size: MAX_CREDENTIAL_CA_BYTES + 1,
+            ..asset
+        };
+        let refused = install_credential_ca(
+            extracted.path(),
+            fresh.path(),
+            partial.path(),
+            &oversized,
+            &grown,
+        )
+        .unwrap_err()
+        .to_string();
+        assert!(refused.contains("a checkpoint carries"), "{refused}");
     }
 
     #[cfg(unix)]
