@@ -21,6 +21,7 @@ depends=(
     'tar'
 )
 options=(!debug !strip)
+install=smolvm.install
 conflicts=('smolvm-bin' 'smolvm-git')
 source=(
     "LICENSE-$pkgver::https://raw.githubusercontent.com/smol-machines/$pkgname/refs/tags/v$pkgver/LICENSE"
