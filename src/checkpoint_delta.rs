@@ -359,6 +359,8 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
     let unpacked = staging.path().join("checkpoint");
     smolvm_pack::extract::unpack_checkpoint_history(artifact, &footer, &unpacked)
         .map_err(io("unpack checkpoint"))?;
+    #[cfg(unix)]
+    own_unpacked_checkpoint(&unpacked).map_err(io("take ownership of checkpoint"))?;
     let base_objects = match &base {
         Some((_, directory)) => {
             store::complete_from_base(&unpacked, directory).map_err(io("complete delta"))?
@@ -431,6 +433,32 @@ fn already_prepared(artifact: &Path, shared: &Path) -> Result<Option<Option<Path
         .as_ref()
         .is_some_and(|c| c.payload == smolvm_pack::format::CheckpointLayout::Chunked);
     Ok(Some(chunked.then(|| shared.to_path_buf())))
+}
+
+/// Give this process the files of a checkpoint unpacked into its store.
+///
+/// Unpacking as root keeps the owners the archive recorded: the uid of
+/// whatever captured it, a laptop user for a moved machine. The store is this
+/// host's, and a lazily restored disk's VMM reads its objects through an
+/// idmapped mount that maps only this process's ids, so a foreign owner left
+/// them unreadable and the guest's disk stalled.
+#[cfg(unix)]
+fn own_unpacked_checkpoint(root: &Path) -> std::io::Result<()> {
+    use std::os::unix::fs::MetadataExt;
+    let (uid, gid) = unsafe { (libc::geteuid(), libc::getegid()) };
+    let mut pending = vec![root.to_path_buf()];
+    while let Some(path) = pending.pop() {
+        let metadata = std::fs::symlink_metadata(&path)?;
+        if metadata.uid() != uid || metadata.gid() != gid {
+            std::os::unix::fs::lchown(&path, Some(uid), Some(gid))?;
+        }
+        if metadata.is_dir() {
+            for entry in std::fs::read_dir(&path)? {
+                pending.push(entry?.path());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// The lock the pack extractor holds while it extracts into `shared`.
@@ -525,10 +553,21 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     // RAM written below reaches the disk later, as for a deferred extraction.
     smolvm_pack::extract::mark_unsynced(&smolvm_pack::extract::unsynced_marker_path(&shared))
         .map_err(io("mark checkpoint memory unsynced"))?;
-    let materialized = store::materialize_over(
+    // Lazy restores serve the machine's disks from the store as the guest
+    // reads them, so the tree leaves them out.
+    #[cfg(unix)]
+    let lazy = crate::lazy_disk::enabled();
+    #[cfg(not(unix))]
+    let lazy = false;
+    #[cfg(unix)]
+    let skip = |path: &str| lazy && crate::lazy_disk::is_lazy_asset(path);
+    #[cfg(not(unix))]
+    let skip = |_: &str| false;
+    let materialized = store::materialize_over_except(
         &imported.directory,
         &partial,
         base_tree.as_ref().map(|(s, t)| (s.as_path(), t.as_path())),
+        &skip,
     );
     // A base is only a shortcut: if it fails, build the tree from the objects.
     let materialized = match materialized {
@@ -536,7 +575,7 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
             tracing::warn!(%error, "building over a restore base failed; materializing in full");
             let _ = std::fs::remove_dir_all(&partial);
             base_tree = None;
-            store::materialize_over(&imported.directory, &partial, None)
+            store::materialize_over_except(&imported.directory, &partial, None, &skip)
         }
         other => other,
     };
@@ -544,6 +583,21 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         let _ = std::fs::remove_dir_all(&partial);
         Error::agent("materialize checkpoint", error.to_string())
     })?;
+    #[cfg(unix)]
+    {
+        let recorded = std::fs::write(
+            partial.join(crate::lazy_disk::TREE_SOURCE),
+            imported.directory.as_os_str().as_encoded_bytes(),
+        )
+        .and_then(|()| match lazy {
+            true => std::fs::write(partial.join(crate::lazy_disk::TREE_WITHOUT_DISKS), b"1\n"),
+            false => Ok(()),
+        });
+        if let Err(error) = recorded {
+            let _ = std::fs::remove_dir_all(&partial);
+            return Err(io("record the checkpoint a restore tree came from")(error));
+        }
+    }
     let token = write_materialized_token(&partial).map_err(|error| {
         let _ = std::fs::remove_dir_all(&partial);
         io("mark materialized checkpoint")(error)
@@ -599,6 +653,7 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
         written_chunks = stats.written_chunks,
         import_ms,
         materialize_ms = started.elapsed().as_millis() as u64,
+        lazy_disks = lazy,
         "chunked checkpoint prepared for restore"
     );
     Ok(Some(shared))

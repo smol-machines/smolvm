@@ -194,10 +194,14 @@ pub struct Keep {
 impl Keep {
     /// What the machines in `db` need from `store`.
     pub fn from_db(db: &crate::db::SmolvmDb, store: &Path) -> crate::Result<Self> {
-        Ok(Self::from_records(
-            db.list_vms()?.into_iter().map(|(_, record)| record),
-            store,
-        ))
+        #[cfg_attr(not(unix), allow(unused_mut))]
+        let mut keep =
+            Self::from_records(db.list_vms()?.into_iter().map(|(_, record)| record), store);
+        // A lazily restored machine reads its disks from its checkpoint until
+        // they are complete.
+        #[cfg(unix)]
+        keep.dirs.extend(crate::lazy_disk::kept_checkpoints(store));
+        Ok(keep)
     }
 
     fn from_records(

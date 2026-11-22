@@ -3125,6 +3125,18 @@ pub fn materialize_over(
     output: &Path,
     base: Option<(&Path, &Path)>,
 ) -> io::Result<MaterializeStats> {
+    materialize_over_except(directory, output, base, &|_| false)
+}
+
+/// [`materialize_over`], leaving out the files `skip` names by index path:
+/// a restore serving its disks lazily from the stored checkpoint does not
+/// write them. [`materialize_missing`] adds them later if needed.
+pub fn materialize_over_except(
+    directory: &Path,
+    output: &Path,
+    base: Option<(&Path, &Path)>,
+    skip: &dyn Fn(&str) -> bool,
+) -> io::Result<MaterializeStats> {
     let index = read_index(directory)?;
     let base = base
         .map(|(stored, tree)| read_index(stored).map(|index| (index, tree.to_path_buf())))
@@ -3165,6 +3177,9 @@ pub fn materialize_over(
     let threads = worker_threads();
     let mut stats = MaterializeStats::default();
     for entry in &index.files {
+        if skip(&entry.path) {
+            continue;
+        }
         let destination = output.join(&entry.path);
         fs::create_dir_all(
             destination
@@ -3226,6 +3241,131 @@ pub fn materialize_over(
         "checkpoint materialized over base"
     );
     Ok(stats)
+}
+
+/// Write into the materialization `output` each file of the stored
+/// checkpoint at `directory` that `select` names and `output` lacks: the
+/// files [`materialize_over_except`] left out. Each appears whole or not at
+/// all. Returns how many files were written.
+pub fn materialize_missing(
+    directory: &Path,
+    output: &Path,
+    select: &dyn Fn(&str) -> bool,
+) -> io::Result<usize> {
+    let index = read_index(directory)?;
+    let objects = directory.join("objects");
+    let threads = worker_threads();
+    let mut written = 0;
+    for entry in index.files.iter().filter(|entry| select(&entry.path)) {
+        let destination = output.join(&entry.path);
+        if fs::symlink_metadata(&destination).is_ok() {
+            continue;
+        }
+        let parent = destination
+            .parent()
+            .ok_or_else(|| invalid("missing asset parent"))?;
+        fs::create_dir_all(parent)?;
+        // Unique per call: two installs in one process may complete one tree.
+        static PARTIALS: AtomicU64 = AtomicU64::new(0);
+        let partial = parent.join(format!(
+            ".{}.partial-{}-{}",
+            destination
+                .file_name()
+                .ok_or_else(|| invalid("missing asset name"))?
+                .to_string_lossy(),
+            std::process::id(),
+            PARTIALS.fetch_add(1, Ordering::Relaxed)
+        ));
+        let _ = fs::remove_file(&partial);
+        let result = (|| -> io::Result<()> {
+            let file = File::options()
+                .read(true)
+                .write(true)
+                .create_new(true)
+                .open(&partial)?;
+            file.set_len(entry.size)?;
+            let jobs = entry.chunks.iter().enumerate().filter_map(|(index, hash)| {
+                let offset = index as u64 * CHUNK_SIZE as u64;
+                Some((offset, hash.as_ref()?))
+            });
+            for_each_parallel(threads, jobs, |(offset, hash)| {
+                let count = (entry.size - offset).min(CHUNK_SIZE as u64) as usize;
+                write_at(
+                    &file,
+                    offset,
+                    &read_object(&objects.join(hash), hash, count)?,
+                )
+            })?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                file.set_permissions(fs::Permissions::from_mode(entry.mode))?;
+            }
+            file.sync_all()?;
+            fs::rename(&partial, &destination)
+        })();
+        if result.is_err() {
+            let _ = fs::remove_file(&partial);
+        }
+        result?;
+        written += 1;
+    }
+    Ok(written)
+}
+
+/// One file of a stored checkpoint, read a chunk at a time: what a disk
+/// served lazily from the checkpoint reads before its VMM takes over.
+pub struct ChunkedFile {
+    objects: std::path::PathBuf,
+    file: StoredFile,
+}
+
+impl ChunkedFile {
+    /// The file at index path `path` of the stored checkpoint at `directory`.
+    pub fn open(directory: &Path, path: &str) -> io::Result<Self> {
+        let file = read_index(directory)?
+            .files
+            .into_iter()
+            .find(|file| file.path == path)
+            .ok_or_else(|| invalid("the checkpoint has no such file"))?;
+        Ok(Self {
+            objects: directory.join("objects"),
+            file,
+        })
+    }
+
+    /// The file's size in bytes.
+    pub fn size(&self) -> u64 {
+        self.file.size
+    }
+
+    /// Bytes per chunk; the last chunk may be shorter.
+    pub fn chunk_size() -> u64 {
+        CHUNK_SIZE as u64
+    }
+
+    /// How many chunks the file has.
+    pub fn chunks(&self) -> usize {
+        self.file.chunks.len()
+    }
+
+    /// Whether chunk `index` is all zeros, held by no object.
+    pub fn is_zero(&self, index: usize) -> bool {
+        self.file.chunks.get(index).is_some_and(Option::is_none)
+    }
+
+    /// Chunk `index`, verified against its digest; `None` when it is zeros.
+    pub fn read(&self, index: usize) -> io::Result<Option<Vec<u8>>> {
+        let hash = self
+            .file
+            .chunks
+            .get(index)
+            .ok_or_else(|| invalid("chunk index out of range"))?;
+        let Some(hash) = hash else { return Ok(None) };
+        let offset = index as u64 * CHUNK_SIZE as u64;
+        let count = (self.file.size - offset).min(CHUNK_SIZE as u64) as usize;
+        read_object(&self.objects.join(hash), hash, count).map(Some)
+    }
 }
 
 /// How many of a checkpoint's smallest chunk digests stand for all of them

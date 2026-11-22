@@ -3963,6 +3963,10 @@ pub fn expand_disks(
         }
     }
 
+    // Growing a disk changes its size, which a lazily restored one takes
+    // from its checkpoint until it is complete.
+    #[cfg(unix)]
+    smolvm::lazy_disk::settle(&smolvm::agent::vm_data_dir(name))?;
     let manager = AgentManager::for_vm(name)
         .map_err(|e| smolvm::Error::agent("get agent manager", e.to_string()))?;
 

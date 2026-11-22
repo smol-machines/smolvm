@@ -789,6 +789,9 @@ pub(super) fn compact_if_deeper_than(
     vm_ids: Option<(u32, u32)>,
     threshold: usize,
 ) -> Result<()> {
+    // Folding reads the layers, which lazily restored ones lack until filled.
+    #[cfg(unix)]
+    crate::lazy_disk::settle(gdir)?;
     for (id, raw) in super::FORK_DISK_ROLES {
         let (active, format) = crate::agent::resolve_disk_image(gdir, raw);
         // A raw active disk is the guest's own and has no chain to fold.

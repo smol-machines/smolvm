@@ -109,6 +109,8 @@ pub mod image_store;
 /// containerd shim) can serve `_boot-vm` from its own executable instead of
 /// needing a separate `_boot-vm`-capable helper on disk.
 pub mod internal_boot;
+#[cfg(unix)]
+pub mod lazy_disk;
 pub mod log_rotation;
 /// One machine description, resolved the same way by every creation path.
 pub mod machine_spec;
