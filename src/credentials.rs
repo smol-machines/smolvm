@@ -18,7 +18,7 @@ pub use smolvm_protocol::credentials::{
     CredentialBinding, CredentialPolicy, GUEST_CA_DIR, GUEST_TRUST_ENV,
 };
 use smolvm_protocol::SecretRef;
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 
@@ -141,6 +141,13 @@ pub fn plan_binding_change(
     policy
         .validate(record.dns_filter_hosts.as_deref())
         .map_err(|e| Error::config("credentials", e.to_string()))?;
+    // Bindings turn outbound networking on at launch, so a machine whose
+    // networking is off (`machine update --no-net`, which also clears its
+    // bindings) would reach the internet again while `machine status` reports
+    // networking off. A machine that already has bindings and no networking of
+    // its own was created before bindings implied networking: its bindings
+    // already give it egress, so changing them opens nothing new.
+    refuse_bindings_without_network(machine, record, &policy)?;
     let minted = smolvm_credentials::generate_placeholders(&policy);
     let placeholders: BTreeMap<String, String> = policy
         .credentials
@@ -170,6 +177,31 @@ pub fn plan_binding_change(
     })
 }
 
+/// Refuse giving `record` the bindings of `policy` when its networking is off: bindings turn outbound networking on
+/// at launch. A machine that already has bindings and no networking of its own was created before bindings implied
+/// networking; its bindings already give it egress, so changing them opens nothing new.
+fn refuse_bindings_without_network(
+    machine: &str,
+    record: &VmRecord,
+    policy: &CredentialPolicy,
+) -> Result<()> {
+    let has_bindings = record
+        .credential_policy
+        .as_ref()
+        .is_some_and(|p| !p.is_empty());
+    if policy.is_empty() || has_bindings || record.outbound_without_credentials() {
+        return Ok(());
+    }
+    Err(Error::config(
+        "credentials",
+        format!(
+            "machine '{machine}' has networking off, and credential bindings need outbound \
+             networking; enable it first (`smolvm machine update --name {machine} --net` on \
+             the stopped machine)"
+        ),
+    ))
+}
+
 /// What [`set_bindings`] did.
 pub struct BindingsSet {
     /// The record as saved, with the new bindings.
@@ -180,26 +212,302 @@ pub struct BindingsSet {
     pub at_next_start: bool,
 }
 
-/// Replace `name`'s credential bindings with `policy` ([`plan_binding_change`]), saved for its next start and handed
-/// at once to the machine when it runs. A machine that booted without bindings runs no interceptor, so it takes them
-/// from its next start. An added binding resolves from its variable, or from a value handed over after it
-/// (`machine credentials refresh`, `PUT …/credential-values`).
-pub fn set_bindings(name: &str, policy: CredentialPolicy) -> Result<BindingsSet> {
-    set_bindings_in(&crate::db::SmolvmDb::open()?, name, policy)
+/// Who changes a machine's bindings, which decides where their values may come from.
+#[derive(Debug, Clone, Copy)]
+pub enum BindingsChanger<'a> {
+    /// This host's operator (the CLI), defining the bindings named in `defines`: those read their values from this
+    /// host (a `[secrets]` reference, the environment `machine start` ran with, or a value the operator hands the
+    /// running machine). Every other binding keeps where its values come from.
+    Operator {
+        /// The bindings this command defines.
+        defines: &'a [String],
+    },
+    /// An HTTP API caller or an embedder. A binding it adds or changes in any way (variable, hosts, header) takes
+    /// only the values that caller supplies, never this host's, now or at any later start; one it leaves exactly as
+    /// it was keeps its source. So it can neither route a host variable or secret to a host of its choosing nor
+    /// redirect an operator's binding, and the value already held for it, to a new host.
+    Untrusted,
+}
+
+/// Serializes changes to one machine's bindings, and the values handed to it for them, across processes: a value
+/// read for a binding as one change sees it can never reach the binding as another change left it.
+pub struct BindingsLock {
+    machine: String,
+    path: PathBuf,
+    file: std::fs::File,
+}
+
+impl BindingsLock {
+    /// Remove the lock file once the machine turns out not to exist (a delete raced the caller's lookup), so a
+    /// change to a machine that is gone leaves nothing behind.
+    pub fn remove_if_machine_gone(&self) {
+        if still_names(&self.path, &self.file) {
+            let _ = std::fs::remove_file(&self.path);
+        }
+    }
+}
+
+/// The lock file of [`lock_bindings`] for the machine whose data directory is `data_dir`. It sits in the directory of
+/// all machines, which belongs to this host's user, beside the machine's data directory rather than inside it: that
+/// directory belongs to the machine's own user, and a process escaped from the machine must not be able to swap the
+/// lock for a link or a FIFO that a root CLI or server then opens.
+fn bindings_lock_beside(data_dir: &Path) -> PathBuf {
+    let mut name = data_dir.file_name().unwrap_or_default().to_os_string();
+    name.push(".credential-bindings.lock");
+    data_dir.with_file_name(name)
+}
+
+/// Take [`BindingsLock`] for machine `name`, waiting for whoever holds it.
+pub fn lock_bindings(name: &str) -> Result<BindingsLock> {
+    // unit tests never write into this host's machine directory
+    #[cfg(test)]
+    let data_dir = std::env::temp_dir()
+        .join(format!("smolvm-test-bindings-locks-{}", std::process::id()))
+        .join(crate::agent::vm_dir_hash(name));
+    #[cfg(not(test))]
+    let data_dir = crate::agent::vm_data_dir(name);
+    lock_bindings_at(
+        &bindings_lock_beside(&data_dir),
+        name,
+        BINDINGS_LOCK_TIMEOUT,
+    )
+}
+
+/// Remove the lock file of the machine whose data directory is `data_dir`, once the machine is deleted.
+pub(crate) fn remove_bindings_lock(data_dir: &Path) {
+    let path = bindings_lock_beside(data_dir);
+    match std::fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            tracing::warn!(path = %path.display(), %error, "could not remove credential bindings lock")
+        }
+    }
+}
+
+/// How long a change waits for another change to the same machine's bindings before giving up: a change holds the
+/// lock for a record write and a socket round trip, so a holder past this is stuck, and a caller (an API handler
+/// among them) must not wait on it forever.
+const BINDINGS_LOCK_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+
+/// Open the lock file, creating it, without following a link or blocking on a FIFO. It is private to its owner
+/// (0600): anyone who could open it could hold it and stall every change to the machine's bindings. A file this call
+/// creates goes, when root creates it (`sudo smolvm …`), to the owner of the directory, so this host's user can still
+/// take it. A file that already exists is never changed: it is refused when it belongs to anyone but this user, root
+/// or that directory's owner, is open to others, or has another name (a hard link to some other file, which root
+/// must never take over).
+fn open_bindings_lock(path: &Path) -> std::io::Result<std::fs::File> {
+    let open = |create: bool| {
+        let mut options = std::fs::OpenOptions::new();
+        options.read(true).write(true);
+        if create {
+            options.create_new(true);
+        }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options
+                .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC);
+        }
+        options.open(path)
+    };
+    let (file, created) = match open(true) {
+        Ok(file) => (file, true),
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => (open(false)?, false),
+        Err(error) => return Err(error),
+    };
+    let meta = file.metadata()?;
+    if !meta.is_file() {
+        return Err(std::io::Error::other(format!(
+            "{} is not a regular file",
+            path.display()
+        )));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::fd::AsRawFd;
+        use std::os::unix::fs::MetadataExt;
+        let parent = std::fs::metadata(path.parent().unwrap_or(Path::new("/")))?;
+        let me = unsafe { libc::geteuid() };
+        if created {
+            if me == 0
+                && parent.uid() != 0
+                && unsafe { libc::fchown(file.as_raw_fd(), parent.uid(), parent.gid()) } != 0
+            {
+                return Err(std::io::Error::last_os_error());
+            }
+        } else {
+            let refuse = |why: String| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    format!("{} {why}; remove it", path.display()),
+                ))
+            };
+            if meta.nlink() != 1 {
+                return refuse(format!("has {} names", meta.nlink()));
+            }
+            if ![me, 0, parent.uid()].contains(&meta.uid()) {
+                return refuse(format!("belongs to another user (uid {})", meta.uid()));
+            }
+            if meta.mode() & 0o077 != 0 {
+                return refuse(format!(
+                    "is open to others (mode {:o})",
+                    meta.mode() & 0o777
+                ));
+            }
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = created;
+    Ok(file)
+}
+
+/// Whether `path` still names the file `file` has open: a delete may unlink it between the open and the lock.
+fn still_names(path: &Path, file: &std::fs::File) -> bool {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        match (std::fs::symlink_metadata(path), file.metadata()) {
+            (Ok(named), Ok(open)) => named.dev() == open.dev() && named.ino() == open.ino(),
+            _ => false,
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        // only a deleted machine's lock is removed, and a change to a deleted machine finds no record to change
+        let _ = (path, file);
+        true
+    }
+}
+
+/// Take the lock at `path`, waiting at most `timeout` for whoever holds it.
+fn lock_bindings_at(path: &Path, name: &str, timeout: std::time::Duration) -> Result<BindingsLock> {
+    let fail = |e: std::io::Error| Error::agent("credential bindings lock", e.to_string());
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(fail)?;
+    }
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        let file = open_bindings_lock(path).map_err(fail)?;
+        match file.try_lock() {
+            Ok(()) => {
+                if still_names(path, &file) {
+                    return Ok(BindingsLock {
+                        machine: name.to_string(),
+                        path: path.to_path_buf(),
+                        file,
+                    });
+                }
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(Error::agent_conflict(
+                        "credential bindings lock",
+                        format!(
+                            "another change to machine '{name}''s credential bindings has held them for over \
+                             {}s; try again once it finishes",
+                            timeout.as_secs_f32()
+                        ),
+                    ));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(fail(error)),
+        }
+    }
+}
+
+/// Which of the bindings in `next` take only supplied values, and which variables stay withheld from the workload's
+/// plaintext environment, after `changer` replaces `record`'s bindings with `next`.
+fn provenance_after(
+    record: &VmRecord,
+    next: &CredentialPolicy,
+    changer: BindingsChanger<'_>,
+) -> (BTreeSet<String>, BTreeSet<String>) {
+    let before = record.credential_policy.as_ref();
+    let mut supplied: BTreeSet<String> = record
+        .credentials_supplied_bindings
+        .iter()
+        .filter(|name| next.binding(name).is_some())
+        .cloned()
+        .collect();
+    let mut withheld = record.credential_withheld_variables.clone();
+    match changer {
+        BindingsChanger::Operator { defines } => {
+            for name in defines {
+                supplied.remove(name);
+            }
+        }
+        BindingsChanger::Untrusted => {
+            for binding in &next.credentials {
+                if before.and_then(|p| p.binding(&binding.name)) != Some(binding) {
+                    supplied.insert(binding.name.clone());
+                }
+            }
+            // A binding defined from this host may read an operator's secret reference, which then feeds the
+            // interceptor and is withheld from the guest; removing or changing the binding must not make it
+            // plaintext. A binding this caller set never read one, so it cannot withhold the operator's variables.
+            withheld.extend(
+                before
+                    .iter()
+                    .flat_map(|p| p.credentials.iter())
+                    .filter(|b| record.credential_host_sourced(&b.name))
+                    .filter(|b| next.binding(&b.name) != Some(*b))
+                    .filter(|b| record.secret_refs.contains_key(&b.environment_variable))
+                    .map(|b| b.environment_variable.clone()),
+            );
+        }
+    }
+    // only a reference the machine still has can be withheld, so the set never outgrows the machine's secrets
+    withheld.retain(|var| record.secret_refs.contains_key(var));
+    (supplied, withheld)
+}
+
+/// Replace `name`'s credential bindings with the policy `build` makes from its record as it is under `lock`
+/// ([`plan_binding_change`]), saved for its next start and handed at once to the machine when it runs. A machine that
+/// booted without bindings runs no interceptor, so it takes them from its next start. Where each binding's values
+/// come from follows `changer`. Hold `lock` until any values for the new bindings have been handed over too.
+pub fn set_bindings(
+    name: &str,
+    lock: &BindingsLock,
+    changer: BindingsChanger<'_>,
+    build: impl FnOnce(&VmRecord) -> Result<CredentialPolicy>,
+) -> Result<BindingsSet> {
+    set_bindings_in(&crate::db::SmolvmDb::open()?, name, lock, changer, build)
 }
 
 /// [`set_bindings`] against `db`, for a runtime that keeps its own database.
 pub fn set_bindings_in(
     db: &crate::db::SmolvmDb,
     name: &str,
-    policy: CredentialPolicy,
+    lock: &BindingsLock,
+    changer: BindingsChanger<'_>,
+    build: impl FnOnce(&VmRecord) -> Result<CredentialPolicy>,
 ) -> Result<BindingsSet> {
-    let record = db.get_vm(name)?.ok_or_else(|| Error::vm_not_found(name))?;
+    if lock.machine != name {
+        return Err(Error::agent(
+            "credential bindings lock",
+            format!("held for machine '{}', not '{name}'", lock.machine),
+        ));
+    }
+    let Some(record) = db.get_vm(name)? else {
+        lock.remove_if_machine_gone();
+        return Err(Error::vm_not_found(name));
+    };
+    let policy = build(&record)?;
     let change = plan_binding_change(name, &record, policy)?;
+    let (supplied, withheld) = provenance_after(&record, &change.policy, changer);
     let saved = db
-        .update_vm_durable(name, |r| {
+        // the machine planned for, never one deleted and created again under its name since
+        .try_update_reviewed_vm_durable(&record, |r| {
+            // checked again as the record is now: networking may have been turned off since it was read
+            refuse_bindings_without_network(name, r, &change.policy)?;
             r.credential_policy = (!change.policy.is_empty()).then(|| change.policy.clone());
             r.credential_placeholders = change.placeholders.clone();
+            r.credentials_supplied_bindings = supplied.clone();
+            r.credential_withheld_variables = withheld.clone();
+            Ok(())
         })?
         .ok_or_else(|| Error::vm_not_found(name))?;
     let running = crate::agent::state_probe::resolve_state(name, &saved)
@@ -211,7 +519,11 @@ pub fn set_bindings_in(
         .exists();
     let live = running && interceptor;
     if live {
-        crate::agent::apply_live_credential_bindings(name, &change)?;
+        // the host sources of the bindings this host's operator defined, and none for any other
+        let sources = CredentialLaunch::for_record(name, &saved)
+            .map(|launch| launch.sources)
+            .unwrap_or_default();
+        crate::agent::apply_live_credential_bindings(name, &change, &sources)?;
     }
     Ok(BindingsSet {
         record: saved,
@@ -261,26 +573,33 @@ pub fn require_host_sources(policy: &CredentialPolicy) -> Result<()> {
 /// Split a workload's secret references from its credential environment. A
 /// variable bound to a credential never carries plaintext into the guest: its
 /// reference feeds the interceptor, and the guest gets the placeholder plus
-/// the variables pointing HTTP clients at the machine CA. Returns the refs to
-/// resolve into the environment and the credential variables to add.
+/// the variables pointing HTTP clients at the machine CA. A variable in
+/// `withheld` (one that backed a binding an untrusted caller later changed)
+/// never carries plaintext either. Returns the refs to resolve into the
+/// environment and the credential variables to add.
 pub fn workload_env(
     policy: Option<&CredentialPolicy>,
     placeholders: &BTreeMap<String, String>,
     secret_refs: &BTreeMap<String, SecretRef>,
+    withheld: &BTreeSet<String>,
 ) -> (BTreeMap<String, SecretRef>, Vec<(String, String)>) {
-    let Some(policy) = policy.filter(|p| !p.is_empty()) else {
-        return (secret_refs.clone(), Vec::new());
-    };
+    let policy = policy.filter(|p| !p.is_empty());
     let refs = secret_refs
         .iter()
         .filter(|(name, _)| {
-            !policy
-                .credentials
-                .iter()
-                .any(|b| &b.environment_variable == *name)
+            !withheld.contains(*name)
+                && !policy.is_some_and(|policy| {
+                    policy
+                        .credentials
+                        .iter()
+                        .any(|b| &b.environment_variable == *name)
+                })
         })
         .map(|(name, r)| (name.clone(), r.clone()))
         .collect();
+    let Some(policy) = policy else {
+        return (refs, Vec::new());
+    };
     let mut env: Vec<(String, String)> = policy.guest_env(placeholders).collect();
     env.extend(
         GUEST_TRUST_ENV
@@ -313,11 +632,18 @@ pub struct CredentialLaunch {
     /// environment (bindings that arrived over the HTTP API).
     #[serde(default)]
     pub supplied_only: bool,
+    /// Variables withheld from the workload's plaintext environment although
+    /// no binding names them now ([`VmRecord::credential_withheld_variables`]).
+    #[serde(default, skip_serializing_if = "BTreeSet::is_empty")]
+    pub withheld_variables: BTreeSet<String>,
 }
 
 impl CredentialLaunch {
     /// Describe the launch for a record. `None` when the machine has no
     /// credential policy. Pure: the CA is created by [`Self::ensure_ca`].
+    /// Only a binding this host's operator defined has a host source
+    /// ([`VmRecord::credential_host_sourced`]); every other one resolves from
+    /// supplied values alone.
     pub fn for_record(machine: &str, record: &VmRecord) -> Option<Self> {
         let mut launch = Self::from_parts(
             machine,
@@ -327,6 +653,10 @@ impl CredentialLaunch {
             record.golden.as_deref(),
         )?;
         launch.supplied_only = record.credentials_supplied_by_api;
+        launch
+            .sources
+            .retain(|binding, _| record.credential_host_sourced(binding));
+        launch.withheld_variables = record.credential_withheld_variables.clone();
         Some(launch)
     }
 
@@ -367,6 +697,7 @@ impl CredentialLaunch {
             ca_dir,
             sources,
             supplied_only: false,
+            withheld_variables: BTreeSet::new(),
         })
     }
 
@@ -498,8 +829,8 @@ impl CredentialLaunch {
     /// Point bindings at the values supplied for this machine, and return the
     /// environment the boot process needs for it: `Some(value)` to set,
     /// `None` to remove. A supplied value travels in a variable private to the
-    /// boot process, so it never lands in the boot config on disk. A
-    /// `supplied_only` binding with no value is pointed at a variable that is
+    /// boot process, so it never lands in the boot config on disk. A binding
+    /// with no host source and no value is pointed at a variable that is
     /// removed, so it resolves to nothing rather than to a host variable.
     pub fn child_env(&mut self) -> Vec<(String, Option<zeroize::Zeroizing<String>>)> {
         let held = SUPPLIED.lock().unwrap_or_else(|e| e.into_inner());
@@ -512,7 +843,7 @@ impl CredentialLaunch {
             let value = supplied
                 .and_then(|values| values.get(&binding.name))
                 .cloned();
-            if value.is_none() && !self.supplied_only {
+            if value.is_none() && !self.supplied_only && self.sources.contains_key(&binding.name) {
                 continue;
             }
             let var = supplied_var(index);
@@ -533,14 +864,55 @@ struct LiveBindings {
     ca_owner: String,
 }
 
+/// Take the boot process's sources and held values from the bindings `current` to `next`. A binding left exactly as
+/// it was keeps both. One added or changed in any way (variable, hosts, header) drops the value held for it, so a
+/// value handed over for one destination never follows the binding to another, and resolves from `next_sources`
+/// alone: the trusted caller names there the host source of each binding this host's operator defined, and a binding
+/// it does not name resolves only from a value handed over after the change, never from this process's environment.
+fn replace_live_bindings(
+    current: &CredentialPolicy,
+    next: &CredentialPolicy,
+    next_sources: &BTreeMap<String, SecretRef>,
+    sources: &mut BTreeMap<String, SecretRef>,
+    live: &mut BTreeMap<String, zeroize::Zeroizing<String>>,
+) {
+    sources.retain(|name, _| next.binding(name).is_some());
+    live.retain(|name, _| next.binding(name).is_some());
+    for binding in &next.credentials {
+        if current.binding(&binding.name) == Some(binding) {
+            continue;
+        }
+        live.remove(&binding.name);
+        match next_sources.get(&binding.name) {
+            Some(source) => sources.insert(binding.name.clone(), source.clone()),
+            None => sources.remove(&binding.name),
+        };
+    }
+}
+
+/// The request handing a running machine its new bindings over [`CREDENTIALS_SOCKET`], with the host source of each
+/// binding this host's operator defined in `sources`. `sources` sits beside `bindings`, not inside it: a boot process
+/// that predates it (v1.36) refuses an unknown top-level field as a malformed request and keeps the bindings it has,
+/// where it would quietly drop a nested one and resolve every added binding from its own environment.
+pub(crate) fn live_bindings_request(
+    change: &BindingChange,
+    sources: &BTreeMap<String, SecretRef>,
+) -> String {
+    serde_json::json!({
+        "bindings": { "policy": change.policy, "placeholders": change.placeholders },
+        "sources": sources,
+    })
+    .to_string()
+}
+
 /// Serve [`CREDENTIALS_SOCKET`] in `vm_dir`: each connection sends
-/// `{"values":{"<binding>":"<value>",…}}` or `{"bindings":{"policy":…,"placeholders":…}}` and gets back `ok` or
-/// `error: <reason>`. Values replace those the machine resolves for the bindings named, from its next request on; a
-/// name that is not a binding changes nothing. Bindings replace the machine's bindings: an added one resolves from
-/// its variable (or a value handed over after it), a removed one is no longer substituted (its hosts stay
-/// intercepted, their responses checked for the values sent there), and a CA the caller added for a new host signs
-/// that host from the next connection. A change is refused, the running machine keeping its bindings, if connections
-/// already spliced to a host it covers do not end in time or another change is being applied.
+/// `{"values":{"<binding>":"<value>",…}}` or `{"bindings":{"policy":…,"placeholders":…},"sources":…}` and gets back
+/// `ok` or `error: <reason>`. Values replace those the machine resolves for the bindings named, from its next request
+/// on; a name that is not a binding changes nothing. Bindings replace the machine's bindings
+/// ([`replace_live_bindings`]): a removed one is no longer substituted (its hosts stay intercepted, their responses
+/// checked for the values sent there) and its values are dropped, and a CA the caller added for a new host signs that
+/// host from the next connection. A change is refused, the running machine keeping its bindings, sources and held
+/// values, if connections already spliced to a host it covers do not end in time or another change is being applied.
 fn serve_live_values(
     vm_dir: &Path,
     policy: &CredentialPolicy,
@@ -559,10 +931,12 @@ fn serve_live_values(
         values: BTreeMap<String, String>,
         #[serde(default)]
         bindings: Option<Bindings>,
+        /// Host sources of the bindings this host's operator defined ([`live_bindings_request`]). A bindings change
+        /// without it, from a caller that predates it, leaves every added or changed binding to values handed over.
+        #[serde(default)]
+        sources: BTreeMap<String, SecretRef>,
     }
-    let bindings: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(
-        policy.credentials.iter().map(|b| b.name.clone()).collect(),
-    ));
+    let bindings: Arc<Mutex<CredentialPolicy>> = Arc::new(Mutex::new(policy.clone()));
     let path = vm_dir.join(CREDENTIALS_SOCKET);
     let _ = std::fs::remove_file(&path);
     crate::network::launch::serve_control_socket(
@@ -572,41 +946,36 @@ fn serve_live_values(
         move |request| {
             let request: Request =
                 serde_json::from_str(request).map_err(|_| "malformed request".to_string())?;
+            let mut current = bindings.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(next) = request.bindings {
                 let Some(change) = change.as_ref() else {
                     return Err("this machine cannot change its bindings while it runs".to_string());
                 };
                 // Ends the connections spliced to hosts the new bindings cover first, or refuses with nothing
-                // changed.
+                // changed: sources, held values and the bindings stay as they are.
                 let prepared = change.control.prepare(&next.policy)?;
+                replace_live_bindings(
+                    &current,
+                    &next.policy,
+                    &request.sources,
+                    &mut change.sources.write().unwrap_or_else(|e| e.into_inner()),
+                    &mut live.lock().unwrap_or_else(|e| e.into_inner()),
+                );
                 let names: Vec<String> = next
                     .policy
                     .credentials
                     .iter()
                     .map(|b| b.name.clone())
                     .collect();
-                {
-                    let mut sources = change.sources.write().unwrap_or_else(|e| e.into_inner());
-                    sources.retain(|name, _| names.contains(name));
-                    for b in &next.policy.credentials {
-                        sources.entry(b.name.clone()).or_insert_with(|| {
-                            crate::secrets::env_ref(b.environment_variable.clone())
-                        });
-                    }
-                }
-                live.lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .retain(|name, _| names.contains(name));
+                *current = next.policy.clone();
                 prepared.commit(
                     next.policy,
                     next.placeholders,
                     load_extra_cas(&change.ca_dir, &change.ca_owner),
                 );
-                *bindings.lock().unwrap_or_else(|e| e.into_inner()) = names.clone();
                 tracing::info!(bindings = ?names, "credential bindings replaced");
             }
-            let known = bindings.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            if let Some(unknown) = request.values.keys().find(|k| !known.contains(k)) {
+            if let Some(unknown) = request.values.keys().find(|k| current.binding(k).is_none()) {
                 return Err(format!("no credential binding '{unknown}'"));
             }
             for (binding, value) in &request.values {
@@ -1094,7 +1463,7 @@ mod tests {
         ]
         .into_iter()
         .collect();
-        let (refs, env) = workload_env(Some(&policy), &placeholders, &refs);
+        let (refs, env) = workload_env(Some(&policy), &placeholders, &refs, &BTreeSet::new());
         assert_eq!(refs.keys().collect::<Vec<_>>(), vec!["OTHER"]);
         assert_eq!(env[0], ("N_KEY".to_string(), placeholders["n"].clone()));
         assert!(env
@@ -1102,5 +1471,710 @@ mod tests {
             .any(|(k, v)| k == "SSL_CERT_FILE" && v == "/run/smolvm/ca-bundle.pem"));
         assert!(env.iter().all(|(_, v)| !v.contains("secret")));
         assert!(prepare_policy(&policy, Some(&["github.com".to_string()])).is_err());
+    }
+
+    /// A running machine's credentials socket, as its boot process serves it, booted with `policy` and `sources`.
+    struct LiveMachine {
+        dir: tempfile::TempDir,
+        resolver: SecretRefResolver,
+        _interceptor: Interceptor,
+    }
+
+    impl LiveMachine {
+        fn boot(policy: &CredentialPolicy, sources: BTreeMap<String, SecretRef>) -> Self {
+            let dir = tempfile::tempdir().unwrap();
+            let live = LiveValues::default();
+            let sources = Arc::new(std::sync::RwLock::new(sources));
+            let interceptor = Interceptor::spawn(
+                InterceptorConfig {
+                    machine: "live-test".into(),
+                    policy: policy.clone(),
+                    placeholders: smolvm_credentials::generate_placeholders(policy),
+                    ca: MachineCa::generate("live-test", &binding_subtrees(policy)).unwrap(),
+                    extra_cas: Vec::new(),
+                    upstream_roots_pem: Vec::new(),
+                },
+                Arc::new(SecretRefResolver {
+                    sources: sources.clone(),
+                    live: live.clone(),
+                }),
+            )
+            .unwrap();
+            serve_live_values(
+                dir.path(),
+                policy,
+                live.clone(),
+                Some(LiveBindings {
+                    control: interceptor.control(),
+                    sources: sources.clone(),
+                    ca_dir: dir.path().join("ca"),
+                    ca_owner: "live-test".into(),
+                }),
+            );
+            LiveMachine {
+                dir,
+                resolver: SecretRefResolver { sources, live },
+                _interceptor: interceptor,
+            }
+        }
+
+        fn send(&self, body: &str) -> String {
+            use std::io::{Read, Write};
+            let mut stream =
+                crate::platform::uds::UdsStream::connect(self.dir.path().join(CREDENTIALS_SOCKET))
+                    .unwrap();
+            stream.write_all(body.as_bytes()).unwrap();
+            stream.shutdown(std::net::Shutdown::Write).unwrap();
+            let mut reply = String::new();
+            stream.read_to_string(&mut reply).unwrap();
+            reply.trim().to_string()
+        }
+
+        /// Hand the machine `policy` as its new bindings, as a host-side change does.
+        fn rebind(&self, policy: &CredentialPolicy, sources: &BTreeMap<String, SecretRef>) {
+            assert_eq!(
+                self.send(&live_bindings_request(&change_to(policy), sources)),
+                "ok"
+            );
+        }
+
+        fn resolve(&self, binding: &str, host: &str) -> Option<String> {
+            self.resolver
+                .resolve(&CredentialRequest {
+                    machine: "live-test".into(),
+                    binding: binding.into(),
+                    host: host.into(),
+                    port: 443,
+                    method: "GET".into(),
+                    path: "/".into(),
+                })
+                .ok()
+                .map(|v| v.to_string())
+        }
+    }
+
+    fn change_to(policy: &CredentialPolicy) -> BindingChange {
+        BindingChange {
+            policy: policy.clone(),
+            placeholders: smolvm_credentials::generate_placeholders(policy),
+            trust_changed: false,
+            guest_ca: None,
+        }
+    }
+
+    /// A boot process from v1.36 kept running across a host upgrade must refuse a bindings change that carries
+    /// sources, keeping the bindings it booted with, rather than quietly dropping them and resolving every added
+    /// binding from its own environment. Its request shape, as it shipped.
+    #[test]
+    fn a_boot_process_that_predates_sources_refuses_the_change() {
+        #[derive(Deserialize)]
+        #[allow(dead_code)]
+        struct Bindings {
+            policy: CredentialPolicy,
+            placeholders: BTreeMap<String, String>,
+        }
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        #[allow(dead_code)]
+        struct V136Request {
+            #[serde(default)]
+            values: BTreeMap<String, String>,
+            #[serde(default)]
+            bindings: Option<Bindings>,
+        }
+        let request = live_bindings_request(
+            &change_to(&policy_of(&["gh=GH_TOKEN@attacker.example"])),
+            &BTreeMap::new(),
+        );
+        assert!(serde_json::from_str::<V136Request>(&request).is_err());
+        // values alone, which it still takes, keep their shape
+        assert!(serde_json::from_str::<V136Request>(r#"{"values":{"gh":"v"}}"#).is_ok());
+    }
+
+    /// A bindings change from a caller that predates sources leaves an added binding to values handed over.
+    #[test]
+    fn a_bindings_change_without_sources_reads_no_host_value() {
+        let machine = LiveMachine::boot(&policy_of(&["a=A_KEY@api.a.com"]), BTreeMap::new());
+        let next = policy_of(&["a=A_KEY@api.a.com", "evil=PATH@attacker.example"]);
+        let body = serde_json::json!({
+            "bindings": {
+                "policy": next,
+                "placeholders": smolvm_credentials::generate_placeholders(&next),
+            }
+        });
+        assert_eq!(machine.send(&body.to_string()), "ok");
+        assert_eq!(machine.resolve("evil", "attacker.example"), None);
+    }
+
+    fn policy_of(specs: &[&str]) -> CredentialPolicy {
+        CredentialPolicy {
+            credentials: specs
+                .iter()
+                .map(|spec| parse_credential_flag(spec).unwrap())
+                .collect(),
+        }
+    }
+
+    /// A binding added to a running machine without a host source (every binding an API caller adds) never resolves
+    /// from the boot process's environment, which it inherited from whoever started it: `PATH` stands in for
+    /// `AWS_SECRET_ACCESS_KEY` in the serve process. One the operator added with a source resolves from that source.
+    #[test]
+    fn a_binding_added_live_never_reads_the_boot_process_environment() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("gh-token");
+        std::fs::write(&token, "operator-file").unwrap();
+        let machine = LiveMachine::boot(&policy_of(&["a=A_KEY@api.a.com"]), BTreeMap::new());
+        assert!(std::env::var("PATH").is_ok_and(|v| !v.is_empty()));
+        let next = policy_of(&[
+            "a=A_KEY@api.a.com",
+            "evil=PATH@attacker.example",
+            "gh=GH_TOKEN@github.com",
+        ]);
+        machine.rebind(
+            &next,
+            &[("gh".to_string(), crate::secrets::file_ref(token))].into(),
+        );
+        assert_eq!(machine.resolve("evil", "attacker.example"), None);
+        assert_eq!(
+            machine.resolve("gh", "github.com").as_deref(),
+            Some("operator-file")
+        );
+        // a value handed over for it afterwards is what it resolves to
+        assert_eq!(machine.send(r#"{"values":{"evil":"supplied"}}"#), "ok");
+        assert_eq!(
+            machine.resolve("evil", "attacker.example").as_deref(),
+            Some("supplied")
+        );
+    }
+
+    /// Retargeting a binding (its hosts, its variable or its header) drops the value held for it and the source it
+    /// booted with, so neither reaches the new destination; a binding left exactly as it was keeps both.
+    #[test]
+    fn a_retargeted_binding_never_takes_its_held_value_to_the_new_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("gh-token");
+        std::fs::write(&token, "operator-file").unwrap();
+        let booted = policy_of(&["gh=GH_TOKEN@github.com", "a=A_KEY@api.a.com"]);
+        for retarget in [
+            "gh=GH_TOKEN@attacker.example",
+            "gh=OTHER_VAR@github.com",
+            "gh=GH_TOKEN@github.com:set-header=x-token",
+        ] {
+            // each case starts from a machine that holds a value for gh
+            let machine = LiveMachine::boot(
+                &booted,
+                [("gh".to_string(), crate::secrets::file_ref(token.clone()))].into(),
+            );
+            assert_eq!(
+                machine.send(r#"{"values":{"gh":"operator-pushed","a":"kept"}}"#),
+                "ok"
+            );
+            assert_eq!(
+                machine.resolve("gh", "github.com").as_deref(),
+                Some("operator-pushed")
+            );
+            machine.rebind(
+                &policy_of(&[retarget, "a=A_KEY@api.a.com"]),
+                &BTreeMap::new(),
+            );
+            for host in ["attacker.example", "github.com"] {
+                assert_eq!(machine.resolve("gh", host), None, "{retarget} {host}");
+            }
+            assert_eq!(
+                machine.resolve("a", "api.a.com").as_deref(),
+                Some("kept"),
+                "{retarget}"
+            );
+        }
+    }
+
+    /// A change the interceptor refuses (here another change is already prepared) leaves the boot process as it was:
+    /// the held value, the source and the bindings the values are checked against.
+    #[test]
+    fn a_refused_binding_change_leaves_held_values_sources_and_bindings_alone() {
+        let dir = tempfile::tempdir().unwrap();
+        let token = dir.path().join("a-token");
+        std::fs::write(&token, "a-file").unwrap();
+        let booted = policy_of(&["gh=GH_TOKEN@github.com", "a=A_KEY@api.a.com"]);
+        let machine = LiveMachine::boot(
+            &booted,
+            [("a".to_string(), crate::secrets::file_ref(token))].into(),
+        );
+        assert_eq!(machine.send(r#"{"values":{"gh":"operator-pushed"}}"#), "ok");
+        let pending = machine
+            ._interceptor
+            .control()
+            .prepare(&policy_of(&["other=O_KEY@other.example"]))
+            .unwrap();
+        let next = policy_of(&["gh=GH_TOKEN@attacker.example", "evil=PATH@attacker.example"]);
+        let refused = machine.send(&live_bindings_request(&change_to(&next), &BTreeMap::new()));
+        assert!(refused.contains("in progress"), "{refused}");
+        assert_eq!(
+            machine.resolve("gh", "github.com").as_deref(),
+            Some("operator-pushed")
+        );
+        assert_eq!(machine.resolve("a", "api.a.com").as_deref(), Some("a-file"));
+        // the bindings values are checked against are still the booted ones
+        assert!(machine
+            .send(r#"{"values":{"evil":"x"}}"#)
+            .contains("no credential binding 'evil'"));
+        assert_eq!(machine.send(r#"{"values":{"a":"pushed"}}"#), "ok");
+        drop(pending);
+    }
+
+    fn bindings_db(
+        name: &str,
+        setup: impl FnOnce(&mut VmRecord),
+    ) -> (tempfile::TempDir, crate::db::SmolvmDb) {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("smolvm.db")).unwrap();
+        let mut record = VmRecord::new(name.into(), 1, 512, Vec::new(), Vec::new(), true);
+        setup(&mut record);
+        db.insert_vm(name, &record).unwrap();
+        (dir, db)
+    }
+
+    /// A bindings lock for `name` in a scratch directory, never in this host's machine directory.
+    fn test_lock(name: &str) -> (tempfile::TempDir, BindingsLock) {
+        let dir = tempfile::tempdir().unwrap();
+        let lock = lock_bindings_at(
+            &dir.path().join("m.credential-bindings.lock"),
+            name,
+            BINDINGS_LOCK_TIMEOUT,
+        )
+        .unwrap();
+        (dir, lock)
+    }
+
+    fn change(
+        db: &crate::db::SmolvmDb,
+        name: &str,
+        changer: BindingsChanger<'_>,
+        specs: &[&str],
+    ) -> Result<VmRecord> {
+        let (_dir, lock) = test_lock(name);
+        let policy = policy_of(specs);
+        set_bindings_in(db, name, &lock, changer, |_| Ok(policy)).map(|set| set.record)
+    }
+
+    fn host_sources(name: &str, record: &VmRecord) -> Vec<String> {
+        CredentialLaunch::for_record(name, record)
+            .map(|launch| launch.sources.into_keys().collect())
+            .unwrap_or_default()
+    }
+
+    /// A binding an API caller or embedder puts on a machine whose values come from this host (a CLI machine, or an
+    /// API machine created without bindings) never reads this host's variables or secrets at a later start, whatever
+    /// variable it names; one left exactly as the operator defined it keeps reading them, and the operator naming a
+    /// binding again makes it read them.
+    #[test]
+    fn a_binding_set_by_an_untrusted_caller_never_reads_this_host_at_a_later_start() {
+        let name = format!("cred-test-provenance-{}", std::process::id());
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("op-secret");
+        std::fs::write(&secret, "operator-secret").unwrap();
+        let (_db_dir, db) = bindings_db(&name, |r| {
+            r.secret_refs
+                .insert("OP_SECRET".into(), crate::secrets::file_ref(secret));
+        });
+        let operator = change(
+            &db,
+            &name,
+            BindingsChanger::Operator {
+                defines: &["gh".to_string()],
+            },
+            &["gh=GH_TOKEN@github.com"],
+        )
+        .unwrap();
+        assert_eq!(host_sources(&name, &operator), vec!["gh"]);
+
+        let api = change(
+            &db,
+            &name,
+            BindingsChanger::Untrusted,
+            &[
+                "gh=GH_TOKEN@github.com",
+                "evil=AWS_SECRET_ACCESS_KEY@attacker.example",
+                "steal=OP_SECRET@attacker.example",
+            ],
+        )
+        .unwrap();
+        assert_eq!(host_sources(&name, &api), vec!["gh"]);
+        let mut launch = CredentialLaunch::for_record(&name, &api).unwrap();
+        let env = launch.child_env();
+        // nothing supplied: both point at a variable the boot process does not get
+        assert_eq!(env.len(), 2);
+        assert!(env.iter().all(|(_, value)| value.is_none()));
+        for binding in ["evil", "steal"] {
+            let var = launch.sources[binding].from_env.clone().unwrap();
+            assert!(var.starts_with("SMOLVM_CREDENTIAL_"), "{binding}: {var}");
+        }
+
+        // an operator command that carries them without naming them leaves them supplied-only
+        let carried = change(
+            &db,
+            &name,
+            BindingsChanger::Operator {
+                defines: &["b".to_string()],
+            },
+            &[
+                "gh=GH_TOKEN@github.com",
+                "evil=AWS_SECRET_ACCESS_KEY@attacker.example",
+                "steal=OP_SECRET@attacker.example",
+                "b=B_KEY@api.b.com",
+            ],
+        )
+        .unwrap();
+        assert_eq!(host_sources(&name, &carried), vec!["b", "gh"]);
+
+        // retargeting the operator's binding makes it supplied-only too
+        let retargeted = change(
+            &db,
+            &name,
+            BindingsChanger::Untrusted,
+            &["gh=GH_TOKEN@attacker.example", "b=B_KEY@api.b.com"],
+        )
+        .unwrap();
+        assert_eq!(host_sources(&name, &retargeted), vec!["b"]);
+
+        // until the operator defines it again
+        let redefined = change(
+            &db,
+            &name,
+            BindingsChanger::Operator {
+                defines: &["gh".to_string()],
+            },
+            &["gh=GH_TOKEN@github.com", "b=B_KEY@api.b.com"],
+        )
+        .unwrap();
+        assert_eq!(host_sources(&name, &redefined), vec!["b", "gh"]);
+    }
+
+    /// Removing or renaming a binding over the API never turns the operator's secret reference that fed it into
+    /// plaintext in the workload's environment.
+    #[test]
+    fn unbinding_a_variable_over_the_api_never_makes_its_secret_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("gh-token");
+        std::fs::write(&secret, "ghp_operator").unwrap();
+        for after in [&[][..], &["gh=RENAMED@github.com"][..]] {
+            let name = format!("cred-test-withheld-{}-{}", std::process::id(), after.len());
+            let (_db_dir, db) = bindings_db(&name, |r| {
+                r.secret_refs
+                    .insert("GH_TOKEN".into(), crate::secrets::file_ref(secret.clone()));
+            });
+            let bound = change(
+                &db,
+                &name,
+                BindingsChanger::Operator {
+                    defines: &["gh".to_string()],
+                },
+                &["gh=GH_TOKEN@github.com"],
+            )
+            .unwrap();
+            let plaintext = |record: &VmRecord| {
+                crate::secrets::record_env_with_secrets(record)
+                    .unwrap()
+                    .iter()
+                    .any(|(_, value)| value.contains("ghp_operator"))
+            };
+            assert!(!plaintext(&bound));
+            let changed = change(&db, &name, BindingsChanger::Untrusted, after).unwrap();
+            assert!(!plaintext(&changed), "{after:?}");
+            // an exec session the server answers without the record withholds it too
+            let launch = CredentialLaunch::for_record(&name, &changed);
+            let withheld = launch
+                .as_ref()
+                .map(|l| l.withheld_variables.clone())
+                .unwrap_or_else(|| changed.credential_withheld_variables.clone());
+            assert!(withheld.contains("GH_TOKEN"), "{after:?}");
+        }
+    }
+
+    /// An API caller cannot withhold the operator's plaintext secrets: a binding it set itself never read one, so
+    /// removing it withholds nothing, and the withheld set never names more than the machine's secret references.
+    #[test]
+    fn an_untrusted_caller_cannot_withhold_the_operators_plaintext() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = dir.path().join("db-url");
+        std::fs::write(&secret, "postgres://operator").unwrap();
+        let name = format!("cred-test-withhold-abuse-{}", std::process::id());
+        let (_db_dir, db) = bindings_db(&name, |r| {
+            r.secret_refs
+                .insert("DB_URL".into(), crate::secrets::file_ref(secret.clone()));
+        });
+        for round in 0..3 {
+            change(
+                &db,
+                &name,
+                BindingsChanger::Untrusted,
+                &[
+                    &format!("x=DB_URL@a{round}.example"),
+                    &format!("y=V{round}@b.example"),
+                ],
+            )
+            .unwrap();
+            let removed = change(&db, &name, BindingsChanger::Untrusted, &[]).unwrap();
+            assert!(
+                removed.credential_withheld_variables.is_empty(),
+                "{:?}",
+                removed.credential_withheld_variables
+            );
+            let env = crate::secrets::record_env_with_secrets(&removed).unwrap();
+            assert!(env.contains(&("DB_URL".into(), "postgres://operator".into())));
+        }
+
+        // a withheld variable whose reference the machine no longer has is dropped at the next change
+        let (_other_dir, other) = bindings_db(&format!("{name}-gone"), |r| {
+            r.credential_withheld_variables.insert("GONE".into());
+        });
+        let after = change(
+            &other,
+            &format!("{name}-gone"),
+            BindingsChanger::Untrusted,
+            &[],
+        )
+        .unwrap();
+        assert!(after.credential_withheld_variables.is_empty());
+    }
+
+    /// Bindings turn outbound networking on at launch, so a machine whose networking is off takes no binding change
+    /// that adds one; a machine created before bindings implied networking keeps changing its bindings, and removing
+    /// every binding is always allowed.
+    #[test]
+    fn a_binding_change_never_turns_networking_back_on() {
+        let name = format!("cred-test-offline-{}", std::process::id());
+        let (_db_dir, db) = bindings_db(&name, |r| r.network = false);
+        let gh = BindingsChanger::Operator {
+            defines: &["gh".to_string()],
+        };
+        for changer in [gh, BindingsChanger::Untrusted] {
+            let refused = change(&db, &name, changer, &["gh=GH_TOKEN@github.com"]).unwrap_err();
+            assert!(refused.to_string().contains("networking off"), "{refused}");
+            let record = db.get_vm(&name).unwrap().unwrap();
+            assert_eq!(record.credential_policy, None);
+            assert!(!record.launch_network_plan().outbound);
+        }
+        change(&db, &name, BindingsChanger::Untrusted, &[]).unwrap();
+
+        let legacy = format!("cred-test-legacy-{}", std::process::id());
+        let (_legacy_dir, legacy_db) = bindings_db(&legacy, |r| {
+            r.network = false;
+            r.credential_policy = Some(policy_of(&["a=A_KEY@api.a.com"]));
+        });
+        let kept = change(
+            &legacy_db,
+            &legacy,
+            gh,
+            &["a=A_KEY@api.a.com", "gh=GH_TOKEN@github.com"],
+        )
+        .unwrap();
+        assert_eq!(kept.credential_policy.unwrap().credentials.len(), 2);
+
+        let online = format!("cred-test-online-{}", std::process::id());
+        let (_online_dir, online_db) = bindings_db(&online, |_| {});
+        change(&online_db, &online, gh, &["gh=GH_TOKEN@github.com"]).unwrap();
+    }
+
+    /// Networking turned off between reading the record and saving the bindings still refuses the change.
+    #[test]
+    fn networking_turned_off_during_a_binding_change_refuses_it() {
+        let name = format!("cred-test-offline-race-{}", std::process::id());
+        let (_db_dir, db) = bindings_db(&name, |_| {});
+        let (_lock_dir, lock) = test_lock(&name);
+        let refused = set_bindings_in(&db, &name, &lock, BindingsChanger::Untrusted, |_| {
+            // as `machine update --no-net` would, after this change read the record
+            db.update_vm(&name, |r| r.network = false).unwrap();
+            Ok(policy_of(&["gh=GH_TOKEN@github.com"]))
+        })
+        .err()
+        .expect("refused");
+        assert!(refused.to_string().contains("networking off"), "{refused}");
+        let record = db.get_vm(&name).unwrap().unwrap();
+        assert_eq!(record.credential_policy, None);
+        assert!(!record.launch_network_plan().outbound);
+    }
+
+    /// Turning networking off under a machine's bindings is refused: they would keep it reaching the internet while
+    /// it reports networking off.
+    #[test]
+    fn networking_never_turns_off_under_bindings() {
+        let mut record = VmRecord::new("offline".into(), 1, 512, Vec::new(), Vec::new(), true);
+        record.credential_policy = Some(policy_of(&["gh=GH_TOKEN@github.com"]));
+        let refused = record
+            .replace_egress(false, Vec::new(), Vec::new())
+            .unwrap_err();
+        assert!(
+            refused.to_string().contains("credential bindings"),
+            "{refused}"
+        );
+        assert!(record.network);
+        record.credential_policy = None;
+        record
+            .replace_egress(false, Vec::new(), Vec::new())
+            .unwrap();
+        assert!(!record.network);
+    }
+
+    /// Binding changes and the values handed over after them are serialized per machine across processes: a second
+    /// holder (here another open of the lock file) waits until the first lets go.
+    #[test]
+    fn binding_changes_to_one_machine_wait_for_each_other() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.credential-bindings.lock");
+        let name = "cred-test-lock";
+        let first = lock_bindings_at(&path, name, BINDINGS_LOCK_TIMEOUT).unwrap();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let waiter = {
+            let path = path.clone();
+            std::thread::spawn(move || {
+                let _second = lock_bindings_at(&path, name, BINDINGS_LOCK_TIMEOUT).unwrap();
+                tx.send(()).unwrap();
+            })
+        };
+        assert!(rx
+            .recv_timeout(std::time::Duration::from_millis(200))
+            .is_err());
+        drop(first);
+        rx.recv_timeout(std::time::Duration::from_secs(10)).unwrap();
+        waiter.join().unwrap();
+
+        // a lock held for one machine changes no other
+        let (_db_dir, db) = bindings_db(name, |_| {});
+        let (_other_dir, other) = test_lock("cred-test-lock-other");
+        let refused = set_bindings_in(&db, name, &other, BindingsChanger::Untrusted, |_| {
+            Ok(policy_of(&["gh=GH_TOKEN@github.com"]))
+        });
+        assert!(refused.is_err());
+    }
+
+    /// A holder that never lets go (a stuck process, or anyone else who got hold of the file) costs a waiter a bounded
+    /// wait and a clear conflict, never a hang: an API handler waiting on it would stall the machine's lifecycle.
+    #[test]
+    fn a_held_bindings_lock_times_out_with_a_clear_error() {
+        if !crate::test_support::in_own_process!() {
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("m.credential-bindings.lock");
+        let _held = lock_bindings_at(&path, "stuck", BINDINGS_LOCK_TIMEOUT).unwrap();
+        let started = std::time::Instant::now();
+        let refused = lock_bindings_at(&path, "stuck", std::time::Duration::from_millis(300))
+            .err()
+            .expect("a held lock times out");
+        assert!(started.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(refused.code(), "CONFLICT");
+        assert!(refused.to_string().contains("machine 'stuck'"), "{refused}");
+    }
+
+    /// The lock sits beside the machine's data directory and goes with it on delete.
+    #[test]
+    fn a_deleted_machines_bindings_lock_is_removed() {
+        let root = tempfile::tempdir().unwrap();
+        let data_dir = root.path().join("0123456789abcdef");
+        let path = bindings_lock_beside(&data_dir);
+        assert_eq!(
+            path,
+            root.path()
+                .join("0123456789abcdef.credential-bindings.lock")
+        );
+        drop(lock_bindings_at(&path, "m", BINDINGS_LOCK_TIMEOUT).unwrap());
+        assert!(path.is_file());
+        remove_bindings_lock(&data_dir);
+        assert!(!path.exists());
+        remove_bindings_lock(&data_dir);
+    }
+
+    /// Lock files are private to their owner, since anyone who can open one can hold it: created 0600, and an
+    /// existing one that others can open, or a link in its place, refused rather than used or followed.
+    #[cfg(unix)]
+    #[test]
+    fn bindings_lock_files_are_private_to_their_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        let dir = tempfile::tempdir().unwrap();
+        let fresh = dir.path().join("a.credential-bindings.lock");
+        drop(lock_bindings_at(&fresh, "a", BINDINGS_LOCK_TIMEOUT).unwrap());
+        assert_eq!(mode(&fresh), 0o600);
+        // and taken again as it is
+        drop(lock_bindings_at(&fresh, "a", BINDINGS_LOCK_TIMEOUT).unwrap());
+
+        let wide = dir.path().join("b.credential-bindings.lock");
+        std::fs::write(&wide, "").unwrap();
+        std::fs::set_permissions(&wide, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let refused = lock_bindings_at(&wide, "b", BINDINGS_LOCK_TIMEOUT)
+            .err()
+            .expect("refused");
+        assert!(refused.to_string().contains("open to others"), "{refused}");
+        assert_eq!(mode(&wide), 0o644);
+
+        let target = dir.path().join("elsewhere");
+        std::fs::write(&target, "").unwrap();
+        let link = dir.path().join("c.credential-bindings.lock");
+        std::os::unix::fs::symlink(&target, &link).unwrap();
+        assert!(lock_bindings_at(&link, "c", BINDINGS_LOCK_TIMEOUT).is_err());
+    }
+
+    /// An existing lock with another name (a hard link to some other file, which root would otherwise take over) is
+    /// refused and never changed.
+    #[cfg(unix)]
+    #[test]
+    fn a_hard_linked_lock_file_is_refused_and_left_alone() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let precious = dir.path().join("sudoers");
+        std::fs::write(&precious, "root ALL=(ALL) ALL").unwrap();
+        std::fs::set_permissions(&precious, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let before = std::fs::metadata(&precious).unwrap();
+        let lock = dir.path().join("d.credential-bindings.lock");
+        std::fs::hard_link(&precious, &lock).unwrap();
+        let refused = lock_bindings_at(&lock, "d", BINDINGS_LOCK_TIMEOUT)
+            .err()
+            .expect("refused");
+        assert!(refused.to_string().contains("2 names"), "{refused}");
+        let after = std::fs::metadata(&precious).unwrap();
+        assert_eq!(
+            (after.uid(), after.gid(), after.mode()),
+            (before.uid(), before.gid(), before.mode())
+        );
+    }
+
+    /// A machine deleted and created again under its name while a change was planned for the old one takes nothing:
+    /// the new machine's record is never given bindings planned against the old.
+    #[test]
+    fn a_machine_recreated_during_a_binding_change_refuses_it() {
+        let name = format!("cred-test-recreated-{}", std::process::id());
+        let (_db_dir, db) = bindings_db(&name, |_| {});
+        let (_lock_dir, lock) = test_lock(&name);
+        let refused = set_bindings_in(&db, &name, &lock, BindingsChanger::Untrusted, |_| {
+            db.remove_vm(&name).unwrap();
+            let mut successor = VmRecord::new(name.clone(), 1, 512, Vec::new(), Vec::new(), true);
+            successor.created_at += 1;
+            db.insert_vm(&name, &successor).unwrap();
+            Ok(policy_of(&["gh=GH_TOKEN@github.com"]))
+        })
+        .err()
+        .expect("refused");
+        assert_eq!(refused.code(), "CONFLICT", "{refused}");
+        assert_eq!(db.get_vm(&name).unwrap().unwrap().credential_policy, None);
+    }
+
+    /// A change to a machine that does not exist leaves no lock file behind.
+    #[test]
+    fn a_change_to_a_missing_machine_leaves_no_lock_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let db = crate::db::SmolvmDb::open_at(&dir.path().join("smolvm.db")).unwrap();
+        let path = dir.path().join("m.credential-bindings.lock");
+        let lock = lock_bindings_at(&path, "missing", BINDINGS_LOCK_TIMEOUT).unwrap();
+        assert!(
+            set_bindings_in(&db, "missing", &lock, BindingsChanger::Untrusted, |_| {
+                Ok(CredentialPolicy::default())
+            })
+            .is_err()
+        );
+        assert!(!path.exists());
     }
 }

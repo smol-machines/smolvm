@@ -679,6 +679,7 @@ pub fn record_env_with_secrets(
         record.credential_policy.as_ref(),
         &record.credential_placeholders,
         &record.secret_refs,
+        &record.credential_withheld_variables,
     );
     env.extend(crate::secrets::expose_into_env(
         crate::secrets::resolve_refs_to_env(&refs, crate::secrets::ResolutionScope::RecordReplay)?,

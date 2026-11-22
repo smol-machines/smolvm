@@ -751,19 +751,29 @@ fn published_set(
 /// Hand a running machine its new credential bindings ([`crate::credentials::plan_binding_change`]): from its next
 /// request an added binding is substituted and a removed one is not. When the plan added a CA for a new host, the
 /// guest is asked to rebuild its trust too; a guest whose agent predates that refuses, and the host stays
-/// unreachable until the machine restarts (its other bindings change anyway).
+/// unreachable until the machine restarts (its other bindings change anyway). `sources` names the host source of each
+/// binding this host's operator defined; an added or changed binding it does not name resolves only from values
+/// handed over later.
 pub fn apply_live_credential_bindings(
     name: &str,
     change: &crate::credentials::BindingChange,
+    sources: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
 ) -> Result<()> {
-    let request = serde_json::json!({
-        "bindings": { "policy": change.policy, "placeholders": change.placeholders }
-    })
-    .to_string();
+    let request = crate::credentials::live_bindings_request(change, sources);
     send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
+        // a boot process from before bindings carried their sources refuses the request and keeps its bindings
+        let reason = if reason == "malformed request" {
+            "it was started by an older smolvm, which keeps the bindings it booted with until it restarts"
+                .to_string()
+        } else {
+            reason
+        };
         Error::config(
             "credentials",
-            format!("could not hand machine '{name}' its new credential bindings while it runs: {reason}"),
+            format!(
+                "could not hand machine '{name}' its new credential bindings while it runs: {reason}; \
+                 they are saved and apply from its next start"
+            ),
         )
     })?;
     if change.trust_changed {

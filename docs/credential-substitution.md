@@ -173,6 +173,30 @@ request with the `502` below and is never sent. The limit bounds how much of a
 streamed response the host keeps to scrub a value that arrives split across
 chunks.
 
+The same holds for any binding an API caller or embedder adds or changes on a
+machine whose values otherwise come from this host
+(`PUT /api/v1/machines/{name}/credential-bindings`, `set_credential_bindings`):
+it takes only supplied values, at once and at every later start, and never this
+host's environment or `[secrets]`. A binding left exactly as it was keeps its
+source. Changing a binding's variable, hosts or header drops the value already
+held for it, so a value never follows a binding to a new destination, and a
+variable that backed a binding defined from this host, and names one of the
+machine's `[secrets]` references, is never handed to the workload as plaintext
+after such a change. Values the API server or embedder supplied itself are
+its own and stay held for a binding across a rebind, new hosts included.
+`machine credentials add` makes the bindings it names read this host's values
+again; `machine credentials refresh` reads only the bindings defined from this
+host. A machine started by smolvm v1.36 or earlier cannot take a binding change
+safely while it runs: the change is saved, the call fails (409 over the API),
+and the machine keeps the bindings it booted with until its next start.
+
+Bindings need outbound networking. A binding change that would add one to a
+machine whose networking is off (after `machine update --no-net`, for example)
+is refused (400 over the API) rather than turning egress back on; enable
+networking first. Turning networking off (`PUT /api/v1/machines/{name}/network`
+with `blocked`) on a machine that has bindings is refused too; remove them
+first.
+
 Embedders resolve however they like: the engine asks a `CredentialResolver`
 with the machine name, binding name, destination host and port, method and
 path, and expects the raw value back. See `crates/smolvm-credentials`.

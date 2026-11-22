@@ -44,6 +44,7 @@ pub(crate) fn record_secret_refs_env(
             record.credential_policy.as_ref(),
             &record.credential_placeholders,
             &record.secret_refs,
+            &record.credential_withheld_variables,
         ),
         None => {
             let guard = entry.lock();
@@ -54,6 +55,9 @@ pub(crate) fn record_secret_refs_env(
                     .map(|c| &c.placeholders)
                     .unwrap_or(&Default::default()),
                 &guard.secret_refs,
+                credentials
+                    .map(|c| &c.withheld_variables)
+                    .unwrap_or(&Default::default()),
             )
         }
     };

@@ -699,6 +699,7 @@ pub fn params_secret_env(params: &CreateVmParams) -> smolvm::Result<Vec<(String,
         params.credential_policy.as_ref(),
         &params.credential_placeholders,
         &params.secret_refs,
+        &Default::default(),
     );
     let mut env = resolve_secret_refs_for_env(&refs)?;
     env.extend(credential_env);

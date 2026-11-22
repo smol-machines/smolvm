@@ -7779,6 +7779,11 @@ impl UpdateCmd {
             changes.extend(disk_changes);
         }
 
+        // Turning networking off clears the bindings, so no binding change may land in between.
+        let _bindings_lock = self
+            .no_net
+            .then(|| smolvm::credentials::lock_bindings(&self.name))
+            .transpose()?;
         // Single DB transaction: all settings + disk sizes together.
         db.update_vm(&self.name, |r| {
             // Disk sizes (must match the physical expansion above)

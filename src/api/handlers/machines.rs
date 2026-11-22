@@ -6626,6 +6626,17 @@ async fn delete_one_transaction(
     Ok(DeleteResponse { deleted: name })
 }
 
+/// Take machine `name`'s credential bindings lock off the async runtime; a change holding it too long is a 409.
+async fn bindings_lock(name: &str) -> Result<crate::credentials::BindingsLock, ApiError> {
+    let machine = name.to_string();
+    tokio::task::spawn_blocking(move || crate::credentials::lock_bindings(&machine))
+        .await
+        .map_err(|error| {
+            ApiError::internal(format!("credential bindings lock task failed: {error}"))
+        })?
+        .map_err(ApiError::from)
+}
+
 /// Replace a machine's credential bindings.
 #[utoipa::path(
     put,
@@ -6637,9 +6648,9 @@ async fn delete_one_transaction(
     request_body = CredentialBindingsRequest,
     responses(
         (status = 200, description = "Bindings saved; a running machine that booted with bindings uses them from its next request (`live`), one that booted without them from its next start", body = CredentialBindingsResponse),
-        (status = 400, description = "A binding is invalid or names a host outside the machine's allow-list", body = ApiErrorResponse),
+        (status = 400, description = "A binding is invalid, names a host outside the machine's allow-list, or would be added to a machine whose networking is off (bindings need outbound networking)", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Saved, but the running machine could not take them; they apply from its next start", body = ApiErrorResponse)
+        (status = 409, description = "Saved, but the running machine could not take them; they apply from its next start. Or another change to the machine's bindings held them too long, and nothing changed", body = ApiErrorResponse)
     )
 )]
 pub async fn put_credential_bindings(
@@ -6647,6 +6658,13 @@ pub async fn put_credential_bindings(
     Path(name): Path<String>,
     Json(req): Json<CredentialBindingsRequest>,
 ) -> Result<Json<CredentialBindingsResponse>, ApiError> {
+    state
+        .lookup_vm(&name)
+        .await?
+        .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+    // The bindings lock first, waiting a bounded time for another change, and only then the lifecycle lock, so a
+    // stuck change never holds up the machine's start, stop or delete.
+    let lock = bindings_lock(&name).await?;
     // Under the lifecycle lock so a start or stop cannot land between saving the bindings and handing them over.
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock_owned().await;
@@ -6658,16 +6676,22 @@ pub async fn put_credential_bindings(
         credentials: req.credentials,
     };
     let machine = name.clone();
-    let set =
-        tokio::task::spawn_blocking(move || crate::credentials::set_bindings(&machine, policy))
-            .await
-            .map_err(|error| {
-                ApiError::internal(format!("credential bindings task failed: {error}"))
-            })?;
+    // An API caller is untrusted: a binding it adds or changes never reads this host's values.
+    let set = tokio::task::spawn_blocking(move || {
+        crate::credentials::set_bindings(
+            &machine,
+            &lock,
+            crate::credentials::BindingsChanger::Untrusted,
+            |_| Ok(policy),
+        )
+    })
+    .await
+    .map_err(|error| ApiError::internal(format!("credential bindings task failed: {error}")))?;
     let set = match set {
         Ok(set) => set,
         Err(error)
-            if error.to_string().contains("could not hand machine")
+            if error.code() == "CONFLICT"
+                || error.to_string().contains("could not hand machine")
                 || error.to_string().contains("could not trust the new host") =>
         {
             return Err(ApiError::Conflict(error.to_string()))
@@ -6676,8 +6700,11 @@ pub async fn put_credential_bindings(
     };
     // new exec sessions take the placeholders of the bindings as they are now
     if let Ok(entry) = state.get_machine(&name) {
-        entry.lock().credentials =
-            crate::credentials::CredentialLaunch::for_record(&name, &set.record);
+        let mut entry = entry.lock();
+        entry.credentials = crate::credentials::CredentialLaunch::for_record(&name, &set.record);
+        // a variable that backed a binding stays out of plaintext, also where the record is not at hand
+        let withheld = &set.record.credential_withheld_variables;
+        entry.secret_refs.retain(|var, _| !withheld.contains(var));
     }
     let bindings = set
         .record
@@ -7591,7 +7618,7 @@ pub async fn update_machine_egress(
             other => ApiError::from(other),
         })?
         .ok_or_else(|| ApiError::BadRequest("request contains no egress changes".into()))?;
-    commit_egress_change(&state, &name, &record, next, running).await
+    commit_egress_change(&state, &name, &record, next, running, None).await
 }
 
 /// A machine's record for an egress change, and whether it runs: a change
@@ -7635,9 +7662,36 @@ async fn commit_egress_change(
     record: &VmRecord,
     next: VmRecord,
     running: bool,
+    bindings_lock: Option<crate::credentials::BindingsLock>,
 ) -> Result<Json<MachineInfo>, ApiError> {
     let name = name.to_string();
     let rules_change = next.egress_rules != record.egress_rules;
+    // Bindings turn outbound networking on at launch, so networking turns off only while no binding change can land:
+    // under the bindings lock, against the record as it is now.
+    let _bindings_lock =
+        if record.outbound_without_credentials() && !next.outbound_without_credentials() {
+            let lock = match bindings_lock {
+                Some(lock) => lock,
+                None => self::bindings_lock(&name).await?,
+            };
+            let fresh = state
+                .lookup_vm(&name)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+            if fresh
+                .credential_policy
+                .as_ref()
+                .is_some_and(|p| !p.is_empty())
+            {
+                return Err(ApiError::BadRequest(format!(
+                    "machine '{name}' has credential bindings, which require outbound networking; \
+                 remove them before turning networking off"
+                )));
+            }
+            Some(lock)
+        } else {
+            None
+        };
 
     if running {
         record
@@ -7690,9 +7744,9 @@ async fn commit_egress_change(
     request_body = MachineNetwork,
     responses(
         (status = 200, description = "Policy replaced", body = MachineInfo),
-        (status = 400, description = "Invalid policy", body = ApiErrorResponse),
+        (status = 400, description = "Invalid policy, or `blocked` on a machine with credential bindings (they need outbound networking; remove them first)", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "The change needs the machine stopped", body = ApiErrorResponse),
+        (status = 409, description = "The change needs the machine stopped, or (`blocked`) another change to the machine's credential bindings held them too long", body = ApiErrorResponse),
         (status = 500, description = "Update failed", body = ApiErrorResponse)
     )
 )]
@@ -7701,6 +7755,18 @@ pub async fn set_machine_network(
     Path(name): Path<String>,
     Json(req): Json<MachineNetwork>,
 ) -> Result<Json<MachineInfo>, ApiError> {
+    // Turning networking off waits for any change to the bindings before the lifecycle lock, as a bindings change
+    // does, so a stuck change never holds up the machine's lifecycle.
+    let bindings_lock = match req {
+        MachineNetwork::Blocked => {
+            state
+                .lookup_vm(&name)
+                .await?
+                .ok_or_else(|| ApiError::NotFound(format!("machine '{}' not found", name)))?;
+            Some(bindings_lock(&name).await?)
+        }
+        _ => None,
+    };
     let lifecycle = state.lifecycle_lock(&name);
     let _guard = lifecycle.lock_owned().await;
     let (record, running, _egress_lock) = egress_change_record(&state, &name).await?;
@@ -7750,7 +7816,7 @@ pub async fn set_machine_network(
                 .unwrap_or_else(|| record.clone())
         }
     };
-    commit_egress_change(&state, &name, &record, next, running).await
+    commit_egress_change(&state, &name, &record, next, running, bindings_lock).await
 }
 
 /// Replace a machine's environment. A stopped machine takes it at its next
