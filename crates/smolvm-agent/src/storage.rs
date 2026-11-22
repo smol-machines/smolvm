@@ -2841,7 +2841,6 @@ pub fn format() -> Result<()> {
         (root.join(MANIFESTS_DIR), "manifests"),
         (root.join(IMAGE_METADATA_DIR), "image metadata"),
         (root.join(OVERLAYS_DIR), "overlays"),
-        (PathBuf::from(paths::CONTAINERS_RUN_DIR), "container run"),
         (PathBuf::from(paths::CONTAINERS_LOGS_DIR), "container logs"),
         (PathBuf::from(paths::CONTAINERS_EXIT_DIR), "container exit"),
         (PathBuf::from(paths::CRUN_ROOT_DIR), "crun state root"),

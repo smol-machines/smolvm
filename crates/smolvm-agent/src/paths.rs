@@ -56,8 +56,11 @@ pub const OVERLAYS_DIR: &str = "/storage/overlays";
 // Container Runtime Paths
 // =============================================================================
 
-/// Directory for per-container runtime state (pidfile, etc).
-pub const CONTAINERS_RUN_DIR: &str = "/storage/containers/run";
+/// Directory for transient per-exec runtime files (exec pidfiles, process specs,
+/// and crun launch diagnostic logs). Kept on a tmpfs so per-exec file creation
+/// and unlink do not dirty the persistent storage disk (`/dev/vda`) or overlay
+/// disk (`/dev/vdb`).
+pub const CONTAINERS_RUN_DIR: &str = "/run/smolvm/containers/run";
 
 /// Directory for container logs.
 pub const CONTAINERS_LOGS_DIR: &str = "/storage/containers/logs";
@@ -146,5 +149,12 @@ mod tests {
         assert!(staging.starts_with("/run/smolvm"));
         assert!(!staging.starts_with("/mnt"));
         assert!(!staging.starts_with(VIRTIOFS_MOUNT_ROOT));
+    }
+
+    #[test]
+    fn containers_run_dir_is_off_persistent_storage() {
+        let run_dir = std::path::Path::new(CONTAINERS_RUN_DIR);
+        assert!(run_dir.starts_with("/run/smolvm"));
+        assert!(!run_dir.starts_with(STORAGE_ROOT));
     }
 }

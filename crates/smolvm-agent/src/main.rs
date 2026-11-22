@@ -920,6 +920,25 @@ fn mount_essential_filesystems() {
         warn!("smolvm-agent: failed to mount tmpfs on /tmp: {}", e);
     }
 
+    // Per-exec crun pidfiles, process specs, and transient launch logs live
+    // under /run/smolvm/containers/run. Mount a tmpfs there so bare-VM (read-only
+    // rootfs) and overlay-rootfs guests never write per-exec files to persistent
+    // ext4 disks.
+    let containers_run = MountEntry {
+        source: "tmpfs",
+        target: paths::CONTAINERS_RUN_DIR,
+        fstype: "tmpfs",
+        flags: libc::MS_NOSUID | libc::MS_NODEV,
+        data: Some("mode=0755"),
+    };
+    if let Err(e) = containers_run.mount() {
+        warn!(
+            "smolvm-agent: failed to mount tmpfs on {}: {}",
+            paths::CONTAINERS_RUN_DIR,
+            e
+        );
+    }
+
     // libkrun's init.c mounts /proc, /sys, /dev, /dev/pts before exec'ing
     // the agent. Skip redundant mounts if already present.
     if std::path::Path::new("/proc/uptime").exists() {
@@ -1605,7 +1624,7 @@ fn setup_persistent_rootfs() {
     }
 
     // Create mount point directories in new root and move special mounts
-    for dir in &["proc", "sys", "dev"] {
+    for dir in &["proc", "sys", "dev", "run/smolvm/containers/run"] {
         let _ = std::fs::create_dir_all(format!("{}/{}", NEWROOT, dir));
         let src = cstr(&format!("/{}", dir));
         let dst = cstr(&format!("{}/{}", NEWROOT, dir));
@@ -1952,7 +1971,6 @@ fn create_storage_dirs(mount_point: &str) {
         "configs",
         "manifests",
         "overlays",
-        "containers/run",
         "containers/logs",
         "containers/exit",
         "containers/crun",
