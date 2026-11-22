@@ -8,6 +8,14 @@
 //! `requests`, Git), so the agent assembles one bundle — the image's own roots
 //! followed by the machine CA — and bind-mounts it where the host-provided
 //! environment already points.
+//!
+//! Chrome and Chromium ignore those variables and the system store alike on
+//! most distributions, so they get the CA through their `CACertificates`
+//! policy: a file of its own in their managed-policy directories, which no
+//! package writes. The image's system bundle and trust anchors are left
+//! alone: a read-only file over a bundle makes the CA package's own update
+//! fail, and an anchor would be baked into the image's bundle by the next
+//! `update-ca-trust`.
 
 use crate::oci::OciSpec;
 use smolvm_protocol::credentials::{GUEST_CA_BUNDLE, GUEST_CA_DIR, GUEST_CA_FILE};
@@ -65,12 +73,29 @@ pub fn refresh() -> std::io::Result<usize> {
                 tracing::warn!(bundle = %bundle.display(), error = %e, "could not rebuild credential trust bundle")
             }
         }
+        // the browser policy is bound beside the container's bundle
+        if bundle == Path::new(AGENT_BUNDLE) {
+            if let Err(e) = read_ca(ca_path).and_then(|ca| write_browser_policy(&ca)) {
+                tracing::warn!(error = %e, "could not rewrite the credential CA browser policy")
+            }
+        }
     }
     Ok(rebuilt)
 }
 
 /// Agent-side location of the assembled bundle (tmpfs; rebuilt every boot).
 const AGENT_BUNDLE: &str = "/run/smolvm-credentials/ca-bundle.pem";
+/// Agent-side Chrome/Chromium policy trusting the machine CA.
+const AGENT_BROWSER_POLICY: &str = "/run/smolvm-credentials/browser-policy.json";
+
+/// Managed-policy directories of Chromium and of Google Chrome. Created when
+/// missing, since a browser installed after the container starts still reads
+/// them.
+const BROWSER_POLICY_DIRS: &[&str] = &[
+    "/etc/chromium/policies/managed",
+    "/etc/opt/chrome/policies/managed",
+];
+const BROWSER_POLICY_FILE: &str = "smolvm-credentials.json";
 
 /// Trust-root files commonly shipped by images, checked in order.
 const SYSTEM_BUNDLES: &[&str] = &[
@@ -106,6 +131,59 @@ pub fn inject_into_container(spec: &mut OciSpec, rootfs: &Path, mounts: &[(Strin
         return;
     }
     spec.add_bind_mount(AGENT_BUNDLE, GUEST_CA_BUNDLE, true);
+    if let Err(e) = write_browser_policy(&ca) {
+        tracing::warn!(error = %e, "could not write the credential CA browser policy");
+        return;
+    }
+    for dir in BROWSER_POLICY_DIRS {
+        bind_file(
+            spec,
+            rootfs,
+            AGENT_BROWSER_POLICY,
+            &format!("{dir}/{BROWSER_POLICY_FILE}"),
+        );
+    }
+}
+
+/// Bind the agent's `source` read-only at `target` in the container, creating
+/// an empty file there first when the image has none.
+fn bind_file(spec: &mut OciSpec, rootfs: &Path, source: &str, target: &str) {
+    match crate::storage::ensure_file_mount_target_under_root(rootfs, target) {
+        Ok(_) => spec.add_bind_mount(source, target, true),
+        Err(e) => {
+            tracing::warn!(target, error = %e, "could not prepare a credential trust mountpoint")
+        }
+    }
+}
+
+/// Chrome's and Chromium's `CACertificates` policy for every certificate in
+/// `ca`: each certificate's DER, base64-encoded, which is its PEM body.
+fn browser_policy(ca: &[u8]) -> Vec<u8> {
+    let mut certificates: Vec<String> = Vec::new();
+    let mut current: Option<String> = None;
+    for line in String::from_utf8_lossy(ca).lines().map(str::trim) {
+        match line {
+            "-----BEGIN CERTIFICATE-----" => current = Some(String::new()),
+            "-----END CERTIFICATE-----" => certificates.extend(current.take()),
+            body => {
+                if let Some(cert) = current.as_mut() {
+                    cert.push_str(body);
+                }
+            }
+        }
+    }
+    serde_json::to_vec(&serde_json::json!({ "CACertificates": certificates })).unwrap_or_default()
+}
+
+/// Write the browser policy beside the assembled bundle, in place, so its
+/// bind shows a CA added later.
+fn write_browser_policy(ca: &[u8]) -> std::io::Result<()> {
+    std::fs::create_dir_all(
+        Path::new(AGENT_BROWSER_POLICY)
+            .parent()
+            .unwrap_or(Path::new("/")),
+    )?;
+    std::fs::write(AGENT_BROWSER_POLICY, browser_policy(ca))
 }
 
 /// For a machine without a container image, whose commands run in the agent's
@@ -151,7 +229,13 @@ fn install_bundle_at(mounts: &[(String, String, bool)], root: &Path, bundle_path
 fn assemble_bundle(rootfs: &Path, agent_rootfs: &Path, ca: &[u8]) -> Vec<u8> {
     let read_roots = |root: &Path| {
         SYSTEM_BUNDLES.iter().find_map(|candidate| {
-            std::fs::read(root.join(candidate)).ok().filter(|pem| {
+            // through the image's own links: Fedora's bundle is an absolute
+            // link, which read from here would land in the agent's root
+            #[cfg(target_os = "linux")]
+            let path = crate::container::resolve_in_root(root, candidate)?;
+            #[cfg(not(target_os = "linux"))]
+            let path = root.join(candidate);
+            std::fs::read(path).ok().filter(|pem| {
                 pem.windows(b"-----BEGIN CERTIFICATE-----".len())
                     .any(|window| window == b"-----BEGIN CERTIFICATE-----")
             })
@@ -181,6 +265,43 @@ fn write_bundle(bundle: &[u8]) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Chrome takes each CA as its base64 DER: the PEM body, joined.
+    #[test]
+    fn the_browser_policy_lists_every_certificate_in_the_bundle() {
+        let ca = b"-----BEGIN CERTIFICATE-----\nQUJD\nREVG\n-----END CERTIFICATE-----\n\
+                   -----BEGIN CERTIFICATE-----\nR0hJ\n-----END CERTIFICATE-----\n";
+        let policy: serde_json::Value = serde_json::from_slice(&browser_policy(ca)).unwrap();
+        assert_eq!(
+            policy,
+            serde_json::json!({ "CACertificates": ["QUJDREVG", "R0hJ"] })
+        );
+    }
+
+    /// Fedora's bundle is an absolute link into `ca-trust/extracted`: the
+    /// image's roots are read through it inside the image, not from the
+    /// agent's own root.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_images_roots_are_read_through_its_own_links() {
+        let root = tempfile::tempdir().unwrap();
+        let extracted = root.path().join("etc/pki/ca-trust/extracted/pem");
+        std::fs::create_dir_all(&extracted).unwrap();
+        const ROOTS: &[u8] = b"-----BEGIN CERTIFICATE-----\nroots\n-----END CERTIFICATE-----\n";
+        std::fs::write(extracted.join("tls-ca-bundle.pem"), ROOTS).unwrap();
+        std::fs::create_dir_all(root.path().join("etc/ssl/certs")).unwrap();
+        std::os::unix::fs::symlink(
+            "/etc/pki/ca-trust/extracted/pem/tls-ca-bundle.pem",
+            root.path().join("etc/ssl/certs/ca-certificates.crt"),
+        )
+        .unwrap();
+        let bundle = assemble_bundle(root.path(), Path::new("/nonexistent"), b"ca\n");
+        assert_eq!(
+            bundle,
+            [ROOTS, b"ca\n"].concat(),
+            "the image's roots, read through its link"
+        );
+    }
 
     /// A CA the host adds while the machine runs reaches the bundle it built at boot, rewritten in place.
     #[test]

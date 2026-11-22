@@ -184,8 +184,18 @@ path, and expects the raw value back. See `crates/smolvm-credentials`.
 - `SSL_CERT_FILE`, `CURL_CA_BUNDLE`, `REQUESTS_CA_BUNDLE`, `GIT_SSL_CAINFO`
   pointing at the bundle; `NODE_EXTRA_CA_CERTS` and `DENO_CERT` at `ca.pem`.
   curl, Python, Node, Deno, Git and anything using OpenSSL defaults work
-  unmodified. A client with its own trust store (Java keystores, some Go
-  binaries with pinned roots) needs `ca.pem` added to it.
+  unmodified.
+- Chrome and Chromium, which ignore those variables, get the CA through a
+  `CACertificates` policy at `/etc/chromium/policies/managed` and
+  `/etc/opt/chrome/policies/managed` (`smolvm-credentials.json`), in an image
+  container on any distribution. A CA added while the machine runs reaches a
+  browser at its next launch.
+
+  The image's system bundle and trust anchors are left alone, so `apt` and
+  `dnf` updates of `ca-certificates` keep working and nothing of the machine
+  CA is baked into the image. A program that reads only the system store, or
+  has its own trust store (Java keystores, some Go binaries with pinned
+  roots), needs `ca.pem` added to it.
 
 ## What happens to a request
 
