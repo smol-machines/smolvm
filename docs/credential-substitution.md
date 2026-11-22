@@ -299,11 +299,13 @@ handed the CAs its bindings need when it comes back, as is a running machine
 before its interceptor signs a newly bound host. The agent rebuilds the trust
 bundle files, so new connections from clients that read them per connection
 trust the host; a process that loaded its trust when it started (Node with
-`NODE_EXTRA_CA_CERTS`, for one) needs a restart first. A guest agent too old to
-take new CAs while it runs still has removed bindings revoked at once, and the
-added bindings that need a CA it lacks apply from its next start (`deferred`).
-A CA added for a host no binding names any more stays trusted while the machine
-runs and leaves the guest's trust at its next boot.
+`NODE_EXTRA_CA_CERTS`, for one) needs a restart first. A guest agent that
+cannot take a pushed CA bundle (smolvm 1.36.0 and earlier) still has removed
+bindings revoked at once, and the bindings that need a CA it may not have read
+yet apply from its next start (`deferred`). A guest never loses a CA it
+trusts: one added for a host no binding names any more signs nothing for it.
+A checkpoint carries only the CAs the machine's bindings may be signed with or
+its guest trusts, not those a branch sharing them added for its own hosts.
 
 A checkpoint whose CAs exceed 64 KiB (dozens of hosts bound while it ran)
 cannot be restored by smolvm 1.36 or earlier, which refuse it as an unexpected

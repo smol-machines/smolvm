@@ -414,36 +414,25 @@ pub fn guest_trust(
     Ok((!cas.is_empty()).then(|| bundle_of(&cas, |_, ca| ca.may_sign_for(&bound))))
 }
 
-/// The trust a guest that just booted with `policy` is to have ([`guest_trust_at_boot`]).
-pub struct BootTrust {
-    /// The bundle to hand it: `None` when it already trusts exactly what its bindings need.
-    pub hand: Option<String>,
-    /// What it trusts without that bundle, to record when it is not handed one or cannot take it.
-    pub held: String,
-}
-
-/// What a guest that just booted with `policy` is to trust: exactly the CAs its bindings need ([`guest_trust`]), so a
-/// CA no binding needs leaves its trust here, at boot, where no retired binding can still be signed with it. `known`
-/// is what it is known to trust already: the CA file as it was before the boot, for a guest that read it afresh; what
-/// a paused machine's guest was last known to trust; `None` for other restored guests (a checkpoint, a branch), which
-/// are known to trust only the machine CA. `None` when the directory holds no CA.
+/// The bundle to hand a guest that just booted with `policy` when it lacks a CA its bindings may be signed with:
+/// every CA it trusts, `trusted` (a PEM bundle; `None` when only the machine CA is known), and every one its bindings
+/// need. `None` when it lacks none, so a guest whose CA file already holds what its bindings need is handed nothing;
+/// and when the directory holds no CA. A guest never loses a CA it trusts: a CA no binding needs signs nothing for it.
 pub fn guest_trust_at_boot(
     ca_dir: &Path,
     owner: &str,
     policy: &CredentialPolicy,
-    known: Option<&str>,
-) -> Result<Option<BootTrust>> {
+    trusted: Option<&str>,
+) -> Result<Option<String>> {
     let cas = lineage_cas(ca_dir, owner)?;
-    if cas.is_empty() {
-        return Ok(None);
-    }
     let bound = binding_subtrees(policy);
-    let held = trusted_cas(&cas, known);
+    let held = trusted_cas(&cas, trusted);
     let needed: Vec<bool> = cas.iter().map(|ca| ca.may_sign_for(&bound)).collect();
-    Ok(Some(BootTrust {
-        hand: (held != needed).then(|| bundle_of(&cas, |index, _| needed[index])),
-        held: bundle_of(&cas, |index, _| held[index]),
-    }))
+    let lacks = needed
+        .iter()
+        .zip(&held)
+        .any(|(needed, held)| *needed && !*held);
+    Ok(lacks.then(|| bundle_of(&cas, |index, _| held[index] || needed[index])))
 }
 
 /// File in a machine's data directory holding the CA bundle its running guest is known to trust: what it read at boot
@@ -473,20 +462,33 @@ pub fn record_guest_trust(machine: &str, bundle: &str) {
     }
 }
 
-/// Every CA of `ca_dir` as one portable document, for a checkpoint whose captured guest trusts them: the machine CA's
-/// [`MachineCa::export`] with each added CA's under `extra`, oldest first, each loaded without following a link. A
-/// machine CA saved before it recorded its hosts is exported permitting those `policy` binds, as its interceptor
-/// treats it. Holds every signing key: write it only where the checkpoint itself is kept.
+/// The CAs of `ca_dir` a checkpoint of a machine bound by `policy`, whose guest is known to trust `trusted`, carries,
+/// as one portable document: the machine CA's [`MachineCa::export`] with, under `extra` and oldest first, each added
+/// CA its bindings may be signed with or its guest trusts, never one a sibling sharing the directory minted for hosts
+/// this machine has nothing to do with. Each is loaded without following a link. A machine CA saved before it
+/// recorded its hosts is exported permitting those `policy` binds, as its interceptor treats it. Holds signing keys:
+/// write it only where the checkpoint itself is kept.
 pub fn export_cas(
     ca_dir: &Path,
     owner: &str,
     policy: &CredentialPolicy,
+    trusted: Option<&str>,
 ) -> Result<zeroize::Zeroizing<String>> {
     let primary = load_ca(ca_dir, owner)?
         .with_permitted(binding_subtrees(policy))
         .export();
+    let bound = binding_subtrees(policy);
+    let trusted = trusted.map(pem_certificates).unwrap_or_default();
     let extras: Vec<zeroize::Zeroizing<String>> = load_extra_cas(ca_dir, owner)
         .iter()
+        .filter(|ca| {
+            trusted.contains(&ca.certificate_pem().trim())
+                || LineageCa {
+                    certificate: String::new(),
+                    permitted: Some(ca.permitted().to_vec()),
+                }
+                .may_sign_for(&bound)
+        })
         .map(MachineCa::export)
         .collect();
     if extras.is_empty() {
@@ -528,9 +530,15 @@ fn scrub_json(value: &mut serde_json::Value) {
 /// from before CAs recorded their hosts names none: the machine CA then keeps the hosts the directory recorded for it
 /// (resumed in place), or permits those `generated_for` binds, the bindings its checkpoint was captured with.
 pub fn import_cas(document: &str, ca_dir: &Path, generated_for: &CredentialPolicy) -> Result<()> {
-    let mut primary = MachineCa::import(document).map_err(ca_err)?;
     let mut parsed: serde_json::Value = serde_json::from_str(document).map_err(ca_err)?;
-    let extras = match parsed.get("extra") {
+    // the added CAs are taken out before the machine CA is read, so no parse leaves their keys behind unscrubbed
+    let mut added = parsed
+        .as_object_mut()
+        .and_then(|fields| fields.remove("extra"));
+    let primary_document = zeroize::Zeroizing::new(parsed.to_string());
+    scrub_json(&mut parsed);
+    let primary = MachineCa::import(&primary_document).map_err(ca_err);
+    let extras = match &added {
         None => Ok(Vec::new()),
         Some(serde_json::Value::Array(items)) => items
             .iter()
@@ -539,7 +547,10 @@ pub fn import_cas(document: &str, ca_dir: &Path, generated_for: &CredentialPolic
             .map_err(ca_err),
         Some(_) => Err(ca_err("exported CA's added CAs are not a list")),
     };
-    scrub_json(&mut parsed);
+    if let Some(added) = added.as_mut() {
+        scrub_json(added);
+    }
+    let mut primary = primary?;
     let extras = extras?;
     let files = HostCaFiles::at(ca_dir);
     let _lock = lock_ca_dir(&files)?;
@@ -669,8 +680,9 @@ pub struct HandedOver {
 /// every CA the new bindings may be signed with that it lacks, together with every CA it trusts or the old bindings
 /// may be signed with (no CA leaves a running guest's trust: a host leaving the bindings can stay intercepted until
 /// the machine stops). The interceptor then takes the bindings (`bind`). A guest that cannot take the CAs (an agent
-/// predating live trust) still has its removed bindings revoked at once and takes each added or changed binding whose
-/// CAs it already trusts; the others are [`HandedOver::deferred`] to its next start.
+/// predating pushed trust) still has its removed bindings revoked at once and keeps or takes each binding whose CAs it
+/// is known to trust; the others, a binding deferred by an earlier change among them, are [`HandedOver::deferred`] to
+/// its next start.
 pub fn hand_over_binding_change(
     name: &str,
     change: &BindingChange,
@@ -710,14 +722,14 @@ pub fn hand_over_binding_change(
                 .credentials
                 .iter()
                 .cloned()
+                // by what the guest is known to trust, never by the saved bindings, which hold any deferred earlier
                 .partition(|binding| {
-                    change.before.credentials.contains(binding)
-                        || signs_for(&CredentialPolicy {
-                            credentials: vec![binding.clone()],
-                        })
-                        .iter()
-                        .zip(&held)
-                        .all(|(needed, held)| !*needed || *held)
+                    signs_for(&CredentialPolicy {
+                        credentials: vec![binding.clone()],
+                    })
+                    .iter()
+                    .zip(&held)
+                    .all(|(needed, held)| !*needed || *held)
                 });
             let partial = CredentialPolicy { credentials: kept };
             let placeholders = change
@@ -756,21 +768,40 @@ pub fn interceptor_on_network(
     }
 }
 
-/// Largest boot config read to tell whether a machine booted on a pod network.
-const MAX_BOOT_CONFIG_BYTES: u64 = 16 * 1024 * 1024;
+/// File in a machine's data directory saying its last launch attached it to a Kubernetes pod network: it outlives
+/// the boot config, which the boot process removes once read.
+const POD_NETWORK_MARKER: &str = "pod-network";
 
-/// Whether the boot that left `vm_dir`'s boot config attached the machine to a Kubernetes pod network.
-fn booted_on_pod_network(vm_dir: &Path) -> bool {
-    #[derive(Deserialize)]
-    struct Booted {
-        #[serde(default)]
-        pod_netns: Option<PathBuf>,
+/// What [`POD_NETWORK_MARKER`] holds for a machine launched on a pod network; anything else means it was not.
+const POD_NETWORK_MARK: &[u8] = b"pod\n";
+
+/// Record whether the launch about to boot the machine whose data directory is `vm_dir` attaches it to a Kubernetes
+/// pod network, never writing through a link. A pod launch whose mark cannot be written fails: its machine would
+/// later take bindings it cannot enforce.
+pub fn record_launch_network(vm_dir: &Path, pod_network: bool) -> Result<()> {
+    if pod_network {
+        return crate::nofollow::write_replacing(
+            vm_dir,
+            &[POD_NETWORK_MARKER],
+            POD_NETWORK_MARK,
+            0o644,
+        )
+        .map_err(|e| Error::config("pod network", format!("record the pod network launch: {e}")));
     }
-    // the machine's directory is its user's: never follow a link or block on a FIFO there
-    crate::nofollow::read(vm_dir, &["boot-config.json"], MAX_BOOT_CONFIG_BYTES)
-        .ok()
-        .and_then(|config| serde_json::from_slice::<Booted>(&config).ok())
-        .is_some_and(|booted| booted.pod_netns.is_some())
+    if booted_on_pod_network(vm_dir) {
+        if let Err(e) = crate::nofollow::write_replacing(vm_dir, &[POD_NETWORK_MARKER], b"", 0o644)
+        {
+            tracing::warn!(dir = %vm_dir.display(), error = %e, "could not clear the pod network mark");
+        }
+    }
+    Ok(())
+}
+
+/// Whether the last launch of the machine whose data directory is `vm_dir` attached it to a Kubernetes pod network
+/// ([`record_launch_network`]), read without following a link or blocking on a FIFO.
+fn booted_on_pod_network(vm_dir: &Path) -> bool {
+    crate::nofollow::read(vm_dir, &[POD_NETWORK_MARKER], 64)
+        .is_ok_and(|mark| mark == POD_NETWORK_MARK)
 }
 
 /// Refuse a change that adds or changes a binding of machine `name`, whose data directory is `vm_dir`, when it last
@@ -1315,10 +1346,12 @@ impl CredentialLaunch {
             return ensure_cas_for(&self.ca_dir, &self.ca_owner, &self.policy, &self.policy)
                 .map(|_| ());
         }
-        let _lock = lock_ca_dir(&HostCaFiles::at(&self.ca_dir))?;
+        let lock = lock_ca_dir(&HostCaFiles::at(&self.ca_dir))?;
         if ca_exists(&self.ca_dir) {
-            // another launch of the lineage made it first
-            return Ok(());
+            // another launch of the lineage made it first, maybe for other hosts: cover this one's under the lock
+            drop(lock);
+            return ensure_cas_for(&self.ca_dir, &self.ca_owner, &self.policy, &self.policy)
+                .map(|_| ());
         }
         // A wildcard's parent is the subtree the CA may sign in; the name
         // constraint on it already covers every subdomain.
@@ -2240,6 +2273,19 @@ mod tests {
             .collect();
         assert_eq!(bound, ["gh", "gh2"], "notion is revoked, gh2 is covered");
 
+        // the next change, still to a guest that cannot take trust: oa stays deferred, never bound untrusted, though
+        // the saved bindings it is changed from already name it
+        let again = policy(&[
+            ("gh", "api.github.com"),
+            ("gh2", "api.github.com"),
+            ("oa", "api.openai.com"),
+            ("gh3", "api.github.com"),
+        ]);
+        let change = change_in(dir.path(), &next, &again);
+        let (result, _, bound) = hand_over(&change, Some(&read_at_boot), false);
+        assert_eq!(result.unwrap().deferred, ["oa"]);
+        assert!(!bound.unwrap().credentials.iter().any(|b| b.name == "oa"));
+
         // a pure removal needs no trust at all
         let removal = change_in(dir.path(), &booted, &first);
         let (result, calls, bound) = hand_over(&removal, Some(&read_at_boot), false);
@@ -2248,51 +2294,105 @@ mod tests {
         assert_eq!(bound, Some(first));
     }
 
-    /// A guest is handed a bundle at boot only when what it is known to trust differs from what its bindings need: a
-    /// resumed guest whose bindings gained a host while it was paused is; one that read a CA file holding just what it
-    /// needs, or a restored one needing only the machine CA, is not. A CA no binding needs leaves its trust here.
+    /// A guest is handed a bundle at boot only when it lacks a CA its bindings may be signed with: a resumed guest
+    /// whose bindings gained a host while it was paused is, with everything it trusted kept; one that read a CA file
+    /// holding what it needs is not, even when the file also holds CAs it does not need (a branch sharing its golden's
+    /// directory), and neither is a restored one needing only the machine CA.
     #[test]
-    fn a_guest_is_handed_its_trust_at_boot_only_when_it_differs() {
+    fn a_guest_is_handed_trust_at_boot_only_when_it_lacks_a_ca() {
         let dir = ca_dir_for(&[("notion", "api.notion.com")]);
-        let file = |dir: &Path| {
-            std::fs::read_to_string(
-                MachineCa::guest_dir(dir).join(smolvm_credentials::ca::GUEST_CA_FILE),
-            )
-            .unwrap()
-        };
+        let file = |dir: &Path| read_guest_bundle(dir).unwrap();
         let first = policy(&[("notion", "api.notion.com")]);
-        let boot = guest_trust_at_boot(dir.path(), "m", &first, Some(&file(dir.path())))
-            .unwrap()
-            .unwrap();
-        assert!(boot.hand.is_none(), "the CA file is what it needs");
-        assert_eq!(boot.held, primary_pem(dir.path()));
-        let restored = guest_trust_at_boot(dir.path(), "m", &first, None)
-            .unwrap()
-            .unwrap();
-        assert!(restored.hand.is_none(), "every guest trusts the machine CA");
+        assert_eq!(
+            guest_trust_at_boot(dir.path(), "m", &first, Some(&file(dir.path()))).unwrap(),
+            None,
+            "the CA file is what it needs"
+        );
+        assert_eq!(
+            guest_trust_at_boot(dir.path(), "m", &first, None).unwrap(),
+            None,
+            "every guest trusts the machine CA"
+        );
 
         // a binding added while the machine was paused, which then resumes trusting what it was recorded to
         let recorded = file(dir.path());
         let grown = policy(&[("notion", "api.notion.com"), ("gh", "api.github.com")]);
         ensure_cas_for(dir.path(), "m", &grown, &first).unwrap();
-        let resumed = guest_trust_at_boot(dir.path(), "m", &grown, Some(&recorded))
+        let hand = guest_trust_at_boot(dir.path(), "m", &grown, Some(&recorded))
             .unwrap()
-            .unwrap();
-        let hand = resumed
-            .hand
             .expect("the resumed guest is handed the github CA");
         assert!(hand.contains(ca_permitting(dir.path(), "api.github.com").trim()));
-        assert_eq!(resumed.held, recorded, "what it holds if it cannot take it");
+        assert!(hand.contains(primary_pem(dir.path()).trim()));
 
-        // booting afresh after the binding was removed: the file still holds the github CA, which leaves its trust
-        let pruned = guest_trust_at_boot(dir.path(), "m", &first, Some(&file(dir.path())))
-            .unwrap()
-            .unwrap();
-        assert_eq!(pruned.hand.as_deref().map(certificates), Some(1));
+        // a sibling's CA in the shared file, which this machine does not need: nothing to hand, so no push
+        let sibling = policy(&[("notion", "api.notion.com"), ("o", "api.openai.com")]);
+        ensure_cas_for(dir.path(), "m", &sibling, &first).unwrap();
+        assert_eq!(certificates(&file(dir.path())), 3);
+        assert_eq!(
+            guest_trust_at_boot(dir.path(), "m", &grown, Some(&file(dir.path()))).unwrap(),
+            None
+        );
         let none = tempfile::tempdir().unwrap();
         assert!(guest_trust_at_boot(none.path(), "m", &first, None)
             .unwrap()
             .is_none());
+    }
+
+    /// Branches sharing their golden's CA directory may launch for the first time at once: whichever makes the
+    /// machine CA, every launch's hosts end up permitted by some CA.
+    #[test]
+    fn concurrent_first_launches_of_a_lineage_cover_every_host() {
+        let dir = tempfile::tempdir().unwrap();
+        let ca_dir = dir.path().join("credentials");
+        let hosts: Vec<String> = (0..8).map(|i| format!("api{i}.example.org")).collect();
+        std::thread::scope(|scope| {
+            for host in &hosts {
+                let ca_dir = ca_dir.clone();
+                scope.spawn(move || {
+                    let mut launch = CredentialLaunch::from_parts(
+                        "golden",
+                        &policy(&[("b", host.as_str())]),
+                        &BTreeMap::new(),
+                        &BTreeMap::new(),
+                        None,
+                    )
+                    .unwrap();
+                    launch.ca_dir = ca_dir;
+                    launch.ensure_ca().unwrap();
+                });
+            }
+        });
+        let primary = load_ca(&ca_dir, "golden").unwrap();
+        let extras = load_extra_cas(&ca_dir, "golden");
+        for host in &hosts {
+            assert!(
+                primary.permits(host) || extras.iter().any(|ca| ca.permits(host)),
+                "{host} is left uncovered"
+            );
+        }
+    }
+
+    /// A machine launched on a Kubernetes pod network stays marked as one after the boot process removes its boot
+    /// config, so a change adding a binding is refused; a later launch off the pod network clears the mark.
+    #[test]
+    fn a_pod_network_launch_is_remembered_past_the_boot_config() {
+        let vm_dir = tempfile::tempdir().unwrap();
+        let gh = policy(&[("gh", "api.github.com")]);
+        let wide = policy(&[("gh", "*.github.com")]);
+        std::fs::write(
+            vm_dir.path().join("boot-config.json"),
+            r#"{"pod_netns":"/run/netns/x"}"#,
+        )
+        .unwrap();
+        record_launch_network(vm_dir.path(), true).unwrap();
+        // what the boot process does once it has read it
+        std::fs::remove_file(vm_dir.path().join("boot-config.json")).unwrap();
+        let refused = refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &wide)
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains(POD_NETWORK_REFUSAL), "{refused}");
+        record_launch_network(vm_dir.path(), false).unwrap();
+        refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &wide).unwrap();
     }
 
     /// Adding a CA replaces the guest's CA file whole (a booting guest never reads part of it), readable through the
@@ -2335,11 +2435,7 @@ mod tests {
         let vm_dir = tempfile::tempdir().unwrap();
         let widened = policy(&[("gh", "*.github.com")]);
         refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &widened).unwrap();
-        std::fs::write(
-            vm_dir.path().join("boot-config.json"),
-            r#"{"pod_netns":"/var/run/netns/cni-1","credentials":null}"#,
-        )
-        .unwrap();
+        record_launch_network(vm_dir.path(), true).unwrap();
         for (before, after) in [(Some(&gh), &widened), (None, &gh)] {
             let refused = refuse_change_on_pod_network("pod", vm_dir.path(), before, after)
                 .unwrap_err()
@@ -2354,12 +2450,6 @@ mod tests {
         )
         .unwrap();
         refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &gh).unwrap();
-        std::fs::write(
-            vm_dir.path().join("boot-config.json"),
-            r#"{"pod_netns":null}"#,
-        )
-        .unwrap();
-        refuse_change_on_pod_network("pod", vm_dir.path(), Some(&gh), &widened).unwrap();
     }
 
     #[test]

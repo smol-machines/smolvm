@@ -2265,6 +2265,19 @@ impl AgentClient {
         }
     }
 
+    /// Hand the guest `ca_pem`, the credential CA bundle it is to trust from now on, and have it rebuild its trust
+    /// bundles from it. Err when the running agent cannot take a pushed bundle: one that only re-reads the CA file may
+    /// still see an old copy through its file cache, so the caller must not count on the guest trusting `ca_pem`.
+    pub fn push_credential_trust(&mut self, ca_pem: &str) -> Result<()> {
+        if !self.supports_capability(smolvm_protocol::PUSHED_CREDENTIAL_TRUST_CAPABILITY)? {
+            return Err(Error::agent(
+                "credential trust",
+                "this machine's guest agent cannot take a pushed CA bundle; a host needing a new CA is bound from its next start",
+            ));
+        }
+        self.refresh_credential_trust(Some(ca_pem))
+    }
+
     /// Have the guest rebuild its credential trust bundles from the machine's CA file, which the host rewrote after
     /// adding a CA for a binding's new host, or from `ca_pem`, that file's new contents, when the agent takes them
     /// (its view of the file can lag the host's write). Err when the running agent predates this, so the caller can say the

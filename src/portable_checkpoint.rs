@@ -4491,8 +4491,14 @@ fn stage_credential_ca(
     if !crate::credentials::ca_exists(&launch.ca_dir) {
         return Ok(None);
     }
-    let document = crate::credentials::export_cas(&launch.ca_dir, &launch.ca_owner, &launch.policy)
-        .map_err(|e| Error::agent("capture credential CA", e.to_string()))?;
+    let trusted = crate::credentials::recorded_guest_trust(&launch.machine);
+    let document = crate::credentials::export_cas(
+        &launch.ca_dir,
+        &launch.ca_owner,
+        &launch.policy,
+        trusted.as_deref(),
+    )
+    .map_err(|e| Error::agent("capture credential CA", e.to_string()))?;
     let size = document.len() as u64;
     if size > MAX_CREDENTIAL_CA_BYTES {
         return Err(Error::agent(
@@ -8705,6 +8711,14 @@ mod tests {
             .unwrap()
         };
 
+        let expected = guest_file(&launch.ca_dir);
+        // a sibling sharing the directory bound openai: its CA (and key) is not this machine's to carry
+        let sibling = crate::credentials::CredentialPolicy {
+            credentials: vec![
+                crate::credentials::parse_credential_flag("oa=OA@api.openai.com").unwrap(),
+            ],
+        };
+        crate::credentials::ensure_cas_for(&launch.ca_dir, "cred", &sibling, &first).unwrap();
         let snapshot = tempfile::tempdir().unwrap();
         std::fs::create_dir(snapshot.path().join(ASSET_DIR)).unwrap();
         let staged = stage_credential_ca(&launch, &snapshot.path().join(ASSET_DIR))
@@ -8724,7 +8738,11 @@ mod tests {
         let restored = machine.path().join(crate::credentials::CA_DIR_NAME);
         let extras = crate::credentials::load_extra_cas(&restored, "cred-restored");
         let source_extras = crate::credentials::load_extra_cas(&launch.ca_dir, "cred");
-        assert_eq!(extras.len(), 1, "the CA added for api.github.com travels");
+        assert_eq!(
+            extras.len(),
+            1,
+            "the CA added for api.github.com travels, not the sibling's openai one"
+        );
         assert_eq!(
             extras[0].certificate_pem(),
             source_extras[0].certificate_pem(),
@@ -8733,7 +8751,7 @@ mod tests {
         assert!(extras[0].permits("api.github.com") && !extras[0].permits("api.notion.com"));
         let primary = smolvm_credentials::MachineCa::load(&restored, "cred-restored").unwrap();
         assert!(primary.permits("api.notion.com") && !primary.permits("api.github.com"));
-        assert_eq!(guest_file(&restored), guest_file(&launch.ca_dir));
+        assert_eq!(guest_file(&restored), expected);
         // the restored machine's next start finds every host covered: no CA is minted anew
         assert!(
             !crate::credentials::ensure_cas_for(&restored, "cred-restored", &grown, &grown)
@@ -8753,7 +8771,7 @@ mod tests {
             crate::credentials::load_extra_cas(&restored, "cred-restored").len(),
             1
         );
-        assert_eq!(guest_file(&restored), guest_file(&launch.ca_dir));
+        assert_eq!(guest_file(&restored), expected);
     }
 
     /// A checkpoint from before CAs recorded their hosts names none for its machine CA. Restored afresh, the CA
