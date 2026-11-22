@@ -204,7 +204,13 @@ fn add_cas_for(
         }
         bundle.push_str(ca.certificate_pem());
     }
-    // in place: the guest reads it through its read-only mount
+    write_guest_bundle(&files, &bundle)?;
+    Ok(added.then_some(bundle))
+}
+
+/// Overwrite the guest's CA bundle in `files` in place (the guest reads it through its read-only mount), never
+/// through a link, into a file with another name, or into anything but a regular file.
+fn write_guest_bundle(files: &HostCaFiles, bundle: &str) -> Result<()> {
     crate::nofollow::write_in_place(
         &files.base,
         &files.components(&[
@@ -213,8 +219,7 @@ fn add_cas_for(
         ]),
         bundle.as_bytes(),
     )
-    .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))?;
-    Ok(added.then_some(bundle))
+    .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))
 }
 
 /// A machine's credential bindings after a change ([`plan_binding_change`]).
@@ -606,9 +611,8 @@ pub fn set_bindings_in(
         == crate::config::RecordState::Running;
     // whether its interceptor runs, not whether the record has bindings now: removing a machine's last binding leaves
     // the interceptor serving, and adding one back must reach it
-    let interceptor = crate::agent::vm_data_dir(name)
-        .join(CREDENTIALS_SOCKET)
-        .exists();
+    let interceptor =
+        std::fs::symlink_metadata(crate::agent::vm_data_dir(name).join(CREDENTIALS_SOCKET)).is_ok();
     let live = running && interceptor;
     if live {
         // the host sources of the bindings this host's operator defined, and none for any other
@@ -1310,11 +1314,12 @@ mod tests {
     }
 
     /// A CA directory the machine's user owns while root changes its bindings: root never writes the guest bundle
-    /// through a symbolic or hard link planted at its name, so the file the link names is left as it was.
+    /// through a symbolic or hard link, or into a FIFO, planted at its name, so the file the link names is left as it
+    /// was. The write itself is refused, not only skipped because the CA then looks missing.
     #[cfg(unix)]
     #[test]
     fn a_binding_change_never_writes_the_guest_bundle_through_a_link() {
-        for hard in [false, true] {
+        for planted in ["symbolic", "hard", "fifo"] {
             let dir = tempfile::tempdir().unwrap();
             let elsewhere = tempfile::tempdir().unwrap();
             let (first, grown) = saved_ca_and_growth(dir.path());
@@ -1323,19 +1328,36 @@ mod tests {
             let guest =
                 MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
             std::fs::remove_file(&guest).unwrap();
-            if hard {
-                std::fs::hard_link(&victim, &guest).unwrap();
-            } else {
-                std::os::unix::fs::symlink(&victim, &guest).unwrap();
+            match planted {
+                "hard" => std::fs::hard_link(&victim, &guest).unwrap(),
+                "symbolic" => std::os::unix::fs::symlink(&victim, &guest).unwrap(),
+                _ => {
+                    let fifo = std::ffi::CString::new(guest.to_str().unwrap()).unwrap();
+                    // SAFETY: a NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                }
             }
+            let err = write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap_err();
+            assert!(
+                err.to_string().contains("guest CA bundle"),
+                "{planted}: {err}"
+            );
             let _ = ensure_cas_for(dir.path(), "m", &grown, &first);
             assert_eq!(
                 std::fs::read(&victim).unwrap(),
                 b"root's",
-                "written through a {} link",
-                if hard { "hard" } else { "symbolic" }
+                "written through a {planted} link"
             );
         }
+        // an ordinary bundle is overwritten in place, keeping its inode
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        saved_ca_and_growth(dir.path());
+        let guest = MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
+        let inode = std::fs::metadata(&guest).unwrap().ino();
+        write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap();
+        assert_eq!(std::fs::read(&guest).unwrap(), b"bundle");
+        assert_eq!(std::fs::metadata(&guest).unwrap().ino(), inode);
     }
 
     /// A FIFO planted among the CA files is refused, never waited on: root's server must not hang there.
@@ -1362,8 +1384,7 @@ mod tests {
         );
     }
 
-    /// Recording an old CA's hosts never creates a file where a dangling link at `ca.hosts` points, and a new CA is
-    /// never saved into a directory a link at `extra` names.
+    /// Recording an old CA's hosts never creates a file where a dangling link at `ca.hosts` points.
     #[cfg(unix)]
     #[test]
     fn a_binding_change_never_writes_ca_files_through_planted_links() {
@@ -1373,13 +1394,26 @@ mod tests {
         std::fs::remove_file(dir.path().join("ca.hosts")).unwrap();
         let planted = elsewhere.path().join("cron-job");
         std::os::unix::fs::symlink(&planted, dir.path().join("ca.hosts")).unwrap();
-        let outside = elsewhere.path().join("keys");
-        std::fs::create_dir(&outside).unwrap();
-        std::os::unix::fs::symlink(&outside, dir.path().join(EXTRA_CA_DIR)).unwrap();
-        let _ = ensure_cas_for(dir.path(), "m", &grown, &first);
+        assert!(ensure_cas_for(dir.path(), "m", &grown, &first).is_err());
         assert!(!planted.exists(), "ca.hosts written through a link");
+    }
+
+    /// A new CA is never saved into a directory a link at `extra` names, with every other CA file in order.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_ca_is_never_saved_through_a_linked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (first, grown) = saved_ca_and_growth(dir.path());
+        assert!(dir.path().join("ca.hosts").is_file());
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(EXTRA_CA_DIR)).unwrap();
+        let err = ensure_cas_for(dir.path(), "m", &grown, &first).unwrap_err();
+        assert!(err.to_string().contains("ca.pem"), "{err}");
         assert!(
-            std::fs::read_dir(&outside).unwrap().next().is_none(),
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none(),
             "a new CA saved through a linked directory"
         );
     }
@@ -1405,10 +1439,11 @@ mod tests {
                 std::os::unix::fs::symlink(other.path().join("ca.key"), &key).unwrap();
             }
             let how = if hard { "hard" } else { "symbolically" };
-            assert!(
-                load_ca(dir.path(), "m").is_err(),
-                "a {how} linked key was loaded"
-            );
+            // the read itself refuses the key, not a check that finds the CA missing first
+            let err = load_ca(dir.path(), "m")
+                .err()
+                .expect("a linked key was loaded");
+            assert!(err.to_string().contains("ca.key"), "{how}: {err}");
             assert!(
                 !matches!(ensure_cas_for(dir.path(), "m", &grown, &first), Ok(true)),
                 "a CA was added on top of a {how} linked key"

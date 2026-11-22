@@ -665,6 +665,15 @@ fn live_changes_refuse_a_socket_replaced_by_a_link() {
             std::io::ErrorKind::WouldBlock,
             "the linked socket was connected to"
         );
+        // a second name for the socket elsewhere (a hard link) is refused the same way
+        std::fs::remove_file(&ours).unwrap();
+        std::fs::hard_link(&decoy, &ours).unwrap();
+        assert!(apply_live_credential_values("linked-socket", &values).is_err());
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the hard-linked socket was connected to"
+        );
 
         std::fs::remove_file(&ours).unwrap();
         let own = std::os::unix::net::UnixListener::bind(&ours).unwrap();
@@ -678,4 +687,42 @@ fn live_changes_refuse_a_socket_replaced_by_a_link() {
         apply_live_credential_values("linked-socket", &values).unwrap();
         assert!(server.join().unwrap().contains("secret"));
     });
+}
+
+/// A machine whose directory's path is past `sun_path` (a long state
+/// directory or user name) still takes live changes on the control socket its
+/// boot process serves, which binds such a path through a temporary alias.
+#[test]
+fn live_changes_reach_a_machine_whose_socket_path_is_long() {
+    isolated_in(
+        "live_changes_reach_a_machine_whose_socket_path_is_long",
+        || {
+            tempfile::Builder::new()
+                .prefix(&"long".repeat(20))
+                .tempdir()
+        },
+        |_| {
+            let dir = vm_data_dir("long-socket");
+            std::fs::create_dir_all(&dir).unwrap();
+            let ours = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+            assert!(ours.as_os_str().len() > 108, "{}", ours.display());
+            let (sent, received) = std::sync::mpsc::channel();
+            crate::network::launch::serve_control_socket(
+                ours.clone(),
+                "long-socket-test",
+                1024 * 1024,
+                move |request| {
+                    let _ = sent.send(request.to_string());
+                    Ok(())
+                },
+            );
+            assert!(ours.exists(), "the control socket is served");
+            let values = std::collections::BTreeMap::from([(
+                "notion".to_string(),
+                zeroize::Zeroizing::new("secret".to_string()),
+            )]);
+            apply_live_credential_values("long-socket", &values).unwrap();
+            assert!(received.recv().unwrap().contains("secret"));
+        },
+    );
 }

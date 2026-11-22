@@ -7,11 +7,15 @@
 //! process escaped from the machine could swap any of them, or a directory on
 //! the way, for a link to somewhere only root can reach, a hard link to a file
 //! elsewhere, or a FIFO that hangs the reader. So every component below the
-//! trusted base directory is opened relative to its parent's descriptor
-//! without following a link, directories with `O_DIRECTORY`, files only when
-//! regular and never blocking on open. A file read or written in place must
-//! have one name only and belong to this process's user or the base
-//! directory's owner, and reads are capped.
+//! base directory is opened relative to its parent's descriptor without
+//! following a link, directories with `O_DIRECTORY`, files only when regular
+//! and never blocking on open. The base itself is the trusted path to the
+//! machine's directory: its ancestors (a linked cache or runtime directory)
+//! are followed as usual. A file read or written in place must have one name
+//! only and belong to this process's user, root or the base directory's
+//! owner, and reads are capped. What root creates below the base takes the
+//! owner of the directory it is created in, so the machine's own process can
+//! still read it.
 
 use std::path::Path;
 
@@ -58,7 +62,7 @@ pub(crate) fn is_file(base: &Path, components: &[&str]) -> bool {
     };
     unix::open_dirs(base, dirs, false)
         .and_then(|(dir, _)| unix::stat_at(&dir, name))
-        .is_ok_and(|mode| mode & libc::S_IFMT == libc::S_IFREG)
+        .is_ok_and(|stat| stat.st_mode & libc::S_IFMT == libc::S_IFREG)
 }
 
 #[cfg(not(unix))]
@@ -111,6 +115,7 @@ pub(crate) fn write_replacing(
     })?;
     let written = Ok::<_, std::io::Error>(std::fs::File::from(fd))
         .and_then(|mut file| {
+            unix::adopt(&dir, &file)?;
             // its final mode whatever the umask was
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -164,12 +169,18 @@ pub(crate) fn write_in_place(
     use std::io::Write;
     let (name, dirs) = split(components)?;
     let (dir, base_owner) = unix::open_dirs(base, dirs, false)?;
-    let mut file = std::fs::File::from(unix::open_at(
-        &dir,
-        name,
-        libc::O_WRONLY | libc::O_CREAT | libc::O_NONBLOCK,
-        0o644,
-    )?);
+    let flags = libc::O_WRONLY | libc::O_NONBLOCK;
+    let mut file = match unix::open_at(&dir, name, flags | libc::O_CREAT | libc::O_EXCL, 0o644) {
+        Ok(created) => {
+            let file = std::fs::File::from(created);
+            unix::adopt(&dir, &file)?;
+            file
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            std::fs::File::from(unix::open_at(&dir, name, flags, 0)?)
+        }
+        Err(e) => return Err(e),
+    };
     unix::check_file(&file, base_owner)?;
     file.set_len(0)?;
     file.write_all(bytes)
@@ -182,6 +193,91 @@ pub(crate) fn write_in_place(
     bytes: &[u8],
 ) -> std::io::Result<()> {
     std::fs::write(windows::checked_path(base, components, false)?, bytes)
+}
+
+/// A socket file found in a machine's directory without following a link.
+#[cfg(unix)]
+pub(crate) struct SocketFile {
+    /// The socket file itself, opened `O_PATH`, to connect to through
+    /// `/proc/self/fd`: what is reached is then the inode checked here,
+    /// whatever its name is swapped for meanwhile.
+    #[cfg(target_os = "linux")]
+    path_fd: std::os::fd::OwnedFd,
+    /// Device and inode of the socket file.
+    pub(crate) id: (u64, u64),
+    /// Owner of the directory holding it: the machine's own user.
+    pub(crate) dir_owner: u32,
+}
+
+#[cfg(unix)]
+impl SocketFile {
+    /// A short path naming exactly this socket file, where the platform has
+    /// one (`/proc/self/fd/N` on Linux, when `/proc` is mounted).
+    pub(crate) fn pinned_path(&self) -> Option<std::path::PathBuf> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let path =
+                std::path::PathBuf::from(format!("/proc/self/fd/{}", self.path_fd.as_raw_fd()));
+            if path.exists() {
+                return Some(path);
+            }
+        }
+        None
+    }
+}
+
+/// Find socket `name` in directory `base` without following a link: it must
+/// be a socket, have one name only (a hard link to a socket elsewhere has
+/// two) and belong to this user, root or `base`'s owner.
+#[cfg(unix)]
+pub(crate) fn socket(base: &Path, name: &str) -> std::io::Result<SocketFile> {
+    let (dir, dir_owner) = unix::open_dirs(base, &[], false)?;
+    // (is a socket, names, owner, device, inode), read off the file itself, never a link's target
+    #[cfg(target_os = "linux")]
+    let (path_fd, (is_socket, nlink, uid, dev, ino)) = {
+        use std::os::unix::fs::{FileTypeExt, MetadataExt};
+        let fd = unix::open_at(&dir, name, libc::O_PATH, 0)?;
+        let meta = std::fs::File::from(fd.try_clone()?).metadata()?;
+        let status = (
+            meta.file_type().is_socket(),
+            meta.nlink(),
+            meta.uid(),
+            meta.dev(),
+            meta.ino(),
+        );
+        (fd, status)
+    };
+    #[cfg(not(target_os = "linux"))]
+    #[allow(clippy::unnecessary_cast)] // the field types differ between platforms
+    let (is_socket, nlink, uid, dev, ino) = {
+        let stat = unix::stat_at(&dir, name)?;
+        (
+            stat.st_mode & libc::S_IFMT == libc::S_IFSOCK,
+            stat.st_nlink as u64,
+            stat.st_uid,
+            stat.st_dev as u64,
+            stat.st_ino as u64,
+        )
+    };
+    if !is_socket {
+        return Err(std::io::Error::other("not a socket"));
+    }
+    if nlink != 1 {
+        return Err(std::io::Error::other("a socket with more than one name"));
+    }
+    // SAFETY: geteuid has no preconditions.
+    if !unix::owner_allowed(uid, unsafe { libc::geteuid() }, dir_owner) {
+        return Err(std::io::Error::other(
+            "a socket owned by neither this user, root nor the directory's owner",
+        ));
+    }
+    Ok(SocketFile {
+        #[cfg(target_os = "linux")]
+        path_fd,
+        id: (dev, ino),
+        dir_owner,
+    })
 }
 
 fn split<'a>(components: &'a [&'a str]) -> std::io::Result<(&'a str, &'a [&'a str])> {
@@ -264,7 +360,8 @@ mod unix {
         })
     }
 
-    /// `base`, then each of `dirs` below it, opened as directories without
+    /// `base` (its own path followed as usual: it and its ancestors are
+    /// trusted), then each of `dirs` below it, opened as directories without
     /// following a link (a missing one made first with `create`), with the
     /// owner of `base` as it was opened.
     pub(super) fn open_dirs(
@@ -277,22 +374,29 @@ mod unix {
         let mut dir = owned(unsafe {
             libc::open(
                 path.as_ptr(),
-                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+                libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         })?;
         let owner = std::fs::File::from(dir.try_clone()?).metadata()?.uid();
         for name in dirs {
+            let mut made = false;
             if create {
                 let c = component(name)?;
                 // SAFETY: a NUL-terminated name and a live directory descriptor.
-                if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } != 0 {
+                if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } == 0 {
+                    made = true;
+                } else {
                     let error = std::io::Error::last_os_error();
                     if error.kind() != std::io::ErrorKind::AlreadyExists {
                         return Err(error);
                     }
                 }
             }
-            dir = open_at(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            let next = open_at(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            if made {
+                adopt(&dir, &std::fs::File::from(next.try_clone()?))?;
+            }
+            dir = next;
         }
         Ok((dir, owner))
     }
@@ -311,20 +415,46 @@ mod unix {
         // SAFETY: geteuid has no preconditions.
         if !owner_allowed(meta.uid(), unsafe { libc::geteuid() }, base_owner) {
             return Err(std::io::Error::other(
-                "a file owned by neither this user nor the directory's owner",
+                "a file owned by neither this user, root nor the directory's owner",
             ));
         }
         Ok(())
     }
 
     /// Whether a file `owner` owns may be trusted by a process running as `me`
-    /// below a directory `base_owner` owns.
+    /// below a directory `base_owner` owns: its own, root's (a machine
+    /// directory a root process wrote into) or the directory owner's (the
+    /// machine's own user), never a third user's.
     pub(super) fn owner_allowed(owner: u32, me: u32, base_owner: u32) -> bool {
-        owner == me || owner == base_owner
+        owner == me || owner == 0 || owner == base_owner
     }
 
-    /// The file type and mode of `name` in `dir`, itself when it is a link.
-    pub(super) fn stat_at(dir: &OwnedFd, name: &str) -> std::io::Result<libc::mode_t> {
+    /// Give `made`, just created in `dir` by this process, the owner of `dir`
+    /// when this process is root and `dir` is another user's: a file root
+    /// writes into a machine's directory stays readable by the machine's own
+    /// process, as everything else there is.
+    pub(super) fn adopt(dir: &OwnedFd, made: &std::fs::File) -> std::io::Result<()> {
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        let meta = std::fs::File::from(dir.try_clone()?).metadata()?;
+        match adopted_owner(me, meta.uid(), meta.gid()) {
+            // SAFETY: a live descriptor.
+            Some((uid, gid)) if unsafe { libc::fchown(made.as_raw_fd(), uid, gid) } != 0 => {
+                Err(std::io::Error::last_os_error())
+            }
+            _ => Ok(()),
+        }
+    }
+
+    /// The owner a file created by `me` in a directory `dir_uid`:`dir_gid`
+    /// owns is given, when it is not left as created: only root hands a file
+    /// over, and only to another user.
+    pub(super) fn adopted_owner(me: u32, dir_uid: u32, dir_gid: u32) -> Option<(u32, u32)> {
+        (me == 0 && dir_uid != 0).then_some((dir_uid, dir_gid))
+    }
+
+    /// The status of `name` in `dir`, itself when it is a link.
+    pub(super) fn stat_at(dir: &OwnedFd, name: &str) -> std::io::Result<libc::stat> {
         let name = component(name)?;
         // SAFETY: plain data the call fills in.
         let mut stat: libc::stat = unsafe { std::mem::zeroed() };
@@ -340,7 +470,7 @@ mod unix {
         {
             return Err(std::io::Error::last_os_error());
         }
-        Ok(stat.st_mode)
+        Ok(stat)
     }
 
     pub(super) fn list(dir: OwnedFd) -> std::io::Result<Vec<String>> {
@@ -477,7 +607,8 @@ mod tests {
         std::fs::write(sub.join("f"), b"x").unwrap();
         std::os::unix::fs::symlink(&sub, dir.path().join("linked")).unwrap();
         assert!(read(dir.path(), &["linked", "f"], 16).is_err());
-        assert!(read(&dir.path().join("linked"), &["f"], 16).is_err());
+        // the base is the trusted path itself: a link above the machine's directory is followed
+        assert_eq!(read(&dir.path().join("linked"), &["f"], 16).unwrap(), b"x");
         assert!(list(dir.path(), &["linked"]).is_err());
         assert_eq!(list(dir.path(), &["sub"]).unwrap(), ["f"]);
 
@@ -496,7 +627,44 @@ mod tests {
         assert!(unix::owner_allowed(5001, 0, 5001));
         assert!(!unix::owner_allowed(5002, 0, 5001));
         assert!(unix::owner_allowed(1000, 1000, 1000));
-        assert!(!unix::owner_allowed(0, 1000, 1000));
+        // root's file in a user's directory (written by an earlier `sudo smolvm`) stays readable
+        assert!(unix::owner_allowed(0, 1000, 1000));
+        assert!(!unix::owner_allowed(5001, 1000, 1000));
+    }
+
+    /// Root hands what it creates in a machine's directory to the directory's
+    /// owner; anyone else, or root in its own directory, leaves it as created.
+    #[test]
+    fn only_root_hands_what_it_creates_to_the_directorys_owner() {
+        assert_eq!(unix::adopted_owner(0, 5001, 5001), Some((5001, 5001)));
+        assert_eq!(unix::adopted_owner(0, 0, 0), None);
+        assert_eq!(unix::adopted_owner(1000, 1000, 1000), None);
+        assert_eq!(unix::adopted_owner(1000, 5001, 5001), None);
+        // as this test's user, a new file and directory stay its own
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        write_replacing(dir.path(), &["d", "f"], b"x", 0o600).unwrap();
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        assert_eq!(std::fs::metadata(dir.path().join("d/f")).unwrap().uid(), me);
+    }
+
+    /// A socket is found only when it is one, under its own single name.
+    #[test]
+    fn sockets_are_found_only_unlinked_and_under_one_name() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let _listener = std::os::unix::net::UnixListener::bind(dir.path().join("s")).unwrap();
+        let found = socket(dir.path(), "s").unwrap();
+        // SAFETY: geteuid has no preconditions.
+        assert_eq!(found.dir_owner, unsafe { libc::geteuid() });
+        std::fs::write(dir.path().join("f"), b"x").unwrap();
+        assert!(socket(dir.path(), "f").is_err());
+        std::os::unix::fs::symlink(dir.path().join("s"), dir.path().join("l")).unwrap();
+        assert!(socket(dir.path(), "l").is_err());
+        let _other = std::os::unix::net::UnixListener::bind(elsewhere.path().join("o")).unwrap();
+        std::fs::hard_link(elsewhere.path().join("o"), dir.path().join("h")).unwrap();
+        assert!(socket(dir.path(), "h").is_err());
     }
 
     /// Writers in many threads at once never share a temporary file: every

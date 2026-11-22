@@ -802,8 +802,21 @@ pub fn apply_live_credential_bindings(
         )
     })?;
     if change.trust_changed {
-        AgentManager::for_vm(name)
-            .and_then(|manager| crate::agent::AgentClient::connect(manager.vsock_socket()))
+        // the trust bundle is for this machine's guest only: never send it to an agent socket that is not its own
+        let agent_socket = AgentManager::for_vm(name).and_then(|manager| {
+            manager
+                .vsock_socket()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .ok_or_else(|| Error::agent("credential trust", "agent socket has no name"))
+        });
+        agent_socket
+            .and_then(|socket| {
+                connect_machine_socket(name, &socket, Duration::from_secs(30))
+                    .map_err(|e| Error::agent("connect to agent", e))
+            })
+            .and_then(crate::agent::AgentClient::over_connected)
             .and_then(|mut client| client.refresh_credential_trust(change.guest_ca.as_deref()))
             .map_err(|e| {
                 Error::config(
@@ -877,56 +890,7 @@ fn send_live_request(
     rendered: &str,
 ) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
-    let dir = vm_data_dir(name);
-    let path = dir.join(socket);
-    let restart = |e: std::io::Error| {
-        format!("{e}; a machine started before live changes were supported needs a restart")
-    };
-    // The machine's directory is its own user's under per-VM uid isolation,
-    // and what is sent here (credential values among it) is for its boot
-    // process only: refuse anything at the socket's name but a socket.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::FileTypeExt;
-        let meta = std::fs::symlink_metadata(&path).map_err(restart)?;
-        if !meta.file_type().is_socket() {
-            return Err(format!("{} is not a socket", path.display()));
-        }
-    }
-    let mut stream =
-        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2))
-            .map_err(restart)?;
-    // What was reached is read off the connected socket, not the path: a link
-    // swapped in after the check above still cannot route this to a socket
-    // bound anywhere but the machine's own path, nor to one another user
-    // serves.
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        match stream.peer_path() {
-            Ok(Some(bound)) if same_socket_place(&bound, &path) => {}
-            Ok(bound) => {
-                return Err(format!(
-                    "{} reached a socket bound at {}, not the machine's own",
-                    path.display(),
-                    bound.map_or("no path".into(), |b| b.display().to_string())
-                ))
-            }
-            Err(e) => return Err(e.to_string()),
-        }
-        let owner = std::fs::symlink_metadata(&dir)
-            .map_err(|e| e.to_string())?
-            .uid();
-        let peer = stream.peer_uid().map_err(|e| e.to_string())?;
-        // SAFETY: geteuid has no preconditions.
-        let me = unsafe { libc::geteuid() };
-        if !peer_may_serve(peer, owner, me) {
-            return Err(format!(
-                "{} is served by uid {peer}, not by the machine's own process (uid {owner})",
-                path.display()
-            ));
-        }
-    }
+    let mut stream = connect_machine_socket(name, socket, Duration::from_secs(2))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
@@ -937,6 +901,78 @@ fn send_live_request(
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
     Ok(reply)
+}
+
+/// Connect to socket `socket` in machine `name`'s directory, refusing what is
+/// not the machine's own. The directory belongs to the machine's user under
+/// per-VM uid isolation, and what is sent over these sockets (credential
+/// values, trust bundles) is for that machine only, so the socket must be one
+/// under its own single name there, owned and served by the machine's user,
+/// this user or root ([`crate::nofollow::socket`], [`peer_may_serve`]). On
+/// Linux the connect goes to the very inode checked, through `/proc/self/fd`
+/// (which also keeps a long path within `sun_path`). Elsewhere the listener's
+/// bound path must be the machine's own; a long path bound through a
+/// temporary alias since removed is instead checked to name the same socket
+/// file after connecting as before.
+pub(crate) fn connect_machine_socket(
+    name: &str,
+    socket: &str,
+    timeout: Duration,
+) -> std::result::Result<crate::platform::uds::UdsStream, String> {
+    let dir = vm_data_dir(name);
+    let path = dir.join(socket);
+    let restart = |e: std::io::Error| {
+        format!("{e}; a machine started before live changes were supported needs a restart")
+    };
+    #[cfg(unix)]
+    {
+        let refused = |e: std::io::Error| format!("{}: {e}", path.display());
+        let found = match crate::nofollow::socket(&dir, socket) {
+            Ok(found) => found,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(restart(e)),
+            Err(e) => return Err(refused(e)),
+        };
+        let pinned = found.pinned_path();
+        let stream = crate::platform::uds::UdsStream::connect_timeout(
+            pinned.as_deref().unwrap_or(&path),
+            timeout,
+        )
+        .map_err(restart)?;
+        let peer = stream.peer_uid().map_err(refused)?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !peer_may_serve(peer, found.dir_owner, me) {
+            return Err(format!(
+                "{} is served by uid {peer}, not by the machine's own process (uid {})",
+                path.display(),
+                found.dir_owner
+            ));
+        }
+        if pinned.is_none() {
+            match stream.peer_path().map_err(refused)? {
+                Some(bound) if same_socket_place(&bound, &path) => {}
+                Some(bound)
+                    if bound.file_name() == path.file_name()
+                        && bound.parent().is_some_and(|alias| !alias.exists()) =>
+                {
+                    let again = crate::nofollow::socket(&dir, socket).map_err(refused)?;
+                    if again.id != found.id {
+                        return Err(format!("{} changed while connecting", path.display()));
+                    }
+                }
+                bound => {
+                    return Err(format!(
+                        "{} reached a socket bound at {}, not the machine's own",
+                        path.display(),
+                        bound.map_or("no path".into(), |b| b.display().to_string())
+                    ))
+                }
+            }
+        }
+        Ok(stream)
+    }
+    #[cfg(not(unix))]
+    crate::platform::uds::UdsStream::connect_timeout(&path, timeout).map_err(restart)
 }
 
 /// Whether a socket bound at `bound` is the one at `ours`: the same name in
