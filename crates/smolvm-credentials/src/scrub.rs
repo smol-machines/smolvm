@@ -26,30 +26,32 @@ pub(crate) struct Secret<'a> {
     pub placeholder: Option<&'a str>,
 }
 
-struct Pattern {
-    needle: Zeroizing<Vec<u8>>,
-    replacement: Vec<u8>,
-}
-
-/// Replaces every known form of a set of secrets.
+/// Replaces every known form of a set of secrets, in time linear in what it
+/// scans however many forms it knows.
 pub(crate) struct Scrubber {
-    /// Longest first, so the longest form at a position wins.
-    patterns: Vec<Pattern>,
-    first_bytes: [bool; 256],
+    /// Every form, matched leftmost-longest: the longest form starting at the
+    /// first position where any starts wins, as a scan form by form would pick.
+    matcher: aho_corasick::AhoCorasick,
+    /// What replaces each form, by its pattern id.
+    replacements: Vec<Vec<u8>>,
     longest: usize,
+    /// The values whose forms it knows, sorted.
+    values: Vec<Zeroizing<Vec<u8>>>,
 }
 
 impl Scrubber {
     /// `None` when no secret has a form long enough to look for.
     pub(crate) fn new(secrets: &[Secret<'_>]) -> Option<Self> {
-        let mut patterns: Vec<Pattern> = Vec::new();
-        for secret in secrets {
+        // (form, replacement, which secret): sorted and deduplicated so the
+        // first secret giving a form decides what replaces it.
+        let mut forms_found: Vec<(Zeroizing<Vec<u8>>, Vec<u8>, usize)> = Vec::new();
+        for (order, secret) in secrets.iter().enumerate() {
             let restored = secret
                 .placeholder
                 .map(|p| p.as_bytes().to_vec())
                 .unwrap_or_else(|| REDACTED.to_vec());
             for (needle, raw) in forms(secret.value) {
-                if needle.len() < MIN_FORM_LEN || patterns.iter().any(|p| *p.needle == *needle) {
+                if needle.len() < MIN_FORM_LEN {
                     continue;
                 }
                 // Only the value exactly as sent maps back to its placeholder;
@@ -59,26 +61,40 @@ impl Scrubber {
                 } else {
                     REDACTED.to_vec()
                 };
-                patterns.push(Pattern {
-                    needle,
-                    replacement,
-                });
+                forms_found.push((needle, replacement, order));
             }
         }
-        if patterns.is_empty() {
+        if forms_found.is_empty() {
             return None;
         }
-        patterns.sort_by_key(|p| std::cmp::Reverse(p.needle.len()));
-        let mut first_bytes = [false; 256];
-        for pattern in &patterns {
-            first_bytes[pattern.needle[0] as usize] = true;
-        }
-        let longest = patterns[0].needle.len();
+        forms_found.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
+        forms_found.dedup_by(|later, kept| later.0 == kept.0);
+        let longest = forms_found.iter().map(|f| f.0.len()).max().unwrap_or(0);
+        let matcher = aho_corasick::AhoCorasick::builder()
+            .match_kind(aho_corasick::MatchKind::LeftmostLongest)
+            .start_kind(aho_corasick::StartKind::Both)
+            .build(forms_found.iter().map(|f| f.0.as_slice()))
+            .ok()?;
+        let replacements = forms_found.into_iter().map(|f| f.1).collect();
+        let mut values: Vec<Zeroizing<Vec<u8>>> = secrets
+            .iter()
+            .map(|s| Zeroizing::new(s.value.to_vec()))
+            .collect();
+        values.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
+        values.dedup_by(|a, b| a.as_slice() == b.as_slice());
         Some(Self {
-            patterns,
-            first_bytes,
+            matcher,
+            replacements,
             longest,
+            values,
         })
+    }
+
+    /// Whether this scrubber looks for every form of `value`.
+    pub(crate) fn covers(&self, value: &[u8]) -> bool {
+        self.values
+            .binary_search_by(|known| known.as_slice().cmp(value))
+            .is_ok()
     }
 
     /// Bytes a streaming caller must hold back after each chunk: a form may
@@ -97,28 +113,22 @@ impl Scrubber {
         } else {
             buf.len().saturating_sub(self.overlap())
         };
-        let mut i = 0;
         let mut copied = 0;
         let mut hits = 0;
-        while i < limit {
-            if self.first_bytes[buf[i] as usize] {
-                if let Some(pattern) = self
-                    .patterns
-                    .iter()
-                    .find(|p| buf[i..].starts_with(&p.needle))
-                {
-                    out.extend_from_slice(&buf[copied..i]);
-                    out.extend_from_slice(&pattern.replacement);
-                    i += pattern.needle.len();
-                    copied = i;
-                    hits += 1;
-                    continue;
-                }
+        // A form starting before `limit` has all its bytes in `buf`, so it is
+        // found exactly as it would be with the next chunk joined on.
+        for found in self.matcher.find_iter(buf) {
+            if found.start() >= limit {
+                break;
             }
-            i += 1;
+            out.extend_from_slice(&buf[copied..found.start()]);
+            out.extend_from_slice(&self.replacements[found.pattern().as_usize()]);
+            copied = found.end();
+            hits += 1;
         }
-        out.extend_from_slice(&buf[copied..i]);
-        (i, hits)
+        let used = copied.max(limit);
+        out.extend_from_slice(&buf[copied..used]);
+        (used, hits)
     }
 
     /// [`Self::scan`] for `buf` following `sent`, the input bytes already passed on just before it, perhaps under a
@@ -136,26 +146,21 @@ impl Scrubber {
         if lead == 0 {
             return self.scan(buf, last, out);
         }
-        let mut joined = Vec::with_capacity(lead + buf.len());
-        joined.extend_from_slice(&sent[sent.len() - lead..]);
-        joined.extend_from_slice(buf);
-        // A position is checked only with a whole form's worth of bytes after it.
-        let limit = if last {
-            joined.len()
-        } else {
-            joined.len().saturating_sub(self.overlap())
-        };
-        if limit < lead {
+        // A position in `sent` is checked only with a whole form's worth of bytes after it.
+        if !last && buf.len() < self.overlap() {
             return (0, 0);
         }
+        // Only what a form begun in `sent` can reach.
+        let reach = buf.len().min(lead + self.overlap());
+        let mut joined = Vec::with_capacity(lead + reach);
+        joined.extend_from_slice(&sent[sent.len() - lead..]);
+        joined.extend_from_slice(&buf[..reach]);
         let swallowed = (0..lead)
-            .filter(|&i| self.first_bytes[joined[i] as usize])
             .filter_map(|i| {
-                self.patterns
-                    .iter()
-                    .filter(|p| joined[i..].starts_with(&p.needle))
-                    .map(|p| i + p.needle.len())
-                    .max()
+                let input = aho_corasick::Input::new(&joined)
+                    .range(i..)
+                    .anchored(aho_corasick::Anchored::Yes);
+                self.matcher.find(input).map(|found| found.end())
             })
             .filter(|&end| end > lead)
             .max()
@@ -403,6 +408,103 @@ mod tests {
             s.scan_after(b"unrelated text before it", body, true, &mut after)
         );
         assert_eq!(plain, after);
+    }
+
+    /// Form by form, longest first at each position: what the matcher must agree with.
+    fn naive_scrub(secrets: &[Secret<'_>], body: &[u8]) -> Vec<u8> {
+        let mut patterns: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
+        for secret in secrets {
+            let restored = secret
+                .placeholder
+                .map(|p| p.as_bytes().to_vec())
+                .unwrap_or_else(|| REDACTED.to_vec());
+            for (needle, raw) in forms(secret.value) {
+                if needle.len() >= MIN_FORM_LEN && !patterns.iter().any(|p| *p.0 == *needle) {
+                    let replacement = if raw {
+                        restored.clone()
+                    } else {
+                        REDACTED.to_vec()
+                    };
+                    patterns.push((needle.to_vec(), replacement));
+                }
+            }
+        }
+        patterns.sort_by_key(|p| std::cmp::Reverse(p.0.len()));
+        let mut out = Vec::new();
+        let mut i = 0;
+        while i < body.len() {
+            match patterns.iter().find(|p| body[i..].starts_with(&p.0)) {
+                Some((needle, replacement)) => {
+                    out.extend_from_slice(replacement);
+                    i += needle.len();
+                }
+                None => {
+                    out.push(body[i]);
+                    i += 1;
+                }
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn many_values_are_found_as_a_form_by_form_scan_would_in_any_chunking() {
+        let mut seed = 0x2545_f491_u32;
+        let mut next = move || {
+            seed = seed.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+            seed >> 8
+        };
+        const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+        // shared prefixes, one value inside another, a scheme, and characters that encode
+        let mut values: Vec<String> = (0..48)
+            .map(|i| {
+                let mut v = if i % 2 == 0 { "sk-proj-" } else { "ghp_" }.to_string();
+                for _ in 0..(12 + next() % 30) {
+                    v.push(ALNUM[(next() % 62) as usize] as char);
+                }
+                v
+            })
+            .collect();
+        values.push(format!("{}XYZ", values[0]));
+        values.push(format!("Bearer {}", values[1]));
+        values.push("pa\"ss/w\\rd+&=12".to_string());
+        let placeholders: Vec<String> = (0..values.len())
+            .map(|i| format!("SMOL_PLACEHOLDER_V_{i}"))
+            .collect();
+        let secrets: Vec<Secret<'_>> = values
+            .iter()
+            .zip(&placeholders)
+            .enumerate()
+            .map(|(i, (v, p))| Secret {
+                value: v.as_bytes(),
+                placeholder: (i % 3 != 0).then_some(p.as_str()),
+            })
+            .collect();
+        let s = Scrubber::new(&secrets).unwrap();
+        let mut body = Vec::new();
+        for i in 0..400 {
+            let v = values[(next() as usize) % values.len()].as_bytes();
+            match i % 5 {
+                0 => body.extend_from_slice(v),
+                1 => body.extend_from_slice(&v[..v.len() / 2]),
+                2 => body.extend_from_slice(standard_b64(v).as_bytes()),
+                _ => body.extend((0..(next() % 20)).map(|_| ALNUM[(next() % 62) as usize])),
+            }
+        }
+        let expected = naive_scrub(&secrets, &body);
+        assert_eq!(s.scrub(&body).unwrap_or_else(|| body.clone()), expected);
+        for chunk in [1, 7, 64, 1000] {
+            let (mut carry, mut out) = (Vec::new(), Vec::new());
+            for piece in body.chunks(chunk) {
+                carry.extend_from_slice(piece);
+                let (used, _) = s.scan(&carry, false, &mut out);
+                carry.drain(..used);
+            }
+            s.scan(&carry, true, &mut out);
+            assert_eq!(out, expected, "chunk size {chunk}");
+        }
+        assert!(values.iter().all(|v| s.covers(v.as_bytes())));
+        assert!(!s.covers(b"not-a-value-at-all"));
     }
 
     #[test]

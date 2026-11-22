@@ -539,8 +539,8 @@ struct LiveBindings {
 /// name that is not a binding changes nothing. Bindings replace the machine's bindings: an added one resolves from
 /// its variable (or a value handed over after it), a removed one is no longer substituted (its hosts stay
 /// intercepted, their responses checked for the values sent there), and a CA the caller added for a new host signs
-/// that host from the next connection. A change is refused, with nothing changed, if connections already spliced to
-/// a host it covers do not end in time.
+/// that host from the next connection. A change is refused, the running machine keeping its bindings, if connections
+/// already spliced to a host it covers do not end in time or another change is being applied.
 fn serve_live_values(
     vm_dir: &Path,
     policy: &CredentialPolicy,

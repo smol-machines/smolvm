@@ -211,6 +211,9 @@ impl Drop for SpliceGuard {
     }
 }
 
+/// A scrubber shared by the responses it covers; `None` when there is nothing to look for.
+type SharedScrubber = Option<Arc<Scrubber>>;
+
 /// A value a request carried upstream, and the placeholder the guest knows it by.
 struct Carried {
     value: zeroize::Zeroizing<String>,
@@ -233,6 +236,10 @@ struct State {
     pending: Mutex<Option<Vec<String>>>,
     /// Wakes connections waiting on a pending change once it is decided.
     pending_changed: tokio::sync::Notify,
+    /// Connections waiting on a pending change now.
+    held_flows: std::sync::atomic::AtomicUsize,
+    /// host → the scrubber for what its bindings and retired values carry, and the epoch it was built at.
+    scrubbers: Mutex<HashMap<String, (u64, SharedScrubber)>>,
     /// Grows whenever the values a response may need scrubbing of can have grown (bindings changed, a value
     /// resolved): a response being streamed rebuilds its scrubber when it moves.
     secrets_epoch: AtomicU64,
@@ -276,6 +283,8 @@ impl Interceptor {
             spliced: Mutex::new(Vec::new()),
             pending: Mutex::new(None),
             pending_changed: tokio::sync::Notify::new(),
+            held_flows: std::sync::atomic::AtomicUsize::new(0),
+            scrubbers: Mutex::new(HashMap::new()),
             secrets_epoch: AtomicU64::new(0),
             resolver,
             endpoint,
@@ -350,7 +359,8 @@ pub struct InterceptorControl {
 
 impl InterceptorControl {
     /// Replace the bindings while the machine runs: [`Self::prepare`] then [`PreparedBindings::commit`]. Refused,
-    /// changing nothing, when a connection spliced to a host the new bindings cover does not end in time.
+    /// the interceptor keeping its bindings, when a connection spliced to a host the new bindings cover does not
+    /// end in time or another change is prepared.
     pub fn update(
         &self,
         policy: CredentialPolicy,
@@ -363,10 +373,12 @@ impl InterceptorControl {
     }
 
     /// The first half of a change to `policy`: end every connection spliced through untouched to a host `policy`
-    /// covers, and hold new connections to those hosts until the change is committed or dropped, so none is spliced
-    /// meanwhile. Waits, holding no lock, at most [`SPLICE_END_WAIT`]; refused, changing nothing, if a connection
-    /// has not ended by then, since bindings never take effect on a host while an unchecked connection to it is
-    /// open. One change at a time.
+    /// covers, and hold new connections to the hosts it covers that are not intercepted already until the change is
+    /// committed or dropped, so none is spliced meanwhile (an intercepted host never goes back to being spliced).
+    /// Waits, holding no lock, at most [`SPLICE_END_WAIT`]. Refused if a connection has not ended by then, since
+    /// bindings never take effect on a host while an unchecked connection to it is open, and while another change
+    /// is prepared: the interceptor then keeps its bindings, and the caller decides what that means for whatever it
+    /// saved.
     pub fn prepare(
         &self,
         policy: &CredentialPolicy,
@@ -379,8 +391,31 @@ impl InterceptorControl {
             .collect();
         let ending: Vec<Arc<Splice>> = {
             let mut spliced = state.spliced.lock().expect("spliced flows");
+            let mut pending = state.pending.lock().expect("pending change");
+            if pending.is_some() {
+                return Err(
+                    "another change of credential bindings is in progress; retry".to_string(),
+                );
+            }
+            let held: Vec<String> = {
+                let current = state.bindings();
+                let retired = state.retired.lock().expect("retired values");
+                hosts
+                    .iter()
+                    .filter(|pattern| {
+                        !retired.hosts.contains(*pattern)
+                            && !current
+                                .policy
+                                .credentials
+                                .iter()
+                                .any(|b| b.allowed_hosts.contains(pattern))
+                    })
+                    .cloned()
+                    .collect()
+            };
+            *pending = Some(held);
+            drop(pending);
             spliced.retain(|splice| !splice.has_ended());
-            *state.pending.lock().expect("pending change") = Some(hosts.clone());
             spliced
                 .iter()
                 .filter(|splice| {
@@ -411,8 +446,8 @@ impl InterceptorControl {
         if !lingering.is_empty() {
             tracing::warn!(machine = %state.machine, hosts = ?lingering, "connections to hosts the new bindings cover did not end in time; bindings not changed");
             return Err(format!(
-                "connections opened before these bindings to hosts they cover ({}) did not close in time; nothing \
-                 changed, retry",
+                "connections opened before these bindings to hosts they cover ({}) did not close in time; the \
+                 running machine keeps its current bindings, retry",
                 lingering.join(", ")
             ));
         }
@@ -560,7 +595,9 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
             }
         }
         // Decided within the change's own wait; checked again either way.
+        state.held_flows.fetch_add(1, Ordering::AcqRel);
         let _ = tokio::time::timeout(SPLICE_END_WAIT * 2, notified).await;
+        state.held_flows.fetch_sub(1, Ordering::AcqRel);
     };
     match (splice, host) {
         (None, Some(host)) => {
@@ -795,6 +832,8 @@ impl State {
     /// nothing, so every response from the host is checked. Also covered: the
     /// values the request being answered `carried`, whatever the bindings are
     /// now, and those left with the host by bindings that stopped covering it.
+    /// The host's scrubber is built once per change of what it must find and
+    /// shared by the requests it covers.
     async fn scrubber_for(
         &self,
         host: &str,
@@ -802,7 +841,7 @@ impl State {
         method: &str,
         path: &str,
         carried: &[Carried],
-    ) -> Result<Option<Scrubber>> {
+    ) -> Result<Option<Arc<Scrubber>>> {
         let live = self.bindings();
         let unseen: Vec<String> = {
             let resolved = self.resolved.lock().expect("resolved values");
@@ -819,9 +858,50 @@ impl State {
                 .resolve(&live, &binding, host, destination, method, path)
                 .await?;
         }
+        // Read before what it tags: an entry is never older than its epoch.
+        let epoch = self.secrets_epoch();
+        let cached = self
+            .scrubbers
+            .lock()
+            .expect("scrubber cache")
+            .get(host)
+            .filter(|(built, _)| *built == epoch)
+            .map(|(_, scrubber)| scrubber.clone());
+        let shared = match cached {
+            Some(shared) => shared,
+            None => {
+                let mut secrets = self.host_secrets(host);
+                let shared = build_scrubber(&secrets);
+                secrets.clear();
+                let mut cache = self.scrubbers.lock().expect("scrubber cache");
+                if cache.len() >= MAX_CACHED_CLIENTS {
+                    cache.clear();
+                }
+                cache.insert(host.to_string(), (epoch, shared.clone()));
+                shared
+            }
+        };
+        let covered = |value: &[u8]| shared.as_ref().is_some_and(|s| s.covers(value));
+        if carried.iter().all(|c| covered(c.value.as_bytes())) {
+            return Ok(shared);
+        }
+        // A value the request carried that the host's scrubber does not know (dropped since, or never kept).
+        let mut secrets = self.host_secrets(host);
+        secrets.extend(
+            carried
+                .iter()
+                .map(|c| (c.value.clone(), c.placeholder.clone())),
+        );
+        Ok(build_scrubber(&secrets))
+    }
+
+    /// Every value a response from `host` is checked for, whatever request it answers, with the placeholder the
+    /// guest knows it by: the current bindings' first, then those left by bindings that stopped covering it.
+    fn host_secrets(&self, host: &str) -> Vec<(zeroize::Zeroizing<String>, Option<String>)> {
+        let live = self.bindings();
         let resolved = self.resolved.lock().expect("resolved values");
         let retired = self.retired.lock().expect("retired values");
-        let mut secrets: Vec<Secret<'_>> = live
+        let mut secrets: Vec<(zeroize::Zeroizing<String>, Option<String>)> = live
             .policy
             .bindings_for_host(host)
             .flat_map(|b| {
@@ -829,34 +909,24 @@ impl State {
                 let placeholder = b
                     .set_header
                     .is_none()
-                    .then(|| live.placeholders.get(&b.name).map(String::as_str))
+                    .then(|| live.placeholders.get(&b.name).cloned())
                     .flatten();
                 resolved
                     .get(&b.name)
                     .into_iter()
                     .flatten()
-                    .map(move |value| Secret {
-                        value: value.as_bytes(),
-                        placeholder,
-                    })
+                    .map(move |value| (value.clone(), placeholder.clone()))
             })
             .collect();
-        secrets.extend(carried.iter().map(|c| Secret {
-            value: c.value.as_bytes(),
-            placeholder: c.placeholder.as_deref(),
-        }));
         // A value left by a binding that no longer covers the host has no placeholder the guest may still use.
         secrets.extend(
             retired
                 .values
                 .iter()
                 .filter(|(pattern, _)| smolvm_protocol::credentials::host_matches(pattern, host))
-                .map(|(_, value)| Secret {
-                    value: value.as_bytes(),
-                    placeholder: None,
-                }),
+                .map(|(_, value)| (value.clone(), None)),
         );
-        Ok(Scrubber::new(&secrets))
+        secrets
     }
 
     fn leaf_config(&self, host: &str) -> Result<Arc<rustls::ServerConfig>> {
@@ -1335,6 +1405,20 @@ fn decode_body(encoding: &str, compressed: &[u8]) -> std::io::Result<Vec<u8>> {
     }
 }
 
+/// A scrubber for `secrets` (value, placeholder), built outside every lock.
+fn build_scrubber(
+    secrets: &[(zeroize::Zeroizing<String>, Option<String>)],
+) -> Option<Arc<Scrubber>> {
+    let secrets: Vec<Secret<'_>> = secrets
+        .iter()
+        .map(|(value, placeholder)| Secret {
+            value: value.as_bytes(),
+            placeholder: placeholder.as_deref(),
+        })
+        .collect();
+    Scrubber::new(&secrets).map(Arc::new)
+}
+
 /// What a streamed response needs to rebuild its scrubber when the values it must be checked for grow while it
 /// streams (a long poll, an event stream): the request it answers, and the epoch its scrubber was built at.
 struct Rescrub {
@@ -1356,7 +1440,7 @@ struct Rescrub {
 /// for that, as many as the longest form a value may take.
 fn scrubbed<S>(
     body: S,
-    scrubber: Option<Scrubber>,
+    scrubber: Option<Arc<Scrubber>>,
     rescrub: Rescrub,
 ) -> impl Stream<Item = std::result::Result<Bytes, BoxError>> + Send
 where
@@ -1364,9 +1448,11 @@ where
 {
     /// Input bytes passed on that are kept: a form begun in them can still be finished.
     const KEPT: usize = MAX_FORM_LEN - 1;
+    /// Capacity a buffer keeps between chunks; a larger one is let go once drained.
+    const SPARE: usize = 64 * 1024;
     struct Scan<S> {
         body: S,
-        scrubber: Option<Scrubber>,
+        scrubber: Option<Arc<Scrubber>>,
         rescrub: Rescrub,
         carry: Vec<u8>,
         /// The last input bytes passed on, at most [`KEPT`] once trimmed.
@@ -1407,9 +1493,17 @@ where
                     continue;
                 }
                 self.hits += hits;
-                self.sent.extend(self.carry.drain(..used));
-                if self.sent.len() > 2 * KEPT {
-                    self.sent.drain(..self.sent.len() - KEPT);
+                // Only the newest `KEPT` bytes passed on can still begin a form; trimmed in batches.
+                let newest = &self.carry[used - used.min(KEPT)..used];
+                if self.sent.len() + newest.len() > 2 * KEPT {
+                    let keep = KEPT - newest.len();
+                    self.sent
+                        .drain(..self.sent.len() - self.sent.len().min(keep));
+                }
+                self.sent.extend_from_slice(newest);
+                self.carry.drain(..used);
+                if self.carry.capacity() > SPARE.max(2 * self.carry.len()) {
+                    self.carry.shrink_to(SPARE.max(self.carry.len()));
                 }
                 return Ok(out);
             }
@@ -2083,6 +2177,136 @@ mod tests {
             methods: DEFAULT_METHODS.iter().map(|m| m.to_string()).collect(),
             set_header: None,
         }
+    }
+
+    /// Wait, at most ten seconds, until `ready` holds.
+    async fn wait_until(ready: impl Fn() -> bool) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        while !ready() {
+            assert!(std::time::Instant::now() < deadline, "condition never held");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// A spliced connection that never ends: what a change of bindings covering its host must wait for.
+    fn stuck_splice(f: &Fixture, host: &str) -> Arc<Splice> {
+        let splice = Arc::new(Splice {
+            host: Some(host.to_string()),
+            cancel: tokio::sync::Notify::new(),
+            ended: Mutex::new(false),
+            ended_signal: Condvar::new(),
+        });
+        f.interceptor
+            .state
+            .spliced
+            .lock()
+            .unwrap()
+            .push(splice.clone());
+        splice
+    }
+
+    /// A change whose spliced connection does not end in time is refused: the pending change is cleared, and a
+    /// connection held for it meanwhile goes on under the old bindings (spliced to the real server).
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_change_whose_spliced_connection_lingers_is_refused_and_releases_held_ones() {
+        let f = fixture().await;
+        let _stuck = stuck_splice(&f, OTHER_HOST);
+        let grown = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST), bound("other", OTHER_HOST)],
+        };
+        let placeholders = crate::policy::generate_placeholders(&grown);
+        let control = f.interceptor.control();
+        let change =
+            tokio::task::spawn_blocking(move || control.update(grown, placeholders, Vec::new()));
+        let state = f.interceptor.state.clone();
+        wait_until(|| state.pending.lock().unwrap().is_some()).await;
+        // opened while the change is pending, so held until it is decided
+        let request =
+            format!("GET /raw HTTP/1.1\r\nHost: {OTHER_HOST}\r\nConnection: close\r\n\r\n");
+        let (response, refused) = tokio::join!(
+            guest_request(&f, &f.upstream.cert_pem, OTHER_HOST, &request),
+            async {
+                wait_until(|| state.held_flows.load(Ordering::Acquire) == 1).await;
+                change.await.unwrap()
+            }
+        );
+        let why = refused.unwrap_err();
+        assert!(why.contains(OTHER_HOST), "{why}");
+        assert!(state.pending.lock().unwrap().is_none());
+        assert_eq!(state.held_flows.load(Ordering::Acquire), 0);
+        // spliced under the old bindings: the guest trusted only the real server, and nothing was substituted
+        let response = response.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(state.bindings().policy.binding("other").is_none());
+        assert_eq!(
+            f.upstream.seen.lock().unwrap().clone(),
+            vec![(String::new(), "/raw".to_string())]
+        );
+    }
+
+    /// A connection to a host a prepared change covers is held until the change is committed, then handled under
+    /// the committed bindings; only one change is prepared at a time.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_connection_held_for_a_pending_change_is_handled_under_the_committed_bindings() {
+        let policy = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST)],
+        };
+        let resolver = StaticResolver::new()
+            .with("svc", "real-secret")
+            .with("other", "other-secret");
+        let f = fixture_with_policy(policy, CRED_HOST, resolver).await;
+        let grown = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST), bound("other", OTHER_HOST)],
+        };
+        let mut placeholders = crate::policy::generate_placeholders(&grown);
+        placeholders.insert("svc".into(), f.placeholder.clone());
+        let other = placeholders["other"].clone();
+        let extra = MachineCa::generate("test-machine", &[OTHER_HOST.to_string()]).unwrap();
+        let trusted = format!("{}{}", f.ca_pem, extra.certificate_pem());
+        let control = f.interceptor.control();
+        let prepared = control.prepare(&grown).unwrap();
+        assert!(
+            control
+                .prepare(&grown)
+                .err()
+                .is_some_and(|why| why.contains("in progress")),
+            "a second change while one is pending"
+        );
+        let state = f.interceptor.state.clone();
+
+        // a host the machine already intercepts is not held while the change is pending
+        let kept = format!(
+            "GET /v1/me HTTP/1.1\r\nHost: {CRED_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            f.placeholder
+        );
+        let response = tokio::time::timeout(
+            Duration::from_secs(5),
+            guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &kept),
+        )
+        .await
+        .expect("an intercepted host was held for the change")
+        .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        let request = format!(
+            "GET /v1/me HTTP/1.1\r\nHost: {OTHER_HOST}\r\nAuthorization: Bearer {other}\r\nConnection: close\r\n\r\n"
+        );
+        let (response, ()) = tokio::join!(
+            guest_request(&f, trusted.as_bytes(), OTHER_HOST, &request),
+            async {
+                wait_until(|| state.held_flows.load(Ordering::Acquire) == 1).await;
+                prepared.commit(grown, placeholders, vec![extra]);
+            }
+        );
+        let response = response.unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        assert!(state.pending.lock().unwrap().is_none());
+        assert!(f
+            .upstream
+            .seen
+            .lock()
+            .unwrap()
+            .contains(&("Bearer other-secret".to_string(), "/v1/me".to_string())));
     }
 
     /// A value sent to a host whose binding is then removed stays scrubbed there: the host is kept intercepted, so

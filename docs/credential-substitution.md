@@ -214,10 +214,17 @@ the destination. The interceptor reads the TLS server name:
 Bindings changed while the machine runs apply from the next request. A host a
 removed binding allowed stays intercepted until the machine stops, with nothing
 substituted and its old placeholder refused, so its responses are still
-scrubbed of values sent there. Connections relayed untouched to a host that a
-new binding allows are closed before the binding takes effect; if one does not
-close within two seconds, the change is refused and nothing changes. A value
-bound while a response streams is scrubbed from the rest of that response.
+scrubbed of values sent there. It keeps the limits of an intercepted host
+(below): HTTP/1.1 only, no WebSocket upgrades or gRPC, and a `br` or `zstd`
+response refused. Connections relayed untouched to a host that a new binding
+allows are closed before the binding takes effect. If one does not close within
+two seconds, or another change is still being applied, the running machine
+keeps its current bindings and the call fails (`409` over the API), but the new
+bindings are already saved: they apply from the machine's next start, and until
+then a new `exec` session gets the new placeholders, which the running machine
+refuses (`403`, unknown placeholder). Retry the change, or restart the machine.
+A value bound while a response streams is scrubbed from the rest of that
+response.
 
 Refused with a `403` and a one-line reason in the body:
 

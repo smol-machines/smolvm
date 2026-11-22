@@ -10,6 +10,7 @@ name = "smolvm_credentials"
 path = "src/lib.rs"
 
 [dependencies]
+aho-corasick = "1"
 anyhow = "1"
 flate2 = "1"
 bytes = "1"
