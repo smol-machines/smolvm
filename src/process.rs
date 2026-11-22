@@ -1130,7 +1130,7 @@ pub fn install_configured_seccomp_filter(
     target_os = "linux",
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
-fn build_seccomp_program(
+pub(crate) fn build_seccomp_program(
     enforce: bool,
     allow_restricted_io_uring: bool,
 ) -> std::result::Result<seccompiler::BpfProgram, String> {
@@ -1299,6 +1299,13 @@ fn build_seccomp_program(
         // notify-rs uses legacy inotify_init on x86_64; newer architectures
         // expose only inotify_init1.
         libc::SYS_inotify_init,
+        // The mount watcher's recovery keeps its snapshot in SQLite, whose unix
+        // VFS calls stat(3) and lstat(3). The release links against glibc 2.31,
+        // where those resolve to __xstat/__lxstat, which issue the legacy stat
+        // (4) and lstat (6) syscalls on x86_64 even under a newer runtime glibc.
+        // Without them a write into a large mounted workspace killed the VM.
+        libc::SYS_stat,
+        libc::SYS_lstat,
         libc::SYS_arch_prctl,
     ]);
     // arm64 has no legacy `rename`/`unlink`/`mkdir`, only the `*at` forms, so each
@@ -6003,6 +6010,44 @@ mod tests {
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "guardian chmod should survive seccomp, status={status:#x}"
+            );
+        }
+    }
+
+    /// The mount watcher's recovery runs SQLite inside the confined VMM, and a
+    /// release built against glibc 2.31 reaches the legacy x86_64 stat and lstat
+    /// syscalls through it. Direct syscalls, so the check holds whatever libc
+    /// the test itself was linked against.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn seccomp_allows_legacy_stat_and_lstat() {
+        use std::os::unix::ffi::OsStrExt;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let path = std::ffi::CString::new(temp.path().as_os_str().as_bytes()).expect("cstring");
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                let mut stat: libc::stat = std::mem::zeroed();
+                if libc::syscall(libc::SYS_stat, path.as_ptr(), &mut stat) != 0 {
+                    libc::_exit(3);
+                }
+                if libc::syscall(libc::SYS_lstat, path.as_ptr(), &mut stat) != 0 {
+                    libc::_exit(4);
+                }
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "legacy stat and lstat should survive seccomp, status={status:#x}"
             );
         }
     }
