@@ -24,6 +24,10 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 **Windows**: not available (WHP); `--gpu` has no effect there.
 
+## OpenGL in the guest
+
+`--gpu` gives the guest Vulkan only. There is no host OpenGL passthrough (virgl): a guest that needs OpenGL or OpenGL ES runs it on top of the Vulkan device, with ANGLE (`--use-angle=vulkan`) or Mesa's Zink driver (`MESA_LOADER_DRIVER_OVERRIDE=zink`). Guest Vulkan commands are executed in the separate `virgl_render_server` process, so the VM process itself opens no host GPU device and loads no host graphics driver. A display's plain 2D buffers are served on the CPU.
+
 ## Usage
 
 ```bash

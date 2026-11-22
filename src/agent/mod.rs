@@ -232,25 +232,33 @@ pub(crate) fn select_gpu_backend(device: GpuDevice, display: bool) {
 /// launchers so they can never silently diverge.
 ///
 /// Flag values from `libkrun/include/libkrun.h` virglrenderer bindings:
-///   bit 0  — VIRGLRENDERER_USE_EGL         (Linux): EGL context for GPU rendering
-///   bit 3  — VIRGLRENDERER_USE_SURFACELESS  (Linux): no display server required
-///   bit 6  — VIRGLRENDERER_VENUS           (both): Vulkan-over-virtio-gpu (Venus ICD)
-///   bit 7  — VIRGLRENDERER_NO_VIRGL        (macOS): skip OpenGL (vrend) init — without
-///             EGL, vrend_renderer_init crashes on null platform function pointers
+///   bit 6  — VIRGLRENDERER_VENUS           (all): Vulkan-over-virtio-gpu (Venus ICD)
+///   bit 7  — VIRGLRENDERER_NO_VIRGL        (all): skip OpenGL (vrend) init
 ///   bit 9  — VIRGLRENDERER_RENDER_SERVER   (Linux): REQUIRED for render-server mode.
 ///             Enables virglrenderer to call the get_server_fd callback and use an
 ///             external render server.  Without this bit, virglrenderer attempts
 ///             in-process Venus which fails (version stays 0).  With get_server_fd
 ///             provided in the callbacks struct, virglrenderer uses the externally
 ///             spawned virgl_render_server instead of fork/exec-ing its own process.
+///
+/// `--gpu` gives the guest Vulkan through Venus, which on Linux runs in the
+/// separate `virgl_render_server` process. virglrenderer's OpenGL path (vrend)
+/// is never turned on: it decodes guest commands and calls the host OpenGL
+/// driver inside the VM process, so a fault in that driver takes the machine
+/// down with it. NVIDIA's EGL library, for one, crashes when it frees an image
+/// the guest imported from a dma-buf. Without it the VM process opens no host
+/// GPU device and loads no host graphics driver. A display's plain 2D buffers
+/// do not need it either: libkrun serves those from its CPU 2D component. On
+/// macOS the bundled virglrenderer has no OpenGL support at all.
 fn gpu_virgl_flags() -> u32 {
-    #[cfg(target_os = "linux")]
-    {
-        (1 << 0) | (1 << 3) | (1 << 6) | (1 << 9)
-    }
-    #[cfg(not(target_os = "linux"))]
-    {
-        (1 << 6) | (1 << 7)
+    const VENUS: u32 = 1 << 6;
+    const NO_VIRGL: u32 = 1 << 7;
+    const RENDER_SERVER: u32 = 1 << 9;
+
+    if cfg!(target_os = "linux") {
+        VENUS | NO_VIRGL | RENDER_SERVER
+    } else {
+        VENUS | NO_VIRGL
     }
 }
 
@@ -490,5 +498,32 @@ mod gpu_device_tests {
         use super::virgl_flags_for;
         assert_eq!(virgl_flags_for(GpuDevice::SoftwareDisplay), 0);
         assert_ne!(virgl_flags_for(GpuDevice::Accelerated), 0);
+    }
+
+    /// OpenGL translation would run guest commands against the host OpenGL
+    /// driver inside the VM process, so `--gpu` never turns it on.
+    #[test]
+    fn accelerated_gpu_never_runs_opengl_translation() {
+        use super::virgl_flags_for;
+        const USE_EGL: u32 = 1 << 0;
+        const VENUS: u32 = 1 << 6;
+        const NO_VIRGL: u32 = 1 << 7;
+
+        let flags = virgl_flags_for(GpuDevice::Accelerated);
+        assert_eq!(flags & NO_VIRGL, NO_VIRGL);
+        assert_eq!(flags & USE_EGL, 0);
+        assert_eq!(flags & VENUS, VENUS);
+    }
+
+    /// Vulkan runs in the render server process on Linux.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn accelerated_gpu_uses_the_render_server_on_linux() {
+        use super::virgl_flags_for;
+        const RENDER_SERVER: u32 = 1 << 9;
+        assert_eq!(
+            virgl_flags_for(GpuDevice::Accelerated) & RENDER_SERVER,
+            RENDER_SERVER
+        );
     }
 }
