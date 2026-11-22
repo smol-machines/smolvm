@@ -773,59 +773,68 @@ fn published_set(
     mappings
 }
 
-/// Hand a running machine its new credential bindings ([`crate::credentials::plan_binding_change`]): from its next
-/// request an added binding is substituted and a removed one is not. When the plan added a CA for a new host, the
-/// guest is asked to rebuild its trust too; a guest whose agent predates that refuses, and the host stays
-/// unreachable until the machine restarts (its other bindings change anyway). `sources` names the host source of each
-/// binding this host's operator defined; an added or changed binding it does not name resolves only from values
-/// handed over later.
+/// The CAs a guest booting with credential bindings is to trust ([`AgentManager::settle_credential_trust`]).
+struct CredentialTrust {
+    ca_dir: PathBuf,
+    ca_owner: String,
+    policy: crate::credentials::CredentialPolicy,
+}
+
+/// Connect to machine `name`'s own guest agent through its checked socket ([`connect_machine_socket`]): a CA bundle
+/// is for this machine's guest only.
+fn connect_machine_agent(name: &str) -> Result<crate::agent::AgentClient> {
+    let socket = AgentManager::for_vm(name).and_then(|manager| {
+        manager
+            .vsock_socket()
+            .file_name()
+            .and_then(|n| n.to_str())
+            .map(str::to_string)
+            .ok_or_else(|| Error::agent("credential trust", "agent socket has no name"))
+    })?;
+    connect_machine_socket(name, &socket, Duration::from_secs(30))
+        .map_err(|e| Error::agent("connect to agent", e))
+        .and_then(crate::agent::AgentClient::over_connected)
+}
+
+/// Hand a running machine its new credential bindings ([`crate::credentials::hand_over_binding_change`]), with the
+/// host source of each binding this host's operator defined in `sources`: from its next request an added binding is
+/// substituted and a removed one is not. The guest trusts every CA the interceptor may sign a new host with before the
+/// interceptor takes the bindings; a guest whose agent cannot take that still has removed bindings revoked at once,
+/// and the bindings it cannot trust yet apply from its next start.
 pub fn apply_live_credential_bindings(
     name: &str,
     change: &crate::credentials::BindingChange,
     sources: &std::collections::BTreeMap<String, smolvm_protocol::SecretRef>,
-) -> Result<()> {
-    let request = crate::credentials::live_bindings_request(change, sources);
-    send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(|reason| {
-        // a boot process from before bindings carried their sources refuses the request and keeps its bindings
-        let reason = if reason == "malformed request" {
-            "it was started by an older smolvm, which keeps the bindings it booted with until it restarts"
-                .to_string()
-        } else {
-            reason
-        };
-        Error::config(
-            "credentials",
-            format!(
-                "could not hand machine '{name}' its new credential bindings while it runs: {reason}; \
-                 they are saved and apply from its next start"
-            ),
-        )
-    })?;
-    if change.trust_changed {
-        // the trust bundle is for this machine's guest only: never send it to an agent socket that is not its own
-        let agent_socket = AgentManager::for_vm(name).and_then(|manager| {
-            manager
-                .vsock_socket()
-                .file_name()
-                .and_then(|n| n.to_str())
-                .map(str::to_string)
-                .ok_or_else(|| Error::agent("credential trust", "agent socket has no name"))
-        });
-        agent_socket
-            .and_then(|socket| {
-                connect_machine_socket(name, &socket, Duration::from_secs(30))
-                    .map_err(|e| Error::agent("connect to agent", e))
-            })
-            .and_then(crate::agent::AgentClient::over_connected)
-            .and_then(|mut client| client.refresh_credential_trust(change.guest_ca.as_deref()))
-            .map_err(|e| {
-                Error::config(
-                    "credentials",
-                    format!("machine '{name}' has its new bindings, but its guest could not trust the new host yet: {e}"),
-                )
-            })?;
-    }
-    Ok(())
+) -> Result<crate::credentials::HandedOver> {
+    crate::credentials::hand_over_binding_change(
+        name,
+        change,
+        crate::credentials::recorded_guest_trust(name).as_deref(),
+        |bundle| connect_machine_agent(name)?.push_credential_trust(bundle),
+        |policy, placeholders| {
+            let request =
+                crate::credentials::live_bindings_request_for(policy, placeholders, sources);
+            send_live_change(name, crate::credentials::CREDENTIALS_SOCKET, &request).map_err(
+                |reason| {
+                    // a boot process from before bindings carried their sources refuses the request and keeps its
+                    // bindings
+                    let reason = if reason == "malformed request" {
+                        "it was started by an older smolvm, which keeps the bindings it booted with until it restarts"
+                            .to_string()
+                    } else {
+                        reason
+                    };
+                    Error::config(
+                        "credentials",
+                        format!(
+                            "could not hand machine '{name}' its new credential bindings while it runs: {reason}; \
+                             they are saved and apply from its next start"
+                        ),
+                    )
+                },
+            )
+        },
+    )
 }
 
 /// Hand running machine `name` new values for its credential bindings, by
@@ -4304,6 +4313,28 @@ impl AgentManager {
             .as_mut()
             .map(|launch| launch.child_env())
             .unwrap_or_default();
+        // On a pod network no interceptor signs for the guest, so its trust needs nothing.
+        let credential_trust = features
+            .credentials
+            .as_ref()
+            .filter(|_| features.pod_netns.is_none())
+            .map(|launch| CredentialTrust {
+                ca_dir: launch.ca_dir.clone(),
+                ca_owner: launch.ca_owner.clone(),
+                policy: launch.policy.clone(),
+            });
+        if let Some(name) = self.name() {
+            // a binding change asks later whether the machine runs on a pod network, after the boot config is gone
+            crate::credentials::record_launch_network(
+                &vm_data_dir(name),
+                features.pod_netns.is_some(),
+            )?;
+            if let Some(launch) = features.credentials.as_ref() {
+                // what this boot's guest is known to trust, from before it can be handed anything
+                let known = self.known_credential_trust(launch, features.snapshot_dir.is_some())?;
+                crate::credentials::record_guest_trust(name, known.as_deref().unwrap_or(""));
+            }
+        }
 
         // A fresh boot gets the small packed-layer window; a restore keeps the
         // window its guest booted with (recorded with the snapshot).
@@ -4632,7 +4663,76 @@ impl AgentManager {
         if let (Err(_), Some(name)) = (&launched, adopted_scope) {
             release_failed_launch_scope(name, child_pid);
         }
+        if let (Ok(()), Some(trust)) = (&launched, &credential_trust) {
+            self.settle_credential_trust(trust);
+        }
         launched
+    }
+
+    /// What a guest about to boot with `launch` is known to trust: a guest booting afresh reads the CA file, which
+    /// only grows, so it trusts at least the file as the launch leaves it (the CAs its bindings need are added first,
+    /// so the boot process adds none after); a paused machine's guest resumes trusting what it was last recorded to;
+    /// any other restored guest (a checkpoint, a branch) is known to trust only the machine CA (`None`).
+    fn known_credential_trust(
+        &self,
+        launch: &crate::credentials::CredentialLaunch,
+        restored: bool,
+    ) -> Result<Option<String>> {
+        if !restored {
+            launch.ensure_ca()?;
+            return Ok(crate::credentials::read_guest_bundle(&launch.ca_dir));
+        }
+        let Some(name) = self.name() else {
+            return Ok(None);
+        };
+        let paused = crate::db::SmolvmDb::open()
+            .ok()
+            .and_then(|db| db.get_vm(name).ok().flatten())
+            .is_some_and(|record| record.paused_checkpoint.is_some());
+        Ok(paused
+            .then(|| crate::credentials::recorded_guest_trust(name))
+            .flatten())
+    }
+
+    /// Hand a guest that just booted with credential bindings the CAs they may be signed with when it lacks one
+    /// ([`crate::credentials::guest_trust_at_boot`]): bindings changed while it was paused, or since its checkpoint or
+    /// branch point, may need a CA added since. A guest whose CA file already holds them is handed nothing. Under the
+    /// machine's bindings lock, against what it is recorded to trust as the push is made, so a binding change made
+    /// meanwhile is never pushed over with less. A guest agent that cannot take a pushed bundle keeps what it trusts,
+    /// so a host whose CA it lacks fails TLS rather than being reached without its credential.
+    fn settle_credential_trust(&self, trust: &CredentialTrust) {
+        let Some(name) = self.name() else {
+            return;
+        };
+        let _bindings = match crate::credentials::lock_bindings(name) {
+            Ok(lock) => lock,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not hand the guest the credential CAs its bindings need");
+                return;
+            }
+        };
+        let trusted = crate::credentials::recorded_guest_trust(name);
+        let bundle = match crate::credentials::guest_trust_at_boot(
+            &trust.ca_dir,
+            &trust.ca_owner,
+            &trust.policy,
+            trusted.as_deref(),
+        ) {
+            Ok(Some(bundle)) => bundle,
+            Ok(None) => return,
+            Err(e) => {
+                tracing::warn!(error = %e, "could not read the credential CAs the guest must trust");
+                return;
+            }
+        };
+        match connect_machine_agent(name)
+            .and_then(|mut client| client.push_credential_trust(&bundle))
+        {
+            Ok(()) => crate::credentials::record_guest_trust(name, &bundle),
+            Err(e) => {
+                tracing::warn!(error = %e, "the guest could not take the credential CAs its bindings need")
+            }
+        }
     }
 
     /// Like `ensure_running_with_full_config` but uses subprocess launch.

@@ -1262,8 +1262,11 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
                     .map_err(|reason| Error::config("configure guest rollout ingress", reason))?;
                 // The interceptor runs in this process beside the network stack;
                 // the relay dials it for every guest HTTPS flow the egress policy
-                // admits, so the guest cannot route around substitution.
-                if let Some(credentials) = credentials {
+                // admits, so the guest cannot route around substitution. A pod's
+                // bridge carries guest frames past that stack, so none runs there.
+                if let Some(credentials) =
+                    crate::credentials::interceptor_on_network(*credentials, pod_net.is_some())
+                {
                     let interceptor = credentials
                         .start_interceptor(vsock_socket.parent())
                         .inspect_err(|_| {

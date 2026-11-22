@@ -1529,8 +1529,13 @@ impl EmbeddedRuntime {
             // values this embedder supplied stay with their binding even when it changes their binding's hosts: they
             // are its own, unlike a value the operator handed the running machine, which the change dropped
             let held = crate::credentials::retain_and_supply_values(name, &keep, values);
-            if set.live && !held.is_empty() {
-                crate::agent::apply_live_credential_values(name, &held)?;
+            // a deferred binding is not the running machine's yet
+            let live_values: std::collections::BTreeMap<_, _> = held
+                .into_iter()
+                .filter(|(binding, _)| !set.deferred.contains(binding))
+                .collect();
+            if set.live && !live_values.is_empty() {
+                crate::agent::apply_live_credential_values(name, &live_values)?;
             }
             Ok(set)
         })

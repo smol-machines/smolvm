@@ -53,7 +53,12 @@ pub struct RemoveCmd {
 
 /// Say what a bindings change did.
 fn report(name: &str, set: &smolvm::credentials::BindingsSet) {
-    if set.live {
+    if set.live && !set.deferred.is_empty() {
+        eprintln!(
+            "machine '{name}' uses its new credential bindings from its next request, but for {}: its guest cannot trust their hosts while it runs, so they apply from its next start",
+            set.deferred.join(", ")
+        );
+    } else if set.live {
         eprintln!("machine '{name}' uses its new credential bindings from its next request");
     } else if set.at_next_start {
         eprintln!(
@@ -100,6 +105,8 @@ impl AddCmd {
         let host_sourced: BTreeMap<_, _> = values
             .into_iter()
             .filter(|(binding, _)| set.record.credential_host_sourced(binding))
+            // a deferred binding is not the running machine's yet
+            .filter(|(binding, _)| !set.deferred.contains(binding))
             .collect();
         if set.live && !host_sourced.is_empty() {
             smolvm::agent::apply_live_credential_values(&name, &host_sourced)?;

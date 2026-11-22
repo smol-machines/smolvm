@@ -6647,10 +6647,11 @@ async fn bindings_lock(name: &str) -> Result<crate::credentials::BindingsLock, A
     ),
     request_body = CredentialBindingsRequest,
     responses(
-        (status = 200, description = "Bindings saved; a running machine that booted with bindings uses them from its next request (`live`), one that booted without them from its next start", body = CredentialBindingsResponse),
+        (status = 200, description = "Bindings saved; a running machine that booted with bindings uses them from its next request (`live`) but for those its guest cannot trust yet (`deferred`), one that booted without them from its next start", body = CredentialBindingsResponse),
         (status = 400, description = "A binding is invalid, names a host outside the machine's allow-list, or would be added to a machine whose networking is off (bindings need outbound networking)", body = ApiErrorResponse),
         (status = 404, description = "Machine not found", body = ApiErrorResponse),
-        (status = 409, description = "Saved, but the running machine could not take them; they apply from its next start. Or another change to the machine's bindings held them too long, and nothing changed", body = ApiErrorResponse)
+        (status = 409, description = "Saved, but the running machine could not take them; they apply from its next start. Or another change to the machine's bindings or credential CAs held them too long, and nothing changed", body = ApiErrorResponse),
+        (status = 422, description = "Nothing saved: the machine runs on a Kubernetes pod network, where bindings cannot be enforced, and the change adds or changes one", body = ApiErrorResponse)
     )
 )]
 pub async fn put_credential_bindings(
@@ -6690,9 +6691,15 @@ pub async fn put_credential_bindings(
     let set = match set {
         Ok(set) => set,
         Err(error)
+            if error
+                .to_string()
+                .contains(crate::credentials::POD_NETWORK_REFUSAL) =>
+        {
+            return Err(ApiError::Unprocessable(error.to_string()))
+        }
+        Err(error)
             if error.code() == "CONFLICT"
-                || error.to_string().contains("could not hand machine")
-                || error.to_string().contains("could not trust the new host") =>
+                || error.to_string().contains("could not hand machine") =>
         {
             return Err(ApiError::Conflict(error.to_string()))
         }
@@ -6716,6 +6723,7 @@ pub async fn put_credential_bindings(
         bindings,
         live: set.live,
         at_next_start: set.at_next_start,
+        deferred: set.deferred,
     }))
 }
 

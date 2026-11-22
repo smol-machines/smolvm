@@ -26,9 +26,11 @@ use std::path::{Path, PathBuf};
 static BUILT: std::sync::Mutex<Vec<(PathBuf, PathBuf, PathBuf)>> =
     std::sync::Mutex::new(Vec::new());
 
-/// The machine's credential CA bundle as the host last pushed it ([`push_ca`]). The host rewrites the CA file in
-/// place when it adds a CA, and the guest's file cache can serve the old contents for a while after, so a pushed copy
-/// is preferred to the file. The host only ever appends CAs, so the pushed copy is never older than the file.
+/// The machine's credential CA bundle as the host last pushed it ([`push_ca`]). The host replaces the CA file with a
+/// new one when it adds a CA, and the guest's file cache can serve the old contents for a while after, so a pushed
+/// copy is preferred to the file. The file holds every CA of the machine's lineage; the pushed copy holds every CA
+/// the host knows this guest trusts plus those its bindings may now be signed with, pushed again whenever they need
+/// one it lacks, so it never drops a CA the guest trusted.
 static PUSHED: std::sync::Mutex<Option<Vec<u8>>> = std::sync::Mutex::new(None);
 
 /// Use `ca` as the machine's credential CA bundle from now on, in place of its file.
