@@ -846,6 +846,20 @@ impl SmolvmDb {
         self.update_vm_with_durability(name, f, true, false, None)
     }
 
+    /// [`Self::update_vm_durable`] of the machine `reviewed` was read from, never one deleted and created again under
+    /// its name since, with a closure that can refuse the change; a refusal leaves the record as it was.
+    pub(crate) fn try_update_reviewed_vm_durable<F>(
+        &self,
+        reviewed: &VmRecord,
+        f: F,
+    ) -> Result<Option<VmRecord>>
+    where
+        F: FnOnce(&mut VmRecord) -> Result<()>,
+    {
+        let review = launch_admission::LaunchReview::from_record(reviewed)?;
+        self.try_update_vm_with_durability(&reviewed.name, f, true, false, Some(&review))
+    }
+
     /// Commit resumed execution and retire retry keys in the same transaction.
     pub(crate) fn finish_saved_execution<F>(&self, name: &str, f: F) -> Result<Option<VmRecord>>
     where

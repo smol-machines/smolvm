@@ -67,27 +67,42 @@ fn report(name: &str, set: &smolvm::credentials::BindingsSet) {
 impl AddCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        let record = smolvm::db::SmolvmDb::open()?
-            .get_vm(&name)?
-            .ok_or_else(|| {
-                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
-            })?;
-        let mut policy = record.credential_policy.clone().unwrap_or_default();
         let mut added = Vec::new();
         for spec in &self.credentials {
             let binding = smolvm::credentials::parse_credential_flag(spec)
                 .map_err(|why| smolvm::Error::config("credentials", why))?;
-            policy.credentials.retain(|b| b.name != binding.name);
-            added.push((binding.name.clone(), binding.environment_variable.clone()));
-            policy.credentials.push(binding);
+            added.retain(|b: &smolvm::credentials::CredentialBinding| b.name != binding.name);
+            added.push(binding);
         }
         // read before anything changes, so an unset variable changes nothing
-        let names: Vec<String> = added.iter().map(|(n, _)| n.clone()).collect();
-        let values = refresh_values(&added, &names, |var| std::env::var(var).ok())
+        let vars: Vec<(String, String)> = added
+            .iter()
+            .map(|b| (b.name.clone(), b.environment_variable.clone()))
+            .collect();
+        let names: Vec<String> = vars.iter().map(|(n, _)| n.clone()).collect();
+        let values = refresh_values(&vars, &names, |var| std::env::var(var).ok())
             .map_err(|why| smolvm::Error::config("credentials", why))?;
-        let set = smolvm::credentials::set_bindings(&name, policy)?;
-        if set.live && !record.credentials_supplied_by_api {
-            smolvm::agent::apply_live_credential_values(&name, &values)?;
+        // held until the values are handed over, so no other change can retarget a binding in between
+        let lock = smolvm::credentials::lock_bindings(&name)?;
+        let set = smolvm::credentials::set_bindings(
+            &name,
+            &lock,
+            smolvm::credentials::BindingsChanger::Operator { defines: &names },
+            |record| {
+                let mut policy = record.credential_policy.clone().unwrap_or_default();
+                policy
+                    .credentials
+                    .retain(|b| !added.iter().any(|a| a.name == b.name));
+                policy.credentials.extend(added.iter().cloned());
+                Ok(policy)
+            },
+        )?;
+        let host_sourced: BTreeMap<_, _> = values
+            .into_iter()
+            .filter(|(binding, _)| set.record.credential_host_sourced(binding))
+            .collect();
+        if set.live && !host_sourced.is_empty() {
+            smolvm::agent::apply_live_credential_values(&name, &host_sourced)?;
         }
         report(&name, &set);
         Ok(())
@@ -97,26 +112,29 @@ impl AddCmd {
 impl RemoveCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        let record = smolvm::db::SmolvmDb::open()?
-            .get_vm(&name)?
-            .ok_or_else(|| {
-                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
-            })?;
-        let mut policy = record.credential_policy.clone().unwrap_or_default();
-        if let Some(unknown) = self
-            .bindings
-            .iter()
-            .find(|b| !policy.credentials.iter().any(|c| &c.name == *b))
-        {
-            return Err(smolvm::Error::config(
-                "credentials",
-                format!("no credential binding '{unknown}'"),
-            ));
-        }
-        policy
-            .credentials
-            .retain(|b| !self.bindings.contains(&b.name));
-        let set = smolvm::credentials::set_bindings(&name, policy)?;
+        let lock = smolvm::credentials::lock_bindings(&name)?;
+        let set = smolvm::credentials::set_bindings(
+            &name,
+            &lock,
+            smolvm::credentials::BindingsChanger::Operator { defines: &[] },
+            |record| {
+                let mut policy = record.credential_policy.clone().unwrap_or_default();
+                if let Some(unknown) = self
+                    .bindings
+                    .iter()
+                    .find(|b| !policy.credentials.iter().any(|c| &c.name == *b))
+                {
+                    return Err(smolvm::Error::config(
+                        "credentials",
+                        format!("no credential binding '{unknown}'"),
+                    ));
+                }
+                policy
+                    .credentials
+                    .retain(|b| !self.bindings.contains(&b.name));
+                Ok(policy)
+            },
+        )?;
         report(&name, &set);
         Ok(())
     }
@@ -179,14 +197,30 @@ pub fn refresh_values(
     Ok(values)
 }
 
+/// The bindings `refresh` reads from this shell: only those this host's operator defined. A binding an HTTP API caller
+/// or embedder set takes only the values that caller supplies, so this shell's variable must never reach it.
+pub fn host_sourced_bindings(record: &smolvm::config::VmRecord) -> Vec<(String, String)> {
+    record
+        .credential_policy
+        .iter()
+        .flat_map(|p| p.credentials.iter())
+        .filter(|b| record.credential_host_sourced(&b.name))
+        .map(|b| (b.name.clone(), b.environment_variable.clone()))
+        .collect()
+}
+
 impl RefreshCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = self.name.unwrap_or_else(|| "default".to_string());
-        let record = smolvm::db::SmolvmDb::open()?
-            .get_vm(&name)?
-            .ok_or_else(|| {
-                smolvm::Error::config("credentials", format!("machine '{name}' not found"))
-            })?;
+        // held until the values are handed over, so no other change can retarget a binding in between
+        let lock = smolvm::credentials::lock_bindings(&name)?;
+        let Some(record) = smolvm::db::SmolvmDb::open()?.get_vm(&name)? else {
+            lock.remove_if_machine_gone();
+            return Err(smolvm::Error::config(
+                "credentials",
+                format!("machine '{name}' not found"),
+            ));
+        };
         if record.credentials_supplied_by_api {
             return Err(smolvm::Error::config(
                 "credentials",
@@ -196,16 +230,27 @@ impl RefreshCmd {
                 ),
             ));
         }
-        let bindings: Vec<(String, String)> = record
-            .credential_policy
-            .iter()
-            .flat_map(|p| p.credentials.iter())
-            .map(|b| (b.name.clone(), b.environment_variable.clone()))
-            .collect();
+        let bindings = host_sourced_bindings(&record);
         if bindings.is_empty() {
             return Err(smolvm::Error::config(
                 "credentials",
-                format!("machine '{name}' has no credential bindings"),
+                format!("machine '{name}' has no credential bindings defined from this host"),
+            ));
+        }
+        if let Some(supplied) = self.bindings.iter().find(|b| {
+            record
+                .credential_policy
+                .as_ref()
+                .and_then(|p| p.binding(b))
+                .is_some()
+                && !record.credential_host_sourced(b)
+        }) {
+            return Err(smolvm::Error::config(
+                "credentials",
+                format!(
+                    "credential binding '{supplied}' of machine '{name}' was set over the API and takes \
+                     its values only from PUT /api/v1/machines/{name}/credential-values"
+                ),
             ));
         }
         let values = refresh_values(&bindings, &self.bindings, |var| std::env::var(var).ok())
@@ -231,7 +276,36 @@ impl RefreshCmd {
 
 #[cfg(test)]
 mod tests {
-    use super::refresh_values;
+    use super::{host_sourced_bindings, refresh_values};
+
+    /// `refresh` reads from this shell only the bindings this host's operator defined, never one an API caller or
+    /// embedder set (here `evil`, naming a variable of this shell for its own host), nor any binding of a machine
+    /// whose bindings all came from the API.
+    #[test]
+    fn refresh_reads_only_bindings_the_operator_defined() {
+        let mut record =
+            smolvm::config::VmRecord::new("m".into(), 1, 512, Vec::new(), Vec::new(), true);
+        record.credential_policy = Some(smolvm::credentials::CredentialPolicy {
+            credentials: vec![
+                smolvm::credentials::parse_credential_flag("gh=GH_TOKEN@github.com").unwrap(),
+                smolvm::credentials::parse_credential_flag(
+                    "evil=AWS_SECRET_ACCESS_KEY@attacker.example",
+                )
+                .unwrap(),
+            ],
+        });
+        record.credentials_supplied_bindings.insert("evil".into());
+        assert_eq!(
+            host_sourced_bindings(&record),
+            vec![("gh".to_string(), "GH_TOKEN".to_string())]
+        );
+        let env = |v: &str| Some(format!("value-of-{v}"));
+        let values = refresh_values(&host_sourced_bindings(&record), &[], env).unwrap();
+        assert!(!values.contains_key("evil"));
+        assert!(refresh_values(&host_sourced_bindings(&record), &["evil".into()], env).is_err());
+        record.credentials_supplied_by_api = true;
+        assert!(host_sourced_bindings(&record).is_empty());
+    }
 
     fn bindings() -> Vec<(String, String)> {
         vec![

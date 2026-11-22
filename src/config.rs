@@ -831,6 +831,23 @@ pub struct VmRecord {
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub credentials_supplied_by_api: bool,
 
+    /// Bindings an HTTP API caller or embedder added or changed on a machine
+    /// whose other bindings this host's operator set: like every binding of a
+    /// [`Self::credentials_supplied_by_api`] machine, their values come only
+    /// from what that caller supplies, never from this host's environment or
+    /// secrets, at this start or any later one. A binding loses the mark only
+    /// when the operator defines it again (`machine credentials add`).
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub credentials_supplied_bindings: std::collections::BTreeSet<String>,
+
+    /// Variables that backed a binding when an HTTP API caller or embedder
+    /// changed the bindings. A secret reference under one of these names is
+    /// never handed to the workload as plaintext, even once no binding names
+    /// it: unbinding a variable must not turn the operator's secret into
+    /// readable environment.
+    #[serde(default, skip_serializing_if = "std::collections::BTreeSet::is_empty")]
+    pub credential_withheld_variables: std::collections::BTreeSet<String>,
+
     /// True for `machine run` VMs. Auto-deleted on exit or cleanup sweep.
     #[serde(default)]
     pub ephemeral: bool,
@@ -1117,6 +1134,8 @@ impl VmRecord {
             mediated_egress_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
+            credentials_supplied_bindings: Default::default(),
+            credential_withheld_variables: Default::default(),
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
@@ -1231,6 +1250,8 @@ impl VmRecord {
             mediated_egress_required: false,
             credential_placeholders: std::collections::BTreeMap::new(),
             credentials_supplied_by_api: false,
+            credentials_supplied_bindings: Default::default(),
+            credential_withheld_variables: Default::default(),
             ephemeral: false,
             source_smolmachine: None,
             packed_image_on_storage: false,
@@ -1622,6 +1643,22 @@ impl VmRecord {
             credentials
                 .validate(next.dns_filter_hosts.as_deref())
                 .map_err(|e| crate::Error::config("egress policy", e.to_string()))?;
+            // Bindings turn outbound networking on at launch, so turning it off
+            // under them would leave the machine reaching the internet while it
+            // reports networking off.
+            if !credentials.is_empty()
+                && self.outbound_without_credentials()
+                && !next.outbound_without_credentials()
+            {
+                return Err(crate::Error::config(
+                    "egress policy",
+                    format!(
+                        "machine '{}' has credential bindings, which require outbound networking; \
+                         remove them before turning networking off",
+                        self.name
+                    ),
+                ));
+            }
         }
         let resumes_saved_memory =
             self.paused_checkpoint.is_some() || self.checkpoint_head.is_some();
@@ -1822,6 +1859,28 @@ impl VmRecord {
             ));
         }
         Ok(())
+    }
+
+    /// Whether this machine's networking gives it outbound access without its
+    /// credential bindings. Bindings turn outbound networking on at launch, so
+    /// a binding change on a machine without it would open egress that
+    /// `machine status` does not report.
+    pub fn outbound_without_credentials(&self) -> bool {
+        crate::network::plan_launch_network_with(
+            &self.vm_resources(),
+            self.dns_filter_hosts.as_deref(),
+            self.ports.len() + self.udp_ports.len(),
+            false,
+        )
+        .outbound
+    }
+
+    /// Whether credential binding `binding` reads its value from this host (a
+    /// `[secrets]` reference or the environment `machine start` ran with):
+    /// only a binding this host's operator defined does. One set by an HTTP API
+    /// caller, an embedder or a restored artifact takes only supplied values.
+    pub fn credential_host_sourced(&self, binding: &str) -> bool {
+        !self.credentials_supplied_by_api && !self.credentials_supplied_bindings.contains(binding)
     }
 
     /// The network this machine launches with. A credential policy steers the

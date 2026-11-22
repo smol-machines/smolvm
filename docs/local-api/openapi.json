@@ -1884,7 +1884,7 @@
             }
           },
           "400": {
-            "description": "A binding is invalid or names a host outside the machine's allow-list",
+            "description": "A binding is invalid, names a host outside the machine's allow-list, or would be added to a machine whose networking is off (bindings need outbound networking)",
             "content": {
               "application/json": {
                 "schema": {
@@ -1904,7 +1904,7 @@
             }
           },
           "409": {
-            "description": "Saved, but the running machine could not take them; they apply from its next start",
+            "description": "Saved, but the running machine could not take them; they apply from its next start. Or another change to the machine's bindings held them too long, and nothing changed",
             "content": {
               "application/json": {
                 "schema": {
@@ -2892,7 +2892,7 @@
             }
           },
           "400": {
-            "description": "Invalid policy",
+            "description": "Invalid policy, or `blocked` on a machine with credential bindings (they need outbound networking; remove them first)",
             "content": {
               "application/json": {
                 "schema": {
@@ -2912,7 +2912,7 @@
             }
           },
           "409": {
-            "description": "The change needs the machine stopped",
+            "description": "The change needs the machine stopped, or (`blocked`) another change to the machine's credential bindings held them too long",
             "content": {
               "application/json": {
                 "schema": {

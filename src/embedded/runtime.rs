@@ -1422,10 +1422,13 @@ impl EmbeddedRuntime {
 
     /// Hold credential values for `name`'s next boots, by binding name, in
     /// this process's memory only: never on disk, in a boot config or in a
-    /// checkpoint. A binding without one resolves from this process's own
-    /// variable of the binding's name, except on a machine made with
-    /// [`Self::create_machine_with_credentials`], which uses only what is
-    /// supplied. A branch uses its golden's values until it is given its own.
+    /// checkpoint. A binding without one resolves only when this host's
+    /// operator defined it (`smolvm machine create --credential`, `smolvm
+    /// machine credentials add`), from its `[secrets]` reference or the
+    /// variable of its name; a binding this runtime set
+    /// ([`Self::set_credential_bindings`]) or a machine made with
+    /// [`Self::create_machine_with_credentials`] uses only what is supplied.
+    /// A branch uses its golden's values until it is given its own.
     ///
     /// A running machine also gets them at once: its next request to a bound
     /// host carries the new value, with no restart. A value naming no binding
@@ -1475,8 +1478,16 @@ impl EmbeddedRuntime {
     /// Replace `name`'s credential bindings with `policy`, saved for its next
     /// boots, and hold `values` for them by binding name. Values already held
     /// for a binding that stays are kept unless `values` replaces them; those
-    /// of a removed binding are dropped. A value naming no binding of `policy`
-    /// fails the call before anything changes.
+    /// of a removed binding are dropped. Held values belong to this process,
+    /// so they stay with their binding even when the change gives it new
+    /// hosts. A value naming no binding of `policy` fails the call before
+    /// anything changes.
+    ///
+    /// A binding this call adds or changes takes only supplied values, never
+    /// this host's environment or secrets, at once and at every later start;
+    /// one it leaves exactly as it was keeps its source. Adding a binding to a
+    /// machine whose networking is off is refused: bindings need outbound
+    /// networking.
     ///
     /// A running machine that booted with bindings takes the change at once:
     /// a new host is trusted, a removed one is no longer substituted, and its
@@ -1500,12 +1511,23 @@ impl EmbeddedRuntime {
                 smolvm_credentials::check_credential_value(binding, value)
                     .map_err(|why| Error::config("credentials", why))?;
             }
-            let set = crate::credentials::set_bindings_in(&self.db, name, policy)?;
+            // an embedder is untrusted: a binding it adds or changes never reads this host's values; the lock spans the
+            // values handed over after the change
+            let lock = crate::credentials::lock_bindings(name)?;
+            let set = crate::credentials::set_bindings_in(
+                &self.db,
+                name,
+                &lock,
+                crate::credentials::BindingsChanger::Untrusted,
+                |_| Ok(policy),
+            )?;
             let keep: Vec<&str> = bindings.iter().map(String::as_str).collect();
             let values = values
                 .into_iter()
                 .map(|(binding, value)| (binding, zeroize::Zeroizing::new(value)))
                 .collect();
+            // values this embedder supplied stay with their binding even when it changes their binding's hosts: they
+            // are its own, unlike a value the operator handed the running machine, which the change dropped
             let held = crate::credentials::retain_and_supply_values(name, &keep, values);
             if set.live && !held.is_empty() {
                 crate::agent::apply_live_credential_values(name, &held)?;

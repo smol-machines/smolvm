@@ -389,8 +389,9 @@ smolvm machine run    --secret-env OPENAI_API_KEY=OPENAI_API_KEY -- ./app
 smolvm machine create --name web --secret-env DATABASE_URL=PROD_DB_URL   # persists the ref
 smolvm machine exec --name web --secret-env TOKEN=CI_TOKEN -- ./deploy
 
-# Rotate a running machine's --credential values without a restart: each binding's
-# ENV_VAR is read again from this shell and used from the machine's next request.
+# Rotate a running machine's --credential values without a restart: each binding defined from
+# this host has its ENV_VAR read again from this shell and used from the machine's next request
+# (bindings set over the API or by an embedder take only the values their caller supplies).
 smolvm machine credentials refresh --name web [BINDING...]
 # Add or remove bindings on a running machine: from its next request an added binding is
 # substituted (its value read now from this shell) and a removed one is not. A binding for a

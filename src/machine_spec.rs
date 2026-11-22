@@ -1916,6 +1916,8 @@ impl ResolvedSpec {
             mediated_egress_required: restored.mediated_egress_required,
             credential_placeholders,
             credentials_supplied_by_api,
+            credentials_supplied_bindings: Default::default(),
+            credential_withheld_variables: Default::default(),
             ephemeral,
             source_smolmachine: None,
             packed_image_on_storage: restored.packed_image_on_storage,

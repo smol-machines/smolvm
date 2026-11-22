@@ -278,6 +278,7 @@ pub(crate) fn credential_env(record: &VmRecord) -> Vec<(String, String)> {
         record.credential_policy.as_ref(),
         &record.credential_placeholders,
         &BTreeMap::new(),
+        &Default::default(),
     )
     .1
 }
@@ -309,10 +310,24 @@ pub fn set_egress_policy(
                 "machine started while settings were being reviewed",
             ));
         }
+        let had_outbound = r.outbound_without_credentials();
         r.network = updated.network;
         r.allowed_cidrs = updated.allowed_cidrs.clone();
         r.dns_filter_hosts = updated.dns_filter_hosts.clone();
         r.egress_rules = updated.egress_rules.clone();
+        // checked again as the record is now: a binding may have been added since it was reviewed
+        if had_outbound
+            && !r.outbound_without_credentials()
+            && r.credential_policy.as_ref().is_some_and(|p| !p.is_empty())
+        {
+            return Err(Error::config(
+                "egress policy",
+                format!(
+                    "machine '{name}' has credential bindings, which require outbound networking; \
+                     remove them before turning networking off"
+                ),
+            ));
+        }
         Ok(())
     })?;
     Ok(())
