@@ -54,17 +54,103 @@ fn binding_subtrees(policy: &CredentialPolicy) -> Vec<String> {
         .collect()
 }
 
+/// Largest CA file the host reads: a name, a host list, a key or a certificate bundle.
+const MAX_CA_FILE_BYTES: u64 = 1024 * 1024;
+
+/// A CA directory's files as the host reaches them. The machine's data directory holding them belongs to the
+/// machine's own user under per-VM uid isolation, while the host (root under `serve`) still reads and writes them,
+/// so each is reached from that directory without following a link ([`crate::nofollow`]).
+struct HostCaFiles {
+    /// The CA directory's parent: the machine's data directory.
+    base: PathBuf,
+    /// The components from `base` to the CA directory.
+    dirs: Vec<String>,
+}
+
+impl HostCaFiles {
+    fn at(ca_dir: &Path) -> Self {
+        match (ca_dir.parent(), ca_dir.file_name().and_then(|n| n.to_str())) {
+            (Some(base), Some(name)) => Self {
+                base: base.to_path_buf(),
+                dirs: vec![name.to_string()],
+            },
+            _ => Self {
+                base: ca_dir.to_path_buf(),
+                dirs: Vec::new(),
+            },
+        }
+    }
+
+    /// The CA directory at `sub` below this one.
+    fn below(&self, sub: &[&str]) -> Self {
+        Self {
+            base: self.base.clone(),
+            dirs: self
+                .dirs
+                .iter()
+                .cloned()
+                .chain(sub.iter().map(|s| s.to_string()))
+                .collect(),
+        }
+    }
+
+    fn components<'a>(&'a self, path: &[&'a str]) -> Vec<&'a str> {
+        self.dirs
+            .iter()
+            .map(String::as_str)
+            .chain(path.iter().copied())
+            .collect()
+    }
+}
+
+impl smolvm_credentials::ca::CaFiles for HostCaFiles {
+    fn read(&self, path: &[&str]) -> std::io::Result<Vec<u8>> {
+        crate::nofollow::read(&self.base, &self.components(path), MAX_CA_FILE_BYTES)
+    }
+
+    fn write(&self, path: &[&str], bytes: &[u8], mode: u32) -> std::io::Result<()> {
+        crate::nofollow::write_replacing(&self.base, &self.components(path), bytes, mode)
+    }
+
+    fn is_file(&self, path: &[&str]) -> bool {
+        crate::nofollow::is_file(&self.base, &self.components(path))
+    }
+}
+
+fn ca_err(e: impl std::fmt::Display) -> Error {
+    Error::config("credentials", format!("machine CA: {e:#}"))
+}
+
+/// Whether `ca_dir` holds a saved CA, reached without following a link.
+pub fn ca_exists(ca_dir: &Path) -> bool {
+    MachineCa::exists_in(&HostCaFiles::at(ca_dir))
+}
+
+/// Load the CA saved in `ca_dir` without following a link, so a host process never loads, signs with or exports a
+/// key the directory's owner linked in its place.
+pub fn load_ca(ca_dir: &Path, owner: &str) -> Result<MachineCa> {
+    MachineCa::load_from(&HostCaFiles::at(ca_dir), owner).map_err(ca_err)
+}
+
+/// Save `ca` into `ca_dir`, writing every file without following a link.
+pub fn save_ca(ca: &MachineCa, ca_dir: &Path) -> Result<()> {
+    ca.save_to(&HostCaFiles::at(ca_dir)).map_err(ca_err)
+}
+
 /// The CAs added to `ca_dir` for hosts its machine CA does not permit, oldest first.
 pub fn load_extra_cas(ca_dir: &Path, owner: &str) -> Vec<MachineCa> {
-    let mut dirs: Vec<(u32, PathBuf)> = std::fs::read_dir(ca_dir.join(EXTRA_CA_DIR))
-        .into_iter()
-        .flatten()
-        .flatten()
-        .filter_map(|e| Some((e.file_name().to_str()?.parse().ok()?, e.path())))
-        .collect();
+    let files = HostCaFiles::at(ca_dir);
+    let mut dirs: Vec<(u32, String)> =
+        crate::nofollow::list(&files.base, &files.components(&[EXTRA_CA_DIR]))
+            .unwrap_or_default()
+            .into_iter()
+            .filter_map(|name| Some((name.parse().ok()?, name)))
+            .collect();
     dirs.sort();
     dirs.into_iter()
-        .filter_map(|(_, dir)| MachineCa::load(&dir, owner).ok())
+        .filter_map(|(_, dir)| {
+            MachineCa::load_from(&files.below(&[EXTRA_CA_DIR, &dir]), owner).ok()
+        })
         .collect()
 }
 
@@ -78,15 +164,24 @@ pub fn ensure_cas_for(
     policy: &CredentialPolicy,
     generated_for: &CredentialPolicy,
 ) -> Result<bool> {
-    if !MachineCa::exists(ca_dir) {
-        return Ok(false);
+    add_cas_for(ca_dir, owner, policy, generated_for).map(|bundle| bundle.is_some())
+}
+
+/// [`ensure_cas_for`], returning the guest's CA bundle as written when a CA was added: what a running guest is
+/// handed, never read back from a directory its user could have changed since.
+fn add_cas_for(
+    ca_dir: &Path,
+    owner: &str,
+    policy: &CredentialPolicy,
+    generated_for: &CredentialPolicy,
+) -> Result<Option<String>> {
+    let files = HostCaFiles::at(ca_dir);
+    if !MachineCa::exists_in(&files) {
+        return Ok(None);
     }
-    fn ca_err(e: impl std::fmt::Display) -> Error {
-        Error::config("credentials", format!("machine CA: {e:#}"))
-    }
-    MachineCa::record_permitted_if_missing(ca_dir, &binding_subtrees(generated_for))
+    MachineCa::record_permitted_if_missing_in(&files, &binding_subtrees(generated_for))
         .map_err(ca_err)?;
-    let primary = MachineCa::load(ca_dir, owner).map_err(ca_err)?;
+    let primary = MachineCa::load_from(&files, owner).map_err(ca_err)?;
     let mut extras = load_extra_cas(ca_dir, owner);
     let uncovered: Vec<String> = binding_subtrees(policy)
         .into_iter()
@@ -95,26 +190,36 @@ pub fn ensure_cas_for(
     let added = !uncovered.is_empty();
     if added {
         let ca = MachineCa::generate(owner, &uncovered).map_err(ca_err)?;
-        let dir = ca_dir.join(EXTRA_CA_DIR).join(extras.len().to_string());
-        ca.save(&dir).map_err(ca_err)?;
+        ca.save_to(&files.below(&[EXTRA_CA_DIR, &extras.len().to_string()]))
+            .map_err(ca_err)?;
         extras.push(ca);
     }
-    if !extras.is_empty() {
-        let mut bundle = primary.certificate_pem().to_string();
-        for ca in &extras {
-            if !bundle.ends_with('\n') {
-                bundle.push('\n');
-            }
-            bundle.push_str(ca.certificate_pem());
-        }
-        // in place: the guest reads it through its read-only mount
-        std::fs::write(
-            MachineCa::guest_dir(ca_dir).join(smolvm_credentials::ca::GUEST_CA_FILE),
-            bundle,
-        )
-        .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))?;
+    if extras.is_empty() {
+        return Ok(None);
     }
-    Ok(added)
+    let mut bundle = primary.certificate_pem().to_string();
+    for ca in &extras {
+        if !bundle.ends_with('\n') {
+            bundle.push('\n');
+        }
+        bundle.push_str(ca.certificate_pem());
+    }
+    write_guest_bundle(&files, &bundle)?;
+    Ok(added.then_some(bundle))
+}
+
+/// Overwrite the guest's CA bundle in `files` in place (the guest reads it through its read-only mount), never
+/// through a link, into a file with another name, or into anything but a regular file.
+fn write_guest_bundle(files: &HostCaFiles, bundle: &str) -> Result<()> {
+    crate::nofollow::write_in_place(
+        &files.base,
+        &files.components(&[
+            smolvm_credentials::ca::GUEST_SUBDIR,
+            smolvm_credentials::ca::GUEST_CA_FILE,
+        ]),
+        bundle.as_bytes(),
+    )
+    .map_err(|e| Error::config("credentials", format!("write guest CA bundle: {e}")))
 }
 
 /// A machine's credential bindings after a change ([`plan_binding_change`]).
@@ -160,19 +265,11 @@ pub fn plan_binding_change(
         .collect();
     let owner = record.golden.as_deref().unwrap_or(machine);
     let before = record.credential_policy.clone().unwrap_or_default();
-    let trust_changed = ensure_cas_for(&ca_dir(owner), owner, &policy, &before)?;
-    let guest_ca = trust_changed
-        .then(|| {
-            std::fs::read_to_string(
-                MachineCa::guest_dir(&ca_dir(owner)).join(smolvm_credentials::ca::GUEST_CA_FILE),
-            )
-        })
-        .transpose()
-        .map_err(|e| Error::config("credentials", format!("read guest CA bundle: {e}")))?;
+    let guest_ca = add_cas_for(&ca_dir(owner), owner, &policy, &before)?;
     Ok(BindingChange {
         policy,
         placeholders,
-        trust_changed,
+        trust_changed: guest_ca.is_some(),
         guest_ca,
     })
 }
@@ -514,9 +611,8 @@ pub fn set_bindings_in(
         == crate::config::RecordState::Running;
     // whether its interceptor runs, not whether the record has bindings now: removing a machine's last binding leaves
     // the interceptor serving, and adding one back must reach it
-    let interceptor = crate::agent::vm_data_dir(name)
-        .join(CREDENTIALS_SOCKET)
-        .exists();
+    let interceptor =
+        std::fs::symlink_metadata(crate::agent::vm_data_dir(name).join(CREDENTIALS_SOCKET)).is_ok();
     let live = running && interceptor;
     if live {
         // the host sources of the bindings this host's operator defined, and none for any other
@@ -704,7 +800,7 @@ impl CredentialLaunch {
     /// Create the lineage's CA on first use. Called by the launcher before the
     /// guest CA directory is mounted.
     pub fn ensure_ca(&self) -> Result<()> {
-        if MachineCa::exists(&self.ca_dir) {
+        if ca_exists(&self.ca_dir) {
             // a binding changed while the machine was stopped may name a host no CA permits yet
             return ensure_cas_for(&self.ca_dir, &self.ca_owner, &self.policy, &self.policy)
                 .map(|_| ());
@@ -721,8 +817,8 @@ impl CredentialLaunch {
             .into_iter()
             .collect();
         MachineCa::generate(&self.ca_owner, &hosts)
-            .and_then(|ca| ca.save(&self.ca_dir))
-            .map_err(|e| Error::config("credentials", format!("machine CA: {e:#}")))
+            .map_err(ca_err)
+            .and_then(|ca| save_ca(&ca, &self.ca_dir))
     }
 
     /// Read-only mount exposing only the public CA to the guest.
@@ -741,9 +837,8 @@ impl CredentialLaunch {
     /// as long as the VM; dropping it stops substitution. With the machine's
     /// data directory, it also serves [`CREDENTIALS_SOCKET`] there.
     pub fn start_interceptor(&self, vm_dir: Option<&Path>) -> Result<Interceptor> {
-        let ca = MachineCa::load(&self.ca_dir, &self.ca_owner)
-            .map_err(|e| Error::config("credentials", format!("load machine CA: {e:#}")))?
-            .with_permitted(binding_subtrees(&self.policy));
+        let ca =
+            load_ca(&self.ca_dir, &self.ca_owner)?.with_permitted(binding_subtrees(&self.policy));
         let live = LiveValues::default();
         let sources = Arc::new(std::sync::RwLock::new(self.sources.clone()));
         let interceptor = Interceptor::spawn(
@@ -1197,6 +1292,163 @@ mod tests {
         assert!(MachineCa::load(dir.path(), "m")
             .unwrap()
             .permits("api.notion.com"));
+    }
+
+    /// The bindings a CA in `dir` was made for, and the same plus a host no CA permits yet.
+    #[cfg(unix)]
+    fn saved_ca_and_growth(dir: &Path) -> (CredentialPolicy, CredentialPolicy) {
+        let first = CredentialPolicy {
+            credentials: vec![binding("notion", "api.notion.com")],
+        };
+        MachineCa::generate("m", &binding_subtrees(&first))
+            .unwrap()
+            .save(dir)
+            .unwrap();
+        let grown = CredentialPolicy {
+            credentials: vec![
+                binding("notion", "api.notion.com"),
+                binding("gh", "api.github.com"),
+            ],
+        };
+        (first, grown)
+    }
+
+    /// A CA directory the machine's user owns while root changes its bindings: root never writes the guest bundle
+    /// through a symbolic or hard link, or into a FIFO, planted at its name, so the file the link names is left as it
+    /// was. The write itself is refused, not only skipped because the CA then looks missing.
+    #[cfg(unix)]
+    #[test]
+    fn a_binding_change_never_writes_the_guest_bundle_through_a_link() {
+        for planted in ["symbolic", "hard", "fifo"] {
+            let dir = tempfile::tempdir().unwrap();
+            let elsewhere = tempfile::tempdir().unwrap();
+            let (first, grown) = saved_ca_and_growth(dir.path());
+            let victim = elsewhere.path().join("shadow");
+            std::fs::write(&victim, b"root's").unwrap();
+            let guest =
+                MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
+            std::fs::remove_file(&guest).unwrap();
+            match planted {
+                "hard" => std::fs::hard_link(&victim, &guest).unwrap(),
+                "symbolic" => std::os::unix::fs::symlink(&victim, &guest).unwrap(),
+                _ => {
+                    let fifo = std::ffi::CString::new(guest.to_str().unwrap()).unwrap();
+                    // SAFETY: a NUL-terminated path.
+                    assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+                }
+            }
+            let err = write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap_err();
+            assert!(
+                err.to_string().contains("guest CA bundle"),
+                "{planted}: {err}"
+            );
+            let _ = ensure_cas_for(dir.path(), "m", &grown, &first);
+            assert_eq!(
+                std::fs::read(&victim).unwrap(),
+                b"root's",
+                "written through a {planted} link"
+            );
+        }
+        // an ordinary bundle is overwritten in place, keeping its inode
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        saved_ca_and_growth(dir.path());
+        let guest = MachineCa::guest_dir(dir.path()).join(smolvm_credentials::ca::GUEST_CA_FILE);
+        let inode = std::fs::metadata(&guest).unwrap().ino();
+        write_guest_bundle(&HostCaFiles::at(dir.path()), "bundle").unwrap();
+        assert_eq!(std::fs::read(&guest).unwrap(), b"bundle");
+        assert_eq!(std::fs::metadata(&guest).unwrap().ino(), inode);
+    }
+
+    /// A FIFO planted among the CA files is refused, never waited on: root's server must not hang there.
+    #[cfg(unix)]
+    #[test]
+    fn a_binding_change_never_blocks_on_a_planted_fifo() {
+        let dir = tempfile::tempdir().unwrap();
+        let (first, grown) = saved_ca_and_growth(dir.path());
+        let extra = dir.path().join(EXTRA_CA_DIR).join("0");
+        std::fs::create_dir_all(&extra).unwrap();
+        let fifo = std::ffi::CString::new(extra.join("ca.pem").to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (done, finished) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        std::thread::spawn(move || {
+            let _ = done.send(ensure_cas_for(&path, "m", &grown, &first).is_ok());
+        });
+        assert!(
+            finished
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .is_ok(),
+            "blocked on a FIFO"
+        );
+    }
+
+    /// Recording an old CA's hosts never creates a file where a dangling link at `ca.hosts` points.
+    #[cfg(unix)]
+    #[test]
+    fn a_binding_change_never_writes_ca_files_through_planted_links() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (first, grown) = saved_ca_and_growth(dir.path());
+        std::fs::remove_file(dir.path().join("ca.hosts")).unwrap();
+        let planted = elsewhere.path().join("cron-job");
+        std::os::unix::fs::symlink(&planted, dir.path().join("ca.hosts")).unwrap();
+        assert!(ensure_cas_for(dir.path(), "m", &grown, &first).is_err());
+        assert!(!planted.exists(), "ca.hosts written through a link");
+    }
+
+    /// A new CA is never saved into a directory a link at `extra` names, with every other CA file in order.
+    #[cfg(unix)]
+    #[test]
+    fn a_new_ca_is_never_saved_through_a_linked_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        let (first, grown) = saved_ca_and_growth(dir.path());
+        assert!(dir.path().join("ca.hosts").is_file());
+        std::os::unix::fs::symlink(elsewhere.path(), dir.path().join(EXTRA_CA_DIR)).unwrap();
+        let err = ensure_cas_for(dir.path(), "m", &grown, &first).unwrap_err();
+        assert!(err.to_string().contains("ca.pem"), "{err}");
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "a new CA saved through a linked directory"
+        );
+    }
+
+    /// A signing key linked in from elsewhere (another machine's, by a symbolic or a hard link) is never loaded, so
+    /// root never signs with it or exports it in a checkpoint.
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_signing_key_is_never_loaded() {
+        for hard in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let other = tempfile::tempdir().unwrap();
+            let (first, grown) = saved_ca_and_growth(dir.path());
+            MachineCa::generate("other", &["example.org".to_string()])
+                .unwrap()
+                .save(other.path())
+                .unwrap();
+            let key = dir.path().join("ca.key");
+            std::fs::remove_file(&key).unwrap();
+            if hard {
+                std::fs::hard_link(other.path().join("ca.key"), &key).unwrap();
+            } else {
+                std::os::unix::fs::symlink(other.path().join("ca.key"), &key).unwrap();
+            }
+            let how = if hard { "hard" } else { "symbolically" };
+            // the read itself refuses the key, not a check that finds the CA missing first
+            let err = load_ca(dir.path(), "m")
+                .err()
+                .expect("a linked key was loaded");
+            assert!(err.to_string().contains("ca.key"), "{how}: {err}");
+            assert!(
+                !matches!(ensure_cas_for(dir.path(), "m", &grown, &first), Ok(true)),
+                "a CA was added on top of a {how} linked key"
+            );
+        }
     }
 
     #[test]

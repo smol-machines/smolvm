@@ -1491,7 +1491,20 @@ impl AgentClient {
     fn connect_with_timeouts_ms(socket_path: &Path, read_ms: u64, write_ms: u64) -> Result<Self> {
         let stream = UdsStream::connect_timeout(socket_path, Duration::from_millis(read_ms.max(1)))
             .map_err(|e| Error::agent("connect to agent", e.to_string()))?;
+        Self::over_stream(stream, read_ms, write_ms)
+    }
 
+    /// A client over `stream`, already connected to an agent socket (by a
+    /// caller that checked what it reached), with the default timeouts.
+    pub(crate) fn over_connected(stream: UdsStream) -> Result<Self> {
+        Self::over_stream(
+            stream,
+            DEFAULT_READ_TIMEOUT_SECS * 1000,
+            DEFAULT_WRITE_TIMEOUT_SECS * 1000,
+        )
+    }
+
+    fn over_stream(stream: UdsStream, read_ms: u64, write_ms: u64) -> Result<Self> {
         stream
             .set_read_timeout(Some(Duration::from_millis(read_ms)))
             .map_err(|e| Error::agent("set read timeout", e.to_string()))?;

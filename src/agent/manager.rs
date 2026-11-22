@@ -402,10 +402,35 @@ pub fn running_forkable(name: &str) -> Option<bool> {
 }
 
 fn forkable_in_running_config(path: &Path) -> Option<bool> {
-    let content = std::fs::read_to_string(path).ok()?;
-    serde_json::from_str::<RunningVmConfig>(&content)
+    serde_json::from_slice::<RunningVmConfig>(&read_running_config(path).ok()?)
         .ok()
         .map(|config| config.forkable)
+}
+
+/// Largest running configuration read back: mounts, ports and resources.
+const MAX_RUNNING_CONFIG_BYTES: u64 = 4 * 1024 * 1024;
+
+/// Read a running configuration from the machine's data directory, which the
+/// machine's own user owns under per-VM uid isolation while the reader may be
+/// root: never through a link, never blocking on a FIFO, never past
+/// [`MAX_RUNNING_CONFIG_BYTES`].
+fn read_running_config(path: &Path) -> std::io::Result<Vec<u8>> {
+    let (dir, name) = split_file_path(path)?;
+    crate::nofollow::read(dir, &[name], MAX_RUNNING_CONFIG_BYTES)
+}
+
+/// Replace a running configuration in the machine's data directory whole,
+/// never writing through a link left there.
+fn write_running_config(path: &Path, json: &[u8]) -> std::io::Result<()> {
+    let (dir, name) = split_file_path(path)?;
+    crate::nofollow::write_replacing(dir, &[name], json, 0o644)
+}
+
+fn split_file_path(path: &Path) -> std::io::Result<(&Path, &str)> {
+    match (path.parent(), path.file_name().and_then(|n| n.to_str())) {
+        (Some(dir), Some(name)) => Ok((dir, name)),
+        _ => Err(std::io::ErrorKind::InvalidInput.into()),
+    }
 }
 
 /// Whether `record`'s machine can be branched as it is now. A running machine is
@@ -777,8 +802,21 @@ pub fn apply_live_credential_bindings(
         )
     })?;
     if change.trust_changed {
-        AgentManager::for_vm(name)
-            .and_then(|manager| crate::agent::AgentClient::connect(manager.vsock_socket()))
+        // the trust bundle is for this machine's guest only: never send it to an agent socket that is not its own
+        let agent_socket = AgentManager::for_vm(name).and_then(|manager| {
+            manager
+                .vsock_socket()
+                .file_name()
+                .and_then(|n| n.to_str())
+                .map(str::to_string)
+                .ok_or_else(|| Error::agent("credential trust", "agent socket has no name"))
+        });
+        agent_socket
+            .and_then(|socket| {
+                connect_machine_socket(name, &socket, Duration::from_secs(30))
+                    .map_err(|e| Error::agent("connect to agent", e))
+            })
+            .and_then(crate::agent::AgentClient::over_connected)
             .and_then(|mut client| client.refresh_credential_trust(change.guest_ca.as_deref()))
             .map_err(|e| {
                 Error::config(
@@ -852,13 +890,7 @@ fn send_live_request(
     rendered: &str,
 ) -> std::result::Result<String, String> {
     use std::io::{Read, Write};
-    let path = vm_data_dir(name).join(socket);
-    let mut stream =
-        crate::platform::uds::UdsStream::connect_timeout(&path, Duration::from_secs(2)).map_err(
-            |e| {
-                format!("{e}; a machine started before live changes were supported needs a restart")
-            },
-        )?;
+    let mut stream = connect_machine_socket(name, socket, Duration::from_secs(2))?;
     stream
         .set_read_timeout(Some(Duration::from_secs(5)))
         .and_then(|()| stream.write_all(rendered.as_bytes()))
@@ -869,6 +901,111 @@ fn send_live_request(
         .read_to_string(&mut reply)
         .map_err(|e| e.to_string())?;
     Ok(reply)
+}
+
+/// Connect to socket `socket` in machine `name`'s directory, refusing what is
+/// not the machine's own. The directory belongs to the machine's user under
+/// per-VM uid isolation, and what is sent over these sockets (credential
+/// values, trust bundles) is for that machine only, so the socket must be one
+/// under its own single name there, owned and served by the machine's user,
+/// this user or root ([`crate::nofollow::socket`], [`peer_may_serve`]). On
+/// Linux the connect goes to the very inode checked, through `/proc/self/fd`
+/// (which also keeps a long path within `sun_path`). Elsewhere the listener's
+/// bound path must be the machine's own; a long path bound through a
+/// temporary alias since removed is instead checked to name the same socket
+/// file after connecting as before.
+pub(crate) fn connect_machine_socket(
+    name: &str,
+    socket: &str,
+    timeout: Duration,
+) -> std::result::Result<crate::platform::uds::UdsStream, String> {
+    let dir = vm_data_dir(name);
+    let path = dir.join(socket);
+    let restart = |e: std::io::Error| {
+        format!("{e}; a machine started before live changes were supported needs a restart")
+    };
+    #[cfg(unix)]
+    {
+        let refused = |e: std::io::Error| format!("{}: {e}", path.display());
+        let found = match crate::nofollow::socket(&dir, socket) {
+            Ok(found) => found,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Err(restart(e)),
+            Err(e) => return Err(refused(e)),
+        };
+        let pinned = found.pinned_path();
+        let stream = crate::platform::uds::UdsStream::connect_timeout(
+            pinned.as_deref().unwrap_or(&path),
+            timeout,
+        )
+        .map_err(restart)?;
+        let peer = stream.peer_uid().map_err(refused)?;
+        // SAFETY: geteuid has no preconditions.
+        let me = unsafe { libc::geteuid() };
+        if !peer_may_serve(peer, found.dir_owner, me) {
+            return Err(format!(
+                "{} is served by uid {peer}, not by the machine's own process (uid {})",
+                path.display(),
+                found.dir_owner
+            ));
+        }
+        if pinned.is_none() {
+            match stream.peer_path().map_err(refused)? {
+                Some(bound) if same_socket_place(&bound, &path) => {}
+                Some(bound)
+                    if bound.file_name() == path.file_name()
+                        && bound.parent().is_some_and(|alias| !alias.exists()) =>
+                {
+                    let again = crate::nofollow::socket(&dir, socket).map_err(refused)?;
+                    if again.id != found.id {
+                        return Err(format!("{} changed while connecting", path.display()));
+                    }
+                }
+                bound => {
+                    return Err(format!(
+                        "{} reached a socket bound at {}, not the machine's own",
+                        path.display(),
+                        bound.map_or("no path".into(), |b| b.display().to_string())
+                    ))
+                }
+            }
+        }
+        Ok(stream)
+    }
+    #[cfg(not(unix))]
+    crate::platform::uds::UdsStream::connect_timeout(&path, timeout).map_err(restart)
+}
+
+/// Whether a socket bound at `bound` is the one at `ours`: the same name in
+/// the same directory, the directories compared by device and inode so a
+/// differently spelled path (a linked home or cache directory) still matches.
+/// Never by the socket file itself: a link to another machine's socket shares
+/// its inode.
+#[cfg(unix)]
+fn same_socket_place(bound: &Path, ours: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+    if bound == ours {
+        return true;
+    }
+    let dir_id = |path: &Path| {
+        let meta = std::fs::metadata(path.parent()?).ok()?;
+        Some((meta.dev(), meta.ino()))
+    };
+    bound.file_name().is_some()
+        && bound.file_name() == ours.file_name()
+        && dir_id(bound).is_some()
+        && dir_id(bound) == dir_id(ours)
+}
+
+/// Whether a process running as `peer` may answer for a machine whose data
+/// directory `owner` owns, asked by a process running as `me`, once the
+/// socket it serves is known to be bound at the machine's own path: the
+/// machine's own user, or one at least as trusted as the asker (itself, or
+/// root). A boot process run without the per-VM uid drop keeps the host's
+/// user while its directory may still belong to the uid an earlier boot
+/// dropped to. Any other user is another machine's.
+#[cfg(unix)]
+fn peer_may_serve(peer: u32, owner: u32, me: u32) -> bool {
+    peer == owner || peer == me || peer == 0
 }
 
 /// One egress denial observed by the VMM: the policy refused a guest's
@@ -2706,7 +2843,8 @@ impl AgentManager {
     /// Save the running VM config to disk so future CLI invocations can
     /// restore the actual config of a detached VM on reconnect.
     ///
-    /// Uses atomic write (tmp + rename) to avoid partial/corrupt reads.
+    /// Written whole (a new file renamed over it) to avoid partial/corrupt
+    /// reads, and never through a link left in the machine's directory.
     fn save_running_config(
         &self,
         mounts: &[HostMount],
@@ -2724,13 +2862,8 @@ impl AgentManager {
         };
         match serde_json::to_string(&config) {
             Ok(json) => {
-                let tmp = self.config_file.with_extension("json.tmp");
-                if let Err(e) = std::fs::write(&tmp, &json) {
-                    tracing::warn!(error = %e, "failed to write VM config tmp file");
-                    return;
-                }
-                if let Err(e) = std::fs::rename(&tmp, &self.config_file) {
-                    tracing::warn!(error = %e, "failed to rename VM config file");
+                if let Err(e) = write_running_config(&self.config_file, json.as_bytes()) {
+                    tracing::warn!(error = %e, "failed to write VM config file");
                 }
             }
             Err(e) => {
@@ -2744,9 +2877,9 @@ impl AgentManager {
     /// Returns an error string describing why the load failed, so callers
     /// can log it and treat the config as unknown (fail-closed).
     fn load_running_config(&self) -> std::result::Result<RunningVmConfig, String> {
-        let content = std::fs::read_to_string(&self.config_file)
+        let content = read_running_config(&self.config_file)
             .map_err(|e| format!("config file {}: {}", self.config_file.display(), e))?;
-        serde_json::from_str(&content)
+        serde_json::from_slice(&content)
             .map_err(|e| format!("invalid JSON in {}: {}", self.config_file.display(), e))
     }
 
@@ -5719,6 +5852,63 @@ mod tests {
         assert_eq!(super::forkable_in_running_config(&path), Some(false));
         std::fs::write(&path, "not json").unwrap();
         assert_eq!(super::forkable_in_running_config(&path), None);
+    }
+
+    /// A socket bound at the machine's own path matches however its directory
+    /// is spelled; one bound at the same name in another directory does not.
+    #[cfg(unix)]
+    #[test]
+    fn a_socket_is_the_machines_only_when_bound_in_its_own_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let other = tempfile::tempdir().unwrap();
+        let ours = dir.path().join("credentials.sock");
+        assert!(super::same_socket_place(&ours, &ours));
+        let spelled = other.path().join("linked");
+        std::os::unix::fs::symlink(dir.path(), &spelled).unwrap();
+        assert!(super::same_socket_place(
+            &spelled.join("credentials.sock"),
+            &ours
+        ));
+        assert!(!super::same_socket_place(
+            &other.path().join("credentials.sock"),
+            &ours
+        ));
+        assert!(!super::same_socket_place(
+            &dir.path().join("ports.sock"),
+            &ours
+        ));
+    }
+
+    /// Only the machine's own user, the asker's or root may serve its socket;
+    /// another machine's user may not.
+    #[cfg(unix)]
+    #[test]
+    fn only_the_machines_user_the_asker_or_root_may_serve_its_socket() {
+        assert!(super::peer_may_serve(5001, 5001, 0));
+        assert!(super::peer_may_serve(0, 5001, 0));
+        assert!(super::peer_may_serve(1000, 1000, 1000));
+        assert!(super::peer_may_serve(1000, 5001, 1000));
+        assert!(!super::peer_may_serve(5002, 5001, 0));
+        assert!(!super::peer_may_serve(5002, 1000, 1000));
+    }
+
+    /// A FIFO at the running configuration's name is refused, never waited on.
+    #[cfg(unix)]
+    #[test]
+    fn a_running_configuration_fifo_is_refused_not_waited_on() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("agent.config.json");
+        let fifo = std::ffi::CString::new(path.to_str().unwrap()).unwrap();
+        // SAFETY: a NUL-terminated path.
+        assert_eq!(unsafe { libc::mkfifo(fifo.as_ptr(), 0o600) }, 0);
+        let (done, finished) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = done.send(super::forkable_in_running_config(&path));
+        });
+        assert_eq!(
+            finished.recv_timeout(std::time::Duration::from_secs(10)),
+            Ok(None)
+        );
     }
 
     #[test]

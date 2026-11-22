@@ -4474,11 +4474,12 @@ fn checkpoint_credential_ca(
     let Some(launch) = crate::credentials::CredentialLaunch::for_record(name, vm) else {
         return Ok(None);
     };
-    if !smolvm_credentials::MachineCa::exists(&launch.ca_dir) {
+    // The machine's directory is its user's while it runs: never export a key linked in from elsewhere.
+    if !crate::credentials::ca_exists(&launch.ca_dir) {
         return Ok(None);
     }
-    let ca = smolvm_credentials::MachineCa::load(&launch.ca_dir, &launch.ca_owner)
-        .map_err(|e| Error::agent("capture credential CA", format!("{e:#}")))?;
+    let ca = crate::credentials::load_ca(&launch.ca_dir, &launch.ca_owner)
+        .map_err(|e| Error::agent("capture credential CA", e.to_string()))?;
     let path = snapshot_dir.join("credential-ca.json");
     {
         use std::io::Write;
@@ -4519,9 +4520,12 @@ fn install_credential_ca(
             .map_err(|e| Error::agent("read checkpoint credential CA", e.to_string()))?,
     );
     let _ = std::fs::remove_file(&staged);
-    smolvm_credentials::MachineCa::import(&document)
-        .and_then(|ca| ca.save(&vm_data_dir.join(crate::credentials::CA_DIR_NAME)))
-        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))
+    let ca = smolvm_credentials::MachineCa::import(&document)
+        .map_err(|e| Error::agent("install checkpoint credential CA", format!("{e:#}")))?;
+    // The machine's directory may be its user's (a paused machine resumed from this checkpoint): never write the
+    // key, or anything else, through a link left in it.
+    crate::credentials::save_ca(&ca, &vm_data_dir.join(crate::credentials::CA_DIR_NAME))
+        .map_err(|e| Error::agent("install checkpoint credential CA", e.to_string()))
 }
 
 fn checkpoint_network(vm: &VmRecord) -> CheckpointNetwork {
@@ -8555,6 +8559,40 @@ mod tests {
         assert!(
             install_credential_ca(extracted.path(), other.path(), partial.path(), &misplaced)
                 .is_err()
+        );
+    }
+
+    /// A restored machine's directory may already be its user's: installing the CA never writes the key, or
+    /// anything else, through a link left there.
+    #[cfg(unix)]
+    #[test]
+    fn a_checkpoint_credential_ca_is_never_installed_through_a_link() {
+        let extracted = tempfile::tempdir().unwrap();
+        std::fs::create_dir(extracted.path().join(ASSET_DIR)).unwrap();
+        let source = extracted.path().join(CREDENTIAL_CA_ASSET);
+        let original =
+            smolvm_credentials::MachineCa::generate("cred", &["httpbin.org".to_string()]).unwrap();
+        std::fs::write(&source, original.export().as_bytes()).unwrap();
+        let asset = describe_asset(&source, CREDENTIAL_CA_ASSET).unwrap();
+
+        let machine = tempfile::tempdir().unwrap();
+        let partial = tempfile::tempdir().unwrap();
+        let elsewhere = tempfile::tempdir().unwrap();
+        std::os::unix::fs::symlink(
+            elsewhere.path(),
+            machine.path().join(crate::credentials::CA_DIR_NAME),
+        )
+        .unwrap();
+        assert!(
+            install_credential_ca(extracted.path(), machine.path(), partial.path(), &asset)
+                .is_err()
+        );
+        assert!(
+            std::fs::read_dir(elsewhere.path())
+                .unwrap()
+                .next()
+                .is_none(),
+            "the key was written through a linked directory"
         );
     }
 

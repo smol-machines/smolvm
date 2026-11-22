@@ -19,16 +19,75 @@ use std::path::Path;
 use zeroize::Zeroizing;
 
 pub use smolvm_protocol::credentials::GUEST_CA_FILE;
-const CA_KEY_FILE: &str = "ca.key";
+/// The signing key, owner-private.
+pub const CA_KEY_FILE: &str = "ca.key";
 /// Machine name the CA was generated for. Part of its subject, so a CA that
 /// moves to another machine (a restored checkpoint) still signs as itself.
-const CA_NAME_FILE: &str = "ca.name";
+pub const CA_NAME_FILE: &str = "ca.name";
 /// The hosts the CA's name constraint permits, one per line. A CA saved before this file existed permits the hosts
 /// of the policy its machine booted with ([`MachineCa::with_permitted`]).
-const CA_HOSTS_FILE: &str = "ca.hosts";
+pub const CA_HOSTS_FILE: &str = "ca.hosts";
 /// Subdirectory holding only what the guest may see. Mount this, never the
 /// directory that also holds the signing key.
 pub const GUEST_SUBDIR: &str = "guest";
+
+/// The files of one CA directory, named by their components below it (`["guest", "ca.pem"]`). [`Dir`] reaches them
+/// through the plain filesystem; a process writing into a directory another user controls supplies one that never
+/// follows a link there.
+pub trait CaFiles {
+    /// The whole file at `path`.
+    fn read(&self, path: &[&str]) -> std::io::Result<Vec<u8>>;
+    /// Replace the file at `path` with `bytes`, its permissions `mode` from the moment it is created, making missing
+    /// directories on the way.
+    fn write(&self, path: &[&str], bytes: &[u8], mode: u32) -> std::io::Result<()>;
+    /// Whether `path` is a regular file.
+    fn is_file(&self, path: &[&str]) -> bool;
+}
+
+/// A CA directory on the plain filesystem.
+pub struct Dir<'a>(pub &'a Path);
+
+impl Dir<'_> {
+    fn path(&self, path: &[&str]) -> std::path::PathBuf {
+        path.iter()
+            .fold(self.0.to_path_buf(), |dir, name| dir.join(name))
+    }
+}
+
+impl CaFiles for Dir<'_> {
+    fn read(&self, path: &[&str]) -> std::io::Result<Vec<u8>> {
+        std::fs::read(self.path(path))
+    }
+
+    fn write(&self, path: &[&str], bytes: &[u8], mode: u32) -> std::io::Result<()> {
+        use std::io::Write;
+        let path = self.path(path);
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut options = std::fs::OpenOptions::new();
+        options.write(true).create(true).truncate(true);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            options.mode(mode);
+        }
+        let mut file = options.open(&path)?;
+        // a file that already existed keeps its permissions on open: narrow them before anything is written
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            file.set_permissions(std::fs::Permissions::from_mode(mode))?;
+        }
+        #[cfg(not(unix))]
+        let _ = mode;
+        file.write_all(bytes)
+    }
+
+    fn is_file(&self, path: &[&str]) -> bool {
+        self.path(path).is_file()
+    }
+}
 
 /// A CA able to mint leaves for intercepted hosts.
 pub struct MachineCa {
@@ -95,42 +154,70 @@ impl MachineCa {
     /// beside a `guest/ca.pem` copy of the public certificate, which is the
     /// only path ever mounted into the machine.
     pub fn save(&self, dir: &Path) -> Result<()> {
-        let guest = Self::guest_dir(dir);
-        std::fs::create_dir_all(&guest).with_context(|| format!("create {}", guest.display()))?;
-        std::fs::write(dir.join(GUEST_CA_FILE), &self.cert_pem)?;
-        std::fs::write(guest.join(GUEST_CA_FILE), &self.cert_pem)?;
-        std::fs::write(dir.join(CA_NAME_FILE), &self.name)?;
-        std::fs::write(dir.join(CA_HOSTS_FILE), self.permitted.join("\n"))?;
-        let key_path = dir.join(CA_KEY_FILE);
-        std::fs::write(&key_path, Zeroizing::new(self.key.serialize_pem()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))?;
-        }
-        Ok(())
+        self.save_to(&Dir(dir))
+    }
+
+    /// [`MachineCa::save`] into `files`. The key is created owner-private, never readable by others for a moment.
+    pub fn save_to(&self, files: &impl CaFiles) -> Result<()> {
+        let write = |path: &[&str], bytes: &[u8], mode: u32| {
+            files
+                .write(path, bytes, mode)
+                .with_context(|| format!("write {}", path.join("/")))
+        };
+        write(&[GUEST_CA_FILE], self.cert_pem.as_bytes(), 0o644)?;
+        write(
+            &[GUEST_SUBDIR, GUEST_CA_FILE],
+            self.cert_pem.as_bytes(),
+            0o644,
+        )?;
+        write(&[CA_NAME_FILE], self.name.as_bytes(), 0o644)?;
+        write(
+            &[CA_HOSTS_FILE],
+            self.permitted.join("\n").as_bytes(),
+            0o644,
+        )?;
+        write(
+            &[CA_KEY_FILE],
+            Zeroizing::new(self.key.serialize_pem()).as_bytes(),
+            0o600,
+        )
     }
 
     /// Load a CA previously written by [`MachineCa::save`]. `machine` names
     /// it only when the directory predates the recorded name.
     pub fn load(dir: &Path, machine: &str) -> Result<Self> {
-        let name = std::fs::read_to_string(dir.join(CA_NAME_FILE))
+        Self::load_from(&Dir(dir), machine)
+    }
+
+    /// [`MachineCa::load`] from `files`.
+    pub fn load_from(files: &impl CaFiles, machine: &str) -> Result<Self> {
+        // a missing optional file is an old CA's; any other failure (a link refused) fails the load
+        let optional = |file: &str| match files.read(&[file]) {
+            Ok(bytes) => Ok(Some(String::from_utf8_lossy(&bytes).into_owned())),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("read {file}"))),
+        };
+        let name = optional(CA_NAME_FILE)?
             .map(|name| name.trim().to_string())
-            .unwrap_or_else(|_| machine.to_string());
-        let cert_pem = std::fs::read_to_string(dir.join(GUEST_CA_FILE))
-            .with_context(|| format!("read {}", dir.join(GUEST_CA_FILE).display()))?;
+            .unwrap_or_else(|| machine.to_string());
+        let cert_pem = files
+            .read(&[GUEST_CA_FILE])
+            .with_context(|| format!("read {GUEST_CA_FILE}"))
+            .and_then(|bytes| String::from_utf8(bytes).context("CA certificate is not text"))?;
         let key_pem = Zeroizing::new(
-            std::fs::read_to_string(dir.join(CA_KEY_FILE))
-                .with_context(|| format!("read {}", dir.join(CA_KEY_FILE).display()))?,
+            files
+                .read(&[CA_KEY_FILE])
+                .with_context(|| format!("read {CA_KEY_FILE}"))?,
         );
-        let key = KeyPair::from_pem(&key_pem).context("parse CA key")?;
+        let key_pem = std::str::from_utf8(&key_pem).context("CA key is not text")?;
+        let key = KeyPair::from_pem(key_pem).context("parse CA key")?;
         let cert_der = rustls_pemfile::certs(&mut cert_pem.as_bytes())
             .next()
             .context("CA certificate missing")??;
         let issuer = ca_params(&name)
             .self_signed(&key)
             .context("rebuild CA issuer")?;
-        let permitted = std::fs::read_to_string(dir.join(CA_HOSTS_FILE))
+        let permitted = optional(CA_HOSTS_FILE)?
             .map(|hosts| {
                 hosts
                     .lines()
@@ -153,18 +240,33 @@ impl MachineCa {
     /// Record the hosts a CA saved in `dir` permits, when it was saved before they were recorded. Called with the
     /// bindings it was generated for, before they change, so a later policy is never mistaken for what it permits.
     pub fn record_permitted_if_missing(dir: &Path, hosts: &[String]) -> Result<()> {
-        let path = dir.join(CA_HOSTS_FILE);
-        if Self::exists(dir) && !path.exists() {
-            std::fs::write(&path, hosts.join("\n"))?;
+        Self::record_permitted_if_missing_in(&Dir(dir), hosts)
+    }
+
+    /// [`MachineCa::record_permitted_if_missing`] in `files`.
+    pub fn record_permitted_if_missing_in(files: &impl CaFiles, hosts: &[String]) -> Result<()> {
+        if !Self::exists_in(files) {
+            return Ok(());
         }
-        Ok(())
+        match files.read(&[CA_HOSTS_FILE]) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => files
+                .write(&[CA_HOSTS_FILE], hosts.join("\n").as_bytes(), 0o644)
+                .with_context(|| format!("write {CA_HOSTS_FILE}")),
+            Err(e) => Err(anyhow::Error::new(e).context(format!("read {CA_HOSTS_FILE}"))),
+            Ok(_) => Ok(()),
+        }
     }
 
     /// Whether `dir` already holds a saved CA.
     pub fn exists(dir: &Path) -> bool {
-        dir.join(GUEST_CA_FILE).is_file()
-            && dir.join(CA_KEY_FILE).is_file()
-            && Self::guest_dir(dir).join(GUEST_CA_FILE).is_file()
+        Self::exists_in(&Dir(dir))
+    }
+
+    /// [`MachineCa::exists`] in `files`.
+    pub fn exists_in(files: &impl CaFiles) -> bool {
+        files.is_file(&[GUEST_CA_FILE])
+            && files.is_file(&[CA_KEY_FILE])
+            && files.is_file(&[GUEST_SUBDIR, GUEST_CA_FILE])
     }
 
     /// The guest-visible subdirectory of a CA directory.
@@ -306,6 +408,50 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
+            assert_eq!(mode & 0o777, 0o600);
+        }
+    }
+
+    /// The signing key is handed to its writer owner-private, so it is created that way rather than narrowed after
+    /// it was written; everything else is public.
+    #[test]
+    fn the_key_is_created_owner_private() {
+        struct Recording(std::cell::RefCell<Vec<(String, u32)>>);
+        impl CaFiles for Recording {
+            fn read(&self, _: &[&str]) -> std::io::Result<Vec<u8>> {
+                Err(std::io::ErrorKind::NotFound.into())
+            }
+            fn write(&self, path: &[&str], _: &[u8], mode: u32) -> std::io::Result<()> {
+                self.0.borrow_mut().push((path.join("/"), mode));
+                Ok(())
+            }
+            fn is_file(&self, _: &[&str]) -> bool {
+                false
+            }
+        }
+        let files = Recording(Default::default());
+        MachineCa::generate("demo", &["api.example.com".to_string()])
+            .unwrap()
+            .save_to(&files)
+            .unwrap();
+        let written = files.0.into_inner();
+        assert!(written.contains(&(CA_KEY_FILE.to_string(), 0o600)));
+        assert!(written
+            .iter()
+            .all(|(path, mode)| path == CA_KEY_FILE || *mode == 0o644));
+
+        // a key file left world-readable is narrowed by the plain writer too
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let dir = tempfile::tempdir().unwrap();
+            let key = dir.path().join(CA_KEY_FILE);
+            std::fs::write(&key, b"old").unwrap();
+            std::fs::set_permissions(&key, std::fs::Permissions::from_mode(0o644)).unwrap();
+            Dir(dir.path())
+                .write(&[CA_KEY_FILE], b"new", 0o600)
+                .unwrap();
+            let mode = std::fs::metadata(&key).unwrap().permissions().mode();
             assert_eq!(mode & 0o777, 0o600);
         }
     }

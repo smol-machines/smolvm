@@ -2,12 +2,31 @@ use super::*;
 use crate::{config::VmRecord, db::SmolvmDb, storage::DiskFormat};
 
 fn isolated(test: &str, run: impl FnOnce(&std::path::Path)) {
+    isolated_in(test, tempfile::tempdir, run)
+}
+
+/// [`isolated`] under a root short enough that a socket bound in a machine's
+/// data directory fits `sun_path` (104 bytes on macOS, whose default temporary
+/// directory alone takes half of that).
+fn isolated_short(test: &str, run: impl FnOnce(&std::path::Path)) {
+    isolated_in(
+        test,
+        || tempfile::Builder::new().prefix("s").tempdir_in("/tmp"),
+        run,
+    )
+}
+
+fn isolated_in(
+    test: &str,
+    make_root: impl FnOnce() -> std::io::Result<tempfile::TempDir>,
+    run: impl FnOnce(&std::path::Path),
+) {
     const ROOT: &str = "SMOL_REVIEWED_CONTROL_TEST";
     if let Ok(root) = std::env::var(ROOT) {
         run(std::path::Path::new(&root));
         return;
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = make_root().unwrap();
     std::fs::create_dir(root.path().join("rootfs")).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -592,6 +611,118 @@ fn failed_persisted_stop_preserves_execution_and_releases_ownership() {
                 b"host copy"
             );
             db.admit_machine_mutation(&record.name).unwrap();
+        },
+    );
+}
+
+/// Root never writes the running configuration through a link planted beside
+/// it in the machine's directory, nor reads one through a link at its name.
+#[test]
+fn running_config_is_never_written_or_read_through_a_link() {
+    isolated(
+        "running_config_is_never_written_or_read_through_a_link",
+        |root| {
+            let manager = make_manager(root);
+            let victim = root.join("victim");
+            std::fs::write(&victim, b"root's").unwrap();
+            let tmp = manager.config_file.with_extension("json.tmp");
+            std::os::unix::fs::symlink(&victim, &tmp).unwrap();
+            manager.save_running_config(&[], &[], &VmResources::default());
+            assert_eq!(std::fs::read(&victim).unwrap(), b"root's");
+            assert!(manager.load_running_config().is_ok(), "the config is saved");
+
+            let elsewhere = root.join("elsewhere.json");
+            std::fs::copy(&manager.config_file, &elsewhere).unwrap();
+            std::fs::remove_file(&manager.config_file).unwrap();
+            std::os::unix::fs::symlink(&elsewhere, &manager.config_file).unwrap();
+            assert!(manager.load_running_config().is_err());
+            assert_eq!(forkable_in_running_config(&manager.config_file), None);
+        },
+    );
+}
+
+/// A credentials socket replaced by a link to a socket elsewhere is refused
+/// before anything is sent: a machine's values never reach another listener.
+/// The machine's own socket, served by this user, still takes them.
+#[test]
+fn live_changes_refuse_a_socket_replaced_by_a_link() {
+    isolated_short("live_changes_refuse_a_socket_replaced_by_a_link", |root| {
+        use std::io::{Read, Write};
+        let dir = vm_data_dir("linked-socket");
+        std::fs::create_dir_all(&dir).unwrap();
+        let ours = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+        let decoy = root.join("decoy.sock");
+        let listener = std::os::unix::net::UnixListener::bind(&decoy).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        std::os::unix::fs::symlink(&decoy, &ours).unwrap();
+        let values = std::collections::BTreeMap::from([(
+            "notion".to_string(),
+            zeroize::Zeroizing::new("secret".to_string()),
+        )]);
+        assert!(apply_live_credential_values("linked-socket", &values).is_err());
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the linked socket was connected to"
+        );
+        // a second name for the socket elsewhere (a hard link) is refused the same way
+        std::fs::remove_file(&ours).unwrap();
+        std::fs::hard_link(&decoy, &ours).unwrap();
+        assert!(apply_live_credential_values("linked-socket", &values).is_err());
+        assert_eq!(
+            listener.accept().map(|_| ()).unwrap_err().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "the hard-linked socket was connected to"
+        );
+
+        std::fs::remove_file(&ours).unwrap();
+        let own = std::os::unix::net::UnixListener::bind(&ours).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut stream, _) = own.accept().unwrap();
+            let mut request = String::new();
+            stream.read_to_string(&mut request).unwrap();
+            stream.write_all(b"ok").unwrap();
+            request
+        });
+        apply_live_credential_values("linked-socket", &values).unwrap();
+        assert!(server.join().unwrap().contains("secret"));
+    });
+}
+
+/// A machine whose directory's path is past `sun_path` (a long state
+/// directory or user name) still takes live changes on the control socket its
+/// boot process serves, which binds such a path through a temporary alias.
+#[test]
+fn live_changes_reach_a_machine_whose_socket_path_is_long() {
+    isolated_in(
+        "live_changes_reach_a_machine_whose_socket_path_is_long",
+        || {
+            tempfile::Builder::new()
+                .prefix(&"long".repeat(20))
+                .tempdir()
+        },
+        |_| {
+            let dir = vm_data_dir("long-socket");
+            std::fs::create_dir_all(&dir).unwrap();
+            let ours = dir.join(crate::credentials::CREDENTIALS_SOCKET);
+            assert!(ours.as_os_str().len() > 108, "{}", ours.display());
+            let (sent, received) = std::sync::mpsc::channel();
+            crate::network::launch::serve_control_socket(
+                ours.clone(),
+                "long-socket-test",
+                1024 * 1024,
+                move |request| {
+                    let _ = sent.send(request.to_string());
+                    Ok(())
+                },
+            );
+            assert!(ours.exists(), "the control socket is served");
+            let values = std::collections::BTreeMap::from([(
+                "notion".to_string(),
+                zeroize::Zeroizing::new("secret".to_string()),
+            )]);
+            apply_live_credential_values("long-socket", &values).unwrap();
+            assert!(received.recv().unwrap().contains("secret"));
         },
     );
 }
