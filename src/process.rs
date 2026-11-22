@@ -1154,6 +1154,7 @@ fn build_seccomp_program(
         libc::SYS_fstatfs, libc::SYS_statfs, libc::SYS_fcntl, libc::SYS_flock,
         libc::SYS_dup, libc::SYS_dup3, libc::SYS_getdents64,
         libc::SYS_readlinkat, libc::SYS_faccessat, libc::SYS_faccessat2, libc::SYS_umask,
+        libc::SYS_getcwd,
         libc::SYS_fgetxattr, libc::SYS_flistxattr, libc::SYS_pipe2,
         // The VMM-owned host-mount watcher mirrors host changes into guest
         // fsnotify after this filter is installed. `notify` uses inotify on
@@ -1224,7 +1225,7 @@ fn build_seccomp_program(
         // overlap with the arch-gated lists below.
         libc::SYS_mkdirat, libc::SYS_mknodat, libc::SYS_symlinkat, libc::SYS_linkat,
         libc::SYS_unlinkat, libc::SYS_renameat2, libc::SYS_fchmodat, libc::SYS_fchownat,
-        libc::SYS_fchmod, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
+        libc::SYS_fchmod, libc::SYS_fchown, libc::SYS_fdatasync, libc::SYS_utimensat, libc::SYS_copy_file_range,
         libc::SYS_fsetxattr, libc::SYS_fremovexattr,
         libc::SYS_lgetxattr, libc::SYS_lsetxattr, libc::SYS_llistxattr, libc::SYS_lremovexattr,
         // The PATH-following pair, which the fd/symlink variants above cannot
@@ -1284,6 +1285,16 @@ fn build_seccomp_program(
         // vCPUs and device workers are quiesced. `clone` was already allowed;
         // `fork` is the equivalent kernel entry used by this constrained path.
         libc::SYS_fork,
+        // `fsnotify-watch` tracks mounted trees in an anonymous SQLite database
+        // (`Connection::open("")` with `PRAGMA temp_store=FILE`). Once a large
+        // workspace overflows the 2 MiB page cache, reconciling a post-boot
+        // change spills dirty pages or a transient rollback journal to disk,
+        // and bundled `sqlite3.c`'s `unixTempFileDir` / `unixOpen` calls C
+        // `stat` (syscall 4 on x86_64), `lstat` (6), and `open` (2): the legacy
+        // x86_64 counterparts to `newfstatat` and `openat`.
+        libc::SYS_open,
+        libc::SYS_stat,
+        libc::SYS_lstat,
         libc::SYS_dup2,
         libc::SYS_readlink,
         libc::SYS_unlink,
@@ -6148,6 +6159,76 @@ mod tests {
             assert!(
                 libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
                 "child should write through writev and exit cleanly, status={status:#x}"
+            );
+        }
+    }
+
+    /// When a mounted workspace has enough files to overflow `fsnotify-watch`'s
+    /// 2 MiB SQLite page cache, reconciling a post-boot write or delete spills
+    /// dirty pages and a transient rollback journal to disk after the seccomp
+    /// filter is installed. That path must survive `enforce` (including legacy
+    /// `stat`/`lstat`/`open` on x86_64 and `getcwd`/`fchown` in SQLite's Unix VFS).
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn seccomp_allows_fsnotify_snapshot_spill_and_legacy_stat() {
+        use std::sync::atomic::AtomicBool;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..300 {
+            std::fs::write(dir.path().join(format!("file-{i:04}")), b"initial").expect("write");
+        }
+        let program = build_seccomp_program(true, false).expect("build seccomp program");
+        let root = dir.path().to_path_buf();
+
+        unsafe {
+            let pid = libc::fork();
+            assert!(pid >= 0, "fork failed");
+            if pid == 0 {
+                let mut snapshot = match crate::agent::fsnotify_watch::reconcile::Snapshot::new() {
+                    Ok(s) => s,
+                    Err(_) => libc::_exit(3),
+                };
+                snapshot.force_spill_for_test();
+                let stop = AtomicBool::new(false);
+                if snapshot
+                    .reconcile(&[root.clone()], &stop, |_| true)
+                    .is_err()
+                {
+                    libc::_exit(4);
+                }
+                if seccompiler::apply_filter(&program).is_err() {
+                    libc::_exit(2);
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let mut st: libc::stat = std::mem::zeroed();
+                    let path = c"/tmp";
+                    if libc::syscall(libc::SYS_stat, path.as_ptr(), &mut st) != 0 {
+                        libc::_exit(5);
+                    }
+                    if libc::syscall(libc::SYS_lstat, path.as_ptr(), &mut st) != 0 {
+                        libc::_exit(6);
+                    }
+                }
+                std::fs::write(root.join("after-boot"), b"x").expect("write after boot");
+                let _ = std::fs::remove_file(root.join("file-0000"));
+                if snapshot.reconcile(&[root], &stop, |_| true).is_err() {
+                    libc::_exit(7);
+                }
+                libc::_exit(0);
+            }
+            let mut status: libc::c_int = 0;
+            libc::waitpid(pid, &mut status, 0);
+            assert!(
+                !(libc::WIFSIGNALED(status) && libc::WTERMSIG(status) == libc::SIGSYS),
+                "fsnotify snapshot reconciliation and legacy stat must not trigger SIGSYS"
+            );
+            assert!(
+                libc::WIFEXITED(status) && libc::WEXITSTATUS(status) == 0,
+                "child should reconcile under seccomp and exit cleanly, status={status:#x}"
             );
         }
     }

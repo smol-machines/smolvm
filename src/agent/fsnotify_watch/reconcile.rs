@@ -76,6 +76,15 @@ impl Snapshot {
         Ok(Self { db, generation: 0 })
     }
 
+    #[cfg(all(
+        test,
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    pub(crate) fn force_spill_for_test(&self) {
+        self.db.pragma_update(None, "cache_size", 1).unwrap();
+    }
+
     pub fn reconcile(
         &mut self,
         roots: &[PathBuf],

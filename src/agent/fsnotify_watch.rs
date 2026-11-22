@@ -42,7 +42,7 @@ use tracing::{debug, info, warn};
 
 mod queue;
 use queue::{EventQueue, Work};
-mod reconcile;
+pub(crate) mod reconcile;
 use reconcile::{Change, Sink, Snapshot};
 
 /// Whether host directories are watched at all. Setting SMOL_NO_HOT_RELOAD

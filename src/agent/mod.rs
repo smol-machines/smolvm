@@ -9,7 +9,7 @@ pub mod cpu_limit;
 pub mod display;
 pub mod egress_watchlist;
 pub mod fork;
-mod fsnotify_watch;
+pub(crate) mod fsnotify_watch;
 pub mod host_gpu;
 pub mod input;
 mod interactive_start;
