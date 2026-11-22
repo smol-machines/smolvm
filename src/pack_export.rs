@@ -139,6 +139,8 @@ pub fn collect_from_vm_assets(
     let overlay_owner = export_overlay_owner(vm_name, vm);
 
     let vm_dir = vm_data_dir(vm_name);
+    #[cfg(unix)]
+    crate::lazy_disk::settle(&vm_dir)?;
     let (overlay_disk, overlay_fmt) = resolve_disk_image(&vm_dir, OVERLAY_DISK_FILENAME);
     let (storage_disk, storage_fmt) = resolve_disk_image(&vm_dir, STORAGE_DISK_FILENAME);
     let is_image_based = vm.image.is_some();
@@ -584,6 +586,8 @@ impl ExportVm {
         network: bool,
         dns: Option<std::net::Ipv4Addr>,
     ) -> crate::Result<Self> {
+        #[cfg(unix)]
+        crate::lazy_disk::settle(source_vm_dir)?;
         let (storage_disk, storage_fmt) = resolve_disk_image(source_vm_dir, STORAGE_DISK_FILENAME);
         // A machine that has never been started has no disks yet — attaching
         // the nonexistent image would boot the helper into a cryptic libkrun

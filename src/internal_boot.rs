@@ -346,7 +346,9 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
             .and_then(|uid| uid.parse().ok())
         {
             report_boot_chains(&config, uid);
-            boot_seed_dirs(&config)
+            let mut dirs = boot_seed_dirs(&config);
+            dirs.extend(boot_lazy_checkpoint(&config));
+            dirs
         } else {
             Vec::new()
         };
@@ -569,6 +571,8 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         // configuring virtio-blk". Walk each disk's backing chain and grant
         // the files read-only. (The fork-restore boot path skips Landlock
         // entirely; this covers the plain stop -> start path.)
+        // Lazy disks read their checkpoint's index and objects from the store.
+        read_exec.extend(boot_lazy_checkpoint(&config));
         read_exec.extend(boot_disk_backing_paths(
             &config.storage_disk_path,
             &config.overlay_disk_path,
@@ -937,6 +941,14 @@ fn boot_seed_dirs(config: &crate::agent::boot_config::BootConfig) -> Vec<PathBuf
         }
     }
     dirs
+}
+
+/// The stored checkpoint this machine's lazy disks read, by smolvm's own record
+/// of it: the descriptors beside the disks are the VMM uid's to write.
+#[cfg(target_os = "linux")]
+fn boot_lazy_checkpoint(config: &crate::agent::boot_config::BootConfig) -> Option<PathBuf> {
+    let machine = config.storage_disk_path.parent()?;
+    crate::lazy_disk::trusted_checkpoint(&crate::checkpoint_delta::node_store(), machine)
 }
 
 /// Find a seed in the storage backing chain, including a fork's intermediate

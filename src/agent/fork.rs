@@ -1342,6 +1342,9 @@ fn prepare_running_disk_generation(
 ) -> Result<()> {
     use crate::data::disk::DiskFormat;
 
+    // The running source's disks become its branches' backing files, so a
+    // lazily restored one must hold every chunk first.
+    crate::lazy_disk::settle(gdir)?;
     ensure_fork_disk_chain_is_bounded(gdir)?;
 
     let generation_id = snapshot_dir.file_name().ok_or_else(|| {
@@ -3829,6 +3832,10 @@ fn prepare_clone_from_snapshot(
 fn clone_fork_disks(gdir: &Path, snapshot_dir: &Path, clone_dir: &Path) -> Result<()> {
     #[cfg(target_os = "windows")]
     let _ = snapshot_dir;
+    // The clone's disks are backed by the source's, so a lazily restored
+    // source must hold every chunk first.
+    #[cfg(unix)]
+    crate::lazy_disk::settle(gdir)?;
     // The golden's actual disks that exist, resolved by file presence (`.qcow2`
     // if the golden is itself a clone, else `.raw`) — the same single source of
     // truth the agent manager uses. Each entry pairs the canonical `.raw`

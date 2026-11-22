@@ -193,6 +193,12 @@ pub struct ServeStartCmd {
     #[arg(long = "restore-cache-gib", value_name = "GiB", default_value_t = 256)]
     restore_cache_gib: u64,
 
+    /// Boot restored machines before their disks are copied: each disk is
+    /// read from the checkpoint store as the guest touches it and filled in
+    /// the background. Needs the libkrun bundled with this smolvm.
+    #[arg(long = "lazy-disks")]
+    lazy_disks: bool,
+
     /// Space for captured checkpoints kept beside the machine's host, in GiB, so
     /// restoring one here skips the download. SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES,
     /// when set, still takes precedence.
@@ -290,6 +296,12 @@ impl ServeStartCmd {
         // the host reserve and charge each child for its growth (local CLI use
         // and small hosts keep the old, looser defaults).
         smolvm::agent::fork::enable_serve_branch_admission();
+        #[cfg(unix)]
+        if self.lazy_disks {
+            smolvm::lazy_disk::enable();
+        }
+        #[cfg(not(unix))]
+        let _ = self.lazy_disks;
 
         // Per-VM resource isolation + lossless-restart placement. Two paths:
         //

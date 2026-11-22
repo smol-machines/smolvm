@@ -2257,6 +2257,10 @@ fn capture_with_completion(
         .vms
         .get(name)
         .expect("validated checkpoint source must remain in its loaded config");
+    // The capture reads the disk files, so lazily restored ones are filled
+    // first, while the guest still runs.
+    #[cfg(unix)]
+    crate::lazy_disk::settle(&crate::agent::vm_data_dir(name))?;
     // The rootfs the captured guest runs on, not whatever the host has
     // installed since: its processes keep that userland mapped.
     let rootfs_dir = checkpoint_rootfs_dir(options, vm)?;
@@ -6779,6 +6783,38 @@ fn verify_qcow2_backing(staged: &Path, disk: &CheckpointDisk, index: usize) -> R
     Ok(())
 }
 
+/// The stored checkpoint an install serves its disks from lazily, when lazy
+/// restores are on and `extracted` came from one. An extraction that left its
+/// disks out for a lazy restore gets them now if this install copies instead.
+#[cfg(unix)]
+fn lazy_restore_source(extracted: &Path, keep_disks: bool) -> Result<Option<PathBuf>> {
+    if keep_disks {
+        return Ok(None);
+    }
+    let source = crate::lazy_disk::tree_source(extracted);
+    if crate::lazy_disk::enabled() && source.is_some() {
+        return Ok(source);
+    }
+    if extracted
+        .join(crate::lazy_disk::TREE_WITHOUT_DISKS)
+        .exists()
+    {
+        let source = source.ok_or_else(|| {
+            Error::agent(
+                "install checkpoint",
+                "the restore tree left out its disks and does not name their checkpoint",
+            )
+        })?;
+        crate::checkpoint_store::materialize_missing(
+            &source,
+            extracted,
+            &crate::lazy_disk::is_lazy_asset,
+        )
+        .map_err(|error| Error::agent("materialize checkpoint disks", error.to_string()))?;
+    }
+    Ok(None)
+}
+
 #[cfg(target_os = "linux")]
 fn cow_restore_enabled() -> bool {
     std::env::var("SMOLVM_RESTORE_COW_DISK").map_or(true, |value| value != "0")
@@ -7010,6 +7046,12 @@ fn install_with(
         let mut staged_names: Vec<String> = Vec::new();
         #[cfg_attr(not(target_os = "linux"), allow(unused_mut))]
         let mut cow_tops: Vec<crate::agent::DiskOverlaySpec> = Vec::new();
+        // Disks served from the stored checkpoint as the guest reads them,
+        // by target name, with the file of the checkpoint each one is.
+        #[cfg(unix)]
+        let mut lazy_staged: Vec<(String, String)> = Vec::new();
+        #[cfg(unix)]
+        let lazy_source = lazy_restore_source(extracted, keep_disks)?;
         if !keep_disks {
             let staged_disks = partial.join("disks");
             std::fs::create_dir(&staged_disks)
@@ -7019,6 +7061,22 @@ fn install_with(
                     let started = std::time::Instant::now();
                     let staged = staged_disks.join(&file.target);
                     let source = extracted.join(&file.asset.path);
+                    #[cfg(unix)]
+                    if let Some(stored) = lazy_source
+                        .as_deref()
+                        .filter(|_| crate::lazy_disk::is_lazy_asset(&file.asset.path))
+                    {
+                        crate::lazy_disk::stage(stored, &file.asset.path, &staged)
+                            .map_err(|error| Error::agent("stage lazy disk", error.to_string()))?;
+                        if file.format == "raw" {
+                            refuse_qcow2_listed_as_raw(&staged, &file.target)?;
+                        } else {
+                            verify_qcow2_backing(&staged, disk, index)?;
+                        }
+                        lazy_staged.push((file.target.clone(), file.asset.path.clone()));
+                        tracing::info!(asset = %file.asset.path, elapsed_ms = started.elapsed().as_millis(), method = "lazy", "checkpoint disk installed");
+                        continue;
+                    }
                     if file.format == "raw" {
                         refuse_qcow2_listed_as_raw(&source, &file.target)?;
                     }
@@ -7157,6 +7215,24 @@ fn install_with(
         for name in &staged_names {
             std::fs::rename(destination.join("disks").join(name), vm_data_dir.join(name))
                 .map_err(|error| Error::agent("publish checkpoint disk", error.to_string()))?;
+        }
+        #[cfg(unix)]
+        if let (Some(stored), false) = (&lazy_source, lazy_staged.is_empty()) {
+            let lazy = |error: std::io::Error| Error::agent("publish lazy disk", error.to_string());
+            // Recorded before any descriptor exists: only the record says
+            // which checkpoint the machine may read.
+            crate::lazy_disk::record(&crate::checkpoint_delta::node_store(), vm_data_dir, stored)
+                .map_err(lazy)?;
+            for (name, asset) in &lazy_staged {
+                crate::lazy_disk::publish(
+                    stored,
+                    asset,
+                    &destination.join("disks").join(name),
+                    &vm_data_dir.join(name),
+                )
+                .map_err(lazy)?;
+                staged_names.push(name.clone());
+            }
         }
         // Each installed layer's header was checked against the checkpoint's
         // chain, and no VMM runs on these disks yet.

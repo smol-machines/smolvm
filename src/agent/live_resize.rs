@@ -827,6 +827,10 @@ fn grow_disks_locked(
             "machine must be running",
         ));
     }
+    // Growing a disk changes its size, which a lazily restored one takes
+    // from its checkpoint until it is complete.
+    #[cfg(unix)]
+    crate::lazy_disk::settle(&crate::agent::vm_data_dir(name))?;
     if storage_gb.is_none() && overlay_gb.is_none() {
         return Err(Error::config(
             "live resize",
