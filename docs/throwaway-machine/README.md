@@ -78,7 +78,7 @@ The machine persists until deleted, so it does not have the throwaway property.
 Before v1.23.0, to run a workload with no network at all, fetch the image once with the network on,
 then take it away before the run that matters (`references/macos.md`, first choice). The
 `--oci-cache` flag serves the same purpose on a host that runs the same image repeatedly, except on
-macOS from v1.24.0 ([#1819](https://github.com/smol-machines/smolvm/issues/1819)).
+macOS from v1.24.0 to v1.29.0 ([#1819](https://github.com/smol-machines/smolvm/issues/1819), fixed in v1.29.1).
 
 ## Grant egress one host at a time
 
@@ -216,10 +216,9 @@ and `references/traps.md` carry the measurements and what each host does.
 
 ## Platforms
 
-The offline shape this packet is built on works on macOS from v1.20.2 through v1.23.7. From v1.24.0
-(measured through v1.29.0) no `--oci-cache` run boots on macOS
-([#1819](https://github.com/smol-machines/smolvm/issues/1819)), so it is unavailable there again,
-as `SKILL.md` says; before v1.20.2 `references/macos.md` gives a route that does and says what it
-costs. On Windows
+The offline shape this packet is built on works on macOS from v1.20.2 through v1.23.7 and again
+from v1.29.1. From v1.24.0 to v1.29.0 no `--oci-cache` run boots on macOS
+([#1819](https://github.com/smol-machines/smolvm/issues/1819)); before v1.20.2 `references/macos.md`
+gives a route that does and says what it costs. On Windows
 the bake never completes, so the offline shape is unavailable there for a different reason:
 `references/windows.md`.

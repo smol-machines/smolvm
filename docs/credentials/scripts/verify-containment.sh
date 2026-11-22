@@ -60,20 +60,34 @@ echo_back="$(printf 'smolskill-stdin-probe\n' | "$SMOLVM" machine exec -i --name
 hits="$(printf '%s\n' "$value" | "$SMOLVM" machine exec -i --name "$NAME" -- sh -c 'grep -rlF -f /dev/stdin /proc/[0-9]*/environ /run /etc /root /tmp /var /home 2>/dev/null | grep -v "^/proc/$$/" | wc -l | tr -d " "' 2>/dev/null)"
 check value_in_guest "${hits:-unknown}" 0
 
-# 3. Nor in the machine's directory or smolvm's database on the host.
+# 3. Nor in the machine's record or smolvm's database on the host: the machine's
+#    directory, the database in server/ and the usage journal in usage/. The
+#    machine's disks (storage, overlay and cache, .raw or .qcow2, and their
+#    .smolcheckpoint-* layers) are the guest filesystem step 2 searched from
+#    inside; images, pack templates and checkpoints elsewhere are shared disks.
 dir="$("$SMOLVM" machine data-dir --name "$NAME" 2>/dev/null)"
 case "$(uname -s)" in
     Darwin) db="$HOME/Library/Application Support/smolvm" ;;
     *) db="${SMOLVM_DATA_DIR:+$SMOLVM_DATA_DIR/.local/share/smolvm}"
        db="${db:-${XDG_DATA_HOME:-$HOME/.local/share}/smolvm}" ;;
 esac
-# The *.raw disk images are the guest filesystem step 2 searched from inside, and
-# grep took about 19 minutes over their 30 GiB of sparse space on macOS.
-if [ -d "$dir" ] && [ -d "$db" ]; then
-    rec="$( { printf '%s\n' "$value" | grep -rlF --exclude='*.raw' -f /dev/stdin "$dir" "$db" 2>/dev/null || true; } | wc -l | tr -d ' ')"
-    check value_in_record "$rec" 0
+if [ -d "$dir" ] && [ -d "$db/server" ]; then
+    roots=("$dir" "$db/server")
+    [ -d "$db/usage" ] && roots+=("$db/usage")
+    # Only grep's exit 1 means no hit; an unread file must not read as clean.
+    if list="$(find "${roots[@]}" -type f ! -name '*.raw' ! -name '*.qcow2')" && [ -n "$list" ]; then
+        IFS=$'\n' read -r -d '' -a files <<<"$list"
+        rec="$(printf '%s\n' "$value" | grep -lF -f /dev/stdin -- "${files[@]}")"
+        rc=$?
+    else
+        rc=2
+    fi
+    case "$rc" in
+        0|1) check value_in_record "$(printf '%s' "$rec" | grep -c .)" 0 ;;
+        *) printf 'value_in_record=FAIL the search could not read every record file (exit %s; the error is above)\n' "$rc"; fail=1 ;;
+    esac
 else
-    check value_in_record "not_searched (${dir:-no machine directory}, $db)" 0
+    check value_in_record "not_searched (${dir:-no machine directory}, $db/server)" 0
 fi
 
 # 4. TLS to the bound host is terminated by the machine's own CA: the interceptor

@@ -42,13 +42,16 @@ pause, and a pause and resume. Start every machine you might checkpoint with `--
 
 **From v1.20.0 macOS takes a checkpoint file and a pause without the flag**, measured on v1.20.0,
 v1.20.2, v1.21.1, v1.22.0 and v1.22.2, where v1.19.0 and v1.19.3 still refused. **A stored capture
-still needs it.** On v1.22.2 `--store` against a machine started without it fails with:
+needs it through v1.23.7.** There `--store` against a machine started without it fails with:
 
 ```
 Error: agent operation failed: checkpoint machine: libkrun save failed: ERR ENOTSUP VM
 snapshot/restore failed: retain COW guest-memory generation: deferred durable save requires
 file-backed guest RAM
 ```
+
+From v1.24.0 the capture falls back to a synchronous save (#1584): on v1.24.0 and v1.34.0 the same
+`--store` capture published, and a machine restored from it held the source's RAM token.
 
 ## `--output` must end in `.checkpoint` or `.smolcheckpoint`, even when it is a directory
 

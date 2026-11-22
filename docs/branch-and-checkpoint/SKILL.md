@@ -5,11 +5,11 @@ description: Saves a running smolvm machine as checkpoints on a schedule, keeps 
 
 # Checkpoints, restores, pauses and branches
 
-Verified on **smolvm v1.29.0** on macOS arm64, 2026-10-15, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
+Verified on **smolvm v1.34.0** on macOS arm64 and Linux x86_64, 2026-11-09, and on **v1.18.2** on Linux aarch64, 2026-09-24. Done means a restore
 brings back both the disk and the memory you left, the schedule keeps exactly the checkpoints you
 asked for and no fewer, and every child of a branch starts from a state you still hold as a
 checkpoint after the children are gone.
-The Linux runs used the scripts of their date; this version's preflight and cleanup scripts ran
+The Linux aarch64 runs used the scripts of their date; this version's preflight and cleanup scripts ran
 on Linux aarch64 on v1.22.2 on 2026-10-03.
 
 `README.md` says what each of these operations is. This file is how to run them, and the traps.
@@ -22,8 +22,8 @@ on Linux aarch64 on v1.22.2 on 2026-10-03.
 - **A branch's captured state stays on this host and cannot be exported.** So a branch point is
   paired with a checkpoint taken at the same moment, which is the copy you keep.
 - **`--branchable` at `start` decides what a machine can do later.** A branch source needs it on
-  every host, and on macOS so does a stored capture, which is what the scripts here take; Linux
-  checkpoints and pauses without it. `README.md` has the errors when it is missing. The scripts
+  every host, and on macOS before v1.24.0 so does a stored capture, which is what the scripts here
+  take; Linux checkpoints and pauses without it. `README.md` has the errors when it is missing. The scripts
   always start with it.
 
 ## Procedure
@@ -62,10 +62,11 @@ The workload writes a counter into `/dev/shm` every second, which is tmpfs and s
 the disk. `--branch-ready` makes the workload park in `smolvm-branch-ready` after its setup, which a
 batch branch waits for.
 
-**Or the user's own machine.** Name it with `--name` in the steps below. On macOS, if it was
-started without `--branchable`, the first capture fails with `deferred durable save requires
-file-backed guest RAM` on v1.22.2 or `guest RAM has no file-backed regions` before v1.20.0, and the
-only fix is a restart with the flag:
+**Or the user's own machine.** Name it with `--name` in the steps below. On macOS before v1.24.0,
+if it was started without `--branchable`, the first capture fails with `deferred durable save
+requires file-backed guest RAM` (v1.20.0 to v1.23.7) or `guest RAM has no file-backed regions`
+(before v1.20.0); from v1.24.0 the capture falls back to a synchronous save (#1584) and works. On
+the older releases, and for a branch on any release, the only fix is a restart with the flag:
 
 ```bash
 smolvm machine stop  --name worker
@@ -228,8 +229,10 @@ Full detail in `references/traps.md`. The ones that cost the most:
 and **Linux aarch64** on v1.18.2 and once on v1.22.2, with the one difference that Linux needs no
 `--branchable`. On v1.16.1 Linux aarch64 refused `--store` and froze a branch source; from v1.18.2
 it does neither. **Linux x86_64**
-was not re-run. **Windows** on v1.22.2 checkpoints to a file, pauses and branches with
-`--freeze-source` on every branch, and refuses `--store`, so `checkpoint.sh` cannot run there.
+ran every script on v1.34.0, twice, with the same results. **Windows** on v1.34.0 checkpoints to a file, pauses and resumes, and restores a
+machine started with `--branchable`; without the flag a checkpoint or a pause fails with `os error
+1784` from v1.28.1, where v1.22.2 to v1.28.0 took them. Every branch needs `--freeze-source` and
+`--store` is refused, so `checkpoint.sh` cannot run there.
 From v1.23.0 a checkpoint from an arm64 Mac restores on arm64 Linux, run once from this Mac to Lima.
 
 ## Eval prompts, and what they produced
@@ -265,6 +268,23 @@ Linux, across a 10 s pause. Separately, on macOS a restored machine paused while
 full failed its first resume with `extract paused checkpoint: failed to unpack ...`, and the same
 `machine resume` succeeded once space was freed: counter 8 before the pause, 14 after, still
 counting.
+
+## Re-verified on v1.34.0
+
+Run 2026-11-09 PT against v1.34.0 from the published release, checksum checked, under a fresh
+isolated `HOME` on macOS 27.2 arm64 (Apple M4), twice, the second time from a fresh `HOME`, and once
+on Lima `linux-kvm` (Ubuntu 24.04 aarch64, 11 GiB). Every step on both hosts: `result=schedule_ok`,
+three generations listed, restores of `~2` and the newest holding the source's RAM token, a pause
+and resume with the counter at 32 then 33, and both children of a batch branch holding one token.
+Captures now take under a second, so `checkpoint.sh` run right after another hit the one-second name
+collision 4 times in 6 (`result=FAILED ... already exists`); it now waits for the next second. On
+macOS a machine started without `--branchable` took a `--store` capture and restored with its RAM
+token on v1.24.0 and v1.34.0, where v1.23.7 refused it.
+
+On Linux x86_64 (Ubuntu 22.04, KVM, an NVIDIA A10 cloud host with 30 cores and 222 GiB), twice on
+2026-11-09, each pass from a fresh `HOME`, every step: `result=schedule_ok` with 4 of 4 captures,
+three generations listed, restores of `~2` and the newest holding the source's RAM token, a pause
+and resume with the counter at 31 then 32, and both children of a batch branch holding one token.
 
 ## Re-verified on v1.29.0
 
@@ -320,7 +340,7 @@ children holding the same token.
 
 ## What was not run
 
-- **Linux x86_64**, and the scripts on Windows, which are bash.
+- **The scripts on Windows**, which are bash.
 - **A schedule over hours.** Four captures ten seconds apart on each host, and single captures
   within each run; the growth of a store under `--history 32` over a day was not measured.
 - **Restores on another host, beyond Mac to Linux.** Through v1.22.2 a checkpoint restores only on

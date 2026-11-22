@@ -12,8 +12,8 @@ Each packet's `SKILL.md` opens with the release and platforms it last ran on. No
 
 Find the task, then run its packet's first step: a read-only check that ends in `result=ready`
 (`result=clean` for teardown) when this host can do the task. Call each script by its path in this
-directory, from a working directory of your own, since the scripts write to the current directory. Each first step ran as written on v1.29.0 on
-macOS arm64, where throwaway-machine's says `result=blocked`; its `SKILL.md` says why.
+directory, from a working directory of your own, since the scripts write to the current directory. Each first step ran as written on v1.34.0 on
+macOS arm64 and Linux aarch64.
 
 | Task | Packet | First step |
 |---|---|---|

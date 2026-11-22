@@ -12,21 +12,29 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.23.0"
+VERIFIED_VERSION="1.34.0"
 
 # v1.20.2 fixed both issues this packet was built around (#1467): a cached run
 # with a mount boots on macOS (#1192), and a cached run's VM ends with its CLI
 # (#1193). Older releases still have both.
 FIXED_IN="1.20.2"
+
+# From v1.24.0 to v1.29.0 no --oci-cache run boots on macOS (#1819); v1.29.1
+# boots cached runs in a fresh process (#1821).
+REGRESSED_IN="1.24.0"
+REGRESSION_FIXED_IN="1.29.1"
 at_least() { [ "$(printf '%s\n%s\n' "$1" "$2" | sort -V | head -1)" = "$2" ]; }
 
 # x86_64 guests through v1.22.2 have eleven IRQs (libkrun IRQ_BASE 5 to
 # IRQ_MAX 15): four -v mounts boot and five fail with "no more IRQs are
 # available". Any -p, --allow-host or --allow-cidr adds one virtio-net device,
 # however many ports. Measured on Windows Hypervisor Platform. v1.23.0 ships
-# libkrun with IRQ_MAX 23 (#1521) and its ceiling was not measured, so the check
-# applies to x86_64 through v1.22.2 only. arm64 guests have 128 IRQs.
-DEVICE_BUDGET=4
+# libkrun with IRQ_MAX 23 (#1521): on v1.34.0 on Linux KVM nine mounts boot and
+# ten fail with the same error, and the network device still counts as one.
+# v1.23.0 to v1.33.x were not measured and take the newer budget. arm64 guests
+# have 128 IRQs.
+DEVICE_BUDGET_TO_1_22=4
+DEVICE_BUDGET=9
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 note() { printf 'note=%s\n' "$1"; }
@@ -87,12 +95,13 @@ case "$kernel" in
         fi
         # The offline shape is bake with --oci-cache, then run with mounts and
         # no network. Before v1.20.2 that combination never boots on macOS, and
-        # from v1.24.0 no --oci-cache run boots there (measured through v1.29.0).
-        if [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "1.24.0"; then
+        # from v1.24.0 to v1.29.0 no --oci-cache run boots there.
+        if [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "$REGRESSED_IN" \
+            && ! at_least "$version" "$REGRESSION_FIXED_IN"; then
             emit offline_shape unavailable
-            emit offline_shape_blocker "an --oci-cache run does not boot on macOS from v1.24.0"
+            emit offline_shape_blocker "smol-machines/smolvm#1819, fixed in v$REGRESSION_FIXED_IN"
             blocked=1
-            note "from v1.24.0 to at least v1.29.0, on macOS every --oci-cache run, the bake's own included, fails with 'agent did not become ready within 30 seconds', so the offline shape cannot run here. A persistent machine with no network boots the image with no bake (README.md, \"The network is off unless you ask for it\")."
+            note "from v1.24.0 to v1.29.0, on macOS every --oci-cache run, the bake's own included, fails with 'agent did not become ready within 30 seconds', so the offline shape cannot run here. Upgrade to v$REGRESSION_FIXED_IN or later; until then a persistent machine with no network boots the image with no bake (README.md, \"The network is off unless you ask for it\")."
         elif [ -n "${version:-}" ] && [ "$version" != "unknown" ] && at_least "$version" "$FIXED_IN"; then
             emit offline_shape available
         else
@@ -138,14 +147,16 @@ net_devices=0
 emit planned_mounts "$mounts"
 emit planned_ports "$ports"
 emit devices_requested "$((mounts + net_devices))"
-if [ "$arch" = "x86_64" ] && [ -n "${version:-}" ] && [ "$version" != "unknown" ] && ! at_least "$version" "1.22.3"; then
-    emit device_budget "$DEVICE_BUDGET"
-    if [ "$((mounts + net_devices))" -le "$DEVICE_BUDGET" ]; then
+if [ "$arch" = "x86_64" ] && [ -n "${version:-}" ] && [ "$version" != "unknown" ]; then
+    budget="$DEVICE_BUDGET"
+    at_least "$version" "1.22.3" || budget="$DEVICE_BUDGET_TO_1_22"
+    emit device_budget "$budget"
+    if [ "$((mounts + net_devices))" -le "$budget" ]; then
         emit device_budget_ok yes
     else
         emit device_budget_ok no
         blocked=1
-        note "on x86_64 through v1.22.2 more than four devices beyond the base set fail with 'no more IRQs are available'; a published port or an --allow-host grant is one. Combine directories under one mount."
+        note "on x86_64 more than $budget devices beyond the base set fail with 'no more IRQs are available' (four through v1.22.2, nine from v1.23.0); a published port or an --allow-host grant is one. Combine directories under one mount."
     fi
 else
     emit device_budget_ok not_limiting

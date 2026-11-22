@@ -7,7 +7,7 @@
 
 set -uo pipefail
 
-VERIFIED_VERSION="1.29.0"
+VERIFIED_VERSION="1.34.0"
 
 emit() { printf '%s=%s\n' "$1" "$2"; }
 
@@ -69,7 +69,7 @@ case "$kernel" in
         if [ "$arch" != "aarch64" ]; then
             emit hardware_verified no
             blocked=1
-            note "no darwin-x86_64 archive is published for v1.29.0, so the installer accepts an Intel Mac and then stops at the download"
+            note "no darwin-x86_64 archive is published for v1.34.0, so the installer accepts an Intel Mac and then stops at the download"
         else
             emit hardware_verified yes
         fi
