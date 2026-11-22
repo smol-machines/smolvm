@@ -40,8 +40,9 @@ pub(crate) struct Scrubber {
 }
 
 impl Scrubber {
-    /// `None` when no secret has a form long enough to look for.
-    pub(crate) fn new(secrets: &[Secret<'_>]) -> Option<Self> {
+    /// `None` when no secret has a form long enough to look for. An error means the forms could not be compiled
+    /// into a matcher: the caller must not pass the response on unchecked.
+    pub(crate) fn new(secrets: &[Secret<'_>]) -> Result<Option<Self>, aho_corasick::BuildError> {
         // (form, replacement, which secret): sorted and deduplicated so the
         // first secret giving a form decides what replaces it.
         let mut forms_found: Vec<(Zeroizing<Vec<u8>>, Vec<u8>, usize)> = Vec::new();
@@ -65,7 +66,7 @@ impl Scrubber {
             }
         }
         if forms_found.is_empty() {
-            return None;
+            return Ok(None);
         }
         forms_found.sort_by(|a, b| a.0.cmp(&b.0).then(a.2.cmp(&b.2)));
         forms_found.dedup_by(|later, kept| later.0 == kept.0);
@@ -73,8 +74,7 @@ impl Scrubber {
         let matcher = aho_corasick::AhoCorasick::builder()
             .match_kind(aho_corasick::MatchKind::LeftmostLongest)
             .start_kind(aho_corasick::StartKind::Both)
-            .build(forms_found.iter().map(|f| f.0.as_slice()))
-            .ok()?;
+            .build(forms_found.iter().map(|f| f.0.as_slice()))?;
         let replacements = forms_found.into_iter().map(|f| f.1).collect();
         let mut values: Vec<Zeroizing<Vec<u8>>> = secrets
             .iter()
@@ -82,12 +82,12 @@ impl Scrubber {
             .collect();
         values.sort_by(|a, b| a.as_slice().cmp(b.as_slice()));
         values.dedup_by(|a, b| a.as_slice() == b.as_slice());
-        Some(Self {
+        Ok(Some(Self {
             matcher,
             replacements,
             longest,
             values,
-        })
+        }))
     }
 
     /// Whether this scrubber looks for every form of `value`.
@@ -289,6 +289,7 @@ mod tests {
             value: value.as_bytes(),
             placeholder,
         }])
+        .unwrap()
         .expect("patterns")
     }
 
@@ -342,6 +343,7 @@ mod tests {
             value: secret,
             placeholder: None,
         }])
+        .unwrap()
         .unwrap();
         for prefix in ["", "a", "ab", "abc", "Authorization: Basic "] {
             let mut plain = prefix.as_bytes().to_vec();
@@ -480,7 +482,7 @@ mod tests {
                 placeholder: (i % 3 != 0).then_some(p.as_str()),
             })
             .collect();
-        let s = Scrubber::new(&secrets).unwrap();
+        let s = Scrubber::new(&secrets).unwrap().unwrap();
         let mut body = Vec::new();
         for i in 0..400 {
             let v = values[(next() as usize) % values.len()].as_bytes();
@@ -513,6 +515,7 @@ mod tests {
             value: b"abc",
             placeholder: None
         }])
+        .unwrap()
         .is_none());
     }
 }

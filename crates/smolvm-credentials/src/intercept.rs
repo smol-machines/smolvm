@@ -240,6 +240,9 @@ struct State {
     held_flows: std::sync::atomic::AtomicUsize,
     /// host → the scrubber for what its bindings and retired values carry, and the epoch it was built at.
     scrubbers: Mutex<HashMap<String, (u64, SharedScrubber)>>,
+    /// Run by a commit once the new bindings are visible, before it finishes: a test's gate.
+    #[cfg(test)]
+    after_swap: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Grows whenever the values a response may need scrubbing of can have grown (bindings changed, a value
     /// resolved): a response being streamed rebuilds its scrubber when it moves.
     secrets_epoch: AtomicU64,
@@ -285,6 +288,8 @@ impl Interceptor {
             pending_changed: tokio::sync::Notify::new(),
             held_flows: std::sync::atomic::AtomicUsize::new(0),
             scrubbers: Mutex::new(HashMap::new()),
+            #[cfg(test)]
+            after_swap: Mutex::new(None),
             secrets_epoch: AtomicU64::new(0),
             resolver,
             endpoint,
@@ -480,10 +485,15 @@ impl PreparedBindings {
             // Before the swap: a flow that reads the new bindings finds a host they dropped already retired.
             state.retire(&current.policy, &policy);
             *current = Arc::new(Bindings::new(policy, placeholders, cas));
+            // Before the new bindings are visible: no request reading them takes a scrubber built for the old ones.
+            state.bump_secrets();
+        }
+        #[cfg(test)]
+        if let Some(gate) = state.after_swap.lock().expect("commit gate").take() {
+            gate();
         }
         // a host whose CA changed mints its leaf again
         state.leaves.lock().expect("leaf cache").clear();
-        state.bump_secrets();
         // Dropping `self` lets held connections decide under the new bindings.
     }
 }
@@ -821,6 +831,7 @@ impl State {
                 }
             }
         }
+        // Under the locks, so the epoch moves before the value is visible.
         if grew {
             self.bump_secrets();
         }
@@ -871,7 +882,7 @@ impl State {
             Some(shared) => shared,
             None => {
                 let mut secrets = self.host_secrets(host);
-                let shared = build_scrubber(&secrets);
+                let shared = build_scrubber(&secrets)?;
                 secrets.clear();
                 let mut cache = self.scrubbers.lock().expect("scrubber cache");
                 if cache.len() >= MAX_CACHED_CLIENTS {
@@ -892,7 +903,7 @@ impl State {
                 .iter()
                 .map(|c| (c.value.clone(), c.placeholder.clone())),
         );
-        Ok(build_scrubber(&secrets))
+        build_scrubber(&secrets)
     }
 
     /// Every value a response from `host` is checked for, whatever request it answers, with the placeholder the
@@ -1405,10 +1416,10 @@ fn decode_body(encoding: &str, compressed: &[u8]) -> std::io::Result<Vec<u8>> {
     }
 }
 
-/// A scrubber for `secrets` (value, placeholder), built outside every lock.
+/// A scrubber for `secrets` (value, placeholder), built outside every lock. An error fails the response it was for.
 fn build_scrubber(
     secrets: &[(zeroize::Zeroizing<String>, Option<String>)],
-) -> Option<Arc<Scrubber>> {
+) -> Result<SharedScrubber> {
     let secrets: Vec<Secret<'_>> = secrets
         .iter()
         .map(|(value, placeholder)| Secret {
@@ -1416,7 +1427,9 @@ fn build_scrubber(
             placeholder: placeholder.as_deref(),
         })
         .collect();
-    Scrubber::new(&secrets).map(Arc::new)
+    Ok(Scrubber::new(&secrets)
+        .context("build the credential scrubber")?
+        .map(Arc::new))
 }
 
 /// What a streamed response needs to rebuild its scrubber when the values it must be checked for grow while it
@@ -2334,7 +2347,10 @@ mod tests {
             .await
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(!response.contains("ghp_retiredsecret4321"), "{response}");
+        assert!(
+            !response_body(&response).contains("ghp_retiredsecret4321"),
+            "{response}"
+        );
         assert!(response.contains("[smolvm-redacted]"), "{response}");
         // nothing is injected there any more: the old placeholder is refused
         let reuse = format!(
@@ -2386,7 +2402,10 @@ mod tests {
         let read = format!("GET /read HTTP/1.1\r\nHost: {CRED_HOST}\r\n\r\n");
         let response = exchange(&mut tls, &read).await;
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(!response.contains("ghp_keptopensecret1357"), "{response}");
+        assert!(
+            !response_body(&response).contains("ghp_keptopensecret1357"),
+            "{response}"
+        );
     }
 
     /// A raw connection spliced to a host before a binding covers it is ended when the binding takes effect: it
@@ -2427,7 +2446,7 @@ mod tests {
         let read = format!("GET /read HTTP/1.1\r\nHost: {OTHER_HOST}\r\n\r\n");
         let response = exchange(&mut spliced, &read).await;
         assert!(
-            !response.contains("ghp_newlyboundsecret8642"),
+            !response_body(&response).contains("ghp_newlyboundsecret8642"),
             "read back on the old connection: {response}"
         );
         assert!(response.is_empty(), "old connection still open: {response}");
@@ -2451,7 +2470,10 @@ mod tests {
         );
         let response = response.unwrap();
         assert!(response.starts_with("HTTP/1.1 200"), "{response}");
-        assert!(!response.contains("ghp_inflightsecret5678"), "{response}");
+        assert!(
+            !response_body(&response).contains("ghp_inflightsecret5678"),
+            "{response}"
+        );
         assert!(
             response_body(&response).starts_with("echo Bearer "),
             "{response}"
@@ -2522,6 +2544,67 @@ mod tests {
             .unwrap();
         assert!(response.starts_with("HTTP/1.1 502"), "{response}");
         assert!(f.upstream.seen.lock().unwrap().is_empty());
+    }
+
+    /// A host gains a binding whose value is already resolved (it was bound to another host): from the moment the
+    /// new bindings are visible, a response from the host is checked for that value, never by a scrubber built
+    /// before the change.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_binding_is_scrubbed_for_as_soon_as_it_is_visible() {
+        let policy = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST), bound("other", OTHER_HOST)],
+        };
+        let resolver = StaticResolver::new()
+            .with("svc", "real-secret")
+            .with("other", "ghp_alreadyresolved9753");
+        let f = fixture_with_policy(policy.clone(), CRED_HOST, resolver).await;
+        let mut placeholders = crate::policy::generate_placeholders(&policy);
+        placeholders.insert("svc".into(), f.placeholder.clone());
+        let extra = MachineCa::generate("test-machine", &[OTHER_HOST.to_string()]).unwrap();
+        let trusted = format!("{}{}", f.ca_pem, extra.certificate_pem());
+        rebind(&f, policy, placeholders.clone(), vec![extra]);
+        // `other`'s value is resolved and stored upstream, where `CRED_HOST` hands it back too
+        let store = format!(
+            "GET /store HTTP/1.1\r\nHost: {OTHER_HOST}\r\nAuthorization: Bearer {}\r\nConnection: close\r\n\r\n",
+            placeholders["other"]
+        );
+        let response = guest_request(&f, trusted.as_bytes(), OTHER_HOST, &store)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        // builds and caches `CRED_HOST`'s scrubber, which has no business knowing `other`'s value yet
+        let read = format!("GET /read HTTP/1.1\r\nHost: {CRED_HOST}\r\nConnection: close\r\n\r\n");
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &read)
+            .await
+            .unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+
+        // `other` now covers `CRED_HOST` too; the commit stops at its gate once the bindings are visible
+        let mut wider = bound("other", OTHER_HOST);
+        wider.allowed_hosts.push(CRED_HOST.into());
+        let grown = CredentialPolicy {
+            credentials: vec![bound("svc", CRED_HOST), wider],
+        };
+        let (reached_tx, reached_rx) = tokio::sync::oneshot::channel::<()>();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        *f.interceptor.state.after_swap.lock().unwrap() = Some(Box::new(move || {
+            let _ = reached_tx.send(());
+            let _ = release_rx.recv();
+        }));
+        let control = f.interceptor.control();
+        let extra_again = MachineCa::generate("test-machine", &[OTHER_HOST.to_string()]).unwrap();
+        let commit = tokio::task::spawn_blocking(move || {
+            control.update(grown, placeholders, vec![extra_again])
+        });
+        reached_rx.await.unwrap();
+        let response = guest_request(&f, f.ca_pem.as_bytes(), CRED_HOST, &read)
+            .await
+            .unwrap();
+        release_tx.send(()).unwrap();
+        commit.await.unwrap().unwrap();
+        assert!(response.starts_with("HTTP/1.1 200"), "{response}");
+        let body = response_body(&response);
+        assert!(!body.contains("ghp_alreadyresolved9753"), "{body}");
     }
 
     /// A value bound to a host while a response from it streams is scrubbed from the rest of that response.
