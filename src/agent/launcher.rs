@@ -936,7 +936,7 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
             tracing::info!("nested virtualization enabled for the guest");
         }
 
-        // Enable GPU if requested (virgl for OpenGL + Venus for Vulkan via virtio-gpu).
+        // Enable GPU if requested (Venus for Vulkan via virtio-gpu).
         // Requires libkrun built with `gpu` feature and host virglrenderer.
         // On macOS, also requires MoltenVK (Vulkan → Metal translation).
         //
