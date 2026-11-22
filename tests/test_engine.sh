@@ -589,6 +589,28 @@ test_host_docker_internal() {
 
 # --- compose -----------------------------------------------------------------------
 
+test_compose_job_exit_and_immediate_down() (
+    mkdir -p "$WORK/job" && cd "$WORK/job" || return 1
+    local expected actual
+    for expected in 0 17; do
+        cat >compose.yaml <<EOF
+name: ${PREFIX}-job
+services:
+  job:
+    image: alpine
+    command: ["sh", "-c", "exit $expected"]
+    labels: ["$PREFIX"]
+networks:
+  default:
+    labels: ["$PREFIX"]
+EOF
+        actual=0
+        docker compose up --abort-on-container-exit --exit-code-from job || actual=$?
+        docker compose down || return 1
+        [[ $actual == "$expected" ]] || return 1
+    done
+)
+
 test_compose_healthcheck_dependency_two_networks() {
     mkdir -p "$WORK/stack"
     cat >"$WORK/stack/compose.yaml" <<EOF
@@ -718,6 +740,7 @@ run_test "--network container: shares a network" test_network_container_mode || 
 run_test "IPv6 networks" test_ipv6_networks || true
 run_test "host.docker.internal reaches the host" test_host_docker_internal || true
 if docker compose version >/dev/null 2>&1; then
+    run_test "compose: job exit code and immediate down" test_compose_job_exit_and_immediate_down || true
     run_test "compose: health-check dependency, two networks" test_compose_healthcheck_dependency_two_networks || true
 else
     log_skip "compose: health-check dependency, two networks: docker compose is not installed"

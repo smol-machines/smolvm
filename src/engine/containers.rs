@@ -291,6 +291,9 @@ pub(crate) struct Container {
     /// Held while the machine is being stopped after an exit; a start or a
     /// remove waits for it.
     pub(crate) vm: Arc<tokio::sync::Mutex<()>>,
+    // Guard only the supervisor's VM recovery reservation during exit teardown.
+    // Unlike vm, this is never held while waiting for transfer admission.
+    exit_teardown: tokio::sync::Mutex<()>,
     pub(crate) output: tokio::sync::broadcast::Sender<Output>,
     pub(crate) input: InputQueue,
     pub(crate) log_written: tokio::sync::Notify,
@@ -324,6 +327,7 @@ impl Container {
             record: parking_lot::Mutex::new(record),
             op: Arc::new(tokio::sync::Mutex::new(())),
             vm: Arc::new(tokio::sync::Mutex::new(())),
+            exit_teardown: tokio::sync::Mutex::new(()),
             output,
             input: InputQueue::default(),
             log_written: tokio::sync::Notify::new(),
@@ -416,6 +420,15 @@ impl Container {
             }
         }
         Ok(guards)
+    }
+
+    async fn admit_lifecycle_mutation(
+        &self,
+        engine: &Engine,
+        deleting: bool,
+    ) -> ApiResult<Vec<crate::db::transfer_admission::MutationGuard>> {
+        let _teardown = self.exit_teardown.lock().await;
+        self.admit_mutation(engine, deleting)
     }
 
     pub(crate) fn owns_live_execution(&self) -> bool {
@@ -1416,7 +1429,7 @@ pub(crate) async fn start(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult
 }
 
 async fn start_locked(engine: &Arc<Engine>, c: &Arc<Container>) -> ApiResult<bool> {
-    let _admission = c.admit_mutation(engine, false)?;
+    let _admission = c.admit_lifecycle_mutation(engine, false).await?;
     if engine.owner.as_deref() != Some(c.id().as_str()) {
         return Err(ApiError::internal(
             "only the owning supervisor may start this workload",
@@ -2199,11 +2212,13 @@ async fn on_exit(
         }
     }
     let record = c.record();
+    let teardown = c.exit_teardown.lock().await;
     if let Err(error) = exit_cleanup::stop_original_machine(&engine, &record).await {
         c.update(&engine, |r| r.state.error = error.message.clone());
         tracing::error!(container = %c.id(), error = %error.message, "container exit cleanup requires recovery");
         return;
     }
+    drop(teardown);
     super::network::after_stop(&engine, &c).await;
     let restart = if record.host_config.auto_remove {
         None
@@ -2459,10 +2474,12 @@ async fn stop_locked(
     timeout: Option<i64>,
     sig: Option<String>,
 ) -> ApiResult<bool> {
-    let _admission = c.admit_mutation(engine, false)?;
+    let _admission = c.admit_lifecycle_mutation(engine, false).await?;
     if c.record().execution_suspended {
         restore_saved_execution(engine, c, true).await?;
     }
+    let mut exits = c.subscribe_exits();
+    let before = exits.borrow().exits;
     let record = c.record();
     if record.state.status == "restarting" || exit_cleanup::pending(&record) {
         // Stop also cancels a queued restart while teardown is finishing.
@@ -2488,8 +2505,6 @@ async fn stop_locked(
     let sig = sig
         .or_else(|| record.config.stop_signal.clone())
         .unwrap_or_else(|| "SIGTERM".into());
-    let mut exits = c.subscribe_exits();
-    let before = exits.borrow().exits;
     let exited = |exits: &mut tokio::sync::watch::Receiver<ExitState>, d: Duration| {
         let mut rx = exits.clone();
         async move {
@@ -2552,7 +2567,7 @@ pub(crate) async fn restart(
     sig: Option<String>,
 ) -> ApiResult<()> {
     let _op = c.op.lock().await;
-    let _admission = c.admit_mutation(engine, false)?;
+    let _admission = c.admit_lifecycle_mutation(engine, false).await?;
     stop_locked(engine, c, timeout, sig).await?;
     c.update(engine, |r| r.user_stopped = false);
     start_locked(engine, c).await?;
@@ -2567,7 +2582,6 @@ pub(crate) async fn remove(
     force: bool,
     volumes: bool,
 ) -> ApiResult<()> {
-    let _admission = c.admit_mutation(engine, true)?;
     if engine.owner.is_none() {
         let request = axum::http::Request::builder()
             .method("DELETE")
@@ -2589,6 +2603,7 @@ pub(crate) async fn remove(
         return Ok(());
     }
     let _op = c.op.lock().await;
+    let _admission = c.admit_lifecycle_mutation(engine, true).await?;
     let record = c.record();
     if c.is_running() || record.state.status == "restarting" {
         if !force {
