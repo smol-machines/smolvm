@@ -2,12 +2,31 @@ use super::*;
 use crate::{config::VmRecord, db::SmolvmDb, storage::DiskFormat};
 
 fn isolated(test: &str, run: impl FnOnce(&std::path::Path)) {
+    isolated_in(test, tempfile::tempdir, run)
+}
+
+/// [`isolated`] under a root short enough that a socket bound in a machine's
+/// data directory fits `sun_path` (104 bytes on macOS, whose default temporary
+/// directory alone takes half of that).
+fn isolated_short(test: &str, run: impl FnOnce(&std::path::Path)) {
+    isolated_in(
+        test,
+        || tempfile::Builder::new().prefix("s").tempdir_in("/tmp"),
+        run,
+    )
+}
+
+fn isolated_in(
+    test: &str,
+    make_root: impl FnOnce() -> std::io::Result<tempfile::TempDir>,
+    run: impl FnOnce(&std::path::Path),
+) {
     const ROOT: &str = "SMOL_REVIEWED_CONTROL_TEST";
     if let Ok(root) = std::env::var(ROOT) {
         run(std::path::Path::new(&root));
         return;
     }
-    let root = tempfile::tempdir().unwrap();
+    let root = make_root().unwrap();
     std::fs::create_dir(root.path().join("rootfs")).unwrap();
     let output = std::process::Command::new(std::env::current_exe().unwrap())
         .args([
@@ -627,7 +646,7 @@ fn running_config_is_never_written_or_read_through_a_link() {
 /// The machine's own socket, served by this user, still takes them.
 #[test]
 fn live_changes_refuse_a_socket_replaced_by_a_link() {
-    isolated("live_changes_refuse_a_socket_replaced_by_a_link", |root| {
+    isolated_short("live_changes_refuse_a_socket_replaced_by_a_link", |root| {
         use std::io::{Read, Write};
         let dir = vm_data_dir("linked-socket");
         std::fs::create_dir_all(&dir).unwrap();
