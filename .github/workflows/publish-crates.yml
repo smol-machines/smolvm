@@ -17,6 +17,7 @@ name: Publish crates to crates.io
 #   smolvm-smoltcp, smolvm-tar, smolvm-protocol, smolvm-paths (leaves)
 #   → smolvm-network                 (needs the patched stack)
 #   → smolvm-pack, smolvm-smolfile   (need protocol)
+#   → smolvm-credentials             (needs protocol)
 #   → smolvm-registry                (needs pack)
 #   → smolvm-checkpoint              (needs pack; ships the checkpoint format spec)
 # smolvm-cuda / smolvm-cuda-guest are intentionally NOT published.
@@ -63,7 +64,7 @@ jobs:
 
           # Dependency order: a dep must be published (and indexed) before a
           # dependent, so its `version = "x"` requirement resolves on crates.io.
-          crate_paths=(vendor/smoltcp vendor/tar crates/smolvm-protocol crates/smolvm-paths crates/smolvm-network crates/smolvm-pack crates/smolvm-smolfile crates/smolvm-registry crates/smolvm-checkpoint)
+          crate_paths=(vendor/smoltcp vendor/tar crates/smolvm-protocol crates/smolvm-paths crates/smolvm-network crates/smolvm-pack crates/smolvm-smolfile crates/smolvm-credentials crates/smolvm-registry crates/smolvm-checkpoint)
 
           for c in "${crate_paths[@]}"; do
             name="$(grep -m1 '^name' "$c/Cargo.toml" | sed -E 's/.*"([^"]+)".*/\1/')"
