@@ -25,6 +25,7 @@ use std::path::Path;
 pub(crate) fn read(base: &Path, components: &[&str], max: u64) -> std::io::Result<Vec<u8>> {
     let (name, dirs) = split(components)?;
     let (dir, base_owner) = unix::open_dirs(base, dirs, false)?;
+    let base_owner = base_owner.uid;
     let file = std::fs::File::from(unix::open_at(
         &dir,
         name,
@@ -104,7 +105,7 @@ pub(crate) fn write_replacing(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let (name, dirs) = split(components)?;
-    let (dir, _) = unix::open_dirs(base, dirs, true)?;
+    let (dir, owner) = unix::open_dirs(base, dirs, true)?;
     let (tmp, fd) = unique_temp(name, |tmp| {
         unix::open_at(
             &dir,
@@ -115,7 +116,7 @@ pub(crate) fn write_replacing(
     })?;
     let written = Ok::<_, std::io::Error>(std::fs::File::from(fd))
         .and_then(|mut file| {
-            unix::adopt(&dir, &file)?;
+            unix::adopt(owner, &file)?;
             // its final mode whatever the umask was
             use std::os::unix::fs::PermissionsExt;
             file.set_permissions(std::fs::Permissions::from_mode(mode))?;
@@ -157,9 +158,10 @@ pub(crate) fn write_replacing(
 
 /// Overwrite `base/<components…>` with `bytes` in place, keeping its inode,
 /// for a file a running guest reads through a mount of its directory. The
-/// file is created (mode `0o644`) when missing; an existing one must be
-/// regular, have one name only and belong to this user or the base
-/// directory's owner. No component is followed if it is a link.
+/// file is created (mode `0o644`, and handed to the base directory's owner
+/// when root creates it) when missing; an existing one must be regular, have
+/// one name only and belong to this user, root or the base directory's owner.
+/// No component is followed if it is a link.
 #[cfg(unix)]
 pub(crate) fn write_in_place(
     base: &Path,
@@ -168,12 +170,12 @@ pub(crate) fn write_in_place(
 ) -> std::io::Result<()> {
     use std::io::Write;
     let (name, dirs) = split(components)?;
-    let (dir, base_owner) = unix::open_dirs(base, dirs, false)?;
+    let (dir, owner) = unix::open_dirs(base, dirs, false)?;
     let flags = libc::O_WRONLY | libc::O_NONBLOCK;
     let mut file = match unix::open_at(&dir, name, flags | libc::O_CREAT | libc::O_EXCL, 0o644) {
         Ok(created) => {
             let file = std::fs::File::from(created);
-            unix::adopt(&dir, &file)?;
+            unix::adopt(owner, &file)?;
             file
         }
         Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
@@ -181,7 +183,7 @@ pub(crate) fn write_in_place(
         }
         Err(e) => return Err(e),
     };
-    unix::check_file(&file, base_owner)?;
+    unix::check_file(&file, owner.uid)?;
     file.set_len(0)?;
     file.write_all(bytes)
 }
@@ -232,7 +234,8 @@ impl SocketFile {
 /// two) and belong to this user, root or `base`'s owner.
 #[cfg(unix)]
 pub(crate) fn socket(base: &Path, name: &str) -> std::io::Result<SocketFile> {
-    let (dir, dir_owner) = unix::open_dirs(base, &[], false)?;
+    let (dir, owner) = unix::open_dirs(base, &[], false)?;
+    let dir_owner = owner.uid;
     // (is a socket, names, owner, device, inode), read off the file itself, never a link's target
     #[cfg(target_os = "linux")]
     let (path_fd, (is_socket, nlink, uid, dev, ino)) = {
@@ -360,15 +363,24 @@ mod unix {
         })
     }
 
+    /// The owner of a machine's directory: what root hands the files and
+    /// directories it creates below it to.
+    #[derive(Clone, Copy)]
+    pub(crate) struct Owner {
+        pub(crate) uid: u32,
+        pub(crate) gid: u32,
+    }
+
     /// `base` (its own path followed as usual: it and its ancestors are
     /// trusted), then each of `dirs` below it, opened as directories without
-    /// following a link (a missing one made first with `create`), with the
-    /// owner of `base` as it was opened.
+    /// following a link, with the owner of `base` as it was opened. With
+    /// `create`, a missing one is made first; one root makes for another
+    /// user is handed to `base`'s owner ([`make_dir_handed_over`]).
     pub(super) fn open_dirs(
         base: &Path,
         dirs: &[&str],
         create: bool,
-    ) -> std::io::Result<(OwnedFd, u32)> {
+    ) -> std::io::Result<(OwnedFd, Owner)> {
         let path = c_name(base.as_os_str().as_bytes())?;
         // SAFETY: a NUL-terminated path.
         let mut dir = owned(unsafe {
@@ -377,33 +389,115 @@ mod unix {
                 libc::O_RDONLY | libc::O_DIRECTORY | libc::O_CLOEXEC,
             )
         })?;
-        let owner = std::fs::File::from(dir.try_clone()?).metadata()?.uid();
+        let meta = std::fs::File::from(dir.try_clone()?).metadata()?;
+        let owner = Owner {
+            uid: meta.uid(),
+            gid: meta.gid(),
+        };
+        let open =
+            |dir: &OwnedFd, name: &str| open_at(dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0);
         for name in dirs {
-            let mut made = false;
-            if create {
-                let c = component(name)?;
-                // SAFETY: a NUL-terminated name and a live directory descriptor.
-                if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), 0o755) } == 0 {
-                    made = true;
-                } else {
-                    let error = std::io::Error::last_os_error();
-                    if error.kind() != std::io::ErrorKind::AlreadyExists {
-                        return Err(error);
+            dir = match open(&dir, name) {
+                Err(e) if create && e.kind() == std::io::ErrorKind::NotFound => {
+                    // SAFETY: geteuid has no preconditions.
+                    match adopted_owner(unsafe { libc::geteuid() }, owner.uid, owner.gid) {
+                        Some((uid, gid)) => make_dir_handed_over(&dir, name, uid, gid)?,
+                        None => {
+                            make_dir_at(&dir, name, 0o755).or_else(|e| {
+                                if e.kind() == std::io::ErrorKind::AlreadyExists {
+                                    Ok(())
+                                } else {
+                                    Err(e)
+                                }
+                            })?;
+                            open(&dir, name)?
+                        }
                     }
                 }
-            }
-            let next = open_at(&dir, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
-            if made {
-                adopt(&dir, &std::fs::File::from(next.try_clone()?))?;
-            }
-            dir = next;
+                opened => opened?,
+            };
         }
         Ok((dir, owner))
     }
 
+    fn make_dir_at(dir: &OwnedFd, name: &str, mode: libc::mode_t) -> std::io::Result<()> {
+        let c = component(name)?;
+        // SAFETY: a NUL-terminated name and a live directory descriptor.
+        if unsafe { libc::mkdirat(dir.as_raw_fd(), c.as_ptr(), mode) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    fn remove_dir_at(dir: &OwnedFd, name: &str) -> std::io::Result<()> {
+        let name = component(name)?;
+        // SAFETY: a NUL-terminated name and a live directory descriptor.
+        if unsafe { libc::unlinkat(dir.as_raw_fd(), name.as_ptr(), libc::AT_REMOVEDIR) } != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(())
+    }
+
+    /// Make directory `name` in `parent` (which another user may write to),
+    /// owned by `uid`:`gid`, and open it. A directory is only ever handed
+    /// over on a descriptor known to be the one just made: it is made inside
+    /// a new staging directory private to this process, which nobody else
+    /// can enter to swap it, then renamed into place. Handing over whatever
+    /// is at `name` once made would let the other user rename one of root's
+    /// own directories there first. Should `name` appear meanwhile, that one
+    /// is opened as it is, not handed over.
+    pub(super) fn make_dir_handed_over(
+        parent: &OwnedFd,
+        name: &str,
+        uid: u32,
+        gid: u32,
+    ) -> std::io::Result<OwnedFd> {
+        let (stage_name, ()) = super::unique_temp(name, |tmp| make_dir_at(parent, tmp, 0o700))?;
+        let made = (|| {
+            let stage = open_at(parent, &stage_name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            // whatever is at the staging name now, nobody else may enter it
+            let meta = std::fs::File::from(stage.try_clone()?).metadata()?;
+            // SAFETY: geteuid has no preconditions.
+            if meta.uid() != unsafe { libc::geteuid() } || meta.mode() & 0o077 != 0 {
+                return Err(std::io::Error::other("staging directory is not private"));
+            }
+            make_dir_at(&stage, name, 0o755)?;
+            let child = open_at(&stage, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)?;
+            // SAFETY: a live descriptor.
+            if unsafe { libc::fchown(child.as_raw_fd(), uid, gid) } != 0 {
+                let error = std::io::Error::last_os_error();
+                let _ = remove_dir_at(&stage, name);
+                return Err(error);
+            }
+            let (from, to) = (component(name)?, component(name)?);
+            // SAFETY: NUL-terminated names and live directory descriptors.
+            if unsafe {
+                libc::renameat(
+                    stage.as_raw_fd(),
+                    from.as_ptr(),
+                    parent.as_raw_fd(),
+                    to.as_ptr(),
+                )
+            } != 0
+            {
+                let error = std::io::Error::last_os_error();
+                let _ = remove_dir_at(&stage, name);
+                return match error.raw_os_error() {
+                    Some(libc::EEXIST) | Some(libc::ENOTEMPTY) => {
+                        open_at(parent, name, libc::O_RDONLY | libc::O_DIRECTORY, 0)
+                    }
+                    _ => Err(error),
+                };
+            }
+            Ok(child)
+        })();
+        let _ = remove_dir_at(parent, &stage_name);
+        made
+    }
+
     /// An opened file may be read or written: regular, one name only (a hard
-    /// link to a file elsewhere has two), and owned by this process's user or
-    /// by `base_owner`, never by anyone else.
+    /// link to a file elsewhere has two), and owned by this process's user,
+    /// root or `base_owner` ([`owner_allowed`]), never by anyone else.
     pub(super) fn check_file(file: &std::fs::File, base_owner: u32) -> std::io::Result<()> {
         let meta = file.metadata()?;
         if !meta.is_file() {
@@ -429,15 +523,15 @@ mod unix {
         owner == me || owner == 0 || owner == base_owner
     }
 
-    /// Give `made`, just created in `dir` by this process, the owner of `dir`
-    /// when this process is root and `dir` is another user's: a file root
-    /// writes into a machine's directory stays readable by the machine's own
-    /// process, as everything else there is.
-    pub(super) fn adopt(dir: &OwnedFd, made: &std::fs::File) -> std::io::Result<()> {
+    /// Give `made`, a file this process just created below a machine's
+    /// directory, that directory's `owner` when this process is root and the
+    /// directory is another user's: a file root writes there stays readable
+    /// by the machine's own process, as everything else there is, whoever
+    /// owns the directory it is created in (one an older root left behind).
+    pub(super) fn adopt(owner: Owner, made: &std::fs::File) -> std::io::Result<()> {
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
-        let meta = std::fs::File::from(dir.try_clone()?).metadata()?;
-        match adopted_owner(me, meta.uid(), meta.gid()) {
+        match adopted_owner(me, owner.uid, owner.gid) {
             // SAFETY: a live descriptor.
             Some((uid, gid)) if unsafe { libc::fchown(made.as_raw_fd(), uid, gid) } != 0 => {
                 Err(std::io::Error::last_os_error())
@@ -647,6 +741,39 @@ mod tests {
         // SAFETY: geteuid has no preconditions.
         let me = unsafe { libc::geteuid() };
         assert_eq!(std::fs::metadata(dir.path().join("d/f")).unwrap().uid(), me);
+    }
+
+    /// A directory handed to another owner is made in a private staging
+    /// directory and renamed into place: it ends up at its name, owned as
+    /// asked, with no staging directory left; a directory already at the
+    /// name is opened as it is, never replaced.
+    #[test]
+    fn a_handed_over_directory_is_made_privately_then_moved_into_place() {
+        use std::os::unix::fs::MetadataExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (parent, owner) = unix::open_dirs(dir.path(), &[], false).unwrap();
+        let made = unix::make_dir_handed_over(&parent, "ca", owner.uid, owner.gid).unwrap();
+        let meta = std::fs::metadata(dir.path().join("ca")).unwrap();
+        assert!(meta.is_dir());
+        assert_eq!((meta.uid(), meta.gid()), (owner.uid, owner.gid));
+        assert_eq!(
+            std::fs::File::from(made).metadata().unwrap().ino(),
+            meta.ino(),
+            "the descriptor is the directory now at the name"
+        );
+        assert_eq!(list(dir.path(), &[]).unwrap(), ["ca"], "no staging left");
+
+        std::fs::create_dir(dir.path().join("taken")).unwrap();
+        std::fs::write(dir.path().join("taken/keep"), b"x").unwrap();
+        let taken = unix::make_dir_handed_over(&parent, "taken", owner.uid, owner.gid).unwrap();
+        assert_eq!(
+            std::fs::File::from(taken).metadata().unwrap().ino(),
+            std::fs::metadata(dir.path().join("taken")).unwrap().ino()
+        );
+        assert!(dir.path().join("taken/keep").exists());
+        let mut names = list(dir.path(), &[]).unwrap();
+        names.sort();
+        assert_eq!(names, ["ca", "taken"], "no staging left");
     }
 
     /// A socket is found only when it is one, under its own single name.
