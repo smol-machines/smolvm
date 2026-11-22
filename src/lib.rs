@@ -113,6 +113,7 @@ pub mod log_rotation;
 /// One machine description, resolved the same way by every creation path.
 pub mod machine_spec;
 pub mod network;
+pub(crate) mod nofollow;
 /// Shared from-VM pack export used by every `pack create --from-vm` front-end.
 pub mod pack_export;
 pub mod pack_seed;
