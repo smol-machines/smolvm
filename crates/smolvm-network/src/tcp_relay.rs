@@ -327,7 +327,8 @@ fn proxy_channel(wake: RelayWaker) -> (ToProxy, Receiver<Vec<u8>>, RelayWaker) {
 pub enum RelayTarget {
     /// Open a new outbound host `TcpStream` to the destination.
     Connect(SocketAddr),
-    /// Static allow under mediation; still subject to mediated time limits.
+    /// Static allow under mediation: dialed directly, relayed like `Connect`,
+    /// and not subject to the mediated time limits.
     DirectMediated(SocketAddr),
     /// Use an already-accepted host `TcpStream` from a published port listener.
     Attached(TcpStream),
@@ -348,12 +349,10 @@ pub enum RelayTarget {
 }
 
 impl RelayTarget {
-    /// A flow under mediated egress, bounded by its idle and total lifetime.
+    /// A flow the decider was asked about, bounded by its idle and total
+    /// lifetime. A `DirectMediated` flow is dialed without asking it and is not.
     pub(crate) fn is_mediated(&self) -> bool {
-        matches!(
-            self,
-            RelayTarget::Mediated { .. } | RelayTarget::DirectMediated(_)
-        )
+        matches!(self, RelayTarget::Mediated { .. })
     }
 }
 
@@ -1608,7 +1607,7 @@ pub(crate) fn prepare_host_stream(stream: &TcpStream) -> io::Result<()> {
 
 /// How a flow entered the relay.
 pub(crate) struct RelayFlow {
-    /// Bounded by the mediated connection lifetime.
+    /// The decider was asked about it; bounded by the mediated lifetime.
     pub(crate) mediated: bool,
     /// Guest bytes already read (with the offset written so far) that must
     /// reach the host before anything else.
@@ -1729,7 +1728,7 @@ impl RelayPump {
         Ok(())
     }
 
-    /// A mediated flow past its idle or total lifetime.
+    /// A flow the decider was asked about, past its idle or total lifetime.
     pub(crate) fn expired(&self) -> bool {
         self.mediated
             && (self.started.elapsed() >= MEDIATED_MAX_LIFETIME
@@ -2106,6 +2105,37 @@ mod initial_bytes_tests {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_static_allow_under_mediation_is_not_capped_but_a_flow_the_decider_decides_is() {
+        use smolvm_protocol::{EgressRule, RuleAction};
+        let gateway: IpAddr = "100.96.0.1".parse().unwrap();
+        let allowed: SocketAddr = "203.0.113.9:22".parse().unwrap();
+        let policy = EgressPolicy::unrestricted()
+            .with_rules(&[EgressRule {
+                transport: None,
+                cidr: Some("203.0.113.9/32".into()),
+                ports: None,
+                action: RuleAction::Allow,
+            }])
+            .unwrap();
+        let table = TcpRelayTable::new(None, policy, vec![gateway], None).with_intercept(Some(
+            crate::StreamInterception::Mediated(crate::MediatedBinding {
+                endpoint: crate::InterceptEndpoint {
+                    addr: "127.0.0.1:43123".parse().unwrap(),
+                    token: [9; 32],
+                },
+                machine_id: [7; 16],
+                parent_id: [0; 16],
+            }),
+        ));
+        let direct = table.outbound_target(allowed);
+        assert!(matches!(direct, RelayTarget::DirectMediated(_)));
+        assert!(!direct.is_mediated());
+        assert!(table
+            .outbound_target("198.51.100.7:443".parse().unwrap())
+            .is_mediated());
+    }
 
     #[test]
     fn flow_summary_splits_directions_and_finds_the_oldest_outbound_flow() {
