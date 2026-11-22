@@ -315,6 +315,67 @@ fn decode_path(p: Vec<u8>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Child half of `reconcile_runs_under_the_vmm_seccomp_filter`: confines this
+    /// fresh process with the VMM's enforcing filter, then reconciles the tree
+    /// named in `SMOLVM_TEST_RECONCILE_UNDER_SECCOMP`. A syscall the filter does
+    /// not allow kills it with SIGSYS. Does nothing in a normal test run.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn reconcile_under_seccomp_child() {
+        let Some(root) = std::env::var_os("SMOLVM_TEST_RECONCILE_UNDER_SECCOMP") else {
+            return;
+        };
+        let program =
+            crate::process::build_seccomp_program(true, false).expect("build seccomp program");
+        seccompiler::apply_filter(&program).expect("apply seccomp filter");
+        let mut snapshot = Snapshot::new().expect("open snapshot");
+        let stop = AtomicBool::new(false);
+        let mut changes = 0_usize;
+        snapshot
+            .reconcile(&[PathBuf::from(root)], &stop, |_| {
+                changes += 1;
+                true
+            })
+            .expect("reconcile");
+        assert!(changes > 0, "reconcile saw the tree");
+    }
+
+    /// The mount watcher reconciles inside the VMM after its seccomp filter is
+    /// on, so everything a reconcile reaches, SQLite's VFS included, must be on
+    /// the allowlist. Runs in a fresh process: work after a fork of the
+    /// multithreaded test harness can deadlock on locks another thread held.
+    #[cfg(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    ))]
+    #[test]
+    fn reconcile_runs_under_the_vmm_seccomp_filter() {
+        let dir = tempfile::tempdir().unwrap();
+        for d in 0..3 {
+            let sub = dir.path().join(format!("d{d}"));
+            std::fs::create_dir(&sub).unwrap();
+            for f in 0..20 {
+                std::fs::write(sub.join(f.to_string()), b"x").unwrap();
+            }
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "agent::fsnotify_watch::reconcile::tests::reconcile_under_seccomp_child",
+                "--test-threads=1",
+            ])
+            .env("SMOLVM_TEST_RECONCILE_UNDER_SECCOMP", dir.path())
+            .status()
+            .unwrap();
+        assert!(
+            status.success(),
+            "reconcile under the VMM filter: {status:?}"
+        );
+    }
     #[test]
     fn recovery_detects_deleted_trees_replacement_and_old_deep_files() {
         let root = tempfile::tempdir().unwrap();
