@@ -71,7 +71,7 @@ use smoltcp::socket::udp::{PacketBuffer, PacketMetadata, Socket as UdpSocket, Ud
 use smoltcp::time::Instant;
 use smoltcp::wire::{
     EthernetAddress, EthernetFrame, EthernetProtocol, HardwareAddress, IpAddress, IpCidr,
-    IpListenEndpoint, IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
+    IpProtocol, IpVersion, Ipv4Packet, Ipv6Packet, TcpPacket, UdpPacket,
 };
 use std::collections::{HashMap, VecDeque};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr};
@@ -96,11 +96,14 @@ const DNS_BACKLOG_RETRY: Duration = Duration::from_millis(2);
 // DNS-over-TCP to the gateway. Real resolvers (and resolv.conf clients) fall
 // back to TCP for truncated answers and EDNS, so the gateway filter must serve
 // TCP/53 in addition to UDP/53. A small pool of listening sockets handles
-// concurrent queries; DNS/TCP is rare and short-lived (one query per
-// connection), so a few suffice.
+// concurrent connections.
 const DNS_TCP_LISTENERS: usize = 4;
 const DNS_TCP_RX_BYTES: usize = 4096;
 const DNS_TCP_TX_BYTES: usize = 8192;
+// Bound how long an idle or stalled connection can hold a listener. Partial
+// messages do not extend the deadline (RFC 7766 §6.2.3).
+const DNS_TCP_IDLE_TIMEOUT: Duration = Duration::from_secs(10);
+const DNS_TCP_RST_GRACE: Duration = Duration::from_secs(1);
 // A length-prefixed DNS message is bounded by a 16-bit length, but the gateway
 // only needs to handle ordinary queries/responses; cap to keep buffers small
 // and reject a guest that sends a bogus oversized prefix.
@@ -572,9 +575,8 @@ fn run_network_stack(
         // relays, their output to the guest, and their timers.
         let new_connections = relays.service(&mut interface, &mut device, now);
         wake_guest_if_needed(&queues, &device);
-        // Enqueue guest DNS queries to the offload thread (or answer blocked
-        // ones locally), then deliver any answers it has produced back to the
-        // guest. Neither step blocks on the upstream resolver.
+        // Exchange guest DNS queries and answers with the offload thread (or
+        // answer blocked queries locally), without blocking on the resolver.
         let mut woke_dns = false;
         woke_dns |= dispatch_dns_udp(
             dns_socket_handle,
@@ -583,6 +585,17 @@ fn run_network_stack(
             &dns_routing,
             &mut dns_gateway,
             &dns_channels.to_relay,
+        );
+        // Deliver first so a TCP connection can drain the answer and service
+        // its next buffered query in the same poll-loop turn.
+        deliver_dns_responses(
+            dns_socket_handle,
+            &dns_tcp_handles,
+            &mut dns_tcp_conns,
+            &mut sockets,
+            &egress,
+            &mut dns_gateway,
+            &dns_channels.from_relay,
         );
         woke_dns |= process_dns_tcp(
             &dns_tcp_handles,
@@ -596,15 +609,6 @@ fn run_network_stack(
         if woke_dns {
             dns_channels.relay_thread_wake.wake();
         }
-        deliver_dns_responses(
-            dns_socket_handle,
-            &dns_tcp_handles,
-            &mut dns_tcp_conns,
-            &mut sockets,
-            &egress,
-            &mut dns_gateway,
-            &dns_channels.from_relay,
-        );
 
         // General UDP: forward staged guest datagrams to the relay thread,
         // deliver any replies it produced, and expire idle destination sockets.
@@ -690,6 +694,7 @@ fn run_network_stack(
         // Second egress pass: DNS responses or relay data may have queued more
         // packets for the guest.
         flush_interface_egress(&mut interface, &mut device, &mut sockets, now);
+        rearm_dns_tcp_sockets(&dns_tcp_handles, &mut dns_tcp_conns, &mut sockets);
         wake_guest_if_needed(&queues, &device);
 
         let shared_delay = interface
@@ -713,6 +718,12 @@ fn run_network_stack(
         } else {
             timeout.map(|t| t.min(DNS_BACKLOG_RETRY))
         };
+        let dns_tcp_delay = dns_tcp_conns
+            .iter()
+            .filter_map(|conn| conn.deadline)
+            .min()
+            .map(|deadline| deadline.saturating_duration_since(StdInstant::now()));
+        let timeout = timeout.into_iter().chain(dns_tcp_delay).min();
 
         // Block until either wake notifies the shared poller or the timeout
         // elapses. The wakes are notify-only, so no events are reported; the
@@ -1273,22 +1284,24 @@ fn deliver_dns_responses(
 
         // Otherwise it is a DNS/TCP answer: find the awaiting listener.
         for (handle, conn) in dns_tcp_handles.iter().zip(dns_tcp_conns.iter_mut()) {
-            match conn.awaiting {
-                Some(pending) if pending.id == response.id => {
-                    conn.awaiting = None;
-                    if let Some(answer) = response.answer {
-                        if pending.learn {
-                            egress.learn_dns_answer(&answer);
-                        }
-                        frame_dns_tcp_response(conn, &answer);
+            let Some(pending) = conn.awaiting.filter(|pending| pending.id == response.id) else {
+                continue;
+            };
+            conn.awaiting = None;
+            let socket = sockets.get_mut::<tcp::Socket>(*handle);
+            if socket.may_send() {
+                let now = StdInstant::now();
+                if let Some(answer) = response.answer {
+                    if pending.learn {
+                        egress.learn_dns_answer(&answer);
                     }
-                    conn.done = true;
-                    let socket = sockets.get_mut::<tcp::Socket>(*handle);
-                    drain_dns_tcp_tx(socket, conn);
-                    break;
+                    frame_dns_tcp_response(conn, &answer);
+                    conn.deadline = Some(now + DNS_TCP_IDLE_TIMEOUT);
+                } else {
+                    conn.close(socket, now);
                 }
-                _ => {}
             }
+            break;
         }
     }
 }
@@ -1303,23 +1316,51 @@ fn frame_dns_tcp_response(conn: &mut DnsTcpConn, response: &[u8]) {
 }
 
 /// Create the pool of smoltcp TCP listening sockets bound to the gateway's
-/// port 53. Each accepts one DNS-over-TCP connection at a time and is re-armed
-/// by [`process_dns_tcp`] after the connection closes.
+/// port 53. Each accepts one DNS-over-TCP connection at a time.
 fn add_dns_tcp_sockets(sockets: &mut SocketSet<'_>) -> Vec<SocketHandle> {
     (0..DNS_TCP_LISTENERS)
         .map(|_| {
             let rx_buffer = tcp::SocketBuffer::new(vec![0u8; DNS_TCP_RX_BYTES]);
             let tx_buffer = tcp::SocketBuffer::new(vec![0u8; DNS_TCP_TX_BYTES]);
             let mut socket = tcp::Socket::new(rx_buffer, tx_buffer);
-            socket
-                .listen(IpListenEndpoint {
-                    addr: None,
-                    port: DNS_SOCKET_PORT,
-                })
-                .expect("failed to listen on gateway DNS TCP socket");
+            listen_dns_tcp(&mut socket);
             sockets.add(socket)
         })
         .collect()
+}
+
+fn listen_dns_tcp(socket: &mut tcp::Socket<'_>) {
+    // smoltcp owns the handshake timeout: a reset during the handshake can
+    // return the socket directly to LISTEN and a new SYN can arrive before
+    // the DNS service pass observes that transition.
+    socket.set_timeout(Some(DNS_TCP_IDLE_TIMEOUT.into()));
+    socket
+        .listen(DNS_SOCKET_PORT)
+        .expect("failed to listen on gateway DNS TCP socket");
+}
+
+/// Run after egress, so a closed socket can send any pending RST before reuse.
+fn rearm_dns_tcp_sockets(
+    handles: &[SocketHandle],
+    conns: &mut [DnsTcpConn],
+    sockets: &mut SocketSet<'_>,
+) {
+    for (handle, conn) in handles.iter().zip(conns.iter_mut()) {
+        let socket = sockets.get_mut::<tcp::Socket>(*handle);
+        if socket.is_open() {
+            continue;
+        }
+        if socket.state() == tcp::State::Closed && socket.remote_endpoint().is_some() {
+            // If egress is blocked, give the RST a chance to go out, but don't
+            // leave the listener unavailable if the peer is unreachable.
+            let now = StdInstant::now();
+            if now < *conn.deadline.get_or_insert(now + DNS_TCP_RST_GRACE) {
+                continue;
+            }
+        }
+        *conn = DnsTcpConn::default();
+        listen_dns_tcp(socket);
+    }
 }
 
 /// Per-listener state for an in-flight DNS-over-TCP connection: the
@@ -1333,12 +1374,56 @@ struct DnsTcpConn {
     tx: Vec<u8>,
     /// Bytes of `tx` already written to the socket.
     tx_sent: usize,
-    /// The query has been answered (or rejected); drain `tx` then close.
-    done: bool,
-    /// Set once the query has been handed to the DNS offload thread and we are
-    /// waiting for its answer (carries the correlation id + learn flag). While
-    /// set, the connection is parked — `deliver_dns_responses` completes it.
+    /// At most one forwarded query per connection. Subsequent queries wait
+    /// in the socket's bounded RX buffer until this answer is queued.
     awaiting: Option<DnsTcpPending>,
+    /// Idle/stall deadline, or the deadline for the peer to finish closing.
+    deadline: Option<StdInstant>,
+}
+
+impl DnsTcpConn {
+    fn close(&mut self, socket: &mut tcp::Socket<'_>, now: StdInstant) {
+        socket.close();
+        self.deadline = Some(now + DNS_TCP_IDLE_TIMEOUT);
+    }
+
+    /// Read exactly one frame, leaving any pipelined bytes in the TCP socket.
+    /// A partial prefix or body is retained for the next poll.
+    fn read_query(&mut self, socket: &mut tcp::Socket<'_>) -> Result<Option<Vec<u8>>, ()> {
+        fill_dns_tcp_rx(socket, &mut self.rx, 2);
+        if self.rx.len() < 2 {
+            return Ok(None);
+        }
+        let msg_len = u16::from_be_bytes([self.rx[0], self.rx[1]]) as usize;
+        if msg_len == 0 || msg_len > DNS_TCP_MAX_MSG {
+            return Err(());
+        }
+        let frame_len = 2 + msg_len;
+        fill_dns_tcp_rx(socket, &mut self.rx, frame_len);
+        if self.rx.len() < frame_len {
+            return Ok(None);
+        }
+        let query = self.rx[2..].to_vec();
+        self.rx.clear();
+        Ok(Some(query))
+    }
+}
+
+fn fill_dns_tcp_rx(socket: &mut tcp::Socket<'_>, rx: &mut Vec<u8>, len: usize) {
+    while rx.len() < len && socket.can_recv() {
+        let remaining = len - rx.len();
+        if socket
+            .recv(|data| {
+                let n = data.len().min(remaining);
+                rx.extend_from_slice(&data[..n]);
+                (n, n)
+            })
+            .unwrap_or(0)
+            == 0
+        {
+            break;
+        }
+    }
 }
 
 /// Correlation state for a DNS/TCP query parked on the offload thread.
@@ -1348,10 +1433,9 @@ struct DnsTcpPending {
     learn: bool,
 }
 
-/// Service the DNS-over-TCP listening sockets: accept a connection, read the
-/// length-prefixed query, apply the allow-host filter, forward allowed queries
-/// upstream over TCP, write the length-prefixed response, and close. Closed
-/// sockets are re-armed to listen again.
+/// Service an ordered sequence of length-prefixed DNS queries on each TCP
+/// connection. Apply the allow-host filter to every query and relay allowed
+/// queries without blocking the poll loop.
 fn process_dns_tcp(
     handles: &[SocketHandle],
     conns: &mut [DnsTcpConn],
@@ -1362,94 +1446,68 @@ fn process_dns_tcp(
     to_relay: &SyncSender<DnsQuery>,
 ) -> bool {
     let mut queued = false;
+    let now = StdInstant::now();
     for (handle, conn) in handles.iter().zip(conns.iter_mut()) {
         let socket = sockets.get_mut::<tcp::Socket>(*handle);
 
-        // A closed/finished socket: reset state and re-arm to accept the next
-        // connection. `listen` only succeeds from the CLOSED state; if the
-        // socket is still draining (e.g. TIME-WAIT) the error is ignored and the
-        // next poll retries.
-        if !socket.is_open() {
-            if !conn.rx.is_empty() || !conn.tx.is_empty() || conn.done || conn.awaiting.is_some() {
-                *conn = DnsTcpConn::default();
+        if !socket.is_active() || socket.state() == tcp::State::SynReceived {
+            continue;
+        }
+        // The application now owns the timeout; TCP packets or incomplete DNS
+        // frames alone must not extend it.
+        socket.set_timeout(None);
+        if now >= *conn.deadline.get_or_insert(now + DNS_TCP_IDLE_TIMEOUT) {
+            if socket.may_send() && conn.tx.is_empty() && socket.send_queue() == 0 {
+                conn.close(socket, now);
+            } else {
+                // A stalled write or FIN must not hold a listener.
+                socket.abort();
+                conn.deadline = None;
             }
-            let _ = socket.listen(IpListenEndpoint {
-                addr: None,
-                port: DNS_SOCKET_PORT,
-            });
+            continue;
+        }
+        if !socket.may_send() || conn.awaiting.is_some() {
             continue;
         }
 
-        // Parked awaiting the offload thread's answer: nothing to do here until
-        // `deliver_dns_responses` fills `tx` / sets `done`.
-        if conn.awaiting.is_some() {
-            continue;
-        }
-
-        // Already answered: flush whatever response remains, then close.
-        if conn.done {
-            drain_dns_tcp_tx(socket, conn);
-            continue;
-        }
-
-        // Accumulate the length-prefixed query.
-        while socket.can_recv() {
-            let appended = socket.recv(|data| (data.len(), data.to_vec()));
-            match appended {
-                Ok(bytes) if !bytes.is_empty() => conn.rx.extend_from_slice(&bytes),
-                _ => break,
+        loop {
+            if !drain_dns_tcp_tx(socket, conn) {
+                break;
             }
-        }
-
-        // Reject a guest that floods without ever completing a message.
-        if conn.rx.len() > DNS_TCP_MAX_MSG + 2 {
-            conn.done = true;
-            socket.close();
-            continue;
-        }
-
-        if conn.rx.len() >= 2 {
-            let msg_len = u16::from_be_bytes([conn.rx[0], conn.rx[1]]) as usize;
-            if msg_len == 0 || msg_len > DNS_TCP_MAX_MSG {
-                conn.done = true;
-                socket.close();
-                continue;
-            }
-            if conn.rx.len() >= 2 + msg_len {
-                let query = conn.rx[2..2 + msg_len].to_vec();
-                virtio_net_log!(
-                    "virtio-net: DNS/TCP query query_len={} upstream_dns={}",
-                    query.len(),
-                    routing.upstream
-                );
-                match classify_dns_query(&query, egress, routing) {
-                    DnsDecision::Immediate(response) => {
-                        frame_dns_tcp_response(conn, &response);
-                        conn.done = true;
-                        drain_dns_tcp_tx(socket, conn);
-                    }
-                    DnsDecision::Forward { learn } => {
-                        // Hand the query to the offload thread and park the
-                        // connection; the poll loop stays free.
-                        let id = gateway.next_id();
-                        match to_relay.try_send(DnsQuery {
-                            id,
-                            transport: DnsTransport::Tcp,
-                            upstream: routing.upstream,
-                            query,
-                        }) {
-                            Ok(()) => {
-                                conn.awaiting = Some(DnsTcpPending { id, learn });
-                                queued = true;
-                            }
-                            Err(_) => {
-                                // Relay unavailable/full: close empty-handed
-                                // (guest sees EOF, then retries — DNS semantics).
-                                conn.done = true;
-                                socket.close();
-                            }
+            let query = match conn.read_query(socket) {
+                Ok(Some(query)) => query,
+                Ok(None) if socket.may_recv() => break,
+                // Invalid length or peer EOF with no complete query left.
+                // Finish any buffered replies before sending our FIN.
+                Ok(None) | Err(()) => {
+                    conn.close(socket, now);
+                    break;
+                }
+            };
+            conn.deadline = Some(now + DNS_TCP_IDLE_TIMEOUT);
+            virtio_net_log!(
+                "virtio-net: DNS/TCP query query_len={} upstream_dns={}",
+                query.len(),
+                routing.upstream
+            );
+            match classify_dns_query(&query, egress, routing) {
+                DnsDecision::Immediate(response) => frame_dns_tcp_response(conn, &response),
+                DnsDecision::Forward { learn } => {
+                    let id = gateway.next_id();
+                    match to_relay.try_send(DnsQuery {
+                        id,
+                        transport: DnsTransport::Tcp,
+                        upstream: routing.upstream,
+                        query,
+                    }) {
+                        Ok(()) => {
+                            conn.awaiting = Some(DnsTcpPending { id, learn });
+                            queued = true;
                         }
+                        // Preserve the existing failure behavior: EOF on relay errors.
+                        Err(_) => conn.close(socket, now),
                     }
+                    break;
                 }
             }
         }
@@ -1457,18 +1515,20 @@ fn process_dns_tcp(
     queued
 }
 
-/// Write as much of the pending framed response as the socket will accept; once
-/// fully sent, close the connection (the guest reads the answer then sees EOF).
-fn drain_dns_tcp_tx(socket: &mut tcp::Socket<'_>, conn: &mut DnsTcpConn) {
+/// Drain the pending frame into the socket; return false under backpressure.
+fn drain_dns_tcp_tx(socket: &mut tcp::Socket<'_>, conn: &mut DnsTcpConn) -> bool {
     while conn.tx_sent < conn.tx.len() && socket.can_send() {
         match socket.send_slice(&conn.tx[conn.tx_sent..]) {
             Ok(n) if n > 0 => conn.tx_sent += n,
             _ => break,
         }
     }
-    if conn.tx_sent >= conn.tx.len() {
-        socket.close();
+    if conn.tx_sent < conn.tx.len() {
+        return false;
     }
+    conn.tx.clear();
+    conn.tx_sent = 0;
+    true
 }
 
 fn flush_interface_egress(
@@ -1872,6 +1932,206 @@ mod tests {
             classify_guest_frame(&tcp_syn_frame([100, 96, 5, 2], 443), &[gw], None),
             FrameAction::TcpSyn { .. }
         ));
+    }
+
+    #[test]
+    fn dns_tcp_answers_two_pipelined_queries_on_one_connection() {
+        check_dns_tcp_pipeline(false);
+    }
+
+    #[test]
+    fn dns_tcp_answers_a_split_pipeline_after_peer_half_close() {
+        check_dns_tcp_pipeline(true);
+    }
+
+    fn check_dns_tcp_pipeline(split_and_half_close: bool) {
+        use crate::dns_cache::tests::query;
+        use std::sync::mpsc::sync_channel;
+
+        let endpoint = |last_octet| {
+            let ip = Ipv4Addr::new(192, 0, 2, last_octet);
+            let mac = EthernetAddress([2, 0, 0, 0, 0, last_octet]);
+            let queues = NetworkFrameQueues::shared(32);
+            let mut device = VirtioNetworkDevice::new(queues.clone(), 1500);
+            let mut iface = Interface::new(
+                Config::new(HardwareAddress::Ethernet(mac)),
+                &mut device,
+                Instant::ZERO,
+            );
+            iface
+                .update_ip_addrs(|addrs| addrs.push(IpCidr::new(IpAddress::Ipv4(ip), 24)).unwrap());
+            (ip, queues, device, iface)
+        };
+        let (server_ip, server_queues, mut server_dev, mut server_iface) = endpoint(1);
+        let (client_ip, client_queues, mut client_dev, mut client_iface) = endpoint(2);
+        let mut sockets = SocketSet::new(vec![]);
+        let mut client_sockets = SocketSet::new(vec![]);
+        let udp = add_dns_socket(&mut sockets);
+        let handles = add_dns_tcp_sockets(&mut sockets);
+        let mut conns: Vec<_> = handles.iter().map(|_| DnsTcpConn::default()).collect();
+        let mut client = tcp::Socket::new(
+            tcp::SocketBuffer::new(vec![0; 1024]),
+            tcp::SocketBuffer::new(vec![0; 1024]),
+        );
+        client
+            .connect(
+                client_iface.context(),
+                (server_ip, DNS_SOCKET_PORT),
+                (client_ip, 49152),
+            )
+            .unwrap();
+        let client = client_sockets.add(client);
+        let egress = EgressPolicy::new(None, None);
+        let routing = DnsRouting {
+            upstream: server_ip,
+            gateway: server_ip,
+            #[cfg(unix)]
+            switch: None,
+        };
+        let mut gateway = DnsGateway::new();
+        let (to_relay, queries) = sync_channel(4);
+        let (answers, from_relay) = sync_channel(4);
+        let queries_on_wire = [
+            query(123, "example.com", 1, false),
+            query(456, "example.com", 28, false),
+        ];
+        let mut sent = 0;
+        let mut forwarded = Vec::new();
+        let mut received = Vec::new();
+        let mut expected = Vec::new();
+        let frame = |out: &mut Vec<u8>, message: &[u8]| {
+            out.extend_from_slice(&(message.len() as u16).to_be_bytes());
+            out.extend_from_slice(message);
+        };
+        let mut pipeline = Vec::new();
+        for message in &queries_on_wire {
+            frame(&mut pipeline, message);
+            frame(
+                &mut expected,
+                &dns::error_response(message, dns::DNS_RCODE_NXDOMAIN),
+            );
+        }
+
+        let process =
+            |conns: &mut [DnsTcpConn], sockets: &mut SocketSet<'_>, gateway: &mut DnsGateway| {
+                process_dns_tcp(
+                    &handles, conns, sockets, &egress, &routing, gateway, &to_relay,
+                );
+            };
+        for tick in 0..100 {
+            let now = Instant::from_millis(tick * 10);
+            while client_dev.stage_next_frame().is_some() {
+                client_iface.poll_ingress_single(now, &mut client_dev, &mut client_sockets);
+            }
+            flush_interface_egress(&mut client_iface, &mut client_dev, &mut client_sockets, now);
+            while let Some(frame) = client_queues.host_to_guest.pop() {
+                server_queues.guest_to_host.push(frame).unwrap();
+            }
+            while server_dev.stage_next_frame().is_some() {
+                server_iface.poll_ingress_single(now, &mut server_dev, &mut sockets);
+            }
+            flush_interface_egress(&mut server_iface, &mut server_dev, &mut sockets, now);
+            rearm_dns_tcp_sockets(&handles, &mut conns, &mut sockets);
+            while let Some(frame) = server_queues.host_to_guest.pop() {
+                client_queues.guest_to_host.push(frame).unwrap();
+            }
+
+            let socket = client_sockets.get_mut::<tcp::Socket>(client);
+            if sent < pipeline.len() && socket.can_send() {
+                // Split the first length prefix across two poll-loop turns.
+                let end = if split_and_half_close && sent == 0 {
+                    1
+                } else {
+                    pipeline.len()
+                };
+                assert_eq!(socket.send_slice(&pipeline[sent..end]).unwrap(), end - sent);
+                sent = end;
+                if split_and_half_close && sent == pipeline.len() {
+                    socket.close();
+                }
+            }
+            while socket.can_recv() {
+                socket
+                    .recv(|data| {
+                        received.extend_from_slice(data);
+                        (data.len(), ())
+                    })
+                    .unwrap();
+            }
+            if sent == pipeline.len() {
+                if !socket.may_recv() {
+                    assert!(split_and_half_close, "gateway closed the connection early");
+                    break;
+                }
+                if !split_and_half_close
+                    && received.len() >= expected.len()
+                    && handles
+                        .iter()
+                        .all(|h| sockets.get::<tcp::Socket>(*h).send_queue() == 0)
+                {
+                    break;
+                }
+            }
+            deliver_dns_responses(
+                udp,
+                &handles,
+                &mut conns,
+                &mut sockets,
+                &egress,
+                &mut gateway,
+                &from_relay,
+            );
+            process(&mut conns, &mut sockets, &mut gateway);
+            while let Ok(query) = queries.try_recv() {
+                let answer = dns::error_response(&query.query, dns::DNS_RCODE_NXDOMAIN);
+                forwarded.push(query.query);
+                answers
+                    .send(DnsResponse {
+                        id: query.id,
+                        answer: Some(answer),
+                    })
+                    .unwrap();
+            }
+        }
+
+        assert_eq!(sent, pipeline.len(), "client did not send the pipeline");
+        if split_and_half_close {
+            assert!(
+                !client_sockets.get::<tcp::Socket>(client).may_recv(),
+                "gateway did not close after peer EOF"
+            );
+        }
+        assert_eq!(
+            received, expected,
+            "expected two framed replies on the same connection"
+        );
+        assert_eq!(forwarded, queries_on_wire);
+
+        if !split_and_half_close {
+            let (index, &handle) = handles
+                .iter()
+                .enumerate()
+                .find(|(_, h)| sockets.get::<tcp::Socket>(**h).state() == tcp::State::Established)
+                .unwrap();
+            // An idle connection gets FIN. If the peer does not finish closing,
+            // abort it and re-arm the slot only after egress has sent its RST.
+            for (now, state) in [(1000, tcp::State::FinWait1), (11000, tcp::State::Closed)] {
+                conns[index].deadline = Some(StdInstant::now());
+                process(&mut conns, &mut sockets, &mut gateway);
+                assert_eq!(sockets.get::<tcp::Socket>(handle).state(), state);
+                rearm_dns_tcp_sockets(&handles, &mut conns, &mut sockets);
+                assert_eq!(sockets.get::<tcp::Socket>(handle).state(), state);
+                flush_interface_egress(
+                    &mut server_iface,
+                    &mut server_dev,
+                    &mut sockets,
+                    Instant::from_millis(now),
+                );
+            }
+            rearm_dns_tcp_sockets(&handles, &mut conns, &mut sockets);
+            assert!(sockets.get::<tcp::Socket>(handle).is_listening());
+            assert!(conns[index].deadline.is_none());
+        }
     }
 
     #[test]
