@@ -3507,6 +3507,18 @@ pub fn record_shared_artifact_sha256(
     ensure_shared_artifact_sha256(sidecar_path, shared_dir)
 }
 
+/// [`record_shared_artifact_sha256`] reusing a SHA-256 the service already
+/// took over `sidecar_path`'s bytes, as it received them, instead of reading
+/// the whole artifact again. The proof stands in only while it still covers
+/// that exact, unchanged inode; otherwise the artifact is hashed as before.
+pub fn record_shared_artifact_sha256_observed(
+    sidecar_path: &Path,
+    shared_dir: &Path,
+    observed: Option<&mut ArtifactDigestProof>,
+) -> std::io::Result<String> {
+    ensure_shared_artifact_sha256_with_observed(sidecar_path, shared_dir, observed)
+}
+
 fn ensure_shared_artifact_sha256_with_observed(
     sidecar_path: &Path,
     shared_dir: &Path,
@@ -6863,6 +6875,34 @@ mod tests {
         let error = ensure_shared_artifact_sha256_with_observed(&third, &shared, Some(&mut wrong))
             .unwrap_err();
         assert!(error.to_string().contains("checksum collision"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_new_restore_tree_records_the_digest_taken_as_its_artifact_arrived() {
+        let temp = tempfile::tempdir().unwrap();
+        let shared = temp.path().join("shared");
+        fs::create_dir(&shared).unwrap();
+        let artifact = temp.path().join("artifact");
+        fs::write(&artifact, b"artifact bytes").unwrap();
+        // Taken at its word: the recorded identity is the proof's digest, so
+        // the artifact was not read a second time.
+        let claimed = digest_of(b"as received");
+        let mut proof =
+            ArtifactDigestProof::received(File::open(&artifact).unwrap(), claimed.clone(), true)
+                .unwrap();
+        assert_eq!(
+            record_shared_artifact_sha256_observed(&artifact, &shared, Some(&mut proof)).unwrap(),
+            claimed
+        );
+        assert_eq!(read_shared_artifact_sha256(&shared).unwrap(), claimed);
+        // Without a proof it is read, as before.
+        let other = temp.path().join("other-shared");
+        fs::create_dir(&other).unwrap();
+        assert_eq!(
+            record_shared_artifact_sha256_observed(&artifact, &other, None).unwrap(),
+            digest_of(b"artifact bytes")
+        );
     }
 
     #[cfg(unix)]
