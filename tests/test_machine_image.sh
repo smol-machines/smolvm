@@ -437,6 +437,82 @@ test_cp_matches_exec_on_image_machine() {
     cleanup_cp_image
 }
 
+# Execs leave the machine's disks alone: crun's per-exec files live on a tmpfs
+# over /storage/containers/run (smolvm#2357). Each foreground exec used to
+# create and remove its pid file (and, for a user with supplementary groups such
+# as alpine's root, its process file) in that directory on the storage disk, and
+# each background exec its pid file in the agent's /tmp, which is on the overlay
+# disk once the persistent rootfs is pivoted in: about 120 to 136 sectors (a
+# journal commit) on that disk per exec.
+test_exec_does_not_write_disks() (
+    local vm_name="exec-disk-quiet-$$"
+    cleanup_exec_disk_quiet() {
+        $SMOLVM machine stop --name "$vm_name" >/dev/null 2>&1 || true
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    }
+
+    $SMOLVM machine create --name "$vm_name" --image alpine:3.20 --net || return 1
+    trap cleanup_exec_disk_quiet EXIT
+    run_with_timeout 120 $SMOLVM machine start --name "$vm_name" || return 1
+
+    read_disks_now() {
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- sh -ec '
+            sync
+            for d in /sys/block/vd*; do
+                read -r reads merged_read sectors_read read_ms writes merged_write sectors_written rest < "$d/stat"
+                printf "%s=%s\n" "${d##*/}" "$sectors_written"
+            done'
+    }
+
+    # Compare the same set of devices in both samples. Missing, malformed,
+    # duplicated or decreasing counters cannot establish that a disk was idle.
+    max_disk_delta() {
+        awk -v before="$1" -v after="$2" 'BEGIN {
+            n = split(before, rows, "\n")
+            m = split(after, later, "\n")
+            if (!n || n != m) exit 1
+            for (i = 1; i <= n; i++) {
+                if (rows[i] !~ /^vd[a-z]+=[0-9]+$/) exit 1
+                split(rows[i], f, "=")
+                if (f[1] in start) exit 1
+                start[f[1]] = f[2] + 0
+            }
+            for (i = 1; i <= m; i++) {
+                if (later[i] !~ /^vd[a-z]+=[0-9]+$/) exit 1
+                split(later[i], f, "=")
+                if (!(f[1] in start)) exit 1
+                delta = f[2] - start[f[1]]
+                delete start[f[1]]
+                if (delta < 0) exit 1
+                if (delta > max) max = delta
+            }
+            print max + 0
+        }' || { echo "Invalid disk readings: '$1' -> '$2'" >&2; return 1; }
+    }
+
+    # Let boot-time ext4 initialization settle before measuring exec writes.
+    local a b delta i
+    for ((i=0; i<40; i++)); do
+        a=$(read_disks_now) || return 1
+        sleep 10
+        b=$(read_disks_now) || return 1
+        delta=$(max_disk_delta "$a" "$b") || return 1
+        (( delta <= 272 )) && break
+    done
+    (( i < 40 )) || { echo "Disk never went quiet: '$a' -> '$b'"; return 1; }
+
+    a=$(read_disks_now) || return 1
+    for ((i=0; i<8; i++)); do
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- true >/dev/null || return 1
+    done
+    for ((i=0; i<4; i++)); do
+        run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" --detach -- true >/dev/null || return 1
+    done
+    b=$(read_disks_now) || return 1
+    delta=$(max_disk_delta "$a" "$b") || return 1
+    (( delta < 120 )) || { echo "Execs wrote $delta sectors on one disk: '$a' -> '$b'"; return 1; }
+)
+
 run_test "Create with --image" test_create_with_image || true
 run_test "Mirrored pull keeps original image reference" test_mirrored_image_is_cached_under_original_reference || true
 run_test "cp: reads and writes the container filesystem exec uses" test_cp_matches_exec_on_image_machine || true
@@ -452,5 +528,6 @@ run_test "Exec-join: ephemeral run is namespace-isolated" test_ephemeral_run_is_
 run_test "Exec-join: exec recovers after main container exits" test_exec_recovers_after_main_container_exits || true
 run_test "Exec-join: timeout does not kill main container (orphan documented)" test_exec_join_timeout_does_not_kill_main_container || true
 run_test "Exec-join: joined exec user behavior (crun exec runs as root)" test_exec_join_documents_user_behavior || true
+run_test "Exec: execs do not write the machine's disks" test_exec_does_not_write_disks || true
 
 print_summary "Image-Backed Tests"

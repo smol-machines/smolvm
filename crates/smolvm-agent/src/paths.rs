@@ -56,7 +56,10 @@ pub const OVERLAYS_DIR: &str = "/storage/overlays";
 // Container Runtime Paths
 // =============================================================================
 
-/// Directory for per-container runtime state (pidfile, etc).
+/// Directory for the files that live while one crun call runs (exec pid and
+/// process files, create and workload logs). A tmpfs is mounted over it once
+/// the storage disk is up (`crun::mount_run_dir_tmpfs`), so nothing put here
+/// reaches a disk.
 pub const CONTAINERS_RUN_DIR: &str = "/storage/containers/run";
 
 /// Directory for container logs.

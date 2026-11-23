@@ -1561,7 +1561,7 @@ fn spawn_pod_exec(
     entry: &ExecEntry,
     launch: &crate::ResolvedLaunch,
     use_process_spec: bool,
-) -> Result<(std::process::Child, Option<crate::pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<crate::InteractiveExec, Box<dyn std::error::Error>> {
     if !use_process_spec {
         return crate::spawn_exec_in_container(id, launch, entry.tty, false);
     }
@@ -1576,7 +1576,7 @@ fn spawn_pod_exec(
         .stdin_piped()
         .capture_output()
         .spawn()?;
-    Ok((child, None))
+    Ok((child, None, None))
 }
 
 /// Normalize a containerd exec OCI Process for `crun exec --process`: force
@@ -1678,17 +1678,16 @@ fn start_exec_process(
     // the flag path (rare). Everything else keeps the flag-based path unchanged.
     let use_process_spec = !entry.process.additional_gids.is_empty() && !entry.tty;
 
-    let (mut child, pty_master) =
-        match spawn_pod_exec(id, exec_id, &entry, &launch, use_process_spec) {
-            Ok(result) => result,
-            Err(e) => {
-                crate::send_response(
-                    stream,
-                    &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
-                )?;
-                return Ok(());
-            }
-        };
+    let spawned = match spawn_pod_exec(id, exec_id, &entry, &launch, use_process_spec) {
+        Ok(result) => result,
+        Err(e) => {
+            crate::send_response(
+                stream,
+                &AgentResponse::from_err(e, error_codes::SPAWN_FAILED),
+            )?;
+            return Ok(());
+        }
+    };
 
     // Track the crun-exec pid so PodSignal { exec_id } can kill(2) it (crun
     // can't target exec processes by id). Signal delivery refines this to the
@@ -1696,16 +1695,11 @@ fn start_exec_process(
     {
         let mut reg = lock_registry();
         if let Some(e) = reg.get_mut(id).and_then(|p| p.execs.get_mut(exec_id)) {
-            e.pid = Some(child.id());
+            e.pid = Some(spawned.0.id());
         }
     }
 
-    crate::send_response(stream, &AgentResponse::Started)?;
-
-    let loop_result = match pty_master {
-        Some(pty) => crate::run_interactive_loop_pty(stream, &mut child, pty, None),
-        None => crate::run_interactive_loop(stream, &mut child, None),
-    };
+    let loop_result = crate::run_streamed_exec(stream, spawned, None);
 
     // The exec is done — clear the tracked pid.
     {
@@ -1715,15 +1709,7 @@ fn start_exec_process(
         }
     }
 
-    let exit_code = match loop_result {
-        Ok(code) => code,
-        Err(e) => {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(e);
-        }
-    };
-
+    let exit_code = loop_result?;
     crate::send_response(
         stream,
         &AgentResponse::Exited {

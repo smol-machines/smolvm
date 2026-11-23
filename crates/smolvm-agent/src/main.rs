@@ -39,6 +39,17 @@ fn ensure_storage_mounted() -> bool {
                 "INFO",
                 &format!("storage disk mounted (duration_ms={})", uptime_ms() - t0),
             );
+            // Per-exec crun files go to RAM, not to the disk just mounted.
+            #[cfg(target_os = "linux")]
+            if let Err(error) = crun::mount_run_dir_tmpfs() {
+                boot_log(
+                    "WARN",
+                    &format!(
+                        "no tmpfs on {}, its files stay on the storage disk: {error}",
+                        paths::CONTAINERS_RUN_DIR
+                    ),
+                );
+            }
             // Before anything reads /workspace: a pack made with
             // --include-workspace seeds it onto this (fresh) storage disk.
             storage::seed_workspace_from_pack();
@@ -4647,7 +4658,7 @@ fn handle_interactive_run(
     }
 
     // Spawn the command with crun
-    let (mut child, pty_master) = match spawn_interactive_command(
+    let spawned = match spawn_interactive_command(
         &prepared.rootfs_path,
         &launch,
         &mounts,
@@ -4667,26 +4678,12 @@ fn handle_interactive_run(
         }
     };
 
-    // Send Started response
-    send_response(stream, &AgentResponse::Started)?;
-
-    // Run the appropriate interactive I/O loop
-    let exit_code = match pty_master {
-        #[cfg(target_os = "linux")]
-        Some(pty) => match run_interactive_loop_pty(stream, &mut child, pty, timeout_ms) {
-            Ok(exit_code) => exit_code,
-            Err(e) => {
-                maybe_cleanup(&prepared.workload_id);
-                return Err(e);
-            }
-        },
-        _ => match run_interactive_loop(stream, &mut child, timeout_ms) {
-            Ok(exit_code) => exit_code,
-            Err(e) => {
-                maybe_cleanup(&prepared.workload_id);
-                return Err(e);
-            }
-        },
+    let exit_code = match run_streamed_exec(stream, spawned, timeout_ms) {
+        Ok(code) => code,
+        Err(error) => {
+            maybe_cleanup(&prepared.workload_id);
+            return Err(error);
+        }
     };
 
     // Send Exited response
@@ -5192,7 +5189,7 @@ fn handle_run_detached(
     }
     let create_output = create.output();
     match create_output {
-        Ok(output) if output.status.success() => {}
+        Ok(output) if output.status.success() => crun::remove_create_log(&container_id),
         Ok(output) => {
             send_response(
                 stream,
@@ -5384,20 +5381,70 @@ fn exec_process_spec(
     }))
 }
 
-/// Write an exec's process spec where crun reads it. Callers remove the file
-/// once crun has consumed it; files older than ten minutes are swept on every
-/// write for the paths that cannot know when that was.
+/// Keeps the process spec readable by crun until the handler finishes with the child.
+pub(crate) struct ExecProcessFile(std::path::PathBuf);
+
+#[cfg(target_os = "linux")]
+type InteractiveExec = (Child, Option<pty::PtyMaster>, Option<ExecProcessFile>);
+#[cfg(not(target_os = "linux"))]
+type InteractiveExec = (Child, Option<()>, Option<ExecProcessFile>);
+
+/// Own the process spec until the streamed child exits, including on disconnect.
+fn run_streamed_exec(
+    stream: &mut WireStream<impl ReadWrite>,
+    spawned: InteractiveExec,
+    timeout_ms: Option<u64>,
+) -> Result<i32, Box<dyn std::error::Error>> {
+    let (mut child, pty, _process_file) = spawned;
+    let result = send_response(stream, &AgentResponse::Started).and_then(|()| match pty {
+        #[cfg(target_os = "linux")]
+        Some(master) => run_interactive_loop_pty(stream, &mut child, master, timeout_ms),
+        _ => run_interactive_loop(stream, &mut child, timeout_ms),
+    });
+    if result.is_err() && matches!(child.try_wait(), Ok(None)) {
+        terminate_interactive_child(&mut child, None);
+    }
+    result
+}
+
+impl std::ops::Deref for ExecProcessFile {
+    type Target = std::path::Path;
+
+    fn deref(&self) -> &std::path::Path {
+        &self.0
+    }
+}
+
+impl Drop for ExecProcessFile {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
+    }
+}
+
+/// Write an exec's process spec where crun reads it. The returned guard removes
+/// the file. The sweep also clears stale specs left by interrupted agents.
 #[cfg(target_os = "linux")]
 fn write_exec_process_file(
     container_id: &str,
     spec: &oci::OciProcess,
-) -> Result<std::path::PathBuf, String> {
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+) -> Result<ExecProcessFile, String> {
     // A caller can bind a read-only directory at /tmp. Keep crun's private
-    // launch files with its runtime state, outside workload mount targets.
+    // launch files with its runtime state, outside workload mount targets
+    // (and on the run directory's tmpfs, see `crun::mount_run_dir_tmpfs`).
     let dir = std::path::Path::new(paths::CONTAINERS_RUN_DIR).join("exec-process");
-    std::fs::create_dir_all(&dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
-    if let Ok(entries) = std::fs::read_dir(&dir) {
+    write_exec_process_file_in(&dir, container_id, spec)
+}
+
+/// [`write_exec_process_file`] into `dir`.
+#[cfg(target_os = "linux")]
+fn write_exec_process_file_in(
+    dir: &std::path::Path,
+    container_id: &str,
+    spec: &oci::OciProcess,
+) -> Result<ExecProcessFile, String> {
+    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    std::fs::create_dir_all(dir).map_err(|e| format!("create {}: {e}", dir.display()))?;
+    if let Ok(entries) = std::fs::read_dir(dir) {
         let old = std::time::SystemTime::now() - std::time::Duration::from_secs(600);
         for entry in entries.flatten() {
             if entry
@@ -5420,9 +5467,12 @@ fn write_exec_process_file(
         .mode(0o600)
         .open(&path)
         .map_err(|e| format!("create {}: {e}", path.display()))?;
+    // From here the guard owns the file: a write that fails (the tmpfs is
+    // full) removes the partial file instead of leaving it to the sweep.
+    let process_file = ExecProcessFile(path);
     file.write_all(&json)
-        .map_err(|e| format!("write {}: {e}", path.display()))?;
-    Ok(path)
+        .map_err(|e| format!("write {}: {e}", process_file.display()))?;
+    Ok(process_file)
 }
 
 /// A running container's root as the agent sees it (`/proc/<init pid>/root`),
@@ -5441,7 +5491,7 @@ fn exec_process_file_for(
     container_id: &str,
     launch: &ResolvedLaunch,
     terminal: bool,
-) -> Result<Option<std::path::PathBuf>, String> {
+) -> Result<Option<ExecProcessFile>, String> {
     let Some(root) = running_container_root(container_id) else {
         return Ok(None);
     };
@@ -5508,9 +5558,7 @@ fn launch_workload(
     }
     .status()
     .map_err(|e| format!("run crun: {e}"))?;
-    if let Some(pf) = &process_file {
-        let _ = std::fs::remove_file(pf);
-    }
+    drop(process_file);
     let reason = crun::take_log(&log);
     let pid = std::fs::read_to_string(&pid_file)
         .ok()
@@ -5832,7 +5880,7 @@ fn spawn_exec_in_container(
     launch: &ResolvedLaunch,
     tty: bool,
     unprivileged: bool,
-) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveExec, Box<dyn std::error::Error>> {
     use std::io::Read as _;
     use std::os::unix::io::{AsRawFd as _, FromRawFd as _};
     use std::sync::atomic::Ordering;
@@ -5868,23 +5916,22 @@ fn spawn_exec_in_container(
                 }
                 let child = command.spawn()?;
                 drop(slave_fd);
-                return Ok((child, Some(pty_master)));
+                return Ok((child, Some(pty_master), None));
             }
             let child = command
                 .stdin(Stdio::piped())
                 .stdout(Stdio::piped())
                 .stderr(Stdio::piped())
                 .spawn()?;
-            return Ok((child, None));
+            return Ok((child, None, None));
         }
     }
 
     // A user with supplementary groups needs a process file (crun's --user flag
     // is uid:gid only); everyone else takes the flag path unchanged.
-    let spec_for =
-        |terminal: bool| -> Result<Option<std::path::PathBuf>, Box<dyn std::error::Error>> {
-            Ok(exec_process_file_for(container_id, launch, terminal)?)
-        };
+    let spec_for = |terminal: bool| -> Result<Option<ExecProcessFile>, Box<dyn std::error::Error>> {
+        Ok(exec_process_file_for(container_id, launch, terminal)?)
+    };
 
     if tty {
         // Preferred: console socket (resizable). Mirrors the create path.
@@ -5907,9 +5954,8 @@ fn spawn_exec_in_container(
                 .spawn()?,
             };
             let received = console.recv_master(std::time::Duration::from_secs(3));
-            if let Some(pf) = &process_file {
-                let _ = std::fs::remove_file(pf);
-            }
+            // crun has read the process file once it hands over the console.
+            drop(process_file);
             match received {
                 Ok(pty_master) => {
                     let _ = pty_master.set_window_size(80, 24);
@@ -5919,7 +5965,7 @@ fn spawn_exec_in_container(
                             let _ = err.read_to_end(&mut sink);
                         });
                     }
-                    return Ok((child, Some(pty_master)));
+                    return Ok((child, Some(pty_master), None));
                 }
                 Err(e) => {
                     // A transient timeout (crun slow to hand back the console)
@@ -5959,10 +6005,11 @@ fn spawn_exec_in_container(
                 .spawn()?
         };
         drop(slave_fd);
-        Ok((child, Some(pty_master)))
+        Ok((child, Some(pty_master), None))
     } else {
-        let child = match spec_for(false)? {
-            Some(pf) => crun::CrunCommand::exec_with_process(container_id, &pf)
+        let process_file = spec_for(false)?;
+        let child = match &process_file {
+            Some(pf) => crun::CrunCommand::exec_with_process(container_id, pf)
                 .stdin_piped()
                 .capture_output()
                 .spawn()?,
@@ -5972,7 +6019,7 @@ fn spawn_exec_in_container(
                 .capture_output()
                 .spawn()?,
         };
-        Ok((child, None))
+        Ok((child, None, process_file))
     }
 }
 
@@ -6282,6 +6329,7 @@ fn ensure_main_container(
         )
         .into());
     }
+    crun::remove_create_log(&container_id);
     // Mount remote volumes in the window between create and start: the
     // container's namespaces exist but its first instruction has not run, so
     // anything exec'd into it afterwards is guaranteed to see the bucket. This
@@ -6332,7 +6380,7 @@ fn spawn_interactive_command(
     persistent_overlay_id: Option<&str>,
     unprivileged: bool,
     s3_volumes: &[smolvm_protocol::S3Volume],
-) -> Result<(Child, Option<pty::PtyMaster>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveExec, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     if launch.command.is_empty() {
@@ -6448,7 +6496,8 @@ fn spawn_interactive_command(
 
     // The single-container `Run` path keeps cgroups disabled (its VM is the
     // limit); per-container cgroups are a pod-only concern.
-    spawn_crun_run(&bundle_path, &container_id, tty, false)
+    let (child, pty) = spawn_crun_run(&bundle_path, &container_id, tty, false)?;
+    Ok((child, pty, None))
 }
 
 /// Launch a container with `crun run` and hand back the child plus the PTY
@@ -6562,7 +6611,7 @@ fn spawn_interactive_command(
     _persistent_overlay_id: Option<&str>,
     unprivileged: bool,
     _s3_volumes: &[smolvm_protocol::S3Volume],
-) -> Result<(Child, Option<()>), Box<dyn std::error::Error>> {
+) -> Result<InteractiveExec, Box<dyn std::error::Error>> {
     use std::path::Path;
 
     let command: &[String] = &launch.command;
@@ -6613,7 +6662,7 @@ fn spawn_interactive_command(
         .capture_output()
         .spawn()?;
 
-    Ok((child, None))
+    Ok((child, None, None))
 }
 
 /// Run the interactive I/O loop using poll() for efficient I/O multiplexing.
@@ -7746,15 +7795,10 @@ fn run_background_in_keepalive(
     // Capture the detached process's PID via a pid-file so the response
     // honors the run-background contract (the host client parses a PID from
     // stdout). Unique per launch to avoid collisions between concurrent
-    // background execs on the same machine.
-    let pid_file = std::path::PathBuf::from(format!(
-        "/tmp/smolvm-bg-{}-{}.pid",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
+    // background execs on the same machine, and removed on every return path.
+    // On the run directory's tmpfs: after the persistent-rootfs pivot the
+    // agent's /tmp is on the overlay disk.
+    let pid_file = crun::ExecPidFile::new()?;
     let pid = if !unprivileged {
         if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
             let child = command
@@ -7764,12 +7808,11 @@ fn run_background_in_keepalive(
                 .spawn()?;
             child.id()
         } else {
-            run_crun_background_exec(&cid, &launch, &pid_file)?
+            run_crun_background_exec(&cid, &launch, pid_file.path())?
         }
     } else {
-        run_crun_background_exec(&cid, &launch, &pid_file)?
+        run_crun_background_exec(&cid, &launch, pid_file.path())?
     };
-    let _ = std::fs::remove_file(&pid_file);
 
     Ok(AgentResponse::Completed {
         exit_code: 0,
@@ -7799,9 +7842,7 @@ fn run_crun_background_exec(
         .user(launch.user.as_deref()),
     };
     let status = command.stdin_null().discard_output().status()?;
-    if let Some(pf) = &process_file {
-        let _ = std::fs::remove_file(pf);
-    }
+    drop(process_file);
     if !status.success() {
         return Err(format!(
             "crun exec --detach failed (exit {})",
@@ -7982,7 +8023,9 @@ fn run_in_keepalive_container(
     // silently ignored `timeout_ms` — an `exec --timeout N` against an image
     // machine ran to completion regardless (found by QA 2026-07-19).
     let exec_pid_file = crun::ExecPidFile::new()?;
-    let (mut child, namespace_exec) = if !unprivileged {
+    // `_process_file` lives until the wait below has seen crun exit, then
+    // removes the exec's process file (when it has one).
+    let (mut child, _process_file, namespace_exec) = if !unprivileged {
         if let Some(mut command) = restored_container_exec_command(&cid, &launch)? {
             command.stdout(Stdio::piped()).stderr(Stdio::piped());
             if stdin_data.is_some() {
@@ -7990,18 +8033,16 @@ fn run_in_keepalive_container(
             } else {
                 command.stdin(Stdio::null());
             }
-            (command.spawn()?, true)
+            (command.spawn()?, None, true)
         } else {
-            (
-                spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
-                false,
-            )
+            let (child, process_file) =
+                spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?;
+            (child, process_file, false)
         }
     } else {
-        (
-            spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?,
-            false,
-        )
+        let (child, process_file) =
+            spawn_crun_foreground_exec(&cid, &launch, &exec_pid_file, stdin_data)?;
+        (child, process_file, false)
     };
     if namespace_exec {
         std::fs::write(exec_pid_file.path(), child.id().to_string())?;
@@ -8058,11 +8099,13 @@ fn spawn_crun_foreground_exec(
     launch: &ResolvedLaunch,
     exec_pid_file: &crun::ExecPidFile,
     stdin_data: Option<&str>,
-) -> Result<Child, Box<dyn std::error::Error>> {
+) -> Result<(Child, Option<ExecProcessFile>), Box<dyn std::error::Error>> {
     // A user with supplementary groups runs from a process file (crun's --user is
-    // uid:gid only); crun reads it at start and the next write sweeps it.
-    let mut builder = match exec_process_file_for(container_id, launch, false)? {
-        Some(pf) => crun::CrunCommand::exec_with_process(container_id, &pf),
+    // uid:gid only). crun reads it at start; the caller keeps the returned guard
+    // until the child exits, which removes it.
+    let process_file = exec_process_file_for(container_id, launch, false)?;
+    let mut builder = match &process_file {
+        Some(pf) => crun::CrunCommand::exec_with_process(container_id, pf),
         None => crun::CrunCommand::exec(
             container_id,
             &launch.env,
@@ -8079,7 +8122,7 @@ fn spawn_crun_foreground_exec(
     } else {
         builder.stdin_null()
     };
-    Ok(builder.spawn()?)
+    Ok((builder.spawn()?, process_file))
 }
 
 // Mirrors `storage::run_command`'s workload parameter list one-for-one; both
@@ -9502,6 +9545,83 @@ impl<T: AsRawFd> AsRawFd for WireStream<'_, T> {
 /// Trait for read+write streams with raw fd access.
 trait ReadWrite: Read + Write + AsRawFd {}
 impl<T: Read + Write + AsRawFd> ReadWrite for T {}
+
+#[cfg(all(test, target_os = "linux"))]
+mod exec_process_file_tests {
+    use super::*;
+
+    fn spec() -> oci::OciProcess {
+        oci::OciProcess {
+            terminal: false,
+            console_size: None,
+            user: oci::OciUser {
+                uid: 0,
+                gid: 0,
+                additional_gids: vec![1, 2],
+            },
+            args: vec!["true".into()],
+            env: vec!["TERM=dumb".into()],
+            cwd: "/".into(),
+            capabilities: None,
+            rlimits: None,
+            no_new_privileges: false,
+        }
+    }
+
+    #[test]
+    fn process_file_is_removed_when_its_guard_drops() {
+        let dir = tempfile::tempdir().unwrap();
+        let process_file = write_exec_process_file_in(dir.path(), "c1", &spec()).unwrap();
+        let path = process_file.to_path_buf();
+        let written: oci::OciProcess =
+            serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+        assert_eq!(written.user.additional_gids, vec![1, 2]);
+        drop(process_file);
+        assert!(!path.exists());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn streamed_children_release_their_process_files_on_completion() {
+        let dir = tempfile::tempdir().unwrap();
+        for _ in 0..8 {
+            let file = write_exec_process_file_in(dir.path(), "c1", &spec()).unwrap();
+            // Read the spec in the child, after spawn, as crun does.
+            let child = std::process::Command::new("test")
+                .arg("-s")
+                .arg(&*file)
+                .spawn()
+                .unwrap();
+            let (mut agent, _peer) = std::os::unix::net::UnixStream::pair().unwrap();
+            let result = run_streamed_exec(
+                &mut WireStream::new(&mut agent),
+                (child, None, Some(file)),
+                Some(2000),
+            )
+            .unwrap();
+            assert_eq!(result, 0);
+            assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        }
+    }
+    #[test]
+    fn disconnected_stream_releases_its_process_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = write_exec_process_file_in(dir.path(), "c1", &spec()).unwrap();
+        let child = std::process::Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .unwrap();
+        let (mut agent, peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        drop(peer);
+        let result = run_streamed_exec(
+            &mut WireStream::new(&mut agent),
+            (child, None, Some(file)),
+            None,
+        );
+        assert!(result.is_err());
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+}
 
 /// Regression tests for the scoped background-child reaper.
 ///
