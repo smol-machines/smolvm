@@ -26,7 +26,11 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 ## OpenGL in the guest
 
-`--gpu` gives the guest Vulkan only. There is no host OpenGL passthrough (virgl): a guest that needs OpenGL or OpenGL ES runs it on top of the Vulkan device, with ANGLE (`--use-angle=vulkan`) or Mesa's Zink driver (`MESA_LOADER_DRIVER_OVERRIDE=zink`). Guest Vulkan commands are executed in the separate `virgl_render_server` process, so the VM process itself opens no host GPU device and loads no host graphics driver. A display's plain 2D buffers are served on the CPU.
+On a Linux host `--gpu` gives the guest Vulkan (Venus) and OpenGL (virgl), so a stock guest Mesa renders both on the host GPU. Guest Vulkan commands are executed in the separate `virgl_render_server` process; guest OpenGL commands are executed inside the VM process.
+
+On a macOS host the guest gets Vulkan only: a guest that needs OpenGL or OpenGL ES runs it on top of the Vulkan device, with ANGLE (`--use-angle=vulkan`) or Mesa's Zink driver (`MESA_LOADER_DRIVER_OVERRIDE=zink`).
+
+On an NVIDIA host, guest OpenGL cannot import a buffer made by another API (a Vulkan image, for one) unless the import names a non-linear format modifier; the import is dropped and the guest gets OpenGL errors for that buffer. NVIDIA's driver crashes on such an import otherwise.
 
 ## Usage
 
