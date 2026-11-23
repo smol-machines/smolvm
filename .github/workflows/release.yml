@@ -210,6 +210,16 @@ jobs:
           CUDA_DRIVER_SHIM_BINARY=/tmp/cuda/libcuda.so.1 \
             ./scripts/build-agent-rootfs.sh --arch ${{ matrix.arch }} --no-build-agent
 
+      # build-agent-rootfs.sh treats the Vulkan bundle as best-effort, so a
+      # failed fetch would otherwise ship a release whose --gpu containers
+      # have no Vulkan driver.
+      - name: Verify Vulkan guest driver bundled
+        run: |
+          d=target/agent-rootfs/usr/local/lib/smolvm-vulkan
+          test -s "$d/libvulkan_virtio.so"
+          test -s "$d/virtio_icd.json"
+          ls "$d"/loader/libvulkan.so.1* > /dev/null
+
       - name: Verify CUDA artifacts bundled
         run: |
           for f in \

@@ -1,0 +1,49 @@
+name: Build the guest Vulkan driver
+
+# Rebuild lib/vulkan-guest-driver/<arch>/: the Venus driver (Mesa's
+# libvulkan_virtio.so) that a --gpu machine's workload containers get.
+# scripts/build-vulkan-guest-driver.sh pins the Mesa release and the patches;
+# it runs in AlmaLinux 9 so the driver needs nothing newer than glibc 2.34.
+#
+# Runs on dispatch and on a pull request that changes the build. Uploads
+# lib/vulkan-guest-driver/<arch>/ as an artifact; the rebuilt files are then
+# committed into the repo and staged into the agent rootfs by
+# scripts/fetch-vulkan-guest-driver.sh.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/build-vulkan-guest-driver.sh
+      - scripts/vulkan-guest-driver/**
+      - .github/workflows/build-vulkan-guest-driver.yml
+
+jobs:
+  build:
+    name: Vulkan guest driver ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in AlmaLinux 9
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD/scripts:/scripts:ro" -v "$PWD/out:/out" \
+            almalinux:9 bash /scripts/build-vulkan-guest-driver.sh "/out/${{ matrix.arch }}"
+          sudo chown -R "$(id -u):$(id -g)" out
+          cat "out/${{ matrix.arch }}/driver.provenance"
+          sha256sum "out/${{ matrix.arch }}"/*
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: vulkan-guest-driver-${{ matrix.arch }}
+          path: out/${{ matrix.arch }}/
+          if-no-files-found: error
