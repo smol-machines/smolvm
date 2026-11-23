@@ -1102,7 +1102,7 @@ impl PackCreateCmd {
         let vm = config
             .vms
             .get(&vm_name)
-            .ok_or_else(|| Error::agent("pack from VM", format!("VM '{}' not found", vm_name)))?;
+            .ok_or_else(|| Error::vm_not_found(&vm_name))?;
 
         if vm.actual_state() == RecordState::Running {
             return Err(Error::agent(
