@@ -59,6 +59,18 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+/// RAM image path within a checkpoint, as its index names it.
+pub const MEMORY_ASSET: &str = "checkpoint/memory.bin";
+/// Descriptor libkrun reads from a restore directory instead of the RAM image.
+pub const MEMORY_DESCRIPTOR: &str = "memory.bin.lazy";
+
+/// Whether restores also rebuild guest RAM lazily from the store. Only where
+/// the boot can hand the VMM a kernel-fault userfaultfd it opened as root, the
+/// same hosts that restore RAM as a read-only input.
+pub fn memory_enabled() -> bool {
+    enabled() && cfg!(target_os = "linux") && crate::process::vm_uid_drop_active()
+}
+
 /// `DISK.lazydisk`, read by libkrun. Fields libkrun does not know are refused
 /// there, so this writes only those.
 #[derive(Debug, Serialize, Deserialize)]
@@ -105,6 +117,60 @@ pub const TREE_WITHOUT_DISKS: &str = ".lazy-disks-left-out";
 /// cache disk is rebased onto this host's base at install, so it is not.
 pub fn is_lazy_asset(path: &str) -> bool {
     path.starts_with("checkpoint/disks/storage/") || path.starts_with("checkpoint/disks/overlay/")
+}
+
+/// Whether a lazy restore's shared extraction leaves `path` out: its lazy
+/// disks, and its RAM where [`memory_enabled`].
+pub fn left_out_of_tree(path: &str) -> bool {
+    is_lazy_asset(path) || (path == MEMORY_ASSET && memory_enabled())
+}
+
+/// Write the descriptor that makes the restore in `restore_dir` rebuild its
+/// RAM from file `file` of the stored checkpoint at `stored`.
+pub fn write_memory_descriptor(stored: &Path, file: &str, restore_dir: &Path) -> io::Result<()> {
+    let descriptor = serde_json::json!({
+        "version": 1,
+        "index": stored.join("checkpoint.json"),
+        "file": file,
+        "objects": stored.join("objects"),
+    });
+    std::fs::write(
+        restore_dir.join(MEMORY_DESCRIPTOR),
+        serde_json::to_vec(&descriptor)?,
+    )
+}
+
+/// Whether the restore in `restore_dir` rebuilds its RAM lazily.
+pub fn has_lazy_memory(restore_dir: &Path) -> bool {
+    restore_dir.join(MEMORY_DESCRIPTOR).is_file()
+}
+
+/// Turn a lazy-RAM restore into an ordinary one by writing its RAM image
+/// from the store: for a boot that cannot fault it in (not branchable).
+/// `checkpoint` must be the machine's recorded one ([`trusted_checkpoint`]);
+/// the descriptor is the VM's to write and is not believed.
+pub fn materialize_memory(checkpoint: &Path, restore_dir: &Path) -> io::Result<()> {
+    let image = restore_dir.join("memory.bin");
+    let partial = restore_dir.join(".memory.bin.partial");
+    let _ = std::fs::remove_file(&partial);
+    let chunked = ChunkedFile::open(checkpoint, MEMORY_ASSET)?;
+    {
+        use std::os::unix::fs::FileExt;
+        let file = std::fs::File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&partial)?;
+        file.set_len(chunked.size())?;
+        for chunk in 0..chunked.chunks() {
+            if let Some(bytes) = read_arriving(&chunked, chunk, checkpoint)? {
+                file.write_all_at(&bytes, chunk as u64 * ChunkedFile::chunk_size())?;
+            }
+        }
+        file.sync_all()?;
+    }
+    std::fs::rename(&partial, &image)?;
+    std::fs::remove_file(restore_dir.join(MEMORY_DESCRIPTOR))
 }
 
 /// The stored checkpoint shared extraction `tree` was materialized from.
@@ -162,7 +228,9 @@ pub fn record(store: &Path, machine: &Path, checkpoint: &Path) -> io::Result<()>
 /// The stored checkpoint machine directory `machine`'s lazy disks may read,
 /// when it has lazy disks and a record of it.
 pub fn trusted_checkpoint(store: &Path, machine: &Path) -> Option<PathBuf> {
-    if lazy_disks(machine).ok()?.is_empty() {
+    if lazy_disks(machine).ok()?.is_empty()
+        && !has_lazy_memory(&machine.join(crate::portable_checkpoint::INSTALLED_DIR))
+    {
         return None;
     }
     let record: Record =
@@ -641,6 +709,42 @@ mod tests {
         assert!(settle_in(&m.store, &m.machine).is_err());
         assert!(started.elapsed() < Duration::from_secs(5));
         assert!(is_lazy(&m.disk));
+    }
+
+    #[test]
+    fn lazy_ram_is_described_and_can_be_written_out_instead() {
+        let root = tempfile::TempDir::new().unwrap();
+        let store = root.path().join("store");
+        let data = pattern(3 * MIB);
+        let stored = store.join(PUBLISHED).join("vm-m.checkpoint");
+        std::fs::create_dir_all(&stored).unwrap();
+        std::fs::create_dir_all(store.join("cache")).unwrap();
+        let mut writer =
+            crate::checkpoint_store::Writer::new(&store.join("cache"), &stored).unwrap();
+        let file = writer
+            .ingest(MEMORY_ASSET, data.len() as u64, 0o600, &mut &*data)
+            .unwrap();
+        let manifest = smolvm_pack::format::PackManifest::new(
+            "vm://test".into(),
+            "none".into(),
+            "linux/amd64".into(),
+            "linux/amd64".into(),
+        );
+        writer.finish(&stored, manifest, vec![file]).unwrap();
+        let restore = root.path().join("restore");
+        std::fs::create_dir(&restore).unwrap();
+
+        write_memory_descriptor(&stored, MEMORY_ASSET, &restore).unwrap();
+        assert!(has_lazy_memory(&restore));
+        let descriptor: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(restore.join(MEMORY_DESCRIPTOR)).unwrap())
+                .unwrap();
+        assert_eq!(descriptor["file"], MEMORY_ASSET);
+        assert_eq!(descriptor["version"], 1);
+
+        materialize_memory(&stored, &restore).unwrap();
+        assert!(!has_lazy_memory(&restore));
+        assert_eq!(std::fs::read(restore.join("memory.bin")).unwrap(), data);
     }
 
     #[test]

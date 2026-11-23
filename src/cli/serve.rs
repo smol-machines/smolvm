@@ -195,7 +195,9 @@ pub struct ServeStartCmd {
 
     /// Boot restored machines before their disks are copied: each disk is
     /// read from the checkpoint store as the guest touches it and filled in
-    /// the background. Needs the libkrun bundled with this smolvm.
+    /// the background. On a Linux node that drops each VM to its own uid,
+    /// guest RAM is rebuilt the same way. Needs the libkrun bundled with this
+    /// smolvm.
     #[arg(long = "lazy-disks")]
     lazy_disks: bool,
 
