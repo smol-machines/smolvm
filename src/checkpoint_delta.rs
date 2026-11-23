@@ -311,6 +311,8 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
 /// streams: an import on its own is asked for so the checkpoint is held here,
 /// as a later delta's base, and must be complete when it returns.
 fn import_with(artifact: &Path, streamed: bool) -> Result<Option<Imported>> {
+    #[cfg(not(unix))]
+    let _ = streamed;
     let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
         .map_err(|e| Error::agent("read checkpoint footer", e.to_string()))?;
     let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
