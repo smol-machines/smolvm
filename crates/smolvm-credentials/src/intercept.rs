@@ -556,22 +556,10 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
     let upstream = upstream.context("upstream connect")?;
 
     let mut buffered = Vec::with_capacity(2048);
-    let peek = tokio::time::timeout(HANDSHAKE_TIMEOUT, async {
-        loop {
-            match peek_client_hello(&buffered) {
-                Peek::Incomplete if buffered.len() < MAX_CLIENT_HELLO => {
-                    let mut chunk = [0u8; 4096];
-                    let n = stream.read(&mut chunk).await?;
-                    if n == 0 {
-                        return Ok::<_, anyhow::Error>(Peek::NoServerName);
-                    }
-                    buffered.extend_from_slice(&chunk[..n]);
-                }
-                Peek::Incomplete => return Ok(Peek::NoServerName),
-                decided => return Ok(decided),
-            }
-        }
-    })
+    let peek = tokio::time::timeout(
+        HANDSHAKE_TIMEOUT,
+        read_client_hello(&mut stream, &mut buffered),
+    )
     .await
     .context("client hello timeout")??;
 
@@ -618,6 +606,30 @@ async fn handle_flow(state: Arc<State>, mut stream: TcpStream) -> Result<()> {
         (guard, _) => {
             let guard = guard.context("only a named host is intercepted")?;
             passthrough(stream, upstream, buffered, guard).await
+        }
+    }
+}
+
+/// Reads the guest's first bytes into `buffered` until they show whether the
+/// flow opens with a ClientHello and which server it names. A stream that
+/// closes first, or a hello larger than the parser accepts, names none.
+async fn read_client_hello<R: AsyncRead + Unpin>(
+    stream: &mut R,
+    buffered: &mut Vec<u8>,
+) -> Result<Peek> {
+    loop {
+        match peek_client_hello(buffered) {
+            // The record header comes on top of the largest body the parser takes.
+            Peek::Incomplete if buffered.len() < 5 + MAX_CLIENT_HELLO => {
+                let mut chunk = [0u8; 4096];
+                let n = stream.read(&mut chunk).await?;
+                if n == 0 {
+                    return Ok(Peek::NoServerName);
+                }
+                buffered.extend_from_slice(&chunk[..n]);
+            }
+            Peek::Incomplete => return Ok(Peek::NoServerName),
+            decided => return Ok(decided),
         }
     }
 }
@@ -3328,5 +3340,44 @@ mod tests {
             ),
             b"Bearer real trailing".to_vec()
         );
+    }
+
+    /// A ClientHello record naming `host`, with a padding extension of `pad`
+    /// bytes after the server name.
+    fn padded_client_hello(host: &str, pad: usize) -> Vec<u8> {
+        let mut list = vec![0x00];
+        list.extend_from_slice(&(host.len() as u16).to_be_bytes());
+        list.extend_from_slice(host.as_bytes());
+        let mut exts = vec![0x00, 0x00];
+        exts.extend_from_slice(&(list.len() as u16 + 2).to_be_bytes());
+        exts.extend_from_slice(&(list.len() as u16).to_be_bytes());
+        exts.extend_from_slice(&list);
+        exts.extend_from_slice(&[0x00, 0x15]);
+        exts.extend_from_slice(&(pad as u16).to_be_bytes());
+        exts.resize(exts.len() + pad, 0);
+        let mut body = vec![0x03, 0x03];
+        body.extend_from_slice(&[0u8; 32]);
+        body.extend_from_slice(&[0x00, 0x00, 0x02, 0x13, 0x01, 0x01, 0x00]);
+        body.extend_from_slice(&(exts.len() as u16).to_be_bytes());
+        body.extend_from_slice(&exts);
+        let mut record = vec![0x16, 0x03, 0x01];
+        record.extend_from_slice(&(body.len() as u16 + 4).to_be_bytes());
+        record.push(0x01);
+        record.extend_from_slice(&(body.len() as u32).to_be_bytes()[1..]);
+        record.extend_from_slice(&body);
+        record
+    }
+
+    #[tokio::test]
+    async fn reads_a_client_hello_of_the_largest_accepted_size_whole() {
+        // Each padding byte adds one to the record: fill it to the limit.
+        let unpadded = padded_client_hello(CRED_HOST, 0).len();
+        let hello = padded_client_hello(CRED_HOST, 5 + MAX_CLIENT_HELLO - unpadded);
+        let mut buffered = Vec::new();
+        let peek = read_client_hello(&mut &hello[..], &mut buffered)
+            .await
+            .unwrap();
+        assert_eq!(peek, Peek::ServerName(CRED_HOST.into()));
+        assert_eq!(buffered, hello);
     }
 }
