@@ -465,9 +465,6 @@ pub enum MachineCmd {
     /// Stop a running machine
     Stop(StopCmd),
 
-    /// Power off a local VM without syncing guest filesystems. Unsaved data may be lost.
-    PowerOff(PowerOffCmd),
-
     /// Save RAM and disk durably, then stop at the saved execution boundary
     Pause(PauseCmd),
 
@@ -580,7 +577,6 @@ impl MachineCmd {
             MachineCmd::CheckpointWarm(cmd) => cmd.run(),
             MachineCmd::BranchRelease(cmd) => cmd.run(),
             MachineCmd::Stop(cmd) => cmd.run(),
-            MachineCmd::PowerOff(cmd) => cmd.run(),
             MachineCmd::Pause(cmd) => cmd.run(),
             MachineCmd::Resume(cmd) => cmd.run(),
             MachineCmd::Delete(cmd) => cmd.run(),
@@ -3562,6 +3558,42 @@ mod tests {
             "65",
         ])
         .is_err());
+    }
+
+    #[test]
+    fn stop_force_uses_the_stop_command_without_a_pid_argument() {
+        for flag in ["--force", "-f"] {
+            let cli =
+                TestMachineCli::try_parse_from(["machine", "stop", "-n", "web", flag]).unwrap();
+            let MachineCmd::Stop(cmd) = cli.command else {
+                panic!("expected machine stop");
+            };
+            assert!(cmd.force);
+            assert_eq!(cmd.name.as_deref(), Some("web"));
+        }
+        assert!(TestMachineCli::try_parse_from(["machine", "stop", "--force"]).is_ok());
+        assert!(
+            TestMachineCli::try_parse_from(["machine", "stop", "--force", "--timeout", "0"])
+                .is_err()
+        );
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "power-off",
+            "--name",
+            "web",
+            "--expected-pid",
+            "123"
+        ])
+        .is_err());
+        let MachineCmd::Stop(cmd) =
+            TestMachineCli::try_parse_from(["machine", "stop", "--timeout", "5"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected machine stop");
+        };
+        assert!(!cmd.force);
+        assert_eq!(cmd.timeout, Some(5));
     }
 
     #[test]
@@ -6652,6 +6684,11 @@ pub struct StopCmd {
     /// killed, instead of the machine's stop timeout (0 kills it at once)
     #[arg(short = 't', long, value_name = "SECONDS", value_parser = parse_stop_timeout_arg)]
     pub timeout: Option<u64>,
+
+    /// Stop immediately without syncing guest filesystems or staged folders.
+    /// Unsaved data may be lost.
+    #[arg(short = 'f', long, conflicts_with = "timeout")]
+    pub force: bool,
 }
 
 #[derive(Args, Debug)]
@@ -6682,36 +6719,12 @@ impl ResumeCmd {
     }
 }
 
-#[derive(Args, Debug)]
-pub struct PowerOffCmd {
-    /// Registered machine to power off
-    #[arg(long)]
-    pub name: String,
-
-    /// PID of the reviewed VM execution
-    #[arg(long, value_parser = clap::value_parser!(i32).range(2..))]
-    pub expected_pid: i32,
-}
-
-impl PowerOffCmd {
-    pub fn run(self) -> smolvm::Result<()> {
-        let db = smolvm::db::SmolvmDb::open()?;
-        let _admission = db.admit_workload_mutation(Some(&self.name), &[])?;
-        let _fork = smolvm::agent::fork::lock_fork_source(&self.name)?;
-        let record = db
-            .get_vm(&self.name)?
-            .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
-        let manager = smolvm::agent::AgentManager::for_existing_vm_record(&record)?;
-        manager.detach();
-        manager.power_off_persisted(&record, self.expected_pid)?;
-        println!("Powered off machine: {}", self.name);
-        Ok(())
-    }
-}
-
 impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = vm_common::resolve_vm_name(self.name)?;
+        if self.force {
+            return vm_common::force_stop_vm_named(name.as_deref().unwrap_or("default"));
+        }
         let timeout = self.timeout.map(std::time::Duration::from_secs);
         match &name {
             Some(name) => vm_common::stop_vm_named_with_timeout(name, timeout),

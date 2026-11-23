@@ -35,6 +35,25 @@ configuration, which should not sit in `/tmp` or behind a symlink into it.
 The storage disk defaults to 20 GiB and the rootfs overlay to 10 GiB, as `machine list` showed on
 v1.22.2 and on v1.27.3. Both are sparse, so they cost what they hold.
 
+## Stopping an unresponsive machine
+
+`smolvm machine stop --name dev` sends the workload its stop signal, waits for
+its stop timeout, and flushes storage before stopping. `--timeout SECONDS`
+overrides that workload wait; `--timeout 0` skips the wait but still syncs.
+
+If the guest cannot respond, use:
+
+```sh
+smolvm machine stop --name dev --force
+```
+
+`--force` (`-f`) ends the VM without asking the guest to shut down or syncing
+staged folders back to the host. Unsaved writes may be lost; the machine and
+its disks are retained for a later start. It still verifies the VM's process
+identity and refuses to stop a source with running dependent clones. A paused
+machine must be resumed or deleted. `--force` cannot be combined with
+`--timeout`. Omitting `--name` uses `$SMOLVM_MACHINE_NAME`, or `default`.
+
 ## Changing ports while it runs
 
 `machine update` adds or removes TCP ports on a running machine; the change

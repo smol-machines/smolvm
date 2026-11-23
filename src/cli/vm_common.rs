@@ -2706,6 +2706,34 @@ pub fn stop_vm_named_with_timeout(
     Ok(())
 }
 
+/// Force-stop the registered execution without contacting the guest. Admission
+/// and the fork lock keep the selected record stable; the manager verifies its
+/// PID and start time again before terminating it.
+pub fn force_stop_vm_named(name: &str) -> smolvm::Result<()> {
+    let db = SmolvmDb::open()?;
+    let _admission = db.admit_workload_mutation(Some(name), &[])?;
+    let _fork = smolvm::agent::fork::lock_fork_source(name)?;
+    let record = db
+        .get_vm(name)?
+        .ok_or_else(|| smolvm::Error::vm_not_found(name))?;
+    if record.paused_checkpoint.is_some() {
+        return Err(smolvm::Error::agent(
+            "stop",
+            "machine has saved execution; use resume or delete",
+        ));
+    }
+    let manager = AgentManager::for_existing_vm_record(&record)?;
+    manager.detach();
+    match record.pid {
+        Some(pid) => manager.power_off_persisted(&record, pid)?,
+        // A stopped or never-started machine has no execution to kill. Keep
+        // stop idempotent and publish the intentional stop for restart policy.
+        None => manager.stop_persisted(&record, None)?,
+    };
+    println!("Stopped machine: {}", name);
+    Ok(())
+}
+
 /// Kill an orphaned `_boot-vm` process for a machine that the DB thinks is
 /// not running.
 ///

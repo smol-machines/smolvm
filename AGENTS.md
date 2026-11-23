@@ -111,7 +111,7 @@ smolvm machine shell [--name NAME]                # interactive shell (must be r
 smolvm machine create --name NAME [OPTIONS]              # create persistent
 smolvm machine create --name NAME --from FILE.smolmachine  # from packed artifact
 smolvm machine start [--name NAME]                # start (default: "default")
-smolvm machine stop [--name NAME] [--timeout SECS]  # stop (workload gets SIGTERM first)
+smolvm machine stop [--name NAME] [--timeout SECS | --force]  # --force skips guest shutdown and sync
 smolvm machine logs [--name NAME] [-f] [--tail N] # workload stdout/stderr, even when stopped
 smolvm machine delete --name NAME [-f]                   # delete
 smolvm machine status [--name NAME]               # check state
@@ -583,7 +583,7 @@ can create and run machines. Machines that ask for nested virtualization
 
 - **Failures carry stable codes.** `--error-format json` prints a failure as `{"error":{"code":…,"message":…}}` on stderr (exit status unchanged). Codes match the SDKs' `SmolError.code`: `NOT_FOUND` (machine, file, image), `CONFLICT`, `INTERRUPTED` (a stop or delete cut the command off), `CONFIG_ERROR`, `INVALID_STATE`, `STORAGE_ERROR`, `MOUNT_ERROR`, `KVM_UNAVAILABLE`, `HYPERVISOR_UNAVAILABLE`, `COMMAND_FAILED`, `SMOLVM_ERROR`. Branch on the code, not the message.
 - **Disks smaller than 20 GiB need no host tools.** `--storage 8` makes an 8 GiB disk without `resize2fs`, and image machines of that size get an image seed of their own, so creating the next one does not pull the image again.
-- **`machine stop` stops the workload gracefully**: its stop signal (`SIGTERM` by default), then up to its stop timeout (10 s, at most 300) before a kill. `machine stop --timeout SECS` overrides the wait once (`0` kills at once); `machine delete` does not wait. Setting them: `docs/smolfile.md`.
+- **`machine stop` stops the workload gracefully**: its stop signal (`SIGTERM` by default), then up to its stop timeout (10 s, at most 300) before a kill. `machine stop --timeout SECS` overrides the wait once (`0` kills at once); `machine delete` does not wait. `machine stop --force` (`-f`) stops without guest shutdown or filesystem/staged-folder sync, retaining the disks; unsaved writes may be lost. It cannot be combined with `--timeout`. Setting the graceful stop defaults: `docs/smolfile.md`.
 - **`machine logs` shows the workload's output.** The workload's stdout and stderr are appended to `workload.log` in the machine's data directory, kept across restarts, rotated at 10 MiB (three old files kept), and readable while the machine is stopped. `-f` follows, `--tail N` shows the last N lines. Output of `machine exec` is not included. Over the API: `GET /api/v1/machines/{name}/logs?source=workload`.
 - **Observational commands don't stop running VMs.** `machine images`, `machine status`, `machine ls` and similar read-only commands leave a running VM in its current state. If the VM was already running before the command, it stays running after.
 - **`machine prune` works on a running VM.** Regular prune only removes unreferenced layers and is safe while containers are active. `prune --all` requires the VM to be stopped first since it deletes manifests for layers that may be in use.
