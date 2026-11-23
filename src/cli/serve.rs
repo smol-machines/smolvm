@@ -195,11 +195,17 @@ pub struct ServeStartCmd {
 
     /// Boot restored machines before their disks are copied: each disk is
     /// read from the checkpoint store as the guest touches it and filled in
-    /// the background. On a Linux node that drops each VM to its own uid,
-    /// guest RAM is rebuilt the same way. Needs the libkrun bundled with this
-    /// smolvm.
+    /// the background. Needs the libkrun bundled with this smolvm.
     #[arg(long = "lazy-disks")]
     lazy_disks: bool,
+
+    /// With --lazy-disks, on a Linux node that drops each VM to its own uid,
+    /// also rebuild restored RAM from the checkpoint store as the guest
+    /// touches it. Each such machine holds its own copy of the checkpoint's
+    /// RAM that the host cannot evict, where an ordinary restore shares one
+    /// the page cache can drop: use it only with memory to spare.
+    #[arg(long = "lazy-ram", requires = "lazy_disks")]
+    lazy_ram: bool,
 
     /// Space for captured checkpoints kept beside the machine's host, in GiB, so
     /// restoring one here skips the download. SMOLVM_PREPARED_CHECKPOINT_CACHE_MAX_BYTES,
@@ -303,9 +309,13 @@ impl ServeStartCmd {
             smolvm::lazy_disk::enable();
         }
         #[cfg(unix)]
+        if self.lazy_ram {
+            smolvm::lazy_disk::enable_memory();
+        }
+        #[cfg(unix)]
         smolvm::checkpoint_delta::fail_interrupted_imports();
         #[cfg(not(unix))]
-        let _ = self.lazy_disks;
+        let _ = (self.lazy_disks, self.lazy_ram);
 
         // Per-VM resource isolation + lossless-restart placement. Two paths:
         //

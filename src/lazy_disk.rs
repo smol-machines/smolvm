@@ -59,16 +59,32 @@ pub fn enabled() -> bool {
     ENABLED.load(Ordering::Relaxed)
 }
 
+static MEMORY_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Also rebuild restored RAM lazily from now on (`serve start --lazy-ram`).
+pub fn enable_memory() {
+    MEMORY_ENABLED.store(true, Ordering::Relaxed);
+}
+
 /// RAM image path within a checkpoint, as its index names it.
 pub const MEMORY_ASSET: &str = "checkpoint/memory.bin";
 /// Descriptor libkrun reads from a restore directory instead of the RAM image.
 pub const MEMORY_DESCRIPTOR: &str = "memory.bin.lazy";
 
-/// Whether restores also rebuild guest RAM lazily from the store. Only where
-/// the boot can hand the VMM a kernel-fault userfaultfd it opened as root, the
-/// same hosts that restore RAM as a read-only input.
+/// Whether restores also rebuild guest RAM lazily from the store: asked for,
+/// and only where the boot can hand the VMM a kernel-fault userfaultfd it
+/// opened as root, the same hosts that restore RAM as a read-only input.
+///
+/// Off unless asked for. Lazily rebuilt RAM lives in a memfd per machine,
+/// which the host cannot evict, while an ordinary restore maps one RAM image
+/// that every restore of the checkpoint shares and the page cache can drop:
+/// four restores of one checkpoint hold four copies, enough to run a host out
+/// of memory where the ordinary restore fits.
 pub fn memory_enabled() -> bool {
-    enabled() && cfg!(target_os = "linux") && crate::process::vm_uid_drop_active()
+    enabled()
+        && MEMORY_ENABLED.load(Ordering::Relaxed)
+        && cfg!(target_os = "linux")
+        && crate::process::vm_uid_drop_active()
 }
 
 /// `DISK.lazydisk`, read by libkrun. Fields libkrun does not know are refused
