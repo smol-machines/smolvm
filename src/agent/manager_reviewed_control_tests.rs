@@ -492,6 +492,75 @@ fn power_off_ends_the_reviewed_execution_without_guest_sync() {
 }
 
 #[test]
+fn stop_force_cli_ends_an_unresponsive_execution_and_retains_disks() {
+    isolated(
+        "stop_force_cli_ends_an_unresponsive_execution_and_retains_disks",
+        |root| {
+            let (db, record) = staged_fixture(root);
+            let dir = ensure_vm_dir(&record.name).unwrap();
+            let storage = dir.join(crate::storage::STORAGE_DISK_FILENAME);
+            let overlay = dir.join(crate::storage::OVERLAY_DISK_FILENAME);
+            std::fs::write(&storage, b"storage sentinel").unwrap();
+            std::fs::write(&overlay, b"overlay sentinel").unwrap();
+            let child = child();
+            let pid = child.0.id() as i32;
+            let start = process::process_start_time(pid).unwrap();
+            db.update_vm(&record.name, |r| {
+                r.state = crate::config::RecordState::Running;
+                r.pid = Some(pid);
+                r.pid_start_time = Some(start);
+            })
+            .unwrap();
+            let record = db.get_vm(&record.name).unwrap().unwrap();
+            let manager = AgentManager::for_existing_vm_record(&record).unwrap();
+            manager.detach();
+            std::fs::write(&manager.pid_file, format!("{pid}\n{start}")).unwrap();
+            // There is no agent socket: any guest sync would fail. Exercise
+            // the command dispatcher, not just the manager's force-stop API.
+            let stop = || {
+                crate::cli::machine::StopCmd {
+                    name: Some(record.name.clone()),
+                    timeout: None,
+                    force: true,
+                }
+                .run()
+            };
+            stop().unwrap();
+            assert!(!process::is_our_process_strict(pid, Some(start)));
+            let stopped = db.get_vm(&record.name).unwrap().unwrap();
+            assert_eq!(stopped.pid, None);
+            assert!(stopped.restart.user_stopped);
+            assert_eq!(std::fs::read(&storage).unwrap(), b"storage sentinel");
+            assert_eq!(std::fs::read(&overlay).unwrap(), b"overlay sentinel");
+            assert_eq!(
+                std::fs::read(root.join("staged-host/sentinel")).unwrap(),
+                b"host copy"
+            );
+            stop().unwrap(); // A repeated force stop is idempotent.
+            db.update_vm(&record.name, |r| {
+                r.paused_checkpoint = Some("saved-checkpoint".into());
+            })
+            .unwrap();
+            assert!(stop().unwrap_err().to_string().contains("saved execution"));
+            assert_eq!(
+                db.get_vm(&record.name)
+                    .unwrap()
+                    .unwrap()
+                    .paused_checkpoint
+                    .as_deref(),
+                Some(std::path::Path::new("saved-checkpoint"))
+            );
+            assert_eq!(
+                crate::cli::vm_common::force_stop_vm_named("missing")
+                    .unwrap_err()
+                    .code(),
+                "NOT_FOUND"
+            );
+        },
+    );
+}
+
+#[test]
 fn persisted_stop_retains_ownership_until_stopped_state_is_published() {
     isolated(
         "persisted_stop_retains_ownership_until_stopped_state_is_published",
