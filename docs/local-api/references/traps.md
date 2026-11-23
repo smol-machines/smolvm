@@ -77,7 +77,10 @@ written and the exit code is 0.
 `serve start` exposes create, exec and file routes, and started plainly it has no TLS, token or
 auth. Loopback TCP is reachable by other local users. A Unix socket is the safer default: smolvm
 binds it in a private temporary directory, sets mode `0600`, then publishes it at the requested
-path before accepting connections. Run the server and its API clients as the same user.
+path before accepting connections. Run the server and its API clients as the same user. A plain
+server on a `--listen` address other than loopback warns now and is refused from v1.38: serve it
+with client certificates (mutual TLS, below), or pass `--allow-unauthenticated-network` to keep
+exposing it.
 
 **Web pages are refused unless their origin is allowed.** A request a browser sends for a page
 is served only when its `Origin` is a `--cors-origin` (default `http://localhost` and
