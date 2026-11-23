@@ -17,6 +17,11 @@
 //!   rather than bound there directly, which would put it inside a `--volume` share
 //!   and make co-mounting VMs fight over one node (see [`MOUNT_SOCKET_DIR`]).
 //!
+//! - **Serial** (`--serial`, host device → guest tty): the agent opens a pty, links
+//!   its slave at the guest path (`/dev/ttySMOL0`, ...), and relays the pty to the
+//!   vsock port, which libkrun bridges to the host's serial bridge. Containers get
+//!   the slave by bind mount: a pty slave only opens through its own devpts mount.
+//!
 //! The relay honors independent TCP-style half-close so hijacked/streaming
 //! protocols don't lose output — the same property the Docker bridge fixed.
 
@@ -49,6 +54,9 @@ const MOUNT_SOCKET_DIR: &str = "/run/smolvm/published-sockets";
 /// published yet" invariant for every other test in the process.
 static PUBLISHED_MOUNTS: RwLock<Vec<PublishedSocket>> = RwLock::new(Vec::new());
 
+/// Serial ttys ready in the VM, as (pty slave path, guest path), for containers.
+static SERIAL_TTYS: RwLock<Vec<(String, String)>> = RwLock::new(Vec::new());
+
 /// Start every user-published socket bridge. No-op when none are configured.
 ///
 /// Mount listeners are prepared here, synchronously, instead of inside their
@@ -60,6 +68,7 @@ pub fn start_all() {
         _ => return,
     };
     let mut published = Vec::new();
+    let mut serial_ttys = Vec::new();
     for sock in decode(&encoded) {
         match sock.direction {
             SocketDirection::Expose => spawn_bridge(sock, serve_expose),
@@ -70,11 +79,21 @@ pub fn start_all() {
                 }
                 Err(e) => log_bridge_error(&sock, &e),
             },
+            SocketDirection::Serial => match prepare_serial_tty(&sock) {
+                Ok(tty) => {
+                    serial_ttys.push((tty.slave_path.clone(), sock.guest_path.clone()));
+                    spawn_bridge(sock, move |s| serve_serial(s, tty));
+                }
+                Err(e) => log_bridge_error(&sock, &e),
+            },
         }
     }
     *PUBLISHED_MOUNTS
         .write()
         .expect("published-sockets registry lock poisoned") = published;
+    *SERIAL_TTYS
+        .write()
+        .expect("serial tty registry lock poisoned") = serial_ttys;
 }
 
 #[cfg(target_os = "linux")]
@@ -123,6 +142,12 @@ pub fn inject_into_container(spec: &mut crate::oci::OciSpec) {
         .read()
         .expect("published-sockets registry lock poisoned");
     inject_sockets_into_container(spec, &published);
+    let ttys = SERIAL_TTYS
+        .read()
+        .expect("serial tty registry lock poisoned");
+    for (slave, guest_path) in ttys.iter() {
+        spec.add_bind_mount(slave, guest_path, false);
+    }
 }
 
 fn inject_sockets_into_container(spec: &mut crate::oci::OciSpec, sockets: &[PublishedSocket]) {
@@ -382,6 +407,112 @@ where
     }
 
     Ok(())
+}
+
+/// A pty for one serial device: the agent keeps its slave open so reading the
+/// master never fails with EIO while no guest program has the tty open.
+#[cfg(target_os = "linux")]
+struct SerialTty {
+    master: std::fs::File,
+    _slave: std::fs::File,
+    slave_path: String,
+}
+
+/// Open a raw pty for a serial device and link its slave at the guest path.
+#[cfg(target_os = "linux")]
+fn prepare_serial_tty(sock: &PublishedSocket) -> io::Result<SerialTty> {
+    use std::os::unix::fs::PermissionsExt;
+    use std::os::unix::io::FromRawFd;
+
+    let (master, slave) = unsafe {
+        let mut master: libc::c_int = -1;
+        let mut slave: libc::c_int = -1;
+        if libc::openpty(
+            &mut master,
+            &mut slave,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        ) != 0
+        {
+            return Err(io::Error::last_os_error());
+        }
+        // Raw: bytes pass through untouched, as on a real serial line. A program
+        // that opens the tty can still change its settings.
+        let mut tio: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(slave, &mut tio) == 0 {
+            libc::cfmakeraw(&mut tio);
+            libc::tcsetattr(slave, libc::TCSANOW, &tio);
+        }
+        (
+            std::fs::File::from_raw_fd(master),
+            std::fs::File::from_raw_fd(slave),
+        )
+    };
+    let slave_path = std::fs::read_link(format!("/proc/self/fd/{}", {
+        use std::os::unix::io::AsRawFd;
+        slave.as_raw_fd()
+    }))?
+    .to_string_lossy()
+    .into_owned();
+    // Any uid in the image may use the device, as on a host where the user is in
+    // the dialout group.
+    std::fs::set_permissions(&slave_path, std::fs::Permissions::from_mode(0o666))?;
+    let _ = std::fs::remove_file(&sock.guest_path);
+    std::os::unix::fs::symlink(&slave_path, &sock.guest_path)?;
+    Ok(SerialTty {
+        master,
+        _slave: slave,
+        slave_path,
+    })
+}
+
+/// Relay the pty to the host's serial bridge, reconnecting if the link drops.
+#[cfg(target_os = "linux")]
+fn serve_serial(sock: &PublishedSocket, tty: SerialTty) -> io::Result<()> {
+    tracing::info!(
+        vsock_port = sock.vsock_port,
+        guest_path = %sock.guest_path,
+        pty = %tty.slave_path,
+        "serial bridge ready"
+    );
+    loop {
+        match crate::vsock::connect(sock.vsock_port) {
+            Ok(host) => {
+                let master = tty.master.try_clone()?;
+                if let Err(e) = relay(master, host) {
+                    tracing::debug!(error = %e, "serial relay ended");
+                }
+            }
+            Err(e) => tracing::debug!(
+                vsock_port = sock.vsock_port,
+                error = %e,
+                "serial: host bridge not reachable"
+            ),
+        }
+        thread::sleep(std::time::Duration::from_secs(1));
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+struct SerialTty {
+    slave_path: String,
+}
+
+#[cfg(not(target_os = "linux"))]
+fn prepare_serial_tty(_sock: &PublishedSocket) -> io::Result<SerialTty> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "serial devices are only supported on Linux guests",
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn serve_serial(_sock: &PublishedSocket, _tty: SerialTty) -> io::Result<()> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "serial devices are only supported on Linux guests",
+    ))
 }
 
 #[cfg(not(target_os = "linux"))]

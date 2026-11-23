@@ -470,6 +470,34 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         }
     }
 
+    // `--serial` devices: like the video broker, each bridge starts before the
+    // uid drop and Landlock/seccomp, opens its device with the invoking user's
+    // access, then drops to the same per-VM uid. libkrun dials its socket.
+    let serial_run_as = std::env::var("SMOLVM_VM_UID")
+        .ok()
+        .and_then(|uid| uid.parse::<u32>().ok())
+        .map(|uid| {
+            let gid = std::env::var("SMOLVM_VM_GID")
+                .ok()
+                .and_then(|gid| gid.parse::<u32>().ok())
+                .unwrap_or(uid);
+            (uid, gid)
+        });
+    let published_sockets = match config.vsock_socket.parent() {
+        Some(vm_dir) => match crate::agent::serial_bridge::prestart(
+            &config.published_sockets,
+            vm_dir,
+            serial_run_as,
+        ) {
+            Ok(sockets) => sockets,
+            Err(e) => {
+                eprintln!("[serial] {e}");
+                crate::process::exit_child(1);
+            }
+        },
+        None => config.published_sockets.clone(),
+    };
+
     // Drop to an unprivileged uid before touching the guest, so a guest→VMM
     // escape can't signal/ptrace the supervisor or neighbor VMs nor reach
     // root-owned host files. Gated by SMOLVM_VM_UID (+ optional SMOLVM_VM_GID,
@@ -870,7 +898,7 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         docker_socket: docker_socket.as_deref(),
         workload_log_socket: workload_log_socket.as_deref(),
         auto_ports: config.auto_ports.as_ref(),
-        published_sockets: &config.published_sockets,
+        published_sockets: &published_sockets,
         packed_layers_dir: config.packed_layers_dir.as_deref(),
         packed_layers_dax_window: config.packed_layers_dax_window,
         extra_disks: &config.extra_disks,

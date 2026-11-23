@@ -48,6 +48,7 @@ fn boot(config: &EngineConfig) -> crate::Result<VmHandle> {
                     direction: smolvm_protocol::publish_socket::SocketDirection::Expose,
                     guest_path: GUEST_SOCKET.into(),
                     host_path: Some(bridge.to_string_lossy().into_owned()),
+                    baud: None,
                 }],
                 ..Default::default()
             },

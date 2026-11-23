@@ -5118,6 +5118,7 @@ mod mount_socket_placeholder_tests {
             direction: SocketDirection::Mount,
             guest_path: guest_path.to_string(),
             host_path: Some("/tmp/host.sock".to_string()),
+            baud: None,
         }
     }
 
@@ -5166,6 +5167,7 @@ mod mount_socket_placeholder_tests {
                     direction: SocketDirection::Expose,
                     guest_path: "/run/control/exposed.sock".to_string(),
                     host_path: None,
+                    baud: None,
                 },
                 // A socket whose guest path is inside no volume touches nothing.
                 mount_sock("/elsewhere/engine.sock"),

@@ -23,6 +23,7 @@ mod manager;
 pub(crate) use manager::{ensure_vm_dir_at, ControlOperation};
 pub mod pod_net;
 pub mod rootfs_store;
+pub mod serial_bridge;
 #[cfg(unix)]
 pub(crate) mod startup_transaction;
 pub mod state_probe;
