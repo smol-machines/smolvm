@@ -338,6 +338,7 @@ fn lock_checkpoint_cache_namespace(dir: &std::path::Path) -> std::io::Result<std
 
 /// Run `f` while no checkpoint artifact is being verified: adding or removing
 /// a link moves an inode's ctime under a verifier.
+#[cfg(unix)]
 pub(crate) fn with_checkpoint_links_locked<R>(f: impl FnOnce() -> R) -> R {
     let _lock = checkpoint_cache_dir()
         .ok()
