@@ -1732,7 +1732,6 @@ fn allocated(meta: &fs::Metadata) -> u64 {
     meta.blocks().saturating_mul(512)
 }
 
-#[cfg(unix)]
 fn is_object_name(name: &str) -> bool {
     name.len() == 64
         && name
