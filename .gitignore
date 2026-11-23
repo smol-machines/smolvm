@@ -18,6 +18,7 @@
 # dropped, leaving dangling symlinks that break `hashFiles` in release CI).
 !lib/linux-x86_64/*.so
 !lib/linux-aarch64/*.so
+!lib/vulkan-guest-driver/*/*.so
 
 # Distribution build output
 /dist/smolvm-*/
