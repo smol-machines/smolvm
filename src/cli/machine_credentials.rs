@@ -112,6 +112,9 @@ impl AddCmd {
             smolvm::agent::apply_live_credential_values(&name, &host_sourced)?;
         }
         report(&name, &set);
+        for binding in &added {
+            eprintln!("  {}", smolvm::credentials::describe_binding(binding));
+        }
         Ok(())
     }
 }

@@ -944,6 +944,11 @@ pub(crate) fn print_created(record: &VmRecord) {
     if !record.init.is_empty() {
         println!("  Init commands: {}", record.init.len());
     }
+    if let Some(policy) = &record.credential_policy {
+        for binding in &policy.credentials {
+            println!("  {}", smolvm::credentials::describe_binding(binding));
+        }
+    }
     println!(
         "\nUse 'smolvm machine start --name {}' to start the machine",
         record.name
