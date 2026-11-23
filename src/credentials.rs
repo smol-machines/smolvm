@@ -1689,6 +1689,24 @@ impl CredentialResolver for SecretRefResolver {
     }
 }
 
+/// One line saying where a binding's placeholder lands and where its real value
+/// may go. `NAME=ENV_VAR@HOST` names the same variable on both sides, which is
+/// easy to misread as `GUEST_VAR=HOST_VAR`, so create and `credentials add` print
+/// this for every binding.
+pub fn describe_binding(binding: &CredentialBinding) -> String {
+    let hosts = binding.allowed_hosts.join(", ");
+    match (binding.environment_variable.is_empty(), &binding.set_header) {
+        (true, Some(header)) => format!(
+            "credential '{}': no guest variable; header {header} is set on HTTPS requests to {hosts}",
+            binding.name
+        ),
+        _ => format!(
+            "credential '{}': the guest's {} holds a placeholder; the real value goes only to {hosts}",
+            binding.name, binding.environment_variable
+        ),
+    }
+}
+
 /// Parse a `--credential NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER]` flag.
 pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBinding, String> {
     let usage = "expected NAME=ENV_VAR@HOST[,HOST...][:body][:set-header=HEADER] \
@@ -1754,6 +1772,33 @@ pub fn parse_credential_flag(spec: &str) -> std::result::Result<CredentialBindin
             .collect(),
         set_header,
     })
+}
+
+#[cfg(test)]
+mod describe_binding_tests {
+    use super::*;
+
+    #[test]
+    fn a_binding_names_the_guest_variable_that_gets_the_placeholder() {
+        let binding =
+            parse_credential_flag("ANTHROPIC_API_KEY=HOST_KEY@api.anthropic.com").unwrap();
+        assert_eq!(
+            describe_binding(&binding),
+            "credential 'ANTHROPIC_API_KEY': the guest's HOST_KEY holds a placeholder; \
+             the real value goes only to api.anthropic.com"
+        );
+    }
+
+    #[test]
+    fn a_header_only_binding_says_it_has_no_guest_variable() {
+        let mut binding =
+            parse_credential_flag("gh=GH@api.github.com:set-header=Authorization").unwrap();
+        binding.environment_variable.clear();
+        assert_eq!(
+            describe_binding(&binding),
+            "credential 'gh': no guest variable; header authorization is set on HTTPS requests to api.github.com"
+        );
+    }
 }
 
 #[cfg(test)]
