@@ -118,21 +118,20 @@ impl GenLib {
             })
         }
     }
-    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {
+    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut super::VhTable, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {
         let mut __c = GenCur { b: args, p: 0 };
         let _ = __streams;
         match func {
-            0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cublasCreate_v2)(&mut h) }; if st == 0 && args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, h as u64); if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() { eprintln!("[vh-insert] pid={} id={id:#x}", std::process::id()); } } } (st, (h as u64).to_le_bytes().to_vec()) }
+            0 => { let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe { (self.f_cublasCreate_v2)(&mut h) }; if st == 0 { super::vh_record(__vh, super::VhKind::CublasHandle, h as u64); if args.len() >= 8 { let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 { __vh.insert(id, (super::VhKind::CublasHandle, h as u64)); if std::env::var_os("SMOLVM_CUDA_HOST_OPLOG").is_some() { eprintln!("[vh-insert] pid={} id={id:#x}", std::process::id()); } } } } (st, (h as u64).to_le_bytes().to_vec()) }
             1 => {
-                let __raw = __c.u64();
-                let handle = super::vh_resolve(__vh, __raw) as *mut c_void;
-                if __raw & super::VHANDLE_TAG != 0 { __vh.remove(&__raw); }
+                let Some(handle) = super::vh_retire(__vh, __c.u64(), super::VhKind::CublasHandle) else { return (0, Vec::new()); };
+                let handle = handle as *mut c_void;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasDestroy_v2)(handle) };
                 (st, out)
             }
             2 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -151,7 +150,7 @@ impl GenLib {
                 (st, out)
             }
             3 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -170,7 +169,7 @@ impl GenLib {
                 (st, out)
             }
             4 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -189,7 +188,7 @@ impl GenLib {
                 (st, out)
             }
             5 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -212,7 +211,7 @@ impl GenLib {
                 (st, out)
             }
             6 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -235,14 +234,14 @@ impl GenLib {
                 (st, out)
             }
             7 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
-                let stream = super::stream_resolve(__streams, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
+                let stream = match super::stream_resolve(__streams, __c.u64()) { Ok(s) => s as *mut c_void, Err(st) => return (st, Vec::new()) };
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasSetStream_v2)(handle, stream) };
                 (st, out)
             }
             8 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let workspace = super::dptr_resolve(__c.u64()) as *mut c_void;
                 let size = __c.u64();
                 let mut out = Vec::new();
@@ -250,14 +249,14 @@ impl GenLib {
                 (st, out)
             }
             9 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mode = __c.i32();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasSetMathMode)(handle, mode as c_int) };
                 (st, out)
             }
             10 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mut mode_v: c_int = 0 as c_int;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasGetMathMode)(handle, &mut mode_v) };
@@ -273,7 +272,7 @@ impl GenLib {
                 (st, out)
             }
             12 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -297,7 +296,7 @@ impl GenLib {
                 (st, out)
             }
             13 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -325,7 +324,7 @@ impl GenLib {
                 (st, out)
             }
             14 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -350,7 +349,7 @@ impl GenLib {
                 (st, out)
             }
             15 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let alpha_v = __c.f32();
                 let x = super::dptr_resolve(__c.u64()) as *const f32;
@@ -362,7 +361,7 @@ impl GenLib {
                 (st, out)
             }
             16 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let alpha_v = __c.f64();
                 let x = super::dptr_resolve(__c.u64()) as *const f64;
@@ -374,7 +373,7 @@ impl GenLib {
                 (st, out)
             }
             17 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let alpha_v = __c.f32();
                 let x = super::dptr_resolve(__c.u64()) as *mut f32;
@@ -384,7 +383,7 @@ impl GenLib {
                 (st, out)
             }
             18 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let alpha_v = __c.f64();
                 let x = super::dptr_resolve(__c.u64()) as *mut f64;
@@ -394,7 +393,7 @@ impl GenLib {
                 (st, out)
             }
             19 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let x = super::dptr_resolve(__c.u64()) as *mut f32;
                 let incx = __c.i32();
@@ -405,7 +404,7 @@ impl GenLib {
                 (st, out)
             }
             20 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let x = super::dptr_resolve(__c.u64()) as *mut f64;
                 let incx = __c.i32();
@@ -416,7 +415,7 @@ impl GenLib {
                 (st, out)
             }
             21 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let x = super::dptr_resolve(__c.u64()) as *mut f32;
                 let incx = __c.i32();
@@ -427,7 +426,7 @@ impl GenLib {
                 (st, out)
             }
             22 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let x = super::dptr_resolve(__c.u64()) as *mut f64;
                 let incx = __c.i32();
@@ -438,7 +437,7 @@ impl GenLib {
                 (st, out)
             }
             23 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let trans = __c.i32();
                 let m = __c.i32();
                 let n = __c.i32();
@@ -455,7 +454,7 @@ impl GenLib {
                 (st, out)
             }
             24 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let trans = __c.i32();
                 let m = __c.i32();
                 let n = __c.i32();
@@ -472,7 +471,7 @@ impl GenLib {
                 (st, out)
             }
             25 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let m = __c.i32();
                 let n = __c.i32();
                 let alpha_v = __c.f32();
@@ -487,7 +486,7 @@ impl GenLib {
                 (st, out)
             }
             26 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let m = __c.i32();
                 let n = __c.i32();
                 let alpha_v = __c.f64();
@@ -502,7 +501,7 @@ impl GenLib {
                 (st, out)
             }
             27 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -520,7 +519,7 @@ impl GenLib {
                 (st, out)
             }
             28 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -538,7 +537,7 @@ impl GenLib {
                 (st, out)
             }
             29 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let trans = __c.i32();
                 let n = __c.i32();
@@ -554,7 +553,7 @@ impl GenLib {
                 (st, out)
             }
             30 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let trans = __c.i32();
                 let n = __c.i32();
@@ -570,7 +569,7 @@ impl GenLib {
                 (st, out)
             }
             31 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let side = __c.i32();
                 let uplo = __c.i32();
                 let m = __c.i32();
@@ -588,7 +587,7 @@ impl GenLib {
                 (st, out)
             }
             32 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let side = __c.i32();
                 let uplo = __c.i32();
                 let m = __c.i32();
@@ -606,7 +605,7 @@ impl GenLib {
                 (st, out)
             }
             33 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let side = __c.i32();
                 let uplo = __c.i32();
                 let trans = __c.i32();
@@ -623,7 +622,7 @@ impl GenLib {
                 (st, out)
             }
             34 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let side = __c.i32();
                 let uplo = __c.i32();
                 let trans = __c.i32();
@@ -640,14 +639,14 @@ impl GenLib {
                 (st, out)
             }
             35 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let sm_count_target = __c.i32();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasSetSmCountTarget)(handle, sm_count_target as c_int) };
                 (st, out)
             }
             36 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mut stream_v: *mut c_void = std::ptr::null_mut();
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasGetStream_v2)(handle, &mut stream_v) };
@@ -655,7 +654,7 @@ impl GenLib {
                 (st, out)
             }
             37 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mut version_v: c_int = 0 as c_int;
                 let mut out = Vec::new();
                 let st = unsafe { (self.f_cublasGetVersion_v2)(handle, &mut version_v) };
@@ -663,7 +662,7 @@ impl GenLib {
                 (st, out)
             }
             38 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mode = __c.i32();
                 let m = __c.i32();
                 let n = __c.i32();
@@ -678,7 +677,7 @@ impl GenLib {
                 (st, out)
             }
             39 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mode = __c.i32();
                 let m = __c.i32();
                 let n = __c.i32();
@@ -693,7 +692,7 @@ impl GenLib {
                 (st, out)
             }
             40 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mode = __c.i32();
                 let m = __c.i32();
                 let n = __c.i32();
@@ -708,7 +707,7 @@ impl GenLib {
                 (st, out)
             }
             41 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let mode = __c.i32();
                 let m = __c.i32();
                 let n = __c.i32();
@@ -723,7 +722,7 @@ impl GenLib {
                 (st, out)
             }
             42 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let n = __c.i32();
                 let k = __c.i32();
@@ -740,7 +739,7 @@ impl GenLib {
                 (st, out)
             }
             43 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let n = __c.i32();
                 let k = __c.i32();
@@ -757,7 +756,7 @@ impl GenLib {
                 (st, out)
             }
             44 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let n = __c.i32();
                 let src = super::dptr_resolve(__c.u64()) as *const f32;
@@ -768,7 +767,7 @@ impl GenLib {
                 (st, out)
             }
             45 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let n = __c.i32();
                 let src = super::dptr_resolve(__c.u64()) as *const f64;
@@ -779,7 +778,7 @@ impl GenLib {
                 (st, out)
             }
             46 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let n = __c.i32();
                 let src = super::dptr_resolve(__c.u64()) as *const f32;
@@ -790,7 +789,7 @@ impl GenLib {
                 (st, out)
             }
             47 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let uplo = __c.i32();
                 let n = __c.i32();
                 let src = super::dptr_resolve(__c.u64()) as *const f64;
@@ -801,7 +800,7 @@ impl GenLib {
                 (st, out)
             }
             48 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
                 let lda = __c.i32();
@@ -815,7 +814,7 @@ impl GenLib {
                 (st, out)
             }
             49 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
                 let lda = __c.i32();
@@ -829,7 +828,7 @@ impl GenLib {
                 (st, out)
             }
             50 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
                 let lda = __c.i32();
@@ -843,7 +842,7 @@ impl GenLib {
                 (st, out)
             }
             51 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let n = __c.i32();
                 let Aarray = super::dptr_resolve(__c.u64()) as *const c_void;
                 let lda = __c.i32();
@@ -857,7 +856,7 @@ impl GenLib {
                 (st, out)
             }
             52 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();
@@ -875,7 +874,7 @@ impl GenLib {
                 (st, out)
             }
             53 => {
-                let handle = super::vh_resolve(__vh, __c.u64()) as *mut c_void;
+                let handle = super::vh_resolve(__vh, __c.u64(), super::VhKind::CublasHandle) as *mut c_void;
                 let transa = __c.i32();
                 let transb = __c.i32();
                 let m = __c.i32();

@@ -147,6 +147,10 @@ pub struct GpuBackend {
     cuda_library_builds: std::collections::HashMap<u64, (u32, Vec<Vec<u8>>)>,
     next_cuda_library_build: u64,
     live_cuda_libraries: std::collections::HashSet<u64>,
+    /// The module `cuLibraryGetModule` handed out for a live library. The
+    /// library owns it: it is a usable module (`LIBRARY_MODULES`) for as long
+    /// as the library is loaded and forgotten when that is unloaded.
+    cuda_library_modules: std::collections::HashMap<u64, u64>,
     /// `cuFuncGetParamInfo` — CUDA 12.4+. `None` on older drivers, where
     /// [`Backend::func_get_param_info`] reports `CUDA_ERROR_NOT_SUPPORTED`.
     func_get_param_info:
@@ -329,17 +333,19 @@ pub struct GpuBackend {
     cublaslt: Option<CublasLt>,
     /// Legacy cuDNN batch-norm (Ex) forwarder — PyTorch's `BatchNorm2d` path.
     cudnn_bn: Option<CudnnBn>,
-    /// Guest-assigned virtual handle (bit 63 set) → real host descriptor
-    /// pointer. Lets the guest fire-and-forget descriptor creation: it invents
-    /// the id, the host materializes and maps it, and every later reference is
-    /// translated here. Real pointers (bit 63 clear) pass through untouched.
+    /// Guest-assigned virtual handle (bit 63 set) → kind and real host
+    /// descriptor pointer. Lets the guest fire-and-forget descriptor creation:
+    /// it invents the id, the host materializes and maps it, and every later
+    /// reference is translated here, checked against the kind of object the
+    /// parameter expects. Real pointers (bit 63 clear) resolve only if a create
+    /// returned them (see [`vh_resolve`]).
     ///
     /// Behind `Arc<Mutex>` so a fork clone's reconnecting session can adopt a
     /// snapshot of its (frozen) parent's map — the descriptors are real host
     /// pointers valid in the shared primary context, so copying the id→pointer
     /// pairs is enough. Lock cost is negligible: every access already sits
     /// behind a guest round-trip.
-    vhandles: std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+    vhandles: std::sync::Arc<std::sync::Mutex<VhTable>>,
     /// Host mappings of guest RAM, each `(gpa_start, host_va, len)`, for
     /// zero-copy `memcpy_gpa_*` (via `krun_get_guest_ram`). Empty outside a
     /// microVM / on older libkrun. Guest RAM is usually split into a low and a
@@ -593,6 +599,7 @@ impl GpuBackend {
                 cuda_library_builds: std::collections::HashMap::new(),
                 next_cuda_library_build: 1,
                 live_cuda_libraries: std::collections::HashSet::new(),
+                cuda_library_modules: std::collections::HashMap::new(),
                 func_get_param_info: sym(&lib, b"cuFuncGetParamInfo\0").ok(),
                 kernel_get_param_info: sym(&lib, b"cuKernelGetParamInfo\0").ok(),
                 func_set_attribute: sym(&lib, b"cuFuncSetAttribute\0")?,
@@ -709,7 +716,7 @@ impl GpuBackend {
                     // snapshot (guest creates a cuBLAS handle on one channel,
                     // GEMMs flow on another → vh-miss → NOT_INITIALIZED).
                     static WORKER_VHANDLES: std::sync::OnceLock<
-                        std::sync::Arc<std::sync::Mutex<std::collections::HashMap<u64, u64>>>,
+                        std::sync::Arc<std::sync::Mutex<VhTable>>,
                     > = std::sync::OnceLock::new();
                     WORKER_VHANDLES
                         .get_or_init(|| {
@@ -757,6 +764,27 @@ impl GpuBackend {
                 .and_then(|b| b.try_into().ok())
                 .map(u64::from_le_bytes)
                 .ok_or(CUDA_ERROR_INVALID_VALUE)
+        };
+        // Library, kernel and module handles are host pointers the guest
+        // holds by value, and the driver dereferences them: accept only the
+        // ones this backend (libraries), this process (kernels, via
+        // `register_cuda_function`) or this worker (modules) handed out.
+        let read_library = |bytes: &[u8]| -> Result<u64, c_int> {
+            let library = read_handle(bytes)?;
+            self.live_cuda_libraries
+                .contains(&library)
+                .then_some(library)
+                .ok_or(CUDA_ERROR_INVALID_HANDLE)
+        };
+        let read_kernel = |bytes: &[u8]| -> Result<u64, c_int> {
+            let kernel = read_handle(bytes)?;
+            validate_cuda_function(kernel).map(|()| kernel)
+        };
+        let read_module = |bytes: &[u8]| -> Result<u64, c_int> {
+            let module = read_handle(bytes)?;
+            super::module_is_live(module)
+                .then_some(module)
+                .ok_or(CUDA_ERROR_INVALID_HANDLE)
         };
         let response = |status: c_int, handle: *mut c_void| {
             Ok((
@@ -861,18 +889,21 @@ impl GpuBackend {
                 },
                 Err(status) => response(status, std::ptr::null_mut()),
             },
-            6 => match (read_handle(args), self.library_unload) {
+            6 => match (read_library(args), self.library_unload) {
                 (Ok(library), Some(unload)) => {
                     let status = unsafe { unload(library as *mut c_void) };
                     if status == 0 {
                         self.live_cuda_libraries.remove(&library);
+                        if let Some(module) = self.cuda_library_modules.remove(&library) {
+                            super::worker_handle_take(&super::LIBRARY_MODULES, module);
+                        }
                     }
                     response(status, std::ptr::null_mut())
                 }
                 (Err(status), _) => response(status, std::ptr::null_mut()),
                 (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
             },
-            7 => match (read_handle(args), self.library_get_kernel) {
+            7 => match (read_library(args), self.library_get_kernel) {
                 (Ok(library), Some(get_kernel)) if args.len() > 8 => {
                     match CString::new(&args[8..]) {
                         Ok(name) => {
@@ -892,7 +923,7 @@ impl GpuBackend {
                 (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
                 _ => response(CUDA_ERROR_INVALID_VALUE, std::ptr::null_mut()),
             },
-            8 => match (read_handle(args), self.kernel_get_function) {
+            8 => match (read_kernel(args), self.kernel_get_function) {
                 (Ok(kernel), Some(get_function)) => {
                     let mut function = std::ptr::null_mut();
                     let status = unsafe { get_function(&mut function, kernel as *mut c_void) };
@@ -904,10 +935,14 @@ impl GpuBackend {
                 (Err(status), _) => response(status, std::ptr::null_mut()),
                 (_, None) => response(CUDA_ERROR_NOT_SUPPORTED, std::ptr::null_mut()),
             },
-            9 => match (read_handle(args), self.library_get_module) {
+            9 => match (read_library(args), self.library_get_module) {
                 (Ok(library), Some(get_module)) => {
                     let mut module = std::ptr::null_mut();
                     let status = unsafe { get_module(&mut module, library as *mut c_void) };
+                    if status == 0 {
+                        self.cuda_library_modules.insert(library, module as u64);
+                        super::worker_handle_register(&super::LIBRARY_MODULES, module as u64);
+                    }
                     response(status, module)
                 }
                 (Err(status), _) => response(status, std::ptr::null_mut()),
@@ -924,7 +959,7 @@ impl GpuBackend {
                 ),
                 Err(status) => response(status, std::ptr::null_mut()),
             },
-            11 => match read_handle(args) {
+            11 => match read_module(args) {
                 Ok(module) if args.len() > 8 => match CString::new(&args[8..]) {
                     Ok(name) => {
                         let mut pointer = 0u64;
@@ -1092,6 +1127,9 @@ impl GpuBackend {
                 });
                 match (parsed, self.kernel_get_attribute) {
                     (Some((kernel, attrib, device)), Some(get_attribute)) => {
+                        if let Err(status) = validate_cuda_function(kernel) {
+                            return Some(response(status, std::ptr::null_mut()));
+                        }
                         let mut value = 0;
                         let status = unsafe {
                             get_attribute(&mut value, attrib, kernel as *mut c_void, device)
@@ -1119,6 +1157,9 @@ impl GpuBackend {
                 });
                 match (parsed, self.kernel_set_attribute) {
                     (Some((kernel, attrib, value, device)), Some(set_attribute)) => {
+                        if let Err(status) = validate_cuda_function(kernel) {
+                            return Some(response(status, std::ptr::null_mut()));
+                        }
                         let status =
                             unsafe { set_attribute(attrib, value, kernel as *mut c_void, device) };
                         response(status, std::ptr::null_mut())
@@ -1160,21 +1201,53 @@ fn chk(code: CuResultCode) -> CuResult<()> {
 /// fork clone resuming a dead token just starts with an empty map. Lets a
 /// clone's fresh connection adopt a snapshot of its (frozen) parent's handle
 /// map — see [`GpuBackend::begin_session`].
-type VhMap = std::sync::Mutex<std::collections::HashMap<u64, u64>>;
+type VhMap = std::sync::Mutex<VhTable>;
 static HANDOFF: std::sync::Mutex<Option<std::collections::HashMap<u64, std::sync::Weak<VhMap>>>> =
     std::sync::Mutex::new(None);
 
-fn next_lineage_token() -> u64 {
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static NEXT: AtomicU64 = AtomicU64::new(1);
-    NEXT.fetch_add(1, Ordering::Relaxed)
+/// Library objects (real pointers) a handoff copied into a second session's
+/// map. The parent is not frozen in general — a golden's reconnect and a
+/// forked guest process both resume a token whose session keeps serving — so
+/// from then on two maps name the object and a destroy on either side only
+/// retires the caller's name: [`vh_retire`] never frees one of these (the
+/// other session would keep handing the freed pointer to the library). Never
+/// freed also means the address is never reused for another object, so the
+/// set stays accurate. Leaks the objects, like `TEMPLATE_GRAPHS` in host.rs.
+static HANDED_OFF: std::sync::Mutex<Option<std::collections::HashSet<u64>>> =
+    std::sync::Mutex::new(None);
+
+fn handed_off(real: u64) -> bool {
+    HANDED_OFF
+        .lock()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|s| s.contains(&real))
 }
 
-/// Adopt `resume_token`'s (frozen) descriptor map into `dst`, then register
-/// `dst` under a fresh token and return it. The parent's entries are real host
-/// pointers valid in the shared primary context, so copying id→pointer pairs is
-/// enough for a fork clone to keep using them. Closed sessions' entries (dead
-/// `Weak`s) are pruned on the way through.
+fn next_lineage_token<V>(taken: &std::collections::HashMap<u64, V>) -> u64 {
+    // Random, so one machine's session cannot name another's map by guessing
+    // the next number. 0 means "no handoff" on the wire: it is never drawn, and
+    // it is the answer when there is no randomness (the clone starts empty).
+    loop {
+        let mut token = [0u8; 8];
+        if getrandom::fill(&mut token).is_err() {
+            return 0;
+        }
+        let token = u64::from_le_bytes(token);
+        if token != 0 && !taken.contains_key(&token) {
+            return token;
+        }
+    }
+}
+
+/// Adopt `resume_token`'s descriptor map into `dst`, then register `dst` under
+/// a fresh token and return it. The parent's entries are real host pointers
+/// valid in the shared primary context, so copying id→pointer pairs is enough
+/// for a fork clone to keep using them. The parent may well stay live, so the
+/// copied objects are marked [`HANDED_OFF`] under the parent's map lock (the
+/// lock its destroys hold while they decide whether to free) and outlive
+/// either session's destroy. Closed sessions' entries (dead `Weak`s) are
+/// pruned on the way through.
 fn handoff_register(dst: &std::sync::Arc<VhMap>, resume_token: u64) -> u64 {
     let mut reg = HANDOFF.lock().unwrap();
     let reg = reg.get_or_insert_with(std::collections::HashMap::new);
@@ -1184,13 +1257,26 @@ fn handoff_register(dst: &std::sync::Arc<VhMap>, resume_token: u64) -> u64 {
             // (see the WORKER_VHANDLES init) — self-adoption would deadlock
             // on the same mutex and is a no-op anyway.
             if !std::sync::Arc::ptr_eq(&parent, dst) {
-                *dst.lock().unwrap() = parent.lock().unwrap().clone();
+                let parent = parent.lock().unwrap();
+                HANDED_OFF
+                    .lock()
+                    .unwrap()
+                    .get_or_insert_with(std::collections::HashSet::new)
+                    .extend(
+                        parent
+                            .values()
+                            .map(|&(_, real)| real)
+                            .filter(|&real| real != 0),
+                    );
+                *dst.lock().unwrap() = parent.clone();
             }
         }
     }
-    let token = next_lineage_token();
     reg.retain(|_, w| w.strong_count() > 0);
-    reg.insert(token, std::sync::Arc::downgrade(dst));
+    let token = next_lineage_token(reg);
+    if token != 0 {
+        reg.insert(token, std::sync::Arc::downgrade(dst));
+    }
     token
 }
 
@@ -2823,7 +2909,12 @@ impl Backend for GpuBackend {
         self.gen_lib_call(lib, func, args, streams)
     }
     fn lib_handle_alias(&mut self, golden: u64, real: u64) {
-        self.vhandles.lock().unwrap().insert(golden, real);
+        // The golden's handle names the same kind of object as the worker's
+        // re-created one, which its create call just recorded.
+        let mut vh = self.vhandles.lock().unwrap();
+        if let Some(&entry) = vh.get(&real) {
+            vh.insert(golden, entry);
+        }
     }
 }
 
@@ -2886,18 +2977,21 @@ impl CudnnBackend {
     /// Descriptor handles may be guest-assigned virtual ids (`vh`); attribute
     /// arrays of type `CUDNN_TYPE_BACKEND_DESCRIPTOR` embed handles and are
     /// translated element-wise.
-    fn dispatch(
-        &self,
-        func: u16,
-        args: &[u8],
-        vh: &mut std::collections::HashMap<u64, u64>,
-    ) -> (i32, Vec<u8>) {
+    fn dispatch(&self, func: u16, args: &[u8], vh: &mut VhTable) -> (i32, Vec<u8>) {
         /// `cudnnBackendAttributeType_t` values whose 8-byte elements are
         /// handles the guest may know only by virtual id: HANDLE(0) — the
         /// cudnnHandle_t itself — and BACKEND_DESCRIPTOR(15). VOID_PTR(6)
         /// elements are device pointers (untagged), translated harmlessly.
         fn handle_bearing(ty: i32) -> bool {
             matches!(ty, 0 | 6 | 15)
+        }
+        /// The kind of object a HANDLE(0) / BACKEND_DESCRIPTOR(15) element names.
+        fn element_kind(ty: i32) -> VhKind {
+            if ty == 0 {
+                VhKind::CudnnHandle
+            } else {
+                VhKind::CudnnBackendDescriptor
+            }
         }
         let rd_u64 = |a: &[u8], o: usize| u64::from_le_bytes(a[o..o + 8].try_into().unwrap());
         let rd_i32 = |a: &[u8], o: usize| i32::from_le_bytes(a[o..o + 4].try_into().unwrap());
@@ -2910,25 +3004,28 @@ impl CudnnBackend {
                 let ty = rd_i32(args, 0);
                 let mut desc: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.create)(ty, &mut desc) };
+                if st == 0 {
+                    vh_record(vh, VhKind::CudnnBackendDescriptor, desc as u64);
+                }
                 if st == 0 && args.len() >= 12 {
                     let id = rd_u64(args, 4);
                     if id & VHANDLE_TAG != 0 {
-                        vh.insert(id, desc as u64);
+                        vh.insert(id, (VhKind::CudnnBackendDescriptor, desc as u64));
                     }
                 }
                 (st, (desc as u64).to_le_bytes().to_vec())
             }
             1 => {
-                let id = rd_u64(args, 0);
-                let desc = vh_resolve(vh, id) as *mut c_void;
-                if id & VHANDLE_TAG != 0 {
-                    vh.remove(&id);
-                }
-                (unsafe { (self.destroy)(desc) }, Vec::new())
+                let Some(desc) = vh_retire(vh, rd_u64(args, 0), VhKind::CudnnBackendDescriptor)
+                else {
+                    return (0, Vec::new());
+                };
+                (unsafe { (self.destroy)(desc as *mut c_void) }, Vec::new())
             }
             2 => {
                 // set_attr(desc, name, type, count, elements...)
-                let desc = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
+                let desc =
+                    vh_resolve(vh, rd_u64(args, 0), VhKind::CudnnBackendDescriptor) as *mut c_void;
                 let name = rd_i32(args, 8);
                 let ty = rd_i32(args, 12);
                 let count = rd_i64(args, 16);
@@ -2941,7 +3038,7 @@ impl CudnnBackend {
                         let r = if ty == 6 {
                             dptr_resolve(h)
                         } else {
-                            vh_resolve(vh, h)
+                            vh_resolve(vh, h, element_kind(ty))
                         };
                         *chunk = r.to_le_bytes();
                     }
@@ -2955,7 +3052,8 @@ impl CudnnBackend {
                 // descriptors and passes their handles in; cuDNN populates them
                 // in place. So seed the buffer with the forwarded input
                 // (translated — the guest may pass virtual ids).
-                let desc = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
+                let desc =
+                    vh_resolve(vh, rd_u64(args, 0), VhKind::CudnnBackendDescriptor) as *mut c_void;
                 let name = rd_i32(args, 8);
                 let ty = rd_i32(args, 12);
                 let req = rd_i64(args, 16);
@@ -2970,7 +3068,7 @@ impl CudnnBackend {
                         let r = if ty == 6 {
                             dptr_resolve(h)
                         } else {
-                            vh_resolve(vh, h)
+                            vh_resolve(vh, h, element_kind(ty))
                         };
                         *chunk = r.to_le_bytes();
                     }
@@ -2988,14 +3086,17 @@ impl CudnnBackend {
                 (st, out)
             }
             4 => {
-                let desc = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
+                let desc =
+                    vh_resolve(vh, rd_u64(args, 0), VhKind::CudnnBackendDescriptor) as *mut c_void;
                 (unsafe { (self.finalize)(desc) }, Vec::new())
             }
             5 => {
                 // execute(handle, plan, variantPack)
-                let handle = vh_resolve(vh, rd_u64(args, 0)) as *mut c_void;
-                let plan = vh_resolve(vh, rd_u64(args, 8)) as *mut c_void;
-                let vpack = vh_resolve(vh, rd_u64(args, 16)) as *mut c_void;
+                let handle = vh_resolve(vh, rd_u64(args, 0), VhKind::CudnnHandle) as *mut c_void;
+                let plan =
+                    vh_resolve(vh, rd_u64(args, 8), VhKind::CudnnBackendDescriptor) as *mut c_void;
+                let vpack =
+                    vh_resolve(vh, rd_u64(args, 16), VhKind::CudnnBackendDescriptor) as *mut c_void;
                 (unsafe { (self.execute)(handle, plan, vpack) }, Vec::new())
             }
             _ => (super::CUDA_ERROR_NOT_FOUND, Vec::new()),
@@ -3090,23 +3191,29 @@ impl CublasLt {
         &self,
         func: u16,
         args: &[u8],
-        vh: &mut std::collections::HashMap<u64, u64>,
+        vh: &mut VhTable,
         streams: &std::collections::HashMap<u64, u64>,
     ) -> (i32, Vec<u8>) {
         // Fire-and-forget creates append a guest-minted virtual id after the
         // regular args; register it so later (deferred) calls resolve.
-        fn register_vh(
-            vh: &mut std::collections::HashMap<u64, u64>,
-            args: &[u8],
-            fixed: usize,
-            real: u64,
-        ) {
+        fn register_vh(vh: &mut VhTable, kind: VhKind, args: &[u8], fixed: usize, real: u64) {
+            vh_record(vh, kind, real);
             if args.len() >= fixed + 8 {
                 let id = u64::from_le_bytes(args[fixed..fixed + 8].try_into().unwrap());
                 if id & VHANDLE_TAG != 0 {
-                    vh.insert(id, real);
+                    vh.insert(id, (kind, real));
                 }
             }
+        }
+        // The light handle may also be a cuBLAS handle: a `cublasHandle_t` is
+        // documented as usable in place of a `cublasLtHandle_t` (torch reuses
+        // its cuBLAS handle), but nothing else is.
+        fn light_resolve(vh: &VhTable, h: u64) -> *mut c_void {
+            let kind = match vh.get(&h) {
+                Some(&(VhKind::CublasHandle, _)) => VhKind::CublasHandle,
+                _ => VhKind::CublasLtHandle,
+            };
+            vh_resolve(vh, h, kind) as *mut c_void
         }
         // sizeof(cublasLtMatmulHeuristicResult_t): algo[64] + workspaceSize(8)
         // + state(4) + wavesCount(4) + reserved[4](16) = 96 bytes.
@@ -3121,13 +3228,13 @@ impl CublasLt {
                 let scale = rd_i32(4);
                 let mut d: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.desc_create)(&mut d, compute, scale) };
-                register_vh(vh, args, 8, d as u64);
+                register_vh(vh, VhKind::CublasLtMatmulDesc, args, 8, d as u64);
                 (st, (d as u64).to_le_bytes().to_vec())
             }
             1 => {
-                let id = rd_u64(0);
-                let real = vh_resolve(vh, id);
-                vh.remove(&id);
+                let Some(real) = vh_retire(vh, rd_u64(0), VhKind::CublasLtMatmulDesc) else {
+                    return (0, Vec::new());
+                };
                 (
                     unsafe { (self.desc_destroy)(real as *mut c_void) },
                     Vec::new(),
@@ -3135,7 +3242,7 @@ impl CublasLt {
             }
             2 => {
                 // desc_set_attr(desc, attr, buf, size)
-                let desc = vh_resolve(vh, rd_u64(0)) as *mut c_void;
+                let desc = vh_resolve(vh, rd_u64(0), VhKind::CublasLtMatmulDesc) as *mut c_void;
                 let attr = rd_i32(8);
                 let buf = &args[12..];
                 let st =
@@ -3150,20 +3257,20 @@ impl CublasLt {
                 let ld = rd_i64(20);
                 let mut l: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.layout_create)(&mut l, ty, rows, cols, ld) };
-                register_vh(vh, args, 28, l as u64);
+                register_vh(vh, VhKind::CublasLtMatrixLayout, args, 28, l as u64);
                 (st, (l as u64).to_le_bytes().to_vec())
             }
             4 => {
-                let id = rd_u64(0);
-                let real = vh_resolve(vh, id);
-                vh.remove(&id);
+                let Some(real) = vh_retire(vh, rd_u64(0), VhKind::CublasLtMatrixLayout) else {
+                    return (0, Vec::new());
+                };
                 (
                     unsafe { (self.layout_destroy)(real as *mut c_void) },
                     Vec::new(),
                 )
             }
             5 => {
-                let layout = vh_resolve(vh, rd_u64(0)) as *mut c_void;
+                let layout = vh_resolve(vh, rd_u64(0), VhKind::CublasLtMatrixLayout) as *mut c_void;
                 let attr = rd_i32(8);
                 let buf = &args[12..];
                 let st =
@@ -3174,20 +3281,21 @@ impl CublasLt {
                 // pref_create() -> handle
                 let mut p: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.pref_create)(&mut p) };
-                register_vh(vh, args, 0, p as u64);
+                register_vh(vh, VhKind::CublasLtMatmulPreference, args, 0, p as u64);
                 (st, (p as u64).to_le_bytes().to_vec())
             }
             7 => {
-                let id = rd_u64(0);
-                let real = vh_resolve(vh, id);
-                vh.remove(&id);
+                let Some(real) = vh_retire(vh, rd_u64(0), VhKind::CublasLtMatmulPreference) else {
+                    return (0, Vec::new());
+                };
                 (
                     unsafe { (self.pref_destroy)(real as *mut c_void) },
                     Vec::new(),
                 )
             }
             8 => {
-                let pref = vh_resolve(vh, rd_u64(0)) as *mut c_void;
+                let pref =
+                    vh_resolve(vh, rd_u64(0), VhKind::CublasLtMatmulPreference) as *mut c_void;
                 let attr = rd_i32(8);
                 let buf = &args[12..];
                 let st =
@@ -3197,13 +3305,14 @@ impl CublasLt {
             9 => {
                 // algo_get_heuristic(light, opDesc, A, B, C, D, pref, requested)
                 //   -> returnCount + returnCount * heuristicResult structs.
-                let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
-                let op = vh_resolve(vh, rd_u64(8)) as *mut c_void;
-                let a = vh_resolve(vh, rd_u64(16)) as *mut c_void;
-                let b = vh_resolve(vh, rd_u64(24)) as *mut c_void;
-                let c = vh_resolve(vh, rd_u64(32)) as *mut c_void;
-                let d = vh_resolve(vh, rd_u64(40)) as *mut c_void;
-                let pref = vh_resolve(vh, rd_u64(48)) as *mut c_void;
+                let light = light_resolve(vh, rd_u64(0));
+                let op = vh_resolve(vh, rd_u64(8), VhKind::CublasLtMatmulDesc) as *mut c_void;
+                let a = vh_resolve(vh, rd_u64(16), VhKind::CublasLtMatrixLayout) as *mut c_void;
+                let b = vh_resolve(vh, rd_u64(24), VhKind::CublasLtMatrixLayout) as *mut c_void;
+                let c = vh_resolve(vh, rd_u64(32), VhKind::CublasLtMatrixLayout) as *mut c_void;
+                let d = vh_resolve(vh, rd_u64(40), VhKind::CublasLtMatrixLayout) as *mut c_void;
+                let pref =
+                    vh_resolve(vh, rd_u64(48), VhKind::CublasLtMatmulPreference) as *mut c_void;
                 let requested = rd_i32(56).max(0);
                 let mut results = vec![0u8; requested as usize * HEUR_RESULT_SZ];
                 let mut count: c_int = 0;
@@ -3229,27 +3338,31 @@ impl CublasLt {
             10 => {
                 // matmul(light, desc, alpha[16], A, Adesc, B, Bdesc, beta[16],
                 //   C, Cdesc, D, Ddesc, algo[64], workspace, wsSize, stream)
-                let light = vh_resolve(vh, rd_u64(0)) as *mut c_void;
-                let desc = vh_resolve(vh, rd_u64(8)) as *mut c_void;
+                let light = light_resolve(vh, rd_u64(0));
+                let desc = vh_resolve(vh, rd_u64(8), VhKind::CublasLtMatmulDesc) as *mut c_void;
                 let alpha = &args[16..32];
                 // A/B/C/D and the workspace are device pointers — translate them
                 // through the fork-isolation map so a clone's matmul hits its
                 // private copies (untranslated for normal sessions).
                 let a = dptr_resolve(rd_u64(32)) as *mut c_void;
-                let adesc = vh_resolve(vh, rd_u64(40)) as *mut c_void;
+                let adesc = vh_resolve(vh, rd_u64(40), VhKind::CublasLtMatrixLayout) as *mut c_void;
                 let b = dptr_resolve(rd_u64(48)) as *mut c_void;
-                let bdesc = vh_resolve(vh, rd_u64(56)) as *mut c_void;
+                let bdesc = vh_resolve(vh, rd_u64(56), VhKind::CublasLtMatrixLayout) as *mut c_void;
                 let beta = &args[64..80];
                 let c = dptr_resolve(rd_u64(80)) as *mut c_void;
-                let cdesc = vh_resolve(vh, rd_u64(88)) as *mut c_void;
+                let cdesc = vh_resolve(vh, rd_u64(88), VhKind::CublasLtMatrixLayout) as *mut c_void;
                 let dd = dptr_resolve(rd_u64(96)) as *mut c_void;
-                let ddesc = vh_resolve(vh, rd_u64(104)) as *mut c_void;
+                let ddesc =
+                    vh_resolve(vh, rd_u64(104), VhKind::CublasLtMatrixLayout) as *mut c_void;
                 let algo = &args[112..176];
                 let algo_present = rd_u64(176) != 0;
                 let workspace = dptr_resolve(rd_u64(184)) as *mut c_void;
                 let ws_size = rd_u64(192) as usize;
                 // Session-minted stream id → real host stream (see stream_resolve).
-                let stream = stream_resolve(streams, rd_u64(200)) as *mut c_void;
+                let stream = match stream_resolve(streams, rd_u64(200)) {
+                    Ok(stream) => stream as *mut c_void,
+                    Err(st) => return (st, Vec::new()),
+                };
                 let algo_ptr = if algo_present {
                     algo.as_ptr().cast()
                 } else {
@@ -3280,12 +3393,17 @@ impl CublasLt {
             11 => {
                 let mut h: *mut c_void = std::ptr::null_mut();
                 let st = unsafe { (self.lt_create)(&mut h) };
+                if st == 0 {
+                    vh_record(vh, VhKind::CublasLtHandle, h as u64);
+                }
                 (st, (h as u64).to_le_bytes().to_vec())
             }
-            12 => (
-                unsafe { (self.lt_destroy)(rd_u64(0) as *mut c_void) },
-                Vec::new(),
-            ),
+            12 => {
+                let Some(h) = vh_retire(vh, rd_u64(0), VhKind::CublasLtHandle) else {
+                    return (0, Vec::new());
+                };
+                (unsafe { (self.lt_destroy)(h as *mut c_void) }, Vec::new())
+            }
             _ => (super::CUDA_ERROR_NOT_FOUND, Vec::new()),
         }
     }
@@ -3296,12 +3414,49 @@ impl CublasLt {
 /// unambiguous on the wire.
 const VHANDLE_TAG: u64 = 1 << 63;
 
-/// Resolve a possibly-virtual handle against the map: tagged values must be
-/// mapped (0 → guaranteed invalid-handle error from the library), real
-/// pointers pass through.
-fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
+/// The C type of a library object in the handle table. The libraries tell
+/// their handle types apart only at compile time (each is a pointer to its own
+/// private struct) and reject nothing but NULL at run time, so the host must
+/// not hand an object of one kind to a parameter of another: the library would
+/// read, write or free it as the wrong struct.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum VhKind {
+    CublasHandle,
+    CublasLtHandle,
+    CublasLtMatmulDesc,
+    CublasLtMatrixLayout,
+    CublasLtMatmulPreference,
+    CudnnHandle,
+    CudnnTensor,
+    CudnnFilter,
+    CudnnConvolution,
+    CudnnActivation,
+    CudnnBackendDescriptor,
+}
+
+/// Guest-visible handle → (kind, real host pointer) of every library object
+/// the session created, keyed both by the guest-assigned virtual id (when the
+/// create carried one) and by the real pointer the create reply returned.
+type VhTable = std::collections::HashMap<u64, (VhKind, u64)>;
+
+/// Resolve a possibly-virtual handle to an object of kind `kind`. Every value
+/// must be mapped — a guest-assigned virtual id, a real pointer a create call
+/// returned (see [`vh_record`]), or a clone worker's alias — and name an object
+/// created as `kind`, else it resolves to 0, a guaranteed invalid-handle error
+/// from the library.
+fn vh_resolve(map: &VhTable, h: u64, kind: VhKind) -> u64 {
+    let entry = map.get(&h).copied();
+    if let Some((k, _)) = entry.filter(|&(k, _)| k != kind) {
+        // A live object of another type. Always-log, like a miss: a correct
+        // guest never does this.
+        eprintln!(
+            "[vh-kind] pid={} handle {h:#x} is a {k:?}, not a {kind:?}",
+            std::process::id()
+        );
+        return 0;
+    }
+    let r = entry.map_or(0, |(_, r)| r);
     if h & VHANDLE_TAG != 0 {
-        let r = map.get(&h).copied().unwrap_or(0);
         if r == 0 {
             // A tagged id with no mapping resolves to NULL and the library
             // call fails (cuBLAS: NOT_INITIALIZED). Always-log: this is a
@@ -3314,25 +3469,51 @@ fn vh_resolve(map: &std::collections::HashMap<u64, u64>, h: u64) -> u64 {
         }
         r
     } else {
-        // Untagged values are usually real host pointers and pass through —
-        // EXCEPT an inherited raw library handle in a fork-clone worker
-        // (cuBLASLt returns raw pointers to the guest), which the worker
-        // aliased to its own re-created handle at staging. Identity when
-        // absent, so the common case costs one map miss.
-        map.get(&h).copied().unwrap_or(h)
+        // Untagged values are real host pointers the guest got from a create
+        // reply (cuBLASLt returns raw pointers to the guest), including an
+        // inherited raw library handle in a fork-clone worker, which the
+        // worker aliased to its own re-created handle at staging. Any other
+        // value is an address the guest made up; passing it on would let the
+        // guest pick what the library reads, writes or frees.
+        r
     }
 }
 
+/// Record a library object a create call returned. Its real pointer goes back
+/// to the guest in the reply, so it becomes a handle the guest may name
+/// untagged (see [`vh_resolve`]).
+fn vh_record(map: &mut VhTable, kind: VhKind, real: u64) {
+    if real != 0 {
+        map.insert(real, (kind, real));
+    }
+}
+
+/// Resolve the handle a destroy call of kind `kind` is about to free and retire
+/// it: no name of the object — its virtual id, its real pointer or a clone
+/// alias — resolves afterwards. A handle naming an object of another kind is
+/// left alone. Linear in the table, which a destroy can afford. `None` when a
+/// handoff gave the object to another session too ([`HANDED_OFF`]): it must
+/// then stay alive, and the destroy is complete once this session has
+/// forgotten it.
+fn vh_retire(map: &mut VhTable, h: u64, kind: VhKind) -> Option<u64> {
+    let real = vh_resolve(map, h, kind);
+    if real != 0 {
+        map.retain(|_, &mut (_, r)| r != real);
+    }
+    (real == 0 || !handed_off(real)).then_some(real)
+}
+
 /// Resolve a wire `cudaStream_t` against the session stream table. Streams are
-/// session-minted small ids (see `StreamCreate` in host.rs), so passing one
-/// straight to a real library would be read as a pointer and crash it. 0 (the
-/// default stream) and unmapped values (the legacy 0x1/0x2 stream constants)
-/// pass through.
-fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> u64 {
+/// raw host pointers on the wire (see `StreamCreate` in host.rs), so a value
+/// this process never created would be read as a pointer and crash the
+/// library: `live_stream` admits only this process's streams, a clone's
+/// translation of an inherited one, 0 (the default stream) and the legacy
+/// 0x1/0x2 stream constants, and refuses the rest as INVALID_HANDLE.
+fn stream_resolve(map: &std::collections::HashMap<u64, u64>, s: u64) -> CuResult<u64> {
     // Clone workers remap inherited streams, and transparent graph capture
     // temporarily redirects every stream (including the default stream) to a
     // private capture stream. With no mapping this remains identity.
-    super::xlat_stream(map.get(&s).copied().unwrap_or(s))
+    super::live_stream(map.get(&s).copied().unwrap_or(s))
 }
 
 /// Convert a real library stream back to the session-scoped handle that the
@@ -3342,7 +3523,7 @@ fn stream_unresolve(map: &std::collections::HashMap<u64, u64>, raw: u64) -> u64 
         return 0;
     }
     map.keys()
-        .find(|&&guest| stream_resolve(map, guest) == raw)
+        .find(|&&guest| stream_resolve(map, guest) == Ok(raw))
         .copied()
         .unwrap_or(raw)
 }
@@ -3389,10 +3570,9 @@ pub(super) fn dptr_resolve(p: u64) -> u64 {
 struct Cur<'a> {
     b: &'a [u8],
     p: usize,
-    /// Virtual-handle map for resolving guest-assigned descriptor ids in
-    /// [`Cur::ptr`]. Device pointers and real host pointers pass through
-    /// (bit 63 clear).
-    vh: &'a std::collections::HashMap<u64, u64>,
+    /// Virtual-handle table for resolving handles and descriptors in
+    /// [`Cur::ptr`]. Device pointers are read with [`Cur::dptr`] instead.
+    vh: &'a VhTable,
 }
 impl Cur<'_> {
     fn take(&mut self, n: usize) -> &[u8] {
@@ -3412,8 +3592,13 @@ impl Cur<'_> {
     fn f64(&mut self) -> f64 {
         f64::from_le_bytes(self.take(8).try_into().unwrap())
     }
-    fn ptr(&mut self) -> *mut c_void {
-        vh_resolve(self.vh, self.u64()) as *mut c_void
+    fn ptr(&mut self, kind: VhKind) -> *mut c_void {
+        vh_resolve(self.vh, self.u64(), kind) as *mut c_void
+    }
+    /// A device pointer: fork-isolation translated like the generated
+    /// dispatch's `DevPtr` args, never looked up as a handle.
+    fn dptr(&mut self) -> *mut c_void {
+        dptr_resolve(self.u64()) as *mut c_void
     }
 }
 
@@ -3563,17 +3748,12 @@ impl CudnnBn {
         }
     }
 
-    fn dispatch(
-        &self,
-        func: u16,
-        args: &[u8],
-        vh: &std::collections::HashMap<u64, u64>,
-    ) -> (i32, Vec<u8>) {
+    fn dispatch(&self, func: u16, args: &[u8], vh: &VhTable) -> (i32, Vec<u8>) {
         let mut c = Cur { b: args, p: 0, vh };
         match func {
             0 => {
                 // set_nd(desc, dataType, nbDims, dimA[], strideA[])
-                let desc = c.ptr();
+                let desc = c.ptr(VhKind::CudnnTensor);
                 let dtype = c.i32();
                 let nb = c.i32();
                 let n = nb.max(0) as usize;
@@ -3583,8 +3763,8 @@ impl CudnnBn {
                 (st, Vec::new())
             }
             1 => {
-                let derived = c.ptr();
-                let xdesc = c.ptr();
+                let derived = c.ptr(VhKind::CudnnTensor);
+                let xdesc = c.ptr(VhKind::CudnnTensor);
                 let mode = c.i32();
                 (
                     unsafe { (self.derive_bn)(derived, xdesc, mode) },
@@ -3592,19 +3772,19 @@ impl CudnnBn {
                 )
             }
             2 => {
-                let handle = c.ptr();
+                let handle = c.ptr(VhKind::CudnnHandle);
                 let mode = c.i32();
                 let alpha = c.f32();
                 let beta = c.f32();
-                let xdesc = c.ptr();
-                let x = c.ptr();
-                let ydesc = c.ptr();
-                let y = c.ptr();
-                let bndesc = c.ptr();
-                let scale = c.ptr();
-                let bias = c.ptr();
-                let mean = c.ptr();
-                let var = c.ptr();
+                let xdesc = c.ptr(VhKind::CudnnTensor);
+                let x = c.dptr();
+                let ydesc = c.ptr(VhKind::CudnnTensor);
+                let y = c.dptr();
+                let bndesc = c.ptr(VhKind::CudnnTensor);
+                let scale = c.dptr();
+                let bias = c.dptr();
+                let mean = c.dptr();
+                let var = c.dptr();
                 let eps = c.f64();
                 let st = unsafe {
                     (self.fwd_infer)(
@@ -3627,30 +3807,30 @@ impl CudnnBn {
                 (st, Vec::new())
             }
             3 => {
-                let handle = c.ptr();
+                let handle = c.ptr(VhKind::CudnnHandle);
                 let mode = c.i32();
                 let bn_ops = c.i32();
                 let alpha = c.f32();
                 let beta = c.f32();
-                let xdesc = c.ptr();
-                let x = c.ptr();
-                let zdesc = c.ptr();
-                let z = c.ptr();
-                let ydesc = c.ptr();
-                let y = c.ptr();
-                let bndesc = c.ptr();
-                let scale = c.ptr();
-                let bias = c.ptr();
+                let xdesc = c.ptr(VhKind::CudnnTensor);
+                let x = c.dptr();
+                let zdesc = c.ptr(VhKind::CudnnTensor);
+                let z = c.dptr();
+                let ydesc = c.ptr(VhKind::CudnnTensor);
+                let y = c.dptr();
+                let bndesc = c.ptr(VhKind::CudnnTensor);
+                let scale = c.dptr();
+                let bias = c.dptr();
                 let factor = c.f64();
-                let run_mean = c.ptr();
-                let run_var = c.ptr();
+                let run_mean = c.dptr();
+                let run_var = c.dptr();
                 let eps = c.f64();
-                let save_mean = c.ptr();
-                let save_ivar = c.ptr();
-                let act = c.ptr();
-                let ws = c.ptr();
+                let save_mean = c.dptr();
+                let save_ivar = c.dptr();
+                let act = c.ptr(VhKind::CudnnActivation);
+                let ws = c.dptr();
                 let ws_sz = c.u64() as usize;
-                let rs = c.ptr();
+                let rs = c.dptr();
                 let rs_sz = c.u64() as usize;
                 let st = unsafe {
                     (self.fwd_train_ex)(
@@ -3684,35 +3864,35 @@ impl CudnnBn {
                 (st, Vec::new())
             }
             4 => {
-                let handle = c.ptr();
+                let handle = c.ptr(VhKind::CudnnHandle);
                 let mode = c.i32();
                 let bn_ops = c.i32();
                 let alpha_d = c.f32();
                 let beta_d = c.f32();
                 let alpha_p = c.f32();
                 let beta_p = c.f32();
-                let xdesc = c.ptr();
-                let x = c.ptr();
-                let ydesc = c.ptr();
-                let y = c.ptr();
-                let dydesc = c.ptr();
-                let dy = c.ptr();
-                let dzdesc = c.ptr();
-                let dz = c.ptr();
-                let dxdesc = c.ptr();
-                let dx = c.ptr();
-                let dbndesc = c.ptr();
-                let scale = c.ptr();
-                let bias = c.ptr();
-                let dscale = c.ptr();
-                let dbias = c.ptr();
+                let xdesc = c.ptr(VhKind::CudnnTensor);
+                let x = c.dptr();
+                let ydesc = c.ptr(VhKind::CudnnTensor);
+                let y = c.dptr();
+                let dydesc = c.ptr(VhKind::CudnnTensor);
+                let dy = c.dptr();
+                let dzdesc = c.ptr(VhKind::CudnnTensor);
+                let dz = c.dptr();
+                let dxdesc = c.ptr(VhKind::CudnnTensor);
+                let dx = c.dptr();
+                let dbndesc = c.ptr(VhKind::CudnnTensor);
+                let scale = c.dptr();
+                let bias = c.dptr();
+                let dscale = c.dptr();
+                let dbias = c.dptr();
                 let eps = c.f64();
-                let save_mean = c.ptr();
-                let save_ivar = c.ptr();
-                let act = c.ptr();
-                let ws = c.ptr();
+                let save_mean = c.dptr();
+                let save_ivar = c.dptr();
+                let act = c.ptr(VhKind::CudnnActivation);
+                let ws = c.dptr();
                 let ws_sz = c.u64() as usize;
-                let rs = c.ptr();
+                let rs = c.dptr();
                 let rs_sz = c.u64() as usize;
                 let st = unsafe {
                     (self.bwd_ex)(
@@ -3751,14 +3931,14 @@ impl CudnnBn {
                 (st, Vec::new())
             }
             5 => {
-                let handle = c.ptr();
+                let handle = c.ptr(VhKind::CudnnHandle);
                 let mode = c.i32();
                 let bn_ops = c.i32();
-                let xdesc = c.ptr();
-                let zdesc = c.ptr();
-                let ydesc = c.ptr();
-                let bndesc = c.ptr();
-                let act = c.ptr();
+                let xdesc = c.ptr(VhKind::CudnnTensor);
+                let zdesc = c.ptr(VhKind::CudnnTensor);
+                let ydesc = c.ptr(VhKind::CudnnTensor);
+                let bndesc = c.ptr(VhKind::CudnnTensor);
+                let act = c.ptr(VhKind::CudnnActivation);
                 let mut size: usize = 0;
                 let st = unsafe {
                     (self.ws_train)(
@@ -3768,16 +3948,16 @@ impl CudnnBn {
                 (st, (size as u64).to_le_bytes().to_vec())
             }
             6 => {
-                let handle = c.ptr();
+                let handle = c.ptr(VhKind::CudnnHandle);
                 let mode = c.i32();
                 let bn_ops = c.i32();
-                let xdesc = c.ptr();
-                let ydesc = c.ptr();
-                let dydesc = c.ptr();
-                let dzdesc = c.ptr();
-                let dxdesc = c.ptr();
-                let bndesc = c.ptr();
-                let act = c.ptr();
+                let xdesc = c.ptr(VhKind::CudnnTensor);
+                let ydesc = c.ptr(VhKind::CudnnTensor);
+                let dydesc = c.ptr(VhKind::CudnnTensor);
+                let dzdesc = c.ptr(VhKind::CudnnTensor);
+                let dxdesc = c.ptr(VhKind::CudnnTensor);
+                let bndesc = c.ptr(VhKind::CudnnTensor);
+                let act = c.ptr(VhKind::CudnnActivation);
                 let mut size: usize = 0;
                 let st = unsafe {
                     (self.ws_bwd)(
@@ -3788,11 +3968,11 @@ impl CudnnBn {
                 (st, (size as u64).to_le_bytes().to_vec())
             }
             7 => {
-                let handle = c.ptr();
+                let handle = c.ptr(VhKind::CudnnHandle);
                 let mode = c.i32();
                 let bn_ops = c.i32();
-                let act = c.ptr();
-                let xdesc = c.ptr();
+                let act = c.ptr(VhKind::CudnnActivation);
+                let xdesc = c.ptr(VhKind::CudnnTensor);
                 let mut size: usize = 0;
                 let st = unsafe { (self.reserve)(handle, mode, bn_ops, act, xdesc, &mut size) };
                 (st, (size as u64).to_le_bytes().to_vec())
@@ -3806,6 +3986,9 @@ impl Drop for GpuBackend {
     fn drop(&mut self) {
         if let Some(unload) = self.library_unload {
             for library in self.live_cuda_libraries.drain() {
+                if let Some(module) = self.cuda_library_modules.remove(&library) {
+                    super::worker_handle_take(&super::LIBRARY_MODULES, module);
+                }
                 // SAFETY: these handles were returned by cuLibraryLoadData in
                 // this backend and have not been unloaded successfully yet.
                 unsafe {
@@ -4397,12 +4580,15 @@ mod registered_range_tests {
 
 #[cfg(test)]
 mod handoff_tests {
-    use super::handoff_register;
-    use std::collections::HashMap;
+    use super::{handoff_register, VhKind, VhTable};
     use std::sync::{Arc, Mutex};
 
-    fn map(pairs: &[(u64, u64)]) -> Arc<Mutex<HashMap<u64, u64>>> {
-        Arc::new(Mutex::new(pairs.iter().copied().collect()))
+    const K: VhKind = VhKind::CudnnTensor;
+
+    fn map(pairs: &[(u64, u64)]) -> Arc<Mutex<VhTable>> {
+        Arc::new(Mutex::new(
+            pairs.iter().map(|&(id, real)| (id, (K, real))).collect(),
+        ))
     }
 
     // A fork clone (fresh, empty handle map) resuming its parent's token adopts
@@ -4415,23 +4601,64 @@ mod handoff_tests {
         let parent = map(&[]);
         let ptoken = handoff_register(&parent, 0);
         assert_ne!(ptoken, 0, "a session gets a non-zero lineage token");
-        parent.lock().unwrap().insert(1 << 63, 0xdead_beef);
+        parent.lock().unwrap().insert(1 << 63, (K, 0xdead_beef));
 
         let clone = map(&[]);
         let ctoken = handoff_register(&clone, ptoken);
         assert_ne!(ctoken, ptoken, "the clone gets its own token");
         assert_eq!(
             clone.lock().unwrap().get(&(1 << 63)).copied(),
-            Some(0xdead_beef),
+            Some((K, 0xdead_beef)),
             "clone adopted the parent's descriptor"
         );
 
         // The clone's own later descriptors do not leak back into the parent.
-        clone.lock().unwrap().insert((1 << 63) | 2, 0x1234);
+        clone.lock().unwrap().insert((1 << 63) | 2, (K, 0x1234));
         assert!(
             !parent.lock().unwrap().contains_key(&((1 << 63) | 2)),
             "clone and parent maps are independent copies"
         );
+    }
+
+    // The parent is not frozen: a destroy on either side only forgets the
+    // object there, and the library never frees what the other still names.
+    #[test]
+    fn handed_off_objects_outlive_either_sessions_destroy() {
+        use super::{vh_resolve, vh_retire, VHANDLE_TAG};
+        let (real, id) = (0x7f00_dead_1000, VHANDLE_TAG | 0x1234);
+        let parent = map(&[(id, real)]);
+        let ptoken = handoff_register(&parent, 0);
+        let clone = map(&[]);
+        handoff_register(&clone, ptoken);
+
+        assert_eq!(
+            vh_retire(&mut parent.lock().unwrap(), id, K),
+            None,
+            "not freed: the clone still names it"
+        );
+        assert_eq!(
+            vh_resolve(&parent.lock().unwrap(), id, K),
+            0,
+            "forgotten by the parent"
+        );
+        assert_eq!(
+            vh_resolve(&clone.lock().unwrap(), id, K),
+            real,
+            "still the clone's"
+        );
+        assert_eq!(
+            vh_retire(&mut clone.lock().unwrap(), id, K),
+            None,
+            "no second free either"
+        );
+
+        // An object created after the handoff is the creator's alone.
+        let (own, own_id) = (0x7f00_dead_2000, VHANDLE_TAG | 0x1235);
+        parent.lock().unwrap().insert(own_id, (K, own));
+        assert_eq!(vh_retire(&mut parent.lock().unwrap(), own_id, K), Some(own));
+        assert_eq!(vh_resolve(&parent.lock().unwrap(), own_id, K), 0);
+        // An unmapped id still reaches the library as NULL (its error reply).
+        assert_eq!(vh_retire(&mut parent.lock().unwrap(), own_id, K), Some(0));
     }
 
     // Resuming a token whose session has closed (its map dropped) is not an
@@ -4450,5 +4677,49 @@ mod handoff_tests {
             clone.lock().unwrap().is_empty(),
             "no parent to adopt → empty map, no panic"
         );
+    }
+}
+
+#[cfg(test)]
+mod vh_tests {
+    use super::{vh_record, vh_resolve, vh_retire, VhKind, VhTable, VHANDLE_TAG};
+
+    // Only handles the host handed out resolve: an address the guest made up,
+    // or one whose object was destroyed, resolves to NULL.
+    #[test]
+    fn only_recorded_handles_resolve() {
+        const T: VhKind = VhKind::CudnnTensor;
+        let mut vh = VhTable::new();
+        let (real, id) = (0x7f00_0000_1000, VHANDLE_TAG | 1);
+        vh_record(&mut vh, T, real);
+        vh.insert(id, (T, real));
+        assert_eq!(vh_resolve(&vh, real, T), real);
+        assert_eq!(vh_resolve(&vh, id, T), real);
+        assert_eq!(vh_resolve(&vh, real - 32, T), 0, "made-up address");
+        assert_eq!(vh_resolve(&vh, 0, T), 0);
+
+        assert_eq!(vh_retire(&mut vh, id, T), Some(real));
+        assert_eq!(vh_resolve(&vh, real, T), 0, "destroyed via its virtual id");
+        assert!(vh.is_empty());
+    }
+
+    // A handle resolves only as the kind of object it was created as, whether
+    // named by its virtual id or by its real pointer: the library would
+    // otherwise read, write or free it as another struct.
+    #[test]
+    fn handles_resolve_only_as_their_kind() {
+        let mut vh = VhTable::new();
+        let (real, id) = (0x7f00_0000_2000, VHANDLE_TAG | 2);
+        vh_record(&mut vh, VhKind::CudnnFilter, real);
+        vh.insert(id, (VhKind::CudnnFilter, real));
+        for h in [id, real] {
+            assert_eq!(vh_resolve(&vh, h, VhKind::CudnnTensor), 0);
+            assert_eq!(vh_resolve(&vh, h, VhKind::CudnnHandle), 0);
+            assert_eq!(vh_retire(&mut vh, h, VhKind::CudnnTensor), Some(0));
+        }
+        assert_eq!(vh.len(), 2, "a wrong-kind destroy retires nothing");
+        assert_eq!(vh_resolve(&vh, id, VhKind::CudnnFilter), real);
+        assert_eq!(vh_retire(&mut vh, real, VhKind::CudnnFilter), Some(real));
+        assert!(vh.is_empty(), "destroyed via its real pointer");
     }
 }

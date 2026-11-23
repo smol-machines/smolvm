@@ -27,13 +27,16 @@ enum Kind {
     /// A machine scalar passed by value. `.0` is the Rust scalar type.
     Scalar(&'static str),
     /// An opaque host handle (cuBLAS/cuDNN handle, …) — pass the pointer
-    /// value by reference; the guest never dereferences it.
-    Handle,
-    /// A `cudaStream_t`. Streams are session-mapped small ids on the wire (the
-    /// host mints them at StreamCreate), so the host must translate through the
-    /// session stream table — NOT vh_resolve — or the raw id reaches the real
-    /// library as a pointer and crashes it. 0 and the legacy constants
-    /// (0x1/0x2) pass through.
+    /// value by reference; the guest never dereferences it. `.0` names the
+    /// host's `VhKind` of the object: the host resolves a wire handle only to
+    /// an object created as that kind, so a guest cannot hand, say, a filter
+    /// descriptor to a parameter the library reads as a tensor descriptor.
+    Handle(&'static str),
+    /// A `cudaStream_t`. Streams are raw host pointers on the wire (the host
+    /// hands them out at StreamCreate), so the host must check them through
+    /// the session stream table and its live-stream set — NOT vh_resolve — or
+    /// a forged value reaches the real library as a pointer and crashes it.
+    /// 0 and the legacy constants (0x1/0x2) pass through.
     Stream,
     /// A real device address — pass by value.
     DevPtr,
@@ -100,7 +103,7 @@ struct Lib {
 
 fn cublas_spec() -> Lib {
     use Kind::*;
-    let handle = || p("handle", "*mut c_void", Handle);
+    let handle = || p("handle", "*mut c_void", Handle("CublasHandle"));
     let i = |n| p(n, "c_int", Scalar("i32"));
     // Column-major GEMM shared shape for S/D, differing only in element type.
     let gemm = |sym, real, ety: &'static str| Fun {
@@ -407,7 +410,7 @@ fn cublas_spec() -> Lib {
             Fun {
                 sym: "cublasCreate_v2",
                 real: "cublasCreate_v2",
-                params: vec![p("handle_out", "*mut *mut c_void", Handle)], // out-handle: special-cased below
+                params: vec![p("handle_out", "*mut *mut c_void", Handle("CublasHandle"))], // out-handle: special-cased below
             },
             Fun {
                 sym: "cublasDestroy_v2",
@@ -609,12 +612,13 @@ fn cublas_spec() -> Lib {
     }
 }
 
-/// An out-handle constructor (`fn(T* out)`), e.g. `cudnnCreateTensorDescriptor`.
-fn create(name: &'static str) -> Fun {
+/// An out-handle constructor (`fn(T* out)`), e.g. `cudnnCreateTensorDescriptor`,
+/// creating an object of host `VhKind` `kind`.
+fn create(name: &'static str, kind: &'static str) -> Fun {
     Fun {
         sym: name,
         real: name,
-        params: vec![p("out", "*mut *mut c_void", Kind::Handle)],
+        params: vec![p("out", "*mut *mut c_void", Kind::Handle(kind))],
     }
 }
 
@@ -623,8 +627,10 @@ fn create(name: &'static str) -> Fun {
 /// host scalars; the workspace size is a host output.
 fn cudnn_spec() -> Lib {
     use Kind::*;
-    let h = || p("handle", "*mut c_void", Handle);
-    let d = |n| p(n, "*mut c_void", Handle);
+    let h = || p("handle", "*mut c_void", Handle("CudnnHandle"));
+    let t = |n| p(n, "*mut c_void", Handle("CudnnTensor"));
+    let fd = |n| p(n, "*mut c_void", Handle("CudnnFilter"));
+    let cd = |n| p(n, "*mut c_void", Handle("CudnnConvolution"));
     let dev = |n| p(n, "*mut c_void", DevPtr);
     let i = |n| p(n, "c_int", Scalar("i32"));
     let f = |sym, params| Fun {
@@ -637,29 +643,37 @@ fn cudnn_spec() -> Lib {
         id: 2,
         default_sos: &["libcudnn.so", "libcudnn.so.9", "libcudnn.so.8"],
         funcs: vec![
-            create("cudnnCreate"),
+            create("cudnnCreate", "CudnnHandle"),
             f("cudnnDestroy", vec![h()]),
             f(
                 "cudnnSetStream",
                 vec![h(), p("stream", "*mut c_void", Stream)],
             ),
-            create("cudnnCreateTensorDescriptor"),
+            create("cudnnCreateTensorDescriptor", "CudnnTensor"),
             f(
                 "cudnnSetTensor4dDescriptor",
-                vec![d("t"), i("fmt"), i("dtype"), i("n"), i("c"), i("h"), i("w")],
+                vec![t("t"), i("fmt"), i("dtype"), i("n"), i("c"), i("h"), i("w")],
             ),
-            f("cudnnDestroyTensorDescriptor", vec![d("t")]),
-            create("cudnnCreateFilterDescriptor"),
+            f("cudnnDestroyTensorDescriptor", vec![t("t")]),
+            create("cudnnCreateFilterDescriptor", "CudnnFilter"),
             f(
                 "cudnnSetFilter4dDescriptor",
-                vec![d("f"), i("dtype"), i("fmt"), i("k"), i("c"), i("h"), i("w")],
+                vec![
+                    fd("f"),
+                    i("dtype"),
+                    i("fmt"),
+                    i("k"),
+                    i("c"),
+                    i("h"),
+                    i("w"),
+                ],
             ),
-            f("cudnnDestroyFilterDescriptor", vec![d("f")]),
-            create("cudnnCreateConvolutionDescriptor"),
+            f("cudnnDestroyFilterDescriptor", vec![fd("f")]),
+            create("cudnnCreateConvolutionDescriptor", "CudnnConvolution"),
             f(
                 "cudnnSetConvolution2dDescriptor",
                 vec![
-                    d("cv"),
+                    cd("cv"),
                     i("pad_h"),
                     i("pad_w"),
                     i("u"),
@@ -670,15 +684,15 @@ fn cudnn_spec() -> Lib {
                     i("ctype"),
                 ],
             ),
-            f("cudnnDestroyConvolutionDescriptor", vec![d("cv")]),
+            f("cudnnDestroyConvolutionDescriptor", vec![cd("cv")]),
             f(
                 "cudnnGetConvolutionForwardWorkspaceSize",
                 vec![
                     h(),
-                    d("x"),
-                    d("w"),
-                    d("cv"),
-                    d("y"),
+                    t("x"),
+                    fd("w"),
+                    cd("cv"),
+                    t("y"),
                     i("algo"),
                     p("size", "*mut usize", HostOutScalar("u64")),
                 ],
@@ -688,16 +702,16 @@ fn cudnn_spec() -> Lib {
                 vec![
                     h(),
                     p("alpha", "*const f32", HostInScalar("f32")),
-                    d("xDesc"),
+                    t("xDesc"),
                     dev("x"),
-                    d("wDesc"),
+                    fd("wDesc"),
                     dev("w"),
-                    d("convDesc"),
+                    cd("convDesc"),
                     i("algo"),
                     dev("workspace"),
                     p("wsSize", "usize", Scalar("u64")),
                     p("beta", "*const f32", HostInScalar("f32")),
-                    d("yDesc"),
+                    t("yDesc"),
                     dev("y"),
                 ],
             ),
@@ -810,7 +824,7 @@ fn gen_guest(lib: &Lib) -> String {
                         p.name
                     );
                 }
-                Kind::Handle | Kind::Stream | Kind::DevPtr => {
+                Kind::Handle(_) | Kind::Stream | Kind::DevPtr => {
                     let _ = writeln!(
                         s,
                         "    a.extend_from_slice(&({} as u64).to_le_bytes());",
@@ -918,13 +932,16 @@ fn gen_host(lib: &Lib) -> String {
     // Dispatch.
     let _ = writeln!(
         s,
-        "    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut std::collections::HashMap<u64, u64>, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {{\n        let mut __c = GenCur {{ b: args, p: 0 }};\n        let _ = __streams;\n        match func {{"
+        "    pub fn dispatch(&self, func: u16, args: &[u8], __vh: &mut super::VhTable, __streams: &std::collections::HashMap<u64, u64>) -> (i32, Vec<u8>) {{\n        let mut __c = GenCur {{ b: args, p: 0 }};\n        let _ = __streams;\n        match func {{"
     );
     for (idx, f) in lib.funcs.iter().enumerate() {
         if is_create(f) {
+            let Kind::Handle(vk) = f.params[0].kind else {
+                panic!("{}: an out-handle must be a Handle", f.sym);
+            };
             let _ = writeln!(
                 s,
-                "            {idx} => {{ let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe {{ (self.f_{})(&mut h) }}; if st == 0 && args.len() >= 8 {{ let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 {{ __vh.insert(id, h as u64); if std::env::var_os(\"SMOLVM_CUDA_HOST_OPLOG\").is_some() {{ eprintln!(\"[vh-insert] pid={{}} id={{id:#x}}\", std::process::id()); }} }} }} (st, (h as u64).to_le_bytes().to_vec()) }}",
+                "            {idx} => {{ let mut h: *mut c_void = std::ptr::null_mut(); let st = unsafe {{ (self.f_{})(&mut h) }}; if st == 0 {{ super::vh_record(__vh, super::VhKind::{vk}, h as u64); if args.len() >= 8 {{ let id = u64::from_le_bytes(args[..8].try_into().unwrap()); if id & super::VHANDLE_TAG != 0 {{ __vh.insert(id, (super::VhKind::{vk}, h as u64)); if std::env::var_os(\"SMOLVM_CUDA_HOST_OPLOG\").is_some() {{ eprintln!(\"[vh-insert] pid={{}} id={{id:#x}}\", std::process::id()); }} }} }} }} (st, (h as u64).to_le_bytes().to_vec()) }}",
                 f.real
             );
             continue;
@@ -938,29 +955,34 @@ fn gen_host(lib: &Lib) -> String {
                     let _ = writeln!(binds, "                let {} = __c.{t}();", p.name);
                     call.push(format!("{} as {}", p.name, p.cty));
                 }
-                Kind::Handle => {
+                Kind::Handle(vk) => {
                     // May be a guest-assigned virtual id — resolve to the real
-                    // pointer (untagged values pass through). Destroy calls
-                    // also retire the mapping so the table doesn't grow.
+                    // pointer (untagged values must be pointers a create
+                    // returned) of an object of the kind the C parameter
+                    // expects. Destroy calls also retire the mapping so the
+                    // table doesn't grow and the freed pointer stops resolving;
+                    // an object a handoff gave another session is not freed.
                     if f.sym.contains("Destroy") {
                         let _ = writeln!(
                             binds,
-                            "                let __raw = __c.u64();\n                let {} = super::vh_resolve(__vh, __raw) as {};\n                if __raw & super::VHANDLE_TAG != 0 {{ __vh.remove(&__raw); }}",
-                            p.name, p.cty
+                            "                let Some({}) = super::vh_retire(__vh, __c.u64(), super::VhKind::{vk}) else {{ return (0, Vec::new()); }};\n                let {} = {} as {};",
+                            p.name, p.name, p.name, p.cty
                         );
                     } else {
                         let _ = writeln!(
                             binds,
-                            "                let {} = super::vh_resolve(__vh, __c.u64()) as {};",
+                            "                let {} = super::vh_resolve(__vh, __c.u64(), super::VhKind::{vk}) as {};",
                             p.name, p.cty
                         );
                     }
                     call.push(p.name.to_string());
                 }
                 Kind::Stream => {
+                    // A stream this process never created is refused with the
+                    // CUresult as the call's status rather than forwarded.
                     let _ = writeln!(
                         binds,
-                        "                let {} = super::stream_resolve(__streams, __c.u64()) as {};",
+                        "                let {} = match super::stream_resolve(__streams, __c.u64()) {{ Ok(s) => s as {}, Err(st) => return (st, Vec::new()) }};",
                         p.name, p.cty
                     );
                     call.push(p.name.to_string());
