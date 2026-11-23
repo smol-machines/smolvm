@@ -20,7 +20,8 @@ The default listen path differs per platform (`/tmp/smolvm.sock` on macOS,
 
 **A plain server has no authentication of any kind.** Whoever can reach the socket or the port can
 create and run machines, so treat it as equivalent to a shell on the host, and prefer the Unix
-socket. Mutual TLS is configured from the environment, and a server started that way still opens a
+socket. A plain server on a `--listen` address other than loopback warns now and is refused from
+v1.38 unless you pass `--allow-unauthenticated-network`. Mutual TLS is configured from the environment, and a server started that way still opens a
 plain loopback listener beside it; `references/traps.md` has both.
 
 ## The endpoints

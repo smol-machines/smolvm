@@ -566,7 +566,9 @@ metadata and the traps: `docs/pack/`.
 `smolvm serve start` serves the machine lifecycle over local HTTP, on a Unix
 socket by default (loopback TCP on Windows) or on `--listen 127.0.0.1:8080`.
 A plain server has no authentication: whoever reaches the socket or the port
-can create and run machines. Machines that ask for nested virtualization
+can create and run machines, so a plain server on a `--listen` address other than loopback warns,
+and from v1.38 refuses it, unless mutual TLS is configured or `--allow-unauthenticated-network` is
+passed. Machines that ask for nested virtualization
 (`nestedVirt`) are refused with 403 unless the server runs with `--allow-nested-virt`.
 `smolvm serve openapi` prints the spec; the endpoints, field names and traps:
 `docs/local-api/`.

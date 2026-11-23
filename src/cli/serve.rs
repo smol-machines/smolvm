@@ -143,6 +143,15 @@ pub struct ServeStartCmd {
     #[arg(long = "egress-watchlist", value_name = "PATH")]
     egress_watchlist: Option<std::path::PathBuf>,
 
+    /// Serve the API over plain HTTP on a TCP address other than loopback.
+    /// The API has no authentication of its own: anyone who can reach the
+    /// address controls this host and every machine on it. Such an address
+    /// needs this flag, or serve TLS with client certificates
+    /// (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA): without either, serve warns
+    /// now, and from v1.38 refuses to start.
+    #[arg(long = "allow-unauthenticated-network")]
+    allow_unauthenticated_network: bool,
+
     /// Require the mTLS client certificate's subject CN to equal this value
     /// for API access. Only applies when serve TLS is configured
     /// (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA). Unset (the default), every
@@ -488,17 +497,47 @@ impl ServeStartCmd {
     }
 
     async fn run_server(self, listen_target: ListenTarget) -> Result<()> {
+        // Resolve the serve API's TLS posture before anything starts. In fleet
+        // mode this is fail-closed: a missing/partial mTLS config aborts startup
+        // rather than silently serving plain HTTP (control↔node mTLS, increment 3).
+        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
+            client_cn: self.mtls_client_cn.clone(),
+            allow_peer_blobs: self.mtls_allow_peer_blobs,
+        })
+        .map_err(|e| smolvm::error::Error::Config {
+            operation: "serve tls".to_string(),
+            reason: e.to_string(),
+        })?;
+
         // On Windows `ListenTarget` has only the `Tcp` variant (Unix-socket
         // listening is unix-gated), making this match irrefutable there.
         #[cfg_attr(not(unix), allow(irrefutable_let_patterns))]
         if let ListenTarget::Tcp(addr) = &listen_target {
-            if addr.ip().is_unspecified() {
-                eprintln!(
-                    "WARNING: Server is listening on all interfaces ({}).",
-                    addr.ip()
-                );
-                eprintln!("         The API has no authentication - any network client can control this host.");
-                eprintln!("         Consider using the default Unix socket or --listen 127.0.0.1:8080 for local-only access.");
+            match network_exposure(*addr, tls.is_some(), self.allow_unauthenticated_network) {
+                NetworkExposure::Private => {}
+                NetworkExposure::Unacknowledged => {
+                    tracing::warn!(
+                        address = %addr,
+                        "serving the API without authentication on a network address; \
+                         from v1.38 this needs --allow-unauthenticated-network or mutual TLS"
+                    );
+                    eprintln!("WARNING: Server is listening on {addr} without authentication.");
+                    eprintln!("         Any client that can reach it can control this host.");
+                    eprintln!(
+                        "         From v1.38 serve refuses this address unless you configure"
+                    );
+                    eprintln!(
+                        "         mutual TLS (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA) or pass"
+                    );
+                    eprintln!("         --allow-unauthenticated-network. Pass it now to keep serving here,");
+                    eprintln!(
+                        "         or listen on the default Unix socket or a loopback address."
+                    );
+                }
+                NetworkExposure::Allowed => {
+                    eprintln!("WARNING: Server is listening on {addr} without authentication.");
+                    eprintln!("         Any client that can reach it can control this host.");
+                }
             }
         }
 
@@ -626,18 +665,6 @@ impl ServeStartCmd {
             }
             result
         });
-
-        // Resolve the serve API's TLS posture before binding. In fleet mode this
-        // is fail-closed: a missing/partial mTLS config aborts startup rather
-        // than silently serving plain HTTP (control↔node mTLS, increment 3).
-        let tls = super::serve_tls::resolve_tls(super::serve_tls::ClientIdentityPolicy {
-            client_cn: self.mtls_client_cn.clone(),
-            allow_peer_blobs: self.mtls_allow_peer_blobs,
-        })
-        .map_err(|e| smolvm::error::Error::Config {
-            operation: "serve tls".to_string(),
-            reason: e.to_string(),
-        })?;
 
         // The service outlives its machines when the host is out of memory.
         #[cfg(target_os = "linux")]
@@ -1013,6 +1040,34 @@ impl ListenTarget {
     }
 }
 
+/// Whether a TCP listener exposes the unauthenticated API to the network.
+#[derive(Debug, PartialEq, Eq)]
+enum NetworkExposure {
+    /// Loopback only, or client certificates are required.
+    Private,
+    /// Reachable without authentication, and the operator asked for it.
+    Allowed,
+    /// Reachable without authentication, and the operator did not say so:
+    /// served with a warning until v1.38 refuses it.
+    Unacknowledged,
+}
+
+fn network_exposure(addr: SocketAddr, mtls: bool, allow: bool) -> NetworkExposure {
+    let loopback = match addr.ip() {
+        std::net::IpAddr::V6(v6) => v6
+            .to_ipv4_mapped()
+            .map_or(v6.is_loopback(), |v4| v4.is_loopback()),
+        ip => ip.is_loopback(),
+    };
+    if loopback || mtls {
+        NetworkExposure::Private
+    } else if allow {
+        NetworkExposure::Allowed
+    } else {
+        NetworkExposure::Unacknowledged
+    }
+}
+
 fn default_listen_value() -> String {
     #[cfg(unix)]
     {
@@ -1291,6 +1346,49 @@ async fn shutdown_signal_or_internal(shutdown: tokio::sync::watch::Receiver<bool
 #[cfg(test)]
 mod tests {
     use super::ListenTarget;
+    use super::{network_exposure, NetworkExposure};
+    use std::net::SocketAddr;
+
+    #[test]
+    fn a_network_listener_needs_client_certificates_or_an_explicit_opt_in() {
+        use NetworkExposure::*;
+        let at = |s: &str| s.parse::<SocketAddr>().unwrap();
+        for private in [
+            "127.0.0.1:8080",
+            "127.9.9.9:1",
+            "[::1]:8080",
+            "[::ffff:127.0.0.1]:8080",
+        ] {
+            assert_eq!(
+                network_exposure(at(private), false, false),
+                Private,
+                "{private}"
+            );
+        }
+        for open in [
+            "0.0.0.0:8080",
+            "[::]:8080",
+            "10.0.0.5:8080",
+            "[::ffff:10.0.0.5]:80",
+        ] {
+            assert_eq!(
+                network_exposure(at(open), false, false),
+                Unacknowledged,
+                "{open}"
+            );
+            assert_eq!(
+                network_exposure(at(open), true, false),
+                Private,
+                "{open} with mTLS"
+            );
+            assert_eq!(
+                network_exposure(at(open), false, true),
+                Allowed,
+                "{open} opted in"
+            );
+        }
+    }
+
     use std::time::{Duration, Instant};
 
     #[test]
