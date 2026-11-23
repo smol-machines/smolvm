@@ -748,8 +748,13 @@ pub fn prepare_restore_with_digest(
     // RAM written below reaches the disk later, as for a deferred extraction.
     // A tree that leaves RAM out has none to write back; marking it would make
     // the write-back fail and the tree count as unextracted.
+    // Only Linux defers the write-back (it needs the host's boot id to tell a
+    // later boot that the RAM may be lost); elsewhere the RAM is flushed before
+    // the tree is published.
+    let ram_in_tree = !skip("checkpoint/memory.bin");
+    let defer_ram_sync = ram_in_tree && cfg!(target_os = "linux");
     let unsynced = smolvm_pack::extract::unsynced_marker_path(&shared);
-    if !skip("checkpoint/memory.bin") {
+    if defer_ram_sync {
         smolvm_pack::extract::mark_unsynced(&unsynced)
             .map_err(io("mark checkpoint memory unsynced"))?;
     } else if let Err(error) = std::fs::remove_file(&unsynced) {
@@ -798,6 +803,14 @@ pub fn prepare_restore_with_digest(
         let _ = std::fs::remove_dir_all(&partial);
         io("mark materialized checkpoint")(error)
     })?;
+    if ram_in_tree && !defer_ram_sync {
+        let flushed = std::fs::File::open(partial.join("checkpoint/memory.bin"))
+            .and_then(|memory| memory.sync_all());
+        if let Err(error) = flushed {
+            let _ = std::fs::remove_dir_all(&partial);
+            return Err(io("write checkpoint memory")(error));
+        }
+    }
     smolvm_pack::extract::mark_extracted(&partial).map_err(io("mark checkpoint extracted"))?;
     #[cfg(unix)]
     {

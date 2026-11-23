@@ -4178,6 +4178,30 @@ pub fn materialize_pack_layers_with_options(
         #[cfg(not(target_os = "linux"))]
         unreachable!("shared pack extraction is Linux-only")
     }
+    // A chunked checkpoint was prepared once into its shared tree (see
+    // checkpoint_delta::prepare_restore); its payload is the store, not the
+    // files a machine installs. Point the machine at that tree, as a shared
+    // extraction would, instead of extracting the store privately.
+    let prepared = smolvm_pack::extract::shared_pack_dir(
+        &crate::agent::shared_pack_cache_root(),
+        footer.checksum,
+    );
+    let chunked = smolvm_pack::packer::read_manifest_from_sidecar(sidecar)
+        .ok()
+        .and_then(|manifest| manifest.checkpoint)
+        .is_some_and(|checkpoint| {
+            checkpoint.payload == smolvm_pack::format::CheckpointLayout::Chunked
+        });
+    if chunked && smolvm_pack::extract::is_extracted(&prepared) {
+        std::fs::create_dir_all(&cache_dir)
+            .map_err(|error| Error::agent("point at prepared checkpoint", error.to_string()))?;
+        let pointer = crate::agent::shared_pack_pointer_path(&cache_dir);
+        let partial = pointer.with_extension("partial");
+        std::fs::write(&partial, prepared.as_os_str().as_encoded_bytes())
+            .and_then(|()| std::fs::rename(&partial, &pointer))
+            .map_err(|error| Error::agent("point at prepared checkpoint", error.to_string()))?;
+        return Ok(());
+    }
     // A private extraction neither hashes the artifact nor defers its sync.
     drop(options);
     smolvm_pack::extract::force_detach_layers_volume(&cache_dir);
