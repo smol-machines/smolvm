@@ -1,0 +1,8 @@
+{
+    "ICD": {
+        "api_version": "1.4.318",
+        "library_arch": "64",
+        "library_path": "libvulkan_virtio.so"
+    },
+    "file_format_version": "1.0.1"
+}

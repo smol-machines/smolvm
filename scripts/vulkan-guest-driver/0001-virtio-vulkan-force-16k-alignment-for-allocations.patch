@@ -1,0 +1,64 @@
+From 761ef1ec5ff2aae1cc3dc8bbc22b3d06ef04b549 Mon Sep 17 00:00:00 2001
+From: Sergio Lopez <slp@redhat.com>
+Date: Wed, 25 Jun 2025 08:11:47 +0000
+Subject: [PATCH] virtio/vulkan: force 16k alignment for allocations (HACK)
+
+---
+ src/virtio/vulkan/vn_device_memory.c    | 4 ++++
+ src/virtio/vulkan/vn_renderer_virtgpu.c | 4 ++++
+ src/virtio/vulkan/vn_ring.c             | 2 +-
+ 3 files changed, 9 insertions(+), 1 deletion(-)
+
+diff --git a/src/virtio/vulkan/vn_device_memory.c b/src/virtio/vulkan/vn_device_memory.c
+index 7aec50a..5c86130 100644
+--- a/src/virtio/vulkan/vn_device_memory.c
++++ b/src/virtio/vulkan/vn_device_memory.c
+@@ -31,6 +31,10 @@ vn_device_memory_alloc_simple(struct vn_device *dev,
+ {
+    VkDevice dev_handle = vn_device_to_handle(dev);
+    VkDeviceMemory mem_handle = vn_device_memory_to_handle(mem);
++
++   ((VkMemoryAllocateInfo *)alloc_info)->allocationSize =
++      align64(alloc_info->allocationSize, 16384);
++
+    if (VN_PERF(NO_ASYNC_MEM_ALLOC)) {
+       return vn_call_vkAllocateMemory(dev->primary_ring, dev_handle,
+                                       alloc_info, NULL, &mem_handle);
+diff --git a/src/virtio/vulkan/vn_renderer_virtgpu.c b/src/virtio/vulkan/vn_renderer_virtgpu.c
+index e9316fb..b570197 100644
+--- a/src/virtio/vulkan/vn_renderer_virtgpu.c
++++ b/src/virtio/vulkan/vn_renderer_virtgpu.c
+@@ -1241,6 +1241,8 @@ virtgpu_bo_create_from_device_memory(
+    const uint32_t blob_flags =
+       virtgpu_bo_blob_flags(gpu, flags, external_handles);
+ 
++   size = align64(size, 16384);
++
+    uint32_t res_id;
+    uint32_t gem_handle = virtgpu_ioctl_resource_create_blob(
+       gpu, gpu->bo_blob_mem, blob_flags, size, mem_id, &res_id);
+@@ -1291,6 +1293,8 @@ virtgpu_shmem_create(struct vn_renderer *renderer, size_t size)
+ {
+    struct virtgpu *gpu = (struct virtgpu *)renderer;
+ 
++   size = align64(size, 16384);
++
+    struct vn_renderer_shmem *cached_shmem =
+       vn_renderer_shmem_cache_get(&gpu->shmem_cache, size);
+    if (cached_shmem) {
+diff --git a/src/virtio/vulkan/vn_ring.c b/src/virtio/vulkan/vn_ring.c
+index 8782cb1..2241389 100644
+--- a/src/virtio/vulkan/vn_ring.c
++++ b/src/virtio/vulkan/vn_ring.c
+@@ -264,7 +264,7 @@ vn_ring_get_layout(size_t buf_size,
+    layout->extra_offset = layout->buffer_offset + layout->buffer_size;
+    layout->extra_size = extra_size;
+ 
+-   layout->shmem_size = layout->extra_offset + layout->extra_size;
++   layout->shmem_size = align64(layout->extra_offset + layout->extra_size, 16384);
+ }
+ 
+ struct vn_ring *
+-- 
+2.56.1
+

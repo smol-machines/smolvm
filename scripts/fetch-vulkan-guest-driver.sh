@@ -8,14 +8,17 @@
 # what crates/smolvm-agent/src/vulkan.rs bind-mounts into --gpu containers so
 # Vulkan works with no user setup, mirroring the CUDA shim staging.
 #
-# Every artifact is pinned by URL + sha256:
-#   - libvulkan_virtio.so from the slp/mesa-krunkit COPR (the patched Mesa;
-#     also correct on 4 KiB-page Linux hosts — same upstream code path).
-#   - Its DT_NEEDED closure (libdrm, xcb/wayland client libs and libXau, zstd,
-#     expat, zlib) and the Vulkan loader from the immutable AlmaLinux 9.6
-#     vault, so the driver dlopens on images that ship none of these. glibc >= 2.34
-#     (el9) is required of the workload image; older images degrade to
-#     no-Vulkan exactly as they do today.
+# The driver itself, libvulkan_virtio.so, is committed under
+# lib/vulkan-guest-driver/<arch>/. scripts/build-vulkan-guest-driver.sh builds
+# it from a pinned Mesa release with the krunkit Venus patches (a macOS host
+# needs them; they are harmless on a 4 KiB-page Linux host), on AlmaLinux 9.
+#
+# Everything else is pinned by URL + sha256: the driver's DT_NEEDED closure
+# (libdrm, xcb/wayland client libs and libXau, zstd, expat, zlib) and the
+# Vulkan loader come from the immutable AlmaLinux 9.6 vault, the same
+# libraries the driver was linked against, so it dlopens on images that ship
+# none of these. glibc >= 2.34 (el9) is required of the workload image; older
+# images degrade to no-Vulkan exactly as they do today.
 #
 # Usage: fetch-vulkan-guest-driver.sh <aarch64|x86_64> <output-dir>
 # The bundle lands in <output-dir>/ as flat lib*.so* files plus
@@ -36,14 +39,14 @@ set -euo pipefail
 ARCH="${1:?arch (aarch64|x86_64)}"
 OUT="${2:?output dir}"
 
-COPR="https://download.copr.fedorainfracloud.org/results/slp/mesa-krunkit/epel-9-$ARCH/09212593-mesa"
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+DRIVER_DIR="$REPO_ROOT/lib/vulkan-guest-driver/$ARCH"
 VAULT="https://repo.almalinux.org/vault/9.6"
 
-# name|url|sha256 — resolved 2026-08-20 from the COPR build 09212593 and the
-# AlmaLinux 9.6 vault (immutable). Update all three fields together.
+# name|url|sha256 — resolved 2026-08-20 from the AlmaLinux 9.6 vault
+# (immutable). Update all three fields together.
 case "$ARCH" in
 aarch64) PINS=(
-  "mesa-vulkan-drivers-24.2.8-104.el9.aarch64.rpm|$COPR/mesa-vulkan-drivers-24.2.8-104.el9.aarch64.rpm|a38e8b384c431cef84b1443252a9fdc754238133a42e07e518191aeec76097c2"
   "vulkan-loader-1.4.304.0-1.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/vulkan-loader-1.4.304.0-1.el9.aarch64.rpm|a9c4da94e48fc85c6969d5cf03c3c5446a4f68bbe962f557086a3b0fb30b09f6"
   "libdrm-2.4.123-2.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libdrm-2.4.123-2.el9.aarch64.rpm|7070f1cbe3a269b21544238b13127334bfeb39efd85989033ba3990c9c5b674c"
   "zlib-1.2.11-40.el9.aarch64.rpm|$VAULT/BaseOS/aarch64/os/Packages/zlib-1.2.11-40.el9.aarch64.rpm|e3acb023695f3f4626f8cbef5b89caba8760954873e30e1d4ea9f2d720b37295"
@@ -56,7 +59,6 @@ aarch64) PINS=(
   "libwayland-client-1.21.0-1.el9.aarch64.rpm|$VAULT/AppStream/aarch64/os/Packages/libwayland-client-1.21.0-1.el9.aarch64.rpm|9cee7c9f55019668dbf6dd8e2031e23a6e16f773bf308ed126ba5e4acfccbd57"
 ) ;;
 x86_64) PINS=(
-  "mesa-vulkan-drivers-24.2.8-104.el9.x86_64.rpm|$COPR/mesa-vulkan-drivers-24.2.8-104.el9.x86_64.rpm|d447cd1562646d704bff677776c6222f6d4734d0d780983533ba5d90366e2309"
   "vulkan-loader-1.4.304.0-1.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/vulkan-loader-1.4.304.0-1.el9.x86_64.rpm|34b090c246b2443d7ffcc4bc103a8d647f7090712d3a4e6ddce08860fda0f30b"
   "libdrm-2.4.123-2.el9.x86_64.rpm|$VAULT/AppStream/x86_64/os/Packages/libdrm-2.4.123-2.el9.x86_64.rpm|a4abf6bf087c6992d385e5a8a3bec2d2821536d6c2fcfc8242b635076e423739"
   "zlib-1.2.11-40.el9.x86_64.rpm|$VAULT/BaseOS/x86_64/os/Packages/zlib-1.2.11-40.el9.x86_64.rpm|90d7d5d145c6d397645ffefdff40e3d2783e3bf3bfa7b6c1f089c2cad81a3191"
@@ -93,6 +95,12 @@ extract_rpm() {
     return 1
 }
 
+for f in libvulkan_virtio.so virtio_icd.json; do
+    [[ -s "$DRIVER_DIR/$f" ]] || {
+        echo "missing $DRIVER_DIR/$f (build it with scripts/build-vulkan-guest-driver.sh)" >&2
+        exit 1
+    }
+done
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT
 
@@ -119,15 +127,12 @@ command -v patchelf &>/dev/null || {
 # Only usr/lib64 matters; the rpms ship nothing else we need.
 rm -rf "$OUT"/lib*.so* "$OUT"/virtio_icd.json "$OUT"/loader
 cp -a "$WORK"/usr/lib64/lib*.so* "$OUT"/
+cp "$DRIVER_DIR/libvulkan_virtio.so" "$OUT/libvulkan_virtio.so"
+chmod 755 "$OUT/libvulkan_virtio.so"
 # The loader is the one library an image may legitimately lack; keep it apart
 # so the agent can expose it alone.
 mkdir -p "$OUT/loader"
 mv "$OUT"/libvulkan.so.1* "$OUT/loader/"
-# Drop the other mesa vulkan drivers and layers — Venus only, smaller bundle,
-# and no chance of the loader probing an ICD we didn't intend to ship.
-find "$OUT" -name 'libvulkan_*.so' ! -name 'libvulkan_virtio.so' -delete
-find "$OUT" -name 'libVkLayer_*.so' -delete
-find "$OUT" -name 'libpowervr_rogue.so' -delete
 # Self-contained resolution: each real library looks next to itself first.
 for lib in "$OUT"/lib*.so*; do
     [[ -L "$lib" ]] && continue
@@ -135,11 +140,22 @@ for lib in "$OUT"/lib*.so*; do
 done
 patchelf --print-rpath "$OUT/libvulkan_virtio.so" | grep -qx '$ORIGIN'
 
-# The ICD manifest is the rpm's own (correct api_version) with library_path
+# Every library the driver names must be in the bundle or be glibc's own.
+for needed in $(patchelf --print-needed "$OUT/libvulkan_virtio.so"); do
+    case "$needed" in
+    libc.so.6 | libm.so.6 | libdl.so.2 | libpthread.so.0 | librt.so.1 | ld-linux-*) ;;
+    *) [[ -e "$OUT/$needed" ]] || {
+        echo "the driver needs $needed, which the bundle does not carry" >&2
+        exit 1
+    } ;;
+    esac
+done
+
+# The ICD manifest is the build's own (correct api_version) with library_path
 # rewritten to the CONTAINER path the agent bind-mounts the bundle to
 # (crates/smolvm-agent/src/vulkan.rs CONTAINER_DIR).
 sed 's|"library_path" *: *"[^"]*"|"library_path": "/opt/smolvm-vulkan/libvulkan_virtio.so"|' \
-    "$WORK/usr/share/vulkan/icd.d/virtio_icd.$ARCH.json" > "$OUT/virtio_icd.json"
+    "$DRIVER_DIR/virtio_icd.json" > "$OUT/virtio_icd.json"
 grep -q "/opt/smolvm-vulkan/libvulkan_virtio.so" "$OUT/virtio_icd.json"
 
 echo "Vulkan guest driver bundle staged in $OUT ($(du -sh "$OUT" | cut -f1))"

@@ -1,0 +1,5 @@
+# Written by scripts/build-vulkan-guest-driver.sh — do not edit by hand.
+mesa=25.2.8
+mesa_sha256=097842f3e49d996868b38688db87b006f7d4541e93ce86d2f341d8b3e7be7c93
+patches=8075175187887888cf61f118264c9192a653b12fae28ff499bcfee18d1b85708
+arch=aarch64

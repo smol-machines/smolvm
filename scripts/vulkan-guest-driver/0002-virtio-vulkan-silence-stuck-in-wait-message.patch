@@ -1,0 +1,27 @@
+From aa36147bfff248b1278334ac198789251594c89c Mon Sep 17 00:00:00 2001
+From: Sergio Lopez <slp@redhat.com>
+Date: Tue, 24 Jun 2025 10:54:04 +0000
+Subject: [PATCH] virtio/vulkan: silence stuck in wait message (HACK)
+
+---
+ src/virtio/vulkan/vn_common.c | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index 2d389a8..3020ad6 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -269,8 +269,8 @@ vn_relax(struct vn_relax_state *state)
+ 
+    if (unlikely(*iter % (1 << warn_order) == 0)) {
+       struct vn_instance *instance = state->instance;
+-      vn_log(instance, "stuck in %s wait with iter at %d", state->reason_str,
+-             *iter);
++      //vn_log(instance, "stuck in %s wait with iter at %d", state->reason_str,
++      //       *iter);
+ 
+       struct vn_ring *ring = instance->ring.ring;
+       const uint32_t status = vn_ring_load_status(ring);
+-- 
+2.56.1
+
