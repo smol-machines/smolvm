@@ -736,7 +736,7 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     #[cfg(not(unix))]
     let lazy = false;
     #[cfg(unix)]
-    let skip = |path: &str| lazy && crate::lazy_disk::is_lazy_asset(path);
+    let skip = |path: &str| lazy && crate::lazy_disk::left_out_of_tree(path);
     #[cfg(not(unix))]
     let skip = |_: &str| false;
     let materialized = store::materialize_over_except(

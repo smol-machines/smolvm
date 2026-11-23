@@ -68,7 +68,7 @@ const FIXED_MEMORY_OVERHEAD_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 /// Directory inside an extracted artifact containing live state.
 pub const ASSET_DIR: &str = "checkpoint";
 
-const INSTALLED_DIR: &str = "portable-checkpoint";
+pub(crate) const INSTALLED_DIR: &str = "portable-checkpoint";
 const PENDING_MARKER: &str = "pending";
 const RETAINED_MEMORY_BACKING: &str = ".portable-checkpoint-memory.bin";
 pub(crate) const READONLY_INPUT_DIR: &str = ".restore-input";
@@ -6805,12 +6805,8 @@ fn lazy_restore_source(extracted: &Path, keep_disks: bool) -> Result<Option<Path
                 "the restore tree left out its disks and does not name their checkpoint",
             )
         })?;
-        crate::checkpoint_store::materialize_missing(
-            &source,
-            extracted,
-            &crate::lazy_disk::is_lazy_asset,
-        )
-        .map_err(|error| Error::agent("materialize checkpoint disks", error.to_string()))?;
+        crate::checkpoint_store::materialize_missing(&source, extracted, &|_| true)
+            .map_err(|error| Error::agent("materialize checkpoint disks", error.to_string()))?;
     }
     Ok(None)
 }
@@ -7000,6 +6996,33 @@ fn install_with(
             let filename = Path::new(expected)
                 .file_name()
                 .expect("fixed checkpoint asset path");
+            #[cfg(unix)]
+            if expected == crate::lazy_disk::MEMORY_ASSET {
+                if let Some(stored) = crate::lazy_disk::tree_source(extracted) {
+                    if crate::lazy_disk::memory_enabled() {
+                        // The VMM rebuilds RAM from the store as the guest
+                        // touches it; nothing is copied before boot.
+                        crate::lazy_disk::write_memory_descriptor(&stored, expected, &partial)
+                            .map_err(|error| Error::agent("stage lazy RAM", error.to_string()))?;
+                        tracing::info!(
+                            asset = expected,
+                            elapsed_ms = started.elapsed().as_millis(),
+                            method = "lazy",
+                            "checkpoint payload installed"
+                        );
+                        continue;
+                    }
+                    // A lazy restore's tree left RAM out; this one copies it.
+                    if !extracted.join(expected).exists() {
+                        crate::checkpoint_store::materialize_missing(&stored, extracted, &|path| {
+                            path == crate::lazy_disk::MEMORY_ASSET
+                        })
+                        .map_err(|error| {
+                            Error::agent("materialize checkpoint RAM", error.to_string())
+                        })?;
+                    }
+                }
+            }
             if expected == "checkpoint/memory.bin"
                 && stage_readonly_memory(
                     &extracted.join(expected),
@@ -7610,13 +7633,24 @@ fn pinned_rootfs_available(checkpoint: &PortableCheckpointManifest) -> bool {
     }
 }
 
+/// Whether the restore in `dir` rebuilds its RAM from the store.
+fn has_lazy_memory(dir: &Path) -> bool {
+    #[cfg(unix)]
+    return crate::lazy_disk::has_lazy_memory(dir);
+    #[cfg(not(unix))]
+    {
+        let _ = dir;
+        false
+    }
+}
+
 /// Return the pending one-shot checkpoint directory for a machine, if any.
 pub fn pending_dir(vm_data_dir: &Path) -> Option<PathBuf> {
     let dir = vm_data_dir.join(INSTALLED_DIR);
     let marker = dir.join(PENDING_MARKER);
     if marker.is_file()
         && dir.join("checkpoint.bin").is_file()
-        && (dir.join("memory.bin").is_file() || has_readonly_memory(&dir))
+        && (dir.join("memory.bin").is_file() || has_readonly_memory(&dir) || has_lazy_memory(&dir))
         && dir.join("manifest.bin").is_file()
     {
         Some(dir)

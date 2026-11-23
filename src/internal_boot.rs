@@ -17,11 +17,52 @@ const GUARDIAN_MANIFEST_MAGIC: u64 = 0x534d4f4c4752444e;
 #[cfg(target_os = "linux")]
 const PREOPENED_USERFAULTFD_FD: libc::c_int = 198;
 
+/// A restore that rebuilds its RAM from the store needs a kernel-fault
+/// userfaultfd, opened here while the boot still holds root, and a branchable
+/// launch (libkrun's lazy RAM is a layered generation). A launch that is not
+/// branchable gets its RAM image written from the store instead, before boot.
 #[cfg(target_os = "linux")]
-fn preopen_guardian_userfaultfd() -> crate::Result<()> {
+fn prepare_lazy_ram(
+    snapshot_dir: &Path,
+    config: &crate::agent::boot_config::BootConfig,
+) -> crate::Result<bool> {
+    if !crate::lazy_disk::has_lazy_memory(snapshot_dir) {
+        return Ok(false);
+    }
+    if std::env::var_os("SMOLVM_FORKABLE").is_none_or(|value| value != "1") {
+        let checkpoint = boot_lazy_checkpoint(config).ok_or_else(|| {
+            crate::Error::agent(
+                "prepare restore RAM",
+                "no record of the machine's checkpoint",
+            )
+        })?;
+        crate::lazy_disk::materialize_memory(&checkpoint, snapshot_dir)
+            .map_err(|error| crate::Error::agent("prepare restore RAM", error.to_string()))?;
+        // Written as root; the VMM opens it after dropping to the VM's uid.
+        if let Some(uid) = std::env::var("SMOLVM_VM_UID")
+            .ok()
+            .and_then(|v| v.parse().ok())
+        {
+            let gid = std::env::var("SMOLVM_VM_GID")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(uid);
+            std::os::unix::fs::chown(snapshot_dir.join("memory.bin"), Some(uid), Some(gid))
+                .map_err(|error| crate::Error::agent("prepare restore RAM", error.to_string()))?;
+        }
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+#[cfg(target_os = "linux")]
+fn preopen_guardian_userfaultfd(
+    config: &crate::agent::boot_config::BootConfig,
+) -> crate::Result<()> {
     let Some(snapshot_dir) = std::env::var_os("SMOLVM_SNAPSHOT_DIR") else {
         return Ok(());
     };
+    let lazy_ram = prepare_lazy_ram(Path::new(&snapshot_dir), config)?;
     let manifest_path = PathBuf::from(snapshot_dir).join("manifest.bin");
     let manifest = std::fs::read(&manifest_path)
         .map_err(|error| crate::Error::agent("read fork manifest", error.to_string()))?;
@@ -29,7 +70,7 @@ fn preopen_guardian_userfaultfd() -> crate::Result<()> {
         .get(..8)
         .map(|bytes| u64::from_le_bytes(bytes.try_into().unwrap()))
         .ok_or_else(|| crate::Error::agent("read fork manifest", "manifest is truncated"))?;
-    if magic != GUARDIAN_MANIFEST_MAGIC {
+    if magic != GUARDIAN_MANIFEST_MAGIC && !lazy_ram {
         return Ok(());
     }
 
@@ -298,7 +339,7 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
         // inside KVM. Open it while this dedicated boot process still has the host
         // service's privileges; libkrun takes ownership after the uid drop.
         #[cfg(target_os = "linux")]
-        preopen_guardian_userfaultfd()?;
+        preopen_guardian_userfaultfd(&config)?;
 
         // If the supervisor delegated a cgroup v2 root (via SMOLVM_CGROUP_ROOT),
         // place this VMM in a per-VM cgroup with cpu/pids/memory caps so an untrusted
