@@ -313,7 +313,7 @@ impl ServeStartCmd {
             smolvm::lazy_disk::enable_memory();
         }
         #[cfg(unix)]
-        smolvm::checkpoint_delta::fail_interrupted_imports();
+        smolvm::checkpoint_delta::resume_interrupted_imports();
         #[cfg(not(unix))]
         let _ = (self.lazy_disks, self.lazy_ram);
 
