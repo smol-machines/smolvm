@@ -4421,6 +4421,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "smolvm-pack",
+ "smolvm-tar",
  "tempfile",
  "tracing",
  "zstd",

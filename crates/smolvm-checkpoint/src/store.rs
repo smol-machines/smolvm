@@ -2916,7 +2916,8 @@ pub fn is_importing(directory: &Path) -> bool {
 /// runs once the index is in, before any object (a delta links its base's
 /// objects there). `ready` runs once every object of the files `early` names
 /// is present; a file exported in restore order reaches that well before its
-/// end. On failure the directory is marked [`IMPORT_FAILED`] and kept, since
+/// end; it also waits for the first chunk of every other file, an image's
+/// header. On failure the directory is marked [`IMPORT_FAILED`] and kept, since
 /// a restore may already read it.
 pub fn unpack_streamed(
     payload: impl Read,
@@ -3017,8 +3018,8 @@ fn unpack_streamed_into(
                 index
                     .files
                     .iter()
-                    .filter(|file| early(&file.path))
-                    .flat_map(|file| file.chunks.iter().flatten())
+                    .flat_map(|file| chunks_before_resume(file, early(&file.path)))
+                    .flatten()
                     .filter(|hash| !objects.join(hash).exists())
                     .cloned()
                     .collect(),
@@ -3052,22 +3053,35 @@ pub fn is_served_disk(path: &str) -> bool {
     path.starts_with("checkpoint/disks/storage/") || path.starts_with("checkpoint/disks/overlay/")
 }
 
+/// The chunks of `file` a restore needs before the machine resumes: all of
+/// them for an `early` file, otherwise only the first (an image's header,
+/// which the restore reads to check its chain).
+fn chunks_before_resume(file: &StoredFile, early: bool) -> &[Option<String>] {
+    if early {
+        &file.chunks
+    } else {
+        &file.chunks[..file.chunks.len().min(1)]
+    }
+}
+
 /// The index's objects in the order a restore needs them: guest RAM first,
-/// then the other files a machine cannot resume without, then the disks it
-/// can read as it runs ([`is_served_disk`]), each from start to end. Each
-/// object once, where it is first needed.
+/// then the rest of what a machine cannot resume without (files that are not
+/// [`is_served_disk`], and each disk's header), then the disks it can read as
+/// it runs, each from start to end. Each object once, where first needed.
 fn restore_order(index: &Index) -> Vec<String> {
     let mut files: Vec<&StoredFile> = index.files.iter().collect();
-    files.sort_by_key(|file| {
-        (
-            is_served_disk(&file.path),
-            !file.path.ends_with("memory.bin"),
-        )
-    });
-    let mut seen = HashSet::new();
-    files
+    files.sort_by_key(|file| !file.path.ends_with("memory.bin"));
+    let before_resume = files
         .iter()
-        .flat_map(|file| file.chunks.iter().flatten())
+        .flat_map(|file| chunks_before_resume(file, !is_served_disk(&file.path)));
+    let served = files
+        .iter()
+        .filter(|file| is_served_disk(&file.path))
+        .flat_map(|file| &file.chunks);
+    let mut seen = HashSet::new();
+    before_resume
+        .chain(served)
+        .flatten()
         .filter(|hash| seen.insert(hash.as_str()))
         .cloned()
         .collect()
@@ -3199,6 +3213,27 @@ pub fn complete_from_base(directory: &Path, base: &Path) -> io::Result<usize> {
             return Err(invalid(format!(
                 "delta checkpoint needs object {hash} that its base does not hold"
             )));
+        }
+        match fs::hard_link(&source, objects.join(&hash)) {
+            Ok(()) => linked += 1,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(linked)
+}
+
+/// Link into `directory` every object its index names that it lacks and the
+/// stored checkpoint `base` holds: a delta arriving with [`unpack_streamed`],
+/// whose other objects are still on their way. Returns how many it linked.
+pub fn link_from_base(directory: &Path, base: &Path) -> io::Result<usize> {
+    let objects = directory.join("objects");
+    let base_objects = base.join("objects");
+    let mut linked = 0;
+    for hash in missing_objects(directory)? {
+        let source = base_objects.join(&hash);
+        if !source.is_file() {
+            continue;
         }
         match fs::hard_link(&source, objects.join(&hash)) {
             Ok(()) => linked += 1,
@@ -4898,10 +4933,11 @@ mod tests {
         )
         .unwrap();
         assert!(indexed.get());
+        // Only the disk's header is in when the restore may go on.
         assert_eq!(
             present_at_ready.get(),
-            Some(0),
-            "ready before any disk object"
+            Some(1),
+            "ready before the disk's body"
         );
         assert!(!is_importing(&target));
         assert!(missing_objects(&target).unwrap().is_empty());

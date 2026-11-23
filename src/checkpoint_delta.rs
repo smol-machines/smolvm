@@ -350,6 +350,12 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         }
         None => None,
     };
+    // A restore serving its disks lazily goes on once the file's resume
+    // inputs are in; the disks keep arriving behind it.
+    #[cfg(unix)]
+    if crate::lazy_disk::enabled() {
+        return import_streamed(artifact, &footer, checkpoint, id, &store, pin, base).map(Some);
+    }
     let staging_root = store.join("staging");
     std::fs::create_dir_all(&staging_root).map_err(io("create checkpoint staging"))?;
     let staging = tempfile::Builder::new()
@@ -418,6 +424,176 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         base: base.map(|(id, _)| id),
         already_held: false,
     }))
+}
+
+/// Mark failed every checkpoint a previous process was still importing when
+/// it stopped, so lazily restored disks waiting on it stop waiting. Called
+/// once at serve start, before any import of this process begins.
+#[cfg(unix)]
+pub fn fail_interrupted_imports() {
+    let Ok(entries) = std::fs::read_dir(published_dir(&node_store())) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let directory = entry.path();
+        if store::is_importing(&directory) && !directory.join(store::IMPORT_FAILED).exists() {
+            match std::fs::write(directory.join(store::IMPORT_FAILED), b"1\n") {
+                Ok(()) => tracing::warn!(
+                    directory = %directory.display(),
+                    "a checkpoint import was interrupted by a restart; marked failed"
+                ),
+                Err(error) => tracing::warn!(
+                    directory = %directory.display(),
+                    %error,
+                    "could not mark an interrupted checkpoint import failed"
+                ),
+            }
+        }
+    }
+}
+
+/// [`import`] that publishes the checkpoint as its objects arrive and returns
+/// once everything but its storage and overlay disks is in. The rest is
+/// unpacked in the background; a lazily restored disk waits for each object
+/// it needs. If the rest fails, the checkpoint is marked so and its readers
+/// stop waiting.
+#[cfg(unix)]
+fn import_streamed(
+    artifact: &Path,
+    footer: &smolvm_pack::format::PackFooter,
+    checkpoint: &smolvm_pack::format::PortableCheckpointManifest,
+    id: String,
+    store: &Path,
+    pin: Option<std::sync::Arc<crate::checkpoint_retention::Pin>>,
+    base: Option<(String, PathBuf)>,
+) -> Result<Imported> {
+    use std::io::Read;
+    let published = published_dir(store);
+    std::fs::create_dir_all(&published).map_err(io("create checkpoint store"))?;
+    let directory = published.join(format!("{id}.checkpoint"));
+    if directory.exists() {
+        // Not held, so an earlier import of it stopped short. Readers of a
+        // failed import already stopped waiting on it.
+        if store::is_importing(&directory) && !directory.join(store::IMPORT_FAILED).exists() {
+            return Err(Error::agent_conflict(
+                "restore checkpoint",
+                format!("checkpoint {id} is still being imported here; retry"),
+            ));
+        }
+        let stale = store.join("staging").join(format!(
+            ".stale-{id}-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or_default()
+        ));
+        std::fs::create_dir_all(store.join("staging")).map_err(io("create checkpoint staging"))?;
+        std::fs::rename(&directory, &stale).map_err(io("move aside an unfinished import"))?;
+        let _ = std::fs::remove_dir_all(&stale);
+    }
+    let payload = std::fs::File::open(artifact)
+        .map_err(io("open checkpoint"))?
+        .take(footer.assets_size);
+    let lineage = checkpoint.lineage.clone().expect("checked by import");
+    let base_id = base.as_ref().map(|(id, _)| id.clone());
+    let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
+    let started = std::time::Instant::now();
+    let tail = {
+        let (directory, store, id, pin) = (
+            directory.clone(),
+            store.to_path_buf(),
+            id.clone(),
+            pin.clone(),
+        );
+        std::thread::Builder::new()
+            .name("checkpoint-import".into())
+            .spawn(move || -> Result<usize> {
+                // Held until every object is in, so retention leaves it be.
+                let _pin = pin;
+                let mut base_objects = 0;
+                store::unpack_streamed(
+                    payload,
+                    &directory,
+                    &|path| !store::is_served_disk(path),
+                    |directory| {
+                        let indexed_id = store::read_manifest(directory)?
+                            .checkpoint
+                            .and_then(|checkpoint| checkpoint.lineage)
+                            .map(|lineage| lineage.id);
+                        if indexed_id.as_deref() != Some(id.as_str()) {
+                            return Err(std::io::Error::new(
+                                std::io::ErrorKind::InvalidData,
+                                "the checkpoint's index names a different checkpoint id than its manifest",
+                            ));
+                        }
+                        if let Some((_, base)) = &base {
+                            base_objects = store::link_from_base(directory, base)?;
+                        }
+                        store::record_lineage(
+                            &store,
+                            &store::LineageRecord {
+                                id: id.clone(),
+                                parent: lineage.parent.clone(),
+                                machine: lineage.machine.clone(),
+                                created_at: lineage.created_at.clone(),
+                                path: directory.to_string_lossy().into_owned(),
+                            },
+                        )
+                    },
+                    || {
+                        let _ = ready_tx.send(());
+                    },
+                )
+                .map_err(io("unpack checkpoint"))?;
+                store::adopt_objects(&store, &directory).map_err(io("adopt checkpoint objects"))?;
+                Ok(base_objects)
+            })
+            .map_err(io("start checkpoint import"))?
+    };
+    // The sender drops when the import ends, so a failure before the resume
+    // inputs are in surfaces here instead of waiting forever.
+    if ready_rx.recv().is_err() {
+        return match tail.join() {
+            Ok(Err(error)) => Err(error),
+            Ok(Ok(_)) => Err(Error::agent(
+                "restore checkpoint",
+                "import ended before it was ready",
+            )),
+            Err(_) => Err(Error::agent(
+                "restore checkpoint",
+                "checkpoint import panicked",
+            )),
+        };
+    }
+    let ready_ms = started.elapsed().as_millis() as u64;
+    {
+        let (id, directory) = (id.clone(), directory.clone());
+        std::thread::spawn(move || match tail.join() {
+            Ok(Ok(base_objects)) => tracing::info!(
+                %id,
+                ready_ms,
+                complete_ms = started.elapsed().as_millis() as u64,
+                base_objects,
+                "chunked checkpoint import finished"
+            ),
+            Ok(Err(error)) => tracing::error!(
+                %id,
+                directory = %directory.display(),
+                %error,
+                "chunked checkpoint import failed after its machine was released"
+            ),
+            Err(_) => tracing::error!(%id, "chunked checkpoint import panicked"),
+        });
+    }
+    tracing::info!(%id, ready_ms, "chunked checkpoint ready to restore");
+    Ok(Imported {
+        pin,
+        id,
+        directory,
+        base: base_id,
+        already_held: false,
+        ..Default::default()
+    })
 }
 
 /// `Some` once `shared` is extracted: the tree for a chunked `artifact`, or

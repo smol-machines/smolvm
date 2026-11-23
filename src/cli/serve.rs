@@ -300,6 +300,8 @@ impl ServeStartCmd {
         if self.lazy_disks {
             smolvm::lazy_disk::enable();
         }
+        #[cfg(unix)]
+        smolvm::checkpoint_delta::fail_interrupted_imports();
         #[cfg(not(unix))]
         let _ = self.lazy_disks;
 
