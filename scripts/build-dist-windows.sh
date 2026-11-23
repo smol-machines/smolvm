@@ -85,6 +85,14 @@ fi
 # then hand the tarball back to the runner user so the later `zip` can read it.
 TAR_SUDO=""
 if command -v sudo >/dev/null 2>&1 && sudo -n true 2>/dev/null; then TAR_SUDO="sudo"; fi
+# An absolute link points outside the install directory on the host, and
+# installers that check link containment (mise) refuse the whole archive.
+ABSOLUTE_LINKS="$($TAR_SUDO find "$ROOTFS_SRC" -type l -lname '/*')"
+if [[ -n "$ABSOLUTE_LINKS" ]]; then
+    echo "Error: agent-rootfs has absolute symlinks; rebuild it with scripts/build-agent-rootfs.sh:" >&2
+    echo "$ABSOLUTE_LINKS" >&2
+    exit 1
+fi
 echo "Packing agent-rootfs.tar.gz..."
 $TAR_SUDO tar -czf "$DIST_DIR/agent-rootfs.tar.gz" -C "$ROOTFS_SRC" .
 [[ -n "$TAR_SUDO" ]] && $TAR_SUDO chown "$(id -u):$(id -g)" "$DIST_DIR/agent-rootfs.tar.gz"

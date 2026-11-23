@@ -528,7 +528,7 @@ jobs:
         run: |
           sudo cp /tmp/agent/smolvm-agent target/agent-rootfs/usr/local/bin/smolvm-agent
           sudo chmod +x target/agent-rootfs/usr/local/bin/smolvm-agent
-          sudo ln -sf /usr/local/bin/smolvm-agent target/agent-rootfs/sbin/init
+          sudo ln -sf ../usr/local/bin/smolvm-agent target/agent-rootfs/sbin/init
 
       - name: Build Windows distribution
         run: ./scripts/build-dist-windows.sh

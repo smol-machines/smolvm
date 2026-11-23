@@ -4,7 +4,9 @@
 #
 # Part of the smolvm test suite. Run with: ./tests/test_agent_rootfs_modes.sh
 #
-# Covers normalize_owner_only_modes() in scripts/build-agent-rootfs.sh, which
+# Covers relativize_absolute_symlinks() and normalize_owner_only_modes() in
+# scripts/build-agent-rootfs.sh. The first makes every absolute link relative,
+# so no link points outside the install directory on the host. The second
 # widens the stock Alpine paths that only their owner can read. A mode-preserving
 # install lands those root-owned under a system prefix, where `pack create` — it
 # tars the whole rootfs and cannot skip anything — fails for the user running
@@ -56,9 +58,10 @@ print_summary() {
 
 BUILD_SCRIPT="$(cd "$(dirname "$0")/.." && pwd)/scripts/build-agent-rootfs.sh"
 
-# Source just the function under test; the build script's top level would go off
+# Source just the functions under test; the build script's top level would go off
 # and download Alpine.
 eval "$(awk '/^normalize_owner_only_modes\(\) \{/,/^\}/' "$BUILD_SCRIPT")"
+eval "$(awk '/^relativize_absolute_symlinks\(\) \{/,/^\}/' "$BUILD_SCRIPT")"
 
 echo ""
 echo "=========================================="
@@ -219,11 +222,49 @@ test_shared_temporary_directories_are_sticky_and_writable() {
     return "$rc"
 }
 
+# The guest mounts the rootfs at /, so each rewritten link must name the same
+# guest path, and none may point outside the tree on the host.
+test_absolute_symlinks_become_relative_to_the_same_guest_path() {
+    local root rc=0 link want got
+    root=$(mktemp -d)
+    mkdir -p "$root/bin" "$root/sbin" "$root/etc/ssl1.1"
+    ln -s /bin/busybox "$root/bin/sed"
+    ln -s /usr/local/bin/smolvm-agent "$root/sbin/init"
+    ln -s /etc/ssl/cert.pem "$root/etc/ssl1.1/cert.pem"
+    ln -s /etc/ssl/certs "$root/etc/ssl1.1/certs"
+    ln -s /proc/mounts "$root/etc/mtab"
+    ln -s /usr/lib "$root/lib64"
+    ln -s / "$root/rootfs"
+    ln -s busybox "$root/bin/sh"
+
+    relativize_absolute_symlinks "$root" || rc=1
+    while read -r link want; do
+        got="$(readlink "$root/$link")"
+        if [[ "$got" != "$want" ]]; then
+            echo "$link -> $got, want $want"
+            rc=1
+        fi
+    done <<'EOF'
+bin/sed busybox
+sbin/init ../usr/local/bin/smolvm-agent
+etc/ssl1.1/cert.pem ../ssl/cert.pem
+etc/ssl1.1/certs ../ssl/certs
+etc/mtab ../proc/mounts
+lib64 usr/lib
+rootfs .
+bin/sh busybox
+EOF
+
+    rm -rf "$root"
+    return $rc
+}
+
 run_test "Temporary directories keep sticky write access" test_shared_temporary_directories_are_sticky_and_writable
 run_test "Stock Alpine owner-only paths are widened" test_stock_alpine_paths_are_widened
 run_test "Unexpected owner-only file fails loudly" test_unexpected_owner_only_path_fails_loudly
 run_test "Unexpected owner-only directory fails loudly" test_unexpected_owner_only_directory_fails_loudly
 run_test "Missing optional paths are tolerated" test_missing_optional_paths_are_tolerated
 run_test "Symlinks do not trip the check" test_symlinks_do_not_trip_the_check
+run_test "Absolute symlinks become relative to the same guest path" test_absolute_symlinks_become_relative_to_the_same_guest_path
 
 print_summary "Agent Rootfs Permission Tests"
