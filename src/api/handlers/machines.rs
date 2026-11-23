@@ -2511,6 +2511,12 @@ pub async fn restore_portable_checkpoint(
         let import_only = options.import_only.unwrap_or(false);
         let input = artifact.clone();
         let needs_verification = verified.is_none();
+        // The SHA-256 taken as the artifact was received or cached, so the
+        // restore tree's identity is recorded without reading it again.
+        let digest = verified
+            .as_ref()
+            .filter(|verified| verified.covers(&input))
+            .and_then(|verified| verified.digest_proof());
         let started = std::time::Instant::now();
         let prepared = tokio::task::spawn_blocking(move || -> crate::Result<Option<String>> {
             // Classic artifacts take the ordinary path, which verifies them.
@@ -2530,7 +2536,7 @@ pub async fn restore_portable_checkpoint(
                 return crate::checkpoint_delta::import(&input)
                     .map(|imported| imported.map(|imported| imported.id));
             }
-            crate::checkpoint_delta::prepare_restore(&input)
+            crate::checkpoint_delta::prepare_restore_with_digest(&input, digest)
                 .map(|tree| tree.map(|tree| tree.display().to_string()))
         })
         .await

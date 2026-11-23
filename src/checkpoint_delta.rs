@@ -658,6 +658,15 @@ fn lock_shared_extraction(shared: &Path) -> Result<std::fs::File> {
 /// extraction directory its footer names, reusing the closest held base's
 /// materialization. Returns `None` for classic files.
 pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
+    prepare_restore_with_digest(artifact, None)
+}
+
+/// [`prepare_restore`] given the SHA-256 the service took of `artifact` as it
+/// received it, so recording the tree's identity does not read it again.
+pub fn prepare_restore_with_digest(
+    artifact: &Path,
+    mut digest: Option<smolvm_pack::extract::ArtifactDigestProof>,
+) -> Result<Option<PathBuf>> {
     let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
         .map_err(|e| Error::agent("read checkpoint footer", e.to_string()))?;
     let shared_root = crate::agent::shared_pack_cache_root();
@@ -788,7 +797,12 @@ pub fn prepare_restore(artifact: &Path) -> Result<Option<PathBuf>> {
     // refused after this returns. Record whose payload the entry holds before
     // it can be found, so another artifact with the same key is refused
     // rather than served this tree.
-    smolvm_pack::extract::record_shared_artifact_sha256(artifact, &shared).map_err(|error| {
+    smolvm_pack::extract::record_shared_artifact_sha256_observed(
+        artifact,
+        &shared,
+        digest.as_mut(),
+    )
+    .map_err(|error| {
         let _ = std::fs::remove_dir_all(&partial);
         io("record materialized checkpoint")(error)
     })?;
