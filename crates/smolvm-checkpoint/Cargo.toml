@@ -17,6 +17,7 @@ zstd = "0.14.3"
 tempfile = "3"
 tracing = "0.1"
 libc = "0.2"
+tar = { workspace = true }
 
 [dev-dependencies]
 sha2 = "0.10"

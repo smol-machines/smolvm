@@ -1732,7 +1732,6 @@ fn allocated(meta: &fs::Metadata) -> u64 {
     meta.blocks().saturating_mul(512)
 }
 
-#[cfg(unix)]
 fn is_object_name(name: &str) -> bool {
     name.len() == 64
         && name
@@ -2895,6 +2894,198 @@ pub struct ExportStats {
     pub base_objects: usize,
 }
 
+/// Marker inside a published checkpoint whose objects are still arriving.
+pub const IMPORTING: &str = ".importing";
+/// Marker inside a published checkpoint whose import stopped short: the
+/// objects it lacks will not arrive.
+pub const IMPORT_FAILED: &str = ".import-failed";
+
+/// Whether the stored checkpoint at `directory` is still being imported.
+pub fn is_importing(directory: &Path) -> bool {
+    directory.join(IMPORTING).exists()
+}
+
+/// Unpack a chunked checkpoint's payload (the zstd tar a [`export_chunked`]
+/// file carries) straight into `directory`, its final place in the store, so
+/// a restore can use it before every object has arrived.
+///
+/// `directory` must not exist. It holds [`IMPORTING`] until the last object is
+/// in. Each object appears under its name only once whole, so a reader never
+/// sees part of one; one that is not there yet is still coming. `with_index`
+/// runs once the index is in, before any object (a delta links its base's
+/// objects there). `ready` runs once every object of the files `early` names
+/// is present; a file exported in restore order reaches that well before its
+/// end; it also waits for the first chunk of every other file, an image's
+/// header. On failure the directory is marked [`IMPORT_FAILED`] and kept, since
+/// a restore may already read it.
+pub fn unpack_streamed(
+    payload: impl Read,
+    directory: &Path,
+    early: &dyn Fn(&str) -> bool,
+    with_index: impl FnOnce(&Path) -> io::Result<()>,
+    ready: impl FnOnce(),
+) -> io::Result<()> {
+    fs::create_dir(directory)?;
+    fs::write(directory.join(IMPORTING), b"1\n")?;
+    let result = unpack_streamed_into(payload, directory, early, with_index, ready);
+    match &result {
+        Ok(()) => fs::remove_file(directory.join(IMPORTING))?,
+        Err(_) => {
+            let _ = fs::write(directory.join(IMPORT_FAILED), b"1\n");
+        }
+    }
+    result
+}
+
+fn unpack_streamed_into(
+    payload: impl Read,
+    directory: &Path,
+    early: &dyn Fn(&str) -> bool,
+    with_index: impl FnOnce(&Path) -> io::Result<()>,
+    ready: impl FnOnce(),
+) -> io::Result<()> {
+    let objects = directory.join("objects");
+    fs::create_dir(&objects)?;
+    let mut archive = tar::Archive::new(zstd::stream::Decoder::new(payload)?);
+    let mut with_index = Some(with_index);
+    let mut ready = Some(ready);
+    // Objects the early files still wait for, once the index is known.
+    let mut waiting: Option<HashSet<String>> = None;
+    let mut check_ready = |waiting: &Option<HashSet<String>>| {
+        if waiting.as_ref().is_some_and(HashSet::is_empty) {
+            if let Some(ready) = ready.take() {
+                ready();
+            }
+        }
+    };
+    for entry in archive.entries()? {
+        let mut entry = entry?;
+        let path = entry.path()?.into_owned();
+        let name = path.to_string_lossy().trim_end_matches('/').to_string();
+        let kind = entry.header().entry_type();
+        if kind.is_dir() {
+            if name == "objects" || name == "layers" || name == GENERATIONS {
+                continue;
+            }
+            match name.strip_prefix("generations/") {
+                Some(id) if valid_generation_id(id) => {
+                    fs::create_dir_all(directory.join(&name))?;
+                    continue;
+                }
+                _ => return Err(invalid(format!("unexpected checkpoint entry {name}"))),
+            }
+        }
+        if !kind.is_file() {
+            return Err(invalid(format!("unexpected checkpoint entry {name}")));
+        }
+        if let Some(hash) = name.strip_prefix("objects/") {
+            if !is_object_name(hash) || entry.size() > (CHUNK_SIZE + 128 * 1024) as u64 {
+                return Err(invalid(format!("unexpected checkpoint object {name}")));
+            }
+            if waiting.is_none() {
+                return Err(invalid("a checkpoint's objects came before its index"));
+            }
+            let part = objects.join(format!(".part-{hash}"));
+            write_entry(&mut entry, &part)?;
+            fs::rename(&part, objects.join(hash))?;
+            if let Some(waiting) = waiting.as_mut() {
+                waiting.remove(hash);
+            }
+            check_ready(&waiting);
+            continue;
+        }
+        let generation_index = name
+            .strip_prefix("generations/")
+            .and_then(|rest| rest.strip_suffix("/checkpoint.json"))
+            .is_some_and(valid_generation_id);
+        if name != INDEX && !generation_index {
+            return Err(invalid(format!("unexpected checkpoint entry {name}")));
+        }
+        if entry.size() > 256 * 1024 * 1024 {
+            return Err(invalid("checkpoint index too large"));
+        }
+        let target = directory.join(&name);
+        let part = target.with_extension("json.part");
+        write_entry(&mut entry, &part)?;
+        fs::rename(&part, &target)?;
+        if name == INDEX {
+            let index = read_index(directory)?;
+            if let Some(with_index) = with_index.take() {
+                with_index(directory)?;
+            }
+            waiting = Some(
+                index
+                    .files
+                    .iter()
+                    .flat_map(|file| chunks_before_resume(file, early(&file.path)))
+                    .flatten()
+                    .filter(|hash| !objects.join(hash).exists())
+                    .cloned()
+                    .collect(),
+            );
+            check_ready(&waiting);
+        }
+    }
+    if waiting.is_none() {
+        return Err(invalid("the checkpoint carries no index"));
+    }
+    let missing = missing_objects(directory)?;
+    if !missing.is_empty() {
+        return Err(invalid(format!(
+            "checkpoint is missing {} object(s)",
+            missing.len()
+        )));
+    }
+    check_ready(&waiting);
+    Ok(())
+}
+
+fn write_entry(entry: &mut impl Read, path: &Path) -> io::Result<()> {
+    let mut file = File::options().write(true).create_new(true).open(path)?;
+    io::copy(entry, &mut file)?;
+    Ok(())
+}
+
+/// Whether `path` is a storage or overlay disk layer: what a restore can
+/// serve from the store as the guest reads it rather than before it boots.
+pub fn is_served_disk(path: &str) -> bool {
+    path.starts_with("checkpoint/disks/storage/") || path.starts_with("checkpoint/disks/overlay/")
+}
+
+/// The chunks of `file` a restore needs before the machine resumes: all of
+/// them for an `early` file, otherwise only the first (an image's header,
+/// which the restore reads to check its chain).
+fn chunks_before_resume(file: &StoredFile, early: bool) -> &[Option<String>] {
+    if early {
+        &file.chunks
+    } else {
+        &file.chunks[..file.chunks.len().min(1)]
+    }
+}
+
+/// The index's objects in the order a restore needs them: guest RAM first,
+/// then the rest of what a machine cannot resume without (files that are not
+/// [`is_served_disk`], and each disk's header), then the disks it can read as
+/// it runs, each from start to end. Each object once, where first needed.
+fn restore_order(index: &Index) -> Vec<String> {
+    let mut files: Vec<&StoredFile> = index.files.iter().collect();
+    files.sort_by_key(|file| !file.path.ends_with("memory.bin"));
+    let before_resume = files
+        .iter()
+        .flat_map(|file| chunks_before_resume(file, !is_served_disk(&file.path)));
+    let served = files
+        .iter()
+        .filter(|file| is_served_disk(&file.path))
+        .flat_map(|file| &file.chunks);
+    let mut seen = HashSet::new();
+    before_resume
+        .chain(served)
+        .flatten()
+        .filter(|hash| seen.insert(hash.as_str()))
+        .cloned()
+        .collect()
+}
+
 /// Export the stored checkpoint at `directory` as one `Chunked` file holding
 /// its index and objects. With `base` (another stored checkpoint), every
 /// object the base's own index references is left out and the manifest names
@@ -2942,6 +3133,7 @@ pub fn export_chunked(
         stats.objects += 1;
         stats.object_bytes += fs::metadata(&target)?.len();
     }
+    let order = restore_order(&own);
     let mut manifest = own.manifest;
     {
         let checkpoint = manifest
@@ -2978,8 +3170,9 @@ pub fn export_chunked(
         };
     }
     decorate(&mut manifest);
-    let collector =
+    let mut collector =
         smolvm_pack::assets::AssetCollector::new(staging).map_err(|e| invalid(e.to_string()))?;
+    collector.set_object_order(order);
     let artifact = temporary.path().join("export.smolcheckpoint");
     let info = smolvm_pack::packer::Packer::new(manifest)
         .with_asset_collector(collector)
@@ -3019,6 +3212,27 @@ pub fn complete_from_base(directory: &Path, base: &Path) -> io::Result<usize> {
             return Err(invalid(format!(
                 "delta checkpoint needs object {hash} that its base does not hold"
             )));
+        }
+        match fs::hard_link(&source, objects.join(&hash)) {
+            Ok(()) => linked += 1,
+            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(linked)
+}
+
+/// Link into `directory` every object its index names that it lacks and the
+/// stored checkpoint `base` holds: a delta arriving with [`unpack_streamed`],
+/// whose other objects are still on their way. Returns how many it linked.
+pub fn link_from_base(directory: &Path, base: &Path) -> io::Result<usize> {
+    let objects = directory.join("objects");
+    let base_objects = base.join("objects");
+    let mut linked = 0;
+    for hash in missing_objects(directory)? {
+        let source = base_objects.join(&hash);
+        if !source.is_file() {
+            continue;
         }
         match fs::hard_link(&source, objects.join(&hash)) {
             Ok(()) => linked += 1,
@@ -4568,6 +4782,233 @@ mod tests {
         let empty = root.path().join("empty");
         fs::create_dir_all(empty.join("objects")).unwrap();
         assert!(complete_from_base(&other, &empty).is_err());
+    }
+
+    #[test]
+    fn a_chunked_export_carries_the_index_then_ram_then_disks_in_order() {
+        let root = tempfile::tempdir().unwrap();
+        let cache = root.path().join("cache");
+        let directory = root.path().join("stored");
+        fs::create_dir(&directory).unwrap();
+        // Distinct chunks: disk chunk i holds 10 + i, RAM chunk i holds 20 + i.
+        let chunks = |base: u8, count: usize| -> Vec<u8> {
+            (0..count)
+                .flat_map(|i| vec![base + i as u8; CHUNK_SIZE])
+                .collect()
+        };
+        let disk = chunks(10, 3);
+        let memory = chunks(20, 2);
+        let mut writer = Writer::new(&cache, &directory).unwrap();
+        // The disk is ingested first, so the index lists it before RAM.
+        let stored = [
+            ("checkpoint/disks/storage/0", &disk),
+            ("checkpoint/memory.bin", &memory),
+        ]
+        .iter()
+        .map(|(path, bytes)| {
+            writer
+                .ingest(path, bytes.len() as u64, 0o600, &mut bytes.as_slice())
+                .unwrap()
+        })
+        .collect();
+        writer
+            .finish(
+                &directory,
+                lineage_manifest(&"c".repeat(32), None, "t"),
+                stored,
+            )
+            .unwrap();
+
+        let file = root.path().join("out.checkpoint");
+        export_chunked(&directory, None, &file, |_| {}).unwrap();
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(&file).unwrap();
+        let payload = File::open(&file).unwrap().take(footer.assets_size);
+        let mut archive = tar::Archive::new(zstd::stream::Decoder::new(payload).unwrap());
+        let names: Vec<String> = archive
+            .entries()
+            .unwrap()
+            .map(|entry| {
+                entry
+                    .unwrap()
+                    .path()
+                    .unwrap()
+                    .to_string_lossy()
+                    .into_owned()
+            })
+            .filter(|name| name != "layers" && name != "layers/")
+            .collect();
+        let index = read_index(&directory).unwrap();
+        let hashes_of = |path: &str| -> Vec<String> {
+            let file = index.files.iter().find(|f| f.path == path).unwrap();
+            file.chunks
+                .iter()
+                .flatten()
+                .map(|hash| format!("objects/{hash}"))
+                .collect()
+        };
+        let mut expected = vec![INDEX.to_string(), "objects".to_string()];
+        expected.extend(hashes_of("checkpoint/memory.bin"));
+        expected.extend(hashes_of("checkpoint/disks/storage/0"));
+        let names: Vec<String> = names
+            .into_iter()
+            .map(|name| name.trim_end_matches('/').to_string())
+            .collect();
+        assert_eq!(names, expected);
+    }
+
+    /// A stored checkpoint with a 3-chunk storage disk and 2-chunk RAM, and
+    /// its chunked export.
+    fn exported_checkpoint(root: &Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let cache = root.join("cache");
+        let directory = root.join("stored");
+        fs::create_dir(&directory).unwrap();
+        let chunks = |base: u8, count: usize| -> Vec<u8> {
+            (0..count)
+                .flat_map(|i| vec![base + i as u8; CHUNK_SIZE])
+                .collect()
+        };
+        let disk = chunks(10, 3);
+        let memory = chunks(20, 2);
+        let mut writer = Writer::new(&cache, &directory).unwrap();
+        let stored = [
+            ("checkpoint/disks/storage/0", &disk),
+            ("checkpoint/memory.bin", &memory),
+        ]
+        .iter()
+        .map(|(path, bytes)| {
+            writer
+                .ingest(path, bytes.len() as u64, 0o600, &mut bytes.as_slice())
+                .unwrap()
+        })
+        .collect();
+        writer
+            .finish(
+                &directory,
+                lineage_manifest(&"c".repeat(32), None, "t"),
+                stored,
+            )
+            .unwrap();
+        let file = root.join("out.checkpoint");
+        export_chunked(&directory, None, &file, |_| {}).unwrap();
+        (directory, file)
+    }
+
+    fn payload_of(file: &Path) -> io::Take<File> {
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(file).unwrap();
+        File::open(file).unwrap().take(footer.assets_size)
+    }
+
+    #[test]
+    fn a_streamed_import_is_ready_before_its_disks_arrive_and_completes() {
+        let root = tempfile::tempdir().unwrap();
+        let (stored, file) = exported_checkpoint(root.path());
+        let index = read_index(&stored).unwrap();
+        let disk_objects: Vec<String> = index
+            .files
+            .iter()
+            .filter(|f| is_served_disk(&f.path))
+            .flat_map(|f| f.chunks.iter().flatten().cloned())
+            .collect();
+        let target = root.path().join("published");
+        let present_at_ready = std::cell::Cell::new(None);
+        let indexed = std::cell::Cell::new(false);
+        unpack_streamed(
+            payload_of(&file),
+            &target,
+            &|path| !is_served_disk(path),
+            |directory| {
+                assert!(directory.join(INDEX).is_file());
+                indexed.set(true);
+                Ok(())
+            },
+            || {
+                assert!(is_importing(&target));
+                let present = disk_objects
+                    .iter()
+                    .filter(|hash| target.join("objects").join(hash).exists())
+                    .count();
+                present_at_ready.set(Some(present));
+            },
+        )
+        .unwrap();
+        assert!(indexed.get());
+        // Only the disk's header is in when the restore may go on.
+        assert_eq!(
+            present_at_ready.get(),
+            Some(1),
+            "ready before the disk's body"
+        );
+        assert!(!is_importing(&target));
+        assert!(missing_objects(&target).unwrap().is_empty());
+        let tree = root.path().join("tree");
+        materialize_over(&target, &tree, None).unwrap();
+        let original = root.path().join("original");
+        materialize_over(&stored, &original, None).unwrap();
+        for file in ["checkpoint/memory.bin", "checkpoint/disks/storage/0"] {
+            assert_eq!(
+                fs::read(tree.join(file)).unwrap(),
+                fs::read(original.join(file)).unwrap()
+            );
+        }
+        assert!(fs::read_dir(target.join("objects")).unwrap().all(|e| !e
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".part-")));
+    }
+
+    #[test]
+    fn a_streamed_import_cut_short_is_marked_failed_and_kept() {
+        let root = tempfile::tempdir().unwrap();
+        let (_, file) = exported_checkpoint(root.path());
+        let mut payload = Vec::new();
+        payload_of(&file).read_to_end(&mut payload).unwrap();
+        payload.truncate(payload.len() / 2);
+        let target = root.path().join("published");
+        let error =
+            unpack_streamed(&payload[..], &target, &|_| true, |_| Ok(()), || {}).unwrap_err();
+        assert!(!error.to_string().is_empty());
+        assert!(target.join(IMPORT_FAILED).exists());
+        assert!(is_importing(&target));
+    }
+
+    #[test]
+    fn a_streamed_import_accepts_a_file_in_name_order() {
+        let root = tempfile::tempdir().unwrap();
+        let (stored, _) = exported_checkpoint(root.path());
+        // What an older smolvm wrote: the objects sorted by name.
+        let file = root.path().join("unordered.checkpoint");
+        {
+            let staging = root.path().join("staging");
+            fs::create_dir_all(staging.join("objects")).unwrap();
+            fs::copy(stored.join(INDEX), staging.join(INDEX)).unwrap();
+            for entry in fs::read_dir(stored.join("objects")).unwrap() {
+                let entry = entry.unwrap();
+                fs::copy(
+                    entry.path(),
+                    staging.join("objects").join(entry.file_name()),
+                )
+                .unwrap();
+            }
+            let manifest = read_index(&stored).unwrap().manifest;
+            let collector = smolvm_pack::assets::AssetCollector::new(staging).unwrap();
+            smolvm_pack::packer::Packer::new(manifest)
+                .with_asset_collector(collector)
+                .pack_artifact(&file)
+                .unwrap();
+        }
+        let target = root.path().join("published");
+        let ready = std::cell::Cell::new(false);
+        unpack_streamed(
+            payload_of(&file),
+            &target,
+            &|_| true,
+            |_| Ok(()),
+            || ready.set(true),
+        )
+        .unwrap();
+        assert!(ready.get());
+        assert!(missing_objects(&target).unwrap().is_empty());
     }
 
     #[test]

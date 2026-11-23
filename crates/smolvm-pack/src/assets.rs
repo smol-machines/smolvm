@@ -778,6 +778,8 @@ pub struct AssetCollector {
     link_host_assets: bool,
     /// Files packed under `checkpoint/` from outside the staging tree.
     patched_files: Vec<PatchedFile>,
+    /// Names under the staging tree's `objects/`, in the order to pack them.
+    object_order: Vec<String>,
 }
 
 impl AssetCollector {
@@ -803,7 +805,15 @@ impl AssetCollector {
             },
             link_host_assets: false,
             patched_files: Vec::new(),
+            object_order: Vec::new(),
         })
+    }
+
+    /// Pack the files under the staging tree's `objects/` in this order, any
+    /// not named after them. A chunked checkpoint lists what a restore needs
+    /// first, so a restore reading the file as it arrives can start early.
+    pub fn set_object_order(&mut self, order: Vec<String>) {
+        self.object_order = order;
     }
 
     /// Pack `file` under `checkpoint/`, after the staged checkpoint files.
@@ -1458,6 +1468,10 @@ impl AssetCollector {
                 }
                 continue;
             }
+            if name == "objects" && path.is_dir() && !self.object_order.is_empty() {
+                append_objects_in_order(&mut tar_builder, &path, &self.object_order)?;
+                continue;
+            }
             #[cfg(target_os = "macos")]
             append_macos_tree(&mut tar_builder, &path, Path::new(&name))?;
             #[cfg(not(target_os = "macos"))]
@@ -1481,6 +1495,38 @@ impl AssetCollector {
             .finish()
             .map_err(|e| PackError::Compression(e.to_string()))
     }
+}
+
+/// Pack the flat directory `objects` as `objects/`, its files named in
+/// `order` first and in that order, then the rest sorted by name.
+fn append_objects_in_order<W: Write>(
+    builder: &mut tar::Builder<W>,
+    objects: &Path,
+    order: &[String],
+) -> Result<()> {
+    let tar = |error: std::io::Error| PackError::Tar(error.to_string());
+    builder.append_dir("objects", objects).map_err(tar)?;
+    let mut rest: std::collections::BTreeSet<std::ffi::OsString> = fs::read_dir(objects)?
+        .map(|entry| entry.map(|entry| entry.file_name()))
+        .collect::<std::io::Result<_>>()?;
+    let ordered = order
+        .iter()
+        .filter(|name| rest.remove(std::ffi::OsStr::new(name.as_str())))
+        .map(std::ffi::OsString::from)
+        .collect::<Vec<_>>();
+    for name in ordered.into_iter().chain(rest) {
+        let path = objects.join(&name);
+        if !fs::symlink_metadata(&path)?.is_file() {
+            return Err(PackError::Tar(format!(
+                "checkpoint object {} is not a file",
+                path.display()
+            )));
+        }
+        builder
+            .append_path_with_name(&path, Path::new("objects").join(&name))
+            .map_err(tar)?;
+    }
+    Ok(())
 }
 
 /// The data ranges of `file`, `len` bytes long, as `(offset, length)`.

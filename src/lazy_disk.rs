@@ -389,6 +389,34 @@ fn wait_filled(checkpoint: &Path, disk: &Path, timeout: Duration) -> io::Result<
     }
 }
 
+/// How long a chunk of a checkpoint still being imported is waited for.
+const ARRIVAL_TIMEOUT: Duration = Duration::from_secs(10 * 60);
+
+/// Chunk `index` of `chunked`, waiting for it while `checkpoint` is still
+/// being imported. An import that failed will not bring it.
+fn read_arriving(
+    chunked: &ChunkedFile,
+    index: usize,
+    checkpoint: &Path,
+) -> io::Result<Option<Vec<u8>>> {
+    let deadline = Instant::now() + ARRIVAL_TIMEOUT;
+    loop {
+        match chunked.read(index) {
+            Err(error)
+                if error.kind() == io::ErrorKind::NotFound
+                    && crate::checkpoint_store::is_importing(checkpoint)
+                    && !checkpoint
+                        .join(crate::checkpoint_store::IMPORT_FAILED)
+                        .exists()
+                    && Instant::now() < deadline =>
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            other => return other,
+        }
+    }
+}
+
 /// Fill every chunk of `disk` its presence record lacks, from the store. No
 /// VMM may have the disk open, one would hold chunks it has not recorded yet:
 /// the caller holds the descriptor's lock exclusively.
@@ -420,7 +448,7 @@ fn fill(checkpoint: &Path, disk: &Path) -> io::Result<()> {
                         let Some(&chunk) = missing.get(at) else {
                             return Ok(());
                         };
-                        if let Some(bytes) = chunked.read(chunk)? {
+                        if let Some(bytes) = read_arriving(&chunked, chunk, checkpoint)? {
                             file.write_all_at(&bytes, chunk as u64 * ChunkedFile::chunk_size())?;
                         }
                     }
@@ -568,6 +596,51 @@ mod tests {
         let filled = std::fs::read(&m.disk).unwrap();
         assert_eq!(&filled[..data.len()], &data[..]);
         assert_eq!(&filled[5 * MIB..], b"grown");
+    }
+
+    /// Take chunk 1's object out of `stored`, as if still on its way, and mark
+    /// the checkpoint as being imported.
+    fn hold_back_chunk_one(stored: &Path) -> (PathBuf, PathBuf) {
+        let chunked = ChunkedFile::open(stored, FILE).unwrap();
+        assert!(!chunked.is_zero(1));
+        let index: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(stored.join("checkpoint.json")).unwrap())
+                .unwrap();
+        let hash = index["files"][0]["chunks"][1].as_str().unwrap().to_string();
+        let object = stored.join("objects").join(&hash);
+        let held = stored.join("held-object");
+        std::fs::rename(&object, &held).unwrap();
+        std::fs::write(stored.join(crate::checkpoint_store::IMPORTING), b"1\n").unwrap();
+        (object, held)
+    }
+
+    #[test]
+    fn filling_waits_for_a_chunk_still_being_imported() {
+        let data = pattern(3 * MIB);
+        let m = lazy_machine(&data);
+        let (object, held) = hold_back_chunk_one(&m.stored);
+        let arrives = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            std::fs::rename(held, object).unwrap();
+        });
+        settle_in(&m.store, &m.machine).unwrap();
+        arrives.join().unwrap();
+        assert_eq!(std::fs::read(&m.disk).unwrap(), data);
+    }
+
+    #[test]
+    fn filling_stops_at_once_when_the_import_failed() {
+        let m = lazy_machine(&pattern(3 * MIB));
+        hold_back_chunk_one(&m.stored);
+        std::fs::write(
+            m.stored.join(crate::checkpoint_store::IMPORT_FAILED),
+            b"1\n",
+        )
+        .unwrap();
+        let started = Instant::now();
+        assert!(settle_in(&m.store, &m.machine).is_err());
+        assert!(started.elapsed() < Duration::from_secs(5));
+        assert!(is_lazy(&m.disk));
     }
 
     #[test]
