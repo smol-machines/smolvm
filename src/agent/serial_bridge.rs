@@ -233,6 +233,8 @@ pub fn run_helper(
     Ok(())
 }
 
+/// Entry point for the hidden `_serial-bridge` subprocess; serial passthrough
+/// needs a Unix host.
 #[cfg(not(unix))]
 pub fn run_helper(
     _device: &Path,
