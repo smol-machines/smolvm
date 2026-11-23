@@ -2937,6 +2937,32 @@ pub fn unpack_streamed(
     result
 }
 
+/// Finish an [`unpack_streamed`] that stopped short (its process ended), from
+/// the same payload: objects already in are kept, the rest are written as the
+/// first time. `directory` must still be marked [`IMPORTING`] and not
+/// [`IMPORT_FAILED`]; on failure it is marked failed.
+pub fn resume_streamed(payload: impl Read, directory: &Path) -> io::Result<()> {
+    if !is_importing(directory) || directory.join(IMPORT_FAILED).exists() {
+        return Err(invalid("no import of this checkpoint to resume"));
+    }
+    // Partial objects the stopped import was writing.
+    if let Ok(entries) = fs::read_dir(directory.join("objects")) {
+        for entry in entries.flatten() {
+            if entry.file_name().to_string_lossy().starts_with(".part-") {
+                fs::remove_file(entry.path())?;
+            }
+        }
+    }
+    let result = unpack_streamed_into(payload, directory, &|_| false, |_| Ok(()), || {});
+    match &result {
+        Ok(()) => fs::remove_file(directory.join(IMPORTING))?,
+        Err(_) => {
+            let _ = fs::write(directory.join(IMPORT_FAILED), b"1\n");
+        }
+    }
+    result
+}
+
 fn unpack_streamed_into(
     payload: impl Read,
     directory: &Path,
@@ -2945,7 +2971,7 @@ fn unpack_streamed_into(
     ready: impl FnOnce(),
 ) -> io::Result<()> {
     let objects = directory.join("objects");
-    fs::create_dir(&objects)?;
+    fs::create_dir_all(&objects)?;
     let mut archive = tar::Archive::new(zstd::stream::Decoder::new(payload)?);
     let mut with_index = Some(with_index);
     let mut ready = Some(ready);
@@ -2985,9 +3011,12 @@ fn unpack_streamed_into(
             if waiting.is_none() {
                 return Err(invalid("a checkpoint's objects came before its index"));
             }
-            let part = objects.join(format!(".part-{hash}"));
-            write_entry(&mut entry, &part)?;
-            fs::rename(&part, objects.join(hash))?;
+            // A resumed import, or a delta's base, may already hold it.
+            if !objects.join(hash).exists() {
+                let part = objects.join(format!(".part-{hash}"));
+                write_entry(&mut entry, &part)?;
+                fs::rename(&part, objects.join(hash))?;
+            }
             if let Some(waiting) = waiting.as_mut() {
                 waiting.remove(hash);
             }
@@ -4970,6 +4999,79 @@ mod tests {
         assert!(!error.to_string().is_empty());
         assert!(target.join(IMPORT_FAILED).exists());
         assert!(is_importing(&target));
+    }
+
+    #[test]
+    fn a_streamed_import_stopped_partway_resumes_from_the_same_file() {
+        let root = tempfile::tempdir().unwrap();
+        // Data that does not compress, so a cut partway through the file falls
+        // partway through its objects.
+        let noise = |seed: u64, len: usize| -> Vec<u8> {
+            let mut state = seed;
+            (0..len)
+                .map(|_| {
+                    state = state
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    (state >> 33) as u8
+                })
+                .collect()
+        };
+        let cache = root.path().join("cache");
+        let stored = root.path().join("stored");
+        fs::create_dir(&stored).unwrap();
+        let mut writer = Writer::new(&cache, &stored).unwrap();
+        let disk = noise(1, 4 * CHUNK_SIZE);
+        let memory = noise(2, 2 * CHUNK_SIZE);
+        let files = [
+            ("checkpoint/disks/storage/0", &disk),
+            ("checkpoint/memory.bin", &memory),
+        ]
+        .iter()
+        .map(|(path, bytes)| {
+            writer
+                .ingest(path, bytes.len() as u64, 0o600, &mut bytes.as_slice())
+                .unwrap()
+        })
+        .collect();
+        writer
+            .finish(&stored, lineage_manifest(&"d".repeat(32), None, "t"), files)
+            .unwrap();
+        let file = root.path().join("noise.checkpoint");
+        export_chunked(&stored, None, &file, |_| {}).unwrap();
+        let mut payload = Vec::new();
+        payload_of(&file).read_to_end(&mut payload).unwrap();
+        let target = root.path().join("published");
+        // The process stops partway: the import is left marked as running,
+        // with a partial object, and not failed.
+        let _ = unpack_streamed(
+            &payload[..payload.len() * 3 / 5],
+            &target,
+            &|_| true,
+            |_| Ok(()),
+            || {},
+        );
+        fs::remove_file(target.join(IMPORT_FAILED)).unwrap();
+        fs::write(target.join("objects").join(".part-leftover"), b"half").unwrap();
+        assert!(is_importing(&target));
+        assert!(!missing_objects(&target).unwrap().is_empty());
+
+        resume_streamed(&payload[..], &target).unwrap();
+        assert!(!is_importing(&target));
+        assert!(missing_objects(&target).unwrap().is_empty());
+        assert!(!target.join("objects").join(".part-leftover").exists());
+        let tree = root.path().join("tree");
+        materialize_over(&target, &tree, None).unwrap();
+        let original = root.path().join("original");
+        materialize_over(&stored, &original, None).unwrap();
+        for path in ["checkpoint/memory.bin", "checkpoint/disks/storage/0"] {
+            assert_eq!(
+                fs::read(tree.join(path)).unwrap(),
+                fs::read(original.join(path)).unwrap()
+            );
+        }
+        // Nothing to resume once complete.
+        assert!(resume_streamed(&payload[..], &target).is_err());
     }
 
     #[test]

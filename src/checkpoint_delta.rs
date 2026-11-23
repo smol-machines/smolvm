@@ -146,6 +146,24 @@ pub fn capture(
 }
 
 /// The stored directory of checkpoint `id` on this node, if it is complete.
+/// Wait while this node streams checkpoint `id` into its store, so a delta of
+/// it finds it complete. Returns at once when no import of it is running, and
+/// gives up after a while: the delta is then refused as if the base were absent.
+#[cfg(unix)]
+fn wait_for_import(store: &Path, id: &str) {
+    let Ok(Some(record)) = store::find_lineage(store, id) else {
+        return;
+    };
+    let directory = PathBuf::from(record.path);
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(15 * 60);
+    while store::is_importing(&directory)
+        && !directory.join(store::IMPORT_FAILED).exists()
+        && std::time::Instant::now() < deadline
+    {
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+}
+
 fn held_checkpoint(store: &Path, id: &str) -> Result<Option<PathBuf>> {
     let Some(record) = store::find_lineage(store, id).map_err(io("read checkpoint lineage"))?
     else {
@@ -285,6 +303,14 @@ pub struct Imported {
 /// base must already be held here with the exact index digest it names;
 /// otherwise this fails with a conflict naming the base to import first.
 pub fn import(artifact: &Path) -> Result<Option<Imported>> {
+    import_with(artifact, false)
+}
+
+/// [`import`]; with `streamed`, under lazy restores, return once the file's
+/// resume inputs are in and import the rest in the background. Only a restore
+/// streams: an import on its own is asked for so the checkpoint is held here,
+/// as a later delta's base, and must be complete when it returns.
+fn import_with(artifact: &Path, streamed: bool) -> Result<Option<Imported>> {
     let footer = smolvm_pack::packer::read_footer_from_sidecar(artifact)
         .map_err(|e| Error::agent("read checkpoint footer", e.to_string()))?;
     let manifest = smolvm_pack::packer::read_manifest_from_sidecar(artifact)
@@ -327,6 +353,9 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
         Some(base) => {
             _base_pin = crate::checkpoint_retention::pin(&store, &base.id)
                 .map_err(io("pin base checkpoint"))?;
+            // A base a restore here is still streaming in is held once it is in.
+            #[cfg(unix)]
+            wait_for_import(&store, &base.id);
             let Some(directory) = held_checkpoint(&store, &base.id)? else {
                 return Err(Error::agent_conflict(
                     "restore checkpoint",
@@ -353,7 +382,7 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
     // A restore serving its disks lazily goes on once the file's resume
     // inputs are in; the disks keep arriving behind it.
     #[cfg(unix)]
-    if crate::lazy_disk::enabled() {
+    if streamed && crate::lazy_disk::enabled() {
         return import_streamed(artifact, &footer, checkpoint, id, &store, pin, base).map(Some);
     }
     let staging_root = store.join("staging");
@@ -426,29 +455,91 @@ pub fn import(artifact: &Path) -> Result<Option<Imported>> {
     }))
 }
 
-/// Mark failed every checkpoint a previous process was still importing when
-/// it stopped, so lazily restored disks waiting on it stop waiting. Called
-/// once at serve start, before any import of this process begins.
+/// Where a streamed import keeps a link to the file it reads until it is
+/// complete, so a restart can finish it.
 #[cfg(unix)]
-pub fn fail_interrupted_imports() {
-    let Ok(entries) = std::fs::read_dir(published_dir(&node_store())) else {
+fn import_source(store: &Path, id: &str) -> PathBuf {
+    store.join("staging").join(format!("{id}.import-source"))
+}
+
+/// Removes a file when dropped.
+#[cfg(unix)]
+struct RemoveOnDrop(Option<PathBuf>);
+
+#[cfg(unix)]
+impl Drop for RemoveOnDrop {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// Finish, in the background, every checkpoint a previous process was still
+/// streaming in when it stopped, from the file it kept; mark failed any it
+/// cannot, so lazily restored disks waiting on it stop waiting. Called once
+/// at serve start, before any import of this process begins.
+#[cfg(unix)]
+pub fn resume_interrupted_imports() {
+    let store = node_store();
+    let Ok(entries) = std::fs::read_dir(published_dir(&store)) else {
         return;
     };
     for entry in entries.flatten() {
         let directory = entry.path();
-        if store::is_importing(&directory) && !directory.join(store::IMPORT_FAILED).exists() {
-            match std::fs::write(directory.join(store::IMPORT_FAILED), b"1\n") {
+        if !store::is_importing(&directory) || directory.join(store::IMPORT_FAILED).exists() {
+            continue;
+        }
+        let id = directory
+            .file_name()
+            .and_then(|name| name.to_str())
+            .and_then(|name| name.strip_suffix(".checkpoint"))
+            .map(str::to_owned);
+        let source = id
+            .as_deref()
+            .map(|id| import_source(&store, id))
+            .filter(|source| source.is_file());
+        match (id, source) {
+            (Some(id), Some(source)) => {
+                tracing::warn!(directory = %directory.display(), "resuming a checkpoint import a restart interrupted");
+                let store = store.clone();
+                std::thread::spawn(move || resume_import(&store, &id, &directory, &source));
+            }
+            _ => match std::fs::write(directory.join(store::IMPORT_FAILED), b"1\n") {
                 Ok(()) => tracing::warn!(
                     directory = %directory.display(),
-                    "a checkpoint import was interrupted by a restart; marked failed"
+                    "a checkpoint import was interrupted by a restart and cannot be resumed; marked failed"
                 ),
                 Err(error) => tracing::warn!(
                     directory = %directory.display(),
                     %error,
                     "could not mark an interrupted checkpoint import failed"
                 ),
-            }
+            },
         }
+    }
+}
+
+#[cfg(unix)]
+fn resume_import(store: &Path, id: &str, directory: &Path, source: &Path) {
+    let started = std::time::Instant::now();
+    let _pin = crate::checkpoint_retention::pin(store, id);
+    let result = (|| -> std::io::Result<()> {
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(source)
+            .map_err(|error| std::io::Error::other(error.to_string()))?;
+        let payload = std::io::Read::take(std::fs::File::open(source)?, footer.assets_size);
+        store::resume_streamed(payload, directory)?;
+        store::adopt_objects(store, directory)?;
+        Ok(())
+    })();
+    let _ = std::fs::remove_file(source);
+    match result {
+        Ok(()) => tracing::info!(
+            %id,
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "interrupted checkpoint import finished"
+        ),
+        Err(error) => tracing::error!(%id, %error, "interrupted checkpoint import failed"),
     }
 }
 
@@ -494,6 +585,14 @@ fn import_streamed(
     let payload = std::fs::File::open(artifact)
         .map_err(io("open checkpoint"))?
         .take(footer.assets_size);
+    // A link to the file until every object is in, so a restart of this
+    // process finishes the import instead of leaving machines without disks.
+    let source = import_source(store, &id);
+    let _ = std::fs::create_dir_all(store.join("staging"));
+    let _ = std::fs::remove_file(&source);
+    let source = std::fs::hard_link(artifact, &source)
+        .is_ok()
+        .then_some(source);
     let lineage = checkpoint.lineage.clone().expect("checked by import");
     let base_id = base.as_ref().map(|(id, _)| id.clone());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
@@ -510,6 +609,7 @@ fn import_streamed(
             .spawn(move || -> Result<usize> {
                 // Held until every object is in, so retention leaves it be.
                 let _pin = pin;
+                let _source = RemoveOnDrop(source);
                 let mut base_objects = 0;
                 store::unpack_streamed(
                     payload,
@@ -684,7 +784,7 @@ pub fn prepare_restore_with_digest(
         return Ok(prepared);
     }
     let started = std::time::Instant::now();
-    let Some(imported) = import(artifact)? else {
+    let Some(imported) = import_with(artifact, true)? else {
         return Ok(None);
     };
     let import_ms = started.elapsed().as_millis() as u64;
@@ -885,6 +985,44 @@ pub fn prepare_restore_with_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_delta_waits_for_its_base_to_finish_streaming_in() {
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::TempDir::new().unwrap();
+        let store = root.path().join("store");
+        let directory = store.join("published").join(format!("{ID}.checkpoint"));
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join(store::IMPORTING), b"1\n").unwrap();
+        store::record_lineage(
+            &store,
+            &store::LineageRecord {
+                id: ID.into(),
+                parent: None,
+                machine: "m".into(),
+                created_at: "t".into(),
+                path: directory.to_string_lossy().into_owned(),
+            },
+        )
+        .unwrap();
+        let marker = directory.join(store::IMPORTING);
+        let finishes = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            std::fs::remove_file(marker).unwrap();
+        });
+        let started = std::time::Instant::now();
+        wait_for_import(&store, ID);
+        assert!(started.elapsed() >= std::time::Duration::from_millis(250));
+        finishes.join().unwrap();
+
+        // A failed import is not waited for.
+        std::fs::write(directory.join(store::IMPORTING), b"1\n").unwrap();
+        std::fs::write(directory.join(store::IMPORT_FAILED), b"1\n").unwrap();
+        let started = std::time::Instant::now();
+        wait_for_import(&store, ID);
+        assert!(started.elapsed() < std::time::Duration::from_secs(1));
+    }
 
     #[test]
     fn a_held_checkpoint_stands_in_only_for_the_same_index() {
