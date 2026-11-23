@@ -1,0 +1,53 @@
+name: Build the Linux host renderer
+
+# Rebuild the renderer bundled in lib/linux-<arch>/: libvirglrenderer,
+# virgl_render_server and libepoxy. scripts/build-virglrenderer-linux.sh pins
+# the releases and applies patches/virglrenderer-linux/; it runs in Ubuntu
+# 20.04 so the result needs nothing newer than glibc 2.31.
+#
+# Runs on dispatch and on a pull request that changes the build. Uploads the
+# files as an artifact; they are then committed into lib/linux-<arch>/.
+
+on:
+  workflow_dispatch:
+  pull_request:
+    paths:
+      - scripts/build-virglrenderer-linux.sh
+      - patches/virglrenderer-linux/**
+      - .github/workflows/build-virglrenderer-linux.yml
+
+jobs:
+  build:
+    name: Host renderer ${{ matrix.arch }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: x86_64
+            runner: ubuntu-22.04
+          - arch: aarch64
+            runner: ubuntu-22.04-arm
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build in Ubuntu 20.04
+        run: |
+          mkdir -p out
+          docker run --rm -v "$PWD/scripts:/src/scripts:ro" \
+            -v "$PWD/patches:/src/patches:ro" -v "$PWD/out:/out" \
+            ubuntu:20.04 bash /src/scripts/build-virglrenderer-linux.sh "/out/${{ matrix.arch }}"
+          sudo chown -R "$(id -u):$(id -g)" out
+          cat "out/${{ matrix.arch }}/virglrenderer.provenance"
+          sha256sum "out/${{ matrix.arch }}"/*
+
+      # Symbolic links do not survive upload-artifact, so the files travel in
+      # a tarball.
+      - name: Pack
+        run: tar -C "out/${{ matrix.arch }}" -cf "virglrenderer-linux-${{ matrix.arch }}.tar" .
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: virglrenderer-linux-${{ matrix.arch }}
+          path: virglrenderer-linux-${{ matrix.arch }}.tar
+          if-no-files-found: error

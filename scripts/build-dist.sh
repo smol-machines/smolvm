@@ -746,7 +746,8 @@ rm -f "smolvm-*.tar.gz"
 # Everything shipped must load on the glibc floor the build asked for.
 if [[ "$(uname -s)" == "Linux" && -n "${LINUX_GLIBC:-}" ]]; then
     floor_files=("$DIST_DIR/smolvm-bin")
-    for f in "$DIST_DIR/containerd-shim-smolvm-v2" "$DIST_DIR/smol-bin" "$DIST_DIR"/lib/libkrun.so*; do
+    for f in "$DIST_DIR/containerd-shim-smolvm-v2" "$DIST_DIR/smol-bin" "$DIST_DIR"/lib/libkrun.so* \
+        "$DIST_DIR"/lib/libvirglrenderer.so* "$DIST_DIR"/lib/libepoxy.so* "$DIST_DIR/lib/virgl_render_server"; do
         [[ -f "$f" && ! -L "$f" ]] && floor_files+=("$f")
     done
     ./scripts/check-glibc-floor.sh "$LINUX_GLIBC" "${floor_files[@]}"
