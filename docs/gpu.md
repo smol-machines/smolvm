@@ -10,17 +10,14 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 **macOS**: virglrenderer and MoltenVK are bundled in the smolvm distribution. No extra installs needed.
 
-**Linux**: virglrenderer and a host Vulkan driver must be installed from the system package manager:
+**Linux**: virglrenderer is bundled in the smolvm distribution. The host needs only its GPU driver: a Vulkan driver, plus the libEGL, libgbm and libdrm that come with it.
 
 | Distro | Packages |
 |--------|----------|
-| Alpine | `apk add virglrenderer mesa-vulkan-intel` (or `mesa-vulkan-ati` for AMD) |
-| Debian/Ubuntu | `apt install virglrenderer0 mesa-vulkan-drivers` |
-| Nix / NixOS | the flake does not put virglrenderer on the loader path; export `LD_LIBRARY_PATH` with the nixpkgs `virglrenderer` and `libepoxy` lib dirs (and `/run/opengl-driver/lib` on NixOS), see the [GPU page](https://smolmachines.com/docs/introduction/concepts/gpu) |
+| Debian/Ubuntu | `apt install mesa-vulkan-drivers libegl1 libgbm1` (or the NVIDIA driver packages) |
+| Arch | `pacman -S mesa vulkan-radeon` (or `vulkan-intel`, or `nvidia-utils`) |
 
-> virglrenderer depends on libEGL and libdrm from the host GPU driver stack. These are hardware-specific and cannot be bundled. Any GPU-capable Linux host will already have them installed via its GPU driver.
-
-**An NVIDIA host needs virglrenderer 1.2.0 or newer.** Older render servers preload Vulkan in a way NVIDIA's driver rejects, so the guest's `vkCreateDevice` fails with `VK_ERROR_INITIALIZATION_FAILED`; 1.2.0 turns that preload off by default ([upstream MR 1557](https://gitlab.freedesktop.org/virgl/virglrenderer/-/merge_requests/1557)). Ubuntu 24.04 packages 1.0.0, so on such a host build 1.2.0 or newer from source, keeping `vulkan-preload=false`, or use a release that ships it ([#730](https://github.com/smol-machines/smolvm/issues/730)).
+The bundled renderer is built by `scripts/build-virglrenderer-linux.sh` from a pinned upstream release plus the patches in `patches/virglrenderer-linux/`. A build of smolvm that does not carry it (a source build, the Nix flake) falls back to the host's `libvirglrenderer.so.1`, which must then be 1.2.0 or newer on an NVIDIA host: older render servers preload Vulkan in a way NVIDIA's driver rejects. The Nix flake does not put virglrenderer on the loader path; export `LD_LIBRARY_PATH` with the nixpkgs `virglrenderer` and `libepoxy` lib dirs (and `/run/opengl-driver/lib` on NixOS), see the [GPU page](https://smolmachines.com/docs/introduction/concepts/gpu).
 
 **Windows**: not available (WHP); `--gpu` has no effect there.
 

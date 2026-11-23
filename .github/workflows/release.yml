@@ -461,6 +461,18 @@ jobs:
             fi
           done
 
+      # --gpu on Linux uses the renderer in lib/ in preference to the host's,
+      # so a dist without it would silently run whatever the distro packages.
+      - name: Verify host renderer bundled
+        if: runner.os == 'Linux'
+        run: |
+          VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"
+          DIST_LIB="dist/smolvm-${VERSION}-${{ matrix.platform }}/lib"
+          test -s "$DIST_LIB/libvirglrenderer.so.1"
+          test -s "$DIST_LIB/libepoxy.so.0"
+          test -x "$DIST_LIB/virgl_render_server"
+          cat "${{ matrix.lib_dir }}/virglrenderer.provenance"
+
       - name: List distribution contents
         run: |
           VERSION="$(grep '^version' Cargo.toml | head -1 | cut -d'"' -f2)"

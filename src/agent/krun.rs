@@ -544,14 +544,14 @@ fn ensure_linux_gpu_dependencies(lib_dir: &Path) -> Result<(), String> {
     // missing system copy so statically-linked builds remain valid.
     let epoxy = lib_dir.join("libepoxy.so.0");
     if epoxy.exists() {
-        dlopen_global(&epoxy).map_err(linux_gpu_runtime_error)?;
+        dlopen_global(&epoxy).map_err(linux_bundled_gpu_runtime_error)?;
     } else {
         let _ = dlopen_global_soname("libepoxy.so.0");
     }
 
     let virgl = lib_dir.join("libvirglrenderer.so.1");
     if virgl.exists() {
-        dlopen_global(&virgl).map_err(linux_gpu_runtime_error)?;
+        dlopen_global(&virgl).map_err(linux_bundled_gpu_runtime_error)?;
     } else {
         dlopen_global_soname("libvirglrenderer.so.1").map_err(linux_gpu_runtime_error)?;
     }
@@ -561,6 +561,17 @@ fn ensure_linux_gpu_dependencies(lib_dir: &Path) -> Result<(), String> {
     // failure was a missing `virgl_set_debug_callback`) before the first GPU
     // FFI call can make the dynamic linker abort the VMM process.
     dlopen_now(&lib_dir.join(libkrun_filename())).map_err(linux_gpu_runtime_error)
+}
+
+/// The bundled renderer failed to load. It carries everything but the host
+/// GPU driver's own libraries, so one of those is what is missing.
+#[cfg(target_os = "linux")]
+fn linux_bundled_gpu_runtime_error(detail: String) -> String {
+    format!(
+        "Linux GPU support (--gpu) requires the host GPU driver's libEGL, \
+         libgbm and libdrm, and a Vulkan driver (Debian/Ubuntu: `apt install \
+         mesa-vulkan-drivers libegl1 libgbm1`; Arch: `pacman -S mesa`): {detail}"
+    )
 }
 
 #[cfg(target_os = "linux")]
@@ -639,7 +650,7 @@ fn dlopen_now(path: &Path) -> Result<(), String> {
 
 #[cfg(all(test, target_os = "linux"))]
 mod linux_gpu_tests {
-    use super::linux_gpu_runtime_error;
+    use super::{linux_bundled_gpu_runtime_error, linux_gpu_runtime_error};
 
     #[test]
     fn gpu_runtime_error_is_actionable() {
@@ -649,5 +660,18 @@ mod linux_gpu_tests {
         assert!(error.contains("apt install"));
         assert!(error.contains("pacman -S"));
         assert!(error.contains("virgl_example"));
+    }
+
+    #[test]
+    fn bundled_renderer_error_names_the_host_driver_libraries() {
+        let error = linux_bundled_gpu_runtime_error(
+            "libgbm.so.1: cannot open shared object file".to_string(),
+        );
+        assert!(error.contains("--gpu"));
+        assert!(error.contains("libgbm"));
+        assert!(error.contains("apt install"));
+        assert!(error.contains("pacman -S"));
+        assert!(error.contains("libgbm.so.1: cannot open"));
+        assert!(!error.contains("Install virglrenderer"));
     }
 }
