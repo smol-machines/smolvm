@@ -55,7 +55,7 @@ storage = 40                          # storage disk GiB (default: 20)
 overlay = 4                           # overlay disk GiB (default: 10)
 
 # Mounts, ports and provisioning ([dev] lists below replace these when set)
-volumes = ["./src:/app"]              # host bind mounts; a guest path alone ("/var/lib/docker") is a directory on the machine's disk
+volumes = ["$HOME/src:/app"]          # host bind mounts expand $VAR/${VAR}; a guest path alone is a directory on the machine's disk
 ports = ["8080:8080", "27015:27015/udp"]  # host:guest forwarding; /udp for UDP
 init = ["pip install -r requirements.txt"]  # run once as root, on the machine's first start
 

@@ -83,6 +83,55 @@ fn dev_or_top<T>(dev: Vec<T>, top: Vec<T>) -> Vec<T> {
     }
 }
 
+static ENV_REFERENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\$(?:\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+        .expect("environment reference regex must compile")
+});
+
+fn expand_env_references(input: &str) -> smolvm::Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut end = 0;
+    for captures in ENV_REFERENCE.captures_iter(input) {
+        let matched = captures.get(0).expect("a capture always has a full match");
+        let name = captures
+            .get(1)
+            .or_else(|| captures.get(2))
+            .expect("an environment reference always has a name")
+            .as_str();
+        let value = std::env::var(name).map_err(|error| {
+            smolvm::Error::config(
+                "smolfile volumes",
+                format!("environment variable '{name}': {error}"),
+            )
+        })?;
+        output.push_str(&input[end..matched.start()]);
+        output.push_str(&value);
+        end = matched.end();
+    }
+    output.push_str(&input[end..]);
+    Ok(output)
+}
+
+fn expand_smolfile_volume(spec: &str) -> smolvm::Result<String> {
+    let mut paths_end = spec.len();
+    if let Some((head, options)) = spec[..paths_end].rsplit_once(':') {
+        if options.contains('=') {
+            paths_end = head.len();
+        }
+    }
+    if let Some((head, mode)) = spec[..paths_end].rsplit_once(':') {
+        if matches!(mode, "ro" | "rw" | "staged") {
+            paths_end = head.len();
+        }
+    }
+    let Some((source, _target)) = spec[..paths_end].rsplit_once(':') else {
+        return Ok(spec.to_string());
+    };
+    let source_end = source.len();
+    let expanded = expand_env_references(source)?;
+    Ok(format!("{expanded}{}", &spec[source_end..]))
+}
+
 /// A machine spec from CLI flags merged over an optional Smolfile, before a
 /// source or engine defaults apply. Volume specs stay unparsed: how they parse
 /// depends on `--allow-system-mounts`, which the command applies.
@@ -273,7 +322,10 @@ pub fn build_create_spec(
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
 
     // Volumes: [dev].volumes > top-level volumes, then CLI extends
-    let mut volumes = dev_or_top(dev.volumes, sf_volumes);
+    let mut volumes = dev_or_top(dev.volumes, sf_volumes)
+        .iter()
+        .map(|volume| expand_smolfile_volume(volume))
+        .collect::<smolvm::Result<Vec<_>>>()?;
     volumes.extend(cli_volume);
 
     // Env: top-level env + [dev].env + CLI extends (whitespace trimmed)
@@ -939,6 +991,33 @@ mod tests {
     use super::*;
     use smolvm::data::network::PortMapping;
 
+    #[test]
+    fn smolfile_volume_expands_environment_variables_only_in_the_host_path() {
+        std::env::set_var("SMOLVM_TEST_VOLUME_ROOT", "/srv");
+        std::env::set_var("SMOLVM_TEST_VOLUME_DRIVE", "C:");
+        let expanded = expand_smolfile_volume(
+            "$SMOLVM_TEST_VOLUME_ROOT/data:/workspace/$SMOLVM_TEST_UNSET_GUEST:ro",
+        )
+        .unwrap();
+        let braced =
+            expand_smolfile_volume("${SMOLVM_TEST_VOLUME_DRIVE}\\src:/app:uid=1000").unwrap();
+        std::env::remove_var("SMOLVM_TEST_VOLUME_ROOT");
+        std::env::remove_var("SMOLVM_TEST_VOLUME_DRIVE");
+
+        assert_eq!(expanded, "/srv/data:/workspace/$SMOLVM_TEST_UNSET_GUEST:ro");
+        assert_eq!(braced, "C:\\src:/app:uid=1000");
+    }
+
+    #[test]
+    fn smolfile_volume_rejects_a_missing_environment_variable() {
+        const MISSING: &str = "SMOLVM_TEST_MISSING_VOLUME_ROOT";
+        std::env::remove_var(MISSING);
+        let error = expand_smolfile_volume(&format!("${MISSING}/data:/app"))
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(MISSING), "{error}");
+    }
+
     fn build_from_smolfile(path: PathBuf) -> smolvm::Result<CreateVmParams> {
         build_create_params(
             "test-vm".to_string(),
@@ -964,6 +1043,27 @@ mod tests {
             vec![],
             Default::default(),
         )
+    }
+
+    #[test]
+    fn smolfile_volume_expansion_follows_dev_precedence() {
+        const ROOT_ENV: &str = "SMOLVM_TEST_SMOLFILE_VOLUME_ROOT";
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().join("host-root");
+        std::env::set_var(ROOT_ENV, &root);
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            format!(
+                "volumes = [\"${ROOT_ENV}/top:/top\"]\n[dev]\nvolumes = [\"${{{ROOT_ENV}}}/dev:/dev\"]\n"
+            ),
+        )
+        .unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+
+        std::env::remove_var(ROOT_ENV);
+        assert_eq!(params.volume, vec![format!("{}/dev:/dev", root.display())]);
     }
 
     /// Every launch setting a Smolfile can express must reach every carrier
