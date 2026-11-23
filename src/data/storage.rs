@@ -226,13 +226,10 @@ impl HostMount {
                 spec
             ))
         };
-        // The owner comes last; a host path cannot contain '=' in a segment of
-        // its own after the guest path.
-        let (spec_rest, owner) = match spec.rsplit_once(':') {
-            Some((head, options)) if options.contains('=') => {
-                (head, Some(Self::parse_owner(options).ok_or_else(invalid)?))
-            }
-            _ => (spec, None),
+        let (spec_rest, options) = Self::strip_owner(spec);
+        let owner = match options {
+            Some(options) => Some(Self::parse_owner(options).ok_or_else(invalid)?),
+            None => None,
         };
         let mut mount = Self::parse_mode(spec_rest, allow_system_mounts, invalid)?;
         if owner.is_some() && mount.staged {
@@ -243,6 +240,37 @@ impl HostMount {
         }
         mount.owner = owner;
         Ok(mount)
+    }
+
+    /// Split a mount specification into its host source and the rest
+    /// (`:guest[:mode][:options]`), by the grammar [`Self::parse`] reads. `None`
+    /// when it names no host source, as a guest path alone does.
+    pub fn split_source(spec: &str) -> Option<(&str, &str)> {
+        let (rest, _) = Self::strip_owner(spec);
+        let (rest, _) = Self::strip_mode(rest);
+        match rest.rsplit_once(':') {
+            Some((source, target)) if !source.is_empty() && !target.is_empty() => {
+                Some((source, &spec[source.len()..]))
+            }
+            _ => None,
+        }
+    }
+
+    /// The owner options come last; a host path cannot contain '=' in a
+    /// segment of its own after the guest path.
+    fn strip_owner(spec: &str) -> (&str, Option<&str>) {
+        match spec.rsplit_once(':') {
+            Some((head, options)) if options.contains('=') => (head, Some(options)),
+            _ => (spec, None),
+        }
+    }
+
+    /// The optional mode before the owner: `ro`, `rw` or `staged`.
+    fn strip_mode(spec: &str) -> (&str, Option<&str>) {
+        match spec.rsplit_once(':') {
+            Some((head, mode @ ("ro" | "rw" | "staged"))) => (head, Some(mode)),
+            _ => (spec, None),
+        }
     }
 
     /// `uid=N[,gid=N]`: the gid defaults to the uid, as for a user's own group.
@@ -268,12 +296,8 @@ impl HostMount {
         // colon (e.g. `C:\data:/data:ro`). The guest path is a Unix path with no
         // colon, and the optional trailing mode is `ro`/`rw`; everything before
         // the guest path is the host source.
-        let (rest, read_only, staged) = match spec.rsplit_once(':') {
-            Some((head, "ro")) => (head, true, false),
-            Some((head, "rw")) => (head, false, false),
-            Some((head, "staged")) => (head, false, true),
-            _ => (spec, false, false),
-        };
+        let (rest, mode) = Self::strip_mode(spec);
+        let (read_only, staged) = (mode == Some("ro"), mode == Some("staged"));
         match rest.rsplit_once(':') {
             Some((source, target)) if !source.is_empty() && !target.is_empty() => {
                 let mut mount =
@@ -674,6 +698,28 @@ mod tests {
             HostMount::new(&b, "/logs", true).unwrap(),
         ];
         assert!(HostMount::ensure_unique_targets(&ok).is_ok());
+    }
+
+    #[test]
+    fn split_source_finds_the_host_path_the_parser_reads() {
+        for (spec, source) in [
+            ("/srv:/data", Some("/srv")),
+            ("C:\\data:/data:ro", Some("C:\\data")),
+            ("/srv:/data:staged", Some("/srv")),
+            ("/srv:/data:uid=1000", Some("/srv")),
+            ("/srv:/data:rw:uid=1,gid=2", Some("/srv")),
+            ("/var/lib/docker", None),
+            (":/data", None),
+        ] {
+            assert_eq!(
+                HostMount::split_source(spec).map(|(source, rest)| {
+                    assert_eq!(format!("{source}{rest}"), spec);
+                    source
+                }),
+                source,
+                "{spec}"
+            );
+        }
     }
 
     fn parse_one(spec: &str) -> HostMount {

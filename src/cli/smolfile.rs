@@ -83,6 +83,64 @@ fn dev_or_top<T>(dev: Vec<T>, top: Vec<T>) -> Vec<T> {
     }
 }
 
+/// `$$`, `${NAME}` or `$NAME` in a Smolfile volume's host path.
+static ENV_REFERENCE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"\$(?:(\$)|\{([A-Za-z_][A-Za-z0-9_]*)\}|([A-Za-z_][A-Za-z0-9_]*))")
+        .expect("environment reference regex must compile")
+});
+
+/// Expand `$NAME` and `${NAME}` in `input` through `lookup`; `$$` is a literal
+/// `$`. A variable that is unset or empty is an error: either would leave a
+/// different host path than the Smolfile names.
+fn expand_env_references(
+    input: &str,
+    lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> smolvm::Result<String> {
+    let mut output = String::with_capacity(input.len());
+    let mut end = 0;
+    for captures in ENV_REFERENCE.captures_iter(input) {
+        let matched = captures.get(0).expect("a capture always has a full match");
+        output.push_str(&input[end..matched.start()]);
+        end = matched.end();
+        if captures.get(1).is_some() {
+            output.push('$');
+            continue;
+        }
+        let name = captures
+            .get(2)
+            .or_else(|| captures.get(3))
+            .expect("an environment reference always has a name")
+            .as_str();
+        let value = lookup(name).map_err(|error| {
+            smolvm::Error::config(
+                "smolfile volumes",
+                format!("environment variable '{name}': {error} (write $$ for a literal $)"),
+            )
+        })?;
+        if value.is_empty() {
+            return Err(smolvm::Error::config(
+                "smolfile volumes",
+                format!("environment variable '{name}' is empty"),
+            ));
+        }
+        output.push_str(&value);
+    }
+    output.push_str(&input[end..]);
+    Ok(output)
+}
+
+/// Expand environment references in a Smolfile volume's host path only; the
+/// guest path and options stay as written.
+fn expand_smolfile_volume(
+    spec: &str,
+    lookup: &dyn Fn(&str) -> Result<String, std::env::VarError>,
+) -> smolvm::Result<String> {
+    match smolvm::data::storage::HostMount::split_source(spec) {
+        Some((source, rest)) => Ok(format!("{}{rest}", expand_env_references(source, lookup)?)),
+        None => Ok(spec.to_string()),
+    }
+}
+
 /// A machine spec from CLI flags merged over an optional Smolfile, before a
 /// source or engine defaults apply. Volume specs stay unparsed: how they parse
 /// depends on `--allow-system-mounts`, which the command applies.
@@ -273,7 +331,10 @@ pub fn build_create_spec(
         .map_err(|e| smolvm::Error::config("smolfile ports", e))?;
 
     // Volumes: [dev].volumes > top-level volumes, then CLI extends
-    let mut volumes = dev_or_top(dev.volumes, sf_volumes);
+    let mut volumes = dev_or_top(dev.volumes, sf_volumes)
+        .iter()
+        .map(|volume| expand_smolfile_volume(volume, &|name| std::env::var(name)))
+        .collect::<smolvm::Result<Vec<_>>>()?;
     volumes.extend(cli_volume);
 
     // Env: top-level env + [dev].env + CLI extends (whitespace trimmed)
@@ -939,6 +1000,57 @@ mod tests {
     use super::*;
     use smolvm::data::network::PortMapping;
 
+    fn vars(
+        pairs: &'static [(&'static str, &'static str)],
+    ) -> impl Fn(&str) -> Result<String, std::env::VarError> {
+        move |name| {
+            pairs
+                .iter()
+                .find(|(key, _)| *key == name)
+                .map(|(_, value)| value.to_string())
+                .ok_or(std::env::VarError::NotPresent)
+        }
+    }
+
+    #[test]
+    fn smolfile_volume_expands_environment_variables_only_in_the_host_path() {
+        let lookup = vars(&[("ROOT", "/srv"), ("DRIVE", "C:")]);
+        for (spec, expanded) in [
+            (
+                "$ROOT/data:/workspace/$GUEST:ro",
+                "/srv/data:/workspace/$GUEST:ro",
+            ),
+            ("${DRIVE}\\src:/app:uid=1000", "C:\\src:/app:uid=1000"),
+            ("${ROOT}/a:/b:staged", "/srv/a:/b:staged"),
+            ("$ROOT/a:/b:ro:uid=1,gid=2", "/srv/a:/b:ro:uid=1,gid=2"),
+            // A guest path alone names no host path to expand.
+            ("/var/lib/$GUEST", "/var/lib/$GUEST"),
+            // `$$` is a literal `$`; a `$` before no name stays as written.
+            ("./cost$$1/$ROOT:/app", "./cost$1//srv:/app"),
+            ("./a$/b-$1:/app", "./a$/b-$1:/app"),
+        ] {
+            assert_eq!(
+                expand_smolfile_volume(spec, &lookup).unwrap(),
+                expanded,
+                "{spec}"
+            );
+        }
+    }
+
+    #[test]
+    fn smolfile_volume_rejects_a_missing_or_empty_environment_variable() {
+        let lookup = vars(&[("EMPTY", "")]);
+        for (spec, name) in [
+            ("$MISSING/data:/app", "MISSING"),
+            ("${EMPTY}/data:/app", "EMPTY"),
+        ] {
+            let error = expand_smolfile_volume(spec, &lookup)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains(name), "{error}");
+        }
+    }
+
     fn build_from_smolfile(path: PathBuf) -> smolvm::Result<CreateVmParams> {
         build_create_params(
             "test-vm".to_string(),
@@ -964,6 +1076,24 @@ mod tests {
             vec![],
             Default::default(),
         )
+    }
+
+    /// Through the real environment: cargo sets `CARGO_MANIFEST_DIR` for the
+    /// test process, so nothing here changes the environment other tests read.
+    #[test]
+    fn smolfile_volume_expansion_follows_dev_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Smolfile");
+        std::fs::write(
+            &path,
+            "volumes = [\"$CARGO_MANIFEST_DIR/top:/top\"]\n[dev]\nvolumes = [\"${CARGO_MANIFEST_DIR}/dev:/dev\"]\n",
+        )
+        .unwrap();
+
+        let params = build_from_smolfile(path).unwrap();
+
+        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        assert_eq!(params.volume, vec![format!("{root}/dev:/dev")]);
     }
 
     /// Every launch setting a Smolfile can express must reach every carrier
