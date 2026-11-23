@@ -735,9 +735,6 @@ pub fn prepare_restore_with_digest(
     ));
     let _ = std::fs::remove_dir_all(&partial);
     let started = std::time::Instant::now();
-    // RAM written below reaches the disk later, as for a deferred extraction.
-    smolvm_pack::extract::mark_unsynced(&smolvm_pack::extract::unsynced_marker_path(&shared))
-        .map_err(io("mark checkpoint memory unsynced"))?;
     // Lazy restores serve the machine's disks from the store as the guest
     // reads them, so the tree leaves them out.
     #[cfg(unix)]
@@ -748,6 +745,20 @@ pub fn prepare_restore_with_digest(
     let skip = |path: &str| lazy && crate::lazy_disk::left_out_of_tree(path);
     #[cfg(not(unix))]
     let skip = |_: &str| false;
+    // RAM written below reaches the disk later, as for a deferred extraction.
+    // A tree that leaves RAM out has none to write back; marking it would make
+    // the write-back fail and the tree count as unextracted.
+    let unsynced = smolvm_pack::extract::unsynced_marker_path(&shared);
+    if !skip("checkpoint/memory.bin") {
+        smolvm_pack::extract::mark_unsynced(&unsynced)
+            .map_err(io("mark checkpoint memory unsynced"))?;
+    } else if let Err(error) = std::fs::remove_file(&unsynced) {
+        // One left by an earlier tree for this key would send this one to
+        // a write-back of RAM it does not hold.
+        if error.kind() != std::io::ErrorKind::NotFound {
+            return Err(io("clear checkpoint memory unsynced")(error));
+        }
+    }
     let materialized = store::materialize_over_except(
         &imported.directory,
         &partial,
@@ -810,6 +821,28 @@ pub fn prepare_restore_with_digest(
         Ok(()) => {}
         Err(_) if smolvm_pack::extract::is_extracted(&shared) => {
             let _ = std::fs::remove_dir_all(&partial);
+        }
+        // An earlier tree for this key that no longer counts as extracted (its
+        // RAM write-back failed: "extracted again on next use"). Machines hold
+        // their own links to what they use from it, so replace it.
+        Err(error) if shared.is_dir() => {
+            let stale = shared_root.join(format!(
+                ".{:08x}-stale-{}",
+                footer.checksum,
+                std::process::id()
+            ));
+            let _ = std::fs::remove_dir_all(&stale);
+            let replaced =
+                std::fs::rename(&shared, &stale).and_then(|()| std::fs::rename(&partial, &shared));
+            if let Err(retry) = replaced {
+                let _ = std::fs::remove_dir_all(&partial);
+                return Err(io("publish materialized checkpoint")(std::io::Error::new(
+                    retry.kind(),
+                    format!("{error}; replacing the stale tree: {retry}"),
+                )));
+            }
+            tracing::warn!(tree = %shared.display(), "replaced a restore tree that was to be extracted again");
+            let _ = std::fs::remove_dir_all(&stale);
         }
         Err(error) => {
             let _ = std::fs::remove_dir_all(&partial);
