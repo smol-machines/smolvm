@@ -336,6 +336,16 @@ fn lock_checkpoint_cache_namespace(dir: &std::path::Path) -> std::io::Result<std
     Ok(lock)
 }
 
+/// Run `f` while no checkpoint artifact is being verified: adding or removing
+/// a link moves an inode's ctime under a verifier.
+#[cfg(unix)]
+pub(crate) fn with_checkpoint_links_locked<R>(f: impl FnOnce() -> R) -> R {
+    let _lock = checkpoint_cache_dir()
+        .ok()
+        .and_then(|dir| lock_checkpoint_cache_namespace(&dir).ok());
+    f()
+}
+
 // Readers may verify concurrently, but cache aliases must not change ctime
 // between the verifier's two fstat calls. Keep the full identity check intact.
 fn lock_checkpoint_cache_verification(dir: &std::path::Path) -> std::io::Result<std::fs::File> {
@@ -737,7 +747,10 @@ impl Drop for CheckpointTransfer {
             };
             #[cfg(target_os = "linux")]
             crate::artifact_cache::release_checkpoint_artifact_alias(&artifact);
-            #[cfg(not(target_os = "linux"))]
+            // An import still streaming from the upload keeps it for a restart.
+            #[cfg(unix)]
+            crate::checkpoint_delta::keep_import_source(&artifact);
+            #[cfg(not(unix))]
             let _ = &artifact;
             drop(directory);
         };

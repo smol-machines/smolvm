@@ -457,23 +457,146 @@ fn import_with(artifact: &Path, streamed: bool) -> Result<Option<Imported>> {
     }))
 }
 
-/// Where a streamed import keeps a link to the file it reads until it is
-/// complete, so a restart can finish it.
+/// Where a streamed import records which file it reads until it is complete,
+/// so a restart can finish it.
 #[cfg(unix)]
 fn import_source(store: &Path, id: &str) -> PathBuf {
     store.join("staging").join(format!("{id}.import-source"))
 }
 
-/// Removes a file when dropped.
+/// The identity a recorded import source must still have to be read again.
+/// Not ctime: a restore verifying the same file must not see it change, so
+/// the import records its path instead of linking it.
 #[cfg(unix)]
-struct RemoveOnDrop(Option<PathBuf>);
+fn source_identity(metadata: &std::fs::Metadata) -> String {
+    use std::os::unix::fs::MetadataExt;
+    format!(
+        "{} {} {} {} {}",
+        metadata.dev(),
+        metadata.ino(),
+        metadata.len(),
+        metadata.mtime(),
+        metadata.mtime_nsec()
+    )
+}
+
+/// Record `artifact` as the source of import `id`; `None` if it cannot be.
+#[cfg(unix)]
+fn record_import_source(store: &Path, id: &str, artifact: &Path) -> Option<PathBuf> {
+    let artifact = std::path::absolute(artifact).ok()?;
+    let identity = source_identity(&std::fs::metadata(&artifact).ok()?);
+    let record = import_source(store, id);
+    let tmp = record.with_extension("import-source.tmp");
+    std::fs::create_dir_all(store.join("staging")).ok()?;
+    let mut body = identity.into_bytes();
+    body.push(b'\n');
+    body.extend_from_slice(artifact.as_os_str().as_encoded_bytes());
+    std::fs::write(&tmp, body).ok()?;
+    std::fs::rename(&tmp, &record).ok()?;
+    Some(record)
+}
+
+/// The file `record` names, if it is still the one the import was reading.
+#[cfg(unix)]
+fn recorded_import_source(record: &Path) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let body = std::fs::read(record).ok()?;
+    let newline = body.iter().position(|b| *b == b'\n')?;
+    let path = PathBuf::from(std::ffi::OsStr::from_bytes(&body[newline + 1..]));
+    let metadata = std::fs::metadata(&path).ok()?;
+    (metadata.is_file() && source_identity(&metadata).as_bytes() == &body[..newline])
+        .then_some(path)
+}
+
+/// Where a streamed import keeps the file it reads once the request that
+/// received it is done with it.
+#[cfg(unix)]
+fn kept_import_source(store: &Path, id: &str) -> PathBuf {
+    store.join("staging").join(format!("{id}.import-file"))
+}
+
+/// A streamed import still reading a file, by that file's path.
+#[cfg(unix)]
+struct Reading {
+    store: PathBuf,
+    id: String,
+    kept: bool,
+}
 
 #[cfg(unix)]
-impl Drop for RemoveOnDrop {
-    fn drop(&mut self) {
-        if let Some(path) = &self.0 {
-            let _ = std::fs::remove_file(path);
+static READING: std::sync::Mutex<std::collections::BTreeMap<PathBuf, Reading>> =
+    std::sync::Mutex::new(std::collections::BTreeMap::new());
+
+#[cfg(unix)]
+fn reading() -> std::sync::MutexGuard<'static, std::collections::BTreeMap<PathBuf, Reading>> {
+    READING.lock().unwrap_or_else(|error| error.into_inner())
+}
+
+/// Called with checkpoint links locked, just before a request removes
+/// `artifact`: if a streamed import is still reading it, keep a link to it
+/// where a restart finds it. Linking only then leaves the inode untouched
+/// while the request verifies it.
+#[cfg(unix)]
+pub fn keep_import_source(artifact: &Path) {
+    let Ok(artifact) = std::path::absolute(artifact) else {
+        return;
+    };
+    let mut reading = reading();
+    let Some(entry) = reading.get_mut(&artifact).filter(|entry| !entry.kept) else {
+        return;
+    };
+    let kept = kept_import_source(&entry.store, &entry.id);
+    let _ = std::fs::remove_file(&kept);
+    if std::fs::hard_link(&artifact, &kept).is_ok()
+        && record_import_source(&entry.store, &entry.id, &kept).is_some()
+    {
+        entry.kept = true;
+    } else {
+        let _ = std::fs::remove_file(&kept);
+    }
+}
+
+/// A streamed import's claim on its source, given up when it is dropped.
+#[cfg(unix)]
+struct ImportSource {
+    artifact: Option<PathBuf>,
+    store: PathBuf,
+    id: String,
+}
+
+#[cfg(unix)]
+impl ImportSource {
+    fn claim(store: &Path, id: &str, artifact: &Path) -> Self {
+        let artifact = std::path::absolute(artifact).ok();
+        if let Some(artifact) = &artifact {
+            reading().insert(
+                artifact.clone(),
+                Reading {
+                    store: store.to_path_buf(),
+                    id: id.to_owned(),
+                    kept: false,
+                },
+            );
+            record_import_source(store, id, artifact);
         }
+        Self {
+            artifact,
+            store: store.to_path_buf(),
+            id: id.to_owned(),
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for ImportSource {
+    fn drop(&mut self) {
+        crate::api::handlers::machines::with_checkpoint_links_locked(|| {
+            if let Some(artifact) = &self.artifact {
+                reading().remove(artifact);
+            }
+            let _ = std::fs::remove_file(kept_import_source(&self.store, &self.id));
+        });
+        let _ = std::fs::remove_file(import_source(&self.store, &self.id));
     }
 }
 
@@ -497,21 +620,28 @@ pub fn resume_interrupted_imports() {
             .and_then(|name| name.to_str())
             .and_then(|name| name.strip_suffix(".checkpoint"))
             .map(str::to_owned);
-        let source = id
-            .as_deref()
-            .map(|id| import_source(&store, id))
-            .filter(|source| source.is_file());
+        let record = id.as_deref().map(|id| import_source(&store, id));
+        let source = record.as_deref().and_then(recorded_import_source);
         match (id, source) {
             (Some(id), Some(source)) => {
                 tracing::warn!(directory = %directory.display(), "resuming a checkpoint import a restart interrupted");
                 let store = store.clone();
                 std::thread::spawn(move || resume_import(&store, &id, &directory, &source));
             }
-            _ => match std::fs::write(directory.join(store::IMPORT_FAILED), b"1\n") {
-                Ok(()) => tracing::warn!(
-                    directory = %directory.display(),
-                    "a checkpoint import was interrupted by a restart and cannot be resumed; marked failed"
-                ),
+            (id, _) => match std::fs::write(directory.join(store::IMPORT_FAILED), b"1\n") {
+                Ok(()) => {
+                    if let Some(id) = id {
+                        drop(ImportSource {
+                            artifact: None,
+                            store: store.clone(),
+                            id,
+                        });
+                    }
+                    tracing::warn!(
+                        directory = %directory.display(),
+                        "a checkpoint import was interrupted by a restart and cannot be resumed; marked failed"
+                    )
+                }
                 Err(error) => tracing::warn!(
                     directory = %directory.display(),
                     %error,
@@ -534,7 +664,11 @@ fn resume_import(store: &Path, id: &str, directory: &Path, source: &Path) {
         store::adopt_objects(store, directory)?;
         Ok(())
     })();
-    let _ = std::fs::remove_file(source);
+    drop(ImportSource {
+        artifact: None,
+        store: store.to_path_buf(),
+        id: id.to_owned(),
+    });
     match result {
         Ok(()) => tracing::info!(
             %id,
@@ -587,14 +721,9 @@ fn import_streamed(
     let payload = std::fs::File::open(artifact)
         .map_err(io("open checkpoint"))?
         .take(footer.assets_size);
-    // A link to the file until every object is in, so a restart of this
+    // Which file it is, until every object is in, so a restart of this
     // process finishes the import instead of leaving machines without disks.
-    let source = import_source(store, &id);
-    let _ = std::fs::create_dir_all(store.join("staging"));
-    let _ = std::fs::remove_file(&source);
-    let source = std::fs::hard_link(artifact, &source)
-        .is_ok()
-        .then_some(source);
+    let source = ImportSource::claim(store, &id, artifact);
     let lineage = checkpoint.lineage.clone().expect("checked by import");
     let base_id = base.as_ref().map(|(id, _)| id.clone());
     let (ready_tx, ready_rx) = std::sync::mpsc::channel::<()>();
@@ -611,7 +740,7 @@ fn import_streamed(
             .spawn(move || -> Result<usize> {
                 // Held until every object is in, so retention leaves it be.
                 let _pin = pin;
-                let _source = RemoveOnDrop(source);
+                let _source = source;
                 let mut base_objects = 0;
                 store::unpack_streamed(
                     payload,
@@ -1000,6 +1129,72 @@ pub fn prepare_restore_with_digest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A restore verifies the artifact while it is being imported, so the
+    /// import's claim on it must not change the inode; once the request lets
+    /// go, a kept link must survive it for a restart, and the import's end
+    /// must clean up both.
+    #[cfg(unix)]
+    #[test]
+    fn an_import_keeps_its_source_only_once_the_request_lets_go() {
+        use std::os::unix::fs::MetadataExt;
+        const ID: &str = "0123456789abcdef0123456789abcdef";
+        let root = tempfile::TempDir::new().unwrap();
+        let store = root.path().join("store");
+        let artifact = root.path().join("upload.smolcheckpoint");
+        std::fs::write(&artifact, b"payload").unwrap();
+        let inode = |p: &Path| {
+            let m = std::fs::metadata(p).unwrap();
+            (m.ino(), m.ctime(), m.ctime_nsec(), m.nlink())
+        };
+        let before = inode(&artifact);
+        let source = ImportSource::claim(&store, ID, &artifact);
+        let record = import_source(&store, ID);
+        assert_eq!(
+            inode(&artifact),
+            before,
+            "claiming the source changed its inode"
+        );
+        assert_eq!(
+            recorded_import_source(&record).as_deref(),
+            Some(artifact.as_path())
+        );
+
+        // The request is done with the upload: the import keeps it.
+        keep_import_source(&artifact);
+        std::fs::remove_file(&artifact).unwrap();
+        let kept = kept_import_source(&store, ID);
+        assert_eq!(
+            recorded_import_source(&record).as_deref(),
+            Some(kept.as_path())
+        );
+        assert_eq!(std::fs::read(&kept).unwrap(), b"payload");
+
+        drop(source);
+        assert!(
+            !kept.exists() && !record.exists(),
+            "the import left its source behind"
+        );
+        // A request ending after the import must not keep anything.
+        std::fs::write(&artifact, b"payload").unwrap();
+        keep_import_source(&artifact);
+        assert!(!kept.exists());
+    }
+
+    /// A different file at the recorded path is not the one being imported.
+    #[cfg(unix)]
+    #[test]
+    fn a_replaced_import_source_is_not_resumed_from() {
+        const ID: &str = "fedcba9876543210fedcba9876543210";
+        let root = tempfile::TempDir::new().unwrap();
+        let store = root.path().join("store");
+        let artifact = root.path().join("upload.smolcheckpoint");
+        std::fs::write(&artifact, b"payload").unwrap();
+        let record = record_import_source(&store, ID, &artifact).unwrap();
+        std::fs::remove_file(&artifact).unwrap();
+        std::fs::write(&artifact, b"another payload").unwrap();
+        assert_eq!(recorded_import_source(&record), None);
+    }
 
     #[cfg(unix)]
     #[test]
