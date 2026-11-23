@@ -1487,6 +1487,7 @@ fn cases() -> Vec<Case> {
                 s.published_sockets = vec![PublishedSocketConfig {
                     guest_path: "/run/app.sock".into(),
                     host_path: None,
+                    baud: None,
                     direction: crate::config::SocketDirection::Expose,
                 }]
             },

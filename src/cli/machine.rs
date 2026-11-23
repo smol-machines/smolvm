@@ -175,6 +175,21 @@ fn merge_auto_ports_flags(
     })
 }
 
+/// `--serial DEVICE[:BAUD]` flags as published-socket entries, numbered in flag
+/// order so the first is /dev/ttySMOL0 in the guest.
+fn parse_serial_flags(
+    flags: &[String],
+) -> smolvm::Result<Vec<smolvm::config::PublishedSocketConfig>> {
+    flags
+        .iter()
+        .enumerate()
+        .map(|(i, spec)| {
+            smolvm::agent::serial_bridge::parse_flag(spec, i)
+                .map_err(|e| smolvm::Error::config("--serial", e))
+        })
+        .collect()
+}
+
 /// Parse `--expose-socket`/`--mount-socket` specs into published-socket configs.
 ///
 /// - `--expose-socket GUEST_PATH[:HOST_PATH]`: expose a guest-listening socket to
@@ -202,6 +217,7 @@ fn parse_published_sockets(
             direction: SocketDirection::Expose,
             guest_path,
             host_path: host_path.filter(|h| !h.is_empty()),
+            baud: None,
         });
     }
     for spec in mount {
@@ -221,6 +237,7 @@ fn parse_published_sockets(
             direction: SocketDirection::Mount,
             guest_path: guest_path.to_string(),
             host_path: Some(host_path.to_string()),
+            baud: None,
         });
     }
     if out.len() > smolvm_protocol::ports::PUBLISH_SOCKET_MAX {
@@ -981,6 +998,12 @@ pub struct RunCmd {
     )]
     pub mount_socket: Vec<String>,
 
+    /// Pass a host serial device into the machine (repeatable). The guest sees it
+    /// as /dev/ttySMOL0, /dev/ttySMOL1, ... in flag order. Format: DEVICE[:BAUD],
+    /// for example /dev/cu.usbserial-0001:115200 or /dev/ttyACM0 (default 115200).
+    #[arg(long = "serial", value_name = "DEVICE[:BAUD]")]
+    pub serial: Vec<String>,
+
     /// Mount ~/.docker/ into the VM. Registry credentials from `docker login`
     /// (credential helpers included) are resolved on the host for every pull,
     /// so this is only needed for other contents of the directory.
@@ -1737,6 +1760,9 @@ impl RunCmd {
         vm_common::prepare_params_credentials(&mut params)?;
         params.published_sockets =
             parse_published_sockets(&self.expose_socket, &self.mount_socket)?;
+        params
+            .published_sockets
+            .extend(parse_serial_flags(&self.serial)?);
         params.auto_ports = merge_auto_ports_flags(
             params.auto_ports.take(),
             self.auto_ports,
@@ -5184,6 +5210,12 @@ pub struct CreateCmd {
     #[arg(long = "mount-socket", value_name = "HOST_PATH:GUEST_PATH")]
     pub mount_socket: Vec<String>,
 
+    /// Pass a host serial device into the machine (repeatable). The guest sees it
+    /// as /dev/ttySMOL0, /dev/ttySMOL1, ... in flag order. Format: DEVICE[:BAUD],
+    /// for example /dev/cu.usbserial-0001:115200 or /dev/ttyACM0 (default 115200).
+    #[arg(long = "serial", value_name = "DEVICE[:BAUD]")]
+    pub serial: Vec<String>,
+
     /// Run command once, on the machine's first start (can be used multiple times)
     #[arg(long = "init", value_name = "COMMAND")]
     pub init: Vec<String>,
@@ -5531,6 +5563,7 @@ impl CreateCmd {
             oci_platform,
             expose_socket,
             mount_socket,
+            serial,
             init,
             env,
             workdir,
@@ -5659,6 +5692,7 @@ impl CreateCmd {
             cli.net = true;
         }
         cli.published_sockets = parse_published_sockets(expose_socket, mount_socket)?;
+        cli.published_sockets.extend(parse_serial_flags(serial)?);
         // CLI `--secret-*` refs win over Smolfile `[secrets]` of the same name.
         for (key, r) in parse_cli_secret_refs(secret_env, secret_file, secret_keychain)? {
             cli.secret_refs.insert(key, r);

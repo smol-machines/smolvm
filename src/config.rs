@@ -31,6 +31,9 @@ pub struct PublishedSocketConfig {
     /// For `mount`, the existing host socket to bridge in (required).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub host_path: Option<String>,
+    /// Line speed of a `serial` entry's device; `None` for other directions.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub baud: Option<u32>,
 }
 
 /// VM lifecycle state.

@@ -1158,6 +1158,7 @@ fn resolve_mounts(
                     direction: smolvm_protocol::publish_socket::SocketDirection::Mount,
                     guest_path: m.destination.clone(),
                     host_path: Some(socket.to_string_lossy().into_owned()),
+                    baud: None,
                 });
                 continue;
             }

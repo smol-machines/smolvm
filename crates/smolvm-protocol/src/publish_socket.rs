@@ -20,6 +20,10 @@ pub enum SocketDirection {
     /// the guest at the guest path. Guest clients connect in — the SSH-agent
     /// pattern.
     Mount,
+    /// A host serial device (`--serial`): smolvm's host bridge owns the device and
+    /// listens on the host path; the guest agent gives guest programs a pty at the
+    /// guest path. Like `Mount`, the guest dials out and libkrun dials the host.
+    Serial,
 }
 
 impl SocketDirection {
@@ -28,6 +32,7 @@ impl SocketDirection {
         match self {
             SocketDirection::Expose => "expose",
             SocketDirection::Mount => "mount",
+            SocketDirection::Serial => "serial",
         }
     }
 
@@ -48,8 +53,9 @@ impl FromStr for SocketDirection {
         match s.to_ascii_lowercase().as_str() {
             "expose" => Ok(SocketDirection::Expose),
             "mount" => Ok(SocketDirection::Mount),
+            "serial" => Ok(SocketDirection::Serial),
             other => Err(format!(
-                "invalid socket direction '{other}' (expected 'expose' or 'mount')"
+                "invalid socket direction '{other}' (expected 'expose', 'mount' or 'serial')"
             )),
         }
     }
@@ -124,6 +130,21 @@ mod tests {
         assert!("bogus".parse::<SocketDirection>().is_err());
         assert!(SocketDirection::Expose.host_listens());
         assert!(!SocketDirection::Mount.host_listens());
+        assert_eq!(
+            "serial".parse::<SocketDirection>().unwrap(),
+            SocketDirection::Serial
+        );
+        assert!(!SocketDirection::Serial.host_listens());
+    }
+
+    #[test]
+    fn a_serial_socket_round_trips_through_the_guest_env() {
+        let sockets = vec![PublishedSocket {
+            vsock_port: 7100,
+            guest_path: "/dev/ttySMOL0".to_string(),
+            direction: SocketDirection::Serial,
+        }];
+        assert_eq!(decode(&encode(&sockets)), sockets);
     }
 
     #[test]

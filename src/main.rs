@@ -122,6 +122,29 @@ enum Commands {
         run_as_gid: Option<u32>,
     },
 
+    /// Internal: relay a host serial device to one VM (`--serial`)
+    #[command(name = "_serial-bridge", hide = true)]
+    SerialBridge {
+        /// Host serial device
+        #[arg(long)]
+        device: std::path::PathBuf,
+        /// Line speed
+        #[arg(long)]
+        baud: u32,
+        /// Mode-0600 Unix socket the owning VMM dials
+        #[arg(long)]
+        socket: std::path::PathBuf,
+        /// VMM process whose lifetime owns this helper
+        #[arg(long)]
+        owner_pid: u32,
+        /// Per-VM uid to drop to once the device is open
+        #[arg(long, requires = "run_as_gid")]
+        run_as_uid: Option<u32>,
+        /// Primary gid paired with `run_as_uid`
+        #[arg(long, requires = "run_as_uid")]
+        run_as_gid: Option<u32>,
+    },
+
     /// Internal: clean up an ephemeral VM after its command exits (not for direct use)
     #[command(name = "_cleanup-ephemeral", hide = true)]
     CleanupEphemeral {
@@ -313,6 +336,21 @@ fn run_cli() {
             run_as_gid,
         } => smolvm::agent::video::run_helper(&socket, owner_pid, run_as_uid.zip(run_as_gid))
             .map_err(smolvm::Error::Io),
+        Commands::SerialBridge {
+            device,
+            baud,
+            socket,
+            owner_pid,
+            run_as_uid,
+            run_as_gid,
+        } => smolvm::agent::serial_bridge::run_helper(
+            &device,
+            baud,
+            &socket,
+            owner_pid,
+            run_as_uid.zip(run_as_gid),
+        )
+        .map_err(smolvm::Error::Io),
         Commands::CleanupEphemeral {
             vm_name,
             pid,

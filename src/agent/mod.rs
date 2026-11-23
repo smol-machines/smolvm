@@ -25,6 +25,7 @@ pub mod pod_net;
 pub mod rootfs_store;
 #[cfg(unix)]
 pub(crate) mod startup_transaction;
+pub mod serial_bridge;
 pub mod state_probe;
 pub mod terminal;
 #[cfg(all(test, unix))]

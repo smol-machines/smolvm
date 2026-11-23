@@ -200,6 +200,7 @@ rejected with a hint to build first (`docker build … && docker save … | … 
 | `--rosetta` | | run, create | Run x86_64 Linux images on Apple Silicon through Rosetta 2. Pulls `linux/amd64` unless `--oci-platform` says otherwise. |
 | `--oci-platform` | | run, create, pack create | Image platform to pull from a multi-arch image (`os/arch`, e.g. `linux/amd64`). Recorded on the machine and used on every start. |
 | `--nested` | | run, create | Let the guest run its own VMs (nested KVM). Off by default; it exposes the host kernel's nested-KVM code to the guest, so enable it only for trusted workloads. |
+| `--serial` | | run, create | Pass a host serial device into the machine as `/dev/ttySMOL0`, `/dev/ttySMOL1`, ...: `DEVICE[:BAUD]`, default 115200 (see `docs/serial-devices.md`) |
 | `--state-dir` | | every command (Linux) | Keep all smolvm state under one directory instead of the default ones, e.g. to run a second engine version beside an installed one |
 | `--stop-on-exit` | | create | Stop the machine when its workload exits, whatever the exit status |
 
