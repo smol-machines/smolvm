@@ -155,14 +155,36 @@ mod tests {
                     continue;
                 };
                 std::thread::spawn(move || {
-                    let mut header = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while stream.read_exact(&mut byte).is_ok() && byte[0] != b'\n' {
-                        header.push(byte[0]);
+                    // Short reads up to a deadline, not one blocking read: on
+                    // macOS a read already blocked on a Unix stream socket now
+                    // and then misses the peer's half-close (seen about once in
+                    // 470 runs under load, the client then waiting out its 30 s
+                    // timeout after the relay had sent everything). A fresh read
+                    // sees the EOF at once.
+                    let _ = stream.set_read_timeout(Some(Duration::from_millis(100)));
+                    let deadline = std::time::Instant::now() + Duration::from_secs(30);
+                    let mut request = Vec::new();
+                    let mut chunk = [0u8; 65536];
+                    loop {
+                        match stream.read(&mut chunk) {
+                            Ok(0) => break,
+                            Ok(n) => request.extend_from_slice(&chunk[..n]),
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    std::io::ErrorKind::WouldBlock
+                                        | std::io::ErrorKind::TimedOut
+                                        | std::io::ErrorKind::Interrupted
+                                ) && std::time::Instant::now() < deadline => {}
+                            Err(_) => return,
+                        }
                     }
-                    let header = String::from_utf8_lossy(&header).to_string();
-                    let mut body = String::new();
-                    let _ = stream.read_to_string(&mut body);
+                    let split = request
+                        .iter()
+                        .position(|b| *b == b'\n')
+                        .unwrap_or(request.len());
+                    let header = String::from_utf8_lossy(&request[..split]).to_string();
+                    let body = String::from_utf8_lossy(request.get(split + 1..).unwrap_or(&[]));
                     let reply = format!("{header}:{body}");
                     let _ = stream.write_all(reply.as_bytes());
                 });
