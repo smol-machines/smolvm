@@ -19,6 +19,8 @@ ANGLE (Intel, Vulkan 1.4 (Virtio-GPU Venus (Intel(R) UHD Graphics ...)), venus)
 
 The bundled renderer is built by `scripts/build-virglrenderer-linux.sh` from a pinned upstream release plus the patches in `patches/virglrenderer-linux/`. A build of smolvm that does not carry it (a source build, the Nix flake) falls back to the host's `libvirglrenderer.so.1`, which must then be 1.2.0 or newer on an NVIDIA host: older render servers preload Vulkan in a way NVIDIA's driver rejects. The Nix flake does not put virglrenderer on the loader path; export `LD_LIBRARY_PATH` with the nixpkgs `virglrenderer` and `libepoxy` lib dirs (and `/run/opengl-driver/lib` on NixOS), see the [GPU page](https://smolmachines.com/docs/introduction/concepts/gpu).
 
+An Intel GPU that does not share the CPU's cache (Core Ultra integrated graphics, Arc cards) needs a host kernel of 6.16 or newer: smolvm then has KVM apply the cache type the guest sets on mapped GPU memory. On an older kernel guest Vulkan on such a GPU hangs or reads stale data. Other GPUs are not affected.
+
 **Windows**: not available (WHP); `--gpu` has no effect there.
 
 ## OpenGL in the guest

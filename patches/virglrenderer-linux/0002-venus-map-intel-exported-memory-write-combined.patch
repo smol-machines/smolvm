@@ -1,0 +1,41 @@
+diff --git a/src/venus/vkr_device_memory.c b/src/venus/vkr_device_memory.c
+--- a/src/venus/vkr_device_memory.c
++++ b/src/venus/vkr_device_memory.c
+@@ -494,6 +494,27 @@
+       close(mem->udmabuf_fd);
+ }
+ 
++/* The Intel driver creates every exportable buffer write-combined on a GPU
++ * that does not share the CPU's cache, whatever the memory type says. Those
++ * are the GPUs that offer a host-visible memory type that is not cached. A
++ * guest that maps such a buffer cached reads and writes stale data.
++ */
++static bool
++vkr_physical_device_exports_write_combined(const struct vkr_physical_device *physical_dev)
++{
++   if (physical_dev->properties.vendorID != 0x8086)
++      return false;
++
++   const VkPhysicalDeviceMemoryProperties *props = &physical_dev->memory_properties;
++   for (uint32_t i = 0; i < props->memoryTypeCount; i++) {
++      const VkMemoryPropertyFlags flags = props->memoryTypes[i].propertyFlags;
++      if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
++          !(flags & VK_MEMORY_PROPERTY_HOST_CACHED_BIT))
++         return true;
++   }
++   return false;
++}
++
+ bool
+ vkr_device_memory_export_blob(struct vkr_device_memory *mem,
+                               uint64_t blob_size,
+@@ -541,6 +562,9 @@
+       /* prefer dmabuf for easier mapping? */
+       fd_type = VIRGL_RESOURCE_FD_DMABUF;
+       handle_type = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT;
++      if (map_info == VIRGL_RENDERER_MAP_CACHE_CACHED &&
++          vkr_physical_device_exports_write_combined(mem->device->physical_device))
++         map_info = VIRGL_RENDERER_MAP_CACHE_WC;
+    } else if (can_export_opaque) {
+       /* prefer opaque for performance? */
+       fd_type = VIRGL_RESOURCE_FD_OPAQUE;
