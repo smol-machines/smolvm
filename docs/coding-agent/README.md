@@ -48,6 +48,32 @@ copies of it, files, dependencies and running processes, each of which an agent 
 independently. The result comes back through git (`format-patch` in the child, `git am` on the
 host), so review stays ordinary git.
 
+## Many tasks instead of many worktrees
+
+Running several agents at once usually means a git worktree per task, and each worktree installs and
+builds its own dependencies. A machine with the repo and its build inside can be branched once per
+task instead: the branches share the source's disk copy-on-write, so four branches of a machine
+holding 1 GiB of build output added 4 MiB, against about 4 GiB for four worktrees. Each task runs
+its agent headless in its own branch (`claude -p ...`), pushes its git branch through the forwarded
+SSH agent, and the branch is deleted when the task is done. `SKILL.md` has the procedure.
+
+## Use it from Claude Code
+
+Install the skill once, so Claude Code knows the procedures:
+
+```bash
+mkdir -p ~/.claude/skills/coding-agent
+curl -fsSL https://raw.githubusercontent.com/smol-machines/smolvm/main/docs/coding-agent/SKILL.md \
+  -o ~/.claude/skills/coding-agent/SKILL.md
+```
+
+Then add a line like this to the project's `CLAUDE.md`, naming your source machine:
+
+```markdown
+For parallel tasks, do not create git worktrees. Use the coding-agent skill: run each task in its own
+branch of the smolvm machine `myrepo-src`, push its git branch, then delete the branch.
+```
+
 ## Keeping the agent off your network
 
 `net = true` gives the agent everything your host can reach, including your LAN, a Tailscale

@@ -1,12 +1,14 @@
 ---
 name: coding-agent
-description: Runs a coding agent (Claude Code, OpenCode, Codex, pi or any other) inside a persistent smolvm machine, so it can run with full permissions without touching the host, and with its API key kept outside the machine. Also covers running several attempts in parallel from one warm machine and keeping the best. Use when someone wants to sandbox their coding agent, run it in skip-permissions or YOLO mode safely, try a task several ways at once, or give it a disposable environment it can install anything into. Do not use it to run untrusted code with no network; use throwaway-machine for that.
+description: Runs a coding agent (Claude Code, OpenCode, Codex, pi or any other) inside a persistent smolvm machine, so it can run with full permissions without touching the host, and with its API key kept outside the machine. Also covers running several attempts in parallel from one warm machine and keeping the best. Use when someone wants to sandbox their coding agent, run many tasks at once with one agent per task instead of creating a git worktree for each, run it in skip-permissions or YOLO mode safely, try a task several ways at once, or give it a disposable environment it can install anything into. Do not use it to run untrusted code with no network; use throwaway-machine for that.
 ---
 
 # A coding agent in a machine
 
 Verified on **smolvm v1.27.4** on Linux x86_64, 2026-10-14, on **v1.29.0** on macOS arm64,
-2026-10-15, and on **v1.36.0** on macOS arm64, 2026-11-23 (both procedures). Done means the agent
+2026-10-15, and on **v1.36.0** on macOS arm64, 2026-11-23 (the first two procedures). The
+many-tasks procedure was verified on **v1.37.0** on Linux x86_64, 2026-11-23, with two tasks
+running headless at once, up to the API request (made with a placeholder key). Done means the agent
 runs inside the machine, the real API key never appears in it, and the agent's work reaches the
 host repo.
 
@@ -101,6 +103,64 @@ for m in try-0 try-1 try-2; do smolvm machine delete --name "$m" -f; done
 
 The agent must commit its work in the child for `format-patch` to carry it. The source keeps
 running, so you can branch it again for the next task.
+
+## Procedure: many tasks at once, one branch per task
+
+Use this instead of a git worktree per task. Each worktree is a full checkout, and each agent in it
+installs and builds its own dependencies. A branch of a warm machine shares all of that copy-on-write,
+so a task costs only what it changes: four branches of a machine holding 1 GiB of build output added
+4 MiB, where four worktrees would add about 4 GiB. Deleting a branch frees its space at once.
+
+**1. Once per repo: a running source machine with the repo and its dependencies inside.**
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/smol-machines/smolvm/main/docs/coding-agent/assets/agent-branch.smolfile -o Smolfile
+smolvm machine create --name myrepo-src -s Smolfile \
+  --credential anthropic=ANTHROPIC_API_KEY@api.anthropic.com
+smolvm machine start --name myrepo-src --branchable
+smolvm machine exec --name myrepo-src -- sh -c '
+  git config --global user.name "agent" && git config --global user.email "agent@example.com"
+  git clone -q git@github.com:ORG/REPO.git /workspace/proj && cd /workspace/proj && npm ci'
+```
+
+The clone over SSH works because the Smolfile forwards your SSH agent; the keys never enter the
+machine. Replace `npm ci` with whatever installs and builds the project. Leave the source running.
+
+**2. Per task: branch, then run the agent headless in the branch.**
+
+```bash
+smolvm machine branch --from myrepo-src --name task-fix-login
+smolvm machine exec --name task-fix-login -- sh -c 'cd /workspace/proj && git checkout -qb fix-login &&
+  claude -p "Fix the login redirect bug. Run the tests. Commit, then git push -u origin fix-login." \
+    --dangerously-skip-permissions'
+```
+
+A branch takes well under a second. Run one of these per task at the same time (each `exec` in the
+background, or in its own terminal); the branches are independent of each other and of the source.
+To watch or steer one, use `exec -it ... claude --dangerously-skip-permissions` instead of `-p`.
+Branch each task with its own `--name`: `--count N` waits for the source to declare a branch point
+unless `--no-wait-ready` is passed.
+
+**3. Collect the work.** The agent pushed its branch through the forwarded SSH agent; open a pull
+request as usual. Without push access, bring it back with `git format-patch` as in the previous
+procedure.
+
+**4. Delete the branch** when the task is merged or dropped:
+
+```bash
+smolvm machine delete --name task-fix-login -f
+```
+
+**Keeping the source current.** Branches start from the source as it is when they are made, so pull
+and rebuild there now and then; earlier branches are unaffected:
+
+```bash
+smolvm machine exec --name myrepo-src -- sh -c 'cd /workspace/proj && git pull -q && npm ci'
+```
+
+**From Claude Code.** With this skill installed (see `README.md`), tell the session to run each
+task in its own branch of `myrepo-src` rather than in a worktree. It runs steps 2 to 4 for each task
+with its shell tool and reports which branches were pushed.
 
 ## Notes
 
