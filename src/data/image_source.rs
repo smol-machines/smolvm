@@ -231,7 +231,7 @@ fn resolve_directory(path: &Path) -> Result<ResolvedImage> {
 
 fn resolve_archive(input: ArchiveInput) -> Result<ResolvedImage> {
     let cache_base = archive_cache_base()?;
-    std::fs::create_dir_all(&cache_base)?;
+    create_shared_dir(&cache_base)?;
     let hash = match input {
         ArchiveInput::File(path) => stage_from_file(&path, &cache_base)?,
         ArchiveInput::Stdin => stage_from_stdin(&cache_base)?,
@@ -287,12 +287,15 @@ fn stage_from_file(path: &Path, cache_base: &Path) -> Result<String> {
     // the user's (valid) archive rather than at the cache. Re-stage instead.
     let staged_len = std::fs::metadata(&archive_path).ok().map(|m| m.len());
     if staged_len != Some(meta.len()) {
-        std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
+        create_shared_dir(archive_path.parent().expect("hash dir has a parent"))?;
         // Remove first: the stale entry may be a hardlink to the caller's file,
         // and linking onto an existing path fails.
         let _ = std::fs::remove_file(&archive_path);
         link_or_copy(path, &archive_path)?;
     }
+    // Also for an entry staged before this was done, whatever umask it got.
+    create_shared_dir(archive_path.parent().expect("hash dir has a parent"))?;
+    make_archive_readable(&archive_path)?;
     Ok(hash)
 }
 
@@ -323,12 +326,17 @@ fn stage_from_stdin(cache_base: &Path) -> Result<String> {
     // truncated through a hardlink to the original archive, and reusing it
     // would fail the boot with a misleading "manifest.json not found in tar".
     if std::fs::metadata(&archive_path).is_ok_and(|m| m.len() == total) {
-        return Ok(hash); // already staged; the temp file is dropped/removed
+        // Already staged; the temp file is dropped/removed.
+        create_shared_dir(archive_path.parent().expect("hash dir has a parent"))?;
+        make_archive_readable(&archive_path)?;
+        return Ok(hash);
     }
     let _ = std::fs::remove_file(&archive_path);
-    std::fs::create_dir_all(archive_path.parent().expect("hash dir has a parent"))?;
+    create_shared_dir(archive_path.parent().expect("hash dir has a parent"))?;
+    // A temp file is created 0600 whatever the umask.
     tmp.persist(&archive_path)
         .map_err(|e| Error::storage("stage stdin archive", e.to_string()))?;
+    make_archive_readable(&archive_path)?;
     Ok(hash)
 }
 
@@ -352,6 +360,48 @@ fn link_or_copy(src: &Path, dst: &Path) -> Result<()> {
         return Ok(());
     }
     std::fs::copy(src, dst)?;
+    Ok(())
+}
+
+/// Create `dir` and its missing parents, and leave `dir` enterable by every
+/// uid. The VMM that serves a staged archive runs as the machine's own uid, so
+/// a cache directory left at the umask's mode (0700 under umask 077) hid the
+/// archive and the boot failed with "packed layers directory not found".
+fn create_shared_dir(dir: &Path) -> Result<()> {
+    std::fs::create_dir_all(dir)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o755))?;
+    }
+    Ok(())
+}
+
+/// Make the staged archive at `path` readable by every uid, for the same
+/// reason as [`create_shared_dir`]. An entry hardlinked to the caller's own
+/// file is replaced with a private copy first, so the caller's file keeps its
+/// mode.
+fn make_archive_readable(path: &Path) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let meta = std::fs::metadata(path)?;
+        if meta.mode() & 0o004 != 0 {
+            return Ok(());
+        }
+        if meta.nlink() > 1 {
+            let dir = path
+                .parent()
+                .expect("an archive lives in its hash directory");
+            let copy = tempfile::NamedTempFile::new_in(dir)?;
+            std::fs::copy(path, copy.path())?;
+            copy.persist(path)
+                .map_err(|e| Error::storage("image archive cache", e.to_string()))?;
+        }
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o644))?;
+    }
+    #[cfg(not(unix))]
+    let _ = path;
     Ok(())
 }
 
@@ -383,7 +433,7 @@ pub fn packed_layers_dir_for_ref(reference: &str) -> Option<PathBuf> {
 /// staged by hardlink rather than copied.
 pub fn archive_staging_dir() -> Result<tempfile::TempDir> {
     let base = archive_cache_base()?;
-    std::fs::create_dir_all(&base)?;
+    create_shared_dir(&base)?;
     Ok(tempfile::TempDir::new_in(base)?)
 }
 
@@ -479,7 +529,7 @@ fn archive_with_mtime_in(base: &Path, reference: &str, mtime: u64) -> Result<Str
     if archive_signature(&target).ok() == Some((size, mtime)) {
         return Ok(format!("{LOCAL_ARCHIVE_PREFIX}{variant}"));
     }
-    std::fs::create_dir_all(&dir)?;
+    create_shared_dir(&dir)?;
     let mut staged = tempfile::NamedTempFile::new_in(&dir)?;
     std::io::copy(&mut std::fs::File::open(&source)?, staged.as_file_mut())?;
     staged.as_file().sync_all()?;
@@ -521,6 +571,56 @@ fn too_large(bytes: u64) -> Error {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn a_cache_directory_is_enterable_whatever_the_umask_left() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("cache").join("hash");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o700)).unwrap();
+        create_shared_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o755);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_private_staged_archive_becomes_readable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let archive = dir.path().join(ARCHIVE_FILE);
+        std::fs::write(&archive, b"tar bytes").unwrap();
+        std::fs::set_permissions(&archive, std::fs::Permissions::from_mode(0o600)).unwrap();
+        make_archive_readable(&archive).unwrap();
+        let mode = std::fs::metadata(&archive).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o644);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_hardlinked_archive_is_copied_rather_than_changing_the_callers_file() {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let dir = tempfile::tempdir().unwrap();
+        let callers = dir.path().join("mine.tar");
+        std::fs::write(&callers, b"tar bytes").unwrap();
+        std::fs::set_permissions(&callers, std::fs::Permissions::from_mode(0o600)).unwrap();
+        let hash_dir = dir.path().join("hash");
+        std::fs::create_dir(&hash_dir).unwrap();
+        let archive = hash_dir.join(ARCHIVE_FILE);
+        std::fs::hard_link(&callers, &archive).unwrap();
+        make_archive_readable(&archive).unwrap();
+        let mode = |p: &Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&callers), 0o600, "the caller's file keeps its mode");
+        assert_eq!(mode(&archive), 0o644);
+        assert_eq!(
+            std::fs::metadata(&callers).unwrap().nlink(),
+            1,
+            "the cache has its own copy"
+        );
+        assert_eq!(std::fs::read(&archive).unwrap(), b"tar bytes");
+    }
 
     // A `local:` key is one name in the archive cache, never a path out of it.
     #[test]
