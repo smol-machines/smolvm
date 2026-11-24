@@ -4537,16 +4537,38 @@ mod relay_output_tests {
         use std::sync::mpsc;
         use std::time::Duration;
 
+        // Deadlines only keep a broken run from hanging; they are not what is
+        // tested (the 50 ms window below is). At 2 s a loaded CI host let the
+        // fake agent give up and hang up before the client had half-closed,
+        // which failed the test as "termination was not confirmed".
+        let deadline = Duration::from_secs(30);
         let (host, mut guest) = UdsStream::pair().unwrap();
+        // Short reads, retried up to the deadline: on macOS a read already
+        // blocked on a socketpair now and then is not woken by the peer's
+        // half-close (seen about once in 350 runs under load, the 30 s
+        // deadline expiring with `shutdown(Write)` having returned Ok). A
+        // fresh read sees the EOF at once.
         guest
-            .set_read_timeout(Some(Duration::from_secs(2)))
+            .set_read_timeout(Some(Duration::from_millis(100)))
             .unwrap();
         let (eof_tx, eof_rx) = mpsc::channel();
         let (exit_tx, exit_rx) = mpsc::channel();
         let agent = std::thread::spawn(move || -> io::Result<()> {
-            assert_eq!(guest.read(&mut [0; 1])?, 0);
+            let started = std::time::Instant::now();
+            loop {
+                match guest.read(&mut [0; 1]) {
+                    Ok(0) => break,
+                    Ok(_) => panic!("the client sent data instead of closing its half"),
+                    Err(e)
+                        if matches!(
+                            e.kind(),
+                            io::ErrorKind::WouldBlock | io::ErrorKind::TimedOut
+                        ) && started.elapsed() < deadline => {}
+                    Err(e) => return Err(e),
+                }
+            }
             eof_tx.send(()).unwrap();
-            exit_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            exit_rx.recv_timeout(deadline).unwrap();
             // Output may already be queued in either negotiated binary or JSON.
             smolvm_protocol::binary_stream::write_response(
                 &mut guest,
@@ -4565,16 +4587,18 @@ mod relay_output_tests {
         let (done_tx, done_rx) = mpsc::channel();
         let client = std::thread::spawn(move || {
             let mut client = AgentClient::from_stream(host);
-            let result = client.end_session_reader_gone();
+            // The production 5 s wait is not what is tested here, and a loaded
+            // host could outlast it between the threads below.
+            let result = client.end_session_reader_gone_with_timeout(deadline);
             client.ensure_session_finished().unwrap();
             done_tx.send(result).unwrap();
         });
-        eof_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        eof_rx.recv_timeout(deadline).unwrap();
         let premature = done_rx.recv_timeout(Duration::from_millis(50));
         exit_tx.send(()).unwrap();
         let result = match premature {
             Ok(code) => code,
-            Err(_) => done_rx.recv_timeout(Duration::from_secs(2)).unwrap(),
+            Err(_) => done_rx.recv_timeout(deadline).unwrap(),
         };
         client.join().unwrap();
         let agent_result = agent.join().unwrap();

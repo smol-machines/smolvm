@@ -1086,13 +1086,15 @@ mod tests {
         let path = dir.path().join("Smolfile");
         std::fs::write(
             &path,
-            "volumes = [\"$CARGO_MANIFEST_DIR/top:/top\"]\n[dev]\nvolumes = [\"${CARGO_MANIFEST_DIR}/dev:/dev\"]\n",
+            "volumes = [\"$HOME/top:/top\"]\n[dev]\nvolumes = [\"${HOME}/dev:/dev\"]\n",
         )
         .unwrap();
 
         let params = build_from_smolfile(path).unwrap();
 
-        let root = std::env::var("CARGO_MANIFEST_DIR").unwrap();
+        // HOME, not CARGO_MANIFEST_DIR: only `cargo test` sets the latter, so
+        // running the test binary directly failed here.
+        let root = std::env::var("HOME").unwrap();
         assert_eq!(params.volume, vec![format!("{root}/dev:/dev")]);
     }
 
