@@ -7693,14 +7693,6 @@ mod tests {
         builder.into_inner().unwrap()
     }
 
-    /// Directories are forced writable mid-extraction so their children can be
-    /// created, so every non-default mode has to be restored afterwards.
-    ///
-    /// Restoring only directories the owner could not write left every
-    /// restrictive-but-writable mode widened to 0755: a packed PostgreSQL data
-    /// directory arrived world-readable and the server refused to start on it,
-    /// and a packed 0700 `.ssh` lost its privacy the same way.
-    #[cfg(unix)]
     #[test]
     #[cfg(unix)]
     fn a_pack_built_under_umask_077_keeps_its_layers_reachable() {
@@ -7735,6 +7727,14 @@ mod tests {
         assert_eq!(mode(elsewhere.path()), 0o700);
     }
 
+    /// Directories are forced writable mid-extraction so their children can be
+    /// created, so every non-default mode has to be restored afterwards.
+    ///
+    /// Restoring only directories the owner could not write left every
+    /// restrictive-but-writable mode widened to 0755: a packed PostgreSQL data
+    /// directory arrived world-readable and the server refused to start on it,
+    /// and a packed 0700 `.ssh` lost its privacy the same way.
+    #[cfg(unix)]
     #[test]
     fn test_safe_unpack_restores_restrictive_but_writable_directory_mode() {
         use std::os::unix::fs::PermissionsExt;
