@@ -3281,7 +3281,7 @@ async fn create_machine_to_end(
                             &image,
                             &crate::registry::PullAuth::FromConfig,
                             storage_gb,
-                            None,
+                            crate::image_seed::api_digest_ttl(),
                             None,
                             None,
                         )
@@ -4398,7 +4398,12 @@ async fn start_machine_transaction(
                 .flatten()
         };
         if let Some(image) = preseeded_image {
-            match crate::image_seed::revalidate_seed(&name_clone, &image, &seed_auth) {
+            match crate::image_seed::revalidate_seed(
+                &name_clone,
+                &image,
+                &seed_auth,
+                crate::image_seed::api_digest_ttl(),
+            ) {
                 Ok(true) => {}
                 Ok(false) => {
                     seed_image = seedable_image(&image);
@@ -4434,7 +4439,7 @@ async fn start_machine_transaction(
                         &image,
                         &seed_auth,
                         storage_gb,
-                        None,
+                        crate::image_seed::api_digest_ttl(),
                         None,
                         None,
                     )

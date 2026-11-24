@@ -143,6 +143,15 @@ pub struct ServeStartCmd {
     #[arg(long = "egress-watchlist", value_name = "PATH")]
     egress_watchlist: Option<std::path::PathBuf>,
 
+    /// Seconds to trust the digest an image tag resolved to when attaching an
+    /// image seed to a new machine. Within the window, creates and starts of
+    /// the same image with the same credentials skip the registry round trip;
+    /// a moved tag or a revoked credential is noticed once it expires. A
+    /// request that brings its own registry credentials is cached under those
+    /// credentials only. 0 (the default) resolves on every create and start.
+    #[arg(long = "seed-digest-ttl", value_name = "SECONDS", default_value_t = 0)]
+    seed_digest_ttl: u64,
+
     /// Require the mTLS client certificate's subject CN to equal this value
     /// for API access. Only applies when serve TLS is configured
     /// (SMOLVM_SERVE_TLS_CERT/_KEY/_CLIENT_CA). Unset (the default), every
@@ -551,6 +560,7 @@ impl ServeStartCmd {
             println!("Local images enabled from {}", dir.display());
             state.set_local_image_dir(Some(dir));
         }
+        smolvm::image_seed::set_api_digest_ttl(self.seed_digest_ttl);
         if let Some(path) = &self.egress_watchlist {
             smolvm::agent::egress_watchlist::enable(path.clone())
                 .map_err(|e| smolvm::error::Error::config("load egress watchlist", e))?;
