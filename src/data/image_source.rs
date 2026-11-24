@@ -550,7 +550,8 @@ fn archive_with_mtime_in(base: &Path, reference: &str, mtime: u64) -> Result<Str
     Ok(format!("{LOCAL_ARCHIVE_PREFIX}{variant}"))
 }
 
-fn archive_cache_base() -> Result<PathBuf> {
+/// The root of the local image archive cache (`smolvm-image-archives`).
+pub(crate) fn archive_cache_base() -> Result<PathBuf> {
     let base = smolvm_paths::cache_dir()
         .ok_or_else(|| Error::storage("image archive cache", "no cache directory available"))?;
     Ok(base.join("smolvm-image-archives"))

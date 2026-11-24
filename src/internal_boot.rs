@@ -518,6 +518,14 @@ fn run_inner(config_path: PathBuf, token: Option<String>) -> crate::Result<()> {
             .ok()
             .and_then(|s| s.parse().ok())
             .unwrap_or(uid);
+        // Every path the VMM will open as `uid`, checked (and repaired where
+        // smolvm owns it) while this process can still fix it, so a mode the
+        // umask or an archive left fails here, by name, not as an EACCES after
+        // boot.
+        if let Err(e) = crate::vm_access::ensure(&config, uid, gid) {
+            eprintln!("[vm-access] refusing to boot: {e}");
+            crate::process::exit_child(1);
+        }
         if let Err(e) = crate::process::drop_privileges(uid, gid) {
             eprintln!("[uid-drop] failed, refusing to boot over-privileged: {e}");
             crate::process::exit_child(1);
