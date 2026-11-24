@@ -35,6 +35,20 @@
 //! on Linux. Clones are independent of the seed, so eviction never has to keep
 //! one alive.
 
+/// How long `smolvm serve` trusts a digest it resolved for an image seed, in
+/// seconds; 0 (the default) resolves at the registry on every create and start.
+static API_DIGEST_TTL_SECS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Set the digest TTL the API's seed paths use (`serve start --seed-digest-ttl`).
+pub fn set_api_digest_ttl(secs: u64) {
+    API_DIGEST_TTL_SECS.store(secs, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The digest TTL the API's seed paths use, or `None` when it is off.
+pub fn api_digest_ttl() -> Option<u64> {
+    Some(API_DIGEST_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed)).filter(|secs| *secs > 0)
+}
+
 #[cfg(unix)]
 pub use imp::{
     discard_unbooted_storage, ensure_image_seed, exit_by_signal, interruptible,
@@ -239,7 +253,12 @@ pub fn discard_unbooted_storage(_: &str, _: &str, _: bool) -> bool {
 
 #[cfg(not(unix))]
 /// Seeds need a Unix host, so other platforms have nothing to revalidate.
-pub fn revalidate_seed(_: &str, _: &str, _: &crate::registry::PullAuth) -> crate::Result<bool> {
+pub fn revalidate_seed(
+    _: &str,
+    _: &str,
+    _: &crate::registry::PullAuth,
+    _: Option<u64>,
+) -> crate::Result<bool> {
     Ok(false)
 }
 
@@ -970,7 +989,12 @@ mod imp {
     /// Reauthorize a seed attached at API create with the credentials supplied
     /// at start. A moved tag or denied request discards the untouched overlay;
     /// the start path can then seed again or let the guest pull normally.
-    pub fn revalidate_seed(name: &str, image: &str, auth: &PullAuth) -> Result<bool> {
+    pub fn revalidate_seed(
+        name: &str,
+        image: &str,
+        auth: &PullAuth,
+        digest_ttl: Option<u64>,
+    ) -> Result<bool> {
         let dir = crate::agent::vm_data_dir(name);
         let base = dir.join(crate::storage::STORAGE_DISK_FILENAME);
         let qcow2 = base.with_extension(DiskFormat::Qcow2.extension());
@@ -1006,9 +1030,9 @@ mod imp {
             // registry to ask.
             let digest = match crate::data::image_source::local_archive_hash(image) {
                 Some(hash) => hash.to_string(),
-                None => {
-                    rt.block_on(crate::image_store::authorized_reference_digest(image, auth))?
-                }
+                None => resolved_digest(image, auth, digest_ttl, || {
+                    rt.block_on(crate::image_store::authorized_reference_digest(image, auth))
+                })?,
             };
             let small_gb = small_seed_gb(
                 crate::db::SmolvmDb::open()?
