@@ -139,11 +139,21 @@ mod tests {
 
     /// A stand-in for libkrun's bridge: accepts on the forward socket, reads
     /// the port line, and echoes the rest back prefixed with that port.
+    ///
+    /// Raises this test process's open-file limit first, as the launcher does
+    /// for a machine's VMM: macOS starts a process at 256, and the whole suite
+    /// running in parallel ran out, which failed these tests at random. A
+    /// failed accept is retried rather than ending the accept thread, which
+    /// left every later connection waiting out the 30 s read timeout.
     fn fake_guest(socket: &Path) {
+        crate::process::raise_nofile_limit();
         let listener = std::os::unix::net::UnixListener::bind(socket).unwrap();
         std::thread::spawn(move || {
             for stream in listener.incoming() {
-                let mut stream = stream.unwrap();
+                let Ok(mut stream) = stream else {
+                    std::thread::sleep(Duration::from_millis(10));
+                    continue;
+                };
                 std::thread::spawn(move || {
                     let mut header = Vec::new();
                     let mut byte = [0u8; 1];
@@ -162,6 +172,7 @@ mod tests {
 
     #[test]
     fn a_reset_client_closes_the_guest_request_half() {
+        crate::process::raise_nofile_limit();
         let dir = tempfile::tempdir().unwrap();
         let socket = dir.path().join(PORT_FORWARD_SOCKET);
         let guest_listener = crate::platform::uds::UdsListener::bind(&socket).unwrap();
