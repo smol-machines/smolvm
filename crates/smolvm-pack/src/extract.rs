@@ -4811,6 +4811,23 @@ fn layer_id_from_asset_path(path: &str) -> Option<String> {
 /// permissions, and (when `layer_order` is non-empty) write the layer-order
 /// index so the guest stacks the layers in true OCI order rather than by their
 /// content-addressed names. `layer_order` is the short layer ids bottom→top.
+/// Make a pack's `layers` directory root's and 0755, as `agent-rootfs` is.
+///
+/// It is packaging, not a guest file: the host and the VMM, which runs as the
+/// machine's own uid, walk through it to the layers. The assets archive still
+/// carries the builder's owner and mode for it, and those now land on disk, so
+/// a pack built under umask 077 (`layers/` 0700, owned by the builder's uid)
+/// left the VMM unable to reach any layer: every start of such a pack failed
+/// with EACCES right after the agent came up. Only the directory itself
+/// changes; what is inside each layer keeps its archived owner and mode. A
+/// symlink in its place is left alone.
+fn open_layers_container(layers_dir: &Path) {
+    if fs::symlink_metadata(layers_dir).is_ok_and(|m| m.is_dir()) {
+        set_owner(layers_dir, 0, 0);
+        set_mode(layers_dir, 0o755);
+    }
+}
+
 fn post_process_extraction(
     cache_dir: &Path,
     layer_order: &[String],
@@ -4841,6 +4858,7 @@ fn post_process_extraction(
     // APFS sparse disk image on macOS. The image is persisted in the cache and
     // re-mounted on subsequent runs.
     let layers_dir = cache_dir.join("layers");
+    open_layers_container(&layers_dir);
     if layers_dir.exists() && !host_unpack_preserves_ownership() && guest_unpacks_layers {
         // This host cannot reproduce the archived uid/gid (see
         // `host_unpack_preserves_ownership`), so leave the tars staged and let
@@ -7680,6 +7698,40 @@ mod tests {
     /// directory arrived world-readable and the server refused to start on it,
     /// and a packed 0700 `.ssh` lost its privacy the same way.
     #[cfg(unix)]
+    #[test]
+    #[cfg(unix)]
+    fn a_pack_built_under_umask_077_keeps_its_layers_reachable() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        // The assets archive of a pack built under umask 077: `layers/` 0700.
+        let mut builder = tar::Builder::new(Vec::new());
+        let mut header = tar::Header::new_gnu();
+        header.set_entry_type(tar::EntryType::Directory);
+        header.set_mode(0o700);
+        header.set_size(0);
+        header.set_cksum();
+        builder
+            .append_data(&mut header, "layers/", std::io::empty())
+            .unwrap();
+        let bytes = builder.into_inner().unwrap();
+        let mut archive = tar::Archive::new(bytes.as_slice());
+        safe_unpack(&mut archive, dir.path()).unwrap();
+        let layers = dir.path().join("layers");
+        let mode = |p: &Path| fs::metadata(p).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode(&layers), 0o700, "the archived mode lands first");
+
+        open_layers_container(&layers);
+        assert_eq!(mode(&layers), 0o755);
+
+        // A symlink standing where `layers` should be is not followed.
+        let elsewhere = tempfile::tempdir().unwrap();
+        fs::set_permissions(elsewhere.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let linked = dir.path().join("linked");
+        std::os::unix::fs::symlink(elsewhere.path(), &linked).unwrap();
+        open_layers_container(&linked);
+        assert_eq!(mode(elsewhere.path()), 0o700);
+    }
+
     #[test]
     fn test_safe_unpack_restores_restrictive_but_writable_directory_mode() {
         use std::os::unix::fs::PermissionsExt;
