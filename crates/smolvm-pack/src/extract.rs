@@ -2518,6 +2518,9 @@ fn extract_sidecar_capped(
         // start. Finish the job here, once, under the same lock.
         let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
         repair_host_layer_owners(cache_dir, debug)?;
+        // An extraction made before `open_layers_container` existed may hold a
+        // `layers` directory only its builder's uid can enter.
+        open_layers_container(&cache_dir.join("layers"));
         repair_host_layer_symlink_owners(cache_dir)?;
         if upgraded && cap_cache {
             if let Some(root) = cache_dir.parent() {
