@@ -347,17 +347,15 @@ impl KrunFunctions {
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         if let Some(configure) = self.set_live_resize {
-            // The current x86 firmware reserves at most 16 CPU slots. Larger
-            // machines can still grow RAM without advertising unsupported CPU growth.
-            return configure(
-                ctx,
-                2 | u32::from(
-                    cfg!(any(
-                        all(target_os = "linux", target_arch = "x86_64"),
-                        all(target_os = "macos", target_arch = "aarch64")
-                    )) && cpus <= 16,
-                ),
-            );
+            // The runtime reserves at most 16 CPU slots. Larger machines can
+            // still grow RAM without advertising unsupported CPU growth.
+            let result = configure(ctx, 2 | u32::from(cpus <= 16));
+            // A runtime older than its platform's CPU growth (Linux arm64
+            // before it) boots as before and refuses CPU growth later.
+            if result == -libc::ENOTSUP && cpus <= 16 {
+                return configure(ctx, 2);
+            }
+            return result;
         }
         let _ = (ctx, cpus);
         0

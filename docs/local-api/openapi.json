@@ -8046,7 +8046,7 @@
               "null"
             ],
             "format": "int32",
-            "description": "Target online CPU count; shrinking requires a compatible Linux x86_64 runtime and agent.",
+            "description": "Target online CPU count; shrinking requires a compatible Linux runtime and agent.",
             "minimum": 0
           },
           "diskGb": {

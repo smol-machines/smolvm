@@ -41,8 +41,11 @@ other CPU implements. Machines started on a Mac therefore boot with pointer
 authentication turned off, so their checkpoints can move. The VM boundary is
 still the isolation boundary; this removes one hardening layer inside the guest.
 
-**CPU hot-add.** KVM on arm64 cannot add vCPUs to a running guest, so a machine
-moved from a Mac keeps the vCPUs it has until it is stopped and started again.
+**CPU hot-add.** A guest that booted on a Mac accepts only CPUs with Apple's
+features (its TSO memory model), which no vCPU on Linux has, so a machine moved
+from a Mac keeps the vCPUs it has until it is stopped and started again.
+`machine resize --cpus` says so. Machines started on Linux arm64 grow and
+shrink live as on other hosts.
 
 ## Not supported yet
 
