@@ -338,7 +338,12 @@ mod tests {
         let mut writers = Vec::new();
         for _ in 0..count {
             let (reader, writer) = UnixStream::pair().unwrap();
-            reader.set_nonblocking(true).unwrap();
+            // Another test forking in parallel can hold a copy of a writer
+            // for a moment before its exec closes it, so wait for EOF
+            // instead of reading once; a real leak still times out.
+            reader
+                .set_read_timeout(Some(std::time::Duration::from_secs(10)))
+                .unwrap();
             readers.push(reader);
             writers.push(writer);
         }
