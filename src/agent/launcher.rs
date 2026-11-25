@@ -1919,6 +1919,10 @@ pub fn launch_agent_vm(config: &LaunchConfig<'_>) -> Result<()> {
         } else if auto_ports.is_some() {
             tracing::warn!("auto ports disabled: no port forwarding socket for this machine");
         }
+        // The guest reaches the host agent only through the filter, which
+        // forwards list and sign and refuses requests that change the agent.
+        let ssh_agent_socket =
+            super::ssh_agent_filter::guard(ssh_agent_socket.as_deref(), vsock_socket);
         let vsock_inputs = vsock_service::VsockServiceInputs {
             ssh_agent_socket: ssh_agent_socket.as_deref(),
             cuda_socket: cuda_socket.as_deref(),

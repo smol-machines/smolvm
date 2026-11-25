@@ -90,6 +90,7 @@ pub mod video {
         ))
     }
 }
+mod ssh_agent_filter;
 pub mod vnc;
 mod vsock_service;
 mod websocket;
