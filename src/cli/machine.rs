@@ -3561,7 +3561,7 @@ mod tests {
     }
 
     #[test]
-    fn stop_force_uses_the_stop_command_without_a_pid_argument() {
+    fn stop_accepts_a_pid_only_for_forced_shutdown() {
         for flag in ["--force", "-f"] {
             let cli =
                 TestMachineCli::try_parse_from(["machine", "stop", "-n", "web", flag]).unwrap();
@@ -3570,6 +3570,21 @@ mod tests {
             };
             assert!(cmd.force);
             assert_eq!(cmd.name.as_deref(), Some("web"));
+        }
+        let MachineCmd::Stop(cmd) =
+            TestMachineCli::try_parse_from(["machine", "stop", "--force", "--pid", "42"])
+                .unwrap()
+                .command
+        else {
+            panic!("expected machine stop")
+        };
+        assert_eq!(cmd.pid, Some(42));
+        assert!(TestMachineCli::try_parse_from(["machine", "stop", "--pid", "42"]).is_err());
+        for invalid in ["0", "1", "-1", "2147483648"] {
+            assert!(TestMachineCli::try_parse_from([
+                "machine", "stop", "--force", "--pid", invalid
+            ])
+            .is_err());
         }
         assert!(TestMachineCli::try_parse_from(["machine", "stop", "--force"]).is_ok());
         assert!(
@@ -6689,6 +6704,10 @@ pub struct StopCmd {
     /// Unsaved data may be lost.
     #[arg(short = 'f', long, conflicts_with = "timeout")]
     pub force: bool,
+
+    /// Force-stop only if this host PID still runs the named machine.
+    #[arg(long, requires = "force", value_parser = clap::value_parser!(i32).range(2..))]
+    pub pid: Option<i32>,
 }
 
 #[derive(Args, Debug)]
@@ -6723,7 +6742,7 @@ impl StopCmd {
     pub fn run(self) -> smolvm::Result<()> {
         let name = vm_common::resolve_vm_name(self.name)?;
         if self.force {
-            return vm_common::force_stop_vm_named(name.as_deref().unwrap_or("default"));
+            return vm_common::force_stop_vm_named(name.as_deref().unwrap_or("default"), self.pid);
         }
         let timeout = self.timeout.map(std::time::Duration::from_secs);
         match &name {

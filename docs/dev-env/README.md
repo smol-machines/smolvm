@@ -54,6 +54,14 @@ identity and refuses to stop a source with running dependent clones. A paused
 machine must be resumed or deleted. `--force` cannot be combined with
 `--timeout`. Omitting `--name` uses `$SMOLVM_MACHINE_NAME`, or `default`.
 
+To stop a specific execution, pass its host PID from `smolvm machine ls --json`:
+
+```sh
+smolvm machine stop --name dev --force --pid 12345
+```
+
+If the registered PID differs or the machine has already stopped, the command fails.
+
 ## Changing ports while it runs
 
 `machine update` adds or removes TCP ports on a running machine; the change

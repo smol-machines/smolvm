@@ -2709,7 +2709,7 @@ pub fn stop_vm_named_with_timeout(
 /// Force-stop the registered execution without contacting the guest. Admission
 /// and the fork lock keep the selected record stable; the manager verifies its
 /// PID and start time again before terminating it.
-pub fn force_stop_vm_named(name: &str) -> smolvm::Result<()> {
+pub fn force_stop_vm_named(name: &str, pid: Option<i32>) -> smolvm::Result<()> {
     let db = SmolvmDb::open()?;
     let _admission = db.admit_workload_mutation(Some(name), &[])?;
     let _fork = smolvm::agent::fork::lock_fork_source(name)?;
@@ -2724,7 +2724,7 @@ pub fn force_stop_vm_named(name: &str) -> smolvm::Result<()> {
     }
     let manager = AgentManager::for_existing_vm_record(&record)?;
     manager.detach();
-    match record.pid {
+    match pid.or(record.pid) {
         Some(pid) => manager.power_off_persisted(&record, pid)?,
         // A stopped or never-started machine has no execution to kill. Keep
         // stop idempotent and publish the intentional stop for restart policy.
