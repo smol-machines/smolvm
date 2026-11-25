@@ -7246,6 +7246,13 @@
             "description": "Storage disk size in GiB.",
             "example": 20,
             "minimum": 0
+          },
+          "workloadError": {
+            "type": [
+              "string",
+              "null"
+            ],
+            "description": "Set on a start whose VM booted but whose image workload failed to\nlaunch: the machine is reachable by exec, but its server is not running.\nThe start is not refused, so a caller that needs the workload must check\nthis; a later start retries the launch."
           }
         }
       },

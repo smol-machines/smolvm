@@ -2029,6 +2029,7 @@ pub fn machine_entry_to_info(name: String, entry: &MachineEntry) -> MachineInfo 
     let disk_used_mb = crate::agent::disk_used_mb(&name);
 
     MachineInfo {
+        workload_error: None,
         disk_chain_depth: None,
         runtime: entry
             .manager
