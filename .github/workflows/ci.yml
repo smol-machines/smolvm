@@ -62,8 +62,8 @@ jobs:
           sudo apt-get install -y binutils binutils-mingw-w64-x86-64 llvm
       - name: Bundled libkrun exports every symbol smolvm requires
         run: ./scripts/check-krun-exports.sh
-      # A libkrun linked against a newer glibc (> 2.31) loads there but fails on
-      # Ubuntu 20.04 / Debian 11 with "GLIBC_x.y not found" before the VM boots
+      # A bundled library linked against a newer glibc (> 2.28) loads there but fails
+      # on RHEL 8 / Debian 10 with "GLIBC_x.y not found" before the VM boots
       # (issue #636). Gate every push so a wrong-host lib can't ship again.
       - name: Bundled libraries support the minimum host versions
         run: |

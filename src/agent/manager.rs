@@ -4547,7 +4547,17 @@ impl AgentManager {
                     None => std::process::Stdio::null(),
                 }
             };
-            cmd.stdout(sink(&debug_log)).stderr(sink(&debug_log));
+            // The boot process moves its own stderr into the startup-error log
+            // once it runs, but the dynamic loader writes before that: a host
+            // glibc older than the build's, or a missing library, would
+            // otherwise leave only "boot process exited (code 127)". Hand the
+            // child that log from the start (Unix; Windows detaches stdio).
+            let stderr_log = if cfg!(unix) && !boot_debug {
+                Some(self.startup_error_log.clone())
+            } else {
+                debug_log.clone()
+            };
+            cmd.stdout(sink(&debug_log)).stderr(sink(&stderr_log));
         }
         // Own process group (pgid = child pid) so the VM is immune to SIGHUP from
         // the parent's terminal closing, without making it a session leader.
@@ -5848,6 +5858,8 @@ fn boot_failure_reason(
                 format!(
                     "{error} — this can be the affected-host KVM first-run bug rather than memory pressure; update the host kernel to include upstream fix 916b7f42b3b3"
                 )
+            } else if error.contains("version `GLIBC_") && error.contains("not found") {
+                format!("{error} — this host's glibc is older than the 2.28 smolvm needs")
             } else {
                 error
             }
@@ -6912,6 +6924,16 @@ mod tests {
         let r = boot_failure_reason(Some(1), Some(log), None);
         assert!(r.contains("krun_add_disk2"), "{r}");
         assert!(r.contains("code 1"), "{r}");
+    }
+
+    #[test]
+    fn boot_failure_names_a_host_glibc_older_than_the_build() {
+        // The dynamic loader's own words, captured before the boot process runs.
+        let log = "/v/smol/smol-vmm: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /v/smol/smol-vmm)\n";
+        let r = boot_failure_reason(Some(127), Some(log), None);
+        assert!(r.contains("GLIBC_2.29' not found"), "{r}");
+        assert!(r.contains("older than the 2.28"), "{r}");
+        assert!(r.contains("code 127"), "{r}");
     }
 
     #[test]

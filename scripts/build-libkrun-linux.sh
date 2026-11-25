@@ -26,7 +26,7 @@
 #                         (it wraps a guest-kernel blob; its floor is GLIBC_2.2),
 #                         so when the goal is lowering libkrun's glibc floor there's
 #                         no need to recompile the kernel — skips the slow step.
-#   LINUX_GLIBC=2.31      link libkrun against this glibc version (with zig and
+#   LINUX_GLIBC=2.28      link libkrun against this glibc version (with zig and
 #                         cargo-zigbuild) instead of the build host's, so it loads
 #                         on hosts that old. The build host's glibc sets the floor
 #                         otherwise (22.04 -> 2.34). The build fails if any symbol

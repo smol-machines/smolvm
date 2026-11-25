@@ -2,8 +2,8 @@ name: Build the Linux host renderer
 
 # Rebuild the renderer bundled in lib/linux-<arch>/: libvirglrenderer,
 # virgl_render_server and libepoxy. scripts/build-virglrenderer-linux.sh pins
-# the releases and applies patches/virglrenderer-linux/; it runs in Ubuntu
-# 20.04 so the result needs nothing newer than glibc 2.31.
+# the releases and applies patches/virglrenderer-linux/; it runs in AlmaLinux
+# 8 so the result needs nothing newer than glibc 2.28.
 #
 # Runs on dispatch and on a pull request that changes the build. Uploads the
 # files as an artifact; they are then committed into lib/linux-<arch>/.
@@ -31,12 +31,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Build in Ubuntu 20.04
+      - name: Build in AlmaLinux 8
         run: |
           mkdir -p out
           docker run --rm -v "$PWD/scripts:/src/scripts:ro" \
             -v "$PWD/patches:/src/patches:ro" -v "$PWD/out:/out" \
-            ubuntu:20.04 bash /src/scripts/build-virglrenderer-linux.sh "/out/${{ matrix.arch }}"
+            almalinux:8 bash /src/scripts/build-virglrenderer-linux.sh "/out/${{ matrix.arch }}"
           sudo chown -R "$(id -u):$(id -g)" out
           cat "out/${{ matrix.arch }}/virglrenderer.provenance"
           sha256sum "out/${{ matrix.arch }}"/*
