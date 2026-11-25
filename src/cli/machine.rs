@@ -54,7 +54,7 @@ fn is_likely_image_ref(s: &str) -> bool {
     s.contains('/') && !s.starts_with('/') && !s.starts_with("./") && !s.starts_with("../")
 }
 
-/// `machine create`'s own long options that appear in a workload command, i.e.
+/// A subcommand's own long options that appear in a workload command, i.e.
 /// after the `--` separator, where they are arguments for the guest process
 /// rather than machine options.
 ///
@@ -62,9 +62,8 @@ fn is_likely_image_ref(s: &str) -> bool {
 /// in ordinary commands to name without drowning the real signal. The long
 /// options come from clap itself, so a newly added flag is covered without
 /// touching this list.
-fn create_flags_in_workload(command: &[String]) -> Vec<String> {
-    use clap::Args as _;
-    let spec = CreateCmd::augment_args(clap::Command::new("create"));
+fn flags_in_workload<T: clap::Args>(name: &'static str, command: &[String]) -> Vec<String> {
+    let spec = T::augment_args(clap::Command::new(name));
     let longs: std::collections::HashSet<String> = spec
         .get_arguments()
         .filter_map(|arg| arg.get_long().map(|long| format!("--{long}")))
@@ -76,6 +75,29 @@ fn create_flags_in_workload(command: &[String]) -> Vec<String> {
         }
     }
     found
+}
+
+fn create_flags_in_workload(command: &[String]) -> Vec<String> {
+    flags_in_workload::<CreateCmd>("create", command)
+}
+
+fn update_flags_in_workload(command: &[String]) -> Vec<String> {
+    flags_in_workload::<UpdateCmd>("update", command)
+}
+
+fn warn_stray_flags_in_workload(stray_flags: &[String]) {
+    if !stray_flags.is_empty() {
+        eprintln!(
+            "note: {} came after `--`, so {} passed to the workload and did not \
+             configure the machine. Machine options go before `--`.",
+            stray_flags.join(", "),
+            if stray_flags.len() == 1 {
+                "it was"
+            } else {
+                "they were"
+            }
+        );
+    }
 }
 
 /// The refusal for credentials on an ephemeral `.smolmachine` run. That run
@@ -494,7 +516,7 @@ pub enum MachineCmd {
     /// Grow a running machine's CPUs, RAM, or disks without rebooting
     Resize(ResizeCmd),
 
-    /// Modify settings on a stopped machine (mounts, ports, resources, disks)
+    /// Modify settings on a stopped machine (mounts, ports, resources, disks, command)
     Update(UpdateCmd),
 
     /// List cached images and storage usage
@@ -4158,6 +4180,155 @@ mod tests {
     }
 
     #[test]
+    fn update_accepts_trailing_workload_command() {
+        let cmd = parse_update(&["--", "/usr/lib/systemd/systemd"]);
+        assert_eq!(cmd.command, ["/usr/lib/systemd/systemd"]);
+        assert!(cmd.validate_command().is_ok());
+
+        let cmd = parse_update(&["--mem", "4096", "--", "/bin/sh", "-c", "echo hi"]);
+        assert_eq!(cmd.mem, Some(4096));
+        assert_eq!(cmd.command, ["/bin/sh", "-c", "echo hi"]);
+        assert!(cmd.validate_command().is_ok());
+
+        let cmd = parse_update(&["--mem", "4096"]);
+        assert!(cmd.command.is_empty());
+
+        // `last = true` rejects a bare positional without `--`.
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "l",
+            "/usr/lib/systemd/systemd",
+        ])
+        .is_err());
+
+        // Empty executable is rejected, while an empty argument after it is valid.
+        assert!(parse_update(&["--", ""]).validate_command().is_err());
+        assert!(parse_update(&["--", "/bin/sh", "-c", ""])
+            .validate_command()
+            .is_ok());
+    }
+
+    #[test]
+    fn update_command_is_not_a_live_only_change() {
+        let alone = parse_update(&["--", "/bin/sh"]);
+        assert!(!alone.changes_only_env());
+        assert!(!alone.changes_only_ports());
+        assert!(!alone.changes_only_labels());
+        assert!(!alone.changes_only_egress());
+
+        for live in [
+            &["-e", "A=1"][..],
+            &["-p", "3000:3000"],
+            &["--label", "k=v"],
+            &["--allow-host", "pypi.org"],
+        ] {
+            let mixed = parse_update(&[live, &["--", "/bin/sh"]].concat());
+            assert!(!mixed.changes_only_env(), "{live:?}");
+            assert!(!mixed.changes_only_ports(), "{live:?}");
+            assert!(!mixed.changes_only_labels(), "{live:?}");
+            assert!(!mixed.changes_only_egress(), "{live:?}");
+        }
+    }
+
+    #[test]
+    fn update_command_replaces_entrypoint_and_cmd_in_db() {
+        use smolvm::config::{RecordState, VmRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = smolvm::db::SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
+
+        let mut record = VmRecord::new("l".to_string(), 2, 1024, vec![], vec![], false);
+        record.state = RecordState::Stopped;
+        record.entrypoint = vec!["/old/entrypoint".to_string()];
+        record.cmd = vec!["old-arg".to_string()];
+        db.insert_vm("l", &record).unwrap();
+
+        // Updating another setting without `-- <cmd>` preserves entrypoint and cmd.
+        parse_update(&["--mem", "2048"]).run_with_db(&db).unwrap();
+        let kept = db.get_vm("l").unwrap().unwrap();
+        assert_eq!(kept.mem, 2048);
+        assert_eq!(kept.entrypoint, ["/old/entrypoint"]);
+        assert_eq!(kept.cmd, ["old-arg"]);
+
+        // Updating with `-- <cmd>` clears entrypoint and replaces cmd.
+        parse_update(&["--", "/usr/lib/systemd/systemd", "--unit=multi-user.target"])
+            .run_with_db(&db)
+            .unwrap();
+        let updated = db.get_vm("l").unwrap().unwrap();
+        assert!(updated.entrypoint.is_empty());
+        assert_eq!(
+            updated.cmd,
+            ["/usr/lib/systemd/systemd", "--unit=multi-user.target"]
+        );
+    }
+
+    #[test]
+    fn update_command_refuses_running_and_paused_machines() {
+        use smolvm::config::{RecordState, VmRecord};
+
+        let dir = tempfile::tempdir().unwrap();
+        let db = smolvm::db::SmolvmDb::open_at(&dir.path().join("state.db")).unwrap();
+
+        let pid = std::process::id() as i32;
+        let mut running = VmRecord::new("run-vm".to_string(), 2, 1024, vec![], vec![], false);
+        running.state = RecordState::Running;
+        running.pid = Some(pid);
+        running.pid_start_time = smolvm::process::process_start_time(pid);
+        running.entrypoint = vec!["/init".to_string()];
+        running.cmd = vec!["serve".to_string()];
+        db.insert_vm("run-vm", &running).unwrap();
+
+        let mut paused = VmRecord::new("pause-vm".to_string(), 2, 1024, vec![], vec![], false);
+        paused.state = RecordState::Paused;
+        paused.entrypoint = vec!["/init".to_string()];
+        paused.cmd = vec!["serve".to_string()];
+        db.insert_vm("pause-vm", &paused).unwrap();
+
+        for (name, extra) in [
+            ("run-vm", &["--", "/bin/sh"][..]),
+            ("run-vm", &["--label", "k=v", "--", "/bin/sh"][..]),
+            ("pause-vm", &["--", "/bin/sh"][..]),
+        ] {
+            let argv = [&["machine", "update", "--name", name][..], extra].concat();
+            let MachineCmd::Update(cmd) = TestMachineCli::parse_from(argv).command else {
+                panic!("expected machine update command");
+            };
+            let err = cmd.run_with_db(&db).unwrap_err();
+            assert!(
+                matches!(err, smolvm::Error::InvalidState { ref expected, .. } if expected == "stopped"),
+                "expected InvalidState(stopped) for {name} {extra:?}, got {err:?}"
+            );
+            let unchanged = db.get_vm(name).unwrap().unwrap();
+            assert_eq!(unchanged.entrypoint, ["/init"]);
+            assert_eq!(unchanged.cmd, ["serve"]);
+        }
+    }
+
+    #[test]
+    fn update_flags_after_separator_are_detected() {
+        let cmd = parse_update(&[
+            "--",
+            "/bin/sh",
+            "-c",
+            "sleep infinity",
+            "--mem",
+            "4096",
+            "--net",
+        ]);
+        assert_eq!(cmd.mem, None);
+        assert!(!cmd.net);
+        assert_eq!(update_flags_in_workload(&cmd.command), ["--mem", "--net"]);
+
+        let words: Vec<String> = ["myserver", "--listen", "0.0.0.0", "-v", "-e", "-p", "8080"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert!(update_flags_in_workload(&words).is_empty());
+    }
+
+    #[test]
     fn update_changes_ports_alone_on_a_running_machine() {
         use smolvm::config::VmRecord;
 
@@ -5471,18 +5642,7 @@ impl CreateCmd {
         // workload may legitimately take an option of the same name), so name
         // them. Checked before the `--from` branch so both create paths warn.
         let stray_flags = create_flags_in_workload(&self.command);
-        if !stray_flags.is_empty() {
-            eprintln!(
-                "note: {} came after `--`, so {} passed to the workload and did not \
-                 configure the machine. Machine options go before `--`.",
-                stray_flags.join(", "),
-                if stray_flags.len() == 1 {
-                    "it was"
-                } else {
-                    "they were"
-                }
-            );
-        }
+        warn_stray_flags_in_workload(&stray_flags);
 
         // --max-image-size raises the archive cap for this invocation by setting
         // the env var the resolver reads (image_source::max_archive_bytes).
@@ -7074,6 +7234,7 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --allow-host pypi.org   # while running
 ///   smolvm machine update --name myvm -e API_URL=https://api.example.com   # while running
 ///   smolvm machine update --name myvm --auto-ports
+///   smolvm machine update --name myvm -- /usr/lib/systemd/systemd
 #[derive(Args, Debug)]
 pub struct UpdateCmd {
     /// Machine to update
@@ -7270,6 +7431,14 @@ pub struct UpdateCmd {
     /// Remove a label by key (repeatable). A key the machine lacks is ignored.
     #[arg(long = "remove-label", value_name = "KEY")]
     pub remove_labels: Vec<String>,
+
+    /// Replace the machine's workload command (entrypoint and cmd). Takes
+    /// effect on the next `machine start`, not `pause`/`resume`.
+    ///
+    /// `last = true` requires the `--` separator so bare positionals fail
+    /// loudly instead of being silently captured as a command.
+    #[arg(last = true, value_name = "COMMAND")]
+    pub command: Vec<String>,
 }
 
 /// Turn a machine's networking off in its record, returning the changes made.
@@ -7385,6 +7554,28 @@ impl UpdateCmd {
             }
         }
         Ok(())
+    }
+
+    /// Check that a trailing workload command starts with a non-empty executable.
+    fn validate_command(&self) -> smolvm::Result<()> {
+        if self.command.first().is_some_and(String::is_empty) {
+            return Err(smolvm::Error::config(
+                "update",
+                "command executable cannot be empty",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Replace the machine's entrypoint and command with the trailing workload
+    /// command, if one was given. Returns a change line when updated.
+    fn apply_command(&self, record: &mut smolvm::config::VmRecord) -> Option<String> {
+        if self.command.is_empty() {
+            return None;
+        }
+        record.entrypoint.clear();
+        record.cmd = self.command.clone();
+        Some(format!("  command: {}", self.command.join(" ")))
     }
 
     /// Apply `--remove-env` then `--env` to `env`. Returns a line per change.
@@ -7534,6 +7725,7 @@ impl UpdateCmd {
             shm_size,
             labels,
             remove_labels,
+            command,
         } = self;
         let egress = *net
             || *outbound_localhost_only
@@ -7566,7 +7758,8 @@ impl UpdateCmd {
             || disk_durability.is_some()
             || !dns_option.is_empty()
             || *clear_dns_options
-            || shm_size.is_some();
+            || shm_size.is_some()
+            || !command.is_empty();
         let labels = !labels.is_empty() || !remove_labels.is_empty();
         let env = !env.is_empty() || !remove_env.is_empty();
         (egress, ports, labels, env, other)
@@ -7712,10 +7905,14 @@ impl UpdateCmd {
     }
 
     pub fn run(self) -> smolvm::Result<()> {
+        let db = smolvm::db::SmolvmDb::open()?;
+        self.run_with_db(&db)
+    }
+
+    fn run_with_db(self, db: &smolvm::db::SmolvmDb) -> smolvm::Result<()> {
         use smolvm::config::RecordState;
         use smolvm::data::storage::HostMount;
 
-        let db = smolvm::db::SmolvmDb::open()?;
         let record = db
             .get_vm(&self.name)?
             .ok_or_else(|| smolvm::Error::vm_not_found(&self.name))?;
@@ -7723,16 +7920,16 @@ impl UpdateCmd {
         let set_labels = smolvm::util::parse_labels(&self.labels)?;
         let state = record.actual_state();
         if self.changes_only_labels() {
-            return self.update_labels(&db, &set_labels);
+            return self.update_labels(db, &set_labels);
         }
         if state == RecordState::Running && self.changes_only_egress() {
-            return self.update_running_egress(&db, &record);
+            return self.update_running_egress(db, &record);
         }
         if state == RecordState::Running && self.changes_only_ports() {
-            return self.update_running_ports(&db, &record);
+            return self.update_running_ports(db, &record);
         }
         if state == RecordState::Running && self.changes_only_env() {
-            return self.update_running_env(&db);
+            return self.update_running_env(db);
         }
 
         // Must be stopped (same check as resize)
@@ -7759,6 +7956,7 @@ impl UpdateCmd {
         proposed.validate()?;
 
         self.validate_env_specs()?;
+        self.validate_command()?;
 
         // The egress allow list after this update, validated as a whole before
         // anything is written (#1299).
@@ -7850,6 +8048,11 @@ impl UpdateCmd {
             .no_net
             .then(|| smolvm::credentials::lock_bindings(&self.name))
             .transpose()?;
+        // Everything after `--` is the workload command, so machine options
+        // written there are passed to the guest process instead of updating
+        // the machine. Name them just as `machine create` does.
+        warn_stray_flags_in_workload(&update_flags_in_workload(&self.command));
+
         // Single DB transaction: all settings + disk sizes together.
         db.update_vm(&self.name, |r| {
             // Disk sizes (must match the physical expansion above)
@@ -8019,6 +8222,10 @@ impl UpdateCmd {
             if let Some(ref wd) = self.workdir {
                 changes.push(format!("  workdir: {}", wd));
                 r.workdir = Some(wd.clone());
+            }
+
+            if let Some(change) = self.apply_command(r) {
+                changes.push(change);
             }
 
             changes.extend(self.apply_labels(&mut r.labels, &set_labels));
