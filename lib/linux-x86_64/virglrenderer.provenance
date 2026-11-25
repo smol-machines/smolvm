@@ -1,7 +1,7 @@
 # Written by scripts/build-virglrenderer-linux.sh — do not edit by hand.
 virglrenderer=1.3.0
 virglrenderer_sha256=065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3
-patches=0c4b0c7beed4e30e0299e4e09b71177b010e93ac210b93c7fb5e952da3266e98
+patches=7c476cf3b0993f9aa6b4a693bbf7b2a7db73eedc94b6db2460c25c5e707af713
 libepoxy=1.5.10
 libepoxy_sha256=072cda4b59dd098bba8c2363a6247299db1fa89411dc221c8b81b8ee8192e623
 arch=x86_64
