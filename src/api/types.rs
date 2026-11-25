@@ -1812,7 +1812,7 @@ pub struct ResizeMachineRequest {
     /// Total usable RAM allocation in MiB (live growth, optional).
     #[serde(default, rename = "memoryMb")]
     pub mem: Option<u32>,
-    /// Target online CPU count; shrinking requires a compatible Linux x86_64 runtime and agent.
+    /// Target online CPU count; shrinking requires a compatible Linux runtime and agent.
     #[serde(default)]
     pub cpus: Option<u8>,
     /// Storage disk size in GiB (expand only, optional).

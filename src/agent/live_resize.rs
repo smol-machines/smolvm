@@ -384,13 +384,16 @@ impl MemoryGrowthInfo {
 fn unsupported_live_compute(operation: &str) -> Error {
     Error::config(
         operation,
-        "live CPU growth requires Linux x86_64 or macOS Apple Silicon; RAM and disk growth are supported separately",
+        "live CPU growth requires Linux x86_64 or aarch64, or macOS Apple Silicon; RAM and disk growth are supported separately",
     )
 }
 
 fn ensure_live_compute_platform(operation: &str) -> Result<()> {
     if cfg!(any(
-        all(target_os = "linux", target_arch = "x86_64"),
+        all(
+            target_os = "linux",
+            any(target_arch = "x86_64", target_arch = "aarch64")
+        ),
         all(target_os = "macos", target_arch = "aarch64")
     )) {
         Ok(())
@@ -681,8 +684,14 @@ fn grow_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
 fn shrink_cpus_locked(db: &SmolvmDb, name: &str, target: u8) -> Result<VmRecord> {
     // HVF must implement CPU_OFF and checkpoint its powered-off state before
     // this can safely be widened to macOS. Reject before touching the guest.
-    if !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
-        return Err(Error::config("CPU shrink", "live CPU shrink requires Linux x86_64 with offline-CPU checkpoint support; no CPUs changed"));
+    if !cfg!(all(
+        target_os = "linux",
+        any(target_arch = "x86_64", target_arch = "aarch64")
+    )) {
+        return Err(Error::config(
+            "CPU shrink",
+            "live CPU shrink requires Linux with offline-CPU checkpoint support; no CPUs changed",
+        ));
     }
     let manager = AgentManager::for_vm(name)?;
     let socket = fork::control_socket_path(name);
@@ -769,10 +778,15 @@ pub fn check_targets(
             return Err(Error::config("CPU resize", "CPU count cannot be zero"));
         }
         ensure_live_compute_platform("CPU resize")?;
-        if target < record.cpus && !cfg!(all(target_os = "linux", target_arch = "x86_64")) {
+        if target < record.cpus
+            && !cfg!(all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ))
+        {
             return Err(Error::config(
                 "CPU shrink",
-                "live CPU shrink requires Linux x86_64 with offline-CPU checkpoint support; no CPUs changed",
+                "live CPU shrink requires Linux with offline-CPU checkpoint support; no CPUs changed",
             ));
         }
     }
@@ -977,7 +991,10 @@ mod tests {
     fn live_compute_platform_refusal_is_actionable() {
         let result = ensure_live_compute_platform("CPU resize");
         if cfg!(any(
-            all(target_os = "linux", target_arch = "x86_64"),
+            all(
+                target_os = "linux",
+                any(target_arch = "x86_64", target_arch = "aarch64")
+            ),
             all(target_os = "macos", target_arch = "aarch64")
         )) {
             assert!(result.is_ok());
