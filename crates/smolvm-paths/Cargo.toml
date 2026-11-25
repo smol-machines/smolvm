@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-paths"
-version = "1.37.2"
+version = "1.37.3"
 edition = "2021"
 description = "Shared state directories for smolvm and its host libraries"
 license = "Apache-2.0"
