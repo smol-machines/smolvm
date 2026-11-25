@@ -63,7 +63,9 @@ for dir in "${LIB_DIRS[@]}"; do
   for fw in "$dir"/libkrunfw.*; do
     [[ -f "$fw" && ! -L "$fw" ]] || continue
     banner="$(grep -a -o -m1 'Linux version [^#]*' "$fw" | head -n1 || true)"
-    if [[ "$banner" != *"(gcc "* ]]; then
+    # Cross-built guests name the compiler with its target triple.
+    gcc_banner='\(([[:alnum:]_.]+-)*gcc[[:space:]]'
+    if [[ ! $banner =~ $gcc_banner ]]; then
       echo "FAIL  $fw: guest kernel not built with gcc (${banner:-no kernel banner})"
       dir_ok=0; fail=1
     fi
