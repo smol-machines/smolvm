@@ -25,7 +25,7 @@ resolver = "2"
 
 [package]
 name = "smolvm"
-version = "1.37.2"
+version = "1.37.5"
 edition = "2021"
 description = "OCI-native microVM runtime"
 license = "Apache-2.0"
@@ -45,16 +45,16 @@ path = "src/main.rs"
 anyhow = "1"
 rand = "0.10"
 russh = { path = "vendor/russh", version = "=0.65.2", default-features = false, features = ["ring"] }
-smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.37.2" }
-smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.37.2" }
-smolvm-network = { path = "crates/smolvm-network", version = "1.37.2" }
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.37.2" }
-smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.37.2" }
-smolvm-pack = { path = "crates/smolvm-pack", version = "1.37.2" }
-smolvm-registry = { path = "crates/smolvm-registry", version = "1.37.2" }
-smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.37.2" }
+smolvm-credentials = { path = "crates/smolvm-credentials", version = "1.37.5" }
+smolvm-checkpoint = { path = "crates/smolvm-checkpoint", version = "1.37.5" }
+smolvm-network = { path = "crates/smolvm-network", version = "1.37.5" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.37.5" }
+smolvm-cuda = { path = "crates/smolvm-cuda", version = "1.37.5" }
+smolvm-pack = { path = "crates/smolvm-pack", version = "1.37.5" }
+smolvm-registry = { path = "crates/smolvm-registry", version = "1.37.5" }
+smolvm-oci-layer = { path = "crates/smolvm-oci-layer", version = "1.37.5" }
 flate2 = "1"
-smolfile = { path = "crates/smolvm-smolfile", version = "1.37.2" }
+smolfile = { path = "crates/smolvm-smolfile", version = "1.37.5" }
 thiserror = "1"
 # `string` lets `smolvm completion` rebuild the command tree from owned
 # names so hidden internal commands can be left out of the script.
@@ -75,7 +75,7 @@ libloading = "0.8"
 # on Windows 10 1809+. See src/platform/uds.rs.
 socket2 = "0.6"
 krun-socket = { git = "https://github.com/smol-machines/libkrun", rev = "4d910e78891e657072abf9c5de7c7c9af2b63f08" }
-smolvm-paths = { path = "crates/smolvm-paths", version = "1.37.2" }
+smolvm-paths = { path = "crates/smolvm-paths", version = "1.37.5" }
 sha1 = "0.10"
 sha2 = "0.10"
 ring = "0.17.14"
@@ -175,7 +175,7 @@ tempfile = "3"
 rcgen = { version = "0.13", default-features = false, features = ["ring", "pem"] }
 # WebSocket client for the interactive exec tests (already locked through axum).
 tokio-tungstenite = "0.29"
-smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.37.2" }
+smolvm-protocol = { path = "crates/smolvm-protocol", version = "1.37.5" }
 tower = { version = "0.5", features = ["util"] }
 wiremock = "0.6"
 
