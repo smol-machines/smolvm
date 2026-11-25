@@ -1457,6 +1457,12 @@ pub(crate) fn kvm_group_gid() -> Option<libc::gid_t> {
     }
 }
 
+/// The supplementary groups a VMM keeps after [`drop_privileges`]: only `kvm`.
+#[cfg(target_os = "linux")]
+pub(crate) fn vm_supplementary_groups() -> Vec<libc::gid_t> {
+    kvm_group_gid().into_iter().collect()
+}
+
 /// Irreversibly drop this process to (`uid`, `gid`), keeping only the `kvm`
 /// supplementary group. Returns `Err` if any step fails so the caller can fail
 /// closed — the VMM must never run with more privilege than requested.
@@ -1467,7 +1473,7 @@ pub(crate) fn kvm_group_gid() -> Option<libc::gid_t> {
 pub fn drop_privileges(uid: u32, gid: u32) -> std::result::Result<(), String> {
     unsafe {
         // Keep only kvm as a supplementary group (drop all others).
-        let groups: Vec<libc::gid_t> = kvm_group_gid().into_iter().collect();
+        let groups = vm_supplementary_groups();
         if libc::setgroups(groups.len(), groups.as_ptr()) != 0 {
             return Err(format!("setgroups: {}", std::io::Error::last_os_error()));
         }

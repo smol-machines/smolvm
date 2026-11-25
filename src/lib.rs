@@ -138,6 +138,7 @@ pub(crate) mod test_support;
 pub mod usage;
 pub mod util;
 pub mod vm;
+pub mod vm_access;
 pub mod vm_exit;
 /// Shared machine-workload launch used by every machine-start front-end.
 pub mod workload;
