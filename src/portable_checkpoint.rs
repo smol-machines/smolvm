@@ -6071,12 +6071,25 @@ fn stage_checkpoint_disk_layer(
     // owned hard link is an exact O(1) snapshot and survives source deletion.
     match std::fs::hard_link(source, staged) {
         Ok(()) => Ok("link"),
-        Err(error) if error.raw_os_error() == Some(libc::EXDEV) => {
+        Err(error) if link_refused_copy_instead(&error) => {
             crate::disk_utils::clone_or_copy_file(source, staged)?;
             Ok("copy")
         }
         Err(error) => Err(Error::agent("stage checkpoint disk", error.to_string())),
     }
+}
+
+/// Whether a failed hard link of an immutable checkpoint input should be
+/// replaced by a copy, which is the same snapshot at the cost of the bytes.
+/// Besides another filesystem (EXDEV), Linux refuses to link a file the
+/// caller does not own (`fs.protected_hardlinks`: EPERM), as when root
+/// expanded the shared disk template that a user's machine is built on; that
+/// failed the user's checkpoint capture outright.
+fn link_refused_copy_instead(error: &std::io::Error) -> bool {
+    matches!(
+        error.raw_os_error(),
+        Some(libc::EXDEV | libc::EPERM | libc::EACCES | libc::EMLINK | libc::EOPNOTSUPP)
+    )
 }
 
 /// Build an integrity entry for a staged checkpoint payload.
@@ -7826,6 +7839,27 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn a_refused_hard_link_of_a_checkpoint_input_falls_back_to_a_copy() {
+        for errno in [
+            libc::EXDEV,
+            libc::EPERM,
+            libc::EACCES,
+            libc::EMLINK,
+            libc::EOPNOTSUPP,
+        ] {
+            assert!(link_refused_copy_instead(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+        // A missing source or a full disk is a real failure, not a reason to copy.
+        for errno in [libc::ENOENT, libc::ENOSPC, libc::EIO] {
+            assert!(!link_refused_copy_instead(
+                &std::io::Error::from_raw_os_error(errno)
+            ));
+        }
+    }
 
     // A checkpoint can list a qcow2 layer as raw: install never inspects a raw
     // file, so its backing path would reach a host file through the layer
