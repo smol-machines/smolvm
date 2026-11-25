@@ -416,6 +416,54 @@ test_volume_owned_by_non_root_workload_user() {
     [[ "$host_owner" == "ok" ]] || { log_fail "host does not own the files the workload created"; return 1; }
 }
 
+# A directory mounted into a running machine from another filesystem than the
+# machine's data directory reaches the guest as a virtio-fs submount. The guest
+# kernel refused to id-map a submount (libkrunfw 0065), so such a mount kept the
+# host user's owner and a non-root workload could not write to it.
+test_live_mount_from_another_filesystem_belongs_to_workload_user() {
+    local vm_name="test-vm-vol-xfs-$$"
+    if [[ "$(uname -s)" != Linux ]]; then
+        echo "  (skipped: Linux only)"
+        return 0
+    fi
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    $SMOLVM machine create --name "$vm_name" --image alpine:latest -u guest >/dev/null 2>&1 || return 1
+    local data_dir other="" candidate
+    data_dir=$($SMOLVM machine data-dir --name "$vm_name" 2>/dev/null)
+    # /dev and /run are protected from mounting; /tmp is tmpfs on many hosts.
+    for candidate in /tmp /var/tmp; do
+        if [[ -n "$data_dir" && -d "$candidate" && -w "$candidate" &&
+            "$(stat -c %d "$candidate")" != "$(stat -c %d "$data_dir")" ]]; then
+            other=$candidate
+            break
+        fi
+    done
+    if [[ -z "$other" ]]; then
+        $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+        echo "  (skipped: /tmp and /var/tmp share a filesystem with the machine's data directory)"
+        return 0
+    fi
+
+    local live
+    live=$(mktemp -d -p "$other")
+    run_with_timeout 90 $SMOLVM machine start --name "$vm_name" >/dev/null 2>&1 &&
+        $SMOLVM machine mount add --name "$vm_name" -v "$live:/live-share" >/dev/null 2>&1
+    local out
+    out=$(run_with_timeout 30 $SMOLVM machine exec --name "$vm_name" -- \
+        sh -c 'echo "$(stat -c %u:%g /live-share) $(touch /live-share/x 2>/dev/null && echo write-ok || echo write-denied)"' 2>&1)
+    local host_owner=""
+    [[ -O "$live/x" ]] && host_owner="ok"
+
+    $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
+    rm -rf "$live"
+
+    if [[ "$out" != "405:100 write-ok" ]]; then
+        log_fail "inside the machine: $out"
+        return 1
+    fi
+    [[ "$host_owner" == "ok" ]] || { log_fail "host does not own the file the workload created"; return 1; }
+}
+
 test_disk_volume_takes_image_ownership() {
     local vm_name="test-vm-diskvol-owner"
     $SMOLVM machine delete --name "$vm_name" -f >/dev/null 2>&1 || true
@@ -461,5 +509,6 @@ run_test "Create with --image: volume targets at/below /workspace resolve in gue
 run_test "Volume: staged sync and restart persistence" test_staged_volume_sync_and_restart || true
 run_test "Volume: new disk volume takes the image's ownership" test_disk_volume_takes_image_ownership || true
 run_test "Volume: host directory belongs to a non-root workload user" test_volume_owned_by_non_root_workload_user || true
+run_test "Volume: live mount from another filesystem belongs to a non-root workload user" test_live_mount_from_another_filesystem_belongs_to_workload_user || true
 
 print_summary "Volume Tests"
