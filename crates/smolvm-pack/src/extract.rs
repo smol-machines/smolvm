@@ -345,7 +345,17 @@ fn server_honors_override_stat() -> bool {
 /// pack's agent asks for: on a root host that drops each VMM to its own uid,
 /// archived owners on disk are unreadable to the VMM.
 fn host_copies_need_owner_record(cache_dir: &Path) -> bool {
-    per_vm_uid_drop_active() && server_honors_override_stat() && user_xattrs_supported(cache_dir)
+    #[cfg(unix)]
+    {
+        per_vm_uid_drop_active()
+            && server_honors_override_stat()
+            && user_xattrs_supported(cache_dir)
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = cache_dir;
+        false
+    }
 }
 /// Written beside the extraction marker once every staged layer tar has been
 /// unpacked on the host with its ownership recorded in the override xattr.
@@ -3879,8 +3889,11 @@ fn unpacked_layer_dirs(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
 /// [`repair_legacy_layer_owners`] still has to repair. Cheap: markers and one
 /// directory listing.
 fn legacy_layer_owners_unrecorded(cache_dir: &Path) -> bool {
-    cfg!(target_os = "linux")
-        && per_vm_uid_drop_active()
+    #[cfg(target_os = "linux")]
+    let uid_drop = per_vm_uid_drop_active();
+    #[cfg(not(target_os = "linux"))]
+    let uid_drop = false;
+    uid_drop
         && !cache_dir.join(HOST_LAYERS_MARKER).exists()
         && !cache_dir.join("layers").join(OWNER_XATTR_MARKER).exists()
         && unpacked_layer_dirs(cache_dir).is_ok_and(|dirs| !dirs.is_empty())
