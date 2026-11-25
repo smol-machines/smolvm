@@ -309,8 +309,43 @@ pub const OPAQUE_XATTR_MARKER: &str = "opaque-xattr";
 /// every host-extracted layer with raw host owners: root as the VMM's uid and
 /// `_apt` as 65534, baked into the exported `.smolmachine`.
 pub fn shares_override_stat_layers(dir: &Path) -> bool {
-    dir.join(OPAQUE_XATTR_MARKER).is_file()
-        || dir.join("layers").join(OPAQUE_XATTR_MARKER).is_file()
+    [OPAQUE_XATTR_MARKER, OWNER_XATTR_MARKER]
+        .iter()
+        .any(|marker| dir.join(marker).is_file() || dir.join("layers").join(marker).is_file())
+}
+
+/// Declares, beside layers the host unpacked in the layout that predates
+/// [`HOST_LAYERS_MARKER`], that their owners and modes are recorded in the
+/// override xattr and every host copy belongs to root. It turns on the
+/// server's override and nothing else: unlike [`OPAQUE_XATTR_MARKER`] it does
+/// not change how the guest mounts the overlay, so a checkpoint taken over the
+/// older layout still resumes over the same whiteouts and opaque directories.
+///
+/// Under the per-VM uid drop the VMM reaches the layers through an idmapped
+/// mount that maps only on-disk id 0. A host copy left with its archived owner
+/// (a 0600 file of uid 1000) could not be opened, so the guest got EACCES even
+/// as root, and a runtime that reads every file under a directory (crun's
+/// `tmpcopyup` of /run) failed to start the workload.
+const OWNER_XATTR_MARKER: &str = ".smolvm-owner-xattr";
+/// Written once [`repair_legacy_layer_owners`] has recorded every owner and
+/// mode of an older-layout extraction in the override xattr, before it hands
+/// the host copies to root. A repair interrupted after that resumes with the
+/// hand-over; one interrupted before it records again from unchanged owners.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+const LEGACY_OWNERS_RECORDED_MARKER: &str = ".smolvm-legacy-owners-recorded";
+
+/// Whether this host's virtiofs server presents the override xattr.
+fn server_honors_override_stat() -> bool {
+    cfg!(any(target_os = "macos", target_os = "windows"))
+        || HOST_LAYERS_PROBE.get().is_some_and(|probe| probe())
+}
+
+/// Whether host-unpacked layers in `cache_dir` must leave their host copies
+/// to root and carry their owners in the override xattr, whatever layout the
+/// pack's agent asks for: on a root host that drops each VMM to its own uid,
+/// archived owners on disk are unreadable to the VMM.
+fn host_copies_need_owner_record(cache_dir: &Path) -> bool {
+    per_vm_uid_drop_active() && server_honors_override_stat() && user_xattrs_supported(cache_dir)
 }
 /// Written beside the extraction marker once every staged layer tar has been
 /// unpacked on the host with its ownership recorded in the override xattr.
@@ -350,10 +385,6 @@ const WHITEOUT_MODE: u32 = 0o020000;
 /// `SMOLVM_HOST_LAYERS=on` waives the pack-version check (for packs built before
 /// the threshold); `off` disables the path; neither bypasses the server check.
 fn host_layers_via_override_stat(pack_version: Option<&str>, cache_dir: &Path) -> bool {
-    let server_honors_override = || {
-        cfg!(any(target_os = "macos", target_os = "windows"))
-            || HOST_LAYERS_PROBE.get().is_some_and(|probe| probe())
-    };
     // The override can only relax the pack-version check: a server that
     // cannot present the xattr would show every file as the host's user.
     match std::env::var("SMOLVM_HOST_LAYERS").ok().as_deref() {
@@ -365,7 +396,7 @@ fn host_layers_via_override_stat(pack_version: Option<&str>, cache_dir: &Path) -
             }
         }
     }
-    if !server_honors_override() {
+    if !server_honors_override_stat() {
         return false;
     }
     // A root Linux host without the uid drop already reproduces owners on
@@ -2518,6 +2549,7 @@ fn extract_sidecar_capped(
         // start. Finish the job here, once, under the same lock.
         let upgraded = upgrade_staged_layers(sidecar_path, cache_dir, agent_version, debug)?;
         repair_host_layer_owners(cache_dir, debug)?;
+        repair_legacy_layer_owners(cache_dir, debug)?;
         // An extraction made before `open_layers_container` existed may hold a
         // `layers` directory only its builder's uid can enter.
         open_layers_container(&cache_dir.join("layers"));
@@ -3800,6 +3832,175 @@ fn repair_host_layer_symlink_owners(cache_dir: &Path) -> std::io::Result<()> {
     fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")
 }
 
+/// Whether `path` itself (never a link's target) carries the user xattr `name`.
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn has_user_xattr(path: &Path, name: &str) -> bool {
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        let (Ok(c_path), Ok(c_name)) = (
+            std::ffi::CString::new(path.as_os_str().as_bytes()),
+            std::ffi::CString::new(name),
+        ) else {
+            return false;
+        };
+        unsafe { libc::lgetxattr(c_path.as_ptr(), c_name.as_ptr(), std::ptr::null_mut(), 0) >= 0 }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (path, name);
+        false
+    }
+}
+
+/// The unpacked layer trees of `cache_dir`: each `layers/<id>` beside its tar.
+fn unpacked_layer_dirs(cache_dir: &Path) -> std::io::Result<Vec<PathBuf>> {
+    let layers = cache_dir.join("layers");
+    let mut dirs = Vec::new();
+    let entries = match fs::read_dir(&layers) {
+        Ok(entries) => entries,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(dirs),
+        Err(e) => return Err(e),
+    };
+    for entry in entries {
+        let tar = entry?.path();
+        if !tar.extension().is_some_and(|ext| ext == "tar") {
+            continue;
+        }
+        let dir = layers.join(tar.file_stem().unwrap_or_default());
+        if fs::symlink_metadata(&dir).is_ok_and(|meta| meta.is_dir()) {
+            dirs.push(dir);
+        }
+    }
+    Ok(dirs)
+}
+
+/// Whether `cache_dir` holds older-layout layers that
+/// [`repair_legacy_layer_owners`] still has to repair. Cheap: markers and one
+/// directory listing.
+fn legacy_layer_owners_unrecorded(cache_dir: &Path) -> bool {
+    cfg!(target_os = "linux")
+        && per_vm_uid_drop_active()
+        && !cache_dir.join(HOST_LAYERS_MARKER).exists()
+        && !cache_dir.join("layers").join(OWNER_XATTR_MARKER).exists()
+        && unpacked_layer_dirs(cache_dir).is_ok_and(|dirs| !dirs.is_empty())
+}
+
+/// Give root, on the host, every file of layers an older engine unpacked with
+/// their archived owners, recording those owners and modes in the override
+/// xattr first, once. See [`OWNER_XATTR_MARKER`] for why.
+///
+/// The layout is otherwise left exactly as it is: whiteouts, opaque
+/// directories and the guest's overlay options do not change, so a checkpoint
+/// taken over this entry resumes over the same tree. What the guest sees is
+/// what the files held on disk, now presented through the override instead of
+/// being unreadable.
+///
+/// Two passes keep it resumable. The first records and changes no owner, so
+/// running it again reads the same owners; an entry that already carries a
+/// record (a layer unpacked with one) keeps it. Only once every record is
+/// written ([`LEGACY_OWNERS_RECORDED_MARKER`]) does the second pass hand each
+/// host copy to root, keeping the owner bits the VMM needs to open it. The
+/// share turns on the override only when [`OWNER_XATTR_MARKER`] is written at
+/// the very end; a machine launched before that sees the files as root's.
+///
+/// User xattrs cover regular files and directories only: a symlink's owner
+/// goes in its directory's [`SYMLINK_OWNERS_XATTR`], and a device node, fifo
+/// or socket (a whiteout is a 0:0 device already) is presented as root's.
+/// Must run under the extraction lock.
+fn repair_legacy_layer_owners(cache_dir: &Path, debug: bool) -> std::io::Result<()> {
+    if !legacy_layer_owners_unrecorded(cache_dir) || !host_copies_need_owner_record(cache_dir) {
+        return Ok(());
+    }
+    #[cfg(target_os = "linux")]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let layer_dirs = unpacked_layer_dirs(cache_dir)?;
+        let recorded = cache_dir.join(LEGACY_OWNERS_RECORDED_MARKER);
+        let walk = |visit: &mut dyn FnMut(&Path, &fs::Metadata) -> std::io::Result<()>| {
+            for root in &layer_dirs {
+                let mut pending = vec![root.clone()];
+                while let Some(path) = pending.pop() {
+                    let meta = fs::symlink_metadata(&path)?;
+                    if meta.is_dir() {
+                        for entry in fs::read_dir(&path)? {
+                            pending.push(entry?.path());
+                        }
+                    }
+                    visit(&path, &meta)?;
+                }
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        if !recorded.exists() {
+            let mut links = PendingSymlinkOwners::default();
+            walk(&mut |path, meta| {
+                let kind = meta.file_type();
+                if kind.is_symlink() {
+                    links.set(path, (u64::from(meta.uid()), u64::from(meta.gid())));
+                } else if (kind.is_file() || kind.is_dir())
+                    && !has_user_xattr(path, OVERRIDE_STAT_XATTR)
+                {
+                    record_override_stat(
+                        path,
+                        u64::from(meta.uid()),
+                        u64::from(meta.gid()),
+                        meta.mode() & 0o7777,
+                    )?;
+                }
+                Ok(())
+            })?;
+            links.write();
+            fs::write(&recorded, "")?;
+        }
+        let mut handed = 0u64;
+        walk(&mut |path, meta| {
+            let kind = meta.file_type();
+            if kind.is_file() || kind.is_dir() {
+                let owner_bits = if kind.is_dir() { 0o700 } else { 0o600 };
+                if meta.mode() & owner_bits != owner_bits {
+                    set_mode(path, (meta.mode() & 0o777) | owner_bits);
+                }
+            }
+            if meta.uid() != 0 || meta.gid() != 0 {
+                set_owner(path, 0, 0);
+                handed += 1;
+            }
+            Ok(())
+        })?;
+        fs::write(cache_dir.join("layers").join(OWNER_XATTR_MARKER), "")?;
+        let _ = fs::remove_file(&recorded);
+        if debug || handed > 0 {
+            eprintln!(
+                "Recorded the image's file owners for this host's per-machine users \
+                 ({handed} files handed to root) in {}",
+                cache_dir.display()
+            );
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    let _ = debug;
+    Ok(())
+}
+
+/// Repair, before a machine boots from `cache_dir`, layers an older engine
+/// unpacked with their archived owners (see [`repair_legacy_layer_owners`]).
+/// Machines created before the repair existed start without going through
+/// an extraction, so the launcher calls this too. Does nothing, without taking
+/// the lock, once the entry is repaired or needs no repair.
+pub fn ensure_layer_owner_records(cache_dir: &Path) -> std::io::Result<()> {
+    if !legacy_layer_owners_unrecorded(cache_dir) {
+        return Ok(());
+    }
+    let lock_file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(cache_dir.with_extension("lock"))?;
+    lock_file_exclusive(&lock_file)?;
+    repair_legacy_layer_owners(cache_dir, false)
+}
+
 /// Inner extraction logic (called under the lock).
 /// Unpack, on the host, the layer tars an earlier extraction left staged for
 /// the guest, when this host can now describe their ownership through the
@@ -4507,6 +4708,7 @@ fn extract_sidecar_inner(
     if !host_layers
         && !guest_unpacks_layers
         && !host_unpack_preserves_ownership()
+        && !host_copies_need_owner_record(cache_dir)
         && has_layer_tars(cache_dir)
     {
         // Extracting here is what every smolvm did before staging existed, so
@@ -4889,6 +5091,11 @@ fn post_process_extraction(
         // dir is already case-sensitive. If the volume can't be created on
         // macOS, fail rather than silently corrupting case-colliding paths.
         let extract_dir = extraction_layers_dir(cache_dir, debug)?;
+        // The layout the pack's agent reads decides how whiteouts are written,
+        // but not who owns the host copies: under the per-VM uid drop an
+        // older-layout unpack still leaves them to root and records the
+        // archived owners in the override xattr (see [`OWNER_XATTR_MARKER`]).
+        let record_owners = owner_xattr || host_copies_need_owner_record(cache_dir);
 
         // Only the tars whose layer is not already in place still cost disk.
         // A tar's size is a faithful upper bound on the tree it unpacks to.
@@ -4918,9 +5125,13 @@ fn post_process_extraction(
                     layer_dir.file_name().unwrap_or_default().to_string_lossy()
                 );
             }
-            if let Some(report) =
-                materialize_tar_dir(tar, layer_dir, debug, owner_xattr, layer_tars > 1)?
-            {
+            if let Some(report) = materialize_tar_dir(
+                tar,
+                layer_dir,
+                debug,
+                record_owners,
+                owner_xattr && layer_tars > 1,
+            )? {
                 if debug && report.skipped > 0 {
                     eprintln!(
                         "debug: layer {}: {} entries the host could not represent were skipped",
@@ -4936,6 +5147,10 @@ fn post_process_extraction(
             fs::write(cache_dir.join(HOST_LAYER_OWNERS_MARKER), "")?;
             fs::write(cache_dir.join(HOST_LAYER_SYMLINKS_MARKER), "")?;
             fs::write(cache_dir.join(HOST_LAYERS_MARKER), "")?;
+        } else if record_owners && layer_tars > 0 && pending.len() == layer_tars {
+            // Every layer was unpacked just now with its owners recorded. A
+            // layer already in place predates this and is left to the repair.
+            fs::write(extract_dir.join(OWNER_XATTR_MARKER), "")?;
         }
         // Record the manifest's layer order so the guest stacks overlayfs
         // lowerdirs correctly (layer dirs are named by digest and don't sort
@@ -9140,6 +9355,175 @@ mod tests {
         fs::create_dir_all(staged.join("layers")).unwrap();
         repair_host_layer_owners(&staged, false).unwrap();
         assert!(!staged.join(HOST_LAYER_OWNERS_MARKER).exists());
+    }
+
+    /// Whether this test host can exercise the per-VM uid drop's layer path:
+    /// root with the drop on, and a temp filesystem that stores user xattrs.
+    #[cfg(target_os = "linux")]
+    fn uid_drop_layer_host(dir: &Path) -> bool {
+        set_host_layers_probe(|| true);
+        (unsafe { libc::geteuid() } == 0) && per_vm_uid_drop_active() && user_xattrs_supported(dir)
+    }
+
+    /// The incident: a pack built by smolvm 1.6.13 was unpacked on the host in
+    /// the layout that predates host layers, with its archived owners on disk.
+    /// Under the per-VM uid drop the VMM could not open `/run/gini/f` (0600,
+    /// uid 1000), and crun's copy-up of /run failed with EACCES. The repair
+    /// records every owner and mode in the override xattr, hands the host copies
+    /// to root and turns the override on for the share, without changing the
+    /// layout the guest mounts.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_older_layout_cache_with_archived_owners_is_recorded_and_handed_to_root() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        if !uid_drop_layer_host(root.path()) {
+            return;
+        }
+        let cache = root.path().join("entry");
+        let layers = cache.join("layers");
+        let layer = layers.join("aaaa");
+        let gini = layer.join("run").join("gini");
+        fs::create_dir_all(&gini).unwrap();
+        fs::write(layers.join("aaaa.tar"), b"").unwrap();
+        fs::write(gini.join("f"), b"secret").unwrap();
+        std::os::unix::fs::symlink("f", gini.join("link")).unwrap();
+        // A record an earlier unpack wrote is the archived owner: kept.
+        fs::write(layer.join("kept"), b"k").unwrap();
+        record_override_stat(&layer.join("kept"), 42, 43, 0o640).unwrap();
+        set_mode(&gini.join("f"), 0o600);
+        set_mode(&gini, 0o700);
+        for path in [gini.clone(), gini.join("f"), gini.join("link")] {
+            set_owner(&path, 1000, 1001);
+        }
+        assert!(!shares_override_stat_layers(&layers));
+
+        ensure_layer_owner_records(&cache).unwrap();
+
+        let xattr = |path: &Path| read_user_xattr(path, OVERRIDE_STAT_XATTR);
+        assert_eq!(xattr(&gini).as_deref(), Some("1000:1001:0700"));
+        assert_eq!(xattr(&gini.join("f")).as_deref(), Some("1000:1001:0600"));
+        assert_eq!(xattr(&layer.join("kept")).as_deref(), Some("42:43:0640"));
+        let links = read_user_xattr(&gini, SYMLINK_OWNERS_XATTR).unwrap_or_default();
+        assert!(links.contains("link\u{0}1000:1001"), "{links:?}");
+        for path in [gini.clone(), gini.join("f"), gini.join("link")] {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (0, 0), "{}", path.display());
+        }
+        assert_eq!(fs::metadata(&gini).unwrap().mode() & 0o700, 0o700);
+        assert_eq!(fs::metadata(gini.join("f")).unwrap().mode() & 0o600, 0o600);
+        assert!(shares_override_stat_layers(&layers));
+        assert!(
+            !cache.join(HOST_LAYERS_MARKER).exists(),
+            "the layout is unchanged"
+        );
+        assert!(
+            !layers.join(OPAQUE_XATTR_MARKER).exists(),
+            "the guest's mount is unchanged"
+        );
+        assert!(!cache.join(LEGACY_OWNERS_RECORDED_MARKER).exists());
+
+        // Once marked, the walk does not run again.
+        set_owner(&gini.join("f"), 1000, 1001);
+        ensure_layer_owner_records(&cache).unwrap();
+        assert_eq!(fs::metadata(gini.join("f")).unwrap().uid(), 1000);
+    }
+
+    /// A repair stopped after its record pass resumes with the hand-over and
+    /// does not record again: by then some owners may already be root's.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_interrupted_owner_repair_resumes_without_recording_again() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        if !uid_drop_layer_host(root.path()) {
+            return;
+        }
+        let cache = root.path().join("entry");
+        let layer = cache.join("layers").join("bbbb");
+        fs::create_dir_all(&layer).unwrap();
+        fs::write(cache.join("layers").join("bbbb.tar"), b"").unwrap();
+        let handed = layer.join("handed");
+        let pending = layer.join("pending");
+        fs::write(&handed, b"h").unwrap();
+        fs::write(&pending, b"p").unwrap();
+        record_override_stat(&handed, 5, 5, 0o600).unwrap();
+        record_override_stat(&pending, 1000, 1000, 0o600).unwrap();
+        set_owner(&pending, 1000, 1000);
+        fs::write(cache.join(LEGACY_OWNERS_RECORDED_MARKER), "").unwrap();
+
+        ensure_layer_owner_records(&cache).unwrap();
+
+        assert_eq!(
+            read_user_xattr(&handed, OVERRIDE_STAT_XATTR).as_deref(),
+            Some("5:5:0600"),
+            "a host copy already handed to root keeps its record"
+        );
+        assert_eq!(fs::metadata(&pending).unwrap().uid(), 0);
+        assert!(cache.join("layers").join(OWNER_XATTR_MARKER).exists());
+    }
+
+    /// A fresh extraction in the older layout on a uid-drop host records the
+    /// archived owners instead of chowning to them, and leaves the overlay
+    /// options alone: no `opaque-xattr`, no host-layers marker.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn an_older_layout_extraction_under_the_uid_drop_leaves_host_copies_to_root() {
+        use std::os::unix::fs::MetadataExt;
+        let root = tempfile::tempdir().unwrap();
+        if !uid_drop_layer_host(root.path()) {
+            return;
+        }
+        let cache = root.path().join("entry");
+        let layers = cache.join("layers");
+        fs::create_dir_all(&layers).unwrap();
+        let mut builder = tar::Builder::new(Vec::new());
+        for (path, kind, mode) in [
+            ("run/", tar::EntryType::Directory, 0o755),
+            ("run/gini/", tar::EntryType::Directory, 0o700),
+            ("run/gini/f", tar::EntryType::Regular, 0o600),
+        ] {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(kind);
+            header.set_mode(mode);
+            let owner = if path.starts_with("run/gini") {
+                1000
+            } else {
+                0
+            };
+            header.set_uid(owner);
+            header.set_gid(owner);
+            let body: &[u8] = if kind == tar::EntryType::Regular {
+                b"secret"
+            } else {
+                b""
+            };
+            header.set_size(body.len() as u64);
+            header.set_cksum();
+            builder.append_data(&mut header, path, body).unwrap();
+        }
+        fs::write(layers.join("cccc.tar"), builder.into_inner().unwrap()).unwrap();
+
+        post_process_extraction(&cache, &["cccc".to_string()], false, false, false).unwrap();
+
+        let gini = layers.join("cccc").join("run").join("gini");
+        for path in [gini.clone(), gini.join("f")] {
+            let meta = fs::symlink_metadata(&path).unwrap();
+            assert_eq!((meta.uid(), meta.gid()), (0, 0), "{}", path.display());
+        }
+        assert_eq!(
+            read_user_xattr(&gini, OVERRIDE_STAT_XATTR).as_deref(),
+            Some("1000:1000:0700")
+        );
+        assert_eq!(
+            read_user_xattr(&gini.join("f"), OVERRIDE_STAT_XATTR).as_deref(),
+            Some("1000:1000:0600")
+        );
+        assert!(shares_override_stat_layers(&layers));
+        assert!(!layers.join(OPAQUE_XATTR_MARKER).exists());
+        assert!(!cache.join(HOST_LAYERS_MARKER).exists());
+        // Nothing is left for the repair to do.
+        assert!(!legacy_layer_owners_unrecorded(&cache));
     }
 
     /// A symlink entry's archived owner reaches the guest through the override

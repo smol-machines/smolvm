@@ -487,6 +487,7 @@ impl LaunchFeatures {
             if !has_image_layers {
                 return Ok(self);
             }
+            repair_layer_owners_before_launch(&shared);
             self.packed_layers_dir = Some(layers_cache_dir.to_path_buf());
             self.pack_idmap_source = Some(if layers.is_dir() { layers } else { shared });
             return Ok(self);
@@ -532,6 +533,9 @@ impl LaunchFeatures {
             .map_err(|e| Error::agent("extract sidecar", e.to_string()))?;
         }
 
+        if has_image_layers {
+            repair_layer_owners_before_launch(layers_cache_dir);
+        }
         if !has_image_layers {
             // On macOS a fallback extraction may have mounted the private
             // case-sensitive layers volume; no VM-mode device needs that mount.
@@ -3375,6 +3379,20 @@ fn set_mount_owner(
         ));
     }
     Ok(())
+}
+
+/// Record, before a machine boots, the owners of layers an older engine
+/// unpacked with their archived owners, which the per-VM uid cannot read
+/// (see `smolvm_pack::extract::ensure_layer_owner_records`). Best effort: a
+/// failure leaves the layers as they were and the launch proceeds.
+fn repair_layer_owners_before_launch(cache_dir: &Path) {
+    if let Err(error) = smolvm_pack::extract::ensure_layer_owner_records(cache_dir) {
+        tracing::warn!(
+            cache = %cache_dir.display(),
+            %error,
+            "could not record packed layer owners; files owned by other users stay unreadable to this machine"
+        );
+    }
 }
 
 #[cfg(test)]
