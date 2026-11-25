@@ -164,8 +164,9 @@ curl http://127.0.0.1:8000/        # appears within about a second
 smolvm machine status --name dev   # port 8000 -> 8000: auto
 ```
 
-The guest agent reads `/proc/net/tcp` and `/proc/net/tcp6` once a second and sends the host
-the set of listening ports whenever it changes; the host publishes guest port `P` at
+The guest agent checks for listening TCP ports once a second. With `--docker-socket`,
+it also checks when Docker starts a container or reports that one has exited.
+When the set changes, the host publishes guest port `P` at
 `127.0.0.1:P` and `[::1]:P` and closes it when the guest stops listening or the machine stops.
 It reaches the server at the guest's loopback, so a server bound to `127.0.0.1` inside works as
 well as one bound to `0.0.0.0`; one bound to a single other address (a container bridge) does
