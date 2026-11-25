@@ -49,6 +49,17 @@ pub fn api_digest_ttl() -> Option<u64> {
     Some(API_DIGEST_TTL_SECS.load(std::sync::atomic::Ordering::Relaxed)).filter(|secs| *secs > 0)
 }
 
+/// Whether eviction after a seed build runs on its own thread instead of in the
+/// request that built the seed. Only `smolvm serve` turns it on: its process is
+/// long-lived, while a CLI run or an embedding process may exit or fork at any
+/// point and keeps pruning inline.
+static BACKGROUND_PRUNE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Run seed eviction off the request path (`smolvm serve`).
+pub fn prune_in_background() {
+    BACKGROUND_PRUNE.store(true, std::sync::atomic::Ordering::Relaxed);
+}
+
 #[cfg(unix)]
 pub use imp::{
     discard_unbooted_storage, ensure_image_seed, exit_by_signal, interruptible,
@@ -718,7 +729,7 @@ mod imp {
         drop(cache);
         note_recent_image(&root, image);
         if built {
-            prune(&root, max_bytes(), &seed);
+            prune_after_build(&root, &seed);
         }
         Ok(true)
     }
@@ -743,7 +754,7 @@ mod imp {
         note_recent_image(&root, image);
         if built {
             if let Some((seed, _)) = seed_disk(&key_dir) {
-                prune(&root, max_bytes(), &seed);
+                prune_after_build(&root, &seed);
             }
         }
         Ok(())
@@ -1407,57 +1418,132 @@ mod imp {
             .unwrap_or(DEFAULT_MAX_BYTES)
     }
 
+    /// Evict least recently used seeds after a build, on a thread of its own
+    /// when the process asked for that (`smolvm serve`), else in the caller.
+    fn prune_after_build(root: &Path, keep: &Path) {
+        if super::BACKGROUND_PRUNE.load(std::sync::atomic::Ordering::Relaxed) {
+            let (root, keep) = (root.to_path_buf(), keep.to_path_buf());
+            let spawned = std::thread::Builder::new()
+                .name("seed-prune".into())
+                .spawn(move || prune(&root, max_bytes(), &keep));
+            if spawned.is_ok() {
+                return;
+            }
+        }
+        prune(root, max_bytes(), keep);
+    }
+
     /// Evict least recently used seeds while the cache is over `max_bytes`. A seed
     /// is only evicted when no disk image under smolvm's cache backs onto it: every
     /// machine, fork generation and paused disk that uses one keeps it.
     fn prune(root: &Path, max_bytes: u64, keep: &Path) {
+        let scan_root = crate::agent::vm_cache_root()
+            .parent()
+            .map_or_else(crate::agent::vm_cache_root, Path::to_path_buf);
+        prune_with(root, max_bytes, keep, || backing_references(&scan_root));
+    }
+
+    /// Slack under the scan's start time for filesystems with coarse timestamps.
+    const SCAN_START_SLACK: std::time::Duration = std::time::Duration::from_secs(2);
+    /// Prefix of a seed directory being deleted. Eviction renames the directory
+    /// first, so a pruner that dies mid-delete never leaves a half-deleted seed
+    /// under its key; the next prune removes what is left.
+    const EVICTING_PREFIX: &str = ".evicting-";
+
+    /// `prune` with the backing-reference scan supplied, so tests can act during it.
+    ///
+    /// The scan walks every disk image under smolvm's cache, which takes minutes
+    /// on a host with thousands of branches, so it runs WITHOUT the cache lock:
+    /// creates keep attaching seeds while it runs. A seed attached during the scan
+    /// may be missed by it, but attaching stamps the seed's mtime while the
+    /// shared cache lock is held, and the eviction below runs under the exclusive
+    /// lock, so every such attach has finished and stamped by then. Any seed used
+    /// since the scan started is kept.
+    pub(super) fn prune_with(
+        root: &Path,
+        max_bytes: u64,
+        keep: &Path,
+        scan: impl FnOnce() -> std::io::Result<std::collections::HashSet<PathBuf>>,
+    ) {
+        // One pruner at a time: a second scan would find nothing the first misses.
+        let Some(_pruning) = Lock::try_exclusive(&root.join(".prune.lock")) else {
+            return;
+        };
+        remove_evicting(root);
+        let total: u64 = cached_seeds(root).iter().map(|(_, bytes, _)| bytes).sum();
+        if total <= max_bytes {
+            return;
+        }
+        let scan_started = std::time::SystemTime::now()
+            .checked_sub(SCAN_START_SLACK)
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let Ok(referenced) = scan() else {
+            // An incomplete scan cannot prove an old seed is unreferenced.
+            return;
+        };
         let Ok(_cache) = CacheLock::exclusive(root) else {
             return;
         };
+        let mut seeds = cached_seeds(root);
+        let mut total: u64 = seeds.iter().map(|(_, bytes, _)| bytes).sum();
+        seeds.sort_by_key(|(_, _, used)| *used);
+        let mut nonce = 0u32;
+        for (seed, bytes, used) in seeds {
+            if total <= max_bytes {
+                break;
+            }
+            let canonical = seed.canonicalize().unwrap_or_else(|_| seed.clone());
+            if seed == keep || used >= scan_started || referenced.contains(&canonical) {
+                continue;
+            }
+            let dir = seed.parent().expect("seed path has a parent");
+            let key = dir.file_name().unwrap_or_default().to_string_lossy();
+            let lock = root.join(format!("{key}.lock"));
+            // Skip a seed another process is building or about to use.
+            let Some(_lock) = Lock::try_exclusive(&lock) else {
+                continue;
+            };
+            nonce += 1;
+            let evicting = root.join(format!(
+                "{EVICTING_PREFIX}{key}-{}-{nonce}",
+                std::process::id()
+            ));
+            if std::fs::rename(dir, &evicting).is_ok() {
+                total = total.saturating_sub(bytes);
+                let _ = std::fs::remove_dir_all(&evicting);
+                tracing::info!(seed = %seed.display(), "evicted image seed");
+            }
+        }
+    }
+
+    /// Every seed in the cache with its allocated size and last use.
+    fn cached_seeds(root: &Path) -> Vec<(PathBuf, u64, std::time::SystemTime)> {
         let Ok(entries) = std::fs::read_dir(root) else {
-            return;
+            return Vec::new();
         };
-        let mut seeds: Vec<(PathBuf, u64, std::time::SystemTime)> = entries
+        entries
             .flatten()
+            .filter(|entry| !entry.file_name().to_string_lossy().starts_with('.'))
             .filter_map(|entry| seed_disk(&entry.path()).map(|(seed, _)| seed))
             .filter_map(|seed| {
                 let meta = std::fs::metadata(&seed).ok()?;
                 Some((seed, meta.blocks() * 512, meta.modified().ok()?))
             })
-            .collect();
-        let mut total: u64 = seeds.iter().map(|(_, bytes, _)| bytes).sum();
-        if total <= max_bytes {
-            return;
-        }
-        let Ok(referenced) = backing_references(
-            &crate::agent::vm_cache_root()
-                .parent()
-                .map_or_else(crate::agent::vm_cache_root, Path::to_path_buf),
-        ) else {
-            // An incomplete scan cannot prove an old seed is unreferenced.
+            .collect()
+    }
+
+    /// Finish deleting seeds an earlier pruner renamed but did not remove.
+    fn remove_evicting(root: &Path) {
+        let Ok(entries) = std::fs::read_dir(root) else {
             return;
         };
-        seeds.sort_by_key(|(_, _, used)| *used);
-        for (seed, bytes, _) in seeds {
-            if total <= max_bytes {
-                break;
-            }
-            let canonical = seed.canonicalize().unwrap_or_else(|_| seed.clone());
-            if seed == keep || referenced.contains(&canonical) {
-                continue;
-            }
-            let dir = seed.parent().expect("seed path has a parent");
-            let lock = root.join(format!(
-                "{}.lock",
-                dir.file_name().unwrap_or_default().to_string_lossy()
-            ));
-            // Skip a seed another process is building or about to use.
-            let Some(_lock) = Lock::try_exclusive(&lock) else {
-                continue;
-            };
-            if std::fs::remove_dir_all(dir).is_ok() {
-                total = total.saturating_sub(bytes);
-                tracing::info!(seed = %seed.display(), "evicted image seed");
+        for entry in entries.flatten() {
+            if entry
+                .file_name()
+                .to_string_lossy()
+                .starts_with(EVICTING_PREFIX)
+            {
+                let _ = std::fs::remove_dir_all(entry.path());
             }
         }
     }
@@ -1681,6 +1767,91 @@ mod imp {
 mod tests {
     use super::imp::*;
     use std::path::PathBuf;
+
+    /// A seed directory `key` under `root` holding a 64 KiB disk last used
+    /// `age_secs` ago; returns the disk's path.
+    fn fake_seed(root: &std::path::Path, key: &str, age_secs: u64) -> PathBuf {
+        let dir = root.join(key);
+        std::fs::create_dir_all(&dir).unwrap();
+        let disk = dir.join("storage.qcow2");
+        std::fs::write(&disk, vec![7u8; 64 * 1024]).unwrap();
+        let used = std::time::SystemTime::now() - std::time::Duration::from_secs(age_secs);
+        std::fs::File::options()
+            .write(true)
+            .open(&disk)
+            .unwrap()
+            .set_modified(used)
+            .unwrap();
+        disk
+    }
+
+    #[test]
+    fn prune_evicts_old_unreferenced_seeds_and_keeps_referenced_and_kept_ones() {
+        let root = tempfile::tempdir().unwrap();
+        let old = fake_seed(root.path(), "a".repeat(64).as_str(), 3600);
+        let referenced = fake_seed(root.path(), "b".repeat(64).as_str(), 3600);
+        let keep = fake_seed(root.path(), "c".repeat(64).as_str(), 3600);
+        let canonical = referenced.canonicalize().unwrap();
+        prune_with(root.path(), 1, &keep, || {
+            Ok([canonical].into_iter().collect())
+        });
+        assert!(!old.exists(), "an old unreferenced seed is evicted");
+        assert!(referenced.exists(), "a seed a disk backs onto is kept");
+        assert!(keep.exists(), "the seed just built is kept");
+    }
+
+    #[test]
+    fn prune_scans_without_the_cache_lock_and_keeps_a_seed_attached_during_the_scan() {
+        use std::os::fd::AsRawFd;
+        let root = tempfile::tempdir().unwrap();
+        let attached = fake_seed(root.path(), "d".repeat(64).as_str(), 3600);
+        let idle = fake_seed(root.path(), "e".repeat(64).as_str(), 3600);
+        let keep = fake_seed(root.path(), "f".repeat(64).as_str(), 3600);
+        let lock_path = root.path().join(".cache.lock");
+        prune_with(root.path(), 1, &keep, || {
+            // A create takes the shared cache lock while the scan runs...
+            let lock = std::fs::File::options()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(&lock_path)
+                .unwrap();
+            let got = unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_SH | libc::LOCK_NB) };
+            assert_eq!(got, 0, "a create must not wait for the scan");
+            // ...and attaches a disk to a seed in a directory the scan already
+            // passed, stamping the seed as used.
+            std::fs::File::options()
+                .write(true)
+                .open(&attached)
+                .unwrap()
+                .set_modified(std::time::SystemTime::now())
+                .unwrap();
+            Ok(Default::default())
+        });
+        assert!(attached.exists(), "a seed used during the scan is kept");
+        assert!(!idle.exists(), "an idle seed is still evicted");
+    }
+
+    #[test]
+    fn prune_finishes_an_interrupted_eviction_and_does_not_count_it_as_a_seed() {
+        let root = tempfile::tempdir().unwrap();
+        // A pruner that died mid-delete left this behind.
+        let leftover = root
+            .path()
+            .join(format!(".evicting-{}-1-1", "a".repeat(64)));
+        std::fs::create_dir_all(&leftover).unwrap();
+        std::fs::write(leftover.join("storage.qcow2"), vec![0u8; 64 * 1024]).unwrap();
+        let only = fake_seed(root.path(), "b".repeat(64).as_str(), 3600);
+        let scanned = std::cell::Cell::new(false);
+        // The one real seed fits the budget: nothing to scan or evict.
+        prune_with(root.path(), 1 << 30, &only, || {
+            scanned.set(true);
+            Ok(Default::default())
+        });
+        assert!(!leftover.exists(), "the half-deleted seed is removed");
+        assert!(only.exists());
+        assert!(!scanned.get(), "a cache under budget is not scanned");
+    }
 
     #[test]
     fn recently_used_images_are_prewarmed_newest_first_within_the_window() {
