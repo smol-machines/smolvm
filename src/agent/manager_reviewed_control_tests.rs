@@ -517,15 +517,20 @@ fn stop_force_cli_ends_an_unresponsive_execution_and_retains_disks() {
             std::fs::write(&manager.pid_file, format!("{pid}\n{start}")).unwrap();
             // There is no agent socket: any guest sync would fail. Exercise
             // the command dispatcher, not just the manager's force-stop API.
-            let stop = || {
+            let stop = |pid| {
                 crate::cli::machine::StopCmd {
                     name: Some(record.name.clone()),
                     timeout: None,
                     force: true,
+                    pid,
                 }
                 .run()
             };
-            stop().unwrap();
+            let stale_pid = std::process::id() as i32;
+            assert!(stop(Some(stale_pid)).is_err());
+            assert!(process::is_our_process_strict(pid, Some(start)));
+            assert_eq!(db.get_vm(&record.name).unwrap().unwrap().pid, Some(pid));
+            stop(Some(pid)).unwrap();
             assert!(!process::is_our_process_strict(pid, Some(start)));
             let stopped = db.get_vm(&record.name).unwrap().unwrap();
             assert_eq!(stopped.pid, None);
@@ -536,12 +541,16 @@ fn stop_force_cli_ends_an_unresponsive_execution_and_retains_disks() {
                 std::fs::read(root.join("staged-host/sentinel")).unwrap(),
                 b"host copy"
             );
-            stop().unwrap(); // A repeated force stop is idempotent.
+            assert!(stop(Some(pid)).is_err());
+            stop(None).unwrap(); // A repeated force stop is idempotent.
             db.update_vm(&record.name, |r| {
                 r.paused_checkpoint = Some("saved-checkpoint".into());
             })
             .unwrap();
-            assert!(stop().unwrap_err().to_string().contains("saved execution"));
+            assert!(stop(None)
+                .unwrap_err()
+                .to_string()
+                .contains("saved execution"));
             assert_eq!(
                 db.get_vm(&record.name)
                     .unwrap()
@@ -551,7 +560,7 @@ fn stop_force_cli_ends_an_unresponsive_execution_and_retains_disks() {
                 Some(std::path::Path::new("saved-checkpoint"))
             );
             assert_eq!(
-                crate::cli::vm_common::force_stop_vm_named("missing")
+                crate::cli::vm_common::force_stop_vm_named("missing", Some(pid))
                     .unwrap_err()
                     .code(),
                 "NOT_FOUND"
