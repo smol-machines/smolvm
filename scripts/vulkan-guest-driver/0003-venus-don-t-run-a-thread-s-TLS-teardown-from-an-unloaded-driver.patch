@@ -1,0 +1,71 @@
+From 935c4ec39a304de8f1078c4b6b1ebe1cbad9ce5e Mon Sep 17 00:00:00 2001
+From: Gustavo Noronha Silva <gustavo@noronha.dev.br>
+Date: Tue, 6 Oct 2026 11:08:32 -0300
+Subject: [PATCH] venus: don't run a thread's TLS teardown from an unloaded
+ driver
+
+vn_tls_get() registers vn_tls_free as the destructor of a tss key the
+first time a thread needs venus TLS state, which vkCreateDevice already
+does. The destructor is in code that is unmapped the moment the last
+vulkan instance is destroyed, which is not guaranteed to happen after
+all threads that used venus have completed.
+
+A thread that used venus and outlives its instance calls vn_tls_free
+after it has been unmapped and crashes in glibc's __nptl_deallocate_tsd
+when it exits. A thread that creates and destroys an instance and a
+device and then returns is enough to hit it; so does a surfaceless EGL
+context on zink over venus that is terminated before its thread exits.
+
+To address this, delete the tss key from an atexit() handler, which
+glibc runs when the driver is unloaded. Other threads still holding
+venus TLS at that point leak it instead of calling into unmapped code.
+
+Fixes: d17ddcc8477 ("venus: dispatch background shader tasks to secondary ring")
+Cc: mesa-stable
+Signed-off-by: Gustavo Noronha Silva <gustavo@noronha.dev.br>
+Part-of: <https://gitlab.freedesktop.org/mesa/mesa/-/merge_requests/44986>
+---
+ src/virtio/vulkan/vn_common.c | 23 +++++++++++++++++++++--
+ 1 file changed, 21 insertions(+), 2 deletions(-)
+
+diff --git a/src/virtio/vulkan/vn_common.c b/src/virtio/vulkan/vn_common.c
+index 79be3148f756..e5684ad3d9e5 100644
+--- a/src/virtio/vulkan/vn_common.c
++++ b/src/virtio/vulkan/vn_common.c
+@@ -377,12 +377,31 @@ vn_tls_free(void *tls)
+ static tss_t vn_tls_key;
+ static bool vn_tls_key_valid;
+ 
++static void
++vn_tls_key_fini(void)
++{
++   vn_tls_key_valid = false;
++   vn_tls_free(tss_get(vn_tls_key));
++   tss_delete(vn_tls_key);
++}
++
+ static void
+ vn_tls_key_create_once(void)
+ {
+    vn_tls_key_valid = tss_create(&vn_tls_key, vn_tls_free) == thrd_success;
+-   if (!vn_tls_key_valid && VN_DEBUG(INIT))
+-      vn_log(NULL, "WARNING: failed to create vn_tls_key");
++   if (!vn_tls_key_valid) {
++      if (VN_DEBUG(INIT))
++         vn_log(NULL, "WARNING: failed to create vn_tls_key");
++      return;
++   }
++
++   /* Nothing ensures all threads that called vn_tls_get() have completed when
++    * the last vulkan instance is destroyed, which unmaps the driver.
++    *
++    * Delete the TLS key so that threads still holding venus TLS leak it
++    * instead of calling into unmapped code.
++    */
++   atexit(vn_tls_key_fini);
+ }
+ 
+ struct vn_tls *
+-- 
+GitLab
+

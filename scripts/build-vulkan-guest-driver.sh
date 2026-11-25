@@ -8,10 +8,13 @@
 # against the same library versions fetch-vulkan-guest-driver.sh bundles
 # beside it, so it loads in old workload images as well as current ones.
 #
-# The source is the pinned Mesa release tarball plus the two krunkit Venus
-# patches in scripts/vulkan-guest-driver/: a macOS host maps guest
-# allocations on 16 KiB pages, so every allocation the host maps must be
-# 16 KiB aligned. On a 4 KiB-page Linux host the larger alignment is harmless.
+# The source is the pinned Mesa release tarball plus the patches in
+# scripts/vulkan-guest-driver/. 0001 and 0002 are the krunkit Venus patches:
+# a macOS host maps guest allocations on 16 KiB pages, so every allocation
+# the host maps must be 16 KiB aligned. On a 4 KiB-page Linux host the larger
+# alignment is harmless. 0003 is Mesa commit 935c4ec39a30, which the pinned
+# release predates: without it a thread that used Vulkan and outlives the
+# program's last Vulkan instance crashes when it exits.
 #
 # Usage: build-vulkan-guest-driver.sh <output-dir>
 # Writes <output-dir>/libvulkan_virtio.so, virtio_icd.json and
