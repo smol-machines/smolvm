@@ -561,6 +561,7 @@ impl ServeStartCmd {
             state.set_local_image_dir(Some(dir));
         }
         smolvm::image_seed::set_api_digest_ttl(self.seed_digest_ttl);
+        smolvm::image_seed::prune_in_background();
         if let Some(path) = &self.egress_watchlist {
             smolvm::agent::egress_watchlist::enable(path.clone())
                 .map_err(|e| smolvm::error::Error::config("load egress watchlist", e))?;
