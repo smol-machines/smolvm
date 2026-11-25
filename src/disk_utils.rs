@@ -94,6 +94,16 @@ pub(crate) fn copy_disk_from_template<D: DiskType>(
     }
 
     clone_or_copy_file(template_path, disk_path)?;
+    // The machine's own disk is writable by its owner whatever mode the template
+    // carries. A clone keeps the source's mode, and a template left 0444 made every
+    // new disk read-only: a VMM that drops to its machine's uid refused to boot
+    // them (2026-11-25), and a non-root host could not even resize the copy below.
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(disk_path, std::fs::Permissions::from_mode(0o644))
+            .map_err(|e| Error::storage("set copied disk mode", e.to_string()))?;
+    }
 
     // The default overlay may already have a full-size ext4. With a compact
     // template the guest grows the filesystem to the requested size at boot.
@@ -1380,6 +1390,31 @@ mod tests {
         assert!(
             !msg.contains("too large"),
             "a valid (non-overflowing) size must not trip the overflow guard: {msg}"
+        );
+    }
+    /// A read-only template still gives a machine a disk it can write: the copy's
+    /// mode is set, not inherited.
+    #[cfg(unix)]
+    #[test]
+    fn a_disk_copied_from_a_read_only_template_is_writable_by_its_owner() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp = tempfile::tempdir().unwrap();
+        let template = temp.path().join("template.ext4");
+        std::fs::File::create(&template)
+            .unwrap()
+            .set_len(1024 * 1024)
+            .unwrap();
+        std::fs::set_permissions(&template, std::fs::Permissions::from_mode(0o444)).unwrap();
+        let disk = temp.path().join("storage.raw");
+        let want = 4 * 1024 * 1024;
+        copy_disk_from_template::<crate::storage::Storage>(&disk, want, &template).unwrap();
+        let meta = std::fs::metadata(&disk).unwrap();
+        assert_eq!(meta.permissions().mode() & 0o777, 0o644);
+        assert_eq!(meta.len(), want);
+        assert_eq!(
+            std::fs::metadata(&template).unwrap().permissions().mode() & 0o777,
+            0o444,
+            "the template itself is left as it was"
         );
     }
 }
