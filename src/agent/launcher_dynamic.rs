@@ -724,8 +724,12 @@ pub fn launch_agent_vm_dynamic(
     // Guest↔host vsock services. The registry owns both sides of each bridge:
     // the host port registration below and the guest activation env injected
     // while building the init environment.
+    // The guest reaches the host agent only through the filter, which forwards
+    // list and sign and refuses requests that change the agent.
+    let ssh_agent_socket =
+        super::ssh_agent_filter::guard(config.ssh_agent_socket, config.vsock_socket);
     let vsock_inputs = vsock_service::VsockServiceInputs {
-        ssh_agent_socket: config.ssh_agent_socket,
+        ssh_agent_socket: ssh_agent_socket.as_deref(),
         cuda_socket: config.cuda_socket,
         docker_socket: None,
         port_forward_socket: None,
