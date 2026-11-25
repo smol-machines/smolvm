@@ -1,16 +1,16 @@
 //! Guest side of automatic port publishing: report listening TCP ports.
 //!
-//! Enabled by [`guest_env::AUTO_PORTS`]. About once a second this reads
+//! Enabled by [`guest_env::AUTO_PORTS`]. At least once a second this reads
 //! `/proc/net/tcp` and `/proc/net/tcp6`, keeps the ports the host's port
 //! forwarder can reach (bound to the wildcard address or to loopback, see
 //! [`auto_ports::forwardable_ports`]), and when that set differs from the
 //! last one sent, connects out on [`ports::AUTO_PORTS`] and sends it whole.
 //! The host publishes and unpublishes to match.
 //!
-//! Polling rather than watching: the kernel has no listen-socket event a
-//! process can subscribe to without netlink sock_diag plumbing, and reading
-//! two small proc files a second costs microseconds. A port appears on the
-//! host within about a second of the server calling `listen()`.
+//! With the Docker socket bridge enabled, container start and die events also
+//! wake the scanner. Events are hints: the kernel's listening set still decides
+//! which ports to publish. Periodic scans cover other servers, missed events,
+//! and daemon restarts.
 //!
 //! Every server in the guest's root network namespace is seen, which covers
 //! image workloads (their containers share it), `machine exec` processes, and
@@ -44,14 +44,59 @@ pub fn start() {
         .name("auto-ports".into())
         .spawn(|| {
             tracing::info!(vsock_port = ports::AUTO_PORTS, "auto ports watcher started");
+            #[cfg(target_os = "linux")]
+            if crate::docker_bridge::is_enabled() {
+                watch_docker_events(std::thread::current());
+            }
             let mut reporter = Reporter::default();
             loop {
                 reporter.tick(read_listening(), connect_to_host);
-                std::thread::sleep(POLL_INTERVAL);
+                std::thread::park_timeout(POLL_INTERVAL);
             }
         });
     if let Err(e) = spawned {
         tracing::warn!(error = %e, "auto ports watcher could not start");
+    }
+}
+
+/// The daemon lives in the workload's mount namespace and may start after
+/// the agent. Keep connection setup and blocking reads off the scanner thread.
+#[cfg(target_os = "linux")]
+fn watch_docker_events(scanner: std::thread::Thread) {
+    if let Err(e) = std::thread::Builder::new()
+        .name("docker-port-events".into())
+        .spawn(move || loop {
+            let result = crate::publish_socket::dial_app(crate::docker_bridge::GUEST_DOCKER_SOCK)
+                .and_then(|mut socket| subscribe(&mut socket, || scanner.unpark()));
+            tracing::trace!(?result, "Docker port event stream disconnected");
+            std::thread::sleep(POLL_INTERVAL);
+        })
+    {
+        tracing::warn!(error = %e, "could not start Docker port event watcher");
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn subscribe(socket: &mut (impl io::Read + Write), wake: impl Fn()) -> io::Result<()> {
+    // Only traffic on this filtered subscription can wake the scanner. The
+    // response contains no authoritative port data, so even a partial event
+    // is sufficient. The headers also trigger a scan when we (re)subscribe.
+    socket.write_all(
+        concat!(
+            "GET /events?filters=%7B%22type%22%3A%5B%22container%22%5D%2C",
+            "%22event%22%3A%5B%22start%22%2C%22die%22%5D%7D HTTP/1.0\r\n",
+            "Host: localhost\r\nConnection: close\r\n\r\n",
+        )
+        .as_bytes(),
+    )?;
+    let mut buf = [0; 8192];
+    loop {
+        match socket.read(&mut buf) {
+            Ok(0) => return Ok(()),
+            Ok(_) => wake(),
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
     }
 }
 
@@ -154,6 +199,34 @@ mod tests {
     use super::*;
     use std::cell::RefCell;
     use std::rc::Rc;
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn docker_subscription_wakes_on_a_live_event_and_returns_on_disconnect() {
+        use std::io::{BufRead, BufReader};
+        use std::os::unix::net::UnixStream;
+        use std::sync::mpsc;
+
+        let (mut client, mut daemon) = UnixStream::pair().unwrap();
+        let (tx, rx) = mpsc::channel();
+        let subscriber = std::thread::spawn(move || {
+            subscribe(&mut client, || tx.send(()).unwrap()).unwrap();
+        });
+        let mut request = BufReader::new(&daemon).lines().map(Result::unwrap);
+        let path = request.next().unwrap();
+        assert!(path.starts_with("GET /events?filters="));
+        for filter in ["container", "start", "die"] {
+            assert!(path.contains(filter));
+        }
+        assert!(request.any(|line| line.is_empty()));
+
+        daemon.write_all(b"HTTP/1.0 200 OK\r\n\r\n").unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        daemon.write_all(b"{\"Action\":\"start\"}\n").unwrap();
+        rx.recv_timeout(Duration::from_secs(5)).unwrap();
+        drop(daemon);
+        subscriber.join().unwrap();
+    }
 
     /// A fake host connection recording every line it was sent.
     #[derive(Clone, Default)]
