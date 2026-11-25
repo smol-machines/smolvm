@@ -20,6 +20,9 @@ struct State {
     stopping: Option<&'static str>,
     /// Bumped by every fence, so an operation can tell one rose while it ran.
     generation: u64,
+    /// The raised fence finished draining: the stop or delete is tearing the
+    /// machine down now.
+    tearing_down: bool,
 }
 
 #[derive(Default)]
@@ -69,6 +72,15 @@ impl Inflight {
         })
     }
 
+    /// Whether a stop or delete has finished draining `name` and is tearing it
+    /// down. While it drains, the machine still runs the commands it waits for.
+    pub(crate) fn tearing_down(&self, name: &str) -> bool {
+        let machines = self.machines.lock().unwrap_or_else(|e| e.into_inner());
+        machines
+            .get(name)
+            .is_some_and(|machine| machine.lock().tearing_down)
+    }
+
     /// Raise the fence for a stop (`by` = "stopped") or delete ("deleted"),
     /// then wait up to `drain` for running operations to finish. The fence
     /// stays up until the returned guard is dropped.
@@ -92,6 +104,7 @@ impl Inflight {
                         .0;
                 }
             }
+            state.tearing_down = true;
         }
         Fence { machine }
     }
@@ -112,19 +125,22 @@ impl Operation {
         let Err(error) = result else {
             return result;
         };
-        let cut_off_by = {
+        Err(self.interrupted(error.to_string()).unwrap_or(error))
+    }
+
+    /// The error to report for a failure `reason` when a stop or delete rose
+    /// while this operation ran, or `None` when none did.
+    pub(crate) fn interrupted(&self, reason: String) -> Option<Error> {
+        let by = {
             let state = self.machine.lock();
             (state.generation != self.generation).then(|| state.stopping.unwrap_or("stopped"))
-        };
-        match cut_off_by {
-            Some(by) => Err(Error::Interrupted {
-                name: self.name.clone(),
-                operation: self.operation.clone(),
-                by: by.to_string(),
-                reason: error.to_string(),
-            }),
-            None => Err(error),
-        }
+        }?;
+        Some(Error::Interrupted {
+            name: self.name.clone(),
+            operation: self.operation.clone(),
+            by: by.to_string(),
+            reason,
+        })
     }
 }
 
@@ -145,7 +161,9 @@ pub(crate) struct Fence {
 
 impl Drop for Fence {
     fn drop(&mut self) {
-        self.machine.lock().stopping = None;
+        let mut state = self.machine.lock();
+        state.stopping = None;
+        state.tearing_down = false;
     }
 }
 
@@ -185,6 +203,36 @@ mod tests {
         let op = inflight.begin("m", "exec").unwrap();
         let _fence = inflight.fence("m", "deleted", None);
         assert_eq!(op.finish(Ok(7)).unwrap(), 7);
+    }
+
+    #[test]
+    fn a_fence_is_tearing_down_from_its_drain_until_it_drops() {
+        let inflight = Inflight::default();
+        assert!(!inflight.tearing_down("m"));
+        let fence = inflight.fence("m", "deleted", None);
+        assert!(inflight.tearing_down("m"));
+        assert!(!inflight.tearing_down("other"));
+        drop(fence);
+        assert!(!inflight.tearing_down("m"));
+    }
+
+    #[test]
+    fn a_draining_fence_is_not_tearing_down_yet() {
+        let inflight = Arc::new(Inflight::default());
+        let op = inflight.begin("m", "exec").unwrap();
+        let fencing = Arc::clone(&inflight);
+        let fence = std::thread::spawn(move || {
+            fencing.fence("m", "stopped", Some(Duration::from_secs(10)))
+        });
+        while inflight.machine("m").lock().stopping.is_none() {
+            std::thread::yield_now();
+        }
+        // The fence waits for the running command, which still has its machine.
+        assert!(!inflight.tearing_down("m"));
+        drop(op);
+        let fence = fence.join().unwrap();
+        assert!(inflight.tearing_down("m"));
+        drop(fence);
     }
 
     #[test]
