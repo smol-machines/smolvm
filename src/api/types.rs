@@ -1514,6 +1514,12 @@ impl CreateMachineRequest {
 #[derive(Debug, Serialize, ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub struct MachineInfo {
+    /// Set on a start whose VM booted but whose image workload failed to
+    /// launch: the machine is reachable by exec, but its server is not running.
+    /// The start is not refused, so a caller that needs the workload must check
+    /// this; a later start retries the launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workload_error: Option<String>,
     /// Maximum number of backing layers across storage, overlay and cache disks.
     /// Measured on machine detail requests; omitted when unavailable. A raw or
     /// standalone disk has depth zero. This is not the branch generation.

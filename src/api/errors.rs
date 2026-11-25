@@ -52,6 +52,25 @@ pub enum ApiError {
 }
 
 impl ApiError {
+    /// The error's own text, without its kind.
+    pub fn message(&self) -> &str {
+        match self {
+            Self::Unauthorized(m)
+            | Self::Forbidden(m)
+            | Self::NotFound(m)
+            | Self::Conflict(m)
+            | Self::PortConflict(m)
+            | Self::CloneIdentityRejuvenationFailed(m)
+            | Self::BadRequest(m)
+            | Self::Unprocessable(m)
+            | Self::PayloadTooLarge(m)
+            | Self::Unavailable(m)
+            | Self::Internal(m) => m,
+            Self::ResizeRejected { message, .. } => message,
+            Self::Timeout => "timed out",
+        }
+    }
+
     /// Convert any displayable error to an internal API error.
     pub fn internal(err: impl Display) -> Self {
         Self::Internal(err.to_string())

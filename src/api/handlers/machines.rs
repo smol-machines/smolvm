@@ -85,6 +85,7 @@ fn record_to_info(name: &str, record: &VmRecord) -> MachineInfo {
         crate::process::process_memory_stats_cached(pid, stats.map(|s| s.rss_bytes))
     });
     MachineInfo {
+        workload_error: None,
         disk_chain_depth: None,
         runtime: pid.and_then(crate::agent::live_resize::RuntimeIdentity::observe),
         name: name.to_string(),
@@ -4521,6 +4522,9 @@ async fn start_machine_transaction(
     // double-launched. Best-effort: a launch failure leaves a reachable VM
     // (Running, exec-able) rather than failing the start and stranding a retry
     // on the early-return path where the workload would never get launched.
+    // Why the image's workload did not start, when the VM did: reported on the
+    // response so the caller can see a machine whose server is not running.
+    let mut workload_error: Option<String> = None;
     if let Some(image) = record.image.clone().filter(|_| !restoring_checkpoint) {
         let entry = state.get_machine(&name)?;
         let mut command = record.entrypoint.clone();
@@ -4626,6 +4630,8 @@ async fn start_machine_transaction(
                 error = ?e,
                 "failed to launch image workload after start; VM is up but its server is not running"
             );
+            metrics::counter!("smolvm_workload_launch_failures_total").increment(1);
+            workload_error = Some(e.message().to_string());
         }
     }
 
@@ -4642,6 +4648,7 @@ async fn start_machine_transaction(
     let mut info = record_to_info(&name, &record);
     info.state = "running".to_string();
     info.pid = pid;
+    info.workload_error = workload_error;
     Ok(Json(info))
 }
 
