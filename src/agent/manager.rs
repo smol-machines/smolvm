@@ -5859,7 +5859,7 @@ fn boot_failure_reason(
                     "{error} — this can be the affected-host KVM first-run bug rather than memory pressure; update the host kernel to include upstream fix 916b7f42b3b3"
                 )
             } else if error.contains("version `GLIBC_") && error.contains("not found") {
-                format!("{error} — this host's glibc is older than the 2.28 smolvm needs")
+                format!("{error} — a smolvm binary or library here needs a newer glibc than this host has; smolvm releases need glibc 2.28 or newer")
             } else {
                 error
             }
@@ -6932,7 +6932,7 @@ mod tests {
         let log = "/v/smol/smol-vmm: /lib64/libm.so.6: version `GLIBC_2.29' not found (required by /v/smol/smol-vmm)\n";
         let r = boot_failure_reason(Some(127), Some(log), None);
         assert!(r.contains("GLIBC_2.29' not found"), "{r}");
-        assert!(r.contains("older than the 2.28"), "{r}");
+        assert!(r.contains("releases need glibc 2.28 or newer"), "{r}");
         assert!(r.contains("code 127"), "{r}");
     }
 
