@@ -4294,7 +4294,7 @@ checksum = "67b1b7a3b5fe4f1376887184045fcf45c69e92af734b7aaddc05fb777b6fbd03"
 
 [[package]]
 name = "smolfile"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "serde",
  "smolvm-protocol",
@@ -4305,7 +4305,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "anyhow",
  "async-stream",
@@ -4388,7 +4388,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-agent"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "flate2",
  "lazy_static",
@@ -4412,7 +4412,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-checkpoint"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "hex",
  "libc",
@@ -4429,7 +4429,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-credentials"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "aho-corasick",
  "anyhow",
@@ -4458,7 +4458,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "getrandom 0.3.4",
  "libc",
@@ -4467,11 +4467,11 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-codegen"
-version = "1.37.2"
+version = "1.37.6"
 
 [[package]]
 name = "smolvm-cuda-guest"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "smolvm-cuda",
  "vsock",
@@ -4479,7 +4479,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cuda-shim"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -4488,7 +4488,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-cudart-shim"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "libc",
  "smolvm-cuda",
@@ -4497,7 +4497,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-network"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "crossbeam-queue",
  "getrandom 0.3.4",
@@ -4515,14 +4515,14 @@ dependencies = [
 
 [[package]]
 name = "smolvm-nvml-shim"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "libc",
 ]
 
 [[package]]
 name = "smolvm-oci-layer"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "flate2",
  "libc",
@@ -4535,7 +4535,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-pack"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "crc32fast",
  "libc",
@@ -4555,7 +4555,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-paths"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "dirs",
  "tempfile",
@@ -4563,7 +4563,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-protocol"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "base64 0.22.1",
  "serde",
@@ -4573,7 +4573,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-registry"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "bytes",
  "filetime",
@@ -4599,7 +4599,7 @@ dependencies = [
 
 [[package]]
 name = "smolvm-s3fs"
-version = "1.37.2"
+version = "1.37.6"
 dependencies = [
  "hmac 0.12.1",
  "libc",
