@@ -379,6 +379,47 @@ pub struct GpuBackend {
 /// — past here the per-DMA launch overhead of thousands of tiny copies costs
 /// more than a single host-side gather plus one big transfer.
 const ZC_DIRECT_MAX_SEGMENTS: usize = 16;
+
+/// Translate a guest-physical range `[gpa, gpa+len)` to a host address, finding
+/// the `(gpa_start, hva, len)` region that contains it. The whole range must lie
+/// in one region (guest buffers are page-pinned and never straddle the PCI hole).
+fn gpa_to_hva(regions: &[(u64, u64, u64)], gpa: u64, len: u64) -> CuResult<u64> {
+    let end = gpa
+        .checked_add(len)
+        .ok_or(super::CUDA_ERROR_INVALID_HANDLE)?;
+    for &(start, hva, rlen) in regions {
+        if gpa >= start && end <= start + rlen {
+            return Ok(hva + (gpa - start));
+        }
+    }
+    Err(super::CUDA_ERROR_INVALID_HANDLE)
+}
+
+/// Total length of a guest segment list, after checking that every segment lies
+/// in one of `regions` and that the lengths add up without overflow. The staging
+/// buffer of a fragmented transfer is sized from this total and then filled
+/// segment by segment, so the whole list must be validated before anything is
+/// copied: a list whose lengths wrap the sum would otherwise get a tiny buffer
+/// and have its valid leading segments copied past the end of it. The total is
+/// also bounded by the guest RAM the segments can address, so overlapping
+/// segments cannot demand an unbounded pinned allocation.
+fn gpa_segments_total(regions: &[(u64, u64, u64)], segments: &[(u64, u64)]) -> CuResult<u64> {
+    let mut total = 0u64;
+    for &(gpa, len) in segments {
+        gpa_to_hva(regions, gpa, len)?;
+        total = total
+            .checked_add(len)
+            .ok_or(super::CUDA_ERROR_INVALID_VALUE)?;
+    }
+    let addressable = regions
+        .iter()
+        .fold(0u64, |sum, &(_, _, rlen)| sum.saturating_add(rlen));
+    if total > addressable {
+        return Err(super::CUDA_ERROR_INVALID_VALUE);
+    }
+    Ok(total)
+}
+
 fn containing_registered_range(
     registered: &[(u64, u64)],
     address: u64,
@@ -1830,8 +1871,9 @@ impl Backend for GpuBackend {
             return Ok(());
         }
         // Heavily fragmented: gather into one pinned staging buffer and issue a
-        // single DMA, avoiding thousands of tiny per-segment transfers.
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
+        // single DMA, avoiding thousands of tiny per-segment transfers. Every
+        // segment is validated here, before the buffer is sized from the sum.
+        let total = gpa_segments_total(&self.guest_ram, segments)?;
         if let Some(stg) = self.ensure_staging(total as usize) {
             let mut off = 0usize;
             for &(gpa, len) in segments {
@@ -1891,8 +1933,9 @@ impl Backend for GpuBackend {
             return Ok(());
         }
         // Heavily fragmented: one DMA into pinned staging, then scatter to the
-        // guest segments.
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
+        // guest segments. Every segment is validated here, before the buffer is
+        // sized from the sum.
+        let total = gpa_segments_total(&self.guest_ram, segments)?;
         if let Some(stg) = self.ensure_staging(total as usize) {
             unsafe { chk((self.memcpy_dtoh)(stg as *mut c_void, dptr, total as usize))? };
             let mut off = 0usize;
@@ -2848,6 +2891,18 @@ fn cudnn_elem_size(attr_type: i32) -> usize {
     }
 }
 
+/// Byte size of a cuDNN attribute array of `count` elements of `attr_type`.
+/// `None` when the count is negative, or the product wraps or exceeds what one
+/// frame can carry: cuDNN is told the array holds `count` elements, so the
+/// size must be exact and a guest-chosen count must not size a host
+/// allocation freely.
+fn cudnn_attr_bytes(count: i64, attr_type: i32) -> Option<usize> {
+    usize::try_from(count)
+        .ok()?
+        .checked_mul(cudnn_elem_size(attr_type))
+        .filter(|&bytes| bytes <= crate::proto::MAX_MSG)
+}
+
 /// The 6-function cuDNN v8 **backend (graph) API** PyTorch uses for convolution.
 /// Descriptors and device pointers passing through are the server's real host
 /// pointers (opaque to the guest), so attribute arrays forward as raw bytes.
@@ -2933,6 +2988,12 @@ impl CudnnBackend {
                 let ty = rd_i32(args, 12);
                 let count = rd_i64(args, 16);
                 let mut elems = args[24..].to_vec();
+                // cuDNN reads `count` elements from `elems`: the guest must
+                // have sent at least that many bytes.
+                match cudnn_attr_bytes(count, ty) {
+                    Some(n) if n <= elems.len() => {}
+                    _ => return (CUDA_ERROR_INVALID_VALUE, Vec::new()),
+                }
                 if handle_bearing(ty) {
                     for chunk in elems.as_chunks_mut::<8>().0 {
                         let h = u64::from_le_bytes(*chunk);
@@ -2959,7 +3020,11 @@ impl CudnnBackend {
                 let name = rd_i32(args, 8);
                 let ty = rd_i32(args, 12);
                 let req = rd_i64(args, 16);
-                let cap = (req.max(0) as usize) * cudnn_elem_size(ty);
+                // cuDNN is told the buffer holds `req` elements, so its byte
+                // size must be exact (no wrap) and fit one reply frame.
+                let Some(cap) = cudnn_attr_bytes(req, ty) else {
+                    return (CUDA_ERROR_INVALID_VALUE, Vec::new());
+                };
                 let input = &args[24..];
                 let mut buf = vec![0u8; cap];
                 let seed = input.len().min(cap);
@@ -3205,6 +3270,11 @@ impl CublasLt {
                 let d = vh_resolve(vh, rd_u64(40)) as *mut c_void;
                 let pref = vh_resolve(vh, rd_u64(48)) as *mut c_void;
                 let requested = rd_i32(56).max(0);
+                // cuBLASLt is told the buffer holds `requested` results; one
+                // reply frame bounds how many the guest may ask for.
+                if requested as usize * HEUR_RESULT_SZ > crate::proto::MAX_MSG {
+                    return (CUDA_ERROR_INVALID_VALUE, Vec::new());
+                }
                 let mut results = vec![0u8; requested as usize * HEUR_RESULT_SZ];
                 let mut count: c_int = 0;
                 let st = unsafe {
@@ -3984,7 +4054,7 @@ impl GpuBackend {
     /// D2H (GPU -> pwrite guest); else H2D (pread guest -> GPU).
     #[cfg(unix)]
     fn gpa_procmem(&mut self, dptr: u64, segments: &[(u64, u64)], to_guest: bool) -> CuResult<()> {
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
+        let total = gpa_segments_total(&self.proc_mem_regions, segments)?;
         if total == 0 {
             return Ok(());
         }
@@ -4004,13 +4074,7 @@ impl GpuBackend {
         let mut resolved: Vec<(u64, u64, u64)> = Vec::with_capacity(segments.len());
         let mut off = 0u64;
         for &(gpa, len) in segments {
-            let hva = self
-                .proc_mem_regions
-                .iter()
-                .find_map(|&(gs, h, rl)| {
-                    (gpa >= gs && gpa.checked_add(len)? <= gs + rl).then(|| h + (gpa - gs))
-                })
-                .ok_or(super::CUDA_ERROR_INVALID_HANDLE)?;
+            let hva = gpa_to_hva(&self.proc_mem_regions, gpa, len)?;
             resolved.push((hva, off, len));
             off += len;
         }
@@ -4123,19 +4187,10 @@ impl GpuBackend {
         Some(p as *mut u8)
     }
 
-    /// Translate a guest-physical range `[gpa, gpa+len)` to a host pointer,
-    /// finding the RAM region that contains it. The whole range must lie in one
-    /// region (guest buffers are page-pinned and never straddle the PCI hole).
+    /// Translate a guest-physical range `[gpa, gpa+len)` to a host pointer into
+    /// the VMM's own guest-RAM mapping (see `gpa_to_hva`).
     fn gpa_to_host(&self, gpa: u64, len: u64) -> CuResult<*mut u8> {
-        let end = gpa
-            .checked_add(len)
-            .ok_or(super::CUDA_ERROR_INVALID_HANDLE)?;
-        for &(start, hva, rlen) in &self.guest_ram {
-            if gpa >= start && end <= start + rlen {
-                return Ok((hva + (gpa - start)) as *mut u8);
-            }
-        }
-        Err(super::CUDA_ERROR_INVALID_HANDLE)
+        gpa_to_hva(&self.guest_ram, gpa, len).map(|hva| hva as *mut u8)
     }
 
     /// Load real nvcomp on first use (from `SMOLVM_NVCOMP_LIB`).
@@ -4355,7 +4410,10 @@ fn zc_trace_enabled() -> bool {
 /// single DMA).
 fn zc_trace_segments(dir: &str, segments: &[(u64, u64)]) {
     if zc_trace_enabled() {
-        let total: u64 = segments.iter().map(|(_, l)| *l).sum();
+        // Traced before the list is validated, so the sum must not overflow.
+        let total = segments
+            .iter()
+            .fold(0u64, |sum, &(_, len)| sum.saturating_add(len));
         zc_trace(&format!(
             "[zc-host] {dir} gpa memcpy: {total} bytes in {} segment(s)",
             segments.len()
@@ -4392,6 +4450,55 @@ mod registered_range_tests {
             containing_registered_range(&[(0, u64::MAX)], u64::MAX, 2),
             None
         );
+    }
+}
+
+#[cfg(test)]
+mod gpa_segment_tests {
+    use super::{gpa_segments_total, gpa_to_hva};
+
+    // One 1 MiB guest-RAM region at gpa 0x1000_0000, mapped at host 0x7f00_0000_0000.
+    const RAM: [(u64, u64, u64); 1] = [(0x1000_0000, 0x7f00_0000_0000, 1 << 20)];
+
+    #[test]
+    fn translates_a_range_inside_a_region() {
+        assert_eq!(gpa_to_hva(&RAM, 0x1000_1000, 0x1000), Ok(0x7f00_0000_1000));
+        assert!(gpa_to_hva(&RAM, 0x1000_0000, (1 << 20) + 1).is_err());
+        assert!(gpa_to_hva(&RAM, 0x0fff_f000, 0x2000).is_err());
+        assert!(gpa_to_hva(&RAM, u64::MAX, 2).is_err());
+    }
+
+    #[test]
+    fn sums_valid_segments() {
+        let segments = [(0x1000_0000, 4096); 17];
+        assert_eq!(gpa_segments_total(&RAM, &segments), Ok(17 * 4096));
+        assert_eq!(gpa_segments_total(&RAM, &[]), Ok(0));
+    }
+
+    // 17 valid pages followed by a length that wraps the
+    // u64 sum of all 18 to 16. The staging buffer used to be sized from that
+    // wrapped sum while the valid segments were copied into it.
+    #[test]
+    fn rejects_a_list_whose_lengths_wrap_the_sum() {
+        let mut segments = vec![(0x1000_0000, 4096); 17];
+        segments.push((0x1000_0000, u64::MAX - 17 * 4096 + 17));
+        assert!(gpa_segments_total(&RAM, &segments).is_err());
+    }
+
+    #[test]
+    fn rejects_a_segment_outside_guest_ram() {
+        let mut segments = vec![(0x1000_0000, 4096); 17];
+        segments.push((0x1000_0000 + (1 << 20) - 0x800, 0x1000));
+        assert!(gpa_segments_total(&RAM, &segments).is_err());
+    }
+
+    // Overlapping segments could otherwise ask for a pinned staging buffer far
+    // larger than the guest's RAM.
+    #[test]
+    fn rejects_a_total_beyond_guest_ram() {
+        let segments = vec![(0x1000_0000, 1 << 20); 2];
+        assert!(gpa_segments_total(&RAM, &segments).is_err());
+        assert_eq!(gpa_segments_total(&RAM, &segments[..1]), Ok(1 << 20));
     }
 }
 
@@ -4449,6 +4556,37 @@ mod handoff_tests {
         assert!(
             clone.lock().unwrap().is_empty(),
             "no parent to adopt → empty map, no panic"
+        );
+    }
+}
+
+#[cfg(test)]
+mod cudnn_attr_bytes_tests {
+    use super::cudnn_attr_bytes;
+
+    #[test]
+    fn sizes_an_attribute_array() {
+        assert_eq!(cudnn_attr_bytes(8, 3), Some(64)); // 8 x INT64
+        assert_eq!(cudnn_attr_bytes(2, 26), Some(32)); // 2 x FRACTION
+        assert_eq!(cudnn_attr_bytes(0, 3), Some(0));
+        assert_eq!(cudnn_attr_bytes(-1, 3), None);
+    }
+
+    // cuDNN is handed the element count, not the byte size, so a count whose
+    // byte size wraps (2^61 + 1 INT64s is an 8-byte buffer) or is larger than a
+    // frame must never size a buffer.
+    #[test]
+    fn rejects_a_count_whose_byte_size_wraps_or_exceeds_a_frame() {
+        assert_eq!(cudnn_attr_bytes((1 << 61) + 1, 3), None);
+        assert_eq!(cudnn_attr_bytes(i64::MAX, 2), None); // 1-byte BOOLEAN
+        assert_eq!(cudnn_attr_bytes(1 << 40, 3), None); // 8 TiB
+        assert_eq!(
+            cudnn_attr_bytes((crate::proto::MAX_MSG / 8) as i64, 3),
+            Some(crate::proto::MAX_MSG)
+        );
+        assert_eq!(
+            cudnn_attr_bytes((crate::proto::MAX_MSG / 8) as i64 + 1, 3),
+            None
         );
     }
 }
