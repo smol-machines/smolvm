@@ -245,7 +245,7 @@ pub fn check_and_repair(uid: u32, gid: u32, reqs: &[Requirement]) -> (Vec<Denial
         let Some(mut denial) = as_vm(uid, gid, || first_denial(req)) else {
             continue;
         };
-        if repair(&denial) {
+        if repair(&denial, uid, gid, &groups) {
             match as_vm(uid, gid, || first_denial(req)) {
                 None => {
                     eprintln!(
@@ -333,10 +333,28 @@ fn describe_mode(path: &Path) -> String {
     }
 }
 
-/// Add the missing read or search bits for others to the blocking component,
-/// when it lies in a tree smolvm owns. True when something changed.
+/// How far to shift an others-class mode bit so it lands in the class the
+/// kernel checks for the VM: the owner's bits when the VM's uid owns the file,
+/// the group's when the file's group is one of the VM's groups, else others'.
+/// Adding a bit to any other class changes nothing for the VM (a 0640 file
+/// whose group is the VM's gid stays unreadable after o+r).
+#[cfg_attr(not(target_os = "linux"), allow(dead_code))]
+fn class_shift(file_uid: u32, file_gid: u32, uid: u32, gid: u32, groups: &[u32]) -> u32 {
+    if file_uid == uid {
+        6
+    } else if file_gid == gid || groups.contains(&file_gid) {
+        3
+    } else {
+        0
+    }
+}
+
+/// Add the missing read or search bits, in the class the kernel checks for the
+/// VM, to the blocking component when it lies in a tree smolvm owns. True when
+/// something changed.
 #[cfg(target_os = "linux")]
-fn repair(denial: &Denial) -> bool {
+fn repair(denial: &Denial, uid: u32, gid: u32, groups: &[u32]) -> bool {
+    use std::os::unix::fs::MetadataExt;
     use std::os::unix::fs::PermissionsExt;
     let req = &denial.requirement;
     let Some((seen_root, disk_root)) = &req.repair else {
@@ -361,6 +379,13 @@ fn repair(denial: &Denial) -> bool {
     } else {
         0
     };
+    // The class comes from the path as the VM sees it: through an idmapped mount
+    // the on-disk owner is not the one the kernel checks (a group-root file shows
+    // the VM's gid there), so the on-disk ids would pick the wrong class.
+    let Ok(seen) = std::fs::symlink_metadata(&denial.blocked_at) else {
+        return false;
+    };
+    let bits = bits << class_shift(seen.uid(), seen.gid(), uid, gid, groups);
     let mode = meta.permissions().mode() & 0o7777;
     if bits == 0 || mode & bits == bits {
         return false;
@@ -400,6 +425,21 @@ mod tests {
         }
         // A file is never made searchable by a List repair.
         assert_eq!(Need::List.repair_bits(false), 0);
+    }
+
+    #[test]
+    fn a_repair_lands_in_the_class_the_kernel_checks_for_the_vm() {
+        let (uid, gid) = (2_000_079, 2_000_079);
+        // Others' bits only help a VM that neither owns the file nor shares its group.
+        assert_eq!(class_shift(0, 0, uid, gid, &[]), 0);
+        assert_eq!(class_shift(uid, 0, uid, gid, &[]), 6);
+        // A pack layer owned by nobody with the VM's gid (seen as 0604 in production).
+        assert_eq!(class_shift(65_534, gid, uid, gid, &[]), 3);
+        assert_eq!(
+            Need::Read.repair_bits(false) << class_shift(65_534, gid, uid, gid, &[]),
+            0o040
+        );
+        assert_eq!(class_shift(0, 36, uid, gid, &[36]), 3);
     }
 
     #[test]
