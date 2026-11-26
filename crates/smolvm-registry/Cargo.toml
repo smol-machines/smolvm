@@ -1,6 +1,6 @@
 [package]
 name = "smolvm-registry"
-version = "1.37.2"
+version = "1.37.7"
 edition = "2021"
 description = "OCI Distribution client for smolmachines registry"
 license = "Apache-2.0"
