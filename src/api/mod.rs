@@ -126,6 +126,7 @@ use state::ApiState;
         handlers::mounts::detach_mount,
         handlers::machines::publish_cache_disk,
         handlers::machines::delete_cache_base,
+        handlers::machines::fetch_cache_base_ahead,
         handlers::machines::update_machine_egress,
         handlers::machines::set_machine_env,
         handlers::machines::branch_machines_batch,
@@ -184,6 +185,7 @@ use state::ApiState;
         types::SetCpuLimitRequest,
         types::CacheDiskSpec,
         types::PublishCacheDiskRequest,
+        types::FetchCacheBaseRequest,
         types::PublishCacheDiskResponse,
         types::UpdateEgressRequest,
         types::SetMachineEnvRequest,
@@ -603,9 +605,13 @@ pub fn create_router(state: Arc<ApiState>, cors_origins: Vec<String>) -> Router 
         .layer(DefaultBodyLimit::max(MAX_ROLLOUT_REQUEST_BYTES));
 
     // Cache bases this server holds: the control plane removes one a failed
-    // publish left behind, or one whose cache disk was deleted.
-    let cache_base_routes =
-        Router::new().route("/{base}", delete(handlers::machines::delete_cache_base));
+    // publish left behind, or one whose cache disk was deleted, and fetches a
+    // new version ahead of the machines that will need it here.
+    let cache_base_routes = Router::new().route(
+        "/{base}",
+        delete(handlers::machines::delete_cache_base)
+            .put(handlers::machines::fetch_cache_base_ahead),
+    );
 
     // API v1 routes
     let api_v1 = Router::new()

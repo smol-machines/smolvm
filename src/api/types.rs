@@ -114,6 +114,16 @@ pub struct CacheDiskSpec {
     pub slot: bool,
 }
 
+/// Fetch a cache base ahead of the machines that will need it.
+#[derive(Debug, Deserialize, ToSchema)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
+pub struct FetchCacheBaseRequest {
+    /// Where to fetch the base: a signed https URL on an allowed object store.
+    pub source_url: String,
+    /// SHA-256 (hex) the fetched base must have.
+    pub sha256: String,
+}
+
 /// Publish a stopped machine's cache disk as a new base.
 #[derive(Debug, Deserialize, ToSchema)]
 #[serde(deny_unknown_fields, rename_all = "camelCase")]
