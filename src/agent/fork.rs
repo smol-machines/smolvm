@@ -1482,26 +1482,78 @@ fn prepare_running_disk_generation(
     Ok(())
 }
 
-/// Whether the running VM process of a machine was started by a different
-/// smolvm engine build than this one. A worker roll replaces the engine under
-/// running VMs, which keep the one they started with; branching such a VM from
-/// the new engine gave children whose workload died at once (one customer's
-/// batch of 7 on 2026-10-22). The record names the build that started the VM
-/// ([`crate::ENGINE_BUILD`]), and only another build is refused: the same
-/// release installed as two files (a CLI's embedded engine and an SDK's cached
-/// one) is one build. A record from an engine that did not record its build
-/// falls back to comparing the process's executable with the one this engine
-/// boots VMs with ([`super::manager::vm_boot_executable`], run as `_boot-vm`,
+/// The oldest smolvm release whose running machines this engine branches.
+///
+/// A roll replaces the engine under running machines, which keep the VM
+/// process they started with, so a branch after a roll has this engine read
+/// state an older one wrote: the source's VM process saves its CPU and device
+/// state (the CPU state carries the feature set the guest booted with), this
+/// engine's VM process restores it, and the child boots the agent rootfs its
+/// source runs on, not the installed one. Machines started by 1.35.0 and every
+/// release since are branched through an in-place upgrade to this engine
+/// before it ships. Raise the floor to the release that makes the change when
+/// one stops this engine reading what an older VM process writes.
+pub const BRANCH_SOURCE_FLOOR: &str = "1.35.0";
+
+/// The `major.minor.patch` release an engine build (`1.37.6+1da10925cec6`) or
+/// version names, `None` when it does not start with one.
+fn release_of(build: &str) -> Option<(u64, u64, u64)> {
+    let version = build.split(['+', '-']).next()?;
+    let mut parts = version.split('.').map(|part| part.parse::<u64>().ok());
+    let release = (parts.next()??, parts.next()??, parts.next()??);
+    parts.next().is_none().then_some(release)
+}
+
+/// Why this engine does not branch a running machine another engine started,
+/// `None` when it does. A machine this build started is always branched. One
+/// started by another build is branched when its release is no older than
+/// [`BRANCH_SOURCE_FLOOR`] and no newer than this engine, and its record names
+/// the agent rootfs it runs on. The rest are refused, since their children
+/// would not run: before the rootfs was recorded a child booted the installed
+/// one and its workload died at once (one customer's batch of 7 on
+/// 2026-10-22), and an engine does not know what a newer one writes. The
+/// record names the build that started the VM ([`crate::ENGINE_BUILD`]): the
+/// same release installed as two files (a CLI's embedded engine and an SDK's
+/// cached one) is one build. A record without a build comes from an engine
+/// older than the floor, told apart from this one by the executable its
+/// process runs ([`super::manager::vm_boot_executable`], run as `_boot-vm`,
 /// which for an embedding SDK is its helper, not the host process); that
-/// fallback is Linux only, and a process or file it cannot read is not refused.
-fn source_runs_another_engine(record: &VmRecord) -> bool {
-    let Some(pid) = record.pid else {
-        return false;
+/// comparison is Linux only, and a process or file it cannot read is not
+/// refused.
+fn source_engine_refusal(record: &VmRecord) -> Option<String> {
+    let pid = record.pid?;
+    let Some(build) = record.engine_build.as_deref() else {
+        return process_runs_another_boot_binary(pid)
+            .then(|| format!("a smolvm older than {BRANCH_SOURCE_FLOOR}"));
     };
-    match record.engine_build.as_deref() {
-        Some(build) => build != crate::ENGINE_BUILD,
-        None => process_runs_another_boot_binary(pid),
+    if build == crate::ENGINE_BUILD {
+        return None;
     }
+    source_release_refusal(build, crate::VERSION, record.agent_rootfs_digest.is_some())
+}
+
+/// [`source_engine_refusal`] for a source started by `build`, another build
+/// than this engine, whose release is `own`.
+fn source_release_refusal(build: &str, own: &str, records_rootfs: bool) -> Option<String> {
+    let (Some(source), Some(own), Some(floor)) = (
+        release_of(build),
+        release_of(own),
+        release_of(BRANCH_SOURCE_FLOOR),
+    ) else {
+        return Some(format!("smolvm {build}, a build with no release number"));
+    };
+    if source > own {
+        return Some(format!("smolvm {build}, which is newer than this engine"));
+    }
+    if source < floor {
+        return Some(format!("smolvm {build}"));
+    }
+    if !records_rootfs {
+        return Some(format!(
+            "smolvm {build}, which did not record the agent rootfs it runs on"
+        ));
+    }
+    None
 }
 
 #[cfg(target_os = "linux")]
@@ -3130,13 +3182,16 @@ pub(crate) fn prepare_forks_reusing(
             "CUDA fork descendants are not supported yet; create a leaf clone without `forkable`",
         ));
     }
-    if source_runs_another_engine(&golden_rec) {
+    if let Some(started_by) = source_engine_refusal(&golden_rec) {
         // A caller-fixable refusal: a restart puts the source on this engine.
         return Err(Error::agent_conflict(
             "fork",
             format!(
-                "machine '{golden}' was started by a different smolvm engine than this server runs \
-                 (the server was upgraded since); restart it (stop, then start) to branch it"
+                "machine '{golden}' was started by a different smolvm engine than this \
+                 server can branch from ({started_by}); this engine ({}) branches machines \
+                 started by smolvm {BRANCH_SOURCE_FLOOR} up to its own release. Restart it \
+                 (stop, then start) to branch it",
+                crate::VERSION
             ),
         ));
     }
@@ -5546,39 +5601,86 @@ tmpfs /tmp tmpfs rw 0 0
     /// The build that started the source decides, not the file its process
     /// runs: the same release installed twice (a CLI's embedded engine and an
     /// SDK's cached copy) is one build, and a source on it is branched from
-    /// the other file; a source started by another build is refused.
+    /// the other file, whatever else its record holds.
     #[test]
-    fn a_source_is_refused_by_its_recorded_engine_build() {
-        assert!(!source_runs_another_engine(&running_on_build(
-            std::process::id(),
-            Some(crate::ENGINE_BUILD)
-        )));
-        assert!(source_runs_another_engine(&running_on_build(
-            std::process::id(),
-            Some("0.0.0+0000000000000")
-        )));
+    fn a_source_this_build_started_is_branched() {
+        assert_eq!(
+            source_engine_refusal(&running_on_build(
+                std::process::id(),
+                Some(crate::ENGINE_BUILD)
+            )),
+            None
+        );
         #[cfg(target_os = "linux")]
         {
             let mut other = spawn_another_binary();
-            let same_build_other_file = source_runs_another_engine(&running_on_build(
-                other.id(),
-                Some(crate::ENGINE_BUILD),
-            ));
-            let other_build = source_runs_another_engine(&running_on_build(
-                other.id(),
-                Some("0.0.0+0000000000000"),
-            ));
+            let same_build_other_file =
+                source_engine_refusal(&running_on_build(other.id(), Some(crate::ENGINE_BUILD)));
             let _ = other.kill();
             let _ = other.wait();
-            assert!(!same_build_other_file);
-            assert!(other_build);
+            assert_eq!(same_build_other_file, None);
         }
-        let mut stopped = running_on_build(std::process::id(), Some("0.0.0+0000000000000"));
+        let mut stopped = running_on_build(std::process::id(), Some("0.0.1+000000000000"));
         stopped.pid = None;
-        assert!(
-            !source_runs_another_engine(&stopped),
+        assert_eq!(
+            source_engine_refusal(&stopped),
+            None,
             "a record without a process is not refused here"
         );
+    }
+
+    /// A source an older engine started is branched after a roll, as long as
+    /// that engine is no older than the floor and recorded the agent rootfs
+    /// the machine runs on; one from before the floor, from a newer engine, or
+    /// without a rootfs on record is refused and names the build.
+    #[test]
+    fn a_source_another_build_started_is_branched_within_the_supported_releases() {
+        let refusal =
+            |build: &str, own: &str, rootfs: bool| source_release_refusal(build, own, rootfs);
+        assert_eq!(refusal("1.35.0+22a315c544e0", "1.37.6", true), None);
+        assert_eq!(refusal("1.37.5+aaaaaaaaaaaa", "1.37.6", true), None);
+        assert_eq!(
+            refusal("1.37.6+aaaaaaaaaaaa", "1.37.6", true),
+            None,
+            "two builds of one release"
+        );
+        assert_eq!(refusal(BRANCH_SOURCE_FLOOR, "2.0.0", true), None);
+        assert_eq!(
+            refusal("1.9.0+aaaaaaaaaaaa", "1.37.6", true).as_deref(),
+            Some("smolvm 1.9.0+aaaaaaaaaaaa"),
+            "releases compare as numbers, not text"
+        );
+        assert!(refusal("1.34.4+aaaaaaaaaaaa", "1.37.6", true).is_some());
+        assert!(refusal("1.37.7+aaaaaaaaaaaa", "1.37.6", true)
+            .unwrap()
+            .contains("newer than this engine"));
+        assert!(refusal("1.35.0+22a315c544e0", "1.37.6", false)
+            .unwrap()
+            .contains("agent rootfs"));
+        for unreadable in ["", "unknown", "1.37", "1.37.6.1+aaaa", "v1.37.6"] {
+            assert!(
+                refusal(unreadable, "1.37.6", true).is_some(),
+                "{unreadable}"
+            );
+        }
+
+        let mut record = running_on_build(std::process::id(), Some("0.0.1+000000000000"));
+        record.agent_rootfs_digest = Some(format!("sha256:{}", "1".repeat(64)));
+        assert_eq!(
+            source_engine_refusal(&record).as_deref(),
+            Some("smolvm 0.0.1+000000000000")
+        );
+    }
+
+    #[test]
+    fn a_release_is_read_from_a_build_or_a_version() {
+        assert_eq!(release_of("1.37.6+1da10925cec6"), Some((1, 37, 6)));
+        assert_eq!(release_of("1.37.6"), Some((1, 37, 6)));
+        assert_eq!(release_of("1.38.0-rc.1+abc"), Some((1, 38, 0)));
+        assert_eq!(release_of(crate::ENGINE_BUILD), release_of(crate::VERSION));
+        assert!(release_of(crate::VERSION) >= release_of(BRANCH_SOURCE_FLOOR));
+        assert_eq!(release_of("1.37"), None);
+        assert_eq!(release_of("unknown"), None);
     }
 
     /// A record from an engine that did not record its build falls back to the
@@ -5587,12 +5689,12 @@ tmpfs /tmp tmpfs rw 0 0
     #[cfg(target_os = "linux")]
     #[test]
     fn a_source_on_another_engine_binary_is_told_apart() {
-        assert!(!source_runs_another_engine(&running_on_build(
-            std::process::id(),
+        assert_eq!(
+            source_engine_refusal(&running_on_build(std::process::id(), None)),
             None
-        )));
+        );
         let mut other = spawn_another_binary();
-        let differs = source_runs_another_engine(&running_on_build(other.id(), None));
+        let differs = source_engine_refusal(&running_on_build(other.id(), None));
         let sleep_bin = std::fs::read_link(format!("/proc/{}/exe", other.id())).unwrap();
         // An embedding SDK boots VMs with its helper, not the host process: a
         // VM running that helper is this engine's, whatever the host runs.
@@ -5601,11 +5703,12 @@ tmpfs /tmp tmpfs rw 0 0
             process_runs_another_binary(std::process::id() as i32, &sleep_bin);
         let _ = other.kill();
         let _ = other.wait();
-        assert!(differs);
+        assert!(differs.is_some());
         assert!(helper_is_this_engine);
         assert!(host_is_not_the_helper);
-        assert!(
-            !source_runs_another_engine(&running_on_build(i32::MAX as u32, None)),
+        assert_eq!(
+            source_engine_refusal(&running_on_build(i32::MAX as u32, None)),
+            None,
             "an unreadable process is not refused"
         );
     }

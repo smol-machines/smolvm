@@ -6620,9 +6620,15 @@
           "version",
           "nested_virt",
           "checkpoint_device_profiles",
-          "checkpoint_format_versions"
+          "checkpoint_format_versions",
+          "branch_source_floor"
         ],
         "properties": {
+          "branch_source_floor": {
+            "type": "string",
+            "description": "The oldest smolvm release whose running machines this engine branches:\na machine started by that release or a newer one keeps branching after\nthe engine under it is upgraded to this one.",
+            "example": "1.35.0"
+          },
           "checkpoint_device_profiles": {
             "type": "array",
             "items": {

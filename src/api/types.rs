@@ -1010,6 +1010,11 @@ pub struct HealthResponse {
     pub checkpoint_device_profiles: Vec<&'static str>,
     /// Portable-checkpoint metadata formats understood by the reader.
     pub checkpoint_format_versions: Vec<u32>,
+    /// The oldest smolvm release whose running machines this engine branches:
+    /// a machine started by that release or a newer one keeps branching after
+    /// the engine under it is upgraded to this one.
+    #[schema(example = "1.35.0")]
+    pub branch_source_floor: &'static str,
 }
 
 /// Machine counts for health response.
