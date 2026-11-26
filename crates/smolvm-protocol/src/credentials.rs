@@ -29,9 +29,10 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fmt;
 
 /// Prefix every generated placeholder starts with. The interceptor refuses
-/// requests that carry this prefix anywhere it does not substitute (path,
-/// query, unsupported bodies or headers) so a placeholder can never leak
-/// upstream unreplaced.
+/// requests that carry this prefix in the path, query or a protected header.
+/// A request body is only scanned when it could be substituted (a form body to
+/// a host with a body binding); elsewhere the prefix is opaque text
+/// (gpu-branch fork).
 pub const PLACEHOLDER_PREFIX: &str = "SMOL_PLACEHOLDER_";
 
 /// Guest directory the machine's public credential CA is mounted at.

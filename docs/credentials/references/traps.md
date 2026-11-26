@@ -46,7 +46,7 @@ Measured refusals, each decided on the host before anything was forwarded:
 | request from the guest | answer |
 |---|---|
 | placeholder in the query string | `403 smolvm credentials: placeholders are substituted in request headers only` |
-| placeholder in a form body | the same; from v1.27.0 `403 smolvm credentials: body substitution is disabled for this binding`, unless the binding has `:body` |
+| placeholder in a form body | the same; from v1.27.0 `403 smolvm credentials: body substitution is disabled for this binding`, unless the binding has `:body`. gpu-branch fork: the body is only scanned when some binding for the host has `:body` and the body is a form; otherwise it is forwarded unchanged, placeholder text included |
 | the placeholder in two headers | `403 smolvm credentials: a request may carry one placeholder` |
 | a made-up `SMOL_PLACEHOLDER_DEMO_...` | `403 smolvm credentials: unknown placeholder` |
 | placeholder in `Cookie` | `403 smolvm credentials: placeholders are not substituted in routing or framing headers` |
