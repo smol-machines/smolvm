@@ -1647,6 +1647,7 @@ where
     let marker = out_base.join(ARCHIVE_EXTRACTED_MARKER);
     let signature = archive_signature(&archive)?;
     if std::fs::read_to_string(&marker).ok().as_deref() == Some(signature.as_str()) {
+        seed_workspace_from_archive_rootfs(&out_base.join(ARCHIVE_ROOTFS_DIR));
         return Ok(Some(out_base));
     }
 
@@ -1666,8 +1667,56 @@ where
     } else {
         recover_archive_config(&archive, &out_base.join(ARCHIVE_CONFIG_FILE))?;
     }
+    seed_workspace_from_archive_rootfs(&rootfs);
     std::fs::write(&marker, signature)?;
     Ok(Some(out_base))
+}
+
+/// Seed `/storage/workspace` once when a flattened local image archive carries
+/// files under `/workspace` (for example from `machine export --include-workspace`).
+///
+/// Containers bind-mount `/storage/workspace` over `/workspace` via
+/// [`add_workspace_fallback`], which would otherwise shadow `/workspace` files
+/// from the archive's rootfs on a fresh storage disk.
+fn seed_workspace_from_archive_rootfs(rootfs: &Path) {
+    const MARKER: &str = ".smolvm-workspace-seeded";
+    let src = rootfs.join(WORKSPACE_DIR);
+    let has_entries = std::fs::read_dir(&src)
+        .ok()
+        .is_some_and(|mut it| it.any(|e| e.ok().is_some_and(|e| e.file_name() != MARKER)));
+    if !has_entries {
+        return;
+    }
+    let workspace = Path::new(STORAGE_ROOT).join(WORKSPACE_DIR);
+    let marker = workspace.join(MARKER);
+    if marker.exists() {
+        return;
+    }
+    if let Err(e) = std::fs::create_dir_all(&workspace) {
+        warn!(error = %e, "archive workspace seed: cannot create workspace dir");
+        return;
+    }
+    info!("seeding /workspace from the image archive");
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("tar --exclude=./.smolvm-workspace-seeded -cf - -C \"$1\" . | tar -xf - -C \"$2\"")
+        .arg("sh")
+        .arg(&src)
+        .arg(&workspace)
+        .status();
+    match status {
+        Ok(s) if s.success() => {
+            if let Err(e) = std::fs::write(&marker, b"") {
+                warn!(error = %e, "archive workspace seed: cannot write marker");
+            }
+        }
+        Ok(s) => {
+            warn!(code = ?s.code(), "archive workspace seed: copy failed; workspace left as-is")
+        }
+        Err(e) => {
+            warn!(error = %e, "archive workspace seed: failed to run tar; workspace left as-is")
+        }
+    }
 }
 
 /// A cheap content signature for a staged archive (size + mtime), used to
