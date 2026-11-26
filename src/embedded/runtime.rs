@@ -1605,8 +1605,23 @@ impl EmbeddedRuntime {
         on_event: F,
     ) -> Result<()> {
         let op = self.inflight.begin(name, "exec")?;
-        let result = self.exec_streaming_inner(name, command, options, cancel, on_event);
-        op.finish(result)
+        // The agent connection reports its own end as an error event, so a stop
+        // or delete that cuts the command off would otherwise surface only as
+        // "connection closed". Hold that event back and report the stop.
+        let mut cut_off = None;
+        let mut on_event = on_event;
+        let result =
+            self.exec_streaming_inner(name, command, options, cancel, |event| match event {
+                ExecEvent::Error(reason) => match op.interrupted(reason.clone()) {
+                    Some(error) => cut_off = Some(error),
+                    None => on_event(ExecEvent::Error(reason)),
+                },
+                event => on_event(event),
+            });
+        match cut_off {
+            Some(error) => Err(error),
+            None => op.finish(result),
+        }
     }
 
     fn exec_streaming_inner<F: FnMut(ExecEvent)>(
@@ -1878,6 +1893,12 @@ impl EmbeddedRuntime {
 
     /// Get the current machine state as a string.
     pub fn state(&self, name: &str) -> String {
+        // A stop or delete past its drain is tearing the machine down, and its
+        // handle is busy doing it: the persisted record would still say
+        // running, so a command it cut off could not tell why.
+        if self.inflight.tearing_down(name) {
+            return "stopped".into();
+        }
         if let Ok(Some(record)) = self.db.get_vm(name) {
             if record.paused_checkpoint.is_some() {
                 return record.state.to_string();
