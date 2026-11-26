@@ -8,10 +8,10 @@
 # releases too old for NVIDIA's driver), and the fixes in
 # patches/virglrenderer-linux/ reach users without waiting for a distro.
 #
-# Run it as root inside an Ubuntu 20.04 container of the target architecture
-# (.github/workflows/build-virglrenderer-linux.yml does). 20.04 is the
-# baseline on purpose: it has glibc 2.31, the oldest the Linux dist supports
-# (LINUX_GLIBC in release.yml).
+# Run it as root inside an AlmaLinux 8 container of the target architecture
+# (.github/workflows/build-virglrenderer-linux.yml does). AlmaLinux 8 is the
+# baseline on purpose: it has glibc 2.28, the oldest the Linux dist supports
+# (LINUX_GLIBC in release.yml), and it is what manylinux_2_28 builds on.
 #
 # What stays with the host: libEGL, libgbm, libdrm and the Vulkan loader and
 # driver. They belong to the GPU driver installed there. The Vulkan loader is
@@ -32,21 +32,24 @@ VIRGL_SHA256="065bc56e89e6f631f96101cd62eba0748e48eb888b434edc86e89d05395e76f3"
 EPOXY_VERSION="1.5.10"
 EPOXY_URL="https://download.gnome.org/sources/libepoxy/1.5/libepoxy-${EPOXY_VERSION}.tar.xz"
 EPOXY_SHA256="072cda4b59dd098bba8c2363a6247299db1fa89411dc221c8b81b8ee8192e623"
-GLIBC_FLOOR="2.31"
+GLIBC_FLOOR="2.28"
 
-if ! grep -q 'VERSION_ID="20.04"' /etc/os-release 2>/dev/null; then
-    echo "build-virglrenderer-linux.sh must run on Ubuntu 20.04 (glibc $GLIBC_FLOOR)" >&2
+if ! grep -q '^ID="almalinux"' /etc/os-release 2>/dev/null \
+    || ! grep -q '^VERSION_ID="8' /etc/os-release; then
+    echo "build-virglrenderer-linux.sh must run on AlmaLinux 8 (glibc $GLIBC_FLOOR)" >&2
     exit 1
 fi
 
-export DEBIAN_FRONTEND=noninteractive
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends gcc libc6-dev python3-pip \
-    ninja-build pkg-config curl ca-certificates xz-utils patch patchelf \
-    binutils libdrm-dev libgbm-dev libegl-dev >/dev/null
-# 20.04 packages a meson older than libepoxy accepts; virglrenderer's
-# generators need PyYAML.
-python3 -m pip install -q 'meson==1.7.0' 'PyYAML==6.0.2'
+dnf install -y -q --enablerepo=powertools gcc glibc-devel python39 python39-pip pkgconf-pkg-config \
+    curl ca-certificates xz patch binutils libdrm-devel mesa-libgbm-devel \
+    libglvnd-devel >/dev/null
+# AlmaLinux 8 packages no meson new enough for libepoxy, and ninja and
+# patchelf only in other repositories; virglrenderer's generators need PyYAML.
+python3.9 -m pip install -q 'meson==1.7.0' 'PyYAML==6.0.2' 'ninja==1.11.1.4' \
+    'patchelf==0.17.2.4'
+export PATH="/usr/local/bin:$PATH"
+# virglrenderer's meson finds `python3`, which must be the one with PyYAML.
+alternatives --set python3 /usr/bin/python3.9
 
 WORK="$(mktemp -d)"
 trap 'rm -rf "$WORK"' EXIT

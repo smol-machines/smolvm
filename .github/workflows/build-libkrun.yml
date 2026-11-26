@@ -1,8 +1,8 @@
-name: Build libkrun (linux, glibc 2.31)
+name: Build libkrun (linux, glibc 2.28)
 
-# Rebuild the bundled linux libkrun.so linked against glibc 2.31 (with zig and
+# Rebuild the bundled linux libkrun.so linked against glibc 2.28 (with zig and
 # cargo-zigbuild, on ubuntu-22.04 for its build dependencies), the same floor
-# the release binaries get (see release.yml): Ubuntu 20.04+, Debian 11+, RHEL 9+. A libkrun built on a newer distro (e.g. Ubuntu 24.04 / glibc
+# the release binaries get (see release.yml): RHEL 8+, Debian 10+, Ubuntu 18.10+. A libkrun built on a newer distro (e.g. Ubuntu 24.04 / glibc
 # 2.39) loads fine there but fails on 22.04 with "GLIBC_2.39 not found", which is
 # exactly how a hand-built lib slipped a 2.39 floor into v1.2.0.
 #
@@ -66,7 +66,7 @@ jobs:
 
       - name: Build libkrun (GPU=1)
         env:
-          LINUX_GLIBC: "2.31"
+          LINUX_GLIBC: "2.28"
         run: |
           if [ "${{ inputs.rebuild_libkrunfw }}" = "true" ]; then
             echo "Rebuilding libkrunfw from source"
@@ -75,8 +75,8 @@ jobs:
             SKIP_LIBKRUNFW=1 GPU=1 ./scripts/build-libkrun-linux.sh
           fi
 
-      - name: Assert glibc floor <= 2.31
-        run: ./scripts/check-glibc-floor.sh 2.31 "lib/linux-${{ matrix.arch }}/libkrun.so"
+      - name: Assert glibc floor <= 2.28
+        run: ./scripts/check-glibc-floor.sh 2.28 "lib/linux-${{ matrix.arch }}/libkrun.so"
 
       - uses: actions/upload-artifact@v4
         with:

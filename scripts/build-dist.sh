@@ -256,7 +256,7 @@ if [[ ! -f "$WORK_LIB_DIR/libkrunfw.5.dylib" ]] && [[ ! -f "$WORK_LIB_DIR/libkru
     exit 1
 fi
 
-# Build a release binary. On Linux, LINUX_GLIBC=2.31 links it against that
+# Build a release binary. On Linux, LINUX_GLIBC=2.28 links it against that
 # glibc with zig and cargo-zigbuild instead of the build host's, so it runs on
 # hosts that old; the binary still lands in target/release for the steps below.
 cargo_release() { # $1 = binary name, rest = cargo args

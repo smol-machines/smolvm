@@ -2,7 +2,7 @@
 #
 # Fail when any of the given ELF files needs a glibc newer than the floor.
 #
-# Usage: ./scripts/check-glibc-floor.sh 2.31 target/release/smolvm lib/linux-x86_64/libkrun.so
+# Usage: ./scripts/check-glibc-floor.sh 2.28 target/release/smolvm lib/linux-x86_64/libkrun.so
 set -euo pipefail
 
 floor="$1"
