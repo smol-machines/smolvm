@@ -23,7 +23,13 @@ for arch in x86_64 aarch64; do
       status=1
       continue
     fi
-    maxv=$(objdump -T "$so" | grep -oE 'GLIBC_[0-9]+\.[0-9]+' | sed 's/GLIBC_//' | sort -V | tail -1)
+    if ! symbols=$(objdump -T "$so" 2>&1); then
+      echo "::error::$so is not a readable ELF file (LFS not pulled?): $symbols"
+      status=1
+      continue
+    fi
+    # libkrunfw imports nothing from glibc, which leaves this empty.
+    maxv=$(grep -oE 'GLIBC_[0-9]+\.[0-9]+' <<<"$symbols" | sed 's/GLIBC_//' | sort -V | tail -1 || true)
     echo "max GLIBC required by $so: ${maxv:-none}"
     if [ -n "$maxv" ] && [ "$(printf '%s\n%s\n' "$maxv" "$FLOOR" | sort -V | tail -1)" != "$FLOOR" ]; then
       echo "::error::$so requires glibc $maxv (> $FLOOR) — rebuild it (see above)"
