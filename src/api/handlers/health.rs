@@ -55,6 +55,7 @@ pub async fn health(State(state): State<Arc<ApiState>>) -> Json<HealthResponse> 
             crate::portable_checkpoint::HISTORY_FORMAT_VERSION,
             crate::portable_checkpoint::DELTA_FORMAT_VERSION,
         ],
+        branch_source_floor: crate::agent::fork::BRANCH_SOURCE_FLOOR,
     })
 }
 
