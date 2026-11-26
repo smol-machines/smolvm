@@ -379,7 +379,13 @@ fn repair(denial: &Denial, uid: u32, gid: u32, groups: &[u32]) -> bool {
     } else {
         0
     };
-    let bits = bits << class_shift(meta.uid(), meta.gid(), uid, gid, groups);
+    // The class comes from the path as the VM sees it: through an idmapped mount
+    // the on-disk owner is not the one the kernel checks (a group-root file shows
+    // the VM's gid there), so the on-disk ids would pick the wrong class.
+    let Ok(seen) = std::fs::symlink_metadata(&denial.blocked_at) else {
+        return false;
+    };
+    let bits = bits << class_shift(seen.uid(), seen.gid(), uid, gid, groups);
     let mode = meta.permissions().mode() & 0o7777;
     if bits == 0 || mode & bits == bits {
         return false;
