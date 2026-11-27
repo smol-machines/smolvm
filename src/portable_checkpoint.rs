@@ -5020,7 +5020,12 @@ fn record_paused_disks(vm_data: &Path, artifact: &Path, captured: Option<&str>) 
         }
         let marker = paused_disks_marker(vm_data)?;
         let partial = marker.with_extension(format!("{}", std::process::id()));
-        let mut file = std::fs::File::create(&partial)?;
+        // Private regardless of the umask: resume trusts this record only when
+        // no one else can write it, and under a group-writable umask (002, the
+        // Ubuntu default) a plainly created file failed that check, which sent
+        // every resume down the slower path that installs the checkpoint's disks.
+        let _ = std::fs::remove_file(&partial);
+        let mut file = create_private_file(&partial)?;
         writeln!(file, "{}", artifact.display())?;
         file.write_all(captured.as_bytes())?;
         file.sync_all()?;
@@ -5596,8 +5601,17 @@ fn install_pinned_layer_from(pins: &Path, layer: &PinnedLayer, extracted: &Path)
     }
     match &layer.next_target {
         Some(target) => {
+            use std::os::unix::fs::PermissionsExt;
             crate::disk_utils::clone_or_copy_file(&pin, &destination)?;
+            // The copy keeps the pin's mode, and a pin is another machine's
+            // immutable layer, often read-only (0400): opening it to rewrite
+            // the backing name failed with EACCES, and the paused branch could
+            // never resume. Make the private copy writable for the header
+            // rewrite, then give it back the pin's mode.
+            let mode = std::fs::metadata(&destination)?.permissions().mode();
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(0o600))?;
             rewrite_qcow2_backing(&destination, target)?;
+            std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))?;
         }
         // A raw layer has nothing to rewrite, and installs as a link.
         None => {
@@ -9913,6 +9927,83 @@ mod tests {
 
         remove_paused_layers(&fork).unwrap();
         assert!(!paused_layers_dir(&fork).unwrap().exists());
+    }
+
+    /// smolvm#2477: a branch's pinned layer that is read-only (a golden's
+    /// immutable base) still installs. The copy used to keep the pin's 0400
+    /// mode, the backing rewrite then failed with EACCES, and a paused branch
+    /// on a host without reflinks could only be deleted.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_read_only_pinned_layer_installs_and_keeps_its_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        let live = restored_disk_chain(&golden);
+        let fork = dir.path().join("fork");
+        std::fs::create_dir(&fork).unwrap();
+        std::fs::write(fork.join(crate::storage::OVERLAY_DISK_FILENAME), b"overlay").unwrap();
+        create_qcow2(
+            &fork.join("storage.qcow2"),
+            golden.join("storage.qcow2").to_str().unwrap(),
+            "qcow2",
+        );
+        for entry in std::fs::read_dir(&golden).unwrap() {
+            let path = entry.unwrap().path();
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).unwrap();
+        }
+        let checkpoint = dir.path().join("staging/checkpoint");
+        let mut pins = LayerPins::new(&fork).unwrap();
+        let (disks, _) = stage_disk_chains(&fork, &checkpoint, Some(&mut pins)).unwrap();
+        let artifact = fork.join("pause-1.smolcheckpoint");
+        pins.commit(&artifact).unwrap();
+
+        let extracted = dir.path().join("extracted");
+        for layer in &paused_layers(&fork, &artifact).unwrap() {
+            install_pinned_layer(&fork, layer, &extracted).unwrap();
+        }
+        let installed = extracted.join("checkpoint/disks/storage/2");
+        let expected = dir.path().join("expected");
+        std::fs::write(&expected, &live).unwrap();
+        rewrite_qcow2_backing(&expected, &disks[0].files[3].target).unwrap();
+        assert_eq!(
+            std::fs::read(&installed).unwrap(),
+            std::fs::read(&expected).unwrap()
+        );
+        assert_eq!(
+            std::fs::metadata(&installed).unwrap().permissions().mode() & 0o777,
+            0o400,
+            "the installed backing keeps the pin's mode"
+        );
+    }
+
+    /// smolvm#2477: the record that lets resume keep a paused machine's own
+    /// disks is private whatever the umask. Created plainly, it was
+    /// group-writable under umask 002, resume refused to trust it, and every
+    /// resume took the path that installs the checkpoint's disks.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn the_paused_disks_record_is_private_whatever_the_umask() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let golden = dir.path().join("golden");
+        restored_disk_chain(&golden);
+        let fork = dir.path().join("fork");
+        std::fs::create_dir(&fork).unwrap();
+        create_qcow2(
+            &fork.join("storage.qcow2"),
+            golden.join("storage.qcow2").to_str().unwrap(),
+            "qcow2",
+        );
+        let captured = disk_chain_identity(&fork).unwrap();
+        let artifact = fork.join("pause-1.smolcheckpoint");
+        record_paused_disks(&fork, &artifact, Some(&captured));
+        let marker = paused_disks_marker(&fork).unwrap();
+        assert_eq!(
+            std::fs::metadata(&marker).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+        remove_paused_disks_marker(&fork).unwrap();
     }
 
     /// An off-host export links its inputs while the machine is locked and
