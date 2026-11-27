@@ -414,7 +414,161 @@ fn host_layers_via_override_stat(pack_version: Option<&str>, cache_dir: &Path) -
     if host_unpack_preserves_ownership() {
         return false;
     }
-    user_xattrs_supported(cache_dir)
+    user_xattrs_supported(cache_dir) && host_can_hold_layer_names(cache_dir)
+}
+
+/// Why Windows cannot store a file under the tar name `name` exactly as
+/// written, or `None` when it can. `name` is one path component.
+///
+/// A Linux file name may hold any byte but `/` and NUL. Win32 refuses some of
+/// them and silently rewrites others: `a:b` writes a stream named `b` on a
+/// file `a`, `a\b` is a file `b` in a directory `a`, a trailing dot or space
+/// is dropped, and `nul` is a device. `device_stems` also counts a device name
+/// with an extension (`aux.h`), which only some Windows versions treat as the
+/// device; pass it where a wrong "cannot" merely costs time.
+fn windows_cannot_hold_name(name: &[u8], device_stems: bool) -> Option<&'static str> {
+    if name.is_empty() || name == b"." || name == b".." {
+        return None;
+    }
+    let Ok(text) = std::str::from_utf8(name) else {
+        return Some("it is not valid UTF-8");
+    };
+    if text
+        .chars()
+        .any(|c| matches!(c, '<' | '>' | ':' | '"' | '|' | '?' | '*' | '\\') || (c as u32) < 0x20)
+    {
+        return Some("it holds a character Windows reserves");
+    }
+    if text.ends_with('.') || text.ends_with(' ') {
+        return Some("it ends in a dot or a space");
+    }
+    let stem = if device_stems {
+        text.split('.').next().unwrap_or(text).trim_end_matches(' ')
+    } else {
+        text
+    };
+    let upper = stem.to_ascii_uppercase();
+    let numbered = |prefix: &str| {
+        upper.strip_prefix(prefix).is_some_and(|rest| {
+            matches!(
+                rest,
+                "0" | "1"
+                    | "2"
+                    | "3"
+                    | "4"
+                    | "5"
+                    | "6"
+                    | "7"
+                    | "8"
+                    | "9"
+                    | "\u{b9}"
+                    | "\u{b2}"
+                    | "\u{b3}"
+            )
+        })
+    };
+    if matches!(
+        upper.as_str(),
+        "CON" | "PRN" | "AUX" | "NUL" | "CONIN$" | "CONOUT$"
+    ) || numbered("COM")
+        || numbered("LPT")
+    {
+        return Some("it is a Windows device name");
+    }
+    None
+}
+
+/// [`windows_cannot_hold_name`] for every component of a tar entry path.
+fn windows_cannot_hold_path(path: &[u8], device_stems: bool) -> Option<&'static str> {
+    path.split(|b| *b == b'/')
+        .find_map(|name| windows_cannot_hold_name(name, device_stems))
+}
+
+/// The first entry of the layer tar at `tar` that a Windows directory cannot
+/// hold as written, with the reason: a name Win32 refuses or rewrites (see
+/// [`windows_cannot_hold_name`]), or two names in one directory that differ
+/// only in case, where the second would replace the first. `None` when every
+/// entry fits, and also when the tar cannot be read: the extraction that
+/// follows reports that.
+fn layer_entry_windows_cannot_hold(tar: &Path) -> Option<String> {
+    let mut archive = tar::Archive::new(File::open(tar).ok()?);
+    // Every directory and file path seen, by its case-folded form.
+    let mut seen: std::collections::HashMap<String, Vec<u8>> = std::collections::HashMap::new();
+    // Seeking past each file's data keeps this to the headers.
+    for entry in archive.entries_with_seek().ok()? {
+        let entry = entry.ok()?;
+        let path = entry.path_bytes();
+        if let Some(reason) = windows_cannot_hold_path(&path, true) {
+            return Some(format!("'{}': {reason}", String::from_utf8_lossy(&path)));
+        }
+        let mut prefix: Vec<u8> = Vec::new();
+        for name in path
+            .split(|b| *b == b'/')
+            .filter(|name| !name.is_empty() && *name != b"." && *name != b"..")
+        {
+            if !prefix.is_empty() {
+                prefix.push(b'/');
+            }
+            prefix.extend_from_slice(name);
+            let folded = String::from_utf8_lossy(&prefix).to_uppercase();
+            match seen.get(&folded) {
+                Some(first) if *first != prefix => {
+                    return Some(format!(
+                        "'{}': '{}' differs from it only in case",
+                        String::from_utf8_lossy(&prefix),
+                        String::from_utf8_lossy(first)
+                    ));
+                }
+                Some(_) => {}
+                None => {
+                    seen.insert(folded, prefix.clone());
+                }
+            }
+        }
+    }
+    None
+}
+
+/// Records, per cache entry, the verdict of [`layers_windows_cannot_hold`]:
+/// empty when every layer fits, else the first entry that does not.
+const LAYER_NAMES_MARKER: &str = ".smolvm-layer-names";
+
+/// The first entry in any of the entry's layer tars that a Windows directory
+/// cannot hold as written (see [`layer_entry_windows_cannot_hold`]), or `None`.
+/// The tars of a cache entry never change, so the answer is computed once and
+/// kept beside them.
+fn layers_windows_cannot_hold(cache_dir: &Path) -> Option<String> {
+    let marker = cache_dir.join(LAYER_NAMES_MARKER);
+    if let Ok(recorded) = fs::read_to_string(&marker) {
+        return (!recorded.is_empty()).then_some(recorded);
+    }
+    let mut tars: Vec<PathBuf> = fs::read_dir(cache_dir.join("layers"))
+        .ok()?
+        .filter_map(|entry| entry.ok().map(|entry| entry.path()))
+        .filter(|path| path.extension().is_some_and(|ext| ext == "tar"))
+        .collect();
+    tars.sort();
+    let found = tars
+        .iter()
+        .find_map(|tar| layer_entry_windows_cannot_hold(tar));
+    let _ = fs::write(&marker, found.as_deref().unwrap_or(""));
+    if let Some(entry) = &found {
+        eprintln!(
+            "note: this image has a file Windows cannot store under its own name ({entry});              its layers are unpacked inside the machine instead of on this host."
+        );
+    }
+    found
+}
+
+/// Whether this host's filesystem can hold every file of the entry's layers
+/// under the name the image gives it. Windows cannot for names Win32 reserves
+/// (every Debian or Ubuntu image has `/var/lib/dpkg/info/<package>:amd64.list`)
+/// or that differ only in case; unpacking such a layer there fails or, worse,
+/// stores the file under another name. Those layers stay staged for the guest,
+/// whose own filesystem holds any name. macOS unpacks into a case-sensitive
+/// volume and Linux filesystems hold every name.
+fn host_can_hold_layer_names(cache_dir: &Path) -> bool {
+    !cfg!(windows) || layers_windows_cannot_hold(cache_dir).is_none()
 }
 
 /// How the host learns whether its virtiofs server honors the override xattr
@@ -1098,6 +1252,28 @@ fn safe_unpack_skipping<R: Read>(
             .any(|skip| normalize_path(&entry_path).starts_with(skip))
         {
             continue;
+        }
+        // A file or directory whose name Windows would refuse, or store under
+        // another name, is an error here rather than a wrong tree later. Links
+        // and special files keep the leniency below.
+        if cfg!(windows)
+            && matches!(
+                entry_type,
+                tar::EntryType::Regular
+                    | tar::EntryType::Continuous
+                    | tar::EntryType::GNUSparse
+                    | tar::EntryType::Directory
+            )
+        {
+            if let Some(reason) = windows_cannot_hold_path(&entry.path_bytes(), false) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidFilename,
+                    format!(
+                        "tar entry '{}' cannot be stored on Windows under its own name: {reason}",
+                        entry_path.display()
+                    ),
+                ));
+            }
         }
         let normalized_entry = normalize_path(&entry_path);
         let required_here = remaining.contains(&normalized_entry);
@@ -8662,6 +8838,224 @@ mod tests {
         fs::write(layers.join(LAYER_ORDER_FILE), layer_id).unwrap();
         fs::write(cache_dir.join(EXTRACTION_MARKER), "").unwrap();
         cache_dir
+    }
+
+    /// A layer tar holding one small regular file per name, in order.
+    fn layer_tar_with(dir: &Path, names: &[&str]) -> PathBuf {
+        let mut builder = tar::Builder::new(Vec::new());
+        for name in names {
+            let mut header = tar::Header::new_gnu();
+            header.set_entry_type(tar::EntryType::Regular);
+            header.set_mode(0o644);
+            header.set_size(1);
+            // `append_data` would refuse some of these names on a Windows
+            // host; the bytes are what a Linux-built layer carries.
+            header.as_gnu_mut().unwrap().name[..name.len()].copy_from_slice(name.as_bytes());
+            header.set_cksum();
+            builder.append(&header, &b"x"[..]).unwrap();
+        }
+        let tar = dir.join("layer.tar");
+        fs::write(&tar, builder.into_inner().unwrap()).unwrap();
+        tar
+    }
+
+    /// The names Win32 refuses or rewrites are told apart from the ones it
+    /// stores as written, Debian's `<package>:amd64.list` among them.
+    #[test]
+    fn names_windows_cannot_hold_are_recognised() {
+        for name in [
+            "libss2:amd64.triggers",
+            "a:b.txt",
+            "what?",
+            "a*b",
+            "quo\"te",
+            "pipe|d",
+            "<x>",
+            "back\\slash",
+            "tab\there",
+            "trailing.",
+            "trailing ",
+            "NUL",
+            "con",
+            "com1",
+            "LPT9",
+        ] {
+            assert!(
+                windows_cannot_hold_name(name.as_bytes(), false).is_some(),
+                "{name:?} should be refused"
+            );
+        }
+        assert!(windows_cannot_hold_name(&[0xff, 0xfe], false).is_some());
+        for name in [
+            ".",
+            "..",
+            "",
+            "libss2",
+            ".hidden",
+            "a b",
+            "a.b.c",
+            "null",
+            "console",
+            "com10",
+            "aux.h",
+            "nul.txt",
+            "\u{e9}t\u{e9}",
+        ] {
+            assert!(
+                windows_cannot_hold_name(name.as_bytes(), false).is_none(),
+                "{name:?} should be accepted"
+            );
+        }
+        // A device name with an extension is the device on some Windows
+        // versions only, so only the cautious reading counts it.
+        assert!(windows_cannot_hold_name(b"aux.h", true).is_some());
+        assert!(windows_cannot_hold_name(b"nul.txt", true).is_some());
+        assert!(windows_cannot_hold_name(b"auxiliary.h", true).is_none());
+        assert!(
+            windows_cannot_hold_path(b"./var/lib/dpkg/info/libss2:amd64.list", false).is_some()
+        );
+        assert!(windows_cannot_hold_path(b"./var/lib/dpkg/info/libss2.list", false).is_none());
+    }
+
+    /// A layer is scanned for the first entry a Windows directory cannot hold:
+    /// a reserved name, or a name that differs from an earlier one only in
+    /// case, at any depth. A layer without either passes.
+    #[test]
+    fn a_layer_windows_cannot_hold_names_its_first_such_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let fits = layer_tar_with(
+            root.path(),
+            &[
+                "./etc/hostname",
+                "./usr/lib/a.so",
+                "./usr/lib/b.so",
+                "./usr/lib/a.so",
+            ],
+        );
+        assert_eq!(layer_entry_windows_cannot_hold(&fits), None);
+
+        let colon = layer_tar_with(
+            root.path(),
+            &[
+                "./etc/hostname",
+                "./var/lib/dpkg/info/libss2:amd64.triggers",
+            ],
+        );
+        let found = layer_entry_windows_cannot_hold(&colon).unwrap();
+        assert!(found.contains("libss2:amd64.triggers"), "{found}");
+
+        let case = layer_tar_with(
+            root.path(),
+            &["./usr/include/xt_CONNMARK.h", "./usr/include/xt_connmark.h"],
+        );
+        let found = layer_entry_windows_cannot_hold(&case).unwrap();
+        assert!(found.contains("only in case"), "{found}");
+
+        let dir_case = layer_tar_with(root.path(), &["./usr/Share/a", "./usr/share/b"]);
+        let found = layer_entry_windows_cannot_hold(&dir_case).unwrap();
+        assert!(found.contains("usr/share"), "{found}");
+
+        assert_eq!(
+            layer_entry_windows_cannot_hold(&root.path().join("missing.tar")),
+            None
+        );
+    }
+
+    /// The verdict for a cache entry is computed once and kept beside its
+    /// layers, so a later start does not read the tars again.
+    #[test]
+    fn the_layer_name_verdict_is_recorded_per_cache_entry() {
+        let root = tempfile::tempdir().unwrap();
+        let cache_dir = root.path().join("entry");
+        let layers = cache_dir.join("layers");
+        fs::create_dir_all(&layers).unwrap();
+        let tar = layer_tar_with(root.path(), &["./root/a:b.txt"]);
+        fs::rename(&tar, layers.join("aaaa.tar")).unwrap();
+        let found = layers_windows_cannot_hold(&cache_dir).unwrap();
+        assert!(found.contains("a:b.txt"), "{found}");
+        assert_eq!(
+            fs::read_to_string(cache_dir.join(LAYER_NAMES_MARKER)).unwrap(),
+            found
+        );
+        fs::remove_file(layers.join("aaaa.tar")).unwrap();
+        assert_eq!(layers_windows_cannot_hold(&cache_dir), Some(found));
+
+        let clean = root.path().join("clean");
+        fs::create_dir_all(clean.join("layers")).unwrap();
+        let tar = layer_tar_with(root.path(), &["./root/ab.txt"]);
+        fs::rename(&tar, clean.join("layers").join("bbbb.tar")).unwrap();
+        assert_eq!(layers_windows_cannot_hold(&clean), None);
+        assert_eq!(
+            fs::read_to_string(clean.join(LAYER_NAMES_MARKER)).unwrap(),
+            ""
+        );
+        // Only a Windows host acts on the verdict.
+        assert_eq!(host_can_hold_layer_names(&cache_dir), !cfg!(windows));
+        assert!(host_can_hold_layer_names(&clean));
+    }
+
+    /// On Windows a pack whose layer holds a name the host cannot store keeps
+    /// its layers staged for the guest on every cache hit, where it used to
+    /// fail the extraction (os error 123); a layer the host can hold is still
+    /// unpacked there.
+    #[cfg(windows)]
+    #[test]
+    fn windows_leaves_layers_it_cannot_hold_staged_for_the_guest() {
+        let root = tempfile::tempdir().unwrap();
+        if !user_xattrs_supported(root.path()) {
+            return;
+        }
+        let engine = env!("CARGO_PKG_VERSION");
+        let no_sidecar = root.path().join("missing.smolmachine");
+
+        let cache_dir = staged_cache_entry(&root.path().join("debian"), "cccc");
+        let tar = layer_tar_with(
+            root.path(),
+            &[
+                "./etc/hostname",
+                "./var/lib/dpkg/info/libss2:amd64.triggers",
+            ],
+        );
+        fs::rename(&tar, cache_dir.join("layers").join("cccc.tar")).unwrap();
+        for _ in 0..2 {
+            assert!(!upgrade_staged_layers(&no_sidecar, &cache_dir, Some(engine), false).unwrap());
+            assert!(!cache_dir.join(HOST_LAYERS_MARKER).exists());
+            assert!(cache_dir.join("layers").join("cccc.tar").is_file());
+            assert!(!cache_dir.join("layers").join("cccc").exists());
+        }
+
+        let clean = staged_cache_entry(&root.path().join("alpine"), "dddd");
+        assert!(upgrade_staged_layers(&no_sidecar, &clean, Some(engine), false).unwrap());
+        assert!(clean.join(HOST_LAYERS_MARKER).exists());
+        assert!(clean.join("layers").join("dddd").join("secret").is_file());
+    }
+
+    /// Where the host has to unpack a tar itself, a file Windows would store
+    /// under another name fails the unpack and names the entry, and nothing
+    /// is written under the rewritten name.
+    #[cfg(windows)]
+    #[test]
+    fn windows_refuses_to_unpack_a_file_under_another_name() {
+        let root = tempfile::tempdir().unwrap();
+        for name in [
+            "./root/a:b.txt",
+            "./var/lib/dpkg/info/libss2:amd64.triggers",
+        ] {
+            let tar = layer_tar_with(root.path(), &["./etc/hostname", name]);
+            let dest = root.path().join("out");
+            let _ = fs::remove_dir_all(&dest);
+            fs::create_dir_all(&dest).unwrap();
+            let mut archive = tar::Archive::new(File::open(&tar).unwrap());
+            let err = safe_unpack(&mut archive, &dest).unwrap_err();
+            assert_eq!(err.kind(), std::io::ErrorKind::InvalidFilename, "{err}");
+            assert!(
+                err.to_string().contains(name.trim_start_matches("./")),
+                "{err}"
+            );
+            assert!(dest.join("etc").join("hostname").is_file());
+            assert!(!dest.join("root").join("a").exists());
+            assert!(!dest.join("var/lib/dpkg/info/libss2").exists());
+        }
     }
 
     /// The upgrade is decided for the agent that will boot the entry: a pack
