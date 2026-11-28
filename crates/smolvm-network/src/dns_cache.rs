@@ -19,6 +19,8 @@
 //! their records, NXDOMAIN and NODATA answers for their SOA's negative TTL, and
 //! nothing else (SERVFAIL, REFUSED, truncated) is kept. A served answer carries
 //! the asking query's id and question bytes, and TTLs reduced by its age.
+//! Guest queries lose their EDNS COOKIE option before any of this ([`strip_cookie`]):
+//! cookies are per hop, and an answer here can reach any guest.
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -36,6 +38,7 @@ const RCODE_NXDOMAIN: u16 = 3;
 const TYPE_SOA: u16 = 6;
 const TYPE_OPT: u16 = 41;
 const EDNS_DO: u32 = 0x8000;
+const EDNS_COOKIE: u16 = 10;
 const RR_FIXED_LEN: usize = 10;
 const MAX_JUMPS: usize = 32;
 
@@ -297,6 +300,56 @@ fn cache_lifetime(answer: &[u8]) -> Option<(Duration, Vec<usize>)> {
     (!ttl.is_zero()).then_some((ttl, ttl_offsets))
 }
 
+/// Remove the EDNS COOKIE option (RFC 7873) from a guest query. Cookies are per hop: a query sent upstream on
+/// behalf of several guests, or answered from the cache, must not bring one guest's cookie back to another, which a
+/// resolver checking cookies (c-ares, so curl) drops. A packet it cannot read is left as it is.
+pub fn strip_cookie(packet: &mut Vec<u8>) {
+    let Some((start, end)) = opt_rdata(packet) else {
+        return;
+    };
+    let mut kept = Vec::with_capacity(end - start);
+    let mut at = start;
+    while at < end {
+        let Some(option) = packet.get(at..at + 4) else {
+            return;
+        };
+        let code = u16::from_be_bytes([option[0], option[1]]);
+        let next = at + 4 + usize::from(u16::from_be_bytes([option[2], option[3]]));
+        if next > end {
+            return;
+        }
+        if code != EDNS_COOKIE {
+            kept.extend_from_slice(&packet[at..next]);
+        }
+        at = next;
+    }
+    if kept.len() == end - start {
+        return;
+    }
+    packet[start - 2..start].copy_from_slice(&(kept.len() as u16).to_be_bytes());
+    packet.splice(start..end, kept);
+}
+
+/// Where the OPT record's options are in `packet`, if it has one.
+fn opt_rdata(packet: &[u8]) -> Option<(usize, usize)> {
+    if packet.len() < HEADER_LEN {
+        return None;
+    }
+    let (qd, an, ns, ar) = counts(packet);
+    let mut offset = HEADER_LEN;
+    for _ in 0..qd {
+        offset = skip_name(packet, offset)?.checked_add(4)?;
+    }
+    for index in 0..u32::from(an) + u32::from(ns) + u32::from(ar) {
+        let (rtype, _, end) = parse_rr(packet, offset)?;
+        if rtype == TYPE_OPT && index >= u32::from(an) + u32::from(ns) {
+            return Some((skip_name(packet, offset)? + RR_FIXED_LEN, end));
+        }
+        offset = end;
+    }
+    None
+}
+
 fn counts(packet: &[u8]) -> (u16, u16, u16, u16) {
     let at = |i: usize| u16::from_be_bytes([packet[i], packet[i + 1]]);
     (at(4), at(6), at(8), at(10))
@@ -395,6 +448,22 @@ pub(crate) mod tests {
         q
     }
 
+    /// Offset just past the question of a query built by [`query`].
+    pub(crate) fn question_end(q: &[u8]) -> usize {
+        skip_uncompressed_name(q, 12).unwrap() + 4
+    }
+
+    /// `query` with an EDNS OPT carrying a COOKIE (client cookie only, as a first query does) and a padding option.
+    pub(crate) fn query_with_cookie(id: u16, n: &str, cookie: [u8; 8]) -> Vec<u8> {
+        let mut q = query(id, n, 1, false);
+        q[11] = 1;
+        q.extend_from_slice(&[0, 0, 41, 0x10, 0, 0, 0, 0, 0, 0, 16]);
+        q.extend_from_slice(&[0, 10, 0, 8]);
+        q.extend_from_slice(&cookie);
+        q.extend_from_slice(&[0, 12, 0, 0]);
+        q
+    }
+
     /// A response to `q` with one A record per `(ttl, ip)` pair, compressed
     /// against the question.
     pub(crate) fn answer(q: &[u8], records: &[(u32, [u8; 4])]) -> Vec<u8> {
@@ -437,6 +506,26 @@ pub(crate) mod tests {
             .iter()
             .map(|&o| u32::from_be_bytes(a[o..o + 4].try_into().unwrap()))
             .collect()
+    }
+
+    #[test]
+    fn the_cookie_option_is_removed_and_every_other_option_kept() {
+        let mut q = query_with_cookie(0x1111, "api.example.com", [7; 8]);
+        strip_cookie(&mut q);
+        let mut expected = query(0x1111, "api.example.com", 1, true);
+        expected.truncate(expected.len() - 2);
+        expected.extend_from_slice(&[0, 4, 0, 12, 0, 0]);
+        assert_eq!(q, expected);
+        // Without a cookie, or unreadable, a packet is left alone.
+        for mut untouched in [
+            query(1, "a.example", 1, true),
+            query(1, "a.example", 1, false),
+            vec![0u8; 5],
+        ] {
+            let before = untouched.clone();
+            strip_cookie(&mut untouched);
+            assert_eq!(untouched, before);
+        }
     }
 
     #[test]

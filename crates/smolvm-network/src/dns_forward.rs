@@ -182,13 +182,15 @@ impl<W> Forwarder<W> {
     pub fn submit(
         &mut self,
         waiter: W,
-        query: Vec<u8>,
+        mut query: Vec<u8>,
         upstreams: &[SocketAddr],
         now: Instant,
     ) -> Option<Answer<W>> {
         if upstreams.is_empty() {
             return Some((waiter, None));
         }
+        // The answer may go to other guests too, now or from the cache.
+        crate::dns_cache::strip_cookie(&mut query);
         let parsed = Query::parse(&query, upstreams);
         if let Some(parsed) = &parsed {
             if let Some(answer) = self.cache.get(parsed, now) {
@@ -459,7 +461,7 @@ fn run_loopback(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::dns_cache::tests::{answer, query};
+    use crate::dns_cache::tests::{answer, query, query_with_cookie};
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
@@ -470,6 +472,8 @@ mod tests {
         DropFirst(usize),
         /// Answer every query with this RCODE and no records.
         Fail(u8),
+        /// Answer every query, echoing its EDNS OPT record (and so its cookie), as a cookie-aware server does.
+        EchoOpt,
     }
 
     struct Resolver {
@@ -502,6 +506,16 @@ mod tests {
                     let reply = match mode {
                         Mode::DropFirst(skip) if count < skip => continue,
                         Mode::DropFirst(_) => answer(&buf[..n], &[(60, [10, 0, 0, 7])]),
+                        Mode::EchoOpt => {
+                            let q = &buf[..n];
+                            let mut a = answer(q, &[(60, [10, 0, 0, 7])]);
+                            let opt_at = crate::dns_cache::tests::question_end(q);
+                            if opt_at < q.len() {
+                                a[11] = 1;
+                                a.extend_from_slice(&q[opt_at..]);
+                            }
+                            a
+                        }
                         Mode::Fail(rcode) => {
                             let mut a = answer(&buf[..n], &[]);
                             a[3] = (a[3] & 0xf0) | rcode;
@@ -576,6 +590,40 @@ mod tests {
             Instant::now(),
         );
         assert!(matches!(hit, Some((999, Some(_)))));
+    }
+
+    #[test]
+    fn a_guest_never_gets_another_guests_dns_cookie_back() {
+        let r = resolver(Mode::EchoOpt);
+        let mut f: Forwarder<u16> = Forwarder::new();
+        let (first, second) = ([0xaa; 8], [0xbb; 8]);
+        let now = Instant::now();
+        assert!(f
+            .submit(
+                1,
+                query_with_cookie(1, "svc.example", first),
+                &[r.addr],
+                now
+            )
+            .is_none());
+        let answers = drain(&mut f, 1, Duration::from_secs(2));
+        let answered = answers[0].1.as_ref().expect("answered");
+        // The second guest is answered from the cache.
+        let (_, cached) = f
+            .submit(
+                2,
+                query_with_cookie(2, "svc.example", second),
+                &[r.addr],
+                Instant::now(),
+            )
+            .expect("a cache hit");
+        let cached = cached.expect("answered");
+        for bytes in [answered, &cached] {
+            assert!(
+                !bytes.windows(8).any(|w| w == first || w == second),
+                "{bytes:?}"
+            );
+        }
     }
 
     #[test]
