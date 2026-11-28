@@ -421,6 +421,27 @@ normalize_owner_only_modes() {
     fi
 }
 
+# The guest mounts this tree at /, so an absolute link target names a path in
+# the tree, but on the host it points outside it, and installers that check
+# link containment (mise) refuse the archive. Rewrite each absolute target
+# relative to the link's own directory, which resolves to the same guest path.
+relativize_absolute_symlinks() {
+    local rootfs_dir="$1" link target dir up rel
+    while IFS= read -r -d '' link; do
+        target="$(readlink "$rootfs_dir/$link")"
+        dir="$(dirname "${link#.}")"
+        dir="${dir%/}/"
+        up=""
+        while [[ "$target" != "$dir"* ]]; do
+            dir="${dir%/*/}/"
+            up="../$up"
+        done
+        rel="$up${target#"$dir"}"
+        rm "$rootfs_dir/$link"
+        ln -s "${rel:-.}" "$rootfs_dir/$link"
+    done < <(cd "$rootfs_dir" && find . -type l -lname '/*' -print0)
+}
+
 if [[ "$(uname -s)" == "Linux" ]]; then
     # On Linux, apk.static is preferred — it handles cross-arch correctly
     install_packages_apk_static
@@ -491,7 +512,7 @@ fi
 # symlink to the agent binary. The agent handles overlayfs setup +
 # pivot_root internally before starting the vsock listener.
 rm -f "$OUTPUT_DIR/sbin/init"
-ln -sf /usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
+ln -sf ../usr/local/bin/smolvm-agent "$OUTPUT_DIR/sbin/init"
 
 # Create resolv.conf
 echo "nameserver 1.1.1.1" > "$OUTPUT_DIR/etc/resolv.conf"
@@ -651,6 +672,7 @@ else
 fi
 
 # Last, so it covers every file the steps above installed — not just the Alpine base.
+relativize_absolute_symlinks "$OUTPUT_DIR"
 normalize_owner_only_modes "$OUTPUT_DIR"
 
 echo ""

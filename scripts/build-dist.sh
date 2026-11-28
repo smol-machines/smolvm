@@ -567,7 +567,16 @@ cp ./target/release-small/smolvm-agent "$DIST_DIR/agent-rootfs/usr/local/bin/smo
 chmod +x "$DIST_DIR/agent-rootfs/usr/local/bin/smolvm-agent"
 # Symlink /sbin/init → agent (saves ~1.8MB in initramfs vs a copy).
 # The agent handles overlayfs setup + pivot_root internally.
-ln -sf /usr/local/bin/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
+ln -sf ../usr/local/bin/smolvm-agent "$DIST_DIR/agent-rootfs/sbin/init"
+
+# An absolute link points outside the install directory on the host, and
+# installers that check link containment (mise) refuse the whole archive.
+ABSOLUTE_LINKS="$(find "$DIST_DIR/agent-rootfs" -type l -lname '/*')"
+if [[ -n "$ABSOLUTE_LINKS" ]]; then
+    echo "Error: agent-rootfs has absolute symlinks; rebuild it with scripts/build-agent-rootfs.sh:" >&2
+    echo "$ABSOLUTE_LINKS" >&2
+    exit 1
+fi
 
 echo "Agent rootfs size: $(du -sh "$DIST_DIR/agent-rootfs" | cut -f1)"
 

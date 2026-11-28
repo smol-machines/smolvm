@@ -57,7 +57,7 @@ cp target/release-small/smolvm-agent "$ROOTFS_DIR/usr/local/bin/"
 # /sbin/init is the kernel's entry point — symlink to the agent binary.
 # The agent handles overlayfs setup + pivot_root internally before
 # starting the vsock listener.
-ln -sf /usr/local/bin/smolvm-agent "$ROOTFS_DIR/sbin/init"
+ln -sf ../usr/local/bin/smolvm-agent "$ROOTFS_DIR/sbin/init"
 
 # Also update target/agent-rootfs if it exists — pack create reads from
 # there first, so it must stay in sync with the installed rootfs.
