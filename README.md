@@ -129,6 +129,8 @@ Use `--allow-host-pattern '*.example.com'` to allow subdomains only; `--allow-ho
 its subdomains. `smolvm machine update` adds (`--allow-host`, `--allow-host-pattern`, `--allow-cidr`) and removes
 (`--remove-allow-host`, a host or pattern as it was added; `--remove-allow-cidr`) entries, also on a running machine
 started with an allow list: a grant applies to the next connection or lookup, and a removed host's learned addresses go with it.
+On a stopped machine, `--allow-private`, `--remove-allow-private` and `--reset-allow-private` change the private ranges
+reopened under `--block-private` (for example a database endpoint whose private address moved) without recreating it.
 
 How It Works
 ------------
