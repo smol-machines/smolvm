@@ -6027,6 +6027,15 @@ impl CreateCmd {
                 }
                 #[cfg(not(target_os = "linux"))]
                 unreachable!("shared pack extraction is Linux-only")
+            } else if let Some(ref checkpoint) = checkpoint {
+                smolvm::portable_checkpoint::extract_checkpoint_for_restore(
+                    sidecar_path,
+                    &cache_dir,
+                    footer.as_ref().expect("file artifact has a footer"),
+                    &manifest,
+                    checkpoint,
+                )
+                .map(|()| (cache_dir.clone(), None::<String>))
             } else {
                 smolvm_pack::extract::extract_sidecar_for_machine(
                     sidecar_path,

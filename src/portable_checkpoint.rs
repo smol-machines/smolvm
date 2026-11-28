@@ -4154,6 +4154,102 @@ pub fn materialize_pack_layers(name: &str, sidecar: &Path) -> Result<()> {
     )
 }
 
+/// Extract a single-file checkpoint sidecar into `dest`, skipping the runtime
+/// libraries, storage template, and (when this host already has the pinned
+/// rootfs) `agent-rootfs.tar` that [`install`] never reads and
+/// [`discard_transport_pack`] deletes immediately afterwards.
+///
+/// Uses [`smolvm_pack::extract::extract_verified_checkpoint_sidecar`] so the
+/// full sidecar checksum is still verified in one sequential read before any
+/// extracted file is installed.
+pub fn extract_checkpoint_for_restore(
+    sidecar: &Path,
+    dest: &Path,
+    footer: &smolvm_pack::PackFooter,
+    manifest: &smolvm_pack::PackManifest,
+    checkpoint: &PortableCheckpointManifest,
+) -> Result<()> {
+    let (skip, required) = restore_extract_filter(manifest, checkpoint, false, &[]);
+    smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+        sidecar, dest, footer, &skip, &required,
+    )
+    .map_err(|error| Error::agent("extract checkpoint sidecar", error.to_string()))
+}
+
+/// Build the `(skip, required)` path lists for selective checkpoint sidecar
+/// extraction.
+///
+/// The host boots its own runtime libraries and storage template, so those
+/// stay packed. `agent-rootfs.tar` is skipped whenever the host already has
+/// the checkpoint's pinned rootfs digest, and extracted (without unpacking it
+/// into `agent-rootfs/`) only when `pin_restore_rootfs` needs it to populate
+/// the rootfs store or learn a legacy checkpoint's digest.
+fn restore_extract_filter(
+    manifest: &smolvm_pack::PackManifest,
+    checkpoint: &PortableCheckpointManifest,
+    keep_disks: bool,
+    pinned: &[PinnedLayer],
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let rootfs_available = pinned_rootfs_available(checkpoint);
+    restore_extract_filter_with_rootfs(manifest, checkpoint, keep_disks, pinned, rootfs_available)
+}
+
+fn restore_extract_filter_with_rootfs(
+    manifest: &smolvm_pack::PackManifest,
+    checkpoint: &PortableCheckpointManifest,
+    keep_disks: bool,
+    pinned: &[PinnedLayer],
+    rootfs_available: bool,
+) -> (Vec<PathBuf>, Vec<PathBuf>) {
+    let mut skip: Vec<PathBuf> = manifest
+        .assets
+        .libraries
+        .iter()
+        .map(|asset| PathBuf::from(&asset.path))
+        .collect();
+    skip.push(PathBuf::from("lib"));
+    if rootfs_available {
+        skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
+    }
+    if let Some(template) = &manifest.assets.storage_template {
+        skip.push(PathBuf::from(&template.path));
+    }
+    if keep_disks {
+        skip.push(PathBuf::from("checkpoint/disks"));
+    }
+
+    let mut required: Vec<PathBuf> = expected_assets(checkpoint)
+        .into_iter()
+        .map(|(_, path)| PathBuf::from(path))
+        .collect();
+    if let Some(asset) = &checkpoint.credential_ca {
+        required.push(PathBuf::from(&asset.path));
+    }
+    if let Some(host_image) = &checkpoint.host_image {
+        if let Some(archive) = &host_image.archive {
+            required.push(PathBuf::from(&archive.path));
+        }
+    }
+    if !rootfs_available {
+        required.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
+    }
+    if !keep_disks {
+        required.extend(
+            checkpoint
+                .disks
+                .iter()
+                .flat_map(|disk| disk.files.iter())
+                .filter(|file| {
+                    !pinned
+                        .iter()
+                        .any(|layer| layer.archive_path == file.asset.path)
+                })
+                .map(|file| PathBuf::from(&file.asset.path)),
+        );
+    }
+    (skip, required)
+}
+
 /// [`materialize_pack_layers`] with the shortcuts a restore can take: a
 /// SHA-256 already known for the artifact's inode (see
 /// [`VerifiedSidecar::digest_proof`]), and, for a long-lived server, leaving
@@ -4186,9 +4282,10 @@ pub fn materialize_pack_layers_with_options(
         &crate::agent::shared_pack_cache_root(),
         footer.checksum,
     );
-    let chunked = smolvm_pack::packer::read_manifest_from_sidecar(sidecar)
-        .ok()
-        .and_then(|manifest| manifest.checkpoint)
+    let manifest = smolvm_pack::packer::read_manifest_from_sidecar(sidecar).ok();
+    let chunked = manifest
+        .as_ref()
+        .and_then(|manifest| manifest.checkpoint.as_ref())
         .is_some_and(|checkpoint| {
             checkpoint.payload == smolvm_pack::format::CheckpointLayout::Chunked
         });
@@ -4209,6 +4306,15 @@ pub fn materialize_pack_layers_with_options(
         Ok(()) => {}
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
         Err(error) => return Err(Error::agent("clear packed layers cache", error.to_string())),
+    }
+    if let Some(manifest) = manifest.as_ref() {
+        if let Some(checkpoint) = manifest.checkpoint.as_ref() {
+            if checkpoint.payload != smolvm_pack::format::CheckpointLayout::Chunked {
+                return extract_checkpoint_for_restore(
+                    sidecar, &cache_dir, &footer, manifest, checkpoint,
+                );
+            }
+        }
     }
     smolvm_pack::extract::extract_sidecar_for_machine(sidecar, &cache_dir, &footer)
         .map_err(|error| Error::agent("extract sidecar", error.to_string()))
@@ -7411,13 +7517,6 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<Option<Restore
     // template the artifact carries for other hosts stay packed. The agent
     // rootfs too, unless the guest booted on one this host no longer has: then
     // the carried copy is extracted and installed in the rootfs store.
-    let mut skip: Vec<PathBuf> = manifest
-        .assets
-        .libraries
-        .iter()
-        .map(|asset| PathBuf::from(&asset.path))
-        .collect();
-    skip.push(PathBuf::from("lib"));
     let rootfs_available = pinned_rootfs_available(checkpoint);
     // The pause kept what the installer reads unpacked: install it from there
     // rather than decoding the artifact, which is only needed elsewhere.
@@ -7444,47 +7543,19 @@ pub(crate) fn prepare_paused_restore(record: &VmRecord) -> Result<Option<Restore
             };
         }
     }
-    if rootfs_available {
-        skip.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
-    }
-    if let Some(template) = &manifest.assets.storage_template {
-        skip.push(PathBuf::from(&template.path));
-    }
-    if keep_disks {
-        skip.push(PathBuf::from("checkpoint/disks"));
-    }
-    // Extract only the files the installer will read. The extractor verifies
-    // every compressed and manifest byte before any state is installed.
-    let mut required: Vec<PathBuf> = expected_assets(checkpoint)
-        .into_iter()
-        .map(|(_, path)| PathBuf::from(path))
-        .collect();
-    if let Some(asset) = &checkpoint.credential_ca {
-        required.push(PathBuf::from(&asset.path));
-    }
-    if !rootfs_available {
-        required.push(PathBuf::from(&manifest.assets.agent_rootfs.path));
-    }
     // Layers the pause pinned rather than packed come from their pins.
     let pinned = if keep_disks {
         Vec::new()
     } else {
         paused_layers(&vm_data, artifact)?
     };
-    if !keep_disks {
-        required.extend(
-            checkpoint
-                .disks
-                .iter()
-                .flat_map(|disk| disk.files.iter())
-                .filter(|file| {
-                    !pinned
-                        .iter()
-                        .any(|layer| layer.archive_path == file.asset.path)
-                })
-                .map(|file| PathBuf::from(&file.asset.path)),
-        );
-    }
+    let (skip, required) = restore_extract_filter_with_rootfs(
+        &manifest,
+        checkpoint,
+        keep_disks,
+        &pinned,
+        rootfs_available,
+    );
     let extract_and_install = |parent: &Path| -> Result<Option<RestoredHostImage>> {
         let staged = tempfile::Builder::new()
             .prefix("resume-")
@@ -9147,6 +9218,87 @@ mod tests {
             None
         );
         assert!(!partial3.join(ROOTFS_PIN).exists());
+    }
+
+    #[test]
+    fn restore_extract_skips_runtime_libs_and_agent_rootfs_when_host_has_it() {
+        let (staging, checkpoint) = installable_checkpoint();
+        std::fs::create_dir_all(staging.path().join("lib")).unwrap();
+        std::fs::write(staging.path().join("lib/libkrun.dylib"), b"runtime-lib").unwrap();
+        std::fs::write(staging.path().join("agent-rootfs.tar"), b"rootfs-tar").unwrap();
+        std::fs::write(staging.path().join("storage-template.ext4"), b"template").unwrap();
+
+        let mut manifest = smolvm_pack::format::PackManifest::new(
+            "vm://bare".into(),
+            "none".into(),
+            "linux/arm64".into(),
+            "darwin/arm64".into(),
+        );
+        manifest.assets.libraries = vec![smolvm_pack::format::AssetEntry {
+            path: "lib/libkrun.dylib".into(),
+            size: 11,
+        }];
+        manifest.assets.agent_rootfs = smolvm_pack::format::AssetEntry {
+            path: "agent-rootfs.tar".into(),
+            size: 10,
+        };
+        manifest.assets.storage_template = Some(smolvm_pack::format::AssetEntry {
+            path: "storage-template.ext4".into(),
+            size: 8,
+        });
+        manifest.checkpoint = Some(checkpoint.clone());
+
+        let out = tempfile::tempdir().unwrap();
+        let sidecar = out.path().join("checkpoint.smolmachine");
+        let collector =
+            smolvm_pack::assets::AssetCollector::new(staging.path().to_path_buf()).unwrap();
+        Packer::new(manifest.clone())
+            .with_asset_collector(collector)
+            .pack_artifact(&sidecar)
+            .unwrap();
+        let footer = smolvm_pack::packer::read_footer_from_sidecar(&sidecar).unwrap();
+
+        // When the host already has the pinned rootfs, skip agent-rootfs.tar,
+        // runtime libs, and storage template while still extracting checkpoint
+        // state and disks.
+        let (skip_with_rootfs, required_with_rootfs) =
+            restore_extract_filter_with_rootfs(&manifest, &checkpoint, false, &[], true);
+        let dest_skip = out.path().join("dest-skip");
+        smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+            &sidecar,
+            &dest_skip,
+            &footer,
+            &skip_with_rootfs,
+            &required_with_rootfs,
+        )
+        .unwrap();
+        assert!(dest_skip.join("checkpoint/checkpoint.bin").is_file());
+        assert!(dest_skip.join("checkpoint/memory.bin").is_file());
+        assert!(dest_skip.join("checkpoint/disks/storage/0").is_file());
+        assert!(dest_skip.join("checkpoint/disks/overlay/0").is_file());
+        assert!(!dest_skip.join("agent-rootfs.tar").exists());
+        assert!(!dest_skip.join("agent-rootfs").exists());
+        assert!(!dest_skip.join("lib/libkrun.dylib").exists());
+        assert!(!dest_skip.join("storage-template.ext4").exists());
+
+        // When the host lacks the pinned rootfs (or the checkpoint is legacy),
+        // extract agent-rootfs.tar as a file (without unpacking agent-rootfs/)
+        // while still skipping runtime libs and storage template.
+        let (skip_need_rootfs, required_need_rootfs) =
+            restore_extract_filter_with_rootfs(&manifest, &checkpoint, false, &[], false);
+        let dest_need = out.path().join("dest-need");
+        smolvm_pack::extract::extract_verified_checkpoint_sidecar(
+            &sidecar,
+            &dest_need,
+            &footer,
+            &skip_need_rootfs,
+            &required_need_rootfs,
+        )
+        .unwrap();
+        assert!(dest_need.join("agent-rootfs.tar").is_file());
+        assert!(!dest_need.join("agent-rootfs").exists());
+        assert!(!dest_need.join("lib/libkrun.dylib").exists());
+        assert!(!dest_need.join("storage-template.ext4").exists());
     }
 
     fn installable_checkpoint() -> (tempfile::TempDir, PortableCheckpointManifest) {
