@@ -1704,6 +1704,65 @@ impl VmRecord {
         Ok(())
     }
 
+    /// The private ranges a stopped machine reopens under `--block-private`
+    /// after one `machine update` amendment, or `None` when the update names
+    /// none. `reset` starts from an empty list, so the machine ends up with
+    /// exactly `add`; it cannot be combined with removals, which would have
+    /// nothing to remove. Any addition turns the block on, as `machine create
+    /// --allow-private` does; removing every entry keeps the block, with no
+    /// range reopened. A removal must name an entry the machine has.
+    pub fn updated_private_floor(
+        &self,
+        add: &[String],
+        remove: &[String],
+        reset: bool,
+    ) -> Result<Option<Vec<String>>> {
+        if add.is_empty() && remove.is_empty() && !reset {
+            return Ok(None);
+        }
+        if reset && !remove.is_empty() {
+            return Err(crate::Error::config(
+                "update",
+                "resetting the private allow list replaces it, so there is nothing for a \
+                 removal to remove; name the full new list instead",
+            ));
+        }
+        if self.block_private.is_none() && (!remove.is_empty() || (reset && add.is_empty())) {
+            return Err(crate::Error::config(
+                "update",
+                format!(
+                    "machine '{}' does not block private ranges, so it has no private allow \
+                     list to change; add a range with --allow-private to turn the block on",
+                    self.name
+                ),
+            ));
+        }
+        let mut ranges = if reset {
+            Vec::new()
+        } else {
+            self.block_private.clone().unwrap_or_default()
+        };
+        for cidr in remove {
+            let before = ranges.len();
+            ranges.retain(|stored| stored != cidr);
+            if ranges.len() == before {
+                return Err(crate::Error::config(
+                    "update",
+                    format!(
+                        "'{cidr}' is not in machine '{}''s allowed private ranges",
+                        self.name
+                    ),
+                ));
+            }
+        }
+        for cidr in add {
+            if !ranges.contains(cidr) {
+                ranges.push(cidr.clone());
+            }
+        }
+        Ok(Some(ranges))
+    }
+
     /// This record after one add/remove amendment of its egress allow list, or
     /// `None` when the update is empty. Hosts are stored as `machine create`
     /// stores them: `allow_hosts` bare (a name and its subdomains),
@@ -2176,6 +2235,77 @@ mod tests {
         record.network_backend = Some(crate::network::NetworkBackend::Tsi);
         let err = record.updated_egress(&update).unwrap_err().to_string();
         assert!(err.contains("TSI"), "{err}");
+    }
+
+    /// smolvm#2476: a stopped machine's private allow list changes without
+    /// recreating the machine.
+    #[test]
+    fn updating_the_private_allow_list_adds_removes_and_replaces() {
+        let mut record = VmRecord::new("pf".to_string(), 1, 512, vec![], vec![], true);
+        let s = |v: &[&str]| v.iter().map(|c| c.to_string()).collect::<Vec<_>>();
+        assert_eq!(record.updated_private_floor(&[], &[], false).unwrap(), None);
+
+        // Adding turns the block on.
+        let next = record
+            .updated_private_floor(&s(&["10.1.2.3/32"]), &[], false)
+            .unwrap();
+        assert_eq!(next, Some(s(&["10.1.2.3/32"])));
+        record.block_private = next;
+
+        // Adding is idempotent and keeps what the machine had.
+        let next = record
+            .updated_private_floor(&s(&["10.1.2.3/32", "10.9.0.0/16"]), &[], false)
+            .unwrap();
+        assert_eq!(next, Some(s(&["10.1.2.3/32", "10.9.0.0/16"])));
+        record.block_private = next;
+        // Removing takes a stored entry out (an RDS endpoint that moved).
+        assert_eq!(
+            record
+                .updated_private_floor(&s(&["10.1.9.9/32"]), &s(&["10.1.2.3/32"]), false)
+                .unwrap(),
+            Some(s(&["10.9.0.0/16", "10.1.9.9/32"]))
+        );
+
+        // Removing something the machine does not have is refused by name.
+        let err = record
+            .updated_private_floor(&[], &s(&["192.168.0.0/16"]), false)
+            .unwrap_err();
+        assert!(err.to_string().contains("192.168.0.0/16"));
+
+        // Reset replaces the list atomically.
+        assert_eq!(
+            record
+                .updated_private_floor(&s(&["10.4.4.4/32"]), &[], true)
+                .unwrap(),
+            Some(s(&["10.4.4.4/32"]))
+        );
+        // Reset with nothing keeps the block with no range reopened.
+        assert_eq!(
+            record.updated_private_floor(&[], &[], true).unwrap(),
+            Some(vec![])
+        );
+        // Removing the last entry keeps the block too.
+        record.block_private = Some(s(&["10.4.4.4/32"]));
+        assert_eq!(
+            record
+                .updated_private_floor(&[], &s(&["10.4.4.4/32"]), false)
+                .unwrap(),
+            Some(vec![])
+        );
+        // Reset plus removal is refused.
+        assert!(record
+            .updated_private_floor(&[], &s(&["10.4.4.4/32"]), true)
+            .is_err());
+    }
+
+    #[test]
+    fn a_machine_without_the_private_block_has_no_private_list_to_remove_from() {
+        let record = VmRecord::new("open".to_string(), 1, 512, vec![], vec![], true);
+        assert!(record.block_private.is_none());
+        assert!(record
+            .updated_private_floor(&[], &["10.0.0.0/8".to_string()], false)
+            .is_err());
+        assert!(record.updated_private_floor(&[], &[], true).is_err());
     }
 
     #[test]

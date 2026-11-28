@@ -4052,6 +4052,50 @@ mod tests {
         cmd
     }
 
+    /// smolvm#2476: the private allow list is a stopped-machine change, never
+    /// one a running machine takes live like the egress allow list.
+    #[test]
+    fn update_private_ranges_wait_for_a_stopped_machine() {
+        for flags in [
+            &["--allow-private", "10.0.1.5/32"][..],
+            &["--remove-allow-private", "10.0.1.5/32"][..],
+            &["--reset-allow-private", "--allow-private", "10.0.2.0/24"][..],
+        ] {
+            let cmd = parse_update(flags);
+            assert!(!cmd.changes_only_egress(), "{flags:?} must not apply live");
+            assert!(!cmd.changes_only_env() && !cmd.changes_only_labels());
+        }
+        let cmd = parse_update(&["--allow-private", "10.0.1.5"]);
+        assert_eq!(
+            cmd.allow_private,
+            vec!["10.0.1.5/32".to_string()],
+            "a bare address is one host"
+        );
+        assert!(
+            TestMachineCli::try_parse_from([
+                "machine",
+                "update",
+                "--name",
+                "l",
+                "--reset-allow-private",
+                "--remove-allow-private",
+                "10.0.1.5/32",
+            ])
+            .is_err(),
+            "a reset replaces the list, so a removal has nothing to remove"
+        );
+        assert!(TestMachineCli::try_parse_from([
+            "machine",
+            "update",
+            "--name",
+            "l",
+            "--no-net",
+            "--allow-private",
+            "10.0.1.5/32",
+        ])
+        .is_err());
+    }
+
     #[test]
     fn update_changes_labels_alone_in_any_state() {
         assert!(parse_update(&["--label", "kit=git"]).changes_only_labels());
@@ -7072,6 +7116,7 @@ impl ResizeCmd {
 ///   smolvm machine update --name myvm --remove-volume ./src:/app
 ///   smolvm machine update --name myvm --net -e DEBUG=1
 ///   smolvm machine update --name myvm --allow-host pypi.org   # while running
+///   smolvm machine update --name myvm --remove-allow-private 10.0.1.5/32 --allow-private 10.0.2.9/32
 ///   smolvm machine update --name myvm -e API_URL=https://api.example.com   # while running
 ///   smolvm machine update --name myvm --auto-ports
 #[derive(Args, Debug)]
@@ -7200,6 +7245,23 @@ pub struct UpdateCmd {
         conflicts_with_all = ["remove_allow_host", "remove_allow_cidr"]
     )]
     pub reset_allow_list: bool,
+
+    /// Re-open a private range under --block-private, as `machine create
+    /// --allow-private` does (turns the block on if it is off). Can be used
+    /// multiple times. Takes effect on the next start.
+    #[arg(long = "allow-private", value_parser = parse_cidr, value_name = "CIDR", conflicts_with = "no_net")]
+    pub allow_private: Vec<String>,
+
+    /// Close a private range again, written as it was added. The block stays
+    /// on with the remaining ranges reopened.
+    #[arg(long = "remove-allow-private", value_parser = parse_cidr, value_name = "CIDR")]
+    pub remove_allow_private: Vec<String>,
+
+    /// Replace the private ranges the machine reopens with exactly this
+    /// update's --allow-private entries, in one step. With none, the block
+    /// stays on and no private range is reopened.
+    #[arg(long = "reset-allow-private", conflicts_with = "remove_allow_private")]
+    pub reset_allow_private: bool,
 
     /// Add/replace environment variable (KEY=VALUE)
     #[arg(short = 'e', long = "env", value_name = "KEY=VALUE")]
@@ -7518,6 +7580,9 @@ impl UpdateCmd {
             allow_udp,
             remove_allow_udp,
             reset_allow_list,
+            allow_private,
+            remove_allow_private,
+            reset_allow_private,
             env,
             remove_env,
             workdir,
@@ -7546,7 +7611,12 @@ impl UpdateCmd {
             || !remove_allow_udp.is_empty()
             || *reset_allow_list;
         let ports = !port.is_empty() || !remove_port.is_empty();
-        let other = !volume.is_empty()
+        // The private-range block is set up when the machine starts, so a
+        // change to what it reopens waits for a stopped machine.
+        let other = !allow_private.is_empty()
+            || !remove_allow_private.is_empty()
+            || *reset_allow_private
+            || !volume.is_empty()
             || !remove_volume.is_empty()
             || *auto_ports
             || *no_auto_ports
@@ -7763,6 +7833,13 @@ impl UpdateCmd {
         // The egress allow list after this update, validated as a whole before
         // anything is written (#1299).
         let egress = self.next_egress(&record)?;
+        // The private ranges reopened under --block-private after this update,
+        // validated before anything is written.
+        let private_floor = record.updated_private_floor(
+            &self.allow_private,
+            &self.remove_allow_private,
+            self.reset_allow_private,
+        )?;
 
         // Parse and validate new mounts (after state check so
         // "machine is running" takes priority over "directory not found")
@@ -8011,6 +8088,25 @@ impl UpdateCmd {
                 if r.egress_rules.len() != before {
                     changes.push("  removed redirect egress rules".to_string());
                 }
+            }
+
+            if let Some(ranges) = &private_floor {
+                let before = r.block_private.clone().unwrap_or_default();
+                for cidr in ranges.iter().filter(|c| !before.contains(c)) {
+                    changes.push(format!("  allowed private range: {cidr}"));
+                }
+                for cidr in before.iter().filter(|c| !ranges.contains(c)) {
+                    changes.push(format!("  removed private range: {cidr}"));
+                }
+                if r.block_private.is_none() {
+                    changes.push("  block private: enabled".to_string());
+                }
+                // As at create: the block implies outbound networking.
+                if !r.network {
+                    changes.push("  network: enabled".to_string());
+                    r.network = true;
+                }
+                r.block_private = Some(ranges.clone());
             }
 
             changes.extend(self.apply_env(&mut r.env));
