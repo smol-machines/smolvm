@@ -168,9 +168,35 @@ test_concurrent_exec_does_not_flip_unreachable() {
 }
 
 
+test_stop_after_a_missed_probe_stops_the_machine() {
+    ensure_machine_running
+    local pid
+    pid=$($SMOLVM machine start 2>&1 | sed -n 's/.*(PID: \([0-9][0-9]*\)).*/\1/p')
+    [[ "$pid" =~ ^[0-9]+$ ]] || { echo "FAIL: could not read the VM pid"; return 1; }
+
+    # A stopped VMM accepts the probe's connection and never answers, so
+    # stop's first probe times out at 3 s; the recheck that follows is
+    # answered once the VMM resumes at 4.5 s.
+    kill -STOP "$pid" || return 1
+    $SMOLVM machine stop >/dev/null 2>&1 &
+    local stop_pid=$!
+    sleep 4.5
+    kill -CONT "$pid"
+    wait "$stop_pid"
+    local stop_exit=$?
+
+    # Reporting success while the VM keeps running leaves it up unnoticed.
+    if [[ $stop_exit -eq 0 ]] && kill -0 "$pid" 2>/dev/null; then
+        echo "FAIL: stop exited 0 but PID $pid is still running"
+        return 1
+    fi
+}
+
+
 run_test "Concurrent machine starts" test_concurrent_machine_start || true
 run_test "State probe tolerates busy agent (no false unreachable)" test_state_probe_tolerates_busy_agent || true
 run_test "Concurrent exec does not flip VM to unreachable" test_concurrent_exec_does_not_flip_unreachable || true
+run_test "Stop after a missed probe stops the machine" test_stop_after_a_missed_probe_stops_the_machine || true
 run_test "Listing: machine ls does not kill VM" test_machine_ls_does_not_kill_vm || true
 run_test "Listing: named VM survives repeated ls" test_named_vm_survives_ls || true
 

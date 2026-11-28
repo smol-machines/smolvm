@@ -141,7 +141,9 @@ pub fn ensure_running_and_connect(
 /// to); CLI callers want the operator to see the zombie teardown.
 /// A failed recovery propagates: the caller must not report the
 /// machine as stopped, detach its volumes, or start over the zombie.
-fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<()> {
+/// `Ok(false)` means the recheck no longer saw it unreachable, so
+/// nothing was stopped and the caller must not act as if it were.
+fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<bool> {
     // Peek at the record before recovery so we can show the PID in
     // the notice. Losing the PID after recovery is fine — the DB
     // gets cleared — but we want the operator to know *which*
@@ -151,7 +153,8 @@ fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<()> {
         .and_then(|db| db.get_vm(name).ok().flatten())
         .and_then(|r| r.pid);
 
-    if smolvm::agent::state_probe::recover_if_unreachable(name)? {
+    let recovered = smolvm::agent::state_probe::recover_if_unreachable(name)?;
+    if recovered {
         println!(
             "Machine '{}' is unreachable (PID {} alive but agent unresponsive); \
              cleaning up.",
@@ -159,7 +162,7 @@ fn cli_recover_if_unreachable(name: &str) -> smolvm::Result<()> {
             pid_for_notice.unwrap_or(0)
         );
     }
-    Ok(())
+    Ok(recovered)
 }
 
 /// Reconcile a missed exec probe against the latest liveness observation.
@@ -1885,7 +1888,17 @@ fn start_vm_named_locked(
             // a clean fresh start.
             // If the zombie cannot be confirmed dead, fail instead of
             // starting on top of it (socket/pid-file conflicts).
-            cli_recover_if_unreachable(name)?;
+            if !cli_recover_if_unreachable(name)? {
+                // The recheck reached the agent, or found the process gone:
+                // do not launch a second VMM over one that may be live.
+                return Err(Error::agent_conflict(
+                    "start machine",
+                    format!(
+                        "machine '{name}' changed state while unreachable recovery \
+                         was in progress; retry start"
+                    ),
+                ));
+            }
         }
         RecordState::Frozen => {
             let clones = smolvm::agent::fork::restart_blocking_dependent_clones(db, name)?;
@@ -2637,17 +2650,20 @@ pub fn stop_vm_named_with_timeout(
             // Only past this point is the zombie confirmed dead. On
             // failure we return the error without claiming the machine
             // stopped and without detaching its volumes.
-            cli_recover_if_unreachable(name)?;
-            // Process is gone — detach the layers volume unless fork children
-            // still reference it. Their pack links also pin a stopped source.
-            // macOS hdiutil detach; a no-op on Linux.
-            if record.source_smolmachine.is_some() {
-                smolvm_pack::extract::force_detach_layers_volume(
-                    &smolvm::agent::machine_layers_cache_dir(name),
-                );
+            if cli_recover_if_unreachable(name)? {
+                // Process is gone: detach the layers volume unless fork children
+                // still reference it. Their pack links also pin a stopped source.
+                // macOS hdiutil detach; a no-op on Linux.
+                if record.source_smolmachine.is_some() {
+                    smolvm_pack::extract::force_detach_layers_volume(
+                        &smolvm::agent::machine_layers_cache_dir(name),
+                    );
+                }
+                println!("Stopped machine: {}", name);
+                return Ok(());
             }
-            println!("Stopped machine: {}", name);
-            return Ok(());
+            // The recheck no longer saw it unreachable: a live agent gets the
+            // graceful stop below, and a process already gone is a no-op there.
         }
         RecordState::Running => {
             // fall through to the normal stop path
