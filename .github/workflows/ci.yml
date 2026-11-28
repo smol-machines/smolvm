@@ -423,6 +423,8 @@ jobs:
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test --lib copy_paths
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+          cargo test --lib a_socket_file_is_never_the_same_resource_as_a_disk
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p smolvm-network --lib fragment
           if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
           cargo test -p smolvm-network --lib maximum_datagrams
