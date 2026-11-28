@@ -623,6 +623,22 @@ fn sweep_abandoned_staging(
     }
 }
 
+/// The path the stub is written to for `--output`. Windows runs the stub only
+/// under `.exe`, so it is appended to any other name; the sidecar follows the
+/// stub's full name. The stub is a copy of this host's smolvm, so `os` is the host's.
+fn stub_output_path(output: PathBuf, os: Os) -> PathBuf {
+    if !os.is_windows()
+        || output
+            .extension()
+            .is_some_and(|e| e.eq_ignore_ascii_case("exe"))
+    {
+        return output;
+    }
+    let mut name = output.into_os_string();
+    name.push(".exe");
+    name.into()
+}
+
 impl PackCreateCmd {
     /// Storage disk size (GiB) for the temporary pack VM.
     ///
@@ -699,7 +715,7 @@ impl PackCreateCmd {
         Ok(root)
     }
 
-    pub fn run(self) -> smolvm::Result<()> {
+    pub fn run(mut self) -> smolvm::Result<()> {
         // `--output foo.smolmachine` names the EXECUTABLE stub, so the sidecar
         // lands at `foo.smolmachine.smolmachine` — a footgun every time (QA
         // BUG-139). The extension belongs to the sidecar, which is derived
@@ -720,6 +736,7 @@ impl PackCreateCmd {
                 ),
             ));
         }
+        self.output = stub_output_path(self.output, Os::current());
         if let Some(vm_name) = self.from_vm.clone() {
             if self.oci_platform.is_some() {
                 warn!("--oci-platform is ignored with --from-vm (VM snapshot is arch-fixed)");
@@ -2435,6 +2452,25 @@ fn dir_size(path: &std::path::Path) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_windows_stub_is_written_under_a_name_windows_will_run() {
+        // Without `.exe` neither cmd nor PowerShell runs the stub `pack create` prints.
+        let cases = [
+            (Os::Windows, "p1", "p1.exe"),
+            (Os::Windows, "out/my-app-1.2", "out/my-app-1.2.exe"),
+            (Os::Windows, "p1.exe", "p1.exe"),
+            (Os::Windows, "P1.EXE", "P1.EXE"),
+            (Os::Linux, "p1", "p1"),
+        ];
+        for (os, given, written) in cases {
+            assert_eq!(
+                stub_output_path(PathBuf::from(given), os),
+                PathBuf::from(written),
+                "{os}: --output {given}"
+            );
+        }
+    }
 
     #[test]
     fn pack_list_formats_references_digests_and_ages() {

@@ -172,13 +172,16 @@ const PLAIN_CLI_NAMES: [&str; 2] = ["smolvm", "smolvm-bin"];
 /// Split out from `main` so the name rule is testable — the regression this
 /// guards against (warning on the shipped `smolvm-bin`) is invisible in a unit
 /// test of anything coarser.
-fn stray_stub_note(exe_stem: &str) -> Option<String> {
-    if PLAIN_CLI_NAMES.contains(&exe_stem) {
+fn stray_stub_note(exe: &std::path::Path) -> Option<String> {
+    let exe_stem = exe.file_stem()?.to_string_lossy();
+    if PLAIN_CLI_NAMES.contains(&exe_stem.as_ref()) {
         return None;
     }
+    let sidecar = smolvm_pack::sidecar_path_for(exe);
+    let sidecar = sidecar.file_name()?.to_string_lossy();
     Some(format!(
         "note: no packed assets found for '{exe_stem}' (looked for a \
-         '{exe_stem}.smolmachine' sidecar next to the executable); \
+         '{sidecar}' sidecar next to the executable); \
          running as the plain smolvm CLI. If this is a packed \
          binary, keep its .smolmachine file alongside it."
     ))
@@ -270,11 +273,8 @@ fn run_cli() {
         // but silently becoming a different program strands users (QA
         // BUG-167). An unexpected executable name is the tell: say what
         // happened before falling through to the normal CLI.
-        let exe_name = std::env::current_exe()
-            .ok()
-            .and_then(|p| p.file_stem().map(|s| s.to_string_lossy().into_owned()));
-        if let Some(name) = exe_name {
-            if let Some(note) = stray_stub_note(&name) {
+        if let Ok(exe) = std::env::current_exe() {
+            if let Some(note) = stray_stub_note(&exe) {
                 eprintln!("{note}");
             }
         }
@@ -412,6 +412,7 @@ fn init_logging() {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::Path;
 
     #[test]
     fn state_dir_is_read_before_the_workload_arguments_only() {
@@ -458,12 +459,12 @@ mod tests {
         // The regression this file exists to prevent: install.sh ships
         // `smolvm-bin` behind a `smolvm` launcher, so flagging it printed a
         // note on EVERY command of a correct install (shipped in 1.7.0).
-        assert_eq!(stray_stub_note("smolvm-bin"), None);
+        assert_eq!(stray_stub_note(Path::new("smolvm-bin")), None);
     }
 
     #[test]
     fn the_launcher_name_is_not_flagged() {
-        assert_eq!(stray_stub_note("smolvm"), None);
+        assert_eq!(stray_stub_note(Path::new("smolvm")), None);
     }
 
     #[test]
@@ -537,10 +538,16 @@ mod tests {
 
     #[test]
     fn a_renamed_stub_is_still_flagged() {
-        let note = stray_stub_note("myapp").expect("a foreign name should warn");
+        let note = stray_stub_note(Path::new("myapp")).expect("a foreign name should warn");
         assert!(
             note.contains("myapp.smolmachine"),
             "names the sidecar to add"
+        );
+        // The lookup appends to the whole file name, extension included.
+        let note = stray_stub_note(Path::new("myapp.exe")).expect("a foreign name should warn");
+        assert!(
+            note.contains("'myapp.exe.smolmachine'"),
+            "names the sidecar the stub looks for"
         );
         assert!(
             note.contains("plain smolvm CLI"),
