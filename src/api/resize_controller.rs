@@ -1,6 +1,7 @@
 //! Bounded recovery of live resource changes after a server restart.
 
 use super::state::ApiState;
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 use tokio::sync::watch;
@@ -9,6 +10,9 @@ use tokio::sync::watch;
 /// Shutdown waits for an already-started blocking operation: dropping its
 /// future would not stop the operation and must not release lifecycle ownership.
 pub async fn run(state: Arc<ApiState>, mut shutdown: watch::Receiver<bool>) {
+    // The last failure warned about for each machine, so a retry that fails the
+    // same way every 10 s is not logged again.
+    let mut warned: HashMap<String, String> = HashMap::new();
     loop {
         if *shutdown.borrow() {
             return;
@@ -21,6 +25,7 @@ pub async fn run(state: Arc<ApiState>, mut shutdown: watch::Receiver<bool>) {
                 Vec::new()
             }
         };
+        warned.retain(|name, _| names.contains(name));
         for name in names {
             if *shutdown.borrow() {
                 return;
@@ -37,11 +42,21 @@ pub async fn run(state: Arc<ApiState>, mut shutdown: watch::Receiver<bool>) {
             .await;
             match result {
                 Ok(Ok(Some(_))) => {
+                    warned.remove(&name);
                     tracing::info!(machine = %name, "recovered unfinished machine resize")
                 }
-                Ok(Ok(None)) => {}
+                Ok(Ok(None)) => {
+                    warned.remove(&name);
+                }
                 Ok(Err(error)) => {
-                    tracing::warn!(machine = %name, %error, "machine resize remains unfinished")
+                    // The error can carry text from the guest, up to a full agent frame.
+                    let error = bounded(&error.to_string());
+                    if warned.get(&name) != Some(&error) {
+                        tracing::warn!(machine = %name, %error, "machine resize remains unfinished");
+                        warned.insert(name, error);
+                    } else {
+                        tracing::debug!(machine = %name, "machine resize still unfinished");
+                    }
                 }
                 Err(error) => {
                     tracing::error!(machine = %name, %error, "machine resize recovery task failed")
@@ -55,9 +70,40 @@ pub async fn run(state: Arc<ApiState>, mut shutdown: watch::Receiver<bool>) {
     }
 }
 
+/// The most of an error's text a log line keeps.
+const MAX_LOGGED_ERROR: usize = 1024;
+
+fn bounded(text: &str) -> String {
+    if text.len() <= MAX_LOGGED_ERROR {
+        return text.to_string();
+    }
+    let mut end = MAX_LOGGED_ERROR;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}… ({} bytes not shown)", &text[..end], text.len() - end)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_long_error_is_cut_at_a_character_boundary() {
+        let text = format!(
+            "{}é{}",
+            "a".repeat(MAX_LOGGED_ERROR - 1),
+            "b".repeat(32 << 20)
+        );
+        let shown = bounded(&text);
+        assert!(shown.len() < MAX_LOGGED_ERROR + 64, "{} bytes", shown.len());
+        assert!(shown.starts_with(&"a".repeat(MAX_LOGGED_ERROR - 1)));
+        assert!(shown.ends_with(&format!(
+            "({} bytes not shown)",
+            text.len() - (MAX_LOGGED_ERROR - 1)
+        )));
+        assert_eq!(bounded("short"), "short");
+    }
     use crate::config::VmRecord;
     use crate::db::{ResizeTarget, SmolvmDb};
 
