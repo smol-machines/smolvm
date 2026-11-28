@@ -608,9 +608,9 @@ fn startup_reenables_explicitly_stopped_work_without_resetting_automatic_retries
     }
 }
 
-/// A machine's socket files are compared with its disks when ownership moves;
-/// on Windows a socket's metadata cannot be read, which failed every stop,
-/// pause and force-delete.
+/// A machine's socket files are resolved and compared with its disks when
+/// ownership moves; on Windows a socket cannot be opened, which failed every
+/// stop, pause, force-delete and restart.
 #[test]
 fn a_socket_file_is_never_the_same_resource_as_a_disk() {
     let dir = tempfile::tempdir().unwrap();
@@ -618,6 +618,10 @@ fn a_socket_file_is_never_the_same_resource_as_a_disk() {
     std::fs::write(&disk, b"disk").unwrap();
     let socket = dir.path().join("agent.sock");
     let _listener = crate::platform::uds::UdsListener::bind(&socket).unwrap();
+    assert_eq!(
+        super::resource_path(&socket).unwrap(),
+        dir.path().canonicalize().unwrap().join("agent.sock")
+    );
     assert!(!super::same_resource(&disk, &socket).unwrap());
     assert!(!super::same_resource(&socket, &disk).unwrap());
     assert!(super::same_resource(&socket, &socket).unwrap());

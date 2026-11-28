@@ -142,6 +142,7 @@ impl Launch {
 
 /// Resolve the existing prefix before creating a disk or runtime file. A
 /// dangling symlink is not a prospective regular path and must not be guessed.
+/// A Windows socket file cannot be opened, so it resolves through its directory.
 pub(super) fn resource_path(path: &Path) -> std::io::Result<PathBuf> {
     let mut prefix = std::path::absolute(path)?;
     let mut tail = Vec::new();
@@ -153,7 +154,10 @@ pub(super) fn resource_path(path: &Path) -> std::io::Result<PathBuf> {
                 }
                 return Ok(path);
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::NotFound
+                    || unreadable_reparse_point(&prefix) =>
+            {
                 match prefix.symlink_metadata() {
                     Ok(meta) if meta.file_type().is_symlink() => return Err(error),
                     Err(error) if error.kind() != std::io::ErrorKind::NotFound => {
@@ -175,16 +179,17 @@ pub(super) fn resource_path(path: &Path) -> std::io::Result<PathBuf> {
     }
 }
 
-/// Whether `path` is a Windows reparse point, such as an AF_UNIX socket file,
-/// read without following it. Never true elsewhere, where metadata of a
-/// socket reads like any other file's.
+/// Whether `path` is a Windows reparse point other than a link, such as an
+/// AF_UNIX socket file, read without following it. Never true elsewhere, where
+/// metadata of a socket reads like any other file's.
 fn unreadable_reparse_point(path: &Path) -> bool {
     #[cfg(windows)]
     {
         use std::os::windows::fs::MetadataExt;
         const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
-        path.symlink_metadata()
-            .is_ok_and(|m| m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+        path.symlink_metadata().is_ok_and(|m| {
+            m.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0 && !m.file_type().is_symlink()
+        })
     }
     #[cfg(not(windows))]
     {
@@ -199,15 +204,19 @@ pub(super) fn same_resource(a: &Path, b: &Path) -> std::io::Result<bool> {
     if a == b {
         return Ok(true);
     }
-    let metadata = |path: &Path| match path.metadata() {
-        Ok(value) => Ok(Some(value)),
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+    let metadata = |path: &Path| {
         // A Windows AF_UNIX socket (agent.sock, control.sock) is a reparse
-        // point that cannot be opened to read its metadata (os error 1920). It
-        // is no disk resource, so it is the same resource only as itself, which
-        // equal paths answered above.
-        Err(_) if unreadable_reparse_point(path) => Ok(None),
-        Err(error) => Err(error),
+        // point that cannot be opened (os error 1920), though its metadata
+        // reads. It is no disk resource, so it is the same resource only as
+        // itself, which equal paths answered above.
+        if unreadable_reparse_point(path) {
+            return Ok(None);
+        }
+        match path.metadata() {
+            Ok(value) => Ok(Some(value)),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
     };
     let (Some(a_meta), Some(b_meta)) = (metadata(a)?, metadata(b)?) else {
         return Ok(false);
