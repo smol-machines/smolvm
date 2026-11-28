@@ -159,9 +159,43 @@ async fn fetch_parts(
         .create_new(true)
         .open(path)
         .map_err(|e| ApiError::internal(format!("create {}: {e}", path.display())))?;
+    fetch_parts_into(client, url, Arc::new(file), total, plan, "cache base", true).await
+}
+
+/// The size of `url`'s body when it answers ranged requests, from a one-byte
+/// probe, or `None` when it does not and must be streamed whole.
+pub(crate) async fn ranged_size(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+) -> Result<Option<u64>, ApiError> {
+    let probe = client
+        .get(url.clone())
+        .header(reqwest::header::RANGE, "bytes=0-0")
+        .send()
+        .await
+        .map_err(|e| {
+            ApiError::internal(format!("probe source url for ranges: {}", e.without_url()))
+        })?;
+    if probe.status() != reqwest::StatusCode::PARTIAL_CONTENT {
+        return Ok(None);
+    }
+    Ok(content_range_total(&probe))
+}
+
+/// Fetch the `total` bytes of `url` into `file` over parallel ranged requests,
+/// sizing it first. `what` names the download in errors; `sync` makes the file
+/// durable before returning, for a caller that keeps it.
+pub(crate) async fn fetch_parts_into(
+    client: &reqwest::Client,
+    url: &reqwest::Url,
+    file: Arc<std::fs::File>,
+    total: u64,
+    plan: FetchPlan,
+    what: &'static str,
+    sync: bool,
+) -> Result<(), ApiError> {
     file.set_len(total)
-        .map_err(|e| ApiError::internal(format!("size {}: {e}", path.display())))?;
-    let file = Arc::new(file);
+        .map_err(|e| ApiError::internal(format!("size {what}: {e}")))?;
     let parts = total.div_ceil(plan.part_bytes);
     let next = Arc::new(AtomicU64::new(0));
     let failed = Arc::new(AtomicBool::new(false));
@@ -185,7 +219,7 @@ async fn fetch_parts(
                 }
                 let start = part * plan.part_bytes;
                 let end = (start + plan.part_bytes).min(total) - 1;
-                if let Err(error) = fetch_part(&client, &url, &file, start, end, plan).await {
+                if let Err(error) = fetch_part(&client, &url, &file, start, end, plan, what).await {
                     failed.store(true, Ordering::Relaxed);
                     return Err(error);
                 }
@@ -194,8 +228,7 @@ async fn fetch_parts(
     }
     let mut first_error = None;
     while let Some(joined) = workers.join_next().await {
-        let result =
-            joined.map_err(|e| ApiError::internal(format!("cache base fetch task: {e}")))?;
+        let result = joined.map_err(|e| ApiError::internal(format!("{what} fetch task: {e}")))?;
         if let Err(error) = result {
             first_error.get_or_insert(error);
         }
@@ -203,11 +236,14 @@ async fn fetch_parts(
     if let Some(error) = first_error {
         return Err(error);
     }
+    if !sync {
+        return Ok(());
+    }
     let file = file.clone();
     tokio::task::spawn_blocking(move || file.sync_all())
         .await
-        .map_err(|e| ApiError::internal(format!("cache base sync task: {e}")))?
-        .map_err(|e| ApiError::internal(format!("sync cache base: {e}")))
+        .map_err(|e| ApiError::internal(format!("{what} sync task: {e}")))?
+        .map_err(|e| ApiError::internal(format!("sync {what}: {e}")))
 }
 
 /// Fetch bytes `start..=end` and write them at `start`, retrying a part that
@@ -219,6 +255,7 @@ async fn fetch_part(
     start: u64,
     end: u64,
     plan: FetchPlan,
+    what: &'static str,
 ) -> Result<(), ApiError> {
     let want = end - start + 1;
     let mut last_error = String::new();
@@ -248,8 +285,8 @@ async fn fetch_part(
                 let file = file.clone();
                 return tokio::task::spawn_blocking(move || write_at(&file, start, &body))
                     .await
-                    .map_err(|e| ApiError::internal(format!("cache base write task: {e}")))?
-                    .map_err(|e| ApiError::internal(format!("write cache base: {e}")));
+                    .map_err(|e| ApiError::internal(format!("{what} write task: {e}")))?
+                    .map_err(|e| ApiError::internal(format!("write {what}: {e}")));
             }
             Err(error) => {
                 last_error = error;
@@ -260,7 +297,7 @@ async fn fetch_part(
         }
     }
     Err(ApiError::internal(format!(
-        "fetch cache base bytes {start}-{end}: {last_error}"
+        "fetch {what} bytes {start}-{end}: {last_error}"
     )))
 }
 
@@ -410,6 +447,42 @@ mod tests {
         assert_eq!(std::fs::read(&path).unwrap(), data);
         // The probe plus eleven 1000-byte parts.
         assert_eq!(served.load(Ordering::Relaxed), 12);
+    }
+
+    /// A checkpoint restore probes for ranges, then fetches into the upload file
+    /// it already created, without an fsync it does not need.
+    #[tokio::test]
+    async fn a_checkpoint_is_fetched_in_parts_into_an_existing_file() {
+        let data = body(10_500);
+        let (url, served) = serve(data.clone(), true).await;
+        let client = reqwest::Client::new();
+        assert_eq!(ranged_size(&client, &url).await.unwrap(), Some(10_500));
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("upload.smolcheckpoint");
+        let file = std::fs::File::create_new(&path).unwrap();
+        fetch_parts_into(
+            &client,
+            &url,
+            Arc::new(file),
+            10_500,
+            SMALL_PLAN,
+            "checkpoint",
+            false,
+        )
+        .await
+        .unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), data);
+        // The probe plus eleven 1000-byte parts.
+        assert_eq!(served.load(Ordering::Relaxed), 12);
+    }
+
+    #[tokio::test]
+    async fn a_source_without_ranges_reports_no_ranged_size() {
+        let (url, _) = serve(body(10_500), false).await;
+        assert_eq!(
+            ranged_size(&reqwest::Client::new(), &url).await.unwrap(),
+            None
+        );
     }
 
     #[tokio::test]

@@ -2429,38 +2429,101 @@ pub async fn restore_portable_checkpoint(
                 .map_err(|error| {
                     ApiError::internal(format!("build checkpoint fetch client: {error}"))
                 })?;
-            let response = client.get(url).send().await.map_err(|error| {
-                ApiError::internal(format!(
-                    "fetch checkpoint from source url: {}",
-                    error.without_url()
-                ))
-            })?;
-            if !response.status().is_success() {
-                return Err(ApiError::BadRequest(format!(
-                    "checkpoint source url returned {}",
-                    response.status()
-                )));
-            }
-            let mut stream = response.bytes_stream();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk.map_err(|error| {
-                    ApiError::internal(format!(
-                        "read checkpoint from source url: {}",
-                        error.without_url()
-                    ))
-                })?;
-                received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
-                    ApiError::BadRequest("checkpoint upload size overflow".to_string())
-                })?;
-                if received > limit {
+            // One stream from object storage runs at about 100 MB/s, so a
+            // multi-GB checkpoint kept the restore waiting a minute or more
+            // before it began. A large one that answers ranged requests comes
+            // over parallel parts instead (the cache-base downloader, about
+            // 2 GB/s), then is read back once, in order, through the same
+            // hasher, so it is verified exactly as a streamed one is.
+            let plan = crate::api::cache_base_fetch::FetchPlan::default();
+            let ranged = crate::api::cache_base_fetch::ranged_size(&client, &url)
+                .await?
+                .filter(|total| *total >= plan.parallel_min_bytes);
+            if let Some(total) = ranged {
+                if total > limit {
                     return Err(ApiError::BadRequest(format!(
                         "checkpoint exceeds the configured {limit}-byte upload limit"
                     )));
                 }
-                file.write_all(&chunk)
+                let parts = file
+                    .try_clone()
                     .await
-                    .map_err(|error| ApiError::internal(format!("write checkpoint: {error}")))?;
-                hasher.update(chunk).await;
+                    .map_err(|error| {
+                        ApiError::internal(format!("open checkpoint upload: {error}"))
+                    })?
+                    .into_std()
+                    .await;
+                crate::api::cache_base_fetch::fetch_parts_into(
+                    &client,
+                    &url,
+                    Arc::new(parts),
+                    total,
+                    plan,
+                    "checkpoint",
+                    false,
+                )
+                .await?;
+                let mut written = tokio::fs::File::open(&artifact).await.map_err(|error| {
+                    ApiError::internal(format!("read checkpoint back: {error}"))
+                })?;
+                let mut buffer = vec![0_u8; 8 << 20];
+                loop {
+                    let count = written.read(&mut buffer).await.map_err(|error| {
+                        ApiError::internal(format!("read checkpoint back: {error}"))
+                    })?;
+                    if count == 0 {
+                        break;
+                    }
+                    received = received.checked_add(count as u64).ok_or_else(|| {
+                        ApiError::BadRequest("checkpoint upload size overflow".to_string())
+                    })?;
+                    hasher
+                        .update(axum::body::Bytes::copy_from_slice(&buffer[..count]))
+                        .await;
+                }
+                if received != total {
+                    return Err(ApiError::internal(format!(
+                        "checkpoint read back {received} of {total} bytes"
+                    )));
+                }
+            }
+            let response = match ranged {
+                Some(_) => None,
+                None => Some(client.get(url).send().await.map_err(|error| {
+                    ApiError::internal(format!(
+                        "fetch checkpoint from source url: {}",
+                        error.without_url()
+                    ))
+                })?),
+            };
+            if let Some(response) = response {
+                if !response.status().is_success() {
+                    return Err(ApiError::BadRequest(format!(
+                        "checkpoint source url returned {}",
+                        response.status()
+                    )));
+                }
+                let mut stream = response.bytes_stream();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk.map_err(|error| {
+                        ApiError::internal(format!(
+                            "read checkpoint from source url: {}",
+                            error.without_url()
+                        ))
+                    })?;
+                    received = received.checked_add(chunk.len() as u64).ok_or_else(|| {
+                        ApiError::BadRequest("checkpoint upload size overflow".to_string())
+                    })?;
+                    if received > limit {
+                        return Err(ApiError::BadRequest(format!(
+                            "checkpoint exceeds the configured {limit}-byte upload limit"
+                        )));
+                    }
+                    file.write_all(&chunk).await.map_err(|error| {
+                        ApiError::internal(format!("write checkpoint: {error}"))
+                    })?;
+                    hasher.update(chunk).await;
+                }
             }
         } else {
             let mut body = request.into_body().into_data_stream();
